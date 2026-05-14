@@ -10,7 +10,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "travsr", version, about = "The code graph that lives next to git.")]
+#[command(
+    name = "travsr",
+    version,
+    about = "The code graph that lives next to git."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
