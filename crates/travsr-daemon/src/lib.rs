@@ -20,8 +20,8 @@ impl Daemon {
 
     /// Run the daemon's event loop until shutdown.
     ///
-    /// Stub — wiring lands across Sprints 2–3.
-    pub async fn run() -> anyhow::Result<()> {
+    /// Stub — wiring (and the `async` keyword) lands in Sprint 2.
+    pub fn run() -> anyhow::Result<()> {
         tracing::info!("travsr-daemon stub: run() invoked");
         Ok(())
     }

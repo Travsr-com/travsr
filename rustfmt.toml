@@ -1,4 +1,5 @@
 edition = "2021"
 max_width = 100
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
+# Unstable rustfmt options — uncomment when we move to nightly:
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"

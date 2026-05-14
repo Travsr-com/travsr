@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
             tracing::info!("travsr init: stub — Sprint 1");
         }
         Command::Daemon { action } => match action {
-            DaemonAction::Start => travsr_daemon::Daemon::run().await?,
+            DaemonAction::Start => travsr_daemon::Daemon::run()?,
             DaemonAction::Stop | DaemonAction::Status => {
                 tracing::info!("travsr daemon {:?}: stub — Sprint 3", action);
             }

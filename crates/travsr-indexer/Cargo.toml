@@ -10,6 +10,6 @@ rust-version.workspace = true
 
 [dependencies]
 travsr-core = { path = "../travsr-core" }
-tree-sitter = { workspace = true }
-tree-sitter-typescript = { workspace = true }
 anyhow = { workspace = true }
+# Tree-sitter parsers will be re-added in Sprint 1 once the indexer wires them
+# up with a version pair that resolves cleanly (see docs/planning/SPRINT-01.md).

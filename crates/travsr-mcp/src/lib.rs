@@ -21,8 +21,8 @@ impl McpServer {
     /// Serve the MCP protocol over stdio. Used by the local daemon for
     /// IDE / agent integration.
     ///
-    /// Stub — protocol wiring lands in Sprint 3.
-    pub async fn serve_stdio() -> anyhow::Result<()> {
+    /// Stub — protocol wiring (and the `async` keyword) lands in Sprint 3.
+    pub fn serve_stdio() -> anyhow::Result<()> {
         Ok(())
     }
 }
