@@ -70,28 +70,7 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
-  vscode:
-    name: vscode extension
-    runs-on: ubuntu-latest
-    if: hashFiles('packages/travsr-vscode/package-lock.json') != ''
-    # Only runs when files inside the VS Code extension change.
-    # The job is additionally gated by the presence of package-lock.json
-    # so it stays a no-op until the extension is bootstrapped in Sprint 3.
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: packages/travsr-vscode/package-lock.json
-
-      - name: Install dependencies
-        working-directory: packages/travsr-vscode
-        run: npm ci --no-audit --no-fund
-
-      - name: Compile extension
-        working-directory: packages/travsr-vscode
-        run: npm run compile
+  # The VS Code extension job is intentionally not wired up yet. Sprint 3
+  # will add a dedicated workflow (.github/workflows/vscode.yml) once the
+  # extension has runtime code and a committed package-lock.json. See
+  # docs/planning/SPRINT-03.md.
