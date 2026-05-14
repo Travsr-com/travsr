@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/travsr-core",
+    "crates/travsr-indexer",
+    "crates/travsr-store",
+    "crates/travsr-retrieval",
+    "crates/travsr-mcp",
+    "crates/travsr-daemon",
+    "crates/travsr-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Travsr Contributors"]
+repository = "https://github.com/raj-rkv/travsr"
+rust-version = "1.75"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tree-sitter = "0.22"
+tree-sitter-typescript = "0.21"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+blake3 = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

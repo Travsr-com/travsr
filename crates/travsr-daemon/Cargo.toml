@@ -1,0 +1,16 @@
+[package]
+name = "travsr-daemon"
+description = "Travsr daemon: git hooks, file watcher, indexer scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+travsr-mcp = { path = "../travsr-mcp" }
+travsr-indexer = { path = "../travsr-indexer" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

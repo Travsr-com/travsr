@@ -1,0 +1,37 @@
+# Internal planning / reference docs (not for public repo)
+Travsr-Proposal.md
+Next-Gen Git Hosting_ Algorithmic Stack.md
+
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / VS Code extension
+node_modules/
+dist/
+out/
+*.vsix
+.vscode-test/
+.vscode/
+
+# Editor / OS
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs and local data
+*.log
+.travsr/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Env / secrets
+.env
+.env.local
+.env.*.local

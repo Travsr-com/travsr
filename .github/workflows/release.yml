@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (Linux aarch64 only)
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      - name: Build travsr-cli (cargo)
+        if: matrix.cross != true
+        run: cargo build --release -p travsr-cli --target ${{ matrix.target }}
+
+      - name: Build travsr-cli (cross)
+        if: matrix.cross == true
+        run: cross build --release -p travsr-cli --target ${{ matrix.target }}
+
+      - name: Archive binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_NAME=travsr
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          STAGE="travsr-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "${TARGET_DIR}/${BIN_NAME}" "dist/${STAGE}/"
+          cd dist
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: travsr-${{ github.ref_name }}-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # TODO Sprint 3: download artifacts, attach to GitHub Release, publish npm wrapper
+      # - uses: actions/download-artifact@v4
+      #   with:
+      #     path: dist
+      # - name: Create GitHub Release and upload assets
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     files: dist/**/*
+      # - name: Setup Node.js 20
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: 20
+      #     registry-url: https://registry.npmjs.org
+      # - name: Publish npm wrapper
+      #   working-directory: packages/travsr
+      #   run: npm publish --access public
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Placeholder
+        run: echo "publish job stub — wired up in Sprint 3"

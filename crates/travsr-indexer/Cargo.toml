@@ -1,0 +1,15 @@
+[package]
+name = "travsr-indexer"
+description = "Tree-sitter + LSIF parsing pipeline for Travsr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+travsr-core = { path = "../travsr-core" }
+tree-sitter = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+anyhow = { workspace = true }

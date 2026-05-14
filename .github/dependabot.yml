@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+
+  - package-ecosystem: npm
+    directory: /packages/travsr-vscode
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - javascript
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - ci

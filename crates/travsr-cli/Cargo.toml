@@ -1,0 +1,20 @@
+[package]
+name = "travsr-cli"
+description = "Travsr command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "travsr"
+path = "src/main.rs"
+
+[dependencies]
+travsr-daemon = { path = "../travsr-daemon" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

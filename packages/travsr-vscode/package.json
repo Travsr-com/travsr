@@ -1,0 +1,38 @@
+{
+  "name": "travsr-vscode",
+  "displayName": "Travsr",
+  "description": "Graph-native code intelligence for VS Code, powered by the local Travsr daemon over MCP.",
+  "version": "0.0.1",
+  "publisher": "travsr",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "travsr.showStatus",
+        "title": "Travsr: Show Status"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc --noEmit -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.3.9",
+    "typescript": "^5.3.0"
+  }
+}
