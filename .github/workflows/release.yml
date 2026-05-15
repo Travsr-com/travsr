@@ -32,48 +32,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (stable, ${{ matrix.target }})
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry and target
+      - name: Cache
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross (Linux aarch64 only)
+      - name: Install cross (aarch64-linux only)
         if: matrix.cross == true
         run: cargo install cross --locked
 
-      - name: Build travsr-cli (cargo)
+      - name: Build (cargo)
         if: matrix.cross != true
         run: cargo build --release -p travsr-cli --target ${{ matrix.target }}
 
-      - name: Build travsr-cli (cross)
+      - name: Build (cross)
         if: matrix.cross == true
         run: cross build --release -p travsr-cli --target ${{ matrix.target }}
 
-      - name: Archive binary
+      - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          BIN_NAME=travsr
-          TARGET_DIR="target/${{ matrix.target }}/release"
-          STAGE="travsr-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir -p "dist/${STAGE}"
-          cp "${TARGET_DIR}/${BIN_NAME}" "dist/${STAGE}/"
-          cd dist
-          tar -czf "${STAGE}.tar.gz" "${STAGE}"
-          shasum -a 256 "${STAGE}.tar.gz" >> SHA256SUMS
+          TARGET="${{ matrix.target }}"
+          TAG="${{ github.ref_name }}"
+          STAGE="travsr-${TAG}-${TARGET}"
+          mkdir -p dist
+          cp "target/${TARGET}/release/travsr" "dist/travsr"
+          tar -czf "dist/${STAGE}.tar.gz" -C dist travsr
+          rm dist/travsr
+          # per-target checksum file — these are combined in the publish job
+          shasum -a 256 "dist/${STAGE}.tar.gz" | awk '{print $1 "  " $2}' > "dist/${STAGE}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: travsr-${{ github.ref_name }}-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/SHA256SUMS
+          path: dist/
           if-no-files-found: error
           retention-days: 14
 
@@ -85,19 +84,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download all build artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Combine SHA256SUMS
-        shell: bash
-        run: |
-          cat dist/SHA256SUMS 2>/dev/null || find dist -name SHA256SUMS -exec cat {} \; > dist/SHA256SUMS
-          cp dist/SHA256SUMS .
+      - name: Combine checksums into SHA256SUMS
+        run: cat dist/*.sha256 > SHA256SUMS
 
-      - name: Create GitHub Release and upload assets
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
