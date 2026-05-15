@@ -17,7 +17,7 @@
 
 ```bash
 # 1. Install
-npm install -g @travsr/travsr
+npm install -g @travsr.com/travsr
 
 # 2. Index your repo
 cd your-project
