@@ -17,7 +17,7 @@
 
 ```bash
 # 1. Install
-npm install -g @raj-rkv/travsr
+npm install -g travsr
 
 # 2. Index your repo
 cd your-project

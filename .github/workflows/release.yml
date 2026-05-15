@@ -30,7 +30,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain (stable, ${{ matrix.target }})
         uses: dtolnay/rust-toolchain@stable
@@ -60,20 +60,20 @@ jobs:
           set -euo pipefail
           BIN_NAME=travsr
           TARGET_DIR="target/${{ matrix.target }}/release"
-          STAGE="travsr-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          STAGE="travsr-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
           cp "${TARGET_DIR}/${BIN_NAME}" "dist/${STAGE}/"
           cd dist
           tar -czf "${STAGE}.tar.gz" "${STAGE}"
-          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          shasum -a 256 "${STAGE}.tar.gz" >> SHA256SUMS
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: travsr-${{ github.ref_name }}-${{ matrix.target }}
           path: |
             dist/*.tar.gz
-            dist/*.tar.gz.sha256
+            dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
 
@@ -82,23 +82,37 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      # TODO Sprint 3: download artifacts, attach to GitHub Release, publish npm wrapper
-      # - uses: actions/download-artifact@v4
-      #   with:
-      #     path: dist
-      # - name: Create GitHub Release and upload assets
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     files: dist/**/*
-      # - name: Setup Node.js 20
-      #   uses: actions/setup-node@v4
-      #   with:
-      #     node-version: 20
-      #     registry-url: https://registry.npmjs.org
-      # - name: Publish npm wrapper
-      #   working-directory: packages/travsr
-      #   run: npm publish --access public
-      #   env:
-      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Placeholder
-        run: echo "publish job stub — wired up in Sprint 3"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine SHA256SUMS
+        shell: bash
+        run: |
+          cat dist/SHA256SUMS 2>/dev/null || find dist -name SHA256SUMS -exec cat {} \; > dist/SHA256SUMS
+          cp dist/SHA256SUMS .
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            SHA256SUMS
+          generate_release_notes: true
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish npm wrapper
+        working-directory: packages/travsr-npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

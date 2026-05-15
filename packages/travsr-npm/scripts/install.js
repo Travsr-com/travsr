@@ -103,6 +103,14 @@ async function install() {
 }
 
 install().catch(err => {
-  console.error(`travsr install failed: ${err.message}`);
-  process.exit(1);
+  // Non-fatal: if the binary download fails (e.g. release not yet published),
+  // warn and exit 0 so npm install completes.  The bin/travsr.js wrapper will
+  // show a clear error on first use.
+  console.warn(
+    `\nTravsr: binary download failed — ${err.message}\n` +
+    `The binary was not installed. Once v${VERSION} release artifacts are ` +
+    `available at https://github.com/raj-rkv/travsr/releases you can re-run:\n` +
+    `  npm install -g travsr\n` +
+    `Or set TRAVSR_BINARY=/path/to/travsr to use a local build.\n`
+  );
 });

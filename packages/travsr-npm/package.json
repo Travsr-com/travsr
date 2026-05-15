@@ -1,5 +1,5 @@
 {
-  "name": "travsr",
+  "name": "@raj-rkv/travsr",
   "version": "0.1.0",
   "description": "The code graph that lives next to git.",
   "license": "MIT",
