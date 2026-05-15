@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/raj-rkv/travsr"
+    "url": "git+https://github.com/raj-rkv/travsr.git"
   },
   "keywords": ["mcp", "code-intelligence", "graph", "ai", "developer-tools"],
   "bin": {
