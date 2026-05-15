@@ -8,7 +8,7 @@
 > hallucinations.
 
 [![CI](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/travsr)](https://www.npmjs.com/package/travsr)
+[![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
