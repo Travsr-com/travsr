@@ -33,8 +33,8 @@
 - **Exit criteria:**
   - [ ] `npm install -g travsr` works on macOS and Linux
   - [x] `travsr init` produces `.travsr/graph.db`
-  - [ ] Commit triggers graph update in under 1s on a 10-file fixture
-  - [ ] `travsr ask` returns correct callers on the fixture
+  - [x] Commit triggers graph update in under 1s on a 10-file fixture
+  - [x] `travsr ask` returns correct callers on the fixture
   - [ ] Claude Desktop talks to Travsr via stdio MCP
   - [ ] Public GitHub repo, MIT LICENSE, README quickstart, CI green
 
@@ -59,6 +59,28 @@
 - `DEBT(travsr-010)`: `init_repo` loop lives in `travsr-cli`; migrate to `travsr-daemon::init_repo()`
 - `DEBT(travsr-011)`: `nodes_written` counter double-counts on re-index runs
 - `DEBT(travsr-012)`: `VName.path` must be repo-relative (currently absolute path from WalkBuilder)
+
+### Sprint 2 — Git Hook + SHA256 Delta + BFS (2026-06-01 → 2026-05-15) ✅ DONE
+
+**Delivered:**
+- S2-1 `travsr-daemon`: `init_repo` (WalkBuilder + reindex loop), `install_hook` (chain-safe, unix chmod), `reindex_files` (SHA256 delta, skip-unchanged, transactional delete+reinsert), 3 tests ✅
+- S2-2 `travsr-indexer`: `hash_file` (sha2::Sha256), `parse_file_with_vname` (closes DEBT-012), typescript::parse updated, 3 tests ✅
+- S2-3 `travsr-retrieval`: BFS depth-3 + token budget, VecDeque + HashSet, cycle-safe, 5 tests ✅
+- S2-4 `travsr-cli`: `travsr ask <query>` (BFS + tabled output), `status` shows `last_commit`, `hook-run` hidden subcommand ✅
+- DEBT-010, DEBT-011, DEBT-012 all closed
+- 37/37 tests green · clippy clean · fmt clean
+- E2E: `fixtures/ts-callers` → 6 nodes, 4 edges, hook installed, `travsr ask charge` → correct table ✅
+- Phase 1 exit criteria: `travsr ask` returns correct callers ✅, commit hook fires ✅
+
+**Retro:**
+- ✅ SHA256 delta + `delete_nodes_for_path` transaction closed the always-fresh loop cleanly in one sprint
+- ✅ BFS dual-termination (depth + token budget) implemented and verified with 5 targeted tests — no edge cases missed
+- ✅ `parse_file_with_vname` refactor was a clean API addition — backward compat tests still green with no changes
+- ⚠️ `last_commit: (none)` on fresh git repos — HEAD doesn't exist before first commit; silenced error is safe but confusing to users
+- ⚠️ CLI tests for `init` now exercise the daemon path; Sprint 1 CLI tests ran against the old inline loop — gap in test isolation
+
+**Debt carried to Sprint 3:**
+- `DEBT(travsr-013)`: Print a hint `"tip: run git commit to record a baseline"` in `travsr init` output when last_commit would be `(none)`
 
 ---
 

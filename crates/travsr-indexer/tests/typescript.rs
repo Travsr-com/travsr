@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use travsr_core::EdgeKind;
-use travsr_indexer::Indexer;
+use travsr_indexer::{hash_file, Indexer};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -126,4 +126,33 @@ fn vname_signature_disambiguates_function_and_class() {
         class_node.vname.signature.starts_with("class:"),
         "class signature must start with class:"
     );
+}
+
+#[test]
+fn hash_file_is_deterministic() {
+    let h1 = hash_file(&fixture("a.ts")).unwrap();
+    let h2 = hash_file(&fixture("a.ts")).unwrap();
+    assert_eq!(h1, h2, "same file must produce the same hash");
+}
+
+#[test]
+fn hash_file_differs_on_change() {
+    let h1 = hash_file(&fixture("a.ts")).unwrap();
+    let tmp = tempfile::NamedTempFile::with_suffix(".ts").unwrap();
+    std::fs::write(tmp.path(), b"export class Different {}").unwrap();
+    let h2 = hash_file(tmp.path()).unwrap();
+    assert_ne!(h1, h2, "different content must produce a different hash");
+}
+
+#[test]
+fn parse_file_with_vname_uses_vname_path() {
+    let out = indexer()
+        .parse_file_with_vname(&fixture("a.ts"), "custom/path.ts")
+        .unwrap();
+    for node in &out.nodes {
+        assert_eq!(
+            node.vname.path, "custom/path.ts",
+            "all nodes must carry the supplied vname_path"
+        );
+    }
 }

@@ -11,6 +11,14 @@ rust-version.workspace = true
 [dependencies]
 travsr-mcp = { path = "../travsr-mcp" }
 travsr-indexer = { path = "../travsr-indexer" }
+travsr-store = { path = "../travsr-store" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+notify = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

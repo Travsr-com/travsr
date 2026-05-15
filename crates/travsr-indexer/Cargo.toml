@@ -13,6 +13,7 @@ travsr-core = { path = "../travsr-core" }
 anyhow = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-typescript = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

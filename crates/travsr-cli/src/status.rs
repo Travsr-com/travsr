@@ -19,8 +19,13 @@ pub fn run() -> anyhow::Result<()> {
     let nodes = store.node_count()?;
     let edges = store.edge_count()?;
     let journal = store.journal_mode()?;
+    let last_commit = store
+        .get_meta("last_commit")?
+        .unwrap_or_else(|| "(none)".to_string());
 
-    println!("nodes: {nodes} | edges: {edges} | schema: v1 | journal: {journal}");
+    println!(
+        "nodes: {nodes} | edges: {edges} | schema: v1 | journal: {journal} | last_commit: {last_commit}"
+    );
 
     Ok(())
 }

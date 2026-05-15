@@ -17,18 +17,20 @@ const QUERIES: &str = r"
 (import_statement source: (string (string_fragment) @import.source))
 ";
 
-pub fn parse(path: &Path) -> anyhow::Result<ParseOutput> {
-    let source = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+/// Parse `abs_path` and emit graph records using `vname_path` as the stable
+/// VName path (repo-relative, forward-slash — fixes DEBT-012).
+pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
+    let source =
+        std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
-    let is_tsx = path.extension().and_then(|e| e.to_str()) == Some("tsx");
+    let is_tsx = abs_path.extension().and_then(|e| e.to_str()) == Some("tsx");
     let language = if is_tsx {
         tree_sitter_typescript::language_tsx()
     } else {
         tree_sitter_typescript::language_typescript()
     };
 
-    let path_str = path.to_string_lossy().replace('\\', "/");
-    let file_node = emit::file_node(&path_str);
+    let file_node = emit::file_node(vname_path);
     let file_id = file_node.id;
 
     let mut output = ParseOutput {
@@ -71,13 +73,13 @@ pub fn parse(path: &Path) -> anyhow::Result<ParseOutput> {
 
         match cap_name.as_str() {
             "class.name" => {
-                let node = emit::class_node(&path_str, text);
+                let node = emit::class_node(vname_path, text);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "fn.name" => {
-                let node = emit::fn_node(&path_str, text);
+                let node = emit::fn_node(vname_path, text);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
@@ -86,20 +88,20 @@ pub fn parse(path: &Path) -> anyhow::Result<ParseOutput> {
                 // Edge hierarchy (Tech Lead sign-off): class→method, not file→method.
                 let class_name = find_parent_class_name(capture.node, source.as_slice())
                     .unwrap_or_else(|| "<anonymous>".to_string());
-                let class_id = emit::class_node(&path_str, &class_name).id;
-                let node = emit::method_node(&path_str, &class_name, text);
+                let class_id = emit::class_node(vname_path, &class_name).id;
+                let node = emit::method_node(vname_path, &class_name, text);
                 let edge = emit::defines_edge(class_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "var.name" => {
-                let node = emit::var_node(&path_str, text);
+                let node = emit::var_node(vname_path, text);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "import.source" => {
-                let node = emit::import_node(&path_str, text);
+                let node = emit::import_node(vname_path, text);
                 let edge = emit::depends_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
