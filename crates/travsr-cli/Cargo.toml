@@ -14,8 +14,18 @@ path = "src/main.rs"
 
 [dependencies]
 travsr-daemon = { path = "../travsr-daemon" }
+travsr-core = { path = "../travsr-core" }
+travsr-store = { path = "../travsr-store" }
+travsr-indexer = { path = "../travsr-indexer" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+tempfile = { workspace = true }
+travsr-store = { path = "../travsr-store" }

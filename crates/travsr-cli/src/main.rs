@@ -1,10 +1,10 @@
 //! `travsr` — the command-line entrypoint.
-//!
-//! Thin shell over `travsr-daemon`. The CLI's only job is to parse args,
-//! initialise logging, and dispatch into the daemon. All real work lives
-//! downstream — see CLAUDE.md crate dependency rules.
 
 #![forbid(unsafe_code)]
+
+mod init;
+mod repo;
+mod status;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -57,9 +57,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Init => {
-            tracing::info!("travsr init: stub — Sprint 1");
-        }
+        Command::Init => init::run()?,
         Command::Daemon { action } => match action {
             DaemonAction::Start => travsr_daemon::Daemon::run()?,
             DaemonAction::Stop | DaemonAction::Status => {
@@ -69,9 +67,7 @@ async fn main() -> Result<()> {
         Command::Mcp { stdio: _ } => {
             tracing::info!("travsr mcp: stub — Sprint 3");
         }
-        Command::Status => {
-            tracing::info!("travsr status: stub — Sprint 1");
-        }
+        Command::Status => status::run()?,
     }
     Ok(())
 }

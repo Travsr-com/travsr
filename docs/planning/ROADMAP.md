@@ -32,11 +32,33 @@
   - npm wrapper that ships the prebuilt Rust binary
 - **Exit criteria:**
   - [ ] `npm install -g travsr` works on macOS and Linux
-  - [ ] `travsr init` produces `.travsr/graph.db`
+  - [x] `travsr init` produces `.travsr/graph.db`
   - [ ] Commit triggers graph update in under 1s on a 10-file fixture
   - [ ] `travsr ask` returns correct callers on the fixture
   - [ ] Claude Desktop talks to Travsr via stdio MCP
   - [ ] Public GitHub repo, MIT LICENSE, README quickstart, CI green
+
+### Sprint 1 — Foundation (2026-05-18 → 2026-05-15) ✅ DONE
+
+**Delivered:**
+- S1-1 `travsr-core`: VName/Node/Edge/EdgeKind locked, BLAKE3 NodeId, 5 tests ✅
+- S1-2 `travsr-indexer`: Tree-sitter TypeScript pipeline (class/fn/method/var/import), 5 integration tests ✅
+- S1-3 `travsr-store`: SqliteStore + WAL + migrations + node_count/edge_count, 6 tests ✅
+- S1-4 `travsr-cli`: `travsr init` (WalkBuilder, .gitignore-aware) + `travsr status`, 5 CLI tests ✅
+- 21/21 tests green · clippy clean · fmt clean
+- E2E demo: `fixtures/ts-small` → 7 nodes, 4 edges, idempotent ✅
+
+**Retro:**
+- ✅ Tree-sitter version pair (0.22 + 0.21) resolved cleanly — version risk was real but mitigated fast
+- ✅ Pre-existing `should_implement_trait` clippy lint caught and fixed — CI would have blocked the PR
+- ✅ Edge hierarchy (class→method, not file→method) locked early by Tech Lead — no rework needed
+- ⚠️ Rust not installed on dev machine — DevOps should add rustup bootstrap check to onboarding docs
+- ⚠️ `VName.path` ended up as absolute path, not repo-relative — spec vs implementation gap; mitigated by debt ticket
+
+**Debt carried to Sprint 2:**
+- `DEBT(travsr-010)`: `init_repo` loop lives in `travsr-cli`; migrate to `travsr-daemon::init_repo()`
+- `DEBT(travsr-011)`: `nodes_written` counter double-counts on re-index runs
+- `DEBT(travsr-012)`: `VName.path` must be repo-relative (currently absolute path from WalkBuilder)
 
 ---
 
