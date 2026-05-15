@@ -44,6 +44,91 @@ Restart Claude Desktop. Ask: *"Who calls PaymentService.charge?"*
 
 ---
 
+## Works with Every MCP-Compatible AI Tool
+
+Travsr speaks [MCP](https://modelcontextprotocol.io) — the open standard for
+connecting AI agents to tools. The same `travsr mcp --stdio` command works
+with any client that supports it.
+
+### Cursor
+
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
+
+```json
+{
+  "mcpServers": {
+    "travsr": {
+      "command": "travsr",
+      "args": ["mcp", "--stdio"]
+    }
+  }
+}
+```
+
+Then ask Cursor: *"What does PaymentService depend on?"*
+
+### GitHub Copilot (VS Code)
+
+Requires VS Code 1.99+. Add to `.vscode/mcp.json` in your project:
+
+```json
+{
+  "servers": {
+    "travsr": {
+      "type": "stdio",
+      "command": "travsr",
+      "args": ["mcp", "--stdio"]
+    }
+  }
+}
+```
+
+Copilot Chat will automatically discover the `get_dependencies` and
+`get_callers` tools and invoke them when answering questions about your code.
+
+### Cline (VS Code extension)
+
+In the Cline extension settings → **MCP Servers** → Add server:
+
+```json
+{
+  "travsr": {
+    "command": "travsr",
+    "args": ["mcp", "--stdio"],
+    "disabled": false
+  }
+}
+```
+
+### Continue.dev
+
+Add to `~/.continue/config.json` under `mcpServers`:
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "travsr",
+      "command": "travsr",
+      "args": ["mcp", "--stdio"]
+    }
+  ]
+}
+```
+
+### Any other MCP client
+
+The pattern is always the same — point your client at `travsr mcp --stdio`.
+Travsr handles the rest.
+
+```
+command: travsr
+args:    ["mcp", "--stdio"]
+type:    stdio
+```
+
+---
+
 ## MCP Tools
 
 | Tool | Description |
