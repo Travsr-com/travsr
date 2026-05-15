@@ -10,21 +10,26 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
+    name: build (${{ matrix.artifact }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # musl = statically linked, runs on any Linux regardless of glibc version
+          - target: x86_64-unknown-linux-musl
+            artifact: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             cross: false
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
+            artifact: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
           - target: x86_64-apple-darwin
+            artifact: x86_64-apple-darwin
             os: macos-latest
             cross: false
           - target: aarch64-apple-darwin
+            artifact: aarch64-apple-darwin
             os: macos-latest
             cross: false
     runs-on: ${{ matrix.os }}
@@ -42,7 +47,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross (aarch64-linux only)
+      - name: Install musl tools (x86_64 Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Install cross (aarch64 Linux)
         if: matrix.cross == true
         run: cargo install cross --locked
 
@@ -58,20 +67,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TARGET="${{ matrix.target }}"
           TAG="${{ github.ref_name }}"
-          STAGE="travsr-${TAG}-${TARGET}"
+          RUST_TARGET="${{ matrix.target }}"
+          ARTIFACT="${{ matrix.artifact }}"
+          STAGE="travsr-${TAG}-${ARTIFACT}"
           mkdir -p dist
-          cp "target/${TARGET}/release/travsr" "dist/travsr"
+          cp "target/${RUST_TARGET}/release/travsr" "dist/travsr"
           tar -czf "dist/${STAGE}.tar.gz" -C dist travsr
           rm dist/travsr
-          # per-target checksum file — these are combined in the publish job
-          shasum -a 256 "dist/${STAGE}.tar.gz" | awk '{print $1 "  " $2}' > "dist/${STAGE}.sha256"
+          shasum -a 256 "dist/${STAGE}.tar.gz" > "dist/${STAGE}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: travsr-${{ github.ref_name }}-${{ matrix.target }}
+          name: travsr-${{ github.ref_name }}-${{ matrix.artifact }}
           path: dist/
           if-no-files-found: error
           retention-days: 14

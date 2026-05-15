@@ -67,7 +67,7 @@ async function install() {
   }
 
   const base = `https://github.com/raj-rkv/travsr/releases/download/v${VERSION}`;
-  const tarName = `travsr-${target}.tar.gz`;
+  const tarName = `travsr-v${VERSION}-${target}.tar.gz`;
   const tarUrl = `${base}/${tarName}`;
   const sumsUrl = `${base}/SHA256SUMS`;
 
