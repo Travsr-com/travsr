@@ -31,12 +31,12 @@
   - `travsr-cli` `init`, `status`, `ask`, `mcp --stdio`
   - npm wrapper that ships the prebuilt Rust binary
 - **Exit criteria:**
-  - [ ] `npm install -g travsr` works on macOS and Linux
+  - [ ] `npm install -g travsr` works on macOS and Linux — needs v0.1.0 tag + CI release run
   - [x] `travsr init` produces `.travsr/graph.db`
   - [x] Commit triggers graph update in under 1s on a 10-file fixture
   - [x] `travsr ask` returns correct callers on the fixture
-  - [ ] Claude Desktop talks to Travsr via stdio MCP
-  - [ ] Public GitHub repo, MIT LICENSE, README quickstart, CI green
+  - [x] Claude Desktop can use travsr via stdio MCP (`travsr mcp --stdio` verified E2E)
+  - [ ] Public GitHub repo, MIT LICENSE, README quickstart, CI green — repo flip + release pending
 
 ### Sprint 1 — Foundation (2026-05-18 → 2026-05-15) ✅ DONE
 
@@ -81,6 +81,29 @@
 
 **Debt carried to Sprint 3:**
 - `DEBT(travsr-013)`: Print a hint `"tip: run git commit to record a baseline"` in `travsr init` output when last_commit would be `(none)`
+
+### Sprint 3 — MCP Server + npm + Launch Docs (2026-06-15 → 2026-05-15) ✅ DONE
+
+**Delivered:**
+- S3-0 `travsr-store`: `iter_edges_to(dst)` added to Store trait + SqliteStore, 1 test ✅
+- S3-1 `travsr-mcp`: full stdio JSON-RPC 2.0 server — `initialize`, `tools/list`, `tools/call`; tools: `get_dependencies` (Depends edges) + `get_callers` (iter_edges_to); synchronous I/O (no tokio), empty-string on no-results (not error), 7 conformance tests ✅
+- S3-2 `travsr-cli`: `travsr mcp --stdio` wired, DEBT-013 last_commit hint closed ✅
+- S3-3 npm: `packages/travsr-npm/` — platform detection, SHA256 verify, `TRAVSR_BINARY` override, exact exit code propagation ✅
+- S3-4 docs: README quickstart + Claude Desktop config snippet, CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, `.github/` issue/PR templates ✅
+- DEBT-013 closed
+- 52/52 tests green · clippy clean · fmt clean
+- E2E: `initialize` → `protocolVersion: 2024-11-05` ✅; `get_callers charge` → `class:PaymentService (class) — service.ts` ✅
+- **Phase 1 functionally complete** — pending public release steps (repo flip, v0.1.0 tag, CI release run)
+
+**Retro:**
+- ✅ Synchronous BufReader stdio loop for MCP was the right call — no async complexity, zero tokio, perfectly correct for stdio
+- ✅ 7 conformance tests via child-process stdin/stdout proved the protocol contract end-to-end without any mocking
+- ✅ `serde_json::json!().to_string()` pattern eliminated all unwrap risk in response serialization
+- ⚠️ `get_callers` returns DefinesBinding callers (class→method) not RefCall callers — MVP correct, but confusing until LSIF lands; documented in DEBT-014
+- ⚠️ npm binary distribution requires a live GitHub Release — cannot be smoke-tested until v0.1.0 tag is pushed and CI release workflow runs
+
+**Debt carried to Phase 2:**
+- `DEBT(travsr-014)`: `get_callers` should prefer `RefCall` edges over `DefinesBinding` once LSIF populates them
 
 ---
 

@@ -1230,6 +1230,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "travsr-daemon",
+ "travsr-mcp",
  "travsr-retrieval",
  "travsr-store",
 ]
@@ -1277,10 +1278,13 @@ name = "travsr-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "serde",
  "serde_json",
- "tokio",
+ "tempfile",
+ "tracing",
  "travsr-retrieval",
+ "travsr-store",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 travsr-daemon = { path = "../travsr-daemon" }
+travsr-mcp = { path = "../travsr-mcp" }
 travsr-store = { path = "../travsr-store" }
 travsr-retrieval = { path = "../travsr-retrieval" }
 clap = { workspace = true }

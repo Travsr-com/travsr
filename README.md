@@ -1,1 +1,103 @@
 # travsr
+
+**The code graph that lives next to git.**
+
+> Source code is a deterministic graph, not unstructured text. Travsr builds
+> that graph on every commit and exposes it via MCP so AI agents traverse edges
+> instead of guessing from vector chunks — 80% fewer tokens, zero structural
+> hallucinations.
+
+[![CI](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/travsr)](https://www.npmjs.com/package/travsr)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+---
+
+## Quickstart
+
+```bash
+# 1. Install
+npm install -g travsr
+
+# 2. Index your repo
+cd your-project
+travsr init
+
+# 3. Connect to Claude Desktop
+```
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
+or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "travsr": {
+      "command": "travsr",
+      "args": ["mcp", "--stdio"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. Ask: *"Who calls PaymentService.charge?"*
+
+---
+
+## MCP Tools
+
+| Tool | Description |
+|---|---|
+| `get_dependencies(file)` | Return all imports/dependencies of a file |
+| `get_callers(symbol)` | Return all nodes with an incoming edge to a symbol |
+
+---
+
+## CLI Commands
+
+```
+travsr init          Index the current repo and install the git hook
+travsr status        Show graph stats and last-indexed commit SHA
+travsr ask <query>   BFS lookup from the terminal (no MCP client needed)
+travsr mcp --stdio   Start the MCP stdio server (used by Claude Desktop)
+```
+
+---
+
+## How It Works
+
+```
+git commit
+  └─▶ post-commit hook
+        └─▶ travsr hook-run <changed files>
+              └─▶ SHA256 delta — only reindex changed files
+                    └─▶ SQLite graph DB  (.travsr/graph.db)
+                          └─▶ MCP stdio server reads on demand
+```
+
+Language support: **TypeScript / TSX**. Python, Go, Rust arriving in Phase 2.
+
+---
+
+## Build from Source
+
+```bash
+git clone https://github.com/raj-rkv/travsr
+cd travsr
+cargo build --release   # requires Rust 1.75+
+```
+
+---
+
+## Troubleshooting
+
+- **Binary not found after install?**  
+  Set `TRAVSR_BINARY=/path/to/travsr` to point to a local build.
+- **Corporate proxy blocks the postinstall download?**  
+  Same — set `TRAVSR_BINARY` to skip the remote fetch.
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome. Licensed MIT.

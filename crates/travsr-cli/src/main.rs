@@ -77,7 +77,13 @@ async fn main() -> Result<()> {
             }
         },
         Command::Mcp { stdio: _ } => {
-            tracing::info!("travsr mcp: stub — Sprint 3");
+            let cwd = std::env::current_dir()?;
+            let repo_root = repo::find_git_root(&cwd)?;
+            let db_path = repo_root.join(".travsr/graph.db");
+            if !db_path.exists() {
+                anyhow::bail!("not initialized — run `travsr init` first");
+            }
+            travsr_mcp::serve_stdio(&db_path)?;
         }
         Command::Status => status::run()?,
         Command::Ask { query } => ask::run(&query)?,

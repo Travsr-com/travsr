@@ -29,6 +29,8 @@ pub trait Store {
     fn get_node(&self, id: NodeId) -> Result<Option<Node>>;
     /// Return every outgoing edge from `src`.
     fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>>;
+    /// Return every incoming edge to `dst`.
+    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>>;
 }
 
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
@@ -319,6 +321,29 @@ impl Store for SqliteStore {
         }
         Ok(out)
     }
+
+    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT src, kind FROM edges WHERE dst = ?1")
+            .context("preparing iter_edges_to query")?;
+        let rows = stmt
+            .query_map(params![node_id_to_i64(dst)], |row| {
+                let src_i64: i64 = row.get(0)?;
+                let kind_str: String = row.get(1)?;
+                Ok((src_i64, kind_str))
+            })
+            .context("executing iter_edges_to query")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (src_i64, kind_str) = row.context("decoding edge row")?;
+            let kind = EdgeKind::from_str(&kind_str)
+                .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
+            out.push(Edge::new(i64_to_node_id(src_i64), dst, kind));
+        }
+        Ok(out)
+    }
 }
 
 fn node_id_to_i64(id: NodeId) -> i64 {
@@ -491,5 +516,32 @@ mod tests {
         assert_eq!(store.get_meta("foo").unwrap(), Some("bar".to_string()));
         store.set_meta("foo", "baz").unwrap();
         assert_eq!(store.get_meta("foo").unwrap(), Some("baz".to_string()));
+    }
+
+    #[test]
+    fn iter_edges_to_returns_incoming_edges() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path("a.ts", "fn:a");
+        let b = node_with_path("b.ts", "fn:b");
+        let c = node_with_path("c.ts", "fn:c");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&c).unwrap();
+        store
+            .put_edge(&Edge::new(a.id, c.id, EdgeKind::DefinesBinding))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(b.id, c.id, EdgeKind::DefinesBinding))
+            .unwrap();
+
+        let edges = store.iter_edges_to(c.id).unwrap();
+        let srcs: Vec<NodeId> = edges.iter().map(|e| e.src).collect();
+        assert_eq!(edges.len(), 2, "both A→C and B→C must be returned");
+        assert!(srcs.contains(&a.id), "A must appear as a caller");
+        assert!(srcs.contains(&b.id), "B must appear as a caller");
+        assert!(
+            edges.iter().all(|e| e.dst == c.id),
+            "dst must be C for all edges"
+        );
     }
 }

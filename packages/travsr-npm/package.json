@@ -1,0 +1,21 @@
+{
+  "name": "travsr",
+  "version": "0.1.0",
+  "description": "The code graph that lives next to git.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/raj-rkv/travsr"
+  },
+  "keywords": ["mcp", "code-intelligence", "graph", "ai", "developer-tools"],
+  "bin": {
+    "travsr": "bin/travsr.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": ["bin/", "scripts/", "README.md"]
+}

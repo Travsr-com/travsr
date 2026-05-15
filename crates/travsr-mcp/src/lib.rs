@@ -1,28 +1,33 @@
 //! travsr-mcp — Model Context Protocol server.
 //!
 //! Exposes Travsr's graph retrieval tools to MCP clients (Claude Desktop,
-//! VS Code, etc.) over stdio (local) or SSE (cloud). Per CLAUDE.md, MCP is
-//! the *only* external interface — no REST, no GraphQL.
+//! VS Code, etc.) over stdio. Per CLAUDE.md principle 4, MCP is the *only*
+//! external interface — no REST, no GraphQL.
+//!
+//! Framing: newline-delimited JSON-RPC 2.0 over stdin/stdout.
+//! All diagnostics are written to stderr via `tracing`.
 
 #![forbid(unsafe_code)]
 
-/// The Travsr MCP server.
-#[derive(Debug, Default)]
-pub struct McpServer {
-    _private: (),
-}
+mod protocol;
+mod server;
+mod tools;
 
-impl McpServer {
-    /// Construct a new MCP server.
-    pub fn new() -> Self {
-        Self::default()
-    }
+use std::path::Path;
 
-    /// Serve the MCP protocol over stdio. Used by the local daemon for
-    /// IDE / agent integration.
-    ///
-    /// Stub — protocol wiring (and the `async` keyword) lands in Sprint 3.
-    pub fn serve_stdio() -> anyhow::Result<()> {
-        Ok(())
-    }
+use anyhow::Context as _;
+use travsr_store::SqliteStore;
+
+pub(crate) const PROTOCOL_VERSION: &str = "2024-11-05";
+pub(crate) const SERVER_NAME: &str = "travsr";
+pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Start the MCP stdio server backed by the graph database at `db_path`.
+///
+/// Reads JSON-RPC 2.0 requests from stdin, dispatches them to the graph
+/// tools, and writes responses to stdout. Runs until stdin is closed.
+pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
+    let store = SqliteStore::open(db_path)
+        .with_context(|| format!("opening graph database at {}", db_path.display()))?;
+    server::run(&store)
 }
