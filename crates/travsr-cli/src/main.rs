@@ -143,14 +143,18 @@ async fn run() -> Result<()> {
         }
         Command::Status => status::run()?,
         Command::Ask { query } => ask::run(&query)?,
-        Command::Graph { query, all, depth, direction, format } => {
-            match (all, query.as_deref()) {
-                (true, Some(_)) => anyhow::bail!("--all and a query are mutually exclusive"),
-                (true, None) => graph::run_all(format)?,
-                (false, Some(q)) => graph::run(q, depth, direction, format)?,
-                (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
-            }
-        }
+        Command::Graph {
+            query,
+            all,
+            depth,
+            direction,
+            format,
+        } => match (all, query.as_deref()) {
+            (true, Some(_)) => anyhow::bail!("--all and a query are mutually exclusive"),
+            (true, None) => graph::run_all(format)?,
+            (false, Some(q)) => graph::run(q, depth, direction, format)?,
+            (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
+        },
         Command::HookRun { paths } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;

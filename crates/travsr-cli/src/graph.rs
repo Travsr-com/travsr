@@ -6,6 +6,8 @@ use travsr_store::{SqliteStore, Store};
 
 use crate::repo::find_git_root;
 
+type GraphData = (HashMap<NodeId, (Node, u8)>, Vec<(NodeId, NodeId, String)>);
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Direction {
     /// Follow outgoing edges (what does this symbol import / define?)
@@ -141,7 +143,11 @@ fn print_dot_from_map(
                 if cand.kind != "file" {
                     continue;
                 }
-                let specifier = node.vname.signature.strip_prefix("import:").unwrap_or(&node.vname.signature);
+                let specifier = node
+                    .vname
+                    .signature
+                    .strip_prefix("import:")
+                    .unwrap_or(&node.vname.signature);
                 if specifier.starts_with('.') {
                     let basename = std::path::Path::new(specifier)
                         .file_stem()
@@ -180,17 +186,20 @@ fn print_dot_from_map(
         if node.kind == "import" && import_redirect.contains_key(node_id) {
             continue;
         }
-        by_kind.entry(node.kind.as_str()).or_default().push(*node_id);
+        by_kind
+            .entry(node.kind.as_str())
+            .or_default()
+            .push(*node_id);
     }
 
     // Cluster definitions: (kind, label, shape, fill, border)
     let clusters: &[(&str, &str, &str, &str, &str)] = &[
-        ("file",     "Files",     "folder",    "#dbeafe", "#3b82f6"),
-        ("class",    "Classes",   "box3d",     "#dcfce7", "#22c55e"),
-        ("function", "Functions", "ellipse",   "#fef9c3", "#eab308"),
-        ("method",   "Methods",   "ellipse",   "#fce7f3", "#ec4899"),
+        ("file", "Files", "folder", "#dbeafe", "#3b82f6"),
+        ("class", "Classes", "box3d", "#dcfce7", "#22c55e"),
+        ("function", "Functions", "ellipse", "#fef9c3", "#eab308"),
+        ("method", "Methods", "ellipse", "#fce7f3", "#ec4899"),
         ("variable", "Variables", "plaintext", "#f3e8ff", "#a855f7"),
-        ("import",   "Imports",   "note",      "#f1f5f9", "#94a3b8"),
+        ("import", "Imports", "note", "#f1f5f9", "#94a3b8"),
     ];
 
     println!("digraph travsr {{");
@@ -216,10 +225,7 @@ fn print_dot_from_map(
         println!();
         for &nid in ids {
             if let Some((node, _)) = nodes_map.get(&nid) {
-                let label = escape_dot(&format!(
-                    "{}\n{}",
-                    node.vname.signature, node.vname.path
-                ));
+                let label = escape_dot(&format!("{}\n{}", node.vname.signature, node.vname.path));
                 println!(
                     "    n{} [label=\"{label}\" shape={shape} style=filled \
                      fillcolor=\"{fill}\" color=\"{border}\"];",
@@ -233,8 +239,14 @@ fn print_dot_from_map(
 
     // Emit edges; suppress defines/binding labels from containers to members.
     for (src_id, dst_id, kind) in &edges {
-        let src_kind = nodes_map.get(src_id).map(|(n, _)| n.kind.as_str()).unwrap_or("");
-        let dst_kind = nodes_map.get(dst_id).map(|(n, _)| n.kind.as_str()).unwrap_or("");
+        let src_kind = nodes_map
+            .get(src_id)
+            .map(|(n, _)| n.kind.as_str())
+            .unwrap_or("");
+        let dst_kind = nodes_map
+            .get(dst_id)
+            .map(|(n, _)| n.kind.as_str())
+            .unwrap_or("");
 
         let suppress = kind == "defines/binding"
             && matches!(src_kind, "file" | "class")
@@ -263,16 +275,16 @@ fn print_json(
         .collect();
     for (src_id, dst_id, _) in edges {
         for &nid in &[*src_id, *dst_id] {
-            if !sig_lookup.contains_key(&nid) {
+            if let std::collections::hash_map::Entry::Vacant(e) = sig_lookup.entry(nid) {
                 if let Some(node) = store.get_node(nid)? {
-                    sig_lookup.insert(nid, node.vname.signature.clone());
+                    e.insert(node.vname.signature.clone());
                 }
             }
         }
     }
 
     let mut kinds: HashMap<String, usize> = HashMap::new();
-    for (_, (node, _)) in nodes_map {
+    for (node, _) in nodes_map.values() {
         *kinds.entry(node.kind.clone()).or_default() += 1;
     }
 
@@ -342,7 +354,7 @@ fn collect_graph(
     seed_id: NodeId,
     max_depth: u8,
     direction: Direction,
-) -> anyhow::Result<(HashMap<NodeId, (Node, u8)>, Vec<(NodeId, NodeId, String)>)> {
+) -> anyhow::Result<GraphData> {
     let mut nodes_map: HashMap<NodeId, (Node, u8)> = HashMap::new();
     let mut edge_list: Vec<(NodeId, NodeId, String)> = Vec::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
@@ -377,9 +389,7 @@ fn collect_graph(
     Ok((nodes_map, edge_list))
 }
 
-fn collect_all_graph(
-    store: &SqliteStore,
-) -> anyhow::Result<(HashMap<NodeId, (Node, u8)>, Vec<(NodeId, NodeId, String)>)> {
+fn collect_all_graph(store: &SqliteStore) -> anyhow::Result<GraphData> {
     let nodes_map: HashMap<NodeId, (Node, u8)> = store
         .all_nodes()?
         .into_iter()
@@ -388,7 +398,6 @@ fn collect_all_graph(
     let edges = store.all_edges()?;
     Ok((nodes_map, edges))
 }
-
 
 fn next_edges(
     store: &SqliteStore,
