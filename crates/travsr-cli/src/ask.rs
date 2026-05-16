@@ -32,7 +32,12 @@ pub fn run(query: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let seed = matches[0].id;
+    let preferred = ["file", "class", "function", "method"];
+    let seed_node = preferred
+        .iter()
+        .find_map(|k| matches.iter().find(|n| n.kind == *k))
+        .unwrap_or(&matches[0]);
+    let seed = seed_node.id;
     let results = travsr_retrieval::bfs(&store, seed, 3, 4096)?;
 
     if results.is_empty() {

@@ -13,12 +13,14 @@ name = "travsr"
 path = "src/main.rs"
 
 [dependencies]
+travsr-core = { path = "../travsr-core" }
 travsr-daemon = { path = "../travsr-daemon" }
 travsr-mcp = { path = "../travsr-mcp" }
 travsr-store = { path = "../travsr-store" }
 travsr-retrieval = { path = "../travsr-retrieval" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -190,7 +190,8 @@ impl SqliteStore {
             .conn
             .prepare(
                 "SELECT id, corpus, root, path, language, signature, kind \
-                 FROM nodes WHERE signature LIKE '%' || ?1 || '%'",
+                 FROM nodes WHERE signature LIKE '%' || ?1 || '%' \
+                    OR path LIKE '%' || ?1 || '%'",
             )
             .context("preparing search query")?;
 
@@ -212,6 +213,52 @@ impl SqliteStore {
         let mut out = Vec::new();
         for row in rows {
             out.push(row.context("decoding search row")?);
+        }
+        Ok(out)
+    }
+
+    pub fn all_nodes(&self) -> Result<Vec<Node>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, corpus, root, path, language, signature, kind FROM nodes")
+            .context("preparing all_nodes query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                Ok(Node { id, vname, kind })
+            })
+            .context("executing all_nodes query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding all_nodes row")?);
+        }
+        Ok(out)
+    }
+
+    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT src, dst, kind FROM edges")
+            .context("preparing all_edges query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let src = i64_to_node_id(row.get::<_, i64>(0)?);
+                let dst = i64_to_node_id(row.get::<_, i64>(1)?);
+                let kind: String = row.get(2)?;
+                Ok((src, dst, kind))
+            })
+            .context("executing all_edges query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding all_edges row")?);
         }
         Ok(out)
     }
