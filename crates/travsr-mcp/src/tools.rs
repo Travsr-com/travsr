@@ -44,6 +44,12 @@ pub fn get_dependencies(store: &SqliteStore, file: &str) -> String {
 }
 
 /// Return all nodes that have an incoming edge to the given symbol.
+///
+/// Edge preference (DEBT-014): if any `RefCall` edges exist (LSIF-sourced,
+/// true call sites), return only those. Fall back to `DefinesBinding` edges
+/// (Tree-sitter structural, e.g. class→method) only when no RefCall edges are
+/// present — keeps results useful before the LSIF pass has run.
+///
 /// Empty string when nothing is found.
 pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
     let nodes = match store.search_nodes_by_name(symbol) {
@@ -67,8 +73,22 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
         }
     };
 
+    // Prefer semantic RefCall edges; fall back to structural DefinesBinding.
+    let ref_call: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind.as_str() == "ref/call")
+        .collect();
+    let selected: Vec<_> = if ref_call.is_empty() {
+        edges
+            .iter()
+            .filter(|e| e.kind.as_str() == "defines/binding")
+            .collect()
+    } else {
+        ref_call
+    };
+
     let mut lines: Vec<String> = Vec::new();
-    for edge in &edges {
+    for edge in selected {
         if let Ok(Some(src_node)) = store.get_node(edge.src) {
             lines.push(format!(
                 "{} ({}) — {}",

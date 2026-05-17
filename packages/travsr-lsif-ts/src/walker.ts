@@ -41,6 +41,8 @@ interface DefCtx {
   symbolInfos: Map<ts.Symbol, SymbolInfo>;
   checker: ts.TypeChecker;
   emitter: Emitter;
+  /** Absolute path to the tsconfig directory — used to compute repo-relative VName paths. */
+  basePath: string;
 }
 
 interface RefCtx {
@@ -96,6 +98,7 @@ export function walk(tsconfigPath: string, emitter: Emitter): void {
       symbolInfos,
       checker,
       emitter,
+      basePath,
     };
     visitDef(sf, ctx);
     emitter.emitContains(ctx.docId, defRangeIds);
@@ -124,7 +127,8 @@ function visitDef(node: ts.Node, ctx: DefCtx): void {
 
   if (symbol && nameNode) {
     if (!ctx.symbolInfos.has(symbol)) {
-      const resultSetId = ctx.emitter.emitResultSet();
+      const vname = computeTravsrVName(node, ctx.sf, ctx.basePath);
+      const resultSetId = ctx.emitter.emitResultSet(vname);
       const defResultId = ctx.emitter.emitDefinitionResult();
       const refResultId = ctx.emitter.emitReferenceResult();
       ctx.emitter.emitEdge('textDocument/definition', resultSetId, defResultId);
@@ -241,6 +245,60 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Compute the Travsr VName for a declaration node.
+ *
+ * Signature format is identical to travsr-indexer/src/emit.rs so that the Rust
+ * LSIF ingester can deterministically compute the same BLAKE3 NodeId and
+ * match LSIF resultSets to Tree-sitter-indexed nodes without a store lookup.
+ *
+ *   class:ClassName          → ClassDeclaration
+ *   fn:funcName              → FunctionDeclaration
+ *   method:ClassName.name    → MethodDeclaration (requires parent class walk)
+ *   var:varName              → VariableDeclaration
+ *   interface:InterfaceName  → InterfaceDeclaration (not indexed by Tree-sitter; included for future use)
+ *
+ * Returns undefined for unrecognised node kinds — the caller omits travsr_vname
+ * in that case, so the resultSet is still valid LSIF, just opaque to the Rust side.
+ */
+function computeTravsrVName(
+  node: ts.Node,
+  sf: ts.SourceFile,
+  basePath: string
+): { path: string; signature: string } | undefined {
+  const relPath = path.relative(basePath, sf.fileName).replace(/\\/g, '/');
+  let signature: string;
+
+  if (ts.isClassDeclaration(node) && node.name) {
+    signature = `class:${node.name.text}`;
+  } else if (ts.isInterfaceDeclaration(node) && node.name) {
+    signature = `interface:${node.name.text}`;
+  } else if (ts.isFunctionDeclaration(node) && node.name) {
+    signature = `fn:${node.name.text}`;
+  } else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
+    const className = findParentClassName(node) ?? '<anonymous>';
+    signature = `method:${className}.${node.name.text}`;
+  } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+    signature = `var:${node.name.getText(sf)}`;
+  } else {
+    return undefined;
+  }
+
+  return { path: relPath, signature };
+}
+
+/** Walk up the AST from a method node to find the enclosing class name. */
+function findParentClassName(node: ts.Node): string | undefined {
+  let current: ts.Node | undefined = node.parent;
+  while (current) {
+    if (ts.isClassDeclaration(current) && current.name) {
+      return current.name.text;
+    }
+    current = current.parent;
+  }
+  return undefined;
+}
 
 /**
  * Given a declaration node, return [symbol, nameNode] if it is a named

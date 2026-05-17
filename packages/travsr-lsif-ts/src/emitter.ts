@@ -59,9 +59,24 @@ export class Emitter {
     });
   }
 
-  emitResultSet(): number {
+  /**
+   * Emit a resultSet vertex, optionally annotating it with a Travsr VName.
+   *
+   * The `travsr_vname` field is a non-standard extension: LSIF consumers that
+   * don't know Travsr ignore it (the field is not in the core spec). The Rust
+   * ingester in travsr-indexer uses it to map LSIF symbols to Travsr NodeIds
+   * without requiring a separate position-lookup pass.
+   *
+   * Signature format mirrors the Tree-sitter indexer in travsr-indexer/src/emit.rs:
+   *   class:ClassName  |  fn:funcName  |  method:ClassName.methodName  |  var:varName
+   */
+  emitResultSet(vname?: { path: string; signature: string }): number {
     const id = this.nextId();
-    return this.emit({ id, type: 'vertex', label: 'resultSet' });
+    const vertex: Record<string, unknown> = { id, type: 'vertex', label: 'resultSet' };
+    if (vname) {
+      vertex['travsr_vname'] = vname;
+    }
+    return this.emit(vertex);
   }
 
   /**

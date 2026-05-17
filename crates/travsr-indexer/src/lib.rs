@@ -8,11 +8,15 @@
 
 mod emit;
 mod hash;
+pub mod lsif;
+pub mod runner;
 mod typescript;
 
 use std::path::Path;
 
 pub use hash::hash_file;
+pub use lsif::ingest as ingest_lsif;
+pub use runner::run_lsif_emitter;
 pub use travsr_core::{Edge, Node};
 
 /// Resolve relative imports in `nodes` to `resolves-to` edges.
