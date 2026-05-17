@@ -92,6 +92,14 @@ pub enum EdgeKind {
     /// Connects `import:./foo` → `file:foo.ts`, enabling transitive
     /// caller traversal across file boundaries.
     ResolvesTo,
+    /// Named import specifier reference emitted by the LSIF pipeline.
+    /// Distinguishes semantic import references from file-level `Depends` edges.
+    RefImports,
+    /// Class-to-interface implementation edge emitted by the LSIF pipeline.
+    IsImplementation,
+    /// Method override edge emitted by the LSIF pipeline when a subclass
+    /// method shadows a same-named method in the base class.
+    Overrides,
 }
 
 impl EdgeKind {
@@ -103,6 +111,9 @@ impl EdgeKind {
             Self::DefinesBinding => "defines/binding",
             Self::Exports => "exports",
             Self::ResolvesTo => "resolves-to",
+            Self::RefImports => "ref/imports",
+            Self::IsImplementation => "is-implementation",
+            Self::Overrides => "overrides",
         }
     }
 
@@ -115,6 +126,9 @@ impl EdgeKind {
             "defines/binding" => Some(Self::DefinesBinding),
             "exports" => Some(Self::Exports),
             "resolves-to" => Some(Self::ResolvesTo),
+            "ref/imports" => Some(Self::RefImports),
+            "is-implementation" => Some(Self::IsImplementation),
+            "overrides" => Some(Self::Overrides),
             _ => None,
         }
     }
@@ -198,6 +212,9 @@ mod tests {
             EdgeKind::DefinesBinding,
             EdgeKind::Exports,
             EdgeKind::ResolvesTo,
+            EdgeKind::RefImports,
+            EdgeKind::IsImplementation,
+            EdgeKind::Overrides,
         ] {
             assert_eq!(EdgeKind::from_str(kind.as_str()), Some(kind));
         }
