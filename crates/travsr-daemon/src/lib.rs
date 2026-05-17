@@ -331,6 +331,68 @@ mod tests {
         assert_eq!(stats.files_indexed, 0, "symlink target must not be indexed");
     }
 
+    // init_repo must complete successfully even when an oversized .ts file is present.
+    // The oversized file must be silently skipped (parse error is logged, not propagated).
+    #[test]
+    fn init_repo_gracefully_skips_oversized_ts_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // Write a file over the 10 MB limit.
+        let big = vec![b'a'; 11 * 1024 * 1024];
+        std::fs::write(tmp.path().join("giant.ts"), &big).unwrap();
+
+        // Must not return Err — skipping is a warning, not a fatal error.
+        let result = init_repo(tmp.path());
+        assert!(result.is_ok(), "init_repo must succeed even with an oversized file: {result:?}");
+    }
+
+    // Valid files must still be indexed alongside an oversized file.
+    // Regression: the oversized file must not abort indexing of healthy files.
+    #[test]
+    fn init_repo_indexes_valid_files_alongside_oversized() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // One valid file.
+        std::fs::write(tmp.path().join("real.ts"), "export class Real { ok() {} }").unwrap();
+        // One oversized file next to it.
+        let big = vec![b'a'; 11 * 1024 * 1024];
+        std::fs::write(tmp.path().join("giant.ts"), &big).unwrap();
+
+        let stats = init_repo(tmp.path()).unwrap();
+        assert!(
+            stats.nodes_written > 0,
+            "valid file must be indexed even when an oversized file is present"
+        );
+    }
+
+    // BUG-EXPOSURE (SEC-005): p.is_file() follows symlinks, so a symlink pointing
+    // directly at a .ts file bypasses follow_links(false) and the target is indexed.
+    // This test documents the gap — it is expected to FAIL until the walker loop
+    // uses entry.file_type().is_some_and(|t| t.is_file()) instead of p.is_file().
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "known bug: p.is_file() follows symlinks to files — fix walker to use entry.file_type()"]
+    fn symlink_to_ts_file_is_not_indexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // Place a .ts file outside the repo.
+        let outside = tempfile::tempdir().unwrap();
+        let secret_path = outside.path().join("secret.ts");
+        std::fs::write(&secret_path, "export const apiKey = 'hunter2';").unwrap();
+
+        // Symlink to the FILE (not a directory) from inside the repo.
+        std::os::unix::fs::symlink(&secret_path, tmp.path().join("leak.ts")).unwrap();
+
+        let stats = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            stats.files_indexed, 0,
+            "symlink to a .ts file must not be indexed (p.is_file() bug)"
+        );
+    }
+
     #[test]
     fn reindex_files_updates_on_change() {
         let tmp = tempfile::tempdir().unwrap();

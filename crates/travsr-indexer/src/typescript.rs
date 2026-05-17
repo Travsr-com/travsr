@@ -143,7 +143,6 @@ mod tests {
     fn oversized_file_returns_err() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.ts");
-        // Write a file just over the 10 MB limit.
         let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
         std::fs::write(&path, &big).unwrap();
 
@@ -151,6 +150,73 @@ mod tests {
         assert!(result.is_err(), "oversized file must return Err");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("too large"), "error must mention 'too large': {msg}");
+    }
+
+    // Boundary: a file exactly at the limit must be accepted, not rejected.
+    #[test]
+    fn file_at_exact_limit_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.ts");
+        // Exactly MAX_FILE_BYTES — should not be rejected.
+        let content = vec![b' '; MAX_FILE_BYTES as usize];
+        std::fs::write(&path, &content).unwrap();
+
+        let result = parse(&path, "boundary.ts");
+        // Must not return the "too large" error — parse may return Ok or a
+        // parse error (all-spaces is not valid TS), but never the size error.
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("too large"),
+                "file at exact limit must not be rejected: {e}"
+            );
+        }
+    }
+
+    // Error message must include the file path so operators know which file triggered it.
+    #[test]
+    fn oversized_error_message_contains_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("giant.ts");
+        let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, &big).unwrap();
+
+        let err = parse(&path, "giant.ts").unwrap_err().to_string();
+        assert!(
+            err.contains("giant.ts"),
+            "error message must include the file path: {err}"
+        );
+    }
+
+    // The timeout constant must be set to a sane non-zero value.
+    #[test]
+    fn parse_timeout_constant_is_nonzero() {
+        assert!(
+            PARSE_TIMEOUT_MICROS > 0,
+            "PARSE_TIMEOUT_MICROS must be non-zero"
+        );
+        // Sanity range: at least 1 s and at most 30 s.
+        assert!(
+            PARSE_TIMEOUT_MICROS >= 1_000_000,
+            "timeout should be >= 1 s, got {PARSE_TIMEOUT_MICROS} µs"
+        );
+        assert!(
+            PARSE_TIMEOUT_MICROS <= 30_000_000,
+            "timeout should be <= 30 s, got {PARSE_TIMEOUT_MICROS} µs"
+        );
+    }
+
+    // A normal-sized valid .ts file must still parse correctly after the size gate.
+    #[test]
+    fn normal_file_still_parses_after_size_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.ts");
+        std::fs::write(&path, "export class AuthService { login() {} }").unwrap();
+
+        let output = parse(&path, "svc.ts").expect("normal file must parse without error");
+        assert!(
+            output.nodes.iter().any(|n| n.kind == "class"),
+            "class node must be emitted for AuthService"
+        );
     }
 }
 
