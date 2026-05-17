@@ -21,11 +21,20 @@ updates:
   - package-ecosystem: npm
     directory: /packages/travsr-lsif-ts
     schedule:
-      interval: daily
+      interval: weekly
     open-pull-requests-limit: 10
     labels:
       - dependencies
       - javascript
+    groups:
+      typescript-compiler:
+        patterns:
+          - "typescript"
+        update-types:
+          - "minor"
+          - "major"
+    reviewers:
+      - raj-rkv
 
   - package-ecosystem: github-actions
     directory: /
