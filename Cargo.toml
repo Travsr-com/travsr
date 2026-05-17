@@ -37,7 +37,7 @@ walkdir = "2"
 ignore = "0.4"
 assert_cmd = "2"
 notify = "6"
-tabled = "0.15"
+tabled = "0.20"
 
 [profile.release]
 lto = "thin"
