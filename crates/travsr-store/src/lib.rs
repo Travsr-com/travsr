@@ -15,11 +15,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 
 /// The current schema version. Bump when adding a migration.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Migration scripts applied in order. Index 0 takes the DB from version 0
-/// (fresh) to version 1.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/v1_initial.sql")];
+/// (fresh) to version 1, index 1 from version 1 to version 2, etc.
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/v1_initial.sql"),
+    include_str!("migrations/v2_edge_provenance.sql"),
+];
 
 /// The storage interface every Travsr backend must satisfy.
 pub trait Store {
@@ -245,17 +248,18 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String)>> {
+    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT src, dst, kind FROM edges")
+            .prepare("SELECT src, dst, kind, provenance FROM edges")
             .context("preparing all_edges query")?;
         let rows = stmt
             .query_map([], |row| {
                 let src = i64_to_node_id(row.get::<_, i64>(0)?);
                 let dst = i64_to_node_id(row.get::<_, i64>(1)?);
                 let kind: String = row.get(2)?;
-                Ok((src, dst, kind))
+                let provenance: String = row.get(3)?;
+                Ok((src, dst, kind, provenance))
             })
             .context("executing all_edges query")?;
         let mut out = Vec::new();
@@ -286,6 +290,26 @@ impl SqliteStore {
             .context("writing meta key")?;
         Ok(())
     }
+
+    /// Persist an edge with LSIF (semantic) provenance.
+    ///
+    /// LSIF always wins: if an identical (src, dst, kind) row already exists
+    /// with `provenance='tree-sitter'`, it is upgraded to `'lsif'`. This
+    /// implements the LSIF-beats-tree-sitter precedence policy (ADR-002).
+    pub fn put_edge_lsif(&mut self, edge: &Edge) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO edges(src, dst, kind, provenance) VALUES(?1, ?2, ?3, 'lsif')
+                 ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'lsif'",
+                params![
+                    node_id_to_i64(edge.src),
+                    node_id_to_i64(edge.dst),
+                    edge.kind.as_str(),
+                ],
+            )
+            .context("inserting lsif edge")?;
+        Ok(())
+    }
 }
 
 impl Store for SqliteStore {
@@ -311,16 +335,20 @@ impl Store for SqliteStore {
     }
 
     fn put_edge(&mut self, edge: &Edge) -> Result<()> {
+        // Tree-sitter edges use DO NOTHING on conflict: they must never demote
+        // an existing 'lsif' row (ADR-002). DO NOTHING is equivalent to the
+        // verbose CASE expression but is explicit about intent.
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?1, ?2, ?3)",
+                "INSERT INTO edges(src, dst, kind, provenance) VALUES(?1, ?2, ?3, 'tree-sitter')
+                 ON CONFLICT(src, dst, kind) DO NOTHING",
                 params![
                     node_id_to_i64(edge.src),
                     node_id_to_i64(edge.dst),
                     edge.kind.as_str(),
                 ],
             )
-            .context("inserting edge")?;
+            .context("inserting tree-sitter edge")?;
         Ok(())
     }
 
@@ -497,6 +525,52 @@ mod tests {
         Node::new(VName::new("", "", path, "typescript", sig), "function")
     }
 
+    // Critical: an existing v1 database (no provenance column) must gain the
+    // column with DEFAULT 'tree-sitter' when opened by the v2 code, and all
+    // pre-existing edges must read back with provenance='tree-sitter'.
+    #[test]
+    fn v1_to_v2_migration_adds_provenance_with_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v1.db");
+
+        // Simulate a v1 DB: create schema manually without the provenance column.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES('schema_version', '1');
+                 CREATE TABLE nodes (
+                   id INTEGER PRIMARY KEY, corpus TEXT NOT NULL, root TEXT NOT NULL,
+                   path TEXT NOT NULL, language TEXT NOT NULL,
+                   signature TEXT NOT NULL, kind TEXT NOT NULL
+                 );
+                 CREATE TABLE edges (
+                   src INTEGER NOT NULL, dst INTEGER NOT NULL, kind TEXT NOT NULL,
+                   PRIMARY KEY (src, dst, kind)
+                 );
+                 CREATE TABLE files (
+                   path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                   last_indexed_at INTEGER NOT NULL
+                 );
+                 INSERT INTO nodes VALUES(1,'','','a.ts','typescript','fn:a','function');
+                 INSERT INTO nodes VALUES(2,'','','b.ts','typescript','fn:b','function');
+                 INSERT INTO edges VALUES(1, 2, 'ref-call');",
+            )
+            .unwrap();
+        }
+
+        // Open with the v2 store — migration must succeed.
+        let store = SqliteStore::open(&db_path).expect("v1→v2 migration must succeed");
+
+        // Pre-existing edge must have provenance='tree-sitter' (the column DEFAULT).
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges.len(), 1, "pre-existing edge must survive migration");
+        assert_eq!(
+            edges[0].3, "tree-sitter",
+            "migrated edge must default to tree-sitter provenance"
+        );
+    }
+
     #[test]
     fn file_hash_round_trips() {
         let mut store = SqliteStore::open_in_memory().unwrap();
@@ -565,6 +639,76 @@ mod tests {
         assert_eq!(store.get_meta("foo").unwrap(), Some("bar".to_string()));
         store.set_meta("foo", "baz").unwrap();
         assert_eq!(store.get_meta("foo").unwrap(), Some("baz".to_string()));
+    }
+
+    #[test]
+    fn lsif_provenance_wins_over_tree_sitter() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+
+        // Tree-sitter inserts first
+        store.put_edge(&edge).unwrap();
+        // LSIF inserts same edge — must win
+        store.put_edge_lsif(&edge).unwrap();
+
+        assert_eq!(store.edge_count().unwrap(), 1, "must be exactly one row");
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges[0].3, "lsif", "provenance must be upgraded to lsif");
+    }
+
+    #[test]
+    fn tree_sitter_cannot_demote_lsif_provenance() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+
+        // LSIF inserts first
+        store.put_edge_lsif(&edge).unwrap();
+        // Tree-sitter tries to insert same edge — must NOT demote
+        store.put_edge(&edge).unwrap();
+
+        let edges = store.all_edges().unwrap();
+        assert_eq!(
+            edges[0].3, "lsif",
+            "tree-sitter must not demote lsif provenance"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_only_edge_has_tree_sitter_provenance() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge(&Edge::new(a.id, b.id, EdgeKind::Depends))
+            .unwrap();
+
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges[0].3, "tree-sitter");
+    }
+
+    #[test]
+    fn lsif_only_edge_has_lsif_provenance() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge_lsif(&Edge::new(a.id, b.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges[0].3, "lsif");
     }
 
     #[test]

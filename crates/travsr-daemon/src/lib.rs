@@ -217,7 +217,7 @@ fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
     };
 
     for edge in &lsif_out.edges {
-        if let Err(e) = store.put_edge(edge) {
+        if let Err(e) = store.put_edge_lsif(edge) {
             tracing::warn!("lsif edge write error: {e}");
         }
     }
