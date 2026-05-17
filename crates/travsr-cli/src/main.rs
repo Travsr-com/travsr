@@ -36,6 +36,9 @@ enum Command {
         /// Use stdio transport (for local IDE / agent integration).
         #[arg(long)]
         stdio: bool,
+        /// Path to a specific graph.db file. Overrides automatic discovery from cwd.
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
     },
     /// Print index and graph status.
     Status,
@@ -132,10 +135,14 @@ async fn run() -> Result<()> {
                 tracing::info!("travsr daemon {:?}: stub — Sprint 3", action);
             }
         },
-        Command::Mcp { stdio: _ } => {
-            let cwd = std::env::current_dir()?;
-            let repo_root = repo::find_git_root(&cwd)?;
-            let db_path = repo_root.join(".travsr/graph.db");
+        Command::Mcp { stdio: _, db } => {
+            let db_path = if let Some(p) = db {
+                p
+            } else {
+                let cwd = std::env::current_dir()?;
+                let repo_root = repo::find_git_root(&cwd)?;
+                repo_root.join(".travsr/graph.db")
+            };
             if !db_path.exists() {
                 anyhow::bail!("not initialized — run `travsr init` first");
             }
