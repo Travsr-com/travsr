@@ -6,6 +6,21 @@ use tree_sitter::{Parser, Query, QueryCursor};
 use crate::emit;
 use crate::ParseOutput;
 
+/// Reject files larger than this before reading them into memory.
+/// Prevents parse-bomb / OOM from crafted or generated multi-GB sources.
+const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+
+/// Kill the Tree-sitter parse if it hasn't finished within this window.
+/// A deeply-nested AST can take unexpectedly long; 5 s is generous for any
+/// real source file and keeps `git commit` responsive.
+const PARSE_TIMEOUT_MICROS: u64 = 5_000_000; // 5 seconds
+
+// Compile-time sanity check: timeout must be in [1 s, 30 s].
+const _: () = {
+    assert!(PARSE_TIMEOUT_MICROS >= 1_000_000);
+    assert!(PARSE_TIMEOUT_MICROS <= 30_000_000);
+};
+
 // One combined query covers all definition and import patterns we care about in Sprint 1.
 // Sprint 2 will extend this with LSIF-derived call/ref edges.
 const QUERIES: &str = r"
@@ -20,6 +35,18 @@ const QUERIES: &str = r"
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
 /// VName path (repo-relative, forward-slash — fixes DEBT-012).
 pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
+    let file_size = std::fs::metadata(abs_path)
+        .with_context(|| format!("stat {}", abs_path.display()))?
+        .len();
+    if file_size > MAX_FILE_BYTES {
+        anyhow::bail!(
+            "skipping {}: file is too large ({} bytes > {} byte limit)",
+            abs_path.display(),
+            file_size,
+            MAX_FILE_BYTES
+        );
+    }
+
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
@@ -42,11 +69,21 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
     parser
         .set_language(&language)
         .context("loading TypeScript grammar")?;
+    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
-    // A parse failure (None) is not an I/O error; still emit the file node.
+    // tree-sitter returns None only on timeout/cancellation, not on bad syntax
+    // (it always recovers from parse errors and returns a tree). None here means
+    // PARSE_TIMEOUT_MICROS fired — warn so operators know symbols were dropped.
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
-        None => return Ok(output),
+        None => {
+            tracing::warn!(
+                "parse timed out for {} after {}s — emitting file node only",
+                abs_path.display(),
+                PARSE_TIMEOUT_MICROS / 1_000_000
+            );
+            return Ok(output);
+        }
     };
 
     let query = Query::new(&language, QUERIES).context("compiling tree-sitter query")?;
@@ -128,5 +165,74 @@ fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<
             Some(p) => current = p,
             None => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_file_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.ts");
+        let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, &big).unwrap();
+
+        let result = parse(&path, "big.ts");
+        assert!(result.is_err(), "oversized file must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("too large"),
+            "error must mention 'too large': {msg}"
+        );
+    }
+
+    // Boundary: a file exactly at the limit must be accepted, not rejected.
+    #[test]
+    fn file_at_exact_limit_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.ts");
+        let content = vec![b' '; MAX_FILE_BYTES as usize];
+        std::fs::write(&path, &content).unwrap();
+
+        let result = parse(&path, "boundary.ts");
+        // Must not return the "too large" error — parse may return Ok or a
+        // parse error (all-spaces is not valid TS), but never the size error.
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("too large"),
+                "file at exact limit must not be rejected: {e}"
+            );
+        }
+    }
+
+    // Error message must include the file path so operators know which file triggered it.
+    #[test]
+    fn oversized_error_message_contains_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("giant.ts");
+        let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, &big).unwrap();
+
+        let err = parse(&path, "giant.ts").unwrap_err().to_string();
+        assert!(
+            err.contains("giant.ts"),
+            "error message must include the file path: {err}"
+        );
+    }
+
+    // A normal-sized valid .ts file must still parse correctly after the size gate.
+    #[test]
+    fn normal_file_still_parses_after_size_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.ts");
+        std::fs::write(&path, "export class AuthService { login() {} }").unwrap();
+
+        let output = parse(&path, "svc.ts").expect("normal file must parse without error");
+        assert!(
+            output.nodes.iter().any(|n| n.kind == "class"),
+            "class node must be emitted for AuthService"
+        );
     }
 }
