@@ -1,0 +1,24 @@
+{
+  "name": "travsr-lsif-ts",
+  "version": "0.1.0",
+  "description": "TypeScript LSIF emitter for Travsr code intelligence — semantic edges via the TS compiler API",
+  "main": "dist/index.js",
+  "bin": {
+    "travsr-lsif-ts": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/test/integration.test.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "typescript": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}
