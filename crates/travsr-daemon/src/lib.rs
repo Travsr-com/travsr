@@ -71,10 +71,12 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
                 continue;
             }
         };
-        let p = entry.into_path();
-        if !p.is_file() {
+        // Use entry.file_type() before into_path() — it does NOT follow symlinks,
+        // so symlinks pointing at .ts files are excluded. p.is_file() would follow them.
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
+        let p = entry.into_path();
         let ext = p.extension().and_then(|e| e.to_str());
         if matches!(ext, Some("ts" | "tsx")) {
             ts_paths.push(p);
@@ -367,13 +369,10 @@ mod tests {
         );
     }
 
-    // BUG-EXPOSURE (SEC-005): p.is_file() follows symlinks, so a symlink pointing
-    // directly at a .ts file bypasses follow_links(false) and the target is indexed.
-    // This test documents the gap — it is expected to FAIL until the walker loop
-    // uses entry.file_type().is_some_and(|t| t.is_file()) instead of p.is_file().
+    // SEC-006: entry.file_type() (no symlink follow) must exclude a symlink that
+    // points directly at a .ts file outside the repo.
     #[cfg(unix)]
     #[test]
-    #[ignore = "known bug: p.is_file() follows symlinks to files — fix walker to use entry.file_type()"]
     fn symlink_to_ts_file_is_not_indexed() {
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
