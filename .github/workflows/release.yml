@@ -78,7 +78,7 @@ jobs:
           shasum -a 256 "dist/${STAGE}.tar.gz" > "dist/${STAGE}.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: travsr-${{ github.ref_name }}-${{ matrix.artifact }}
           path: dist/
