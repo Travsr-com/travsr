@@ -15,7 +15,6 @@
     "typescript": "^5.4.0"
   },
   "devDependencies": {
-    "lsif-protocol": "^0.5.3",
     "@types/node": "^20.0.0"
   },
   "engines": {

@@ -106,8 +106,8 @@ export class Emitter {
   }
 
   /** Multi-target contains edge (project→documents, document→ranges). */
-  emitContains(outV: number, inVs: number[]): number {
-    if (inVs.length === 0) return 0;
+  emitContains(outV: number, inVs: number[]): number | undefined {
+    if (inVs.length === 0) return undefined;
     const id = this.nextId();
     return this.emit({ id, type: 'edge', label: 'contains', outV, inVs });
   }
@@ -116,8 +116,8 @@ export class Emitter {
    * Item edge linking a result vertex to the ranges it contains.
    * property is "definitions", "references", or "implementationResults".
    */
-  emitItem(outV: number, inVs: number[], document: number, property: string): number {
-    if (inVs.length === 0) return 0;
+  emitItem(outV: number, inVs: number[], document: number, property: string): number | undefined {
+    if (inVs.length === 0) return undefined;
     const id = this.nextId();
     return this.emit({ id, type: 'edge', label: 'item', outV, inVs, document, property });
   }

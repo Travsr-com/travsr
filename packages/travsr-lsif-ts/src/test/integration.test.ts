@@ -94,13 +94,38 @@ test('dump contains at least 10 document vertices (one per fixture file)', () =>
   assert.ok(docs.length >= 10, `expected ≥10 document vertices, got ${docs.length}`);
 });
 
+test('dump contains item/references edges for method overrides (Overrides)', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+
+  // Overrides are emitted as `item` edges with property `references` that link
+  // an overriding method range to the base class method's referenceResult.
+  // AuthService.initialize and AuthService.getName both shadow BaseService methods.
+  const edges = parseEdges(result.stdout);
+  const overrideItems = edges.filter(
+    (e) => e['label'] === 'item' && e['property'] === 'references'
+  );
+  assert.ok(
+    overrideItems.length > 0,
+    'no item/references edges found — override ranges may be missing'
+  );
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-function parseVertices(stdout: string): Record<string, unknown>[] {
+function parseAll(stdout: string): Record<string, unknown>[] {
   return stdout
     .trim()
     .split('\n')
     .filter(Boolean)
-    .map((l) => JSON.parse(l) as Record<string, unknown>)
-    .filter((o) => o['type'] === 'vertex');
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+function parseVertices(stdout: string): Record<string, unknown>[] {
+  return parseAll(stdout).filter((o) => o['type'] === 'vertex');
+}
+
+function parseEdges(stdout: string): Record<string, unknown>[] {
+  return parseAll(stdout).filter((o) => o['type'] === 'edge');
 }
