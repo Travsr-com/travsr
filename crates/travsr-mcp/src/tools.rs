@@ -43,9 +43,22 @@ pub fn get_dependencies(store: &SqliteStore, file: &str) -> String {
     lines.join("\n")
 }
 
-/// Return all nodes that have an incoming edge to the given symbol.
+/// Return all nodes that have an incoming edge to the given symbol, tagged
+/// by provenance so both semantic and structural callers are visible.
+///
+/// Output format:
+///   `[call] fn:bar (function) — src/bar.ts`   ← LSIF RefCall (true call site)
+///   `[structural] class:Foo (class) — src/foo.ts` ← Tree-sitter DefinesBinding
+///
+/// Both sets are always returned when present. Tagging allows the LLM to
+/// distinguish a true caller from a structural parent (e.g. class→method),
+/// and avoids the all-or-nothing footgun where one RefCall would hide all
+/// DefinesBinding callers. The precedence policy in #47 will refine this further.
+///
 /// Empty string when nothing is found.
 pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
+    use travsr_core::EdgeKind;
+
     let nodes = match store.search_nodes_by_name(symbol) {
         Ok(n) => n,
         Err(e) => {
@@ -68,14 +81,21 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
     };
 
     let mut lines: Vec<String> = Vec::new();
+
     for edge in &edges {
+        let tag = match edge.kind {
+            EdgeKind::RefCall => "[call]",
+            EdgeKind::DefinesBinding => "[structural]",
+            _ => continue,
+        };
         if let Ok(Some(src_node)) = store.get_node(edge.src) {
             lines.push(format!(
-                "{} ({}) — {}",
+                "{tag} {} ({}) — {}",
                 src_node.vname.signature, src_node.kind, src_node.vname.path
             ));
         }
     }
+
     lines.join("\n")
 }
 

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
-use travsr_indexer::{hash_file, Indexer};
+use travsr_indexer::{hash_file, ingest_lsif, run_lsif_emitter, Indexer};
 use travsr_store::{SqliteStore, Store};
 
 pub use hook::install_hook;
@@ -88,6 +88,10 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     }
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
+
+    // LSIF semantic pass — adds RefCall edges on top of structural edges.
+    // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
+    run_lsif_pass(repo_root, &mut store);
 
     Ok(InitStats {
         files_indexed,
@@ -166,7 +170,55 @@ pub fn reindex_files(
         let _ = store.set_meta("last_commit", &sha);
     }
 
+    // LSIF semantic pass — only when at least one TypeScript file was in the
+    // delta. This avoids a whole-project TS compile on every commit that only
+    // touches Rust/config files. Full file-level delta is DEBT(travsr-25).
+    let any_ts = paths
+        .iter()
+        .any(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("ts" | "tsx")));
+    if any_ts {
+        run_lsif_pass(repo_root, store);
+    }
+
     Ok(())
+}
+
+/// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root.
+///
+/// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
+/// warnings and silently skipped — they must never fail the overall index.
+fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
+    let tsconfig = repo_root.join("tsconfig.json");
+    if !tsconfig.exists() {
+        return;
+    }
+
+    let dump = match run_lsif_emitter(&tsconfig) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("lsif emitter skipped: {e}");
+            return;
+        }
+    };
+
+    let lsif_out = match ingest_lsif(&dump) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("lsif ingest error: {e}");
+            return;
+        }
+    };
+
+    for edge in &lsif_out.edges {
+        if let Err(e) = store.put_edge(edge) {
+            tracing::warn!("lsif edge write error: {e}");
+        }
+    }
+
+    tracing::debug!(
+        "lsif pass: {} RefCall edges persisted",
+        lsif_out.edges.len()
+    );
 }
 
 fn hex_encode(bytes: &[u8; 32]) -> String {
