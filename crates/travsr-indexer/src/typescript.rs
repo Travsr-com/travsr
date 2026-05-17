@@ -15,6 +15,12 @@ const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 /// real source file and keeps `git commit` responsive.
 const PARSE_TIMEOUT_MICROS: u64 = 5_000_000; // 5 seconds
 
+// Compile-time sanity check: timeout must be in [1 s, 30 s].
+const _: () = {
+    assert!(PARSE_TIMEOUT_MICROS >= 1_000_000);
+    assert!(PARSE_TIMEOUT_MICROS <= 30_000_000);
+};
+
 // One combined query covers all definition and import patterns we care about in Sprint 1.
 // Sprint 2 will extend this with LSIF-derived call/ref edges.
 const QUERIES: &str = r"
@@ -135,6 +141,24 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
     Ok(output)
 }
 
+fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut current = node.parent()?;
+    loop {
+        if matches!(current.kind(), "class_declaration" | "class") {
+            let name = (0..current.child_count())
+                .filter_map(|i| current.child(i))
+                .find(|child| child.kind() == "type_identifier")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(str::to_string);
+            return name;
+        }
+        match current.parent() {
+            Some(p) => current = p,
+            None => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,7 +173,10 @@ mod tests {
         let result = parse(&path, "big.ts");
         assert!(result.is_err(), "oversized file must return Err");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("too large"), "error must mention 'too large': {msg}");
+        assert!(
+            msg.contains("too large"),
+            "error must mention 'too large': {msg}"
+        );
     }
 
     // Boundary: a file exactly at the limit must be accepted, not rejected.
@@ -157,7 +184,6 @@ mod tests {
     fn file_at_exact_limit_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("boundary.ts");
-        // Exactly MAX_FILE_BYTES — should not be rejected.
         let content = vec![b' '; MAX_FILE_BYTES as usize];
         std::fs::write(&path, &content).unwrap();
 
@@ -187,24 +213,6 @@ mod tests {
         );
     }
 
-    // The timeout constant must be set to a sane non-zero value.
-    #[test]
-    fn parse_timeout_constant_is_nonzero() {
-        assert!(
-            PARSE_TIMEOUT_MICROS > 0,
-            "PARSE_TIMEOUT_MICROS must be non-zero"
-        );
-        // Sanity range: at least 1 s and at most 30 s.
-        assert!(
-            PARSE_TIMEOUT_MICROS >= 1_000_000,
-            "timeout should be >= 1 s, got {PARSE_TIMEOUT_MICROS} µs"
-        );
-        assert!(
-            PARSE_TIMEOUT_MICROS <= 30_000_000,
-            "timeout should be <= 30 s, got {PARSE_TIMEOUT_MICROS} µs"
-        );
-    }
-
     // A normal-sized valid .ts file must still parse correctly after the size gate.
     #[test]
     fn normal_file_still_parses_after_size_gate() {
@@ -217,23 +225,5 @@ mod tests {
             output.nodes.iter().any(|n| n.kind == "class"),
             "class node must be emitted for AuthService"
         );
-    }
-}
-
-fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    let mut current = node.parent()?;
-    loop {
-        if matches!(current.kind(), "class_declaration" | "class") {
-            let name = (0..current.child_count())
-                .filter_map(|i| current.child(i))
-                .find(|child| child.kind() == "type_identifier")
-                .and_then(|n| n.utf8_text(source).ok())
-                .map(str::to_string);
-            return name;
-        }
-        match current.parent() {
-            Some(p) => current = p,
-            None => return None,
-        }
     }
 }

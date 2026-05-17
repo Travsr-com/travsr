@@ -346,7 +346,10 @@ mod tests {
 
         // Must not return Err — skipping is a warning, not a fatal error.
         let result = init_repo(tmp.path());
-        assert!(result.is_ok(), "init_repo must succeed even with an oversized file: {result:?}");
+        assert!(
+            result.is_ok(),
+            "init_repo must succeed even with an oversized file: {result:?}"
+        );
     }
 
     // Valid files must still be indexed alongside an oversized file.
