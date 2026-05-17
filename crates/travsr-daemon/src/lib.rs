@@ -83,6 +83,10 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         }
     }
 
+    // DEBT(travsr-73): files_indexed counts every path handed to reindex_files,
+    // including files skipped due to size or parse errors. The user-visible
+    // "indexed N files" message is therefore optimistic. Fix by returning a
+    // per-file success/skip result from reindex_files.
     for abs_path in &ts_paths {
         let edges_before = store.edge_count().unwrap_or(0);
         reindex_files(std::slice::from_ref(abs_path), repo_root, &mut store)?;
@@ -391,7 +395,7 @@ mod tests {
         let stats = init_repo(tmp.path()).unwrap();
         assert_eq!(
             stats.files_indexed, 0,
-            "symlink to a .ts file must not be indexed (p.is_file() bug)"
+            "symlink to a .ts file must not be indexed"
         );
     }
 

@@ -12,6 +12,7 @@ rust-version.workspace = true
 travsr-core = { path = "../travsr-core" }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 sha2 = { workspace = true }

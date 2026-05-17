@@ -71,10 +71,19 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
         .context("loading TypeScript grammar")?;
     parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
-    // A parse failure (None) is not an I/O error; still emit the file node.
+    // tree-sitter returns None only on timeout/cancellation, not on bad syntax
+    // (it always recovers from parse errors and returns a tree). None here means
+    // PARSE_TIMEOUT_MICROS fired — warn so operators know symbols were dropped.
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
-        None => return Ok(output),
+        None => {
+            tracing::warn!(
+                "parse timed out for {} after {}s — emitting file node only",
+                abs_path.display(),
+                PARSE_TIMEOUT_MICROS / 1_000_000
+            );
+            return Ok(output);
+        }
     };
 
     let query = Query::new(&language, QUERIES).context("compiling tree-sitter query")?;
