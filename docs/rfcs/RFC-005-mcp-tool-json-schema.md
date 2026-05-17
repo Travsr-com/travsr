@@ -1,4 +1,4 @@
-# RFC-002: MCP Tool JSON Schema Contracts
+# RFC-005: MCP Tool JSON Schema Contracts
 
 **Status:** Accepted
 **Author:** Travsr Engineering

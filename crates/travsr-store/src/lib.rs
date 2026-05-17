@@ -290,9 +290,7 @@ impl SqliteStore {
             .context("writing meta key")?;
         Ok(())
     }
-}
 
-impl SqliteStore {
     /// Persist an edge with LSIF (semantic) provenance.
     ///
     /// LSIF always wins: if an identical (src, dst, kind) row already exists
@@ -337,16 +335,13 @@ impl Store for SqliteStore {
     }
 
     fn put_edge(&mut self, edge: &Edge) -> Result<()> {
-        // Tree-sitter edges default to 'tree-sitter' provenance and cannot
-        // demote an existing 'lsif' edge. Use put_edge_lsif for semantic edges.
+        // Tree-sitter edges use DO NOTHING on conflict: they must never demote
+        // an existing 'lsif' row (ADR-002). DO NOTHING is equivalent to the
+        // verbose CASE expression but is explicit about intent.
         self.conn
             .execute(
                 "INSERT INTO edges(src, dst, kind, provenance) VALUES(?1, ?2, ?3, 'tree-sitter')
-                 ON CONFLICT(src, dst, kind) DO UPDATE SET
-                   provenance = CASE
-                     WHEN edges.provenance = 'lsif' THEN 'lsif'
-                     ELSE edges.provenance
-                   END",
+                 ON CONFLICT(src, dst, kind) DO NOTHING",
                 params![
                     node_id_to_i64(edge.src),
                     node_id_to_i64(edge.dst),

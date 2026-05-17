@@ -380,6 +380,9 @@ fn collect_graph(
                 Direction::Callers => (next_id, current_id),
                 _ => (current_id, next_id),
             };
+            // DEBT(travsr-75): iter_edges_from/to do not return provenance, so
+            // BFS-traversed edges always show "tree-sitter" in JSON output even
+            // when the DB row is "lsif". Only --all mode (all_edges) is correct.
             edge_list.push((src, dst, edge_kind, "tree-sitter".to_string()));
 
             if !visited.contains(&next_id) {
