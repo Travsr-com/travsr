@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+travsr-core = { path = "../travsr-core" }
 travsr-retrieval = { path = "../travsr-retrieval" }
 travsr-store = { path = "../travsr-store" }
 serde = { workspace = true }

@@ -178,24 +178,21 @@ pub fn ingest_raw(dump: &str) -> anyhow::Result<Vec<Edge>> {
             None => continue,
         };
 
-        // Skip call sites in the same file as the definition — a file calling
-        // its own functions produces no useful cross-file graph edge.
-        if caller_path == &callee_vname.path {
-            continue;
-        }
-
         // Caller = the file node at the call site (file-level precision for Sprint 4).
         // DEBT(travsr-25): upgrade to method-level caller once containment tracking lands.
         let caller_id = VName::new("", "", caller_path.as_str(), "typescript", "file").id();
         let callee_id = callee_vname.id();
 
+        // Intra-file edges (caller_path == callee_vname.path) are intentionally
+        // retained: they become meaningful for blast-radius once caller precision
+        // upgrades from FILE to METHOD in a follow-on sprint.
+
+        // DEBT(travsr-25/29/30): call-site count is not preserved — the store's
+        // INSERT OR IGNORE deduplicates multiple calls from the same file to the
+        // same symbol. Edge weights for PPR/blast-radius ranking require an
+        // `Edge.weight` field or a side table; tracked in issues #29 and #30.
         edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
     }
-
-    // Deduplicate: same caller-file → callee-symbol may appear many times if
-    // a file has multiple call sites to the same function.
-    edges.sort_by_key(|e| (e.src.0, e.dst.0));
-    edges.dedup_by_key(|e| (e.src.0, e.dst.0));
 
     Ok(edges)
 }
@@ -263,9 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn ingest_raw_deduplicates_same_caller_callee() {
-        // Two item edges pointing to the same ref range (duplicate call sites
-        // in the same file to the same function) must produce one edge.
+    fn ingest_raw_emits_one_edge_per_item_reference() {
+        // Two item/references edges for the same (caller, callee) pair produce
+        // two edges from ingest_raw — deduplication is handled by the store's
+        // INSERT OR IGNORE. This preserves the raw call-site count for future
+        // PPR weight tracking (DEBT travsr-25/29).
         let dump = r#"
 {"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo","positionEncoding":"utf-16","toolInfo":{"name":"t","version":"0"}}
 {"id":2,"type":"vertex","label":"document","uri":"file:///repo/a.ts"}
@@ -276,16 +275,19 @@ mod tests {
 {"id":7,"type":"edge","label":"item","outV":4,"inVs":[11],"document":2,"property":"references"}
 "#;
         let edges = ingest_raw(dump).unwrap();
-        assert_eq!(edges.len(), 1, "duplicate caller→callee must be deduped");
+        assert_eq!(edges.len(), 2, "two item edges → two raw RefCall edges");
+        assert!(edges.iter().all(|e| e.kind == EdgeKind::RefCall));
     }
 
     #[test]
-    fn ingest_raw_skips_same_file_self_edges() {
-        // A call site in the same file as the definition must not produce a
-        // self-referential RefCall edge.
+    fn ingest_raw_keeps_intra_file_edges() {
+        // Intra-file edges (caller file == callee definition file) are retained:
+        // they become meaningful for blast-radius once caller precision upgrades
+        // from FILE to METHOD level in a follow-on sprint.
         let dump = minimal_dump("same.ts", "fn:bar", "same.ts");
         let edges = ingest_raw(&dump).unwrap();
-        assert_eq!(edges.len(), 0, "same-file edge must be dropped");
+        assert_eq!(edges.len(), 1, "intra-file RefCall edge must be kept");
+        assert_eq!(edges[0].kind, EdgeKind::RefCall);
     }
 
     #[test]

@@ -170,9 +170,15 @@ pub fn reindex_files(
         let _ = store.set_meta("last_commit", &sha);
     }
 
-    // LSIF semantic pass after every incremental reindex.
-    // DEBT(travsr-25): re-emits the whole project; file-level delta is Phase 3.
-    run_lsif_pass(repo_root, store);
+    // LSIF semantic pass — only when at least one TypeScript file was in the
+    // delta. This avoids a whole-project TS compile on every commit that only
+    // touches Rust/config files. Full file-level delta is DEBT(travsr-25).
+    let any_ts = paths
+        .iter()
+        .any(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("ts" | "tsx")));
+    if any_ts {
+        run_lsif_pass(repo_root, store);
+    }
 
     Ok(())
 }

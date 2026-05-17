@@ -5,21 +5,34 @@
 //! installed, the function returns `Err` and callers are expected to log a
 //! warning and skip LSIF ingestion — never to fail the overall index.
 
+use std::io::Read as _;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
+/// Hard ceiling for how long the TS compiler may run before we kill it.
+/// Prevents a hung or looping `travsr-lsif-ts` from blocking `git commit`.
+const TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Run `travsr-lsif-ts --project <tsconfig>` and return the LSIF dump.
+///
+/// The subprocess is killed and an error is returned if it does not complete
+/// within 60 seconds — guarding against infinite loops in `tsconfig.extends`
+/// chains or a stalled TS language service.
 ///
 /// # Errors
 /// - `travsr-lsif-ts` not found on PATH (user must `npm install -g travsr-lsif-ts`)
 /// - Non-zero exit code from the emitter (stderr forwarded as context)
+/// - Process exceeds the 60s timeout
 /// - Stdout is not valid UTF-8
 pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
-    let output = std::process::Command::new("travsr-lsif-ts")
+    let mut child = std::process::Command::new("travsr-lsif-ts")
         .arg("--project")
         .arg(tsconfig)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| {
             format!(
                 "could not run travsr-lsif-ts for {} \
@@ -28,12 +41,36 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
             )
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("travsr-lsif-ts exited with {}: {stderr}", output.status);
+    let deadline = Instant::now() + TIMEOUT;
+
+    let status = loop {
+        match child.try_wait().context("polling travsr-lsif-ts")? {
+            Some(s) => break s,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                anyhow::bail!(
+                    "travsr-lsif-ts timed out after {}s — killed",
+                    TIMEOUT.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
     }
 
-    String::from_utf8(output.stdout).context("travsr-lsif-ts stdout is not valid UTF-8")
+    if !status.success() {
+        anyhow::bail!("travsr-lsif-ts exited with {status}: {stderr}");
+    }
+
+    Ok(stdout)
 }
 
 #[cfg(test)]
