@@ -6,7 +6,10 @@ use travsr_store::{SqliteStore, Store};
 
 use crate::repo::find_git_root;
 
-type GraphData = (HashMap<NodeId, (Node, u8)>, Vec<(NodeId, NodeId, String)>);
+type GraphData = (
+    HashMap<NodeId, (Node, u8)>,
+    Vec<(NodeId, NodeId, String, String)>,
+);
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Direction {
@@ -132,7 +135,7 @@ fn print_dot(
 
 fn print_dot_from_map(
     nodes_map: &HashMap<NodeId, (Node, u8)>,
-    raw_edges: &[(NodeId, NodeId, String)],
+    raw_edges: &[(NodeId, NodeId, String, String)],
 ) -> anyhow::Result<()> {
     // Resolve import nodes to the file node they reference.
     let mut import_redirect: HashMap<NodeId, NodeId> = HashMap::new();
@@ -168,7 +171,7 @@ fn print_dot_from_map(
     // Rewrite edges through the redirect table; drop self-loops and duplicates.
     let mut seen: HashSet<(NodeId, NodeId, String)> = HashSet::new();
     let mut edges: Vec<(NodeId, NodeId, String)> = Vec::new();
-    for (src, dst, kind) in raw_edges {
+    for (src, dst, kind, _provenance) in raw_edges {
         let s = import_redirect.get(src).copied().unwrap_or(*src);
         let d = import_redirect.get(dst).copied().unwrap_or(*dst);
         if s == d {
@@ -267,13 +270,13 @@ fn print_json(
     store: &SqliteStore,
     seed: Option<&Node>,
     nodes_map: &HashMap<NodeId, (Node, u8)>,
-    edges: &[(NodeId, NodeId, String)],
+    edges: &[(NodeId, NodeId, String, String)],
 ) -> anyhow::Result<()> {
     let mut sig_lookup: HashMap<NodeId, String> = nodes_map
         .iter()
         .map(|(id, (node, _))| (*id, node.vname.signature.clone()))
         .collect();
-    for (src_id, dst_id, _) in edges {
+    for (src_id, dst_id, _, _) in edges {
         for &nid in &[*src_id, *dst_id] {
             if let std::collections::hash_map::Entry::Vacant(e) = sig_lookup.entry(nid) {
                 if let Some(node) = store.get_node(nid)? {
@@ -314,10 +317,10 @@ fn print_json(
 
     let edge_entries: Vec<serde_json::Value> = edges
         .iter()
-        .filter_map(|(src_id, dst_id, kind)| {
+        .filter_map(|(src_id, dst_id, kind, provenance)| {
             let from = sig_lookup.get(src_id)?;
             let to = sig_lookup.get(dst_id)?;
-            Some(serde_json::json!({ "from": from, "to": to, "kind": kind }))
+            Some(serde_json::json!({ "from": from, "to": to, "kind": kind, "provenance": provenance }))
         })
         .collect();
 
@@ -356,7 +359,7 @@ fn collect_graph(
     direction: Direction,
 ) -> anyhow::Result<GraphData> {
     let mut nodes_map: HashMap<NodeId, (Node, u8)> = HashMap::new();
-    let mut edge_list: Vec<(NodeId, NodeId, String)> = Vec::new();
+    let mut edge_list: Vec<(NodeId, NodeId, String, String)> = Vec::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
 
@@ -377,7 +380,7 @@ fn collect_graph(
                 Direction::Callers => (next_id, current_id),
                 _ => (current_id, next_id),
             };
-            edge_list.push((src, dst, edge_kind));
+            edge_list.push((src, dst, edge_kind, "tree-sitter".to_string()));
 
             if !visited.contains(&next_id) {
                 visited.insert(next_id);

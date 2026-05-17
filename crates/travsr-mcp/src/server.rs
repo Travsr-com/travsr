@@ -100,6 +100,9 @@ fn handle_tool_call(
             let symbol = args["symbol"].as_str().unwrap_or("");
             tools::get_callers(store, symbol)
         }
+        "get_blast_radius" | "search_symbol" | "get_repo_map" => {
+            "not yet implemented — planned for Phase 3".to_string()
+        }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -113,6 +116,7 @@ fn handle_tool_call(
 
 fn tools_list() -> serde_json::Value {
     serde_json::json!({
+        "_schemaVersion": "1.0.0",
         "tools": [
             {
                 "name": "get_dependencies",
@@ -120,12 +124,10 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": {
-                            "type": "string",
-                            "description": "File path to look up dependencies for"
-                        }
+                        "file": { "type": "string", "description": "Repo-relative file path to look up dependencies for" }
                     },
-                    "required": ["file"]
+                    "required": ["file"],
+                    "additionalProperties": false
                 }
             },
             {
@@ -134,12 +136,43 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Symbol name to find callers of"
-                        }
+                        "symbol": { "type": "string", "description": "Symbol name to find callers of (partial match supported)" }
                     },
-                    "required": ["symbol"]
+                    "required": ["symbol"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_blast_radius",
+                "description": "Return the set of files transitively affected if the given file changes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" }
+                    },
+                    "required": ["file"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "search_symbol",
+                "description": "Find symbol definitions matching a name across the indexed graph.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Symbol name to search for (partial match supported)" }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_repo_map",
+                "description": "Return a structural overview of the indexed repository.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
                 }
             }
         ]
@@ -249,6 +282,9 @@ fn handle_tool_call_global(
         "get_callers" => {
             tools::get_callers_global(repos, args["symbol"].as_str().unwrap_or(""), repo_arg)
         }
+        "get_blast_radius" | "search_symbol" | "get_repo_map" => {
+            "not yet implemented — planned for Phase 3".to_string()
+        }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
@@ -260,6 +296,7 @@ fn handle_tool_call_global(
 
 fn tools_list_global() -> serde_json::Value {
     serde_json::json!({
+        "_schemaVersion": "1.0.0",
         "tools": [
             {
                 "name": "get_dependencies",
@@ -267,10 +304,11 @@ fn tools_list_global() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "File path to look up" },
+                        "file": { "type": "string", "description": "Repo-relative file path to look up" },
                         "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
                     },
-                    "required": ["file"]
+                    "required": ["file"],
+                    "additionalProperties": false
                 }
             },
             {
@@ -279,12 +317,166 @@ fn tools_list_global() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": { "type": "string", "description": "Symbol name to find callers of" },
+                        "symbol": { "type": "string", "description": "Symbol name to find callers of (partial match supported)" },
                         "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
                     },
-                    "required": ["symbol"]
+                    "required": ["symbol"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_blast_radius",
+                "description": "Return the set of files transitively affected if the given file changes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["file"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "search_symbol",
+                "description": "Find symbol definitions matching a name across the indexed graph.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Symbol name to search for (partial match supported)" },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_repo_map",
+                "description": "Return a structural overview of the indexed repository.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Uses current repo if omitted." }
+                    },
+                    "additionalProperties": false
                 }
             }
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_TOOLS: &[&str] = &[
+        "get_dependencies",
+        "get_callers",
+        "get_blast_radius",
+        "search_symbol",
+        "get_repo_map",
+    ];
+
+    #[test]
+    fn tools_list_contains_all_five_tools() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().expect("tools must be an array");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for expected in ALL_TOOLS {
+            assert!(names.contains(expected), "tools/list missing: {expected}");
+        }
+    }
+
+    #[test]
+    fn tools_list_global_contains_all_five_tools() {
+        let list = tools_list_global();
+        let tools = list["tools"].as_array().expect("tools must be an array");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for expected in ALL_TOOLS {
+            assert!(
+                names.contains(expected),
+                "tools_list_global missing: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_has_input_schema_with_type_object() {
+        for list in [tools_list(), tools_list_global()] {
+            let tools = list["tools"].as_array().unwrap();
+            for tool in tools {
+                let name = tool["name"].as_str().unwrap();
+                let schema = &tool["inputSchema"];
+                assert_eq!(
+                    schema["type"].as_str(),
+                    Some("object"),
+                    "tool '{name}' inputSchema must have type=object"
+                );
+                assert!(
+                    schema["properties"].is_object(),
+                    "tool '{name}' inputSchema must have a properties object"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_tools_have_correct_required_fields() {
+        let required_map = [
+            ("get_dependencies", "file"),
+            ("get_callers", "symbol"),
+            ("get_blast_radius", "file"),
+            ("search_symbol", "name"),
+        ];
+        for list in [tools_list(), tools_list_global()] {
+            let tools = list["tools"].as_array().unwrap();
+            for (tool_name, required_field) in required_map {
+                let tool = tools
+                    .iter()
+                    .find(|t| t["name"].as_str() == Some(tool_name))
+                    .unwrap_or_else(|| panic!("tool '{tool_name}' not found"));
+                let required = tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("tool '{tool_name}' must have required array"));
+                assert!(
+                    required.iter().any(|r| r.as_str() == Some(required_field)),
+                    "tool '{tool_name}' must have '{required_field}' in required"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_version_is_semver() {
+        for list in [tools_list(), tools_list_global()] {
+            let version = list["_schemaVersion"]
+                .as_str()
+                .expect("_schemaVersion must be present");
+            let parts: Vec<&str> = version.split('.').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "_schemaVersion must be X.Y.Z, got: {version}"
+            );
+            for part in &parts {
+                part.parse::<u32>()
+                    .unwrap_or_else(|_| panic!("semver part must be numeric: {part}"));
+            }
+        }
+    }
+
+    #[test]
+    fn all_schemas_have_additional_properties_false() {
+        for list in [tools_list(), tools_list_global()] {
+            let tools = list["tools"].as_array().unwrap();
+            for tool in tools {
+                let name = tool["name"].as_str().unwrap();
+                assert_eq!(
+                    tool["inputSchema"]["additionalProperties"].as_bool(),
+                    Some(false),
+                    "tool '{name}' inputSchema must set additionalProperties=false"
+                );
+            }
+        }
+    }
 }
