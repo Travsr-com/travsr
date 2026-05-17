@@ -530,6 +530,52 @@ mod tests {
         Node::new(VName::new("", "", path, "typescript", sig), "function")
     }
 
+    // Critical: an existing v1 database (no provenance column) must gain the
+    // column with DEFAULT 'tree-sitter' when opened by the v2 code, and all
+    // pre-existing edges must read back with provenance='tree-sitter'.
+    #[test]
+    fn v1_to_v2_migration_adds_provenance_with_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v1.db");
+
+        // Simulate a v1 DB: create schema manually without the provenance column.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES('schema_version', '1');
+                 CREATE TABLE nodes (
+                   id INTEGER PRIMARY KEY, corpus TEXT NOT NULL, root TEXT NOT NULL,
+                   path TEXT NOT NULL, language TEXT NOT NULL,
+                   signature TEXT NOT NULL, kind TEXT NOT NULL
+                 );
+                 CREATE TABLE edges (
+                   src INTEGER NOT NULL, dst INTEGER NOT NULL, kind TEXT NOT NULL,
+                   PRIMARY KEY (src, dst, kind)
+                 );
+                 CREATE TABLE files (
+                   path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                   last_indexed_at INTEGER NOT NULL
+                 );
+                 INSERT INTO nodes VALUES(1,'','','a.ts','typescript','fn:a','function');
+                 INSERT INTO nodes VALUES(2,'','','b.ts','typescript','fn:b','function');
+                 INSERT INTO edges VALUES(1, 2, 'ref-call');",
+            )
+            .unwrap();
+        }
+
+        // Open with the v2 store — migration must succeed.
+        let store = SqliteStore::open(&db_path).expect("v1→v2 migration must succeed");
+
+        // Pre-existing edge must have provenance='tree-sitter' (the column DEFAULT).
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges.len(), 1, "pre-existing edge must survive migration");
+        assert_eq!(
+            edges[0].3, "tree-sitter",
+            "migrated edge must default to tree-sitter provenance"
+        );
+    }
+
     #[test]
     fn file_hash_round_trips() {
         let mut store = SqliteStore::open_in_memory().unwrap();
