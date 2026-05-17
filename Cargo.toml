@@ -36,7 +36,7 @@ tree-sitter-typescript = "0.21"
 walkdir = "2"
 ignore = "0.4"
 assert_cmd = "2"
-notify = "6"
+notify = "8"
 tabled = "0.20"
 
 [profile.release]
