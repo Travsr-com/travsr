@@ -6,6 +6,7 @@ mod ask;
 mod graph;
 mod init;
 mod repo;
+mod repos;
 mod status;
 
 use anyhow::Result;
@@ -36,10 +37,15 @@ enum Command {
         /// Use stdio transport (for local IDE / agent integration).
         #[arg(long)]
         stdio: bool,
+        /// Serve all globally registered repos from ~/.travsr/registry.json.
+        #[arg(long)]
+        global: bool,
         /// Path to a specific graph.db file. Overrides automatic discovery from cwd.
         #[arg(long)]
         db: Option<std::path::PathBuf>,
     },
+    /// List all globally registered repos.
+    Repos,
     /// Print index and graph status.
     Status,
     /// Look up callers and dependencies for a symbol name.
@@ -93,6 +99,7 @@ async fn main() {
     }));
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -135,19 +142,28 @@ async fn run() -> Result<()> {
                 tracing::info!("travsr daemon {:?}: stub — Sprint 3", action);
             }
         },
-        Command::Mcp { stdio: _, db } => {
-            let db_path = if let Some(p) = db {
-                p
+        Command::Mcp {
+            stdio: _,
+            global,
+            db,
+        } => {
+            if global {
+                travsr_mcp::serve_stdio_global()?;
             } else {
-                let cwd = std::env::current_dir()?;
-                let repo_root = repo::find_git_root(&cwd)?;
-                repo_root.join(".travsr/graph.db")
-            };
-            if !db_path.exists() {
-                anyhow::bail!("not initialized — run `travsr init` first");
+                let db_path = if let Some(p) = db {
+                    p
+                } else {
+                    let cwd = std::env::current_dir()?;
+                    let repo_root = repo::find_git_root(&cwd)?;
+                    repo_root.join(".travsr/graph.db")
+                };
+                if !db_path.exists() {
+                    anyhow::bail!("not initialized — run `travsr init` first");
+                }
+                travsr_mcp::serve_stdio(&db_path)?;
             }
-            travsr_mcp::serve_stdio(&db_path)?;
         }
+        Command::Repos => repos::run()?,
         Command::Status => status::run()?,
         Command::Ask { query } => ask::run(&query)?,
         Command::Graph {

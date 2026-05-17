@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod registry;
+
 use std::path::Path;
 
 use anyhow::{Context, Result};

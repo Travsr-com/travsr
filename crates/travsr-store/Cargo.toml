@@ -12,6 +12,7 @@ rust-version.workspace = true
 travsr-core = { path = "../travsr-core" }
 rusqlite = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

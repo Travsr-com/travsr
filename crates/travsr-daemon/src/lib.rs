@@ -42,6 +42,15 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 
     install_hook(repo_root)?;
 
+    // Register in global registry so `travsr mcp --global` can find this repo.
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    if let Err(e) = travsr_store::registry::register(repo_name, &db_path) {
+        tracing::warn!("registry update failed (non-fatal): {e}");
+    }
+
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
 
     let mut files_indexed: u64 = 0;

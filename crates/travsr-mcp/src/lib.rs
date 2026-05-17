@@ -31,3 +31,11 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("opening graph database at {}", db_path.display()))?;
     server::run(&store)
 }
+
+/// Start the global MCP stdio server backed by all repos in `~/.travsr/registry.json`.
+///
+/// The registry is re-read on every tool call so repos added via `travsr init`
+/// after startup are picked up live without restarting the server.
+pub fn serve_stdio_global() -> anyhow::Result<()> {
+    server::run_global()
+}

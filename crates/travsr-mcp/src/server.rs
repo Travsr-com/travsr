@@ -4,12 +4,14 @@
 //! and writes responses to stdout. All diagnostics go to stderr via tracing
 //! so stdout stays clean for the MCP client.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 
 use crate::protocol::{INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR};
 use crate::tools;
 use crate::{protocol::RpcRequest, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
-use travsr_store::SqliteStore;
+use travsr_store::{registry, SqliteStore};
 
 pub fn run(store: &SqliteStore) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
@@ -155,4 +157,134 @@ fn error_response(id: serde_json::Value, code: i32, message: String) -> String {
         "error": { "code": code, "message": message }
     })
     .to_string()
+}
+
+// ── Global mode (all registered repos) ───────────────────────────────────────
+
+/// Run the MCP stdio server in global mode.
+///
+/// Serves all repos registered in `~/.travsr/registry.json`. The registry is
+/// re-read on every `tools/call` so repos added via `travsr init` after startup
+/// are picked up live without restarting the server.
+pub fn run_global() -> anyhow::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    for line_result in BufReader::new(stdin.lock()).lines() {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let response = match serde_json::from_str::<RpcRequest>(&line) {
+            Ok(req) => handle_request_global(req),
+            Err(e) => {
+                tracing::debug!("JSON parse error: {e}");
+                Some(error_response(
+                    serde_json::Value::Null,
+                    PARSE_ERROR,
+                    format!("parse error: {e}"),
+                ))
+            }
+        };
+
+        if let Some(resp) = response {
+            writeln!(out, "{resp}")?;
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_request_global(req: RpcRequest) -> Option<String> {
+    let id = match req.id {
+        Some(id) => id,
+        None => {
+            tracing::debug!("notification received: {}", req.method);
+            return None;
+        }
+    };
+
+    let resp = match req.method.as_str() {
+        "initialize" => ok_response(
+            id,
+            serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+            }),
+        ),
+        "tools/list" => ok_response(id, tools_list_global()),
+        "tools/call" => {
+            let repos = registry::all_repos().unwrap_or_default();
+            let params = req.params.unwrap_or(serde_json::Value::Null);
+            handle_tool_call_global(&repos, id, params)
+        }
+        other => {
+            tracing::debug!("unknown method: {other}");
+            error_response(id, METHOD_NOT_FOUND, format!("method not found: {other}"))
+        }
+    };
+
+    Some(resp)
+}
+
+fn handle_tool_call_global(
+    repos: &HashMap<String, PathBuf>,
+    id: serde_json::Value,
+    params: serde_json::Value,
+) -> String {
+    let tool_name = match params["name"].as_str() {
+        Some(n) => n,
+        None => return error_response(id, INVALID_PARAMS, "missing tool name".into()),
+    };
+    let args = &params["arguments"];
+    let repo_arg = args["repo"].as_str();
+
+    let text = match tool_name {
+        "get_dependencies" => {
+            tools::get_dependencies_global(repos, args["file"].as_str().unwrap_or(""), repo_arg)
+        }
+        "get_callers" => {
+            tools::get_callers_global(repos, args["symbol"].as_str().unwrap_or(""), repo_arg)
+        }
+        other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
+    };
+
+    ok_response(
+        id,
+        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+    )
+}
+
+fn tools_list_global() -> serde_json::Value {
+    serde_json::json!({
+        "tools": [
+            {
+                "name": "get_dependencies",
+                "description": "Return the files and modules that a given file imports.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "File path to look up" },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["file"]
+                }
+            },
+            {
+                "name": "get_callers",
+                "description": "Return all graph nodes that have an incoming edge to the given symbol.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol name to find callers of" },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["symbol"]
+                }
+            }
+        ]
+    })
 }

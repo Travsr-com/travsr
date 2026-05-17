@@ -23,8 +23,9 @@ npm install -g @travsr.com/travsr
 cd your-project
 git init          # skip if already a git repo
 travsr init       # indexes TypeScript files → .travsr/graph.db
+                  # auto-registers in ~/.travsr/registry.json
 
-# 3. Connect to Claude Desktop
+# 3. Connect to Claude Desktop — set once, works for all repos
 ```
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
@@ -35,8 +36,7 @@ or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
   "mcpServers": {
     "travsr": {
       "command": "travsr",
-      "args": ["mcp", "--stdio"],
-      "cwd": "/path/to/your-project"
+      "args": ["mcp", "--stdio", "--global"]
     }
   }
 }
@@ -44,13 +44,57 @@ or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 Restart Claude Desktop. Ask: *"Who calls PaymentService.charge?"*
 
+> **No `cwd` needed.** `--global` reads `~/.travsr/registry.json` which
+> `travsr init` populates automatically. Every repo you init becomes
+> immediately available — no config changes required.
+
+---
+
+## Multi-repo support
+
+Travsr maintains a global registry at `~/.travsr/registry.json`. Every
+`travsr init` call registers that repo automatically.
+
+```bash
+# Init each repo once — that's it
+cd ~/projects/repo-a && travsr init
+cd ~/projects/repo-b && travsr init
+cd ~/projects/task-manager && travsr init
+
+# See all registered repos
+travsr repos
+```
+
+```
+| Name         | DB Path                                           | Exists |
+| repo-a       | /Users/you/projects/repo-a/.travsr/graph.db      | yes    |
+| repo-b       | /Users/you/projects/repo-b/.travsr/graph.db      | yes    |
+| task-manager | /Users/you/projects/task-manager/.travsr/graph.db | yes   |
+```
+
+The single `--global` MCP server serves all of them. When you ask about a
+symbol, it searches all registered repos and prefixes results with
+`[repo-name]` so you always know which codebase the answer came from.
+
 ---
 
 ## Works with Every MCP-Compatible AI Tool
 
 Travsr speaks [MCP](https://modelcontextprotocol.io) — the open standard for
-connecting AI agents to tools. The same `travsr mcp --stdio` command works
-with any client that supports it.
+connecting AI agents to tools.
+
+### Claude Desktop / global mode (recommended)
+
+```json
+{
+  "mcpServers": {
+    "travsr": {
+      "command": "travsr",
+      "args": ["mcp", "--stdio", "--global"]
+    }
+  }
+}
+```
 
 ### Cursor
 
@@ -61,7 +105,7 @@ Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
   "mcpServers": {
     "travsr": {
       "command": "travsr",
-      "args": ["mcp", "--stdio"]
+      "args": ["mcp", "--stdio", "--global"]
     }
   }
 }
@@ -77,14 +121,11 @@ Requires VS Code 1.99+. Add to `.vscode/mcp.json` in your project:
     "travsr": {
       "type": "stdio",
       "command": "travsr",
-      "args": ["mcp", "--stdio"]
+      "args": ["mcp", "--stdio", "--global"]
     }
   }
 }
 ```
-
-Copilot Chat will automatically discover the `get_dependencies` and
-`get_callers` tools and invoke them when answering questions about your code.
 
 ### Cline (VS Code extension)
 
@@ -94,7 +135,7 @@ In the Cline extension settings → **MCP Servers** → Add server:
 {
   "travsr": {
     "command": "travsr",
-    "args": ["mcp", "--stdio"],
+    "args": ["mcp", "--stdio", "--global"],
     "disabled": false
   }
 }
@@ -110,41 +151,47 @@ Add to `~/.continue/config.json` under `mcpServers`:
     {
       "name": "travsr",
       "command": "travsr",
-      "args": ["mcp", "--stdio"]
+      "args": ["mcp", "--stdio", "--global"]
     }
   ]
 }
 ```
 
-### Any other MCP client
+### Single-repo mode
 
-The pattern is always the same — point your client at `travsr mcp --stdio`.
-Travsr handles the rest.
+If you prefer to point at one specific repo, use `--db`:
 
+```bash
+travsr mcp --stdio --db /path/to/repo/.travsr/graph.db
 ```
-command: travsr
-args:    ["mcp", "--stdio"]
-type:    stdio
-```
+
+Or omit both flags and run from inside the repo — travsr discovers the db
+from the current git root.
 
 ---
 
 ## MCP Tools
 
-| Tool | Input | Description |
-|---|---|---|
-| `get_dependencies(file)` | File path (partial match) | Return all imports/dependencies of a file |
-| `get_callers(symbol)` | Symbol name (partial match) | Return all nodes with an incoming edge to a symbol |
+In global mode, both tools accept an optional `repo` parameter to target a
+specific registered repo. Omitting `repo` searches all registered repos.
+
+| Tool | Required | Optional | Description |
+|---|---|---|---|
+| `get_dependencies(file)` | `file` — file path | `repo` — repo name | Return all imports/dependencies of a file |
+| `get_callers(symbol)` | `symbol` — symbol name | `repo` — repo name | Return all nodes with an incoming edge to a symbol |
 
 ---
 
 ## CLI Commands
 
 ```
-travsr init                    Index the repo and install the git post-commit hook
-travsr status                  Show node/edge counts, schema version, and last-indexed commit SHA
-travsr ask <query>             BFS symbol lookup from the terminal (partial match supported)
-travsr mcp --stdio             Start the MCP stdio server
+travsr init                    Index the repo, install git hook, register globally
+travsr repos                   List all globally registered repos
+travsr status                  Show node/edge counts, schema version, last-indexed SHA
+travsr ask <query>             BFS symbol lookup from the terminal (partial match)
+travsr mcp --stdio             Start the MCP stdio server (single-repo, cwd-based)
+travsr mcp --stdio --global    Start the MCP stdio server (all registered repos)
+travsr mcp --stdio --db <path> Start the MCP stdio server (explicit db path)
 travsr graph <query>           Show dependency graph for a symbol or file
 travsr graph --all             Show graph for the entire indexed repository
 ```
@@ -172,7 +219,7 @@ travsr graph extension.ts --format json
 
 # Whole-repository graph
 travsr graph --all --format dot | dot -Tsvg -o repo.svg && open repo.svg
-travsr graph --all --format json   # full repo as structured JSON
+travsr graph --all --format json
 ```
 
 **Flags:**
@@ -217,6 +264,7 @@ git init && travsr init
         └─▶ Tree-sitter parses each file
               └─▶ Nodes + edges → .travsr/graph.db (SQLite WAL)
                     └─▶ post-commit hook installed
+                          └─▶ repo registered in ~/.travsr/registry.json
 
 git commit
   └─▶ post-commit hook fires
@@ -249,7 +297,9 @@ git clone https://github.com/raj-rkv/travsr
 cd travsr
 cargo build --release   # requires Rust 1.75+
 
-# Use local build instead of the npm-installed binary
+# Override the npm-installed binary with a local build
+cp target/release/travsr $(which travsr)
+# or
 export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 ```
 
@@ -263,8 +313,13 @@ export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 - **`not initialized — run travsr init`**  
   Run `travsr init` in the repo root before using `graph`, `ask`, `status`, or `mcp`.
 
-- **MCP server returns empty results**  
-  Make sure `cwd` in your MCP client config points to the root of the indexed repo.
+- **MCP server returns empty results in `--global` mode**  
+  Run `travsr repos` to verify the repo is registered and `Exists` shows `yes`.
+  If missing, re-run `travsr init` in that repo.
+
+- **Stale entries in `travsr repos` (Exists = no)**  
+  Safe to ignore — they are skipped automatically. They appear when a repo
+  was deleted or moved after being indexed.
 
 - **Binary not found after npm install?**  
   Set `TRAVSR_BINARY=/path/to/travsr` to use a local build instead.

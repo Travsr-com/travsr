@@ -1304,6 +1304,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "travsr-core",
 ]
