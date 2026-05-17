@@ -30,14 +30,10 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "travsr-lsif-ts exited with {}: {stderr}",
-            output.status
-        );
+        anyhow::bail!("travsr-lsif-ts exited with {}: {stderr}", output.status);
     }
 
-    String::from_utf8(output.stdout)
-        .context("travsr-lsif-ts stdout is not valid UTF-8")
+    String::from_utf8(output.stdout).context("travsr-lsif-ts stdout is not valid UTF-8")
 }
 
 #[cfg(test)]
@@ -45,8 +41,7 @@ mod tests {
     #[test]
     fn run_lsif_emitter_returns_err_for_missing_binary() {
         // An impossible binary name must produce an Err, not a panic.
-        let result = std::process::Command::new("__travsr_nonexistent_binary__")
-            .output();
+        let result = std::process::Command::new("__travsr_nonexistent_binary__").output();
         // We test the Command API directly here because run_lsif_emitter
         // hard-codes the binary name. The important invariant is that a
         // missing binary produces an IO error rather than a panic.

@@ -209,7 +209,10 @@ fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
         }
     }
 
-    tracing::debug!("lsif pass: {} RefCall edges persisted", lsif_out.edges.len());
+    tracing::debug!(
+        "lsif pass: {} RefCall edges persisted",
+        lsif_out.edges.len()
+    );
 }
 
 fn hex_encode(bytes: &[u8; 32]) -> String {

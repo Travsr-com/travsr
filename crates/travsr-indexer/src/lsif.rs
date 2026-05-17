@@ -86,10 +86,7 @@ fn parse_graph(dump: &str) -> anyhow::Result<LsifGraph> {
             ("vertex", "metaData") => {
                 // projectRoot is "file:///abs/path" — strip the scheme.
                 if let Some(root) = obj["projectRoot"].as_str() {
-                    graph.project_root = root
-                        .strip_prefix("file://")
-                        .unwrap_or(root)
-                        .to_string();
+                    graph.project_root = root.strip_prefix("file://").unwrap_or(root).to_string();
                 }
             }
 
@@ -109,10 +106,9 @@ fn parse_graph(dump: &str) -> anyhow::Result<LsifGraph> {
                     let path = vname_obj["path"].as_str().unwrap_or("").to_string();
                     let sig = vname_obj["signature"].as_str().unwrap_or("").to_string();
                     if !path.is_empty() && !sig.is_empty() {
-                        graph.result_sets.insert(
-                            id,
-                            VName::new("", "", path, "typescript", sig),
-                        );
+                        graph
+                            .result_sets
+                            .insert(id, VName::new("", "", path, "typescript", sig));
                     }
                 }
             }
@@ -270,18 +266,16 @@ mod tests {
     fn ingest_raw_deduplicates_same_caller_callee() {
         // Two item edges pointing to the same ref range (duplicate call sites
         // in the same file to the same function) must produce one edge.
-        let dump = format!(
-            r#"
-{{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo","positionEncoding":"utf-16","toolInfo":{{"name":"t","version":"0"}}}}
-{{"id":2,"type":"vertex","label":"document","uri":"file:///repo/a.ts"}}
-{{"id":3,"type":"vertex","label":"resultSet","travsr_vname":{{"path":"b.ts","signature":"fn:foo"}}}}
-{{"id":4,"type":"vertex","label":"referenceResult"}}
-{{"id":5,"type":"edge","label":"textDocument/references","outV":3,"inV":4}}
-{{"id":6,"type":"edge","label":"item","outV":4,"inVs":[10],"document":2,"property":"references"}}
-{{"id":7,"type":"edge","label":"item","outV":4,"inVs":[11],"document":2,"property":"references"}}
-"#
-        );
-        let edges = ingest_raw(&dump).unwrap();
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo","positionEncoding":"utf-16","toolInfo":{"name":"t","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///repo/a.ts"}
+{"id":3,"type":"vertex","label":"resultSet","travsr_vname":{"path":"b.ts","signature":"fn:foo"}}
+{"id":4,"type":"vertex","label":"referenceResult"}
+{"id":5,"type":"edge","label":"textDocument/references","outV":3,"inV":4}
+{"id":6,"type":"edge","label":"item","outV":4,"inVs":[10],"document":2,"property":"references"}
+{"id":7,"type":"edge","label":"item","outV":4,"inVs":[11],"document":2,"property":"references"}
+"#;
+        let edges = ingest_raw(dump).unwrap();
         assert_eq!(edges.len(), 1, "duplicate caller→callee must be deduped");
     }
 
