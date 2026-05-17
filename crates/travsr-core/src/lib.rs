@@ -88,6 +88,10 @@ pub enum EdgeKind {
     DefinesBinding,
     /// A symbol exported from a module.
     Exports,
+    /// An import node resolved to the file node it targets.
+    /// Connects `import:./foo` → `file:foo.ts`, enabling transitive
+    /// caller traversal across file boundaries.
+    ResolvesTo,
 }
 
 impl EdgeKind {
@@ -98,6 +102,7 @@ impl EdgeKind {
             Self::RefCall => "ref/call",
             Self::DefinesBinding => "defines/binding",
             Self::Exports => "exports",
+            Self::ResolvesTo => "resolves-to",
         }
     }
 
@@ -109,6 +114,7 @@ impl EdgeKind {
             "ref/call" => Some(Self::RefCall),
             "defines/binding" => Some(Self::DefinesBinding),
             "exports" => Some(Self::Exports),
+            "resolves-to" => Some(Self::ResolvesTo),
             _ => None,
         }
     }
@@ -191,6 +197,7 @@ mod tests {
             EdgeKind::RefCall,
             EdgeKind::DefinesBinding,
             EdgeKind::Exports,
+            EdgeKind::ResolvesTo,
         ] {
             assert_eq!(EdgeKind::from_str(kind.as_str()), Some(kind));
         }

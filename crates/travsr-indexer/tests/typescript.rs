@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use travsr_core::EdgeKind;
-use travsr_indexer::{hash_file, Indexer};
+use travsr_indexer::{hash_file, link_imports, Indexer};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -126,6 +126,89 @@ fn vname_signature_disambiguates_function_and_class() {
         class_node.vname.signature.starts_with("class:"),
         "class signature must start with class:"
     );
+}
+
+#[test]
+fn link_imports_emits_resolves_to_for_relative_import() {
+    // b.ts imports from "./a" — should produce edges to a.ts and a.tsx candidates
+    let vname_path = "fixtures/ts-small/b.ts";
+    let out = indexer()
+        .parse_file_with_vname(&fixture("b.ts"), vname_path)
+        .unwrap();
+
+    let edges = link_imports(&out.nodes, vname_path);
+
+    // Two candidates per relative import: .ts and .tsx
+    assert_eq!(edges.len(), 2, "expected one edge per extension candidate");
+    assert!(
+        edges.iter().all(|e| e.kind == EdgeKind::ResolvesTo),
+        "all emitted edges must be ResolvesTo"
+    );
+
+    // The import node must be the source of every edge
+    let import_node = out.nodes.iter().find(|n| n.kind == "import").unwrap();
+    assert!(
+        edges.iter().all(|e| e.src == import_node.id),
+        "resolves-to edge src must be the import node"
+    );
+
+    // One of the candidates must resolve to a.ts
+    let expected_target = Indexer::new()
+        .parse_file_with_vname(&fixture("a.ts"), "fixtures/ts-small/a.ts")
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|n| n.kind == "file")
+        .unwrap();
+    assert!(
+        edges.iter().any(|e| e.dst == expected_target.id),
+        "one edge must resolve to fixtures/ts-small/a.ts file node"
+    );
+}
+
+#[test]
+fn link_imports_skips_package_imports() {
+    // extension.ts imports "vscode" — not relative, must be skipped
+    let abs =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/travsr-vscode/src/extension.ts");
+    let vname_path = "packages/travsr-vscode/src/extension.ts";
+    let out = indexer().parse_file_with_vname(&abs, vname_path).unwrap();
+
+    let edges = link_imports(&out.nodes, vname_path);
+
+    // "vscode" is a package import — skipped.  "./status" is relative — 2 candidates.
+    let package_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| {
+            // A resolves-to edge targeting a node whose path contains "vscode" package
+            // would be wrong; we detect by checking that all targets are under the src tree
+            let dst_sig = out
+                .nodes
+                .iter()
+                .find(|n| n.id == e.dst)
+                .map(|n| n.vname.path.as_str())
+                .unwrap_or("");
+            dst_sig.contains("node_modules") || dst_sig == "vscode"
+        })
+        .collect();
+    assert!(
+        package_edges.is_empty(),
+        "package imports must not produce resolves-to edges"
+    );
+
+    // "./status" → 2 candidates (status.ts, status.tsx)
+    assert_eq!(
+        edges.len(),
+        2,
+        "only the relative './status' import should produce edges"
+    );
+}
+
+#[test]
+fn link_imports_empty_for_file_with_no_imports() {
+    let out = indexer().parse_file(&fixture("empty.ts")).unwrap();
+    let edges = link_imports(&out.nodes, "fixtures/ts-small/empty.ts");
+    assert!(edges.is_empty());
 }
 
 #[test]

@@ -143,6 +143,12 @@ pub fn reindex_files(
             }
         }
 
+        for edge in travsr_indexer::link_imports(&out.nodes, &vname_path) {
+            if let Err(err) = store.put_edge(&edge) {
+                tracing::warn!("resolves-to edge write error: {err}");
+            }
+        }
+
         store.put_file_hash(&vname_path, &new_hex)?;
     }
 

@@ -38,3 +38,7 @@ pub fn defines_edge(src: NodeId, dst: NodeId) -> Edge {
 pub fn depends_edge(src: NodeId, dst: NodeId) -> Edge {
     Edge::new(src, dst, EdgeKind::Depends)
 }
+
+pub fn resolves_to_edge(src: NodeId, dst: NodeId) -> Edge {
+    Edge::new(src, dst, EdgeKind::ResolvesTo)
+}
