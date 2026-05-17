@@ -6,6 +6,15 @@ use tree_sitter::{Parser, Query, QueryCursor};
 use crate::emit;
 use crate::ParseOutput;
 
+/// Reject files larger than this before reading them into memory.
+/// Prevents parse-bomb / OOM from crafted or generated multi-GB sources.
+const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+
+/// Kill the Tree-sitter parse if it hasn't finished within this window.
+/// A deeply-nested AST can take unexpectedly long; 5 s is generous for any
+/// real source file and keeps `git commit` responsive.
+const PARSE_TIMEOUT_MICROS: u64 = 5_000_000; // 5 seconds
+
 // One combined query covers all definition and import patterns we care about in Sprint 1.
 // Sprint 2 will extend this with LSIF-derived call/ref edges.
 const QUERIES: &str = r"
@@ -20,6 +29,18 @@ const QUERIES: &str = r"
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
 /// VName path (repo-relative, forward-slash — fixes DEBT-012).
 pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
+    let file_size = std::fs::metadata(abs_path)
+        .with_context(|| format!("stat {}", abs_path.display()))?
+        .len();
+    if file_size > MAX_FILE_BYTES {
+        anyhow::bail!(
+            "skipping {}: file is too large ({} bytes > {} byte limit)",
+            abs_path.display(),
+            file_size,
+            MAX_FILE_BYTES
+        );
+    }
+
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
@@ -42,6 +63,7 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
     parser
         .set_language(&language)
         .context("loading TypeScript grammar")?;
+    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     // A parse failure (None) is not an I/O error; still emit the file node.
     let tree = match parser.parse(&source, None) {
@@ -111,6 +133,25 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_file_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.ts");
+        // Write a file just over the 10 MB limit.
+        let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, &big).unwrap();
+
+        let result = parse(&path, "big.ts");
+        assert!(result.is_err(), "oversized file must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("too large"), "error must mention 'too large': {msg}");
+    }
 }
 
 fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {

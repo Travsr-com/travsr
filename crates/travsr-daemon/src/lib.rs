@@ -59,6 +59,7 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
         .git_ignore(true)
+        .follow_links(false)
         .build();
 
     let mut ts_paths: Vec<PathBuf> = Vec::new();
@@ -309,6 +310,25 @@ mod tests {
             count_after_first, count_after_second,
             "unchanged file must not add duplicate nodes"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // Create a directory outside the repo with a .ts file inside it.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.ts"), "export const secret = 1;").unwrap();
+
+        // Symlink pointing at the outside directory from inside the repo.
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked")).unwrap();
+
+        let stats = init_repo(tmp.path()).unwrap();
+        // The symlink target must not have been indexed — files_indexed
+        // counts only real files in the repo.
+        assert_eq!(stats.files_indexed, 0, "symlink target must not be indexed");
     }
 
     #[test]
