@@ -18,6 +18,15 @@ updates:
       - dependencies
       - javascript
 
+  - package-ecosystem: npm
+    directory: /packages/travsr-lsif-ts
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - javascript
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
