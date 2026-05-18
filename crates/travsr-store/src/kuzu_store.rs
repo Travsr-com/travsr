@@ -9,11 +9,15 @@
 //!
 //! # Connection-per-operation design
 //! In kuzu 0.11.x, `Connection<'db>` borrows from `Database` with an explicit
-//! lifetime parameter. Storing both in the same struct would create a
-//! self-referential type that Rust cannot express safely without `unsafe`.
-//! Instead, `KuzuStore` stores only the `Database` and creates a fresh
-//! `Connection` for each operation. Kùzu connections are thin C-level
-//! handles; the overhead is negligible compared to the query cost.
+//! lifetime parameter, making it impossible to co-locate with `Database` in
+//! one struct without `unsafe`. `KuzuStore` stores only the `Database` and
+//! creates a fresh `Connection<'_>` per operation via `connect()`.
+//!
+//! # kuzu 0.11.x row API
+//! `QueryResult::next()` yields `Vec<kuzu::Value>` directly (not `Vec<Option<…>>`).
+//! Null columns are represented as `Value::Null(LogicalType)`. All Connection
+//! methods (`query`, `prepare`, `execute`) take `&self`, so connections do not
+//! need to be `mut`.
 //!
 //! # Schema (Kùzu Cypher DDL)
 //! ```cypher
@@ -77,7 +81,7 @@ impl KuzuStore {
             "CREATE REL TABLE edges(FROM nodes TO nodes, kind STRING)",
         ];
 
-        let mut conn = self.connect().context("init_schema")?;
+        let conn = self.connect().context("init_schema")?;
         for ddl in ddl_stmts {
             match conn.query(ddl) {
                 Ok(_) => {}
@@ -94,7 +98,7 @@ impl KuzuStore {
 impl Store for KuzuStore {
     /// Upsert a node — creates it if absent, updates `kind` if already present.
     fn put_node(&mut self, node: &Node) -> Result<NodeId> {
-        let mut conn = self.connect().context("put_node")?;
+        let conn = self.connect().context("put_node")?;
         let mut stmt = conn
             .prepare(
                 "MERGE (n:nodes {id: $id}) \
@@ -126,7 +130,7 @@ impl Store for KuzuStore {
     /// Insert a directed edge. Idempotent — duplicate (src, dst, kind) tuples
     /// are silently ignored via MERGE.
     fn put_edge(&mut self, edge: &Edge) -> Result<()> {
-        let mut conn = self.connect().context("put_edge")?;
+        let conn = self.connect().context("put_edge")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (src:nodes {id: $src}), (dst:nodes {id: $dst}) \
@@ -146,7 +150,7 @@ impl Store for KuzuStore {
     }
 
     fn get_node(&self, id: NodeId) -> Result<Option<Node>> {
-        let mut conn = self.connect().context("get_node")?;
+        let conn = self.connect().context("get_node")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (n:nodes {id: $id}) \
@@ -160,10 +164,9 @@ impl Store for KuzuStore {
             )
             .context("executing get_node")?;
 
-        // Explicit type annotation disambiguates the unsized-slice type that
-        // kuzu 0.11.x exposes through its Iterator impl (E0277 fix).
-        let row: Vec<Option<kuzu::Value>> = match result.next() {
-            Some(r) => r.into_iter().collect(),
+        // kuzu 0.11.x: next() yields Vec<Value> directly; nulls are Value::Null.
+        let row: Vec<kuzu::Value> = match result.next() {
+            Some(r) => r,
             None => return Ok(None),
         };
 
@@ -183,7 +186,7 @@ impl Store for KuzuStore {
 
     /// O(out-degree(src))
     fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>> {
-        let mut conn = self.connect().context("iter_edges_from")?;
+        let conn = self.connect().context("iter_edges_from")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (s:nodes {id: $src})-[e:edges]->(d:nodes) \
@@ -198,8 +201,7 @@ impl Store for KuzuStore {
             .context("executing iter_edges_from")?;
 
         let mut edges = Vec::new();
-        while let Some(raw) = result.next() {
-            let row: Vec<Option<kuzu::Value>> = raw.into_iter().collect();
+        while let Some(row) = result.next() {
             let dst_raw = extract_i64(&row, 0, "d.id")?;
             let kind_str = extract_string(&row, 1, "e.kind")?;
             let kind = EdgeKind::from_str(&kind_str)
@@ -211,7 +213,7 @@ impl Store for KuzuStore {
 
     /// O(in-degree(dst))
     fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>> {
-        let mut conn = self.connect().context("iter_edges_to")?;
+        let conn = self.connect().context("iter_edges_to")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (s:nodes)-[e:edges]->(d:nodes {id: $dst}) \
@@ -226,8 +228,7 @@ impl Store for KuzuStore {
             .context("executing iter_edges_to")?;
 
         let mut edges = Vec::new();
-        while let Some(raw) = result.next() {
-            let row: Vec<Option<kuzu::Value>> = raw.into_iter().collect();
+        while let Some(row) = result.next() {
             let src_raw = extract_i64(&row, 0, "s.id")?;
             let kind_str = extract_string(&row, 1, "e.kind")?;
             let kind = EdgeKind::from_str(&kind_str)
@@ -254,15 +255,16 @@ fn is_already_exists(e: &kuzu::Error) -> bool {
     s.contains("already exists") || s.contains("has been created")
 }
 
-fn extract_string(row: &[Option<kuzu::Value>], idx: usize, field: &str) -> Result<String> {
-    match row.get(idx).and_then(Option::as_ref) {
+// kuzu 0.11.x rows are Vec<Value>; nulls are Value::Null(LogicalType).
+fn extract_string(row: &[kuzu::Value], idx: usize, field: &str) -> Result<String> {
+    match row.get(idx) {
         Some(kuzu::Value::String(s)) => Ok(s.clone()),
         other => bail!("expected String for '{field}' at col {idx}, got {other:?}"),
     }
 }
 
-fn extract_i64(row: &[Option<kuzu::Value>], idx: usize, field: &str) -> Result<i64> {
-    match row.get(idx).and_then(Option::as_ref) {
+fn extract_i64(row: &[kuzu::Value], idx: usize, field: &str) -> Result<i64> {
+    match row.get(idx) {
         Some(kuzu::Value::Int64(n)) => Ok(*n),
         other => bail!("expected Int64 for '{field}' at col {idx}, got {other:?}"),
     }
