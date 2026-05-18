@@ -29,9 +29,12 @@ pub use travsr_core::{Edge, Node};
 /// was actually indexed will be reachable during graph traversal. Package
 /// imports (e.g. `"vscode"`) are silently skipped.
 ///
+/// `corpus` must match the corpus used when the file nodes were created so
+/// that the target `NodeId`s resolve correctly (ARCH-102).
+///
 /// Call this after [`Indexer::parse_file_with_vname`] and persist the
 /// returned edges alongside the parse output.
-pub fn link_imports(nodes: &[Node], vname_path: &str) -> Vec<Edge> {
+pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge> {
     let parent = match std::path::Path::new(vname_path).parent() {
         Some(p) => p,
         None => return Vec::new(),
@@ -56,7 +59,7 @@ pub fn link_imports(nodes: &[Node], vname_path: &str) -> Vec<Edge> {
         for ext in ["ts", "tsx"] {
             let candidate = normalized.with_extension(ext);
             let candidate_str = candidate.to_string_lossy().replace('\\', "/");
-            let target = emit::file_node(&candidate_str);
+            let target = emit::file_node(corpus, &candidate_str);
             edges.push(emit::resolves_to_edge(node.id, target.id));
         }
     }
@@ -89,12 +92,34 @@ pub struct ParseOutput {
 }
 
 /// Streaming indexer that walks a repository and emits graph records.
+///
+/// The `corpus` field is the canonical repo identifier (ARCH-102) baked into
+/// every `VName` this indexer produces. Use [`Indexer::with_corpus`] to set it;
+/// [`Indexer::new`] defaults to an empty string for backward compatibility.
 #[derive(Debug, Default)]
-pub struct Indexer;
+pub struct Indexer {
+    corpus: String,
+}
 
 impl Indexer {
+    /// Create an indexer with an empty corpus (backward-compatible default).
     pub fn new() -> Self {
-        Self
+        Self {
+            corpus: String::new(),
+        }
+    }
+
+    /// Create an indexer stamped with the given canonical corpus identifier.
+    /// See `travsr_core::canonical_corpus` and `docs/rfcs/ARCH-102`.
+    pub fn with_corpus(corpus: impl Into<String>) -> Self {
+        Self {
+            corpus: corpus.into(),
+        }
+    }
+
+    /// The corpus this indexer uses for all emitted VNames.
+    pub fn corpus(&self) -> &str {
+        &self.corpus
     }
 
     /// Parse a single source file into nodes and edges.
@@ -115,7 +140,7 @@ impl Indexer {
         vname_path: &str,
     ) -> anyhow::Result<ParseOutput> {
         match abs_path.extension().and_then(|e| e.to_str()) {
-            Some("ts" | "tsx") => typescript::parse(abs_path, vname_path),
+            Some("ts" | "tsx") => typescript::parse(&self.corpus, abs_path, vname_path),
             _ => Ok(ParseOutput::default()),
         }
     }

@@ -34,7 +34,7 @@ const QUERIES: &str = r"
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
 /// VName path (repo-relative, forward-slash — fixes DEBT-012).
-pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
+pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
     let file_size = std::fs::metadata(abs_path)
         .with_context(|| format!("stat {}", abs_path.display()))?
         .len();
@@ -57,7 +57,7 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
         tree_sitter_typescript::language_typescript()
     };
 
-    let file_node = emit::file_node(vname_path);
+    let file_node = emit::file_node(corpus, vname_path);
     let file_id = file_node.id;
 
     let mut output = ParseOutput {
@@ -110,13 +110,13 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
 
         match cap_name.as_str() {
             "class.name" => {
-                let node = emit::class_node(vname_path, text);
+                let node = emit::class_node(corpus, vname_path, text);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "fn.name" => {
-                let node = emit::fn_node(vname_path, text);
+                let node = emit::fn_node(corpus, vname_path, text);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
@@ -125,20 +125,20 @@ pub fn parse(abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
                 // Edge hierarchy (Tech Lead sign-off): class→method, not file→method.
                 let class_name = find_parent_class_name(capture.node, source.as_slice())
                     .unwrap_or_else(|| "<anonymous>".to_string());
-                let class_id = emit::class_node(vname_path, &class_name).id;
-                let node = emit::method_node(vname_path, &class_name, text);
+                let class_id = emit::class_node(corpus, vname_path, &class_name).id;
+                let node = emit::method_node(corpus, vname_path, &class_name, text);
                 let edge = emit::defines_edge(class_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "var.name" => {
-                let node = emit::var_node(vname_path, text);
+                let node = emit::var_node(corpus, vname_path, text);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "import.source" => {
-                let node = emit::import_node(vname_path, text);
+                let node = emit::import_node(corpus, vname_path, text);
                 let edge = emit::depends_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
@@ -179,7 +179,7 @@ mod tests {
         let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
         std::fs::write(&path, &big).unwrap();
 
-        let result = parse(&path, "big.ts");
+        let result = parse("", &path, "big.ts");
         assert!(result.is_err(), "oversized file must return Err");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -196,7 +196,7 @@ mod tests {
         let content = vec![b' '; MAX_FILE_BYTES as usize];
         std::fs::write(&path, &content).unwrap();
 
-        let result = parse(&path, "boundary.ts");
+        let result = parse("", &path, "boundary.ts");
         // Must not return the "too large" error — parse may return Ok or a
         // parse error (all-spaces is not valid TS), but never the size error.
         if let Err(e) = &result {
@@ -215,7 +215,7 @@ mod tests {
         let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
         std::fs::write(&path, &big).unwrap();
 
-        let err = parse(&path, "giant.ts").unwrap_err().to_string();
+        let err = parse("", &path, "giant.ts").unwrap_err().to_string();
         assert!(
             err.contains("giant.ts"),
             "error message must include the file path: {err}"
@@ -229,7 +229,7 @@ mod tests {
         let path = dir.path().join("svc.ts");
         std::fs::write(&path, "export class AuthService { login() {} }").unwrap();
 
-        let output = parse(&path, "svc.ts").expect("normal file must parse without error");
+        let output = parse("", &path, "svc.ts").expect("normal file must parse without error");
         assert!(
             output.nodes.iter().any(|n| n.kind == "class"),
             "class node must be emitted for AuthService"

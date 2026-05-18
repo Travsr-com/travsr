@@ -7,7 +7,85 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+
+// ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
+
+/// Derive the canonical Travsr corpus identifier from a git remote URL.
+///
+/// **Canonical form:** `host/org/repo` — all lowercase, no scheme prefix,
+/// no `.git` suffix, no trailing slash. See `docs/rfcs/ARCH-102`.
+///
+/// Handles all standard git remote URL formats:
+///
+/// | Input | Output |
+/// |---|---|
+/// | `https://github.com/acme/foo.git` | `github.com/acme/foo` |
+/// | `git@github.com:acme/foo.git`     | `github.com/acme/foo` |
+/// | `ssh://git@github.com/acme/foo`   | `github.com/acme/foo` |
+/// | `git://github.com/acme/foo.git`   | `github.com/acme/foo` |
+pub fn canonical_corpus(remote_url: &str) -> String {
+    let s = remote_url.trim();
+
+    // SCP-style SSH: git@host:org/repo[.git]
+    if let Some(rest) = s.strip_prefix("git@") {
+        if let Some((host, path)) = rest.split_once(':') {
+            return format!("{}/{}", host.to_lowercase(), normalize_path(path));
+        }
+    }
+
+    // URL schemes: https://, http://, ssh://, git://
+    let after_scheme = s.split_once("://").map_or(s, |(_, r)| r);
+    // Strip userinfo (ssh://git@host/path → host/path)
+    let after_at = after_scheme
+        .split_once('@')
+        .map_or(after_scheme, |(_, r)| r);
+
+    if let Some((host_port, path)) = after_at.split_once('/') {
+        // Strip port from host (github.com:443 → github.com)
+        let host = host_port.split(':').next().unwrap_or(host_port);
+        return format!("{}/{}", host.to_lowercase(), normalize_path(path));
+    }
+
+    // No path component — fall back to local name
+    format!("local/{}", sanitize_local(s))
+}
+
+/// Derive corpus for a local-only repo (no git remote): `local/<basename>`.
+///
+/// Non-alphanumeric characters (except `-` and `_`) are replaced by `-`.
+/// Cross-repo `Exports` edges are impossible for local corpora by definition.
+pub fn canonical_corpus_local(repo_root: &Path) -> String {
+    let basename = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    format!("local/{}", sanitize_local(basename))
+}
+
+fn normalize_path(path: &str) -> String {
+    // Lowercase first so .trim_end_matches(".git") also catches ".GIT".
+    let lower = path.to_lowercase();
+    lower
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+fn sanitize_local(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
 
 /// Kythe-style globally unique identifier for a code entity.
 ///
@@ -225,5 +303,123 @@ mod tests {
         let v = sample_vname();
         let node = Node::new(v.clone(), "function");
         assert_eq!(node.id, v.id());
+    }
+
+    // ── ARCH-102: canonical_corpus tests ─────────────────────────────────────
+
+    #[test]
+    fn canonical_corpus_handles_https_with_git_suffix() {
+        assert_eq!(
+            canonical_corpus("https://github.com/raj-rkv/travsr.git"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_handles_https_without_git_suffix() {
+        assert_eq!(
+            canonical_corpus("https://github.com/raj-rkv/travsr"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_handles_scp_style_ssh() {
+        assert_eq!(
+            canonical_corpus("git@github.com:raj-rkv/travsr.git"),
+            "github.com/raj-rkv/travsr"
+        );
+        assert_eq!(
+            canonical_corpus("git@github.com:raj-rkv/travsr"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_handles_ssh_url() {
+        assert_eq!(
+            canonical_corpus("ssh://git@github.com/raj-rkv/travsr.git"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_handles_git_protocol() {
+        assert_eq!(
+            canonical_corpus("git://github.com/raj-rkv/travsr.git"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_lowercases_input() {
+        assert_eq!(
+            canonical_corpus("HTTPS://GITHUB.COM/Raj-Rkv/Travsr.GIT"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_strips_port() {
+        assert_eq!(
+            canonical_corpus("https://github.com:443/raj-rkv/travsr.git"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_strips_trailing_slash() {
+        assert_eq!(
+            canonical_corpus("https://github.com/raj-rkv/travsr/"),
+            "github.com/raj-rkv/travsr"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_gitlab() {
+        assert_eq!(
+            canonical_corpus("https://gitlab.com/acme/payments-api.git"),
+            "gitlab.com/acme/payments-api"
+        );
+    }
+
+    #[test]
+    fn canonical_corpus_local_uses_basename() {
+        let path = std::path::Path::new("/home/user/my-project");
+        assert_eq!(canonical_corpus_local(path), "local/my-project");
+    }
+
+    #[test]
+    fn canonical_corpus_local_sanitises_special_chars() {
+        let path = std::path::Path::new("/tmp/My Project (v2)");
+        let result = canonical_corpus_local(path);
+        assert!(result.starts_with("local/"));
+        assert!(!result.contains(' '), "spaces must be replaced");
+        assert!(!result.contains('('), "parens must be replaced");
+    }
+
+    #[test]
+    fn different_corpus_produces_non_colliding_node_ids() {
+        // Regression: same file + same signature in two different repos must
+        // produce different NodeIds because corpus is part of the BLAKE3 input.
+        let v_repo_a = VName::new(
+            "github.com/acme/repo-a",
+            "",
+            "src/foo.ts",
+            "typescript",
+            "fn:bar",
+        );
+        let v_repo_b = VName::new(
+            "github.com/acme/repo-b",
+            "",
+            "src/foo.ts",
+            "typescript",
+            "fn:bar",
+        );
+        assert_ne!(
+            v_repo_a.id(),
+            v_repo_b.id(),
+            "different corpora must produce different NodeIds (cross-repo VName collision)"
+        );
     }
 }

@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
-use travsr_indexer::{hash_file, ingest_lsif, run_lsif_emitter, Indexer};
+use travsr_core::{canonical_corpus, canonical_corpus_local};
+use travsr_indexer::{hash_file, ingest_lsif, link_imports, run_lsif_emitter, Indexer};
 use travsr_store::{SqliteStore, Store};
 
 pub use hook::install_hook;
@@ -52,6 +53,15 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     }
 
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
+
+    // ARCH-102: detect canonical corpus from the git remote and persist it so
+    // every VName in this graph uses the same corpus identifier.
+    // reindex_files reads this value back on subsequent hook runs.
+    let corpus = detect_corpus(repo_root);
+    if let Err(e) = store.set_meta("corpus", &corpus) {
+        tracing::warn!("could not write corpus to meta: {e}");
+    }
+    tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
     let mut files_indexed: u64 = 0;
     let mut edges_written: u64 = 0;
@@ -119,7 +129,21 @@ pub fn reindex_files(
     repo_root: &Path,
     store: &mut SqliteStore,
 ) -> anyhow::Result<()> {
-    let indexer = Indexer::new();
+    // ARCH-102: read the corpus that was set during init_repo so that
+    // incremental hook runs produce VNames with the same corpus as the
+    // initial full index. Fall back gracefully for legacy DBs.
+    let corpus = store
+        .get_meta("corpus")
+        .unwrap_or_default()
+        .unwrap_or_default();
+    if corpus.is_empty() {
+        tracing::warn!(
+            "no corpus in meta — VNames will use empty corpus. \
+             Run `travsr init` to set the canonical corpus (ARCH-102)."
+        );
+    }
+
+    let indexer = Indexer::with_corpus(&corpus);
 
     for abs_path in paths {
         let vname_path = abs_path
@@ -163,7 +187,7 @@ pub fn reindex_files(
             }
         }
 
-        for edge in travsr_indexer::link_imports(&out.nodes, &vname_path) {
+        for edge in link_imports(&out.nodes, &vname_path, &corpus) {
             if let Err(err) = store.put_edge(&edge) {
                 tracing::warn!("resolves-to edge write error: {err}");
             }
@@ -226,6 +250,32 @@ fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
         "lsif pass: {} RefCall edges persisted",
         lsif_out.edges.len()
     );
+}
+
+/// Derive the canonical corpus for `repo_root` by reading `git remote get-url origin`.
+/// Falls back to `local/<basename>` if no remote is configured or git fails.
+fn detect_corpus(repo_root: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "remote",
+            "get-url",
+            "origin",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if remote.is_empty() {
+                canonical_corpus_local(repo_root)
+            } else {
+                canonical_corpus(&remote)
+            }
+        }
+        _ => canonical_corpus_local(repo_root),
+    }
 }
 
 fn hex_encode(bytes: &[u8; 32]) -> String {
