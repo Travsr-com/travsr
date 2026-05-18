@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod protocol;
+mod sanitize;
 mod server;
 mod tools;
 
