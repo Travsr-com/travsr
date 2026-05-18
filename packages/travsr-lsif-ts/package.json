@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "node --test dist/test/integration.test.js",
+    "test": "node --test dist/test/integration.test.js dist/test/security.test.js",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
