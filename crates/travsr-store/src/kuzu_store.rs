@@ -7,12 +7,13 @@
 //! implements the same `Store` trait behind a `kuzu` Cargo feature flag so
 //! the rest of the codebase is unaffected until the feature is enabled.
 //!
-//! # Interior mutability
-//! The `Store` trait requires `&self` for read operations
-//! (`get_node`, `iter_edges_from`, `iter_edges_to`). Kùzu's
-//! `Connection::prepare` and `Connection::execute` require `&mut Connection`.
-//! We bridge the gap with `RefCell<Connection>` — safe because `KuzuStore`
-//! is explicitly not `Sync` and the indexing pipeline is single-threaded.
+//! # Connection-per-operation design
+//! In kuzu 0.11.x, `Connection<'db>` borrows from `Database` with an explicit
+//! lifetime parameter. Storing both in the same struct would create a
+//! self-referential type that Rust cannot express safely without `unsafe`.
+//! Instead, `KuzuStore` stores only the `Database` and creates a fresh
+//! `Connection` for each operation. Kùzu connections are thin C-level
+//! handles; the overhead is negligible compared to the query cost.
 //!
 //! # Schema (Kùzu Cypher DDL)
 //! ```cypher
@@ -25,7 +26,6 @@
 //! `id` is the BLAKE3-derived `NodeId` reinterpreted as `i64` (bitcast of
 //! the `u64`), identical to the SQLite backend's storage strategy.
 
-use std::cell::RefCell;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -37,12 +37,9 @@ use crate::Store;
 
 /// Kùzu-backed graph store. Not `Sync` — one instance per indexing thread.
 pub struct KuzuStore {
-    /// Kept alive so the Connection's internal C-level database pointer
-    /// remains valid for the lifetime of the store.
-    _db: kuzu::Database,
-    /// `RefCell` enables `&self` read methods to obtain `&mut Connection`
-    /// without requiring the `Store` trait to use `&mut self` for reads.
-    conn: RefCell<kuzu::Connection>,
+    /// The open Kùzu database. Connections borrow from this, so it must
+    /// outlive every `Connection` created from it.
+    db: kuzu::Database,
 }
 
 impl KuzuStore {
@@ -52,13 +49,14 @@ impl KuzuStore {
     pub fn open(path: &Path) -> Result<Self> {
         let db = kuzu::Database::new(path, kuzu::SystemConfig::default())
             .with_context(|| format!("opening Kùzu database at {}", path.display()))?;
-        let conn = kuzu::Connection::new(&db).context("creating Kùzu connection")?;
-        let store = Self {
-            _db: db,
-            conn: RefCell::new(conn),
-        };
+        let store = Self { db };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Create a short-lived connection for one operation.
+    fn connect(&self) -> Result<kuzu::Connection<'_>> {
+        kuzu::Connection::new(&self.db).context("creating Kùzu connection")
     }
 
     /// Create the node and edge tables. Kùzu has no `CREATE … IF NOT EXISTS`
@@ -79,16 +77,12 @@ impl KuzuStore {
             "CREATE REL TABLE edges(FROM nodes TO nodes, kind STRING)",
         ];
 
+        let mut conn = self.connect().context("init_schema")?;
         for ddl in ddl_stmts {
-            match self.conn.borrow_mut().query(ddl) {
+            match conn.query(ddl) {
                 Ok(_) => {}
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("already exists") || msg.contains("has been created") {
-                        continue;
-                    }
-                    return Err(e).context("Kùzu schema initialisation failed");
-                }
+                Err(e) if is_already_exists(&e) => {}
+                Err(e) => return Err(e).context("Kùzu schema initialisation failed"),
             }
         }
         Ok(())
@@ -100,7 +94,7 @@ impl KuzuStore {
 impl Store for KuzuStore {
     /// Upsert a node — creates it if absent, updates `kind` if already present.
     fn put_node(&mut self, node: &Node) -> Result<NodeId> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.connect().context("put_node")?;
         let mut stmt = conn
             .prepare(
                 "MERGE (n:nodes {id: $id}) \
@@ -132,7 +126,7 @@ impl Store for KuzuStore {
     /// Insert a directed edge. Idempotent — duplicate (src, dst, kind) tuples
     /// are silently ignored via MERGE.
     fn put_edge(&mut self, edge: &Edge) -> Result<()> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.connect().context("put_edge")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (src:nodes {id: $src}), (dst:nodes {id: $dst}) \
@@ -152,7 +146,7 @@ impl Store for KuzuStore {
     }
 
     fn get_node(&self, id: NodeId) -> Result<Option<Node>> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.connect().context("get_node")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (n:nodes {id: $id}) \
@@ -166,8 +160,10 @@ impl Store for KuzuStore {
             )
             .context("executing get_node")?;
 
-        let row = match result.next() {
-            Some(r) => r,
+        // Explicit type annotation disambiguates the unsized-slice type that
+        // kuzu 0.11.x exposes through its Iterator impl (E0277 fix).
+        let row: Vec<Option<kuzu::Value>> = match result.next() {
+            Some(r) => r.into_iter().collect(),
             None => return Ok(None),
         };
 
@@ -187,7 +183,7 @@ impl Store for KuzuStore {
 
     /// O(out-degree(src))
     fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.connect().context("iter_edges_from")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (s:nodes {id: $src})-[e:edges]->(d:nodes) \
@@ -202,7 +198,8 @@ impl Store for KuzuStore {
             .context("executing iter_edges_from")?;
 
         let mut edges = Vec::new();
-        while let Some(row) = result.next() {
+        while let Some(raw) = result.next() {
+            let row: Vec<Option<kuzu::Value>> = raw.into_iter().collect();
             let dst_raw = extract_i64(&row, 0, "d.id")?;
             let kind_str = extract_string(&row, 1, "e.kind")?;
             let kind = EdgeKind::from_str(&kind_str)
@@ -214,7 +211,7 @@ impl Store for KuzuStore {
 
     /// O(in-degree(dst))
     fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>> {
-        let mut conn = self.conn.borrow_mut();
+        let mut conn = self.connect().context("iter_edges_to")?;
         let mut stmt = conn
             .prepare(
                 "MATCH (s:nodes)-[e:edges]->(d:nodes {id: $dst}) \
@@ -229,7 +226,8 @@ impl Store for KuzuStore {
             .context("executing iter_edges_to")?;
 
         let mut edges = Vec::new();
-        while let Some(row) = result.next() {
+        while let Some(raw) = result.next() {
+            let row: Vec<Option<kuzu::Value>> = raw.into_iter().collect();
             let src_raw = extract_i64(&row, 0, "s.id")?;
             let kind_str = extract_string(&row, 1, "e.kind")?;
             let kind = EdgeKind::from_str(&kind_str)
@@ -248,6 +246,12 @@ fn node_id_to_i64(id: NodeId) -> i64 {
 
 fn i64_to_node_id(v: i64) -> NodeId {
     NodeId(v as u64)
+}
+
+/// True if the Kùzu error means the table already exists (idempotent DDL).
+fn is_already_exists(e: &kuzu::Error) -> bool {
+    let s = e.to_string();
+    s.contains("already exists") || s.contains("has been created")
 }
 
 fn extract_string(row: &[Option<kuzu::Value>], idx: usize, field: &str) -> Result<String> {
@@ -285,7 +289,6 @@ mod tests {
     #[test]
     fn open_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        // Second open on same path must not fail — schema already exists.
         open_store(tmp.path());
         open_store(tmp.path());
     }
@@ -316,7 +319,6 @@ mod tests {
         store
             .put_edge(&Edge::new(a.id, c.id, EdgeKind::Depends))
             .unwrap();
-        // Duplicate edge must be a no-op.
         store
             .put_edge(&Edge::new(a.id, b.id, EdgeKind::RefCall))
             .unwrap();
@@ -347,7 +349,6 @@ mod tests {
             let mut store = open_store(tmp.path());
             store.put_node(&n).unwrap()
         };
-        // Re-open — node must still be there.
         let store = open_store(tmp.path());
         assert_eq!(store.get_node(id).unwrap().as_ref(), Some(&n));
     }
