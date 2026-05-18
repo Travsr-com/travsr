@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
+use travsr_core::SIGNATURE_FORMAT_VERSION;
 use travsr_indexer::{hash_file, ingest_lsif, run_lsif_emitter, Indexer};
 use travsr_store::{SqliteStore, Store};
 
@@ -52,6 +53,12 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     }
 
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
+
+    // Stamp the format version BEFORE indexing so that the reindex_files calls
+    // below see version == SIGNATURE_FORMAT_VERSION and don't skip files.
+    if let Err(e) = store.set_signature_format_version(SIGNATURE_FORMAT_VERSION) {
+        tracing::warn!("could not write signature_format_version before init: {e}");
+    }
 
     let mut files_indexed: u64 = 0;
     let mut edges_written: u64 = 0;
@@ -119,6 +126,22 @@ pub fn reindex_files(
     repo_root: &Path,
     store: &mut SqliteStore,
 ) -> anyhow::Result<()> {
+    // RFC-002: detect signature format version mismatch before touching the
+    // graph. The hook must never block a commit, so return Ok(()) on mismatch
+    // and let the user resolve it with `travsr init`.
+    match store.get_signature_format_version() {
+        Ok(stored) if stored != SIGNATURE_FORMAT_VERSION => {
+            tracing::warn!(
+                "skipping reindex: graph.db was built with signature format v{stored} \
+                 but this binary uses v{SIGNATURE_FORMAT_VERSION}. \
+                 Run `travsr init` to re-index and update the graph."
+            );
+            return Ok(());
+        }
+        Err(e) => tracing::warn!("could not read signature_format_version: {e}"),
+        _ => {}
+    }
+
     let indexer = Indexer::new();
 
     for abs_path in paths {
@@ -305,6 +328,10 @@ mod tests {
         let db_path = tmp.path().join(".travsr/graph.db");
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
         let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // Simulate init_repo: stamp the version before any reindex call.
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
 
         reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
         let count_after_first = store.node_count().unwrap();
@@ -409,6 +436,10 @@ mod tests {
         let db_path = tmp.path().join(".travsr/graph.db");
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
         let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // Simulate init_repo: stamp the version before any reindex call.
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
 
         reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
 

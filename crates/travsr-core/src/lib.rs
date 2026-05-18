@@ -9,6 +9,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Version of the VName signature format baked into every `NodeId` hash.
+///
+/// This byte is the **first input** to the BLAKE3 hasher in `VName::id()`.
+/// Changing it produces a disjoint `NodeId` space — any `.travsr/graph.db`
+/// built with a different version must be fully re-indexed before it can be
+/// queried. See `docs/rfcs/RFC-002-vname-signature-versioning.md`.
+///
+/// Version history:
+///   0 — legacy (no version byte; all pre-RFC-002 databases)
+///   1 — current: Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
+pub const SIGNATURE_FORMAT_VERSION: u8 = 1;
+
 /// Kythe-style globally unique identifier for a code entity.
 ///
 /// VNames are stable across repos, languages, and time — they form the
@@ -47,12 +59,18 @@ impl VName {
 
     /// Stable 64-bit identifier derived from the five-field VName.
     ///
-    /// The hash is the first 8 bytes of the BLAKE3 digest of the
-    /// NUL-separated fields, interpreted as little-endian `u64`. This is
-    /// deterministic across machines, processes, and Travsr versions and
-    /// is suitable for use as the SQLite primary key.
+    /// The hash is the first 8 bytes of the BLAKE3 digest of:
+    ///   `[SIGNATURE_FORMAT_VERSION] || corpus NUL root NUL path NUL language NUL signature`
+    ///
+    /// The leading version byte domain-separates hashes across signature format
+    /// versions (RFC-002). It is deterministic across machines, processes, and
+    /// Travsr versions within the same format version, and is suitable for use
+    /// as the SQLite primary key.
     pub fn id(&self) -> NodeId {
         let mut hasher = blake3::Hasher::new();
+        // Domain separator — must be the first byte. Changing SIGNATURE_FORMAT_VERSION
+        // produces disjoint NodeId spaces; see RFC-002 for the version history.
+        hasher.update(&[SIGNATURE_FORMAT_VERSION]);
         hasher.update(self.corpus.as_bytes());
         hasher.update(b"\0");
         hasher.update(self.root.as_bytes());
@@ -225,5 +243,35 @@ mod tests {
         let v = sample_vname();
         let node = Node::new(v.clone(), "function");
         assert_eq!(node.id, v.id());
+    }
+
+    #[test]
+    fn version_byte_produces_different_id_than_unversioned() {
+        // Regression guard: confirms the RFC-002 domain separator is actually
+        // prepended. If BLAKE3 without a version byte ever produced the same
+        // NodeId as with one, the domain separation would be broken.
+        let v = sample_vname();
+        let versioned_id = v.id(); // uses SIGNATURE_FORMAT_VERSION byte
+
+        // Compute the legacy (no version byte) hash directly.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(v.corpus.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.root.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.language.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.signature.as_bytes());
+        let digest = hasher.finalize();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&digest.as_bytes()[..8]);
+        let legacy_id = NodeId(u64::from_le_bytes(buf));
+
+        assert_ne!(
+            versioned_id, legacy_id,
+            "RFC-002 version byte must produce a different NodeId than the legacy hash"
+        );
     }
 }

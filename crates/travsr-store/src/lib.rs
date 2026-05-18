@@ -15,13 +15,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 
 /// The current schema version. Bump when adding a migration.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// Migration scripts applied in order. Index 0 takes the DB from version 0
 /// (fresh) to version 1, index 1 from version 1 to version 2, etc.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/v1_initial.sql"),
     include_str!("migrations/v2_edge_provenance.sql"),
+    include_str!("migrations/v3_signature_format_version.sql"),
 ];
 
 /// The storage interface every Travsr backend must satisfy.
@@ -289,6 +290,27 @@ impl SqliteStore {
             )
             .context("writing meta key")?;
         Ok(())
+    }
+
+    /// Return the VName signature format version recorded in this database.
+    ///
+    /// Returns `0` for legacy databases (pre-RFC-002) that have no such row,
+    /// or databases migrated from schema v2 where the row was just added with
+    /// the default value `'0'`.
+    pub fn get_signature_format_version(&self) -> Result<u8> {
+        let raw = self
+            .get_meta("signature_format_version")
+            .context("reading signature_format_version")?
+            .unwrap_or_else(|| "0".to_string());
+        raw.parse::<u8>()
+            .with_context(|| format!("invalid signature_format_version in meta: {raw}"))
+    }
+
+    /// Write the VName signature format version. Called by the daemon after a
+    /// successful full re-index to stamp the active format version.
+    pub fn set_signature_format_version(&mut self, v: u8) -> Result<()> {
+        self.set_meta("signature_format_version", &v.to_string())
+            .context("writing signature_format_version")
     }
 
     /// Persist an edge with LSIF (semantic) provenance.
