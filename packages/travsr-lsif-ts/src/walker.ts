@@ -23,6 +23,7 @@
 import * as ts from 'typescript';
 import * as path from 'path';
 import { Emitter } from './emitter';
+import { assertFilesContained, isUnderRoot, resolveRoot, sanitizeTsconfig } from './security';
 
 interface SymbolInfo {
   resultSetId: number;
@@ -63,15 +64,33 @@ export function walk(tsconfigPath: string, emitter: Emitter): void {
   }
 
   const basePath = path.dirname(tsconfigPath);
+
+  // SEC-003 — Check 1: reject plugins / escaping extends / escaping references
+  // before handing the config to the TS compiler. Hard error, no fallback.
+  sanitizeTsconfig(configFile.config, basePath);
+
   const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, basePath);
+
+  // SEC-003 — Check 2: every resolved file must be inside the project root.
+  // Uses realpathSync to follow symlinks. Catches malicious globs and files[].
+  const repoRoot = resolveRoot(basePath);
+  assertFilesContained(parsed.fileNames, repoRoot);
+
   const fileSet = new Set(parsed.fileNames.map((f) => path.normalize(f)));
 
   const program = ts.createProgram(parsed.fileNames, parsed.options);
   const checker = program.getTypeChecker();
 
+  // SEC-003 — Check 3: belt-and-suspenders filter so a future refactor cannot
+  // bypass checks 1 & 2 and accidentally emit ranges for out-of-root files.
   const projectFiles = program
     .getSourceFiles()
-    .filter((sf) => !sf.isDeclarationFile && fileSet.has(path.normalize(sf.fileName)));
+    .filter(
+      (sf) =>
+        !sf.isDeclarationFile &&
+        fileSet.has(path.normalize(sf.fileName)) &&
+        isUnderRoot(sf.fileName, repoRoot)
+    );
 
   emitter.emitMetaData(basePath);
   const projectId = emitter.emitProject();
