@@ -1,0 +1,331 @@
+//! Backend-agnostic schema migration framework for Travsr storage backends.
+//!
+//! ## Why this exists
+//! The original `SqliteStore::migrate()` was a private method that applied
+//! a static `&[&str]` of SQL strings. Kùzu uses Cypher DDL — not SQL — so
+//! that approach cannot be shared. This module decouples migration logic from
+//! the backend implementation so both SQLite and Kùzu (and any future engine)
+//! register their own migration structs and share the same versioned runner.
+//!
+//! ## Design
+//! - `Migration` — one schema change, identified by a monotonic version number
+//! - `StoreMigratable` — extends `Store` with DDL execution + version tracking
+//! - `MigrationRunner` — applies pending migrations in version order; idempotent
+//!
+//! ## Kùzu wiring (feature = "kuzu")
+//! When the `kuzu` feature lands, `KuzuStore` implements `StoreMigratable`
+//! (`exec_ddl` calls `Connection::query`, `schema_version`/`set_schema_version`
+//! read/write the Kùzu meta node table) and registers Cypher DDL migrations
+//! via a `kuzu_migration_runner()` factory. No changes to this module are
+//! required — the trait and runner are backend-agnostic by construction.
+
+use anyhow::{Context as _, Result};
+
+use crate::Store;
+
+// ── Public traits ─────────────────────────────────────────────────────────────
+
+/// A single schema migration identified by a monotonically increasing version.
+///
+/// Implementations are backend-specific: SQLite migrations call `exec_ddl`
+/// with SQL strings; Kùzu migrations call it with Cypher DDL.
+///
+/// Version numbers start at 1. Version 0 means "no migrations applied yet"
+/// (fresh database). Every `Migration` must have a unique, stable `version()`.
+pub trait Migration: Send + Sync {
+    /// The schema version this migration upgrades TO.
+    fn version(&self) -> u32;
+
+    /// Apply this migration to `store`.
+    ///
+    /// Called only when `store.schema_version()? < self.version()`.
+    /// After a successful return the runner writes the new version to meta —
+    /// do not write the version inside `up()`.
+    fn up(&self, store: &mut dyn StoreMigratable) -> Result<()>;
+}
+
+/// Extends [`Store`] with the DDL execution and version-tracking capabilities
+/// required by [`MigrationRunner`].
+///
+/// Backend implementations:
+/// - **SQLite** — `exec_ddl` calls `rusqlite::Connection::execute_batch`;
+///   `schema_version`/`set_schema_version` read/write the `meta` table.
+/// - **Kùzu** — `exec_ddl` calls `kuzu::Connection::query` with Cypher DDL;
+///   version is stored in the Kùzu `meta` node table.
+pub trait StoreMigratable: Store {
+    /// Execute a DDL statement against the backend (SQL, Cypher, etc.).
+    /// Must be idempotent when called with `IF NOT EXISTS` guards.
+    fn exec_ddl(&mut self, ddl: &str) -> Result<()>;
+
+    /// Read the current schema version from the backend's meta store.
+    /// Returns 0 when no version has been recorded yet (fresh database).
+    fn schema_version(&self) -> Result<u32>;
+
+    /// Persist the schema version to the backend's meta store.
+    fn set_schema_version(&mut self, v: u32) -> Result<()>;
+}
+
+// ── Runner ────────────────────────────────────────────────────────────────────
+
+/// Applies pending [`Migration`]s in ascending version order.
+///
+/// # Idempotency
+/// `run` reads the current schema version before applying any migration and
+/// skips all migrations whose `version() <= current`. Calling `run` twice on
+/// the same store is a safe no-op.
+///
+/// # Atomicity
+/// Each migration is written to meta individually: if migration N succeeds but
+/// N+1 panics, the database is left at version N rather than 0. This matches
+/// the "apply-and-record" pattern used by most migration frameworks.
+#[derive(Default)]
+pub struct MigrationRunner {
+    migrations: Vec<Box<dyn Migration>>,
+}
+
+impl MigrationRunner {
+    /// Create an empty runner. Use [`register`] to add migrations before
+    /// calling [`run`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a migration. Migrations are sorted by version before running so
+    /// registration order does not matter.
+    pub fn register(&mut self, migration: impl Migration + 'static) {
+        self.migrations.push(Box::new(migration));
+    }
+
+    /// Apply all pending migrations to `store`.
+    ///
+    /// Migrations whose `version()` is already recorded in meta are skipped.
+    /// After each successful migration the version is written to meta so that
+    /// a crash mid-sequence leaves the store at the last successfully applied
+    /// version.
+    pub fn run(&self, store: &mut dyn StoreMigratable) -> Result<()> {
+        let current = store.schema_version().context("reading schema version")?;
+
+        let mut pending: Vec<&dyn Migration> = self
+            .migrations
+            .iter()
+            .map(|m| m.as_ref())
+            .filter(|m| m.version() > current)
+            .collect();
+
+        // Sort ascending so migrations are applied in the correct order
+        // regardless of registration order.
+        pending.sort_by_key(|m| m.version());
+
+        for migration in pending {
+            let v = migration.version();
+            migration
+                .up(store)
+                .with_context(|| format!("applying migration v{v}"))?;
+            store
+                .set_schema_version(v)
+                .with_context(|| format!("recording migration v{v}"))?;
+        }
+
+        Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Edge, Node, NodeId, Store};
+    use anyhow::Result;
+    use travsr_core::VName;
+
+    // ── Minimal in-memory test backend ────────────────────────────────────────
+
+    /// Fake store for testing the runner in isolation — no SQLite required.
+    struct FakeStore {
+        version: u32,
+        ddl_log: Vec<String>,
+    }
+
+    impl FakeStore {
+        fn new() -> Self {
+            Self {
+                version: 0,
+                ddl_log: Vec::new(),
+            }
+        }
+    }
+
+    // Store trait — only version + ddl matter for migration tests.
+    impl Store for FakeStore {
+        fn put_node(&mut self, _: &Node) -> Result<NodeId> {
+            Ok(VName::new("", "", "", "", "").id())
+        }
+        fn put_edge(&mut self, _: &Edge) -> Result<()> {
+            Ok(())
+        }
+        fn get_node(&self, _: NodeId) -> Result<Option<Node>> {
+            Ok(None)
+        }
+        fn iter_edges_from(&self, _: NodeId) -> Result<Vec<Edge>> {
+            Ok(Vec::new())
+        }
+        fn iter_edges_to(&self, _: NodeId) -> Result<Vec<Edge>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl StoreMigratable for FakeStore {
+        fn exec_ddl(&mut self, ddl: &str) -> Result<()> {
+            self.ddl_log.push(ddl.to_string());
+            Ok(())
+        }
+        fn schema_version(&self) -> Result<u32> {
+            Ok(self.version)
+        }
+        fn set_schema_version(&mut self, v: u32) -> Result<()> {
+            self.version = v;
+            Ok(())
+        }
+    }
+
+    // ── Migration stubs ───────────────────────────────────────────────────────
+
+    struct FakeMigrationV1;
+    impl Migration for FakeMigrationV1 {
+        fn version(&self) -> u32 {
+            1
+        }
+        fn up(&self, store: &mut dyn StoreMigratable) -> Result<()> {
+            store.exec_ddl("CREATE TABLE v1")
+        }
+    }
+
+    struct FakeMigrationV2;
+    impl Migration for FakeMigrationV2 {
+        fn version(&self) -> u32 {
+            2
+        }
+        fn up(&self, store: &mut dyn StoreMigratable) -> Result<()> {
+            store.exec_ddl("ALTER TABLE v1 ADD COLUMN v2")
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn runner_applies_all_migrations_on_fresh_store() {
+        let mut store = FakeStore::new();
+        let mut runner = MigrationRunner::new();
+        runner.register(FakeMigrationV1);
+        runner.register(FakeMigrationV2);
+
+        runner.run(&mut store).unwrap();
+
+        assert_eq!(store.version, 2);
+        assert_eq!(
+            store.ddl_log,
+            ["CREATE TABLE v1", "ALTER TABLE v1 ADD COLUMN v2"]
+        );
+    }
+
+    #[test]
+    fn runner_is_idempotent() {
+        let mut store = FakeStore::new();
+        let mut runner = MigrationRunner::new();
+        runner.register(FakeMigrationV1);
+        runner.register(FakeMigrationV2);
+
+        runner.run(&mut store).unwrap();
+        let ddl_count_after_first = store.ddl_log.len();
+
+        runner.run(&mut store).unwrap(); // second call — must be a no-op
+        assert_eq!(
+            store.ddl_log.len(),
+            ddl_count_after_first,
+            "second run must not apply any migration"
+        );
+    }
+
+    #[test]
+    fn runner_skips_already_applied_migrations() {
+        let mut store = FakeStore::new();
+        store.version = 1; // simulate V1 already applied
+
+        let mut runner = MigrationRunner::new();
+        runner.register(FakeMigrationV1);
+        runner.register(FakeMigrationV2);
+
+        runner.run(&mut store).unwrap();
+
+        assert_eq!(store.version, 2);
+        // Only V2 DDL must have been executed.
+        assert_eq!(store.ddl_log, ["ALTER TABLE v1 ADD COLUMN v2"]);
+    }
+
+    #[test]
+    fn runner_applies_out_of_order_registrations_correctly() {
+        let mut store = FakeStore::new();
+        let mut runner = MigrationRunner::new();
+        runner.register(FakeMigrationV2); // registered first
+        runner.register(FakeMigrationV1); // registered second
+
+        runner.run(&mut store).unwrap();
+
+        // Must be applied V1 → V2 regardless of registration order.
+        assert_eq!(
+            store.ddl_log,
+            ["CREATE TABLE v1", "ALTER TABLE v1 ADD COLUMN v2"]
+        );
+    }
+
+    #[test]
+    fn runner_records_version_after_each_migration() {
+        struct VersionCapture {
+            inner: FakeStore,
+            versions_at_set: Vec<u32>,
+        }
+        impl Store for VersionCapture {
+            fn put_node(&mut self, n: &Node) -> Result<NodeId> {
+                self.inner.put_node(n)
+            }
+            fn put_edge(&mut self, e: &Edge) -> Result<()> {
+                self.inner.put_edge(e)
+            }
+            fn get_node(&self, id: NodeId) -> Result<Option<Node>> {
+                self.inner.get_node(id)
+            }
+            fn iter_edges_from(&self, id: NodeId) -> Result<Vec<Edge>> {
+                self.inner.iter_edges_from(id)
+            }
+            fn iter_edges_to(&self, id: NodeId) -> Result<Vec<Edge>> {
+                self.inner.iter_edges_to(id)
+            }
+        }
+        impl StoreMigratable for VersionCapture {
+            fn exec_ddl(&mut self, ddl: &str) -> Result<()> {
+                self.inner.exec_ddl(ddl)
+            }
+            fn schema_version(&self) -> Result<u32> {
+                self.inner.schema_version()
+            }
+            fn set_schema_version(&mut self, v: u32) -> Result<()> {
+                self.versions_at_set.push(v);
+                self.inner.set_schema_version(v)
+            }
+        }
+
+        let mut store = VersionCapture {
+            inner: FakeStore::new(),
+            versions_at_set: Vec::new(),
+        };
+        let mut runner = MigrationRunner::new();
+        runner.register(FakeMigrationV1);
+        runner.register(FakeMigrationV2);
+
+        runner.run(&mut store).unwrap();
+
+        // Version must be set once per migration, in order.
+        assert_eq!(store.versions_at_set, [1, 2]);
+    }
+}

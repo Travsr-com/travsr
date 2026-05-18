@@ -6,7 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod migration;
 pub mod registry;
+
+pub use migration::{Migration, MigrationRunner, StoreMigratable};
 
 use std::path::Path;
 
@@ -14,15 +17,38 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 
-/// The current schema version. Bump when adding a migration.
-const SCHEMA_VERSION: u32 = 2;
+// ── SQLite migration structs (T2) ─────────────────────────────────────────────
+// Each SQL file becomes a concrete Migration so the runner can apply them
+// independently and track progress per-version rather than all-or-nothing.
 
-/// Migration scripts applied in order. Index 0 takes the DB from version 0
-/// (fresh) to version 1, index 1 from version 1 to version 2, etc.
-const MIGRATIONS: &[&str] = &[
-    include_str!("migrations/v1_initial.sql"),
-    include_str!("migrations/v2_edge_provenance.sql"),
-];
+struct V1Initial;
+impl Migration for V1Initial {
+    fn version(&self) -> u32 {
+        1
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl(include_str!("migrations/v1_initial.sql"))
+    }
+}
+
+struct V2EdgeProvenance;
+impl Migration for V2EdgeProvenance {
+    fn version(&self) -> u32 {
+        2
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl(include_str!("migrations/v2_edge_provenance.sql"))
+    }
+}
+
+/// Build the ordered migration runner for the SQLite backend.
+/// Register new SQLite migrations here; version order is enforced by the runner.
+fn sqlite_migration_runner() -> MigrationRunner {
+    let mut r = MigrationRunner::new();
+    r.register(V1Initial);
+    r.register(V2EdgeProvenance);
+    r
+}
 
 /// The storage interface every Travsr backend must satisfy.
 pub trait Store {
@@ -46,21 +72,39 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Open (or create) a SQLite-backed store at `path`, enabling WAL and
-    /// running any pending migrations.
+    /// running any pending migrations via [`MigrationRunner`].
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite database at {}", path.display()))?;
         Self::configure(&conn)?;
-        Self::migrate(&conn)?;
-        Ok(Self { conn })
+        // Bootstrap the meta table before the runner reads the schema version.
+        Self::bootstrap_meta(&conn)?;
+        let mut store = Self { conn };
+        sqlite_migration_runner()
+            .run(&mut store)
+            .context("running SQLite migrations")?;
+        Ok(store)
     }
 
     /// Open an in-memory SQLite store. Used in tests; WAL is not available
     /// on `:memory:` connections, so journal mode falls back to MEMORY.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
-        Self::migrate(&conn)?;
-        Ok(Self { conn })
+        Self::bootstrap_meta(&conn)?;
+        let mut store = Self { conn };
+        sqlite_migration_runner()
+            .run(&mut store)
+            .context("running SQLite migrations (in-memory)")?;
+        Ok(store)
+    }
+
+    /// Create the `meta` table if it does not already exist.
+    /// Must run before the migration runner, which uses meta to read the version.
+    fn bootstrap_meta(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .context("bootstrapping meta table")
     }
 
     fn configure(conn: &Connection) -> Result<()> {
@@ -70,42 +114,6 @@ impl SqliteStore {
             .context("setting synchronous=NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign_keys pragma")?;
-        Ok(())
-    }
-
-    fn migrate(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-        )
-        .context("creating meta table")?;
-
-        let current: u32 = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .context("reading schema_version")?
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        for (idx, sql) in MIGRATIONS.iter().enumerate() {
-            let target = idx as u32 + 1;
-            if current >= target {
-                continue;
-            }
-            conn.execute_batch(sql)
-                .with_context(|| format!("applying migration v{target}"))?;
-        }
-
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?1) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![SCHEMA_VERSION.to_string()],
-        )
-        .context("recording schema_version")?;
-
         Ok(())
     }
 
@@ -312,6 +320,42 @@ impl SqliteStore {
     }
 }
 
+// ── StoreMigratable (T3) ──────────────────────────────────────────────────────
+
+impl StoreMigratable for SqliteStore {
+    fn exec_ddl(&mut self, ddl: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(ddl)
+            .context("SqliteStore::exec_ddl")
+    }
+
+    fn schema_version(&self) -> anyhow::Result<u32> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("reading schema_version from meta")?;
+        Ok(raw.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
+    fn set_schema_version(&mut self, v: u32) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta(key, value) VALUES('schema_version', ?1) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![v.to_string()],
+            )
+            .context("writing schema_version to meta")?;
+        Ok(())
+    }
+}
+
+// ── Store ─────────────────────────────────────────────────────────────────────
+
 impl Store for SqliteStore {
     fn put_node(&mut self, node: &Node) -> Result<NodeId> {
         let id_i64 = node_id_to_i64(node.id);
@@ -446,9 +490,10 @@ mod tests {
     #[test]
     fn migration_is_idempotent_in_memory() {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        // Re-running the migration on the same connection must not error.
-        SqliteStore::migrate(&store.conn).unwrap();
-        SqliteStore::migrate(&store.conn).unwrap();
+        // Re-running the migration runner on an already-migrated store must be a no-op.
+        let runner = sqlite_migration_runner();
+        runner.run(&mut store).unwrap();
+        runner.run(&mut store).unwrap();
         let n = sample_node("fn:roundtrip");
         store.put_node(&n).unwrap();
     }
