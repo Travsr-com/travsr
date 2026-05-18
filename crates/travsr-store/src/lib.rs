@@ -8,6 +8,11 @@
 
 pub mod registry;
 
+#[cfg(feature = "kuzu")]
+pub mod kuzu_store;
+#[cfg(feature = "kuzu")]
+pub use kuzu_store::KuzuStore;
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
