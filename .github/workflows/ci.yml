@@ -68,7 +68,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
+
+  kuzu:
+    name: travsr-store (kuzu feature, Ubuntu only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CMake (required to build Kùzu C++ from source)
+        run: sudo apt-get install -y cmake
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and test travsr-store with Kùzu backend
+        run: cargo test -p travsr-store --features kuzu
 
   lsif-ts:
     name: lsif-ts (build + test)
