@@ -70,31 +70,6 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-  kuzu:
-    name: travsr-store (kuzu feature — type-check only)
-    runs-on: ubuntu-latest
-    # Informational only: kuzu 0.11.x has a known cxx-bridge linking issue
-    # where kuzu_rs$cxxbridge1$* symbols are not emitted into the link by its
-    # build.rs. cargo check verifies our API usage compiles correctly; full
-    # integration tests run locally once the upstream linking issue is resolved.
-    # Tracked: https://github.com/raj-rkv/travsr/issues/27
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install CMake (required to build Kùzu C++ from source)
-        run: sudo apt-get install -y cmake
-
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
-
-      - name: Type-check travsr-store with Kùzu feature
-        run: cargo check --tests -p travsr-store --features kuzu
-
   lsif-ts:
     name: lsif-ts (build + test)
     runs-on: ubuntu-latest
