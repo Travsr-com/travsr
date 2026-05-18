@@ -34,11 +34,13 @@ import * as path from 'path';
  * to assertFilesContained and isUnderRoot.
  */
 export function resolveRoot(basePath: string): string {
-  try {
-    return fs.realpathSync(path.resolve(basePath));
-  } catch {
-    return path.resolve(basePath);
-  }
+  // Use safeRealpath so partial paths (e.g. /tmp/proj where /tmp → /private/tmp
+  // on macOS but /tmp/proj doesn't exist yet) are resolved consistently with
+  // the paths produced by safeRealpath() inside sanitizeTsconfig and
+  // assertFilesContained. Using fs.realpathSync directly would leave /tmp
+  // unresolved when the child directory is absent, causing a mismatched
+  // prefix comparison and a false-positive SEC-003 error.
+  return safeRealpath(path.resolve(basePath));
 }
 
 /**
@@ -84,7 +86,12 @@ export function sanitizeTsconfig(config: unknown, basePath: string): void {
             'Only local paths within the project root are permitted.'
         );
       }
-      assertUnderRoot(path.resolve(basePath, ext), repoRoot, 'tsconfig.extends');
+      // safeRealpath resolves symlinks so that the comparison against repoRoot
+      // (which was also resolved via realpathSync) is consistent. Without this,
+      // a valid extends on macOS where /tmp → /private/tmp would produce a
+      // false-positive SEC-003 error (path.resolve gives /tmp/…, repoRoot is
+      // /private/tmp/…, so the containment check fails incorrectly).
+      assertUnderRoot(safeRealpath(path.resolve(basePath, ext)), repoRoot, 'tsconfig.extends');
     }
   }
 
@@ -95,8 +102,9 @@ export function sanitizeTsconfig(config: unknown, basePath: string): void {
       if (typeof ref !== 'object' || ref === null) continue;
       const refPath = (ref as Record<string, unknown>)['path'];
       if (typeof refPath !== 'string') continue;
+      // Same symlink-resolution rationale as extends above.
       assertUnderRoot(
-        path.resolve(basePath, refPath),
+        safeRealpath(path.resolve(basePath, refPath)),
         repoRoot,
         'tsconfig.references[].path'
       );

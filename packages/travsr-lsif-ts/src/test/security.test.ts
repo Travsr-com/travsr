@@ -46,6 +46,22 @@ test('sanitizeTsconfig: rejects extends escaping the project root', () => {
   );
 });
 
+test('sanitizeTsconfig: rejects references[].path escaping the project root', () => {
+  const config = { references: [{ path: '../../other-project' }] };
+  assert.throws(
+    () => sanitizeTsconfig(config, '/tmp/proj/nested'),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.ok(err.message.includes('SEC-003'), `missing SEC-003 prefix: ${err.message}`);
+      assert.ok(
+        err.message.includes('references'),
+        `missing 'references' in message: ${err.message}`
+      );
+      return true;
+    }
+  );
+});
+
 test('sanitizeTsconfig: rejects extends with http URL', () => {
   const config = { extends: 'https://attacker.example/malicious.json' };
   assert.throws(
