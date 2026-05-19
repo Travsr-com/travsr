@@ -32,6 +32,23 @@ use crate::Store;
 ///
 /// Version numbers start at 1. Version 0 means "no migrations applied yet"
 /// (fresh database). Every `Migration` must have a unique, stable `version()`.
+///
+/// # Known limitation — atomicity gap
+/// `MigrationRunner::run` applies DDL (`up()`) and records the new schema
+/// version as two separate steps with no transaction wrapping them together.
+/// If the process is killed between `up()` returning and `set_schema_version`
+/// being written, the next startup will re-run `up()` against DDL that was
+/// already partially applied.
+///
+/// **All `up()` implementations must therefore be idempotent under re-execution.
+/// Use `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`,
+/// `CREATE INDEX IF NOT EXISTS`, and equivalent backend-specific guards.** A
+/// migration that is not idempotent will corrupt the schema on the re-run.
+///
+/// If strict atomicity is required in the future, extend `StoreMigratable` with
+/// `begin_tx(&mut self) -> Result<()>` / `commit_tx(&mut self) -> Result<()>`
+/// and wrap each migration in a DDL transaction (supported by both SQLite and
+/// Kùzu).
 pub trait Migration: Send + Sync {
     /// The schema version this migration upgrades TO.
     fn version(&self) -> u32;
@@ -41,6 +58,9 @@ pub trait Migration: Send + Sync {
     /// Called only when `store.schema_version()? < self.version()`.
     /// After a successful return the runner writes the new version to meta —
     /// do not write the version inside `up()`.
+    ///
+    /// **Must be idempotent** — see the trait-level documentation on the
+    /// atomicity gap between DDL application and version recording.
     fn up(&self, store: &mut dyn StoreMigratable) -> Result<()>;
 }
 
@@ -92,7 +112,17 @@ impl MigrationRunner {
 
     /// Add a migration. Migrations are sorted by version before running so
     /// registration order does not matter.
+    ///
+    /// # Panics (debug only)
+    /// Panics in debug builds if a migration with the same `version()` has
+    /// already been registered. Duplicate versions cause undefined apply order
+    /// and double DDL execution — catch this at startup, not at migration time.
     pub fn register(&mut self, migration: impl Migration + 'static) {
+        let v = migration.version();
+        debug_assert!(
+            !self.migrations.iter().any(|m| m.version() == v),
+            "duplicate migration version {v} registered — each version must be unique"
+        );
         self.migrations.push(Box::new(migration));
     }
 
