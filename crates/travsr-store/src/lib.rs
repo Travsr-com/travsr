@@ -6,12 +6,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod migration_manifest;
 pub mod registry;
 
 #[cfg(feature = "kuzu")]
 pub mod kuzu_store;
 #[cfg(feature = "kuzu")]
 pub use kuzu_store::KuzuStore;
+
+pub use migration_manifest::compute_manifest_sqlite;
+#[cfg(feature = "kuzu")]
+pub use migration_manifest::{compute_manifest_kuzu, migrate_sqlite_to_kuzu};
+pub use migration_manifest::{Manifest, ManifestEntry, MigrationError};
 
 use std::path::Path;
 
