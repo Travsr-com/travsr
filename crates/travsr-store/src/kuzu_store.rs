@@ -459,17 +459,23 @@ mod tests {
             EdgeKind::DefinesBinding,
             EdgeKind::Exports,
             EdgeKind::ResolvesTo,
+            EdgeKind::RefImports,
+            EdgeKind::IsImplementation,
+            EdgeKind::Overrides,
         ] {
             store.put_edge(&Edge::new(a.id, b.id, kind)).unwrap();
         }
         let edges = store.iter_edges_from(a.id).unwrap();
-        assert_eq!(edges.len(), 5);
+        assert_eq!(edges.len(), 8);
         for kind in [
             EdgeKind::Depends,
             EdgeKind::RefCall,
             EdgeKind::DefinesBinding,
             EdgeKind::Exports,
             EdgeKind::ResolvesTo,
+            EdgeKind::RefImports,
+            EdgeKind::IsImplementation,
+            EdgeKind::Overrides,
         ] {
             assert!(
                 edges.iter().any(|e| e.kind == kind),
