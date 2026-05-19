@@ -58,9 +58,9 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     // every VName in this graph uses the same corpus identifier.
     // reindex_files reads this value back on subsequent hook runs.
     let corpus = detect_corpus(repo_root);
-    if let Err(e) = store.set_meta("corpus", &corpus) {
-        tracing::warn!("could not write corpus to meta: {e}");
-    }
+    store
+        .set_meta("corpus", &corpus)
+        .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
     let mut files_indexed: u64 = 0;
