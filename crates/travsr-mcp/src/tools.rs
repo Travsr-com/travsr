@@ -183,40 +183,6 @@ pub fn get_callers_global(
     sanitize_for_mcp(&raw)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// SEC-002 end-to-end: a path-traversal repo arg must be rejected through
-    /// the full get_callers_global → collect_global → validate_mcp_arg pipeline.
-    /// This exercises the wiring that the validate_mcp_arg unit tests in
-    /// sanitize.rs do not cover — a regression here would be invisible to those
-    /// unit tests.
-    #[test]
-    fn get_callers_global_rejects_path_traversal_repo_arg() {
-        let repos: HashMap<String, PathBuf> = HashMap::new();
-        let result = get_callers_global(&repos, "charge", Some("../evil"));
-        // Invalid repo arg must return an empty envelope, not a panic or error.
-        assert_eq!(
-            result, "<travsr-data></travsr-data>",
-            "path traversal in repo arg must be rejected and return empty envelope"
-        );
-    }
-
-    /// SEC-002 end-to-end: an absolute-path repo arg must also be rejected.
-    #[test]
-    fn get_dependencies_global_rejects_absolute_repo_arg() {
-        let repos: HashMap<String, PathBuf> = HashMap::new();
-        let result = get_dependencies_global(&repos, "src/main.ts", Some("/etc/passwd"));
-        assert_eq!(
-            result, "<travsr-data></travsr-data>",
-            "absolute path in repo arg must be rejected and return empty envelope"
-        );
-    }
-}
-
 fn collect_global(
     repos: &HashMap<String, PathBuf>,
     target_repo: Option<&str>,
@@ -261,4 +227,38 @@ fn collect_global(
     }
 
     parts.join("\n")
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SEC-002 end-to-end: a path-traversal repo arg must be rejected through
+    /// the full get_callers_global → collect_global → validate_mcp_arg pipeline.
+    /// This exercises the wiring that the validate_mcp_arg unit tests in
+    /// sanitize.rs do not cover — a regression here would be invisible to those
+    /// unit tests.
+    #[test]
+    fn get_callers_global_rejects_path_traversal_repo_arg() {
+        let repos: HashMap<String, PathBuf> = HashMap::new();
+        let result = get_callers_global(&repos, "charge", Some("../evil"));
+        // Invalid repo arg must return an empty envelope, not a panic or error.
+        assert_eq!(
+            result, "<travsr-data></travsr-data>",
+            "path traversal in repo arg must be rejected and return empty envelope"
+        );
+    }
+
+    /// SEC-002 end-to-end: an absolute-path repo arg must also be rejected.
+    #[test]
+    fn get_dependencies_global_rejects_absolute_repo_arg() {
+        let repos: HashMap<String, PathBuf> = HashMap::new();
+        let result = get_dependencies_global(&repos, "src/main.ts", Some("/etc/passwd"));
+        assert_eq!(
+            result, "<travsr-data></travsr-data>",
+            "absolute path in repo arg must be rejected and return empty envelope"
+        );
+    }
 }
