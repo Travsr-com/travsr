@@ -57,6 +57,16 @@ fn migrate_to_kuzu_impl(store: SqliteStore, repo_root: &std::path::Path) -> anyh
 
     let kuzu_dir = repo_root.join(".travsr").join("graph.kuzu");
 
+    // Guard against double-migration: POSIX rename(2) over a non-empty directory
+    // is ENOTEMPTY on Linux, making a second run fail non-deterministically.
+    // Give the user a clear message instead of a cryptic AtomicSwapFailed error.
+    if kuzu_dir.exists() {
+        anyhow::bail!(
+            "Kùzu store already exists at {} — migration already complete.\n             Remove it manually to re-migrate, or run `travsr status` to verify counts.",
+            kuzu_dir.display()
+        );
+    }
+
     println!("\nmigrating to kuzu at {} …", kuzu_dir.display());
 
     let committed_path =
