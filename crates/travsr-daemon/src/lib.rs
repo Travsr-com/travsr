@@ -56,9 +56,9 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 
     // Stamp the format version BEFORE indexing so that the reindex_files calls
     // below see version == SIGNATURE_FORMAT_VERSION and don't skip files.
-    if let Err(e) = store.set_signature_format_version(SIGNATURE_FORMAT_VERSION) {
-        tracing::warn!("could not write signature_format_version before init: {e}");
-    }
+    store
+        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
+        .context("writing signature_format_version")?;
 
     let mut files_indexed: u64 = 0;
     let mut edges_written: u64 = 0;
@@ -459,6 +459,39 @@ mod tests {
         assert!(
             results.is_empty(),
             "old class node must be deleted after reindex"
+        );
+    }
+
+    /// RFC-002: when the stored signature format version differs from the binary's
+    /// version, `reindex_files` must return `Ok(())` without touching the graph.
+    /// This is the core correctness guarantee — a version mismatch must never
+    /// silently corrupt the graph with mixed-format NodeIds.
+    #[test]
+    fn reindex_files_skips_on_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let ts_path = tmp.path().join("svc.ts");
+        std::fs::write(&ts_path, "export class Svc { go() {} }").unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // Stamp version 0 — simulates a DB built with an older binary.
+        store.set_signature_format_version(0).unwrap();
+
+        // Must succeed (hook must never block a commit) but must skip indexing.
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+
+        assert_eq!(
+            store.node_count().unwrap(),
+            0,
+            "version mismatch must leave graph untouched"
+        );
+        // Version must still be 0 — reindex must not overwrite it.
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            0,
+            "version must not be updated by reindex on mismatch"
         );
     }
 }
