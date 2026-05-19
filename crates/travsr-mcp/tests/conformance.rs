@@ -212,3 +212,172 @@ fn mcp_empty_result_is_not_an_error() {
         "content text must be the empty envelope for no-match query"
     );
 }
+
+// ── Phase 2: stub tool conformance tests ─────────────────────────────────────
+
+#[test]
+fn mcp_get_blast_radius_returns_text_content() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_blast_radius","arguments":{"file":"controller.ts"}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2, "expected initialize + tool/call responses");
+    let content = &responses[1]["result"]["content"][0];
+    assert_eq!(
+        content["type"], "text",
+        "get_blast_radius content must have type=text"
+    );
+    let text = content["text"].as_str().expect("content.text must be a string");
+    assert!(
+        text.starts_with("<travsr-data>"),
+        "get_blast_radius text must start with <travsr-data>, got: {text}"
+    );
+}
+
+#[test]
+fn mcp_get_blast_radius_missing_file_arg_returns_text() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_blast_radius","arguments":{}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2, "expected initialize + tool/call responses");
+    let content = &responses[1]["result"]["content"][0];
+    assert_eq!(
+        content["type"], "text",
+        "get_blast_radius with missing file arg must degrade gracefully with type=text"
+    );
+}
+
+#[test]
+fn mcp_search_symbol_returns_text_content() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_symbol","arguments":{"name":"charge"}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2, "expected initialize + tool/call responses");
+    let content = &responses[1]["result"]["content"][0];
+    assert_eq!(
+        content["type"], "text",
+        "search_symbol content must have type=text"
+    );
+    let text = content["text"].as_str().expect("content.text must be a string");
+    assert!(
+        text.starts_with("<travsr-data>"),
+        "search_symbol text must start with <travsr-data>, got: {text}"
+    );
+}
+
+#[test]
+fn mcp_search_symbol_missing_name_arg_returns_text() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_symbol","arguments":{}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2, "expected initialize + tool/call responses");
+    let content = &responses[1]["result"]["content"][0];
+    assert_eq!(
+        content["type"], "text",
+        "search_symbol with missing name arg must degrade gracefully with type=text"
+    );
+}
+
+#[test]
+fn mcp_get_repo_map_returns_text_content() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_repo_map","arguments":{}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2, "expected initialize + tool/call responses");
+    let content = &responses[1]["result"]["content"][0];
+    assert_eq!(
+        content["type"], "text",
+        "get_repo_map content must have type=text"
+    );
+    let text = content["text"].as_str().expect("content.text must be a string");
+    assert!(
+        text.starts_with("<travsr-data>"),
+        "get_repo_map text must start with <travsr-data>, got: {text}"
+    );
+}
+
+#[test]
+fn mcp_get_repo_map_with_extra_args_returns_text() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_repo_map","arguments":{"unexpected":"field"}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2, "expected initialize + tool/call responses");
+    let content = &responses[1]["result"]["content"][0];
+    assert_eq!(
+        content["type"], "text",
+        "get_repo_map with extra args must be lenient and return type=text"
+    );
+}
+
+#[test]
+fn mcp_unknown_tool_returns_error_code() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2, "expected initialize + tool/call responses");
+    assert_eq!(
+        responses[1]["error"]["code"], -32602,
+        "unknown tool must return JSON-RPC -32602 (INVALID_PARAMS)"
+    );
+}
+
+#[test]
+fn mcp_malformed_json_returns_parse_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(tmp.path(), &[r#"not valid json {"#]);
+    assert_eq!(responses.len(), 1, "malformed JSON must produce exactly one error response");
+    assert_eq!(
+        responses[0]["error"]["code"], -32700,
+        "malformed JSON must return JSON-RPC -32700 (PARSE_ERROR)"
+    );
+}
