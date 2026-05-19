@@ -3,12 +3,10 @@
 //! All tests are gated `#[cfg(feature = "kuzu")]` — the file compiles with
 //! zero tests when the feature is absent, so normal CI is unaffected.
 
-// Helpers and imports are only used when the kuzu feature is active.
-#![allow(unused)]
-
+#[cfg(feature = "kuzu")]
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
+#[cfg(feature = "kuzu")]
 use travsr_store::{SqliteStore, Store};
-
 #[cfg(feature = "kuzu")]
 use travsr_store::KuzuStore;
 
