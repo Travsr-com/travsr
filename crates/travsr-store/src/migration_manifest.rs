@@ -102,6 +102,7 @@ pub enum MigrationError {
 ///
 /// Reads all nodes and edges.  Provenance is dropped — the manifest captures
 /// structural graph identity only.
+#[must_use = "manifest result must be checked or used for integrity verification"]
 pub fn compute_manifest_sqlite(store: &SqliteStore) -> Result<Manifest, MigrationError> {
     let nodes = store.all_nodes().context("reading all nodes from sqlite")?;
     let edges = store.all_edges().context("reading all edges from sqlite")?;
@@ -130,7 +131,9 @@ pub fn compute_manifest_sqlite(store: &SqliteStore) -> Result<Manifest, Migratio
         .collect();
     isolated.sort_unstable();
 
-    let sha256 = canonical_sha256(entries, isolated.clone());
+    // Pass `isolated` by value — `canonical_sha256` takes ownership and sorts
+    // internally; cloning here would be a redundant allocation.
+    let (sha256, sorted_isolated) = canonical_sha256(entries, isolated);
 
     Ok(Manifest {
         produced_at: utc_now(),
@@ -138,7 +141,7 @@ pub fn compute_manifest_sqlite(store: &SqliteStore) -> Result<Manifest, Migratio
         node_count,
         edge_count,
         sha256,
-        isolated_node_ids: isolated,
+        isolated_node_ids: sorted_isolated,
     })
 }
 
@@ -176,7 +179,7 @@ pub fn compute_manifest_kuzu(store: &KuzuStore) -> Result<Manifest, MigrationErr
         .collect();
     isolated.sort_unstable();
 
-    let sha256 = canonical_sha256(entries, isolated.clone());
+    let (sha256, sorted_isolated) = canonical_sha256(entries, isolated);
 
     Ok(Manifest {
         produced_at: utc_now(),
@@ -184,7 +187,7 @@ pub fn compute_manifest_kuzu(store: &KuzuStore) -> Result<Manifest, MigrationErr
         node_count,
         edge_count,
         sha256,
-        isolated_node_ids: isolated,
+        isolated_node_ids: sorted_isolated,
     })
 }
 
@@ -223,7 +226,12 @@ pub fn migrate_sqlite_to_kuzu(
     let staging_dir = kuzu_dir.with_file_name("graph.kuzu.new");
     if staging_dir.exists() {
         // Clean up any leftover from a previous crashed attempt.
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        if let Err(e) = std::fs::remove_dir_all(&staging_dir) {
+            tracing::warn!(
+                "SEC-008: could not remove leftover staging dir {}: {e}",
+                staging_dir.display()
+            );
+        }
     }
 
     // Step 3 — open staging KuzuStore and copy all nodes + edges.
@@ -252,16 +260,26 @@ pub fn migrate_sqlite_to_kuzu(
     // Step 4 — post-migration manifest.
     let kuzu_manifest = compute_manifest_kuzu(&kuzu_staging)?;
 
+    // Helper: best-effort staging cleanup; logs a warning if removal fails.
+    let cleanup_staging = |staging: &std::path::Path| {
+        if let Err(e) = std::fs::remove_dir_all(staging) {
+            tracing::warn!(
+                "SEC-008: could not remove staging dir {} after mismatch: {e}",
+                staging.display()
+            );
+        }
+    };
+
     // Step 5 — count-level sanity checks (fast path).
     if sqlite_manifest.node_count != kuzu_manifest.node_count {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        cleanup_staging(&staging_dir);
         return Err(MigrationError::NodeCountMismatch {
             sqlite_count: sqlite_manifest.node_count,
             kuzu_count: kuzu_manifest.node_count,
         });
     }
     if sqlite_manifest.edge_count != kuzu_manifest.edge_count {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        cleanup_staging(&staging_dir);
         return Err(MigrationError::EdgeCountMismatch {
             sqlite_count: sqlite_manifest.edge_count,
             kuzu_count: kuzu_manifest.edge_count,
@@ -272,7 +290,7 @@ pub fn migrate_sqlite_to_kuzu(
     if sqlite_manifest.sha256 != kuzu_manifest.sha256 {
         let sqlite_sha = sqlite_manifest.sha256.clone();
         let kuzu_sha = kuzu_manifest.sha256.clone();
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        cleanup_staging(&staging_dir);
         return Err(MigrationError::ManifestMismatch {
             sqlite_sha,
             kuzu_sha,
@@ -280,7 +298,11 @@ pub fn migrate_sqlite_to_kuzu(
     }
 
     // Step 7 — write manifest JSON atomically to the parent directory.
-    let manifest_dir = kuzu_dir.parent().unwrap_or(kuzu_dir);
+    // `kuzu_dir.parent()` is always `Some` for any non-root path; callers must
+    // supply an absolute path with at least one parent component.
+    let manifest_dir = kuzu_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!("kuzu_dir has no parent — must be an absolute path with a parent directory")
+    })?;
     write_manifest_atomic(manifest_dir, &sqlite_manifest).context("writing migration manifest")?;
 
     // Step 8 — atomic rename: staging → final.
@@ -309,46 +331,67 @@ fn write_manifest_atomic(dir: &Path, manifest: &Manifest) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Build the canonical byte string for `entries` + `isolated_nodes` and return
-/// its SHA-256 as a lowercase hex string.
+/// Build the canonical byte string for `entries` + `isolated_nodes`, return
+/// its SHA-256 as a lowercase hex string, and the sorted isolated-node ids.
 ///
 /// Entries are sorted by `(src, dst, kind)` before hashing so the digest is
 /// order-independent.  Format: `"{src},{dst},{kind}\n"` per edge;
 /// `"node:{id}\n"` per isolated node.
 ///
+/// The function takes ownership of both vectors to avoid a caller-side clone.
+/// The sorted `isolated_nodes` is returned alongside the digest so callers can
+/// embed it in the [`Manifest`] without re-sorting.
+///
 /// # Complexity
 /// O(E log E + N) where E = edge count, N = isolated node count.
-fn canonical_sha256(mut entries: Vec<ManifestEntry>, mut isolated_nodes: Vec<u64>) -> String {
+pub(crate) fn canonical_sha256(
+    mut entries: Vec<ManifestEntry>,
+    mut isolated_nodes: Vec<u64>,
+) -> (String, Vec<u64>) {
     entries.sort_unstable();
     isolated_nodes.sort_unstable();
 
     let mut hasher = Sha256::new();
     for e in &entries {
+        // Guard: EdgeKind enum values never contain commas or newlines.
+        // A format-string injection via `kind` would allow two structurally
+        // different graphs to produce the same digest.
+        debug_assert!(
+            !e.kind.contains(',') && !e.kind.contains('\n'),
+            "edge kind must not contain commas or newlines: {:?}",
+            e.kind
+        );
         hasher.update(format!("{},{},{}\n", e.src, e.dst, e.kind).as_bytes());
     }
     for id in &isolated_nodes {
         hasher.update(format!("node:{id}\n").as_bytes());
     }
-    hasher
+    let digest = hasher
         .finalize()
         .iter()
         .fold(String::with_capacity(64), |mut s, b| {
             use std::fmt::Write as _;
             write!(s, "{b:02x}").expect("writing to String is infallible");
             s
-        })
+        });
+    (digest, isolated_nodes)
 }
 
 /// Return the current UTC time as an ISO-8601 string (seconds precision).
 ///
 /// Implemented using only `std` to avoid pulling in `chrono` or `time`.
-/// Valid for dates in the range 1970–2099.
+/// Returns `"CLOCK_ERROR"` on systems with a clock set before the Unix epoch
+/// (1970-01-01) — this is an explicit sentinel rather than a silent epoch
+/// fallback so the metadata field is diagnosable.
 fn utc_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            tracing::warn!("SEC-008: system clock is before Unix epoch; using sentinel timestamp");
+            return "CLOCK_ERROR".to_string();
+        }
+    };
 
     let tod = secs % 86400;
     let hh = tod / 3600;
@@ -428,17 +471,17 @@ mod tests {
             kind: "depends".to_string(),
         };
 
-        let hash_ab = canonical_sha256(vec![e1.clone(), e2.clone()], vec![]);
-        let hash_ba = canonical_sha256(vec![e2, e1], vec![]);
+        let (hash_ab, _) = canonical_sha256(vec![e1.clone(), e2.clone()], vec![]);
+        let (hash_ba, _) = canonical_sha256(vec![e2, e1], vec![]);
         assert_eq!(hash_ab, hash_ba, "digest must be order-independent");
     }
 
     #[test]
     fn empty_graph_known_sha256() {
         // SHA-256 of the empty byte string is the well-known constant.
+        let (digest, _) = canonical_sha256(vec![], vec![]);
         assert_eq!(
-            canonical_sha256(vec![], vec![]),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            digest, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "empty graph must produce SHA-256 of empty input"
         );
     }
