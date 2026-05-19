@@ -91,6 +91,92 @@ impl KuzuStore {
         }
         Ok(())
     }
+
+    /// Count of nodes currently stored. Used by the parity test harness.
+    pub fn node_count(&self) -> Result<u64> {
+        let conn = self.connect().context("node_count")?;
+        let mut result = conn
+            .query("MATCH (n:nodes) RETURN count(n)")
+            .context("executing node_count")?;
+        let row = result.next().context("node_count: empty result set")?;
+        let n = extract_i64(&row, 0, "count(n)")?;
+        Ok(n as u64)
+    }
+
+    /// Count of edges currently stored. Used by the parity test harness.
+    pub fn edge_count(&self) -> Result<u64> {
+        let conn = self.connect().context("edge_count")?;
+        let mut result = conn
+            .query("MATCH ()-[e:edges]->() RETURN count(e)")
+            .context("executing edge_count")?;
+        let row = result.next().context("edge_count: empty result set")?;
+        let n = extract_i64(&row, 0, "count(e)")?;
+        Ok(n as u64)
+    }
+
+    /// Return every node in the graph. Used by the parity test harness.
+    pub fn all_nodes(&self) -> Result<Vec<Node>> {
+        let conn = self.connect().context("all_nodes")?;
+        let mut result = conn
+            .query(
+                "MATCH (n:nodes) \
+                 RETURN n.id, n.corpus, n.root, n.path, n.language, n.signature, n.kind",
+            )
+            .context("executing all_nodes")?;
+
+        let mut out = Vec::new();
+        while let Some(row) = result.next() {
+            let id_raw  = extract_i64(&row, 0, "n.id")?;
+            let corpus  = extract_string(&row, 1, "n.corpus")?;
+            let root    = extract_string(&row, 2, "n.root")?;
+            let path    = extract_string(&row, 3, "n.path")?;
+            let language = extract_string(&row, 4, "n.language")?;
+            let signature = extract_string(&row, 5, "n.signature")?;
+            let kind    = extract_string(&row, 6, "n.kind")?;
+            out.push(Node {
+                id: i64_to_node_id(id_raw),
+                vname: VName::new(corpus, root, path, language, signature),
+                kind,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Substring search over node signature and path fields.
+    /// Mirrors [`SqliteStore::search_nodes_by_name`]. Used by the parity test harness.
+    pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>> {
+        let conn = self.connect().context("search_nodes_by_name")?;
+        let mut stmt = conn
+            .prepare(
+                "MATCH (n:nodes) \
+                 WHERE n.signature CONTAINS $name OR n.path CONTAINS $name \
+                 RETURN n.id, n.corpus, n.root, n.path, n.language, n.signature, n.kind",
+            )
+            .context("preparing search_nodes_by_name")?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("name", kuzu::Value::String(name.to_string()))],
+            )
+            .context("executing search_nodes_by_name")?;
+
+        let mut out = Vec::new();
+        while let Some(row) = result.next() {
+            let id_raw   = extract_i64(&row, 0, "n.id")?;
+            let corpus   = extract_string(&row, 1, "n.corpus")?;
+            let root     = extract_string(&row, 2, "n.root")?;
+            let path     = extract_string(&row, 3, "n.path")?;
+            let language = extract_string(&row, 4, "n.language")?;
+            let signature = extract_string(&row, 5, "n.signature")?;
+            let kind     = extract_string(&row, 6, "n.kind")?;
+            out.push(Node {
+                id: i64_to_node_id(id_raw),
+                vname: VName::new(corpus, root, path, language, signature),
+                kind,
+            });
+        }
+        Ok(out)
+    }
 }
 
 // ── Store trait ───────────────────────────────────────────────────────────────
