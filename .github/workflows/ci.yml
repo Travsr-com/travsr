@@ -68,7 +68,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
 
   lsif-ts:
     name: lsif-ts (build + test)

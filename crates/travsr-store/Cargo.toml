@@ -8,11 +8,19 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Enable the Kùzu production storage backend. Builds the Kùzu C++ library
+# from source (requires CMake + a C++ toolchain). Off by default so that
+# normal `cargo build/test` is unaffected by the heavy compile step.
+kuzu = ["dep:kuzu"]
+
 [dependencies]
 travsr-core = { path = "../travsr-core" }
 rusqlite = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+kuzu = { version = "0.11", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

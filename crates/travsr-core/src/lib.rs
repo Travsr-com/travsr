@@ -11,6 +11,18 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// Version of the VName signature format baked into every `NodeId` hash.
+///
+/// This byte is the **first input** to the BLAKE3 hasher in `VName::id()`.
+/// Changing it produces a disjoint `NodeId` space — any `.travsr/graph.db`
+/// built with a different version must be fully re-indexed before it can be
+/// queried. See `docs/rfcs/RFC-002-vname-signature-versioning.md`.
+///
+/// Version history:
+///   0 — legacy (no version byte; all pre-RFC-002 databases)
+///   1 — current: Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
+pub const SIGNATURE_FORMAT_VERSION: u8 = 1;
+
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 
 /// Derive the canonical Travsr corpus identifier from a git remote URL.
@@ -125,25 +137,35 @@ impl VName {
 
     /// Stable 64-bit identifier derived from the five-field VName.
     ///
-    /// The hash is the first 8 bytes of the BLAKE3 digest of the
-    /// NUL-separated fields, interpreted as little-endian `u64`. This is
-    /// deterministic across machines, processes, and Travsr versions and
-    /// is suitable for use as the SQLite primary key.
+    /// The hash is the first 8 bytes of the BLAKE3 digest of:
+    ///   `[SIGNATURE_FORMAT_VERSION] || [len_u32_le][corpus] || [len_u32_le][root] || ...`
+    ///
+    /// Length-prefix encoding (4-byte little-endian field length before each
+    /// field) replaces the NUL-separator scheme. This guarantees that no two
+    /// distinct VNames share the same byte stream, and that a v0 byte stream
+    /// (which starts with raw corpus bytes) can never equal a v1 stream (which
+    /// starts with `[version_byte][len]`). See RFC-002.
     pub fn id(&self) -> NodeId {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(self.corpus.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.root.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.language.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.signature.as_bytes());
+        // Version domain separator — must be first. Changing SIGNATURE_FORMAT_VERSION
+        // produces disjoint NodeId spaces; see RFC-002.
+        hasher.update(&[SIGNATURE_FORMAT_VERSION]);
+        // Length-prefix each field so no two distinct VNames share the same byte
+        // stream regardless of field contents (no NUL-injection ambiguity).
+        for field in [
+            self.corpus.as_str(),
+            self.root.as_str(),
+            self.path.as_str(),
+            self.language.as_str(),
+            self.signature.as_str(),
+        ] {
+            let bytes = field.as_bytes();
+            hasher.update(&(bytes.len() as u32).to_le_bytes());
+            hasher.update(bytes);
+        }
         let digest = hasher.finalize();
-        let bytes = digest.as_bytes();
         let mut buf = [0u8; 8];
-        buf.copy_from_slice(&bytes[..8]);
+        buf.copy_from_slice(&digest.as_bytes()[..8]);
         NodeId(u64::from_le_bytes(buf))
     }
 }
@@ -303,6 +325,37 @@ mod tests {
         let v = sample_vname();
         let node = Node::new(v.clone(), "function");
         assert_eq!(node.id, v.id());
+    }
+
+    #[test]
+    fn version_byte_produces_different_id_than_unversioned() {
+        // Regression guard: confirms the RFC-002 domain separator is actually
+        // prepended and that length-prefix encoding is used. The v1 format starts
+        // with [0x01][len][corpus...]; the v0 format starts with raw corpus bytes.
+        // These byte streams can never be equal regardless of field contents.
+        let v = sample_vname();
+        let versioned_id = v.id(); // uses SIGNATURE_FORMAT_VERSION byte + length-prefix
+
+        // Compute the legacy (no version byte, NUL-separated) hash directly.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(v.corpus.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.root.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.language.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.signature.as_bytes());
+        let digest = hasher.finalize();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&digest.as_bytes()[..8]);
+        let legacy_id = NodeId(u64::from_le_bytes(buf));
+
+        assert_ne!(
+            versioned_id, legacy_id,
+            "RFC-002 version byte + length-prefix must produce a different NodeId than the legacy NUL-separated hash"
+        );
     }
 
     // ── ARCH-102: canonical_corpus tests ─────────────────────────────────────
