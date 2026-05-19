@@ -136,7 +136,7 @@ fn link_imports_emits_resolves_to_for_relative_import() {
         .parse_file_with_vname(&fixture("b.ts"), vname_path)
         .unwrap();
 
-    let edges = link_imports(&out.nodes, vname_path);
+    let edges = link_imports(&out.nodes, vname_path, "");
 
     // Two candidates per relative import: .ts and .tsx
     assert_eq!(edges.len(), 2, "expected one edge per extension candidate");
@@ -174,7 +174,7 @@ fn link_imports_skips_package_imports() {
     let vname_path = "packages/travsr-vscode/src/extension.ts";
     let out = indexer().parse_file_with_vname(&abs, vname_path).unwrap();
 
-    let edges = link_imports(&out.nodes, vname_path);
+    let edges = link_imports(&out.nodes, vname_path, "");
 
     // "vscode" is a package import — skipped.  "./status" is relative — 2 candidates.
     let package_edges: Vec<_> = edges
@@ -207,7 +207,7 @@ fn link_imports_skips_package_imports() {
 #[test]
 fn link_imports_empty_for_file_with_no_imports() {
     let out = indexer().parse_file(&fixture("empty.ts")).unwrap();
-    let edges = link_imports(&out.nodes, "fixtures/ts-small/empty.ts");
+    let edges = link_imports(&out.nodes, "fixtures/ts-small/empty.ts", "");
     assert!(edges.is_empty());
 }
 
