@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 use crate::protocol::{INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR};
+use crate::sanitize::sanitize_for_mcp;
 use crate::tools;
 use crate::{protocol::RpcRequest, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use travsr_store::{registry, SqliteStore};
@@ -101,7 +102,10 @@ fn handle_tool_call(
             tools::get_callers(store, symbol)
         }
         "get_blast_radius" | "search_symbol" | "get_repo_map" => {
-            "not yet implemented — planned for Phase 3".to_string()
+            // SEC-001: sanitize even static stub strings to enforce the invariant
+            // that ALL tool outputs pass through the sanitization pipeline. This
+            // prevents Phase 3 implementations from accidentally bypassing it.
+            sanitize_for_mcp("not yet implemented — planned for Phase 3")
         }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
@@ -283,7 +287,10 @@ fn handle_tool_call_global(
             tools::get_callers_global(repos, args["symbol"].as_str().unwrap_or(""), repo_arg)
         }
         "get_blast_radius" | "search_symbol" | "get_repo_map" => {
-            "not yet implemented — planned for Phase 3".to_string()
+            // SEC-001: sanitize even static stub strings to enforce the invariant
+            // that ALL tool outputs pass through the sanitization pipeline. This
+            // prevents Phase 3 implementations from accidentally bypassing it.
+            sanitize_for_mcp("not yet implemented — planned for Phase 3")
         }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };

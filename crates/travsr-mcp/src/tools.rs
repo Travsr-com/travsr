@@ -3,10 +3,24 @@ use std::path::PathBuf;
 
 use travsr_store::{SqliteStore, Store};
 
+use crate::sanitize::{sanitize_for_mcp, validate_mcp_arg};
+
 /// Return the import targets (Depends edges) of the given file path.
 /// Empty string when nothing is found — callers must NOT return an RPC error
 /// for the no-results case (Tech Lead requirement).
 pub fn get_dependencies(store: &SqliteStore, file: &str) -> String {
+    // SEC-002: reject path traversal / absolute paths / oversized args.
+    if let Err(reason) = validate_mcp_arg(file) {
+        tracing::warn!("get_dependencies rejected invalid arg: {reason}");
+        return String::new();
+    }
+    // SEC-001: sanitize raw result before returning to MCP client / LLM.
+    sanitize_for_mcp(&get_dependencies_raw(store, file))
+}
+
+/// Raw (unsanitized) variant used by global aggregation — sanitization happens
+/// once at the aggregation point, not per-store.
+fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
     let nodes = match store.search_nodes_by_name(file) {
         Ok(n) => n,
         Err(e) => {
@@ -57,6 +71,17 @@ pub fn get_dependencies(store: &SqliteStore, file: &str) -> String {
 ///
 /// Empty string when nothing is found.
 pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
+    // SEC-002: validate before forwarding to store queries.
+    if let Err(reason) = validate_mcp_arg(symbol) {
+        tracing::warn!("get_callers rejected invalid arg: {reason}");
+        return String::new();
+    }
+    // SEC-001: sanitize raw result before returning to MCP client / LLM.
+    sanitize_for_mcp(&get_callers_raw(store, symbol))
+}
+
+/// Raw (unsanitized) variant used by global aggregation.
+fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
     use travsr_core::EdgeKind;
 
     let nodes = match store.search_nodes_by_name(symbol) {
@@ -109,8 +134,14 @@ pub fn get_dependencies_global(
     file: &str,
     repo: Option<&str>,
 ) -> String {
-    collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_dependencies(store, file);
+    // SEC-002: validate before registry + store queries.
+    if let Err(reason) = validate_mcp_arg(file) {
+        tracing::warn!("get_dependencies_global rejected invalid arg: {reason}");
+        return String::new();
+    }
+    // Aggregate raw results, prefix per-repo, then sanitize once.
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = get_dependencies_raw(store, file);
         if result.is_empty() || single {
             result
         } else {
@@ -120,7 +151,9 @@ pub fn get_dependencies_global(
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-    })
+    });
+    // SEC-001: sanitize the fully-aggregated string once.
+    sanitize_for_mcp(&raw)
 }
 
 /// Global variant of `get_callers` — searches one named repo or all registered repos.
@@ -129,8 +162,13 @@ pub fn get_callers_global(
     symbol: &str,
     repo: Option<&str>,
 ) -> String {
-    collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_callers(store, symbol);
+    // SEC-002: validate before registry + store queries.
+    if let Err(reason) = validate_mcp_arg(symbol) {
+        tracing::warn!("get_callers_global rejected invalid arg: {reason}");
+        return String::new();
+    }
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = get_callers_raw(store, symbol);
         if result.is_empty() || single {
             result
         } else {
@@ -140,7 +178,9 @@ pub fn get_callers_global(
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-    })
+    });
+    // SEC-001: sanitize the fully-aggregated string once.
+    sanitize_for_mcp(&raw)
 }
 
 fn collect_global(
@@ -148,6 +188,14 @@ fn collect_global(
     target_repo: Option<&str>,
     mut f: impl FnMut(&SqliteStore, &str, bool) -> String,
 ) -> String {
+    // SEC-002: validate repo arg before registry lookup.
+    if let Some(name) = target_repo {
+        if let Err(reason) = validate_mcp_arg(name) {
+            tracing::warn!("collect_global rejected invalid repo arg: {reason}");
+            return String::new();
+        }
+    }
+
     let candidates: Vec<(&str, &PathBuf)> = match target_repo {
         Some(name) => match repos.get_key_value(name) {
             Some((k, v)) => vec![(k.as_str(), v)],
@@ -179,4 +227,38 @@ fn collect_global(
     }
 
     parts.join("\n")
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SEC-002 end-to-end: a path-traversal repo arg must be rejected through
+    /// the full get_callers_global → collect_global → validate_mcp_arg pipeline.
+    /// This exercises the wiring that the validate_mcp_arg unit tests in
+    /// sanitize.rs do not cover — a regression here would be invisible to those
+    /// unit tests.
+    #[test]
+    fn get_callers_global_rejects_path_traversal_repo_arg() {
+        let repos: HashMap<String, PathBuf> = HashMap::new();
+        let result = get_callers_global(&repos, "charge", Some("../evil"));
+        // Invalid repo arg must return an empty envelope, not a panic or error.
+        assert_eq!(
+            result, "<travsr-data></travsr-data>",
+            "path traversal in repo arg must be rejected and return empty envelope"
+        );
+    }
+
+    /// SEC-002 end-to-end: an absolute-path repo arg must also be rejected.
+    #[test]
+    fn get_dependencies_global_rejects_absolute_repo_arg() {
+        let repos: HashMap<String, PathBuf> = HashMap::new();
+        let result = get_dependencies_global(&repos, "src/main.ts", Some("/etc/passwd"));
+        assert_eq!(
+            result, "<travsr-data></travsr-data>",
+            "absolute path in repo arg must be rejected and return empty envelope"
+        );
+    }
 }

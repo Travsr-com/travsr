@@ -204,5 +204,11 @@ fn mcp_empty_result_is_not_an_error() {
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or("non-empty");
-    assert_eq!(text, "", "content text must be empty for no-match query");
+    // SEC-001: empty results are now wrapped in the sanitized envelope.
+    // The envelope is the minimum non-empty response; the LLM sees it as
+    // "no data found" rather than an error.
+    assert_eq!(
+        text, "<travsr-data></travsr-data>",
+        "content text must be the empty envelope for no-match query"
+    );
 }
