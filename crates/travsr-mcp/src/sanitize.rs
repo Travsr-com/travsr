@@ -33,9 +33,11 @@ const MAX_ARG_BYTES: usize = 512;
 ///
 /// Always returns a non-empty string (at minimum the empty envelope).
 pub fn sanitize_for_mcp(raw: &str) -> String {
-    let stripped = strip_control_chars(raw);
-    let truncated = truncate_to_byte_limit(&stripped, MAX_OUTPUT_BYTES);
-    let escaped = escape_tags(truncated);
+    // Truncate the raw input FIRST so strip_control_chars only iterates over
+    // at most MAX_OUTPUT_BYTES bytes, not the full (potentially huge) result.
+    let truncated = truncate_to_byte_limit(raw, MAX_OUTPUT_BYTES);
+    let stripped = strip_control_chars(truncated);
+    let escaped = escape_tags(&stripped);
     wrap_envelope(&escaped)
 }
 
