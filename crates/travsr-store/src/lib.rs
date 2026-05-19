@@ -37,7 +37,23 @@ impl Migration for V2EdgeProvenance {
         2
     }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
-        store.exec_ddl(include_str!("migrations/v2_edge_provenance.sql"))
+        // SQLite does not support `ALTER TABLE … ADD COLUMN IF NOT EXISTS`.
+        // Guard manually so re-running after a crash (atomicity gap) is safe.
+        if !store.column_exists("edges", "provenance")? {
+            store.exec_ddl(include_str!("migrations/v2_edge_provenance.sql"))?;
+        }
+        Ok(())
+    }
+}
+
+struct V3SignatureFormatVersion;
+impl Migration for V3SignatureFormatVersion {
+    fn version(&self) -> u32 {
+        3
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // INSERT OR IGNORE is idempotent — safe to re-run after a crash.
+        store.exec_ddl(include_str!("migrations/v3_signature_format_version.sql"))
     }
 }
 
@@ -47,6 +63,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     let mut r = MigrationRunner::new();
     r.register(V1Initial);
     r.register(V2EdgeProvenance);
+    r.register(V3SignatureFormatVersion);
     r
 }
 
@@ -351,6 +368,19 @@ impl StoreMigratable for SqliteStore {
             )
             .context("writing schema_version to meta")?;
         Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> anyhow::Result<bool> {
+        // `pragma_table_info(table)` returns one row per column; name is col 1.
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .context("checking column existence via pragma_table_info")?;
+        Ok(count > 0)
     }
 }
 

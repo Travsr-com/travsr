@@ -41,9 +41,11 @@ use crate::Store;
 /// already partially applied.
 ///
 /// **All `up()` implementations must therefore be idempotent under re-execution.
-/// Use `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`,
-/// `CREATE INDEX IF NOT EXISTS`, and equivalent backend-specific guards.** A
-/// migration that is not idempotent will corrupt the schema on the re-run.
+/// Use `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, and equivalent
+/// backend-specific guards. For `ALTER TABLE … ADD COLUMN`, call
+/// `store.column_exists(table, column)?` first — SQLite does not support
+/// `ADD COLUMN IF NOT EXISTS` syntax.** A migration that is not idempotent will
+/// corrupt the schema on the re-run.
 ///
 /// If strict atomicity is required in the future, extend `StoreMigratable` with
 /// `begin_tx(&mut self) -> Result<()>` / `commit_tx(&mut self) -> Result<()>`
@@ -69,9 +71,17 @@ pub trait Migration: Send + Sync {
 ///
 /// Backend implementations:
 /// - **SQLite** — `exec_ddl` calls `rusqlite::Connection::execute_batch`;
-///   `schema_version`/`set_schema_version` read/write the `meta` table.
+///   `schema_version`/`set_schema_version` read/write the `meta` table;
+///   `column_exists` queries `pragma_table_info`.
 /// - **Kùzu** — `exec_ddl` calls `kuzu::Connection::query` with Cypher DDL;
-///   version is stored in the Kùzu `meta` node table.
+///   version is stored in the Kùzu `meta` node table; Cypher DDL is natively
+///   idempotent so the default `column_exists` returning `false` is sufficient.
+///
+/// # Note on supertrait bound
+/// `StoreMigratable: Store` is broader than strictly required by the runner
+/// (which only calls the three methods below), but it ensures every migratable
+/// backend is also a full storage backend. Test doubles must implement all of
+/// `Store`; see `FakeStore` in the test module for the minimal implementation.
 pub trait StoreMigratable: Store {
     /// Execute a DDL statement against the backend (SQL, Cypher, etc.).
     /// Must be idempotent when called with `IF NOT EXISTS` guards.
@@ -83,6 +93,16 @@ pub trait StoreMigratable: Store {
 
     /// Persist the schema version to the backend's meta store.
     fn set_schema_version(&mut self, v: u32) -> Result<()>;
+
+    /// Returns `true` if `column` exists in `table`.
+    ///
+    /// Used to guard `ALTER TABLE … ADD COLUMN` on backends (such as SQLite)
+    /// that do not support `ADD COLUMN IF NOT EXISTS` syntax. The default
+    /// implementation returns `false` — backends that cannot natively express
+    /// idempotent column additions must override this.
+    fn column_exists(&self, _table: &str, _column: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
@@ -113,13 +133,14 @@ impl MigrationRunner {
     /// Add a migration. Migrations are sorted by version before running so
     /// registration order does not matter.
     ///
-    /// # Panics (debug only)
-    /// Panics in debug builds if a migration with the same `version()` has
-    /// already been registered. Duplicate versions cause undefined apply order
-    /// and double DDL execution — catch this at startup, not at migration time.
+    /// # Panics
+    /// Panics if a migration with the same `version()` has already been
+    /// registered. Duplicate versions would cause double DDL execution and
+    /// schema corruption — this is a programmer error caught at startup
+    /// (inside `SqliteStore::open`) so it fires in both debug and release.
     pub fn register(&mut self, migration: impl Migration + 'static) {
         let v = migration.version();
-        debug_assert!(
+        assert!(
             !self.migrations.iter().any(|m| m.version() == v),
             "duplicate migration version {v} registered — each version must be unique"
         );
@@ -357,5 +378,42 @@ mod tests {
 
         // Version must be set once per migration, in order.
         assert_eq!(store.versions_at_set, [1, 2]);
+        // Verify DDL was applied *before* the version was recorded — the
+        // DDL log must be non-empty at the point each version number was set.
+        assert_eq!(
+            store.inner.ddl_log.len(),
+            2,
+            "both DDL statements must have run"
+        );
+    }
+
+    #[test]
+    fn runner_does_not_record_version_when_up_fails() {
+        /// A migration whose `up()` always fails.
+        struct FailingMigration;
+        impl Migration for FailingMigration {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _: &mut dyn StoreMigratable) -> Result<()> {
+                anyhow::bail!("intentional DDL failure")
+            }
+        }
+
+        let mut store = FakeStore::new();
+        let mut runner = MigrationRunner::new();
+        runner.register(FailingMigration);
+
+        let result = runner.run(&mut store);
+
+        assert!(result.is_err(), "run() must propagate the migration error");
+        assert_eq!(
+            store.version, 0,
+            "schema version must not advance when up() fails"
+        );
+        assert!(
+            store.ddl_log.is_empty(),
+            "no DDL must be recorded on failure"
+        );
     }
 }
