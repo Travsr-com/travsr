@@ -53,7 +53,10 @@ mod tests {
     use super::*;
 
     // Compile-time guard: catch accidental MAX_ITERATIONS change.
-    const _: () = assert!(MAX_ITERATIONS == 50, "MAX_ITERATIONS changed from ADR-003 value");
+    const _: () = assert!(
+        MAX_ITERATIONS == 50,
+        "MAX_ITERATIONS changed from ADR-003 value"
+    );
 
     #[test]
     fn defaults_match_adr() {
