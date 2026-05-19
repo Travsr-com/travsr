@@ -126,13 +126,13 @@ impl KuzuStore {
 
         let mut out = Vec::new();
         while let Some(row) = result.next() {
-            let id_raw  = extract_i64(&row, 0, "n.id")?;
-            let corpus  = extract_string(&row, 1, "n.corpus")?;
-            let root    = extract_string(&row, 2, "n.root")?;
-            let path    = extract_string(&row, 3, "n.path")?;
+            let id_raw = extract_i64(&row, 0, "n.id")?;
+            let corpus = extract_string(&row, 1, "n.corpus")?;
+            let root = extract_string(&row, 2, "n.root")?;
+            let path = extract_string(&row, 3, "n.path")?;
             let language = extract_string(&row, 4, "n.language")?;
             let signature = extract_string(&row, 5, "n.signature")?;
-            let kind    = extract_string(&row, 6, "n.kind")?;
+            let kind = extract_string(&row, 6, "n.kind")?;
             out.push(Node {
                 id: i64_to_node_id(id_raw),
                 vname: VName::new(corpus, root, path, language, signature),
@@ -162,13 +162,13 @@ impl KuzuStore {
 
         let mut out = Vec::new();
         while let Some(row) = result.next() {
-            let id_raw   = extract_i64(&row, 0, "n.id")?;
-            let corpus   = extract_string(&row, 1, "n.corpus")?;
-            let root     = extract_string(&row, 2, "n.root")?;
-            let path     = extract_string(&row, 3, "n.path")?;
+            let id_raw = extract_i64(&row, 0, "n.id")?;
+            let corpus = extract_string(&row, 1, "n.corpus")?;
+            let root = extract_string(&row, 2, "n.root")?;
+            let path = extract_string(&row, 3, "n.path")?;
             let language = extract_string(&row, 4, "n.language")?;
             let signature = extract_string(&row, 5, "n.signature")?;
-            let kind     = extract_string(&row, 6, "n.kind")?;
+            let kind = extract_string(&row, 6, "n.kind")?;
             out.push(Node {
                 id: i64_to_node_id(id_raw),
                 vname: VName::new(corpus, root, path, language, signature),

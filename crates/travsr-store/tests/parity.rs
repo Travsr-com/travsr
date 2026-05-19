@@ -6,9 +6,9 @@
 #[cfg(feature = "kuzu")]
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 #[cfg(feature = "kuzu")]
-use travsr_store::{SqliteStore, Store};
-#[cfg(feature = "kuzu")]
 use travsr_store::KuzuStore;
+#[cfg(feature = "kuzu")]
+use travsr_store::{SqliteStore, Store};
 
 // ── Fixture helpers (all gated — only needed when kuzu feature is active) ─────
 
@@ -24,22 +24,22 @@ fn make_node(sig: &str, kind: &str, path: &str) -> Node {
 /// The five canonical nodes used by every parity test.
 #[cfg(feature = "kuzu")]
 struct ParityNodes {
-    alpha:   Node,
-    beta:    Node,
-    gamma:   Node,
+    alpha: Node,
+    beta: Node,
+    gamma: Node,
     service: Node,
-    main:    Node,
+    main: Node,
 }
 
 #[cfg(feature = "kuzu")]
 impl ParityNodes {
     fn new() -> Self {
         Self {
-            alpha:   make_node("fn:alpha",      "function", "src/a.ts"),
-            beta:    make_node("fn:beta",       "function", "src/b.ts"),
-            gamma:   make_node("fn:gamma",      "function", "src/c.ts"),
-            service: make_node("class:Service", "class",    "src/svc.ts"),
-            main:    make_node("file:main",     "file",     "src/main.ts"),
+            alpha: make_node("fn:alpha", "function", "src/a.ts"),
+            beta: make_node("fn:beta", "function", "src/b.ts"),
+            gamma: make_node("fn:gamma", "function", "src/c.ts"),
+            service: make_node("class:Service", "class", "src/svc.ts"),
+            main: make_node("file:main", "file", "src/main.ts"),
         }
     }
 }
@@ -74,13 +74,13 @@ fn build_parity_graph_kuzu(store: &mut KuzuStore) {
 #[cfg(feature = "kuzu")]
 fn parity_edges(n: &ParityNodes) -> Vec<Edge> {
     vec![
-        Edge::new(n.alpha.id,   n.beta.id,    EdgeKind::RefCall),
-        Edge::new(n.alpha.id,   n.gamma.id,   EdgeKind::RefCall),
-        Edge::new(n.beta.id,    n.gamma.id,   EdgeKind::RefCall),
-        Edge::new(n.service.id, n.alpha.id,   EdgeKind::DefinesBinding),
-        Edge::new(n.service.id, n.beta.id,    EdgeKind::DefinesBinding),
-        Edge::new(n.main.id,    n.service.id, EdgeKind::Depends),
-        Edge::new(n.main.id,    n.alpha.id,   EdgeKind::Depends),
+        Edge::new(n.alpha.id, n.beta.id, EdgeKind::RefCall),
+        Edge::new(n.alpha.id, n.gamma.id, EdgeKind::RefCall),
+        Edge::new(n.beta.id, n.gamma.id, EdgeKind::RefCall),
+        Edge::new(n.service.id, n.alpha.id, EdgeKind::DefinesBinding),
+        Edge::new(n.service.id, n.beta.id, EdgeKind::DefinesBinding),
+        Edge::new(n.main.id, n.service.id, EdgeKind::Depends),
+        Edge::new(n.main.id, n.alpha.id, EdgeKind::Depends),
     ]
 }
 
@@ -148,8 +148,14 @@ fn parity_get_node_alpha() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_node = sq.get_node(n.alpha.id).expect("sqlite get_node").expect("sqlite: alpha missing");
-    let kz_node = kz.get_node(n.alpha.id).expect("kuzu get_node").expect("kuzu: alpha missing");
+    let sq_node = sq
+        .get_node(n.alpha.id)
+        .expect("sqlite get_node")
+        .expect("sqlite: alpha missing");
+    let kz_node = kz
+        .get_node(n.alpha.id)
+        .expect("kuzu get_node")
+        .expect("kuzu: alpha missing");
 
     assert_eq!(sq_node, kz_node, "get_node(alpha) must return same Node");
 }
@@ -166,8 +172,14 @@ fn parity_get_node_service() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_node = sq.get_node(n.service.id).expect("sqlite get_node").expect("sqlite: service missing");
-    let kz_node = kz.get_node(n.service.id).expect("kuzu get_node").expect("kuzu: service missing");
+    let sq_node = sq
+        .get_node(n.service.id)
+        .expect("sqlite get_node")
+        .expect("sqlite: service missing");
+    let kz_node = kz
+        .get_node(n.service.id)
+        .expect("kuzu get_node")
+        .expect("kuzu: service missing");
 
     assert_eq!(sq_node, kz_node, "get_node(service) must return same Node");
 }
@@ -184,11 +196,15 @@ fn parity_get_node_missing() {
 
     let missing_id = NodeId(999_999);
     assert!(
-        sq.get_node(missing_id).expect("sqlite get_node missing").is_none(),
+        sq.get_node(missing_id)
+            .expect("sqlite get_node missing")
+            .is_none(),
         "sqlite: NodeId(999999) must return None"
     );
     assert!(
-        kz.get_node(missing_id).expect("kuzu get_node missing").is_none(),
+        kz.get_node(missing_id)
+            .expect("kuzu get_node missing")
+            .is_none(),
         "kuzu: NodeId(999999) must return None"
     );
 }
@@ -205,8 +221,12 @@ fn parity_iter_edges_from_alpha() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_edges = sq.iter_edges_from(n.alpha.id).expect("sqlite iter_edges_from alpha");
-    let kz_edges = kz.iter_edges_from(n.alpha.id).expect("kuzu iter_edges_from alpha");
+    let sq_edges = sq
+        .iter_edges_from(n.alpha.id)
+        .expect("sqlite iter_edges_from alpha");
+    let kz_edges = kz
+        .iter_edges_from(n.alpha.id)
+        .expect("kuzu iter_edges_from alpha");
 
     assert_eq!(
         sorted_ids(&sq_edges),
@@ -227,8 +247,12 @@ fn parity_iter_edges_from_main() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_edges = sq.iter_edges_from(n.main.id).expect("sqlite iter_edges_from main");
-    let kz_edges = kz.iter_edges_from(n.main.id).expect("kuzu iter_edges_from main");
+    let sq_edges = sq
+        .iter_edges_from(n.main.id)
+        .expect("sqlite iter_edges_from main");
+    let kz_edges = kz
+        .iter_edges_from(n.main.id)
+        .expect("kuzu iter_edges_from main");
 
     assert_eq!(
         sorted_ids(&sq_edges),
@@ -249,8 +273,12 @@ fn parity_iter_edges_from_leaf() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_edges = sq.iter_edges_from(n.gamma.id).expect("sqlite iter_edges_from gamma");
-    let kz_edges = kz.iter_edges_from(n.gamma.id).expect("kuzu iter_edges_from gamma");
+    let sq_edges = sq
+        .iter_edges_from(n.gamma.id)
+        .expect("sqlite iter_edges_from gamma");
+    let kz_edges = kz
+        .iter_edges_from(n.gamma.id)
+        .expect("kuzu iter_edges_from gamma");
 
     assert!(sq_edges.is_empty(), "sqlite: gamma has no outgoing edges");
     assert!(kz_edges.is_empty(), "kuzu: gamma has no outgoing edges");
@@ -268,10 +296,18 @@ fn parity_iter_edges_to_gamma() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_edges = sq.iter_edges_to(n.gamma.id).expect("sqlite iter_edges_to gamma");
-    let kz_edges = kz.iter_edges_to(n.gamma.id).expect("kuzu iter_edges_to gamma");
+    let sq_edges = sq
+        .iter_edges_to(n.gamma.id)
+        .expect("sqlite iter_edges_to gamma");
+    let kz_edges = kz
+        .iter_edges_to(n.gamma.id)
+        .expect("kuzu iter_edges_to gamma");
 
-    assert_eq!(sq_edges.len(), 2, "sqlite: gamma must have 2 incoming edges");
+    assert_eq!(
+        sq_edges.len(),
+        2,
+        "sqlite: gamma must have 2 incoming edges"
+    );
     assert_eq!(kz_edges.len(), 2, "kuzu: gamma must have 2 incoming edges");
     assert_eq!(
         sorted_ids(&sq_edges),
@@ -292,11 +328,19 @@ fn parity_iter_edges_to_alpha() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_edges = sq.iter_edges_to(n.alpha.id).expect("sqlite iter_edges_to alpha");
-    let kz_edges = kz.iter_edges_to(n.alpha.id).expect("kuzu iter_edges_to alpha");
+    let sq_edges = sq
+        .iter_edges_to(n.alpha.id)
+        .expect("sqlite iter_edges_to alpha");
+    let kz_edges = kz
+        .iter_edges_to(n.alpha.id)
+        .expect("kuzu iter_edges_to alpha");
 
     // Service→alpha (DefinesBinding) and main→alpha (Depends)
-    assert_eq!(sq_edges.len(), 2, "sqlite: alpha must have 2 incoming edges");
+    assert_eq!(
+        sq_edges.len(),
+        2,
+        "sqlite: alpha must have 2 incoming edges"
+    );
     assert_eq!(kz_edges.len(), 2, "kuzu: alpha must have 2 incoming edges");
     assert_eq!(
         sorted_ids(&sq_edges),
@@ -317,8 +361,12 @@ fn parity_iter_edges_to_root() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_edges = sq.iter_edges_to(n.main.id).expect("sqlite iter_edges_to main");
-    let kz_edges = kz.iter_edges_to(n.main.id).expect("kuzu iter_edges_to main");
+    let sq_edges = sq
+        .iter_edges_to(n.main.id)
+        .expect("sqlite iter_edges_to main");
+    let kz_edges = kz
+        .iter_edges_to(n.main.id)
+        .expect("kuzu iter_edges_to main");
 
     assert!(sq_edges.is_empty(), "sqlite: main has no incoming edges");
     assert!(kz_edges.is_empty(), "kuzu: main has no incoming edges");
@@ -336,11 +384,21 @@ fn parity_search_alpha() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_results = sq.search_nodes_by_name("alpha").expect("sqlite search alpha");
+    let sq_results = sq
+        .search_nodes_by_name("alpha")
+        .expect("sqlite search alpha");
     let kz_results = kz.search_nodes_by_name("alpha").expect("kuzu search alpha");
 
-    assert_eq!(sq_results.len(), 1, "sqlite: search 'alpha' must return 1 node");
-    assert_eq!(kz_results.len(), 1, "kuzu: search 'alpha' must return 1 node");
+    assert_eq!(
+        sq_results.len(),
+        1,
+        "sqlite: search 'alpha' must return 1 node"
+    );
+    assert_eq!(
+        kz_results.len(),
+        1,
+        "kuzu: search 'alpha' must return 1 node"
+    );
     assert_eq!(sq_results[0].id, n.alpha.id, "sqlite: must find fn:alpha");
     assert_eq!(kz_results[0].id, n.alpha.id, "kuzu: must find fn:alpha");
 }
@@ -357,13 +415,31 @@ fn parity_search_service() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_results = sq.search_nodes_by_name("Service").expect("sqlite search Service");
-    let kz_results = kz.search_nodes_by_name("Service").expect("kuzu search Service");
+    let sq_results = sq
+        .search_nodes_by_name("Service")
+        .expect("sqlite search Service");
+    let kz_results = kz
+        .search_nodes_by_name("Service")
+        .expect("kuzu search Service");
 
-    assert_eq!(sq_results.len(), 1, "sqlite: search 'Service' must return 1 node");
-    assert_eq!(kz_results.len(), 1, "kuzu: search 'Service' must return 1 node");
-    assert_eq!(sq_results[0].id, n.service.id, "sqlite: must find class:Service");
-    assert_eq!(kz_results[0].id, n.service.id, "kuzu: must find class:Service");
+    assert_eq!(
+        sq_results.len(),
+        1,
+        "sqlite: search 'Service' must return 1 node"
+    );
+    assert_eq!(
+        kz_results.len(),
+        1,
+        "kuzu: search 'Service' must return 1 node"
+    );
+    assert_eq!(
+        sq_results[0].id, n.service.id,
+        "sqlite: must find class:Service"
+    );
+    assert_eq!(
+        kz_results[0].id, n.service.id,
+        "kuzu: must find class:Service"
+    );
 }
 
 #[cfg(feature = "kuzu")]
@@ -379,8 +455,16 @@ fn parity_search_partial_fn() {
     let sq_results = sq.search_nodes_by_name("fn:").expect("sqlite search fn:");
     let kz_results = kz.search_nodes_by_name("fn:").expect("kuzu search fn:");
 
-    assert_eq!(sq_results.len(), 3, "sqlite: search 'fn:' must return 3 function nodes");
-    assert_eq!(kz_results.len(), 3, "kuzu: search 'fn:' must return 3 function nodes");
+    assert_eq!(
+        sq_results.len(),
+        3,
+        "sqlite: search 'fn:' must return 3 function nodes"
+    );
+    assert_eq!(
+        kz_results.len(),
+        3,
+        "kuzu: search 'fn:' must return 3 function nodes"
+    );
     assert_eq!(
         sorted_node_ids(&sq_results),
         sorted_node_ids(&kz_results),
@@ -398,11 +482,21 @@ fn parity_search_missing() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_results = sq.search_nodes_by_name("zzz_nonexistent").expect("sqlite search missing");
-    let kz_results = kz.search_nodes_by_name("zzz_nonexistent").expect("kuzu search missing");
+    let sq_results = sq
+        .search_nodes_by_name("zzz_nonexistent")
+        .expect("sqlite search missing");
+    let kz_results = kz
+        .search_nodes_by_name("zzz_nonexistent")
+        .expect("kuzu search missing");
 
-    assert!(sq_results.is_empty(), "sqlite: nonexistent search must return empty");
-    assert!(kz_results.is_empty(), "kuzu: nonexistent search must return empty");
+    assert!(
+        sq_results.is_empty(),
+        "sqlite: nonexistent search must return empty"
+    );
+    assert!(
+        kz_results.is_empty(),
+        "kuzu: nonexistent search must return empty"
+    );
 }
 
 #[cfg(feature = "kuzu")]
@@ -417,13 +511,27 @@ fn parity_search_by_path() {
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
     build_parity_graph_kuzu(&mut kz);
 
-    let sq_results = sq.search_nodes_by_name("src/a.ts").expect("sqlite search by path");
-    let kz_results = kz.search_nodes_by_name("src/a.ts").expect("kuzu search by path");
+    let sq_results = sq
+        .search_nodes_by_name("src/a.ts")
+        .expect("sqlite search by path");
+    let kz_results = kz
+        .search_nodes_by_name("src/a.ts")
+        .expect("kuzu search by path");
 
-    assert_eq!(sq_results.len(), 1, "sqlite: path search must return 1 node");
+    assert_eq!(
+        sq_results.len(),
+        1,
+        "sqlite: path search must return 1 node"
+    );
     assert_eq!(kz_results.len(), 1, "kuzu: path search must return 1 node");
-    assert_eq!(sq_results[0].id, n.alpha.id, "sqlite: path src/a.ts must find fn:alpha");
-    assert_eq!(kz_results[0].id, n.alpha.id, "kuzu: path src/a.ts must find fn:alpha");
+    assert_eq!(
+        sq_results[0].id, n.alpha.id,
+        "sqlite: path src/a.ts must find fn:alpha"
+    );
+    assert_eq!(
+        kz_results[0].id, n.alpha.id,
+        "kuzu: path src/a.ts must find fn:alpha"
+    );
 }
 
 #[cfg(feature = "kuzu")]
@@ -501,7 +609,8 @@ fn parity_double_put_node_idempotent() {
 
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     sq.put_node(&n.alpha).expect("sqlite put_node 1");
-    sq.put_node(&n.alpha).expect("sqlite put_node 2 (duplicate)");
+    sq.put_node(&n.alpha)
+        .expect("sqlite put_node 2 (duplicate)");
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
@@ -571,8 +680,12 @@ fn parity_edges_from_after_add() {
     sq.put_edge(&new_edge).expect("sqlite add new edge");
     kz.put_edge(&new_edge).expect("kuzu add new edge");
 
-    let sq_edges = sq.iter_edges_from(n.beta.id).expect("sqlite iter_edges_from beta after add");
-    let kz_edges = kz.iter_edges_from(n.beta.id).expect("kuzu iter_edges_from beta after add");
+    let sq_edges = sq
+        .iter_edges_from(n.beta.id)
+        .expect("sqlite iter_edges_from beta after add");
+    let kz_edges = kz
+        .iter_edges_from(n.beta.id)
+        .expect("kuzu iter_edges_from beta after add");
 
     assert_eq!(
         sorted_ids(&sq_edges),
@@ -580,6 +693,14 @@ fn parity_edges_from_after_add() {
         "iter_edges_from(beta) after adding a new edge must match"
     );
     // beta originally had 1 outgoing edge (beta→gamma); now it should have 2
-    assert_eq!(sq_edges.len(), 2, "sqlite: beta must have 2 outgoing edges after add");
-    assert_eq!(kz_edges.len(), 2, "kuzu: beta must have 2 outgoing edges after add");
+    assert_eq!(
+        sq_edges.len(),
+        2,
+        "sqlite: beta must have 2 outgoing edges after add"
+    );
+    assert_eq!(
+        kz_edges.len(),
+        2,
+        "kuzu: beta must have 2 outgoing edges after add"
+    );
 }
