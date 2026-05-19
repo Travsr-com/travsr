@@ -5,6 +5,7 @@
 mod ask;
 mod graph;
 mod init;
+mod migrate;
 mod repo;
 mod repos;
 mod status;
@@ -75,6 +76,12 @@ enum Command {
     HookRun {
         /// Paths reported by `git diff --name-only`.
         paths: Vec<String>,
+    },
+    /// Migrate the graph store to a different backend (e.g. kuzu).
+    Migrate {
+        /// Target backend. Currently supported: kuzu
+        #[arg(long = "to", value_name = "BACKEND")]
+        to: String,
     },
 }
 
@@ -189,6 +196,7 @@ async fn run() -> Result<()> {
                 paths.iter().map(|p| repo_root.join(p)).collect();
             travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
         }
+        Command::Migrate { to } => migrate::run_to(&to)?,
     }
     Ok(())
 }
