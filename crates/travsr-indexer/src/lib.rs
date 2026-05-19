@@ -117,11 +117,6 @@ impl Indexer {
         }
     }
 
-    /// The corpus this indexer uses for all emitted VNames.
-    pub fn corpus(&self) -> &str {
-        &self.corpus
-    }
-
     /// Parse a single source file into nodes and edges.
     ///
     /// Uses the file's own path string as the VName path. Callers that need

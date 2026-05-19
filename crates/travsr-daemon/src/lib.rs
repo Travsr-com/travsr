@@ -132,16 +132,20 @@ pub fn reindex_files(
     // ARCH-102: read the corpus that was set during init_repo so that
     // incremental hook runs produce VNames with the same corpus as the
     // initial full index. Fall back gracefully for legacy DBs.
-    let corpus = store
-        .get_meta("corpus")
-        .unwrap_or_default()
-        .unwrap_or_default();
-    if corpus.is_empty() {
-        tracing::warn!(
-            "no corpus in meta — VNames will use empty corpus. \
-             Run `travsr init` to set the canonical corpus (ARCH-102)."
-        );
-    }
+    let corpus = match store.get_meta("corpus") {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            tracing::warn!(
+                "no corpus in meta — VNames will use empty corpus. \
+                 Run `travsr init` to set the canonical corpus (ARCH-102)."
+            );
+            String::new()
+        }
+        Err(e) => {
+            tracing::warn!("could not read corpus from meta: {e} — using empty corpus");
+            String::new()
+        }
+    };
 
     let indexer = Indexer::with_corpus(&corpus);
 
