@@ -60,30 +60,34 @@ impl VName {
     /// Stable 64-bit identifier derived from the five-field VName.
     ///
     /// The hash is the first 8 bytes of the BLAKE3 digest of:
-    ///   `[SIGNATURE_FORMAT_VERSION] || corpus NUL root NUL path NUL language NUL signature`
+    ///   `[SIGNATURE_FORMAT_VERSION] || [len_u32_le][corpus] || [len_u32_le][root] || ...`
     ///
-    /// The leading version byte domain-separates hashes across signature format
-    /// versions (RFC-002). It is deterministic across machines, processes, and
-    /// Travsr versions within the same format version, and is suitable for use
-    /// as the SQLite primary key.
+    /// Length-prefix encoding (4-byte little-endian field length before each
+    /// field) replaces the NUL-separator scheme. This guarantees that no two
+    /// distinct VNames share the same byte stream, and that a v0 byte stream
+    /// (which starts with raw corpus bytes) can never equal a v1 stream (which
+    /// starts with `[version_byte][len]`). See RFC-002.
     pub fn id(&self) -> NodeId {
         let mut hasher = blake3::Hasher::new();
-        // Domain separator — must be the first byte. Changing SIGNATURE_FORMAT_VERSION
-        // produces disjoint NodeId spaces; see RFC-002 for the version history.
+        // Version domain separator — must be first. Changing SIGNATURE_FORMAT_VERSION
+        // produces disjoint NodeId spaces; see RFC-002.
         hasher.update(&[SIGNATURE_FORMAT_VERSION]);
-        hasher.update(self.corpus.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.root.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.language.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.signature.as_bytes());
+        // Length-prefix each field so no two distinct VNames share the same byte
+        // stream regardless of field contents (no NUL-injection ambiguity).
+        for field in [
+            self.corpus.as_str(),
+            self.root.as_str(),
+            self.path.as_str(),
+            self.language.as_str(),
+            self.signature.as_str(),
+        ] {
+            let bytes = field.as_bytes();
+            hasher.update(&(bytes.len() as u32).to_le_bytes());
+            hasher.update(bytes);
+        }
         let digest = hasher.finalize();
-        let bytes = digest.as_bytes();
         let mut buf = [0u8; 8];
-        buf.copy_from_slice(&bytes[..8]);
+        buf.copy_from_slice(&digest.as_bytes()[..8]);
         NodeId(u64::from_le_bytes(buf))
     }
 }
@@ -248,12 +252,13 @@ mod tests {
     #[test]
     fn version_byte_produces_different_id_than_unversioned() {
         // Regression guard: confirms the RFC-002 domain separator is actually
-        // prepended. If BLAKE3 without a version byte ever produced the same
-        // NodeId as with one, the domain separation would be broken.
+        // prepended and that length-prefix encoding is used. The v1 format starts
+        // with [0x01][len][corpus...]; the v0 format starts with raw corpus bytes.
+        // These byte streams can never be equal regardless of field contents.
         let v = sample_vname();
-        let versioned_id = v.id(); // uses SIGNATURE_FORMAT_VERSION byte
+        let versioned_id = v.id(); // uses SIGNATURE_FORMAT_VERSION byte + length-prefix
 
-        // Compute the legacy (no version byte) hash directly.
+        // Compute the legacy (no version byte, NUL-separated) hash directly.
         let mut hasher = blake3::Hasher::new();
         hasher.update(v.corpus.as_bytes());
         hasher.update(b"\0");
@@ -271,7 +276,7 @@ mod tests {
 
         assert_ne!(
             versioned_id, legacy_id,
-            "RFC-002 version byte must produce a different NodeId than the legacy hash"
+            "RFC-002 version byte + length-prefix must produce a different NodeId than the legacy NUL-separated hash"
         );
     }
 }

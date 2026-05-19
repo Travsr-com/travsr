@@ -138,7 +138,13 @@ pub fn reindex_files(
             );
             return Ok(());
         }
-        Err(e) => tracing::warn!("could not read signature_format_version: {e}"),
+        Err(e) => {
+            tracing::warn!(
+                "could not read signature_format_version: {e}, skipping reindex. \
+                 Run `travsr init` to repair the graph."
+            );
+            return Ok(());
+        }
         _ => {}
     }
 
