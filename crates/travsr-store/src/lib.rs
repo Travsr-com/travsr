@@ -67,6 +67,17 @@ impl Migration for V3SignatureFormatVersion {
     }
 }
 
+struct V4EdgesSrcKindIdx;
+impl Migration for V4EdgesSrcKindIdx {
+    fn version(&self) -> u32 {
+        4
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // CREATE INDEX IF NOT EXISTS is idempotent — safe to re-run after a crash.
+        store.exec_ddl(include_str!("migrations/v4_edges_src_kind_idx.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -74,6 +85,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V1Initial);
     r.register(V2EdgeProvenance);
     r.register(V3SignatureFormatVersion);
+    r.register(V4EdgesSrcKindIdx);
     r
 }
 

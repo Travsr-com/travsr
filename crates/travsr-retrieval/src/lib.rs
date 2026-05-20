@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ppr;
+pub use ppr::ppr;
 
 use std::collections::{HashSet, VecDeque};
 
