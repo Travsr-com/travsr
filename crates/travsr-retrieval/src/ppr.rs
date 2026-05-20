@@ -212,6 +212,16 @@ fn build_weighted_subgraph<S: Store>(
 
     const PPR_BFS_DEPTH: u8 = 6;
 
+    /// Maximum nodes materialised into the PPR subgraph.
+    ///
+    /// A depth-6 BFS from a single hub node in a graph with fan-out F can
+    /// reach O(F^6) nodes. Without a ceiling, a high-fan-out graph (F ≥ 20)
+    /// can exhaust memory on a developer machine before iteration starts.
+    /// 250,000 is well above the realistic neighbourhood of any single query
+    /// at the MVP code-graph scale (< 75M total nodes), so genuine PPR
+    /// quality is unaffected for normal codebases.
+    const MAX_SUBGRAPH_NODES: usize = 250_000;
+
     let mut adj: HashMap<NodeId, Vec<(NodeId, f32)>> = HashMap::new();
     let mut reverse_adj: HashMap<NodeId, ()> = HashMap::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
@@ -224,6 +234,15 @@ fn build_weighted_subgraph<S: Store>(
     }
 
     while let Some((node, depth)) = queue.pop_front() {
+        if visited.len() > MAX_SUBGRAPH_NODES {
+            tracing::warn!(
+                visited = visited.len(),
+                limit = MAX_SUBGRAPH_NODES,
+                "PPR subgraph exceeded node ceiling — truncating BFS"
+            );
+            break;
+        }
+
         let edges = store.iter_edges_from(node)?;
         let mut outgoing: Vec<(NodeId, f32)> = Vec::with_capacity(edges.len());
 
