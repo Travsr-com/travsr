@@ -108,21 +108,27 @@ pub fn compute_manifest_sqlite(store: &SqliteStore) -> Result<Manifest, Migratio
     let edges = store.all_edges().context("reading all edges from sqlite")?;
 
     let node_count = nodes.len() as u64;
-    let edge_count = edges.len() as u64;
 
+    let valid_nodes: HashSet<u64> = nodes.iter().map(|n| n.id.0).collect();
     let mut connected: HashSet<u64> = HashSet::new();
     let entries: Vec<ManifestEntry> = edges
         .iter()
-        .map(|(src, dst, kind, _provenance)| {
-            connected.insert(src.0);
-            connected.insert(dst.0);
-            ManifestEntry {
-                src: src.0,
-                dst: dst.0,
-                kind: kind.clone(),
+        .filter_map(|(src, dst, kind, _provenance)| {
+            if valid_nodes.contains(&src.0) && valid_nodes.contains(&dst.0) {
+                connected.insert(src.0);
+                connected.insert(dst.0);
+                Some(ManifestEntry {
+                    src: src.0,
+                    dst: dst.0,
+                    kind: kind.clone(),
+                })
+            } else {
+                None
             }
         })
         .collect();
+
+    let edge_count = entries.len() as u64;
 
     let mut isolated: Vec<u64> = nodes
         .iter()
