@@ -217,6 +217,41 @@ impl EdgeKind {
         }
     }
 
+    /// PPR transition weight for this edge kind.
+    ///
+    /// Weights encode the semantic importance of each edge type for
+    /// Personalized PageRank: a higher weight means PPR mass flows more
+    /// readily across edges of this kind, producing higher scores for
+    /// reachable nodes.
+    ///
+    /// # Rationale (DEBT-016 / ADR-003)
+    ///
+    /// | Kind              | Weight | Reasoning                               |
+    /// |---|---|---|
+    /// | `RefCall`         | 1.00   | Direct call — strongest semantic link   |
+    /// | `DefinesBinding`  | 0.70   | Parent→child definition — strong structural link |
+    /// | `Exports`         | 0.60   | Exported API surface — important for callers |
+    /// | `Depends`         | 0.50   | File import — broad but less targeted   |
+    /// | `ResolvesTo`      | 0.50   | Import→file resolution — same as Depends |
+    /// | `RefImports`      | 0.40   | Named import specifier — narrower than file import |
+    /// | `IsImplementation`| 0.40   | Class implements interface — type-system link |
+    /// | `Overrides`       | 0.30   | Method override — weakest semantic tie  |
+    ///
+    /// Weights are normalised per-node at PPR iteration time so their
+    /// absolute scale does not matter — only the ratios between kinds.
+    pub fn ppr_weight(self) -> f32 {
+        match self {
+            Self::RefCall => 1.00,
+            Self::DefinesBinding => 0.70,
+            Self::Exports => 0.60,
+            Self::Depends => 0.50,
+            Self::ResolvesTo => 0.50,
+            Self::RefImports => 0.40,
+            Self::IsImplementation => 0.40,
+            Self::Overrides => 0.30,
+        }
+    }
+
     /// Parse from the stable string representation.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
@@ -317,6 +352,44 @@ mod tests {
             EdgeKind::Overrides,
         ] {
             assert_eq!(EdgeKind::from_str(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn ppr_weights_are_ordered_by_semantic_strength() {
+        // RefCall > DefinesBinding > Exports > Depends == ResolvesTo > RefImports == IsImplementation > Overrides
+        assert!(EdgeKind::RefCall.ppr_weight() > EdgeKind::DefinesBinding.ppr_weight());
+        assert!(EdgeKind::DefinesBinding.ppr_weight() > EdgeKind::Exports.ppr_weight());
+        assert!(EdgeKind::Exports.ppr_weight() > EdgeKind::Depends.ppr_weight());
+        assert_eq!(
+            EdgeKind::Depends.ppr_weight(),
+            EdgeKind::ResolvesTo.ppr_weight()
+        );
+        assert!(EdgeKind::Depends.ppr_weight() > EdgeKind::RefImports.ppr_weight());
+        assert_eq!(
+            EdgeKind::RefImports.ppr_weight(),
+            EdgeKind::IsImplementation.ppr_weight()
+        );
+        assert!(EdgeKind::IsImplementation.ppr_weight() > EdgeKind::Overrides.ppr_weight());
+    }
+
+    #[test]
+    fn ppr_weights_are_positive_and_at_most_one() {
+        for kind in [
+            EdgeKind::Depends,
+            EdgeKind::RefCall,
+            EdgeKind::DefinesBinding,
+            EdgeKind::Exports,
+            EdgeKind::ResolvesTo,
+            EdgeKind::RefImports,
+            EdgeKind::IsImplementation,
+            EdgeKind::Overrides,
+        ] {
+            let w = kind.ppr_weight();
+            assert!(
+                w > 0.0 && w <= 1.0,
+                "weight {w} for {kind:?} must be in (0, 1]"
+            );
         }
     }
 
