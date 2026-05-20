@@ -1,0 +1,49 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Deny packages with known security vulnerabilities
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "warn"
+notice = "warn"
+# Ignore advisories that have been reviewed and accepted
+ignore = []
+
+[licenses]
+# Allow common permissive open-source licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+]
+# Deny copyleft / viral licenses
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-3.0",
+    "LGPL-2.0",
+    "LGPL-2.1",
+]
+copyleft = "deny"
+# Confidence threshold for license detection (0.0-1.0)
+confidence-threshold = 0.8
+
+[bans]
+# Warn on multiple versions of the same dep (not an error — monorepo with many deps)
+multiple-versions = "warn"
+# Deny packages that should never appear in a supply chain
+deny = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
