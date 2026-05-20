@@ -16,6 +16,7 @@ const TARGETS = {
   'linux-arm64': 'aarch64-unknown-linux-gnu',
   'darwin-x64':  'x86_64-apple-darwin',
   'darwin-arm64':'aarch64-apple-darwin',
+  'win32-x64':   'x86_64-pc-windows-msvc',
 };
 
 function detect() {
@@ -92,10 +93,13 @@ async function install() {
     process.exit(1);
   }
 
-  // Extract binary from tarball using tar (available on macOS and Linux)
+  // Extract binary from tarball.
+  // On Windows the archive contains travsr.exe; on Unix it contains travsr.
+  // tar ships with macOS, Linux, and Windows 10+ (build 17063+).
+  const binName = process.platform === 'win32' ? 'travsr.exe' : 'travsr';
   const tmpTar = path.join(BIN_DIR, tarName);
   fs.writeFileSync(tmpTar, tarball);
-  execFileSync('tar', ['-xzf', tmpTar, '-C', BIN_DIR, 'travsr'], { stdio: 'inherit' });
+  execFileSync('tar', ['-xzf', tmpTar, '-C', BIN_DIR, binName], { stdio: 'inherit' });
   fs.unlinkSync(tmpTar);
 
   if (process.platform !== 'win32') fs.chmodSync(destBin, 0o755);
