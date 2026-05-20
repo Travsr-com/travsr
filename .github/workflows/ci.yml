@@ -99,6 +99,26 @@ jobs:
       - name: Test
         run: npm test
 
+  msrv:
+    name: MSRV (rust 1.75)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # To bump MSRV: update rust-version in Cargo.toml, update the toolchain
+      # version below, and add a changelog entry.
+      - name: Install Rust toolchain (1.75.0)
+        uses: dtolnay/rust-toolchain@1.75.0
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check workspace compiles on MSRV
+        run: cargo check --workspace --all-features
+
   # The VS Code extension job is intentionally not wired up yet. Sprint 3
   # will add a dedicated workflow (.github/workflows/vscode.yml) once the
   # extension has runtime code and a committed package-lock.json. See
