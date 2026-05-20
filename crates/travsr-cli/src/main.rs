@@ -105,13 +105,7 @@ async fn main() {
         std::process::exit(1);
     }));
 
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
     let result = run().await;
 
@@ -127,6 +121,78 @@ async fn main() {
                 eprintln!("error: {e:#}");
             }
             std::process::exit(1);
+        }
+    }
+}
+
+/// Initialise the global tracing subscriber.
+///
+/// Without the `otlp` feature: stderr-only JSON/pretty subscriber filtered by
+/// `RUST_LOG` (default: `info`).
+///
+/// With the `otlp` feature: adds an OpenTelemetry OTLP layer that exports spans
+/// via gRPC to `TRAVSR_OTLP_ENDPOINT` (default: `http://localhost:4317`).
+/// This is off by default — only enable it when you have a collector running.
+///
+/// Log redaction: file contents are never logged. Spans record only paths,
+/// counts, and numeric identifiers — never raw source text.
+fn init_tracing() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    #[cfg(not(feature = "otlp"))]
+    {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(env_filter)
+            .init();
+    }
+
+    #[cfg(feature = "otlp")]
+    {
+        use opentelemetry_otlp::WithExportConfig as _;
+        use tracing_subscriber::prelude::*;
+
+        let endpoint = std::env::var("TRAVSR_OTLP_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:4317".to_string());
+
+        let exporter = opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(&endpoint);
+
+        // Gracefully degrade to stderr-only if the OTLP pipeline setup fails
+        // (e.g. bad endpoint, missing collector). A tracer init failure must
+        // never panic the binary — the user still needs the CLI to work.
+        match opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(exporter)
+            .install_batch(opentelemetry_sdk::runtime::Tokio)
+        {
+            Ok(tracer_provider) => {
+                let otel_layer =
+                    tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("travsr"));
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                    .with(otel_layer)
+                    .init();
+                tracing::info!(otlp_endpoint = %endpoint, "OTLP trace export enabled");
+            }
+            Err(e) => {
+                // Fall back to stderr-only — the CLI must remain functional.
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::stderr)
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    )
+                    .init();
+                tracing::warn!(
+                    error = %e,
+                    otlp_endpoint = %endpoint,
+                    "OTLP exporter init failed — falling back to stderr-only tracing"
+                );
+            }
         }
     }
 }

@@ -253,6 +253,8 @@ impl SqliteStore {
     }
 
     pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>> {
+        // Log the query name (symbol/path, not file contents — SEC log-redaction rule).
+        let _span = tracing::debug_span!("store.search_nodes_by_name", query = name).entered();
         let mut stmt = self
             .conn
             .prepare(
@@ -281,6 +283,7 @@ impl SqliteStore {
         for row in rows {
             out.push(row.context("decoding search row")?);
         }
+        tracing::debug!(nodes_returned = out.len());
         Ok(out)
     }
 
@@ -509,6 +512,7 @@ impl Store for SqliteStore {
     }
 
     fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>> {
+        let _span = tracing::debug_span!("store.iter_edges_from", src = src.0).entered();
         let mut stmt = self
             .conn
             .prepare("SELECT dst, kind FROM edges WHERE src = ?1")
@@ -528,6 +532,7 @@ impl Store for SqliteStore {
                 .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
             out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
         }
+        tracing::debug!(edges_returned = out.len());
         Ok(out)
     }
 
@@ -535,6 +540,8 @@ impl Store for SqliteStore {
     /// satisfy the query from the `(src, dst, kind)` primary-key index without
     /// a full `src`-partition scan. Overrides the trait default.
     fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>> {
+        let _span =
+            tracing::debug_span!("store.iter_edges_from_kind", src = src.0, kind = ?kind).entered();
         let mut stmt = self
             .conn
             .prepare("SELECT dst FROM edges WHERE src = ?1 AND kind = ?2")
@@ -550,10 +557,12 @@ impl Store for SqliteStore {
             let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
             out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
         }
+        tracing::debug!(edges_returned = out.len());
         Ok(out)
     }
 
     fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>> {
+        let _span = tracing::debug_span!("store.iter_edges_to", dst = dst.0).entered();
         let mut stmt = self
             .conn
             .prepare("SELECT src, kind FROM edges WHERE dst = ?1")
@@ -573,6 +582,7 @@ impl Store for SqliteStore {
                 .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
             out.push(Edge::new(i64_to_node_id(src_i64), dst, kind));
         }
+        tracing::debug!(edges_returned = out.len());
         Ok(out)
     }
 }

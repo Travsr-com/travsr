@@ -91,6 +91,7 @@ fn handle_tool_call(
     };
     let args = &params["arguments"];
 
+    let _span = tracing::info_span!("mcp.tool_call", tool = tool_name).entered();
     let text = match tool_name {
         "get_dependencies" => {
             let file = args["file"].as_str().unwrap_or("");
@@ -114,6 +115,13 @@ fn handle_tool_call(
         }
     };
 
+    // tool_calls_total=1 is a log-based counter field for tracing subscribers.
+    // TODO(travsr-060): replace with otel Counter metric for proper OTLP aggregation.
+    tracing::info!(
+        tool = tool_name,
+        tool_calls_total = 1u64,
+        "mcp.tool_call complete"
+    );
     ok_response(
         id,
         serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
@@ -281,6 +289,7 @@ fn handle_tool_call_global(
     let args = &params["arguments"];
     let repo_arg = args["repo"].as_str();
 
+    let _span = tracing::info_span!("mcp.tool_call", tool = tool_name, global = true).entered();
     let text = match tool_name {
         "get_dependencies" => {
             tools::get_dependencies_global(repos, args["file"].as_str().unwrap_or(""), repo_arg)
@@ -298,6 +307,13 @@ fn handle_tool_call_global(
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
+    // tool_calls_total=1 is a log-based counter field for tracing subscribers.
+    // TODO(travsr-060): replace with otel Counter metric for proper OTLP aggregation.
+    tracing::info!(
+        tool = tool_name,
+        tool_calls_total = 1u64,
+        "mcp.tool_call complete"
+    );
     ok_response(
         id,
         serde_json::json!({ "content": [{ "type": "text", "text": text }] }),

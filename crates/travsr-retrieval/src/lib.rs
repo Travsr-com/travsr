@@ -28,10 +28,19 @@ pub fn bfs(
     max_depth: u8,
     token_budget: usize,
 ) -> Result<Vec<Node>> {
+    let _span = tracing::debug_span!(
+        "bfs.expand",
+        seed = seed.0,
+        max_depth = max_depth,
+        token_budget = token_budget
+    )
+    .entered();
+
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
     let mut result: Vec<Node> = Vec::new();
     let mut tokens_used: usize = 0;
+    let mut edges_traversed: usize = 0;
 
     queue.push_back((seed, 0));
     visited.insert(seed);
@@ -52,6 +61,9 @@ pub fn bfs(
 
         if depth < max_depth {
             for edge in store.iter_edges_from(current_id)? {
+                // edges_traversed counts all edges examined, including back-edges to
+                // already-visited nodes — it measures store query load, not unique new nodes.
+                edges_traversed += 1;
                 if !visited.contains(&edge.dst) {
                     visited.insert(edge.dst);
                     queue.push_back((edge.dst, depth + 1));
@@ -60,6 +72,12 @@ pub fn bfs(
         }
     }
 
+    tracing::debug!(
+        nodes_visited = result.len(),
+        edges_traversed = edges_traversed,
+        tokens_used = tokens_used,
+        "bfs.expand complete"
+    );
     Ok(result)
 }
 
