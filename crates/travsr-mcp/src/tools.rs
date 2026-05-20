@@ -252,6 +252,11 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
     use std::collections::{HashSet, VecDeque};
     use travsr_core::EdgeKind;
 
+    // Hard ceiling: prevents OOM on utility files imported by thousands of callers.
+    // Same guard policy as PPR (MAX_SUBGRAPH_NODES = 250_000); tighter here because
+    // blast-radius is a UI tool whose output must fit in an MCP response.
+    const MAX_BLAST_RADIUS_NODES: usize = 50_000;
+
     // Find all nodes whose VName path matches the given file.
     let seed_nodes = match store.search_nodes_by_name(file) {
         Ok(n) => n,
@@ -287,6 +292,14 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
                 continue;
             }
         };
+
+        if visited.len() >= MAX_BLAST_RADIUS_NODES {
+            tracing::warn!(
+                "get_blast_radius hit ceiling ({MAX_BLAST_RADIUS_NODES} nodes) \
+                 for file '{file}'; result may be incomplete"
+            );
+            break;
+        }
 
         for edge in incoming {
             if !matches!(edge.kind, EdgeKind::DefinesBinding | EdgeKind::RefCall) {
@@ -346,6 +359,11 @@ pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
 }
 
 fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
+    // Cap results: prevents self-DoS from wildcard queries (e.g. "a") and limits
+    // accidental bulk exfiltration. The store LIKE query has no SQL LIMIT yet —
+    // this Rust-side cap is the guard until that is added at the store layer.
+    const MAX_SEARCH_RESULTS: usize = 50;
+
     let nodes = match store.search_nodes_by_name(name) {
         Ok(n) => n,
         Err(e) => {
@@ -356,6 +374,7 @@ fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
 
     let lines: Vec<String> = nodes
         .iter()
+        .take(MAX_SEARCH_RESULTS)
         .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
         .collect();
     lines.join("\n")
@@ -512,6 +531,113 @@ mod tests {
         assert_eq!(
             result, "<travsr-data></travsr-data>",
             "absolute path in repo arg must be rejected and return empty envelope"
+        );
+    }
+
+    // ── blast radius unit tests ───────────────────────────────────────────────
+
+    fn make_store(
+        nodes: &[travsr_core::Node],
+        edges: &[(
+            travsr_core::NodeId,
+            travsr_core::NodeId,
+            travsr_core::EdgeKind,
+        )],
+    ) -> travsr_store::SqliteStore {
+        use travsr_core::Edge;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for n in nodes {
+            store.put_node(n).unwrap();
+        }
+        for &(src, dst, kind) in edges {
+            store.put_edge(&Edge::new(src, dst, kind)).unwrap();
+        }
+        store
+    }
+
+    fn make_node(path: &str, sig: &str) -> travsr_core::Node {
+        use travsr_core::VName;
+        travsr_core::Node::new(VName::new("", "", path, "typescript", sig), "function")
+    }
+
+    /// A file with no callers — blast radius is just itself.
+    #[test]
+    fn blast_radius_includes_source_file() {
+        let a = make_node("a.ts", "fn:a");
+        let store = make_store(&[a.clone()], &[]);
+        let result = get_blast_radius(&store, "a.ts");
+        assert!(
+            result.contains("a.ts"),
+            "source file must appear in its own blast radius"
+        );
+    }
+
+    /// B → A (incoming call): blast_radius("a.ts") must include b.ts.
+    #[test]
+    fn blast_radius_follows_incoming_edges() {
+        use travsr_core::EdgeKind;
+        let a = make_node("a.ts", "fn:a");
+        let b = make_node("b.ts", "fn:b");
+        // B calls A — reverse BFS from A should reach B.
+        let store = make_store(&[a.clone(), b.clone()], &[(b.id, a.id, EdgeKind::RefCall)]);
+        let result = get_blast_radius(&store, "a.ts");
+        assert!(result.contains("a.ts"), "source file must be included");
+        assert!(
+            result.contains("b.ts"),
+            "caller file must be included in blast radius"
+        );
+    }
+
+    /// Cycle A ↔ B — must terminate without infinite loop.
+    #[test]
+    fn blast_radius_handles_cycle() {
+        use travsr_core::EdgeKind;
+        let a = make_node("a.ts", "fn:a");
+        let b = make_node("b.ts", "fn:b");
+        let store = make_store(
+            &[a.clone(), b.clone()],
+            &[
+                (b.id, a.id, EdgeKind::RefCall),
+                (a.id, b.id, EdgeKind::RefCall), // cycle
+            ],
+        );
+        // Must not hang; both files reachable.
+        let result = get_blast_radius(&store, "a.ts");
+        assert!(result.contains("a.ts"));
+        assert!(result.contains("b.ts"));
+    }
+
+    // ── get_repo_map unit tests ───────────────────────────────────────────────
+
+    /// Two nodes in different files must produce two entries.
+    #[test]
+    fn get_repo_map_groups_by_file() {
+        let a = make_node("src/a.ts", "fn:a");
+        let b = make_node("src/b.ts", "fn:b");
+        let store = make_store(&[a, b], &[]);
+        let result = get_repo_map(&store);
+        assert!(result.contains("src/a.ts"), "a.ts must appear in repo map");
+        assert!(result.contains("src/b.ts"), "b.ts must appear in repo map");
+    }
+
+    /// File-kind nodes must not appear as symbols in the map.
+    #[test]
+    fn get_repo_map_excludes_file_kind_nodes() {
+        use travsr_core::VName;
+        let file_node = travsr_core::Node::new(
+            VName::new("", "", "src/a.ts", "typescript", "src/a.ts"),
+            "file",
+        );
+        let fn_node = make_node("src/a.ts", "fn:a");
+        let store = make_store(&[file_node, fn_node], &[]);
+        let result = get_repo_map(&store);
+        // Should list "src/a.ts" as a file entry.
+        assert!(result.contains("src/a.ts"));
+        // The "file" kind node's signature must not appear as a symbol entry.
+        // It should show [1 symbol] (only fn:a), not [2 symbols].
+        assert!(
+            result.contains("[1 symbol]"),
+            "file-kind node must be excluded from symbol count"
         );
     }
 }
