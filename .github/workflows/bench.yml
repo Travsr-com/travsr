@@ -13,7 +13,9 @@ permissions:
 
 concurrency:
   group: bench-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel in-progress on PRs. Never cancel a master push — it may be
+  # in the middle of saving the baseline that future PRs compare against.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   bench:

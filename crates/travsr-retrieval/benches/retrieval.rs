@@ -65,7 +65,10 @@ fn fan(n: usize) -> (SqliteStore, NodeId) {
 
 fn bench_bfs_chain(c: &mut Criterion) {
     let mut group = c.benchmark_group("bfs/chain");
-    for n in [100usize, 1_000, 10_000] {
+    // max_depth is u8 (max 255); chain depth == hop count, so inputs must stay
+    // below 256 or the BFS depth-cap fires before all nodes are visited,
+    // producing identical timing across larger inputs.
+    for n in [50usize, 100, 200] {
         let (store, seed) = chain(n);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| bfs(&store, seed, u8::MAX, usize::MAX).unwrap());
