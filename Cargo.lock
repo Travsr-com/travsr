@@ -2239,6 +2239,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "travsr-error"
+version = "0.3.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "travsr-indexer"
 version = "0.3.0"
 dependencies = [
@@ -2248,6 +2255,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "travsr-core",
+ "travsr-error",
  "tree-sitter",
  "tree-sitter-typescript",
 ]
@@ -2275,6 +2283,7 @@ dependencies = [
  "criterion",
  "tracing",
  "travsr-core",
+ "travsr-error",
  "travsr-store",
 ]
 
@@ -2292,6 +2301,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "travsr-core",
+ "travsr-error",
 ]
 
 [[package]]

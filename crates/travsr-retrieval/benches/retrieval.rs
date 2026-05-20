@@ -22,7 +22,13 @@ use travsr_store::{SqliteStore, Store};
 
 fn make_node(i: usize) -> Node {
     Node::new(
-        VName::new("", "", &format!("file_{i}.ts"), "typescript", &format!("fn:{i}")),
+        VName::new(
+            "",
+            "",
+            &format!("file_{i}.ts"),
+            "typescript",
+            &format!("fn:{i}"),
+        ),
         "function",
     )
 }

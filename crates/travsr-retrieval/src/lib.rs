@@ -13,8 +13,8 @@ pub use ppr::ppr;
 
 use std::collections::{HashSet, VecDeque};
 
-use anyhow::Result;
 use travsr_core::{Node, NodeId};
+use travsr_error::TravsrError;
 use travsr_store::{SqliteStore, Store};
 
 /// Bounded BFS from `seed`, returning reachable nodes in discovery order.
@@ -27,7 +27,7 @@ pub fn bfs(
     seed: NodeId,
     max_depth: u8,
     token_budget: usize,
-) -> Result<Vec<Node>> {
+) -> Result<Vec<Node>, TravsrError> {
     let _span = tracing::debug_span!(
         "bfs.expand",
         seed = seed.0,

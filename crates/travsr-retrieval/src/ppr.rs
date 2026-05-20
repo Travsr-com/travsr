@@ -74,8 +74,9 @@ fn parse_env_f32_bounded(var: &str, default: f32, lo: f32, hi: f32) -> f32 {
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::Result as AnyResult;
 use travsr_core::NodeId;
+use travsr_error::TravsrError;
 use travsr_store::Store;
 
 /// Personalized PageRank over the code graph.
@@ -106,7 +107,16 @@ use travsr_store::Store;
 /// # Complexity
 ///
 /// O(iterations × |E_reachable|) time.  Space O(|V_reachable|).
-pub fn ppr<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> Result<Vec<(NodeId, f32)>> {
+pub fn ppr<S: Store>(
+    store: &S,
+    seeds: &[NodeId],
+    k: usize,
+) -> Result<Vec<(NodeId, f32)>, TravsrError> {
+    (|| -> AnyResult<Vec<(NodeId, f32)>> { ppr_inner(store, seeds, k) })()
+        .map_err(|e| TravsrError::Internal(e.to_string()))
+}
+
+fn ppr_inner<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> AnyResult<Vec<(NodeId, f32)>> {
     let _span = tracing::debug_span!("ppr", seeds = seeds.len(), k = k).entered();
 
     if seeds.is_empty() {
@@ -217,7 +227,7 @@ type WeightedAdj = HashMap<NodeId, Vec<(NodeId, f32)>>;
 fn build_weighted_subgraph<S: Store>(
     store: &S,
     seeds: &[NodeId],
-) -> Result<(WeightedAdj, HashMap<NodeId, ()>)> {
+) -> AnyResult<(WeightedAdj, HashMap<NodeId, ()>)> {
     use std::collections::{HashSet, VecDeque};
     let _span = tracing::debug_span!("ppr.bfs_expand", seeds = seeds.len()).entered();
 

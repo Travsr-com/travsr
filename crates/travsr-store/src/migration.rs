@@ -187,8 +187,8 @@ impl MigrationRunner {
 mod tests {
     use super::*;
     use crate::{Edge, Node, NodeId, Store};
-    use anyhow::Result;
     use travsr_core::VName;
+    use travsr_error::StoreError;
 
     // ── Minimal in-memory test backend ────────────────────────────────────────
 
@@ -209,19 +209,19 @@ mod tests {
 
     // Store trait — only version + ddl matter for migration tests.
     impl Store for FakeStore {
-        fn put_node(&mut self, _: &Node) -> Result<NodeId> {
+        fn put_node(&mut self, _: &Node) -> Result<NodeId, StoreError> {
             Ok(VName::new("", "", "", "", "").id())
         }
-        fn put_edge(&mut self, _: &Edge) -> Result<()> {
+        fn put_edge(&mut self, _: &Edge) -> Result<(), StoreError> {
             Ok(())
         }
-        fn get_node(&self, _: NodeId) -> Result<Option<Node>> {
+        fn get_node(&self, _: NodeId) -> Result<Option<Node>, StoreError> {
             Ok(None)
         }
-        fn iter_edges_from(&self, _: NodeId) -> Result<Vec<Edge>> {
+        fn iter_edges_from(&self, _: NodeId) -> Result<Vec<Edge>, StoreError> {
             Ok(Vec::new())
         }
-        fn iter_edges_to(&self, _: NodeId) -> Result<Vec<Edge>> {
+        fn iter_edges_to(&self, _: NodeId) -> Result<Vec<Edge>, StoreError> {
             Ok(Vec::new())
         }
     }
@@ -337,19 +337,19 @@ mod tests {
             versions_at_set: Vec<u32>,
         }
         impl Store for VersionCapture {
-            fn put_node(&mut self, n: &Node) -> Result<NodeId> {
+            fn put_node(&mut self, n: &Node) -> Result<NodeId, StoreError> {
                 self.inner.put_node(n)
             }
-            fn put_edge(&mut self, e: &Edge) -> Result<()> {
+            fn put_edge(&mut self, e: &Edge) -> Result<(), StoreError> {
                 self.inner.put_edge(e)
             }
-            fn get_node(&self, id: NodeId) -> Result<Option<Node>> {
+            fn get_node(&self, id: NodeId) -> Result<Option<Node>, StoreError> {
                 self.inner.get_node(id)
             }
-            fn iter_edges_from(&self, id: NodeId) -> Result<Vec<Edge>> {
+            fn iter_edges_from(&self, id: NodeId) -> Result<Vec<Edge>, StoreError> {
                 self.inner.iter_edges_from(id)
             }
-            fn iter_edges_to(&self, id: NodeId) -> Result<Vec<Edge>> {
+            fn iter_edges_to(&self, id: NodeId) -> Result<Vec<Edge>, StoreError> {
                 self.inner.iter_edges_to(id)
             }
         }

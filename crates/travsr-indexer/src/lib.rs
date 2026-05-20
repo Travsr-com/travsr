@@ -18,6 +18,7 @@ pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
 pub use runner::run_lsif_emitter;
 pub use travsr_core::{Edge, Node};
+pub use travsr_error::IndexError;
 
 /// Resolve relative imports in `nodes` to `resolves-to` edges.
 ///
@@ -122,7 +123,7 @@ impl Indexer {
     /// Uses the file's own path string as the VName path. Callers that need
     /// repo-relative VName paths (e.g. the daemon) should use
     /// [`parse_file_with_vname`] instead.
-    pub fn parse_file(&self, path: &Path) -> anyhow::Result<ParseOutput> {
+    pub fn parse_file(&self, path: &Path) -> Result<ParseOutput, IndexError> {
         let vname_path = path.to_string_lossy().replace('\\', "/");
         self.parse_file_with_vname(path, &vname_path)
     }
@@ -133,9 +134,16 @@ impl Indexer {
         &self,
         abs_path: &Path,
         vname_path: &str,
-    ) -> anyhow::Result<ParseOutput> {
+    ) -> Result<ParseOutput, IndexError> {
         match abs_path.extension().and_then(|e| e.to_str()) {
-            Some("ts" | "tsx") => typescript::parse(&self.corpus, abs_path, vname_path),
+            Some("ts" | "tsx") => {
+                typescript::parse(&self.corpus, abs_path, vname_path).map_err(|e| {
+                    IndexError::Parse {
+                        file: abs_path.to_string_lossy().into_owned(),
+                        message: e.to_string(),
+                    }
+                })
+            }
             _ => Ok(ParseOutput::default()),
         }
     }

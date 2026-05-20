@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/travsr-error",
     "crates/travsr-core",
     "crates/travsr-indexer",
     "crates/travsr-store",
@@ -19,6 +20,7 @@ repository = "https://github.com/raj-rkv/travsr"
 rust-version = "1.75"
 
 [workspace.dependencies]
+travsr-error = { path = "crates/travsr-error" }
 anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
