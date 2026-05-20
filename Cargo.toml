@@ -44,6 +44,7 @@ ignore = "0.4"
 assert_cmd = "2"
 notify = "8"
 tabled = "0.20"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.release]
 lto = "thin"

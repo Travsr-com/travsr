@@ -1,0 +1,137 @@
+name: Bench
+
+# Runs on every push to master (saves the new baseline) and on every PR
+# (restores the master baseline, runs benchmarks, fails on regression ≥ 10%).
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write   # post the diff table as a PR comment
+
+concurrency:
+  group: bench-${{ github.ref }}
+  # Only cancel in-progress on PRs. Never cancel a master push — it may be
+  # in the middle of saving the baseline that future PRs compare against.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bench:
+    name: criterion regression check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+
+      # ------------------------------------------------------------------
+      # On PRs: restore the most recent master baseline so critcmp can diff
+      # ------------------------------------------------------------------
+      - name: Restore master Criterion baseline
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: criterion-baseline
+          # restore-keys picks the most recent master snapshot
+          key: criterion-master-${{ runner.os }}-${{ github.base_ref }}-${{ github.sha }}
+          restore-keys: |
+            criterion-master-${{ runner.os }}-${{ github.base_ref }}-
+
+      # ------------------------------------------------------------------
+      # Run benchmarks
+      # ------------------------------------------------------------------
+      - name: Run benchmarks → save as "master" baseline
+        if: github.event_name == 'push'
+        run: cargo bench --workspace -- --save-baseline master
+
+      - name: Run benchmarks → save as "pr" baseline
+        if: github.event_name == 'pull_request'
+        run: cargo bench --workspace -- --save-baseline pr
+
+      # ------------------------------------------------------------------
+      # On master pushes: snapshot the new baseline for future PRs
+      # ------------------------------------------------------------------
+      - name: Copy Criterion output to baseline cache dir
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p criterion-baseline
+          cp -r target/criterion/* criterion-baseline/
+
+      - name: Save master Criterion baseline
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: criterion-baseline
+          key: criterion-master-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+
+      # ------------------------------------------------------------------
+      # On PRs: restore master baseline into target/criterion then compare
+      # ------------------------------------------------------------------
+      - name: Merge master baseline into target/criterion
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -d criterion-baseline ]; then
+            mkdir -p target/criterion
+            cp -rn criterion-baseline/. target/criterion/
+            echo "master_baseline_found=true" >> "$GITHUB_ENV"
+          else
+            echo "master_baseline_found=false" >> "$GITHUB_ENV"
+            echo "No master baseline found — skipping comparison, posting raw numbers."
+          fi
+
+      - name: Install critcmp
+        if: github.event_name == 'pull_request'
+        run: cargo install critcmp@0.1 --locked
+
+      - name: Compare baselines (threshold: +10%)
+        if: github.event_name == 'pull_request' && env.master_baseline_found == 'true'
+        id: compare
+        # critcmp exits non-zero when any benchmark regresses beyond --threshold.
+        # Output is captured to bench-diff.txt for the PR comment step.
+        run: |
+          critcmp master pr --threshold 10 | tee bench-diff.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          exit ${PIPESTATUS[0]}
+
+      - name: Emit raw bench numbers (no master baseline)
+        if: github.event_name == 'pull_request' && env.master_baseline_found == 'false'
+        run: critcmp pr | tee bench-diff.txt || true
+
+      # Post the diff table as a sticky PR comment (updated on each push).
+      - name: Post benchmark diff comment
+        if: github.event_name == 'pull_request' && always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f bench-diff.txt ] && [ -s bench-diff.txt ]; then
+            TABLE=$(cat bench-diff.txt)
+          else
+            TABLE="(no benchmark output — baseline may be missing)"
+          fi
+
+          if [ "${{ env.master_baseline_found }}" = "true" ]; then
+            HEADER="## Benchmark comparison (master → PR)"
+            FOOTER="_Threshold: p95 regression ≥ +10% fails this check._"
+          else
+            HEADER="## Benchmark results (no master baseline yet)"
+            FOOTER="_Baseline will be saved when master is updated._"
+          fi
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "${HEADER}
+
+          \`\`\`
+          ${TABLE}
+          \`\`\`
+
+          ${FOOTER}"

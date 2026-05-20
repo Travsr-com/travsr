@@ -13,3 +13,10 @@ travsr-core = { path = "../travsr-core" }
 travsr-store = { path = "../travsr-store" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "retrieval"
+harness = false
