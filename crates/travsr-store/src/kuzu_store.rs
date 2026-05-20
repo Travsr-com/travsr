@@ -142,6 +142,31 @@ impl KuzuStore {
         Ok(out)
     }
 
+    /// Return every edge as a `(src, dst, kind)` triple.
+    ///
+    /// Used by [`crate::migration_manifest::compute_manifest_kuzu`] to build the
+    /// integrity manifest. Provenance is not stored in Kùzu — the triple is the
+    /// full edge identity.
+    #[cfg_attr(not(feature = "kuzu"), allow(dead_code))]
+    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String)>> {
+        let conn = self.connect().context("all_edges: connecting to kuzu")?;
+        let mut result = conn
+            .query(
+                "MATCH (s:nodes)-[e:edges]->(d:nodes) \
+                 RETURN s.id, d.id, e.kind",
+            )
+            .context("all_edges: executing query")?;
+
+        let mut out = Vec::new();
+        while let Some(row) = result.next() {
+            let src_raw = extract_i64(&row, 0, "s.id")?;
+            let dst_raw = extract_i64(&row, 1, "d.id")?;
+            let kind = extract_string(&row, 2, "e.kind")?;
+            out.push((i64_to_node_id(src_raw), i64_to_node_id(dst_raw), kind));
+        }
+        Ok(out)
+    }
+
     /// Substring search over node signature and path fields.
     /// Mirrors [`SqliteStore::search_nodes_by_name`]. Used by the parity test harness.
     pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>> {
