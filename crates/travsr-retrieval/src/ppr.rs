@@ -237,6 +237,8 @@ fn build_weighted_subgraph<S: Store>(
     let mut reverse_adj: HashMap<NodeId, ()> = HashMap::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
+    // Accumulated inside the BFS loop (same pass) — no extra O(V) post-BFS sum.
+    let mut total_edges_seen: usize = 0;
 
     for &s in seeds {
         if visited.insert(s) {
@@ -261,6 +263,7 @@ fn build_weighted_subgraph<S: Store>(
             let w = edge.kind.ppr_weight();
             outgoing.push((edge.dst, w));
             reverse_adj.entry(edge.dst).or_insert(());
+            total_edges_seen += 1;
 
             if depth < PPR_BFS_DEPTH && visited.insert(edge.dst) {
                 queue.push_back((edge.dst, depth + 1));
@@ -270,10 +273,9 @@ fn build_weighted_subgraph<S: Store>(
         adj.insert(node, outgoing);
     }
 
-    let total_edges: usize = adj.values().map(|v| v.len()).sum();
     tracing::debug!(
         nodes_visited = adj.len(),
-        edges_traversed = total_edges,
+        edges_traversed = total_edges_seen,
         "ppr.bfs_expand complete"
     );
     Ok((adj, reverse_adj))

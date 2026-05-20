@@ -115,6 +115,8 @@ fn handle_tool_call(
         }
     };
 
+    // tool_calls_total=1 is a log-based counter field for tracing subscribers.
+    // TODO(travsr-060): replace with otel Counter metric for proper OTLP aggregation.
     tracing::info!(
         tool = tool_name,
         tool_calls_total = 1u64,
@@ -305,6 +307,8 @@ fn handle_tool_call_global(
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
+    // tool_calls_total=1 is a log-based counter field for tracing subscribers.
+    // TODO(travsr-060): replace with otel Counter metric for proper OTLP aggregation.
     tracing::info!(
         tool = tool_name,
         tool_calls_total = 1u64,

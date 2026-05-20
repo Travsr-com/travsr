@@ -61,6 +61,8 @@ pub fn bfs(
 
         if depth < max_depth {
             for edge in store.iter_edges_from(current_id)? {
+                // edges_traversed counts all edges examined, including back-edges to
+                // already-visited nodes — it measures store query load, not unique new nodes.
                 edges_traversed += 1;
                 if !visited.contains(&edge.dst) {
                     visited.insert(edge.dst);
