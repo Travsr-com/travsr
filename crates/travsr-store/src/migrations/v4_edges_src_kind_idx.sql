@@ -1,0 +1,14 @@
+-- Migration v4: covering index on (src, kind, dst) for iter_edges_from_kind.
+--
+-- v1 already has idx_edges_src_kind ON edges(src, kind) — a 2-column index
+-- that makes WHERE src=?1 AND kind=?2 an efficient seek. This v4 migration
+-- adds idx_edges_src_kind_cov (a distinct name) which includes dst in the
+-- index leaf pages, turning the query into a covering (index-only) scan:
+-- SQLite retrieves dst without a separate main-table lookup.
+--
+-- Required for Personalized PageRank (Issue #29) which calls iter_edges_from_kind
+-- in a tight inner loop and must meet the p95 < 50ms budget at scale.
+--
+-- NOTE: index name intentionally differs from the v1 idx_edges_src_kind to
+-- avoid the CREATE INDEX IF NOT EXISTS guard silently treating this as a no-op.
+CREATE INDEX IF NOT EXISTS idx_edges_src_kind_cov ON edges(src, kind, dst);
