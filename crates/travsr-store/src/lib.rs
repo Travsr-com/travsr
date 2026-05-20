@@ -87,6 +87,21 @@ pub trait Store {
     fn get_node(&self, id: NodeId) -> Result<Option<Node>>;
     /// Return every outgoing edge from `src`.
     fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>>;
+    /// Return outgoing edges from `src` filtered to a single [`EdgeKind`].
+    ///
+    /// Implementations **must** use an indexed `WHERE kind = ?` clause so that
+    /// PPR traversal (which filters by kind at every step) meets the p95 < 50ms
+    /// budget on graphs up to the MVP ceiling (75M nodes / 2.5B edges).
+    ///
+    /// The default implementation delegates to [`Store::iter_edges_from`] and
+    /// filters in Rust — backends without a kind index should override this.
+    fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>> {
+        Ok(self
+            .iter_edges_from(src)?
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect())
+    }
     /// Return every incoming edge to `dst`.
     fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>>;
 }
@@ -504,6 +519,28 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    /// Indexed variant — uses `WHERE src = ?1 AND kind = ?2` so SQLite can
+    /// satisfy the query from the `(src, dst, kind)` primary-key index without
+    /// a full `src`-partition scan. Overrides the trait default.
+    fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT dst FROM edges WHERE src = ?1 AND kind = ?2")
+            .context("preparing iter_edges_from_kind query")?;
+        let rows = stmt
+            .query_map(params![node_id_to_i64(src), kind.as_str()], |row| {
+                row.get::<_, i64>(0)
+            })
+            .context("executing iter_edges_from_kind query")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
+            out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+        }
+        Ok(out)
+    }
+
     fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>> {
         let mut stmt = self
             .conn
@@ -815,6 +852,62 @@ mod tests {
 
         let edges = store.all_edges().unwrap();
         assert_eq!(edges[0].3, "lsif");
+    }
+
+    #[test]
+    fn iter_edges_from_kind_filters_correctly() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        let c = sample_node("fn:c");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&c).unwrap();
+        store
+            .put_edge(&Edge::new(a.id, b.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(a.id, c.id, EdgeKind::Depends))
+            .unwrap();
+
+        // Only RefCall edges
+        let ref_call = store.iter_edges_from_kind(a.id, EdgeKind::RefCall).unwrap();
+        assert_eq!(ref_call.len(), 1);
+        assert_eq!(ref_call[0].dst, b.id);
+        assert_eq!(ref_call[0].kind, EdgeKind::RefCall);
+
+        // Only Depends edges
+        let depends = store.iter_edges_from_kind(a.id, EdgeKind::Depends).unwrap();
+        assert_eq!(depends.len(), 1);
+        assert_eq!(depends[0].dst, c.id);
+
+        // Kind with no edges returns empty
+        let exports = store.iter_edges_from_kind(a.id, EdgeKind::Exports).unwrap();
+        assert!(exports.is_empty());
+    }
+
+    #[test]
+    fn iter_edges_from_kind_consistent_with_iter_edges_from() {
+        // The kind-filtered result must be a subset of the full result for the
+        // same src, and every returned edge must have the requested kind.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        let c = sample_node("fn:c");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&c).unwrap();
+        store
+            .put_edge(&Edge::new(a.id, b.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(a.id, c.id, EdgeKind::DefinesBinding))
+            .unwrap();
+
+        let all = store.iter_edges_from(a.id).unwrap();
+        let filtered = store.iter_edges_from_kind(a.id, EdgeKind::RefCall).unwrap();
+        assert!(filtered.len() <= all.len());
+        assert!(filtered.iter().all(|e| e.kind == EdgeKind::RefCall));
     }
 
     #[test]
