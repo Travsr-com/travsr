@@ -9,7 +9,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 use crate::protocol::{INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR};
-use crate::sanitize::sanitize_for_mcp;
 use crate::tools;
 use crate::{protocol::RpcRequest, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use travsr_store::{registry, SqliteStore};
@@ -101,12 +100,15 @@ fn handle_tool_call(
             let symbol = args["symbol"].as_str().unwrap_or("");
             tools::get_callers(store, symbol)
         }
-        "get_blast_radius" | "search_symbol" | "get_repo_map" => {
-            // SEC-001: sanitize even static stub strings to enforce the invariant
-            // that ALL tool outputs pass through the sanitization pipeline. This
-            // prevents Phase 3 implementations from accidentally bypassing it.
-            sanitize_for_mcp("not yet implemented — planned for Phase 3")
+        "get_blast_radius" => {
+            let file = args["file"].as_str().unwrap_or("");
+            tools::get_blast_radius(store, file)
         }
+        "search_symbol" => {
+            let name = args["name"].as_str().unwrap_or("");
+            tools::search_symbol(store, name)
+        }
+        "get_repo_map" => tools::get_repo_map(store),
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -286,12 +288,13 @@ fn handle_tool_call_global(
         "get_callers" => {
             tools::get_callers_global(repos, args["symbol"].as_str().unwrap_or(""), repo_arg)
         }
-        "get_blast_radius" | "search_symbol" | "get_repo_map" => {
-            // SEC-001: sanitize even static stub strings to enforce the invariant
-            // that ALL tool outputs pass through the sanitization pipeline. This
-            // prevents Phase 3 implementations from accidentally bypassing it.
-            sanitize_for_mcp("not yet implemented — planned for Phase 3")
+        "get_blast_radius" => {
+            tools::get_blast_radius_global(repos, args["file"].as_str().unwrap_or(""), repo_arg)
         }
+        "search_symbol" => {
+            tools::search_symbol_global(repos, args["name"].as_str().unwrap_or(""), repo_arg)
+        }
+        "get_repo_map" => tools::get_repo_map_global(repos, repo_arg),
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 

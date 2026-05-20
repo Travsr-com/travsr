@@ -229,6 +229,259 @@ fn collect_global(
     parts.join("\n")
 }
 
+// ── get_blast_radius ──────────────────────────────────────────────────────────
+
+/// Return the set of files transitively affected if the given file changes.
+///
+/// Uses reverse BFS over `DefinesBinding` and `RefCall` edges: starting from
+/// every node defined in the file, follows incoming edges to find everything
+/// that references or calls those definitions.
+///
+/// Output format (one line per affected file, sorted):
+///   `src/service.ts`
+///   `src/controller.ts`
+pub fn get_blast_radius(store: &SqliteStore, file: &str) -> String {
+    if let Err(reason) = validate_mcp_arg(file) {
+        tracing::warn!("get_blast_radius rejected invalid arg: {reason}");
+        return String::new();
+    }
+    sanitize_for_mcp(&get_blast_radius_raw(store, file))
+}
+
+fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
+    use std::collections::{HashSet, VecDeque};
+    use travsr_core::EdgeKind;
+
+    // Find all nodes whose VName path matches the given file.
+    let seed_nodes = match store.search_nodes_by_name(file) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_blast_radius search error: {e}");
+            return String::new();
+        }
+    };
+
+    if seed_nodes.is_empty() {
+        return String::new();
+    }
+
+    let mut visited: HashSet<travsr_core::NodeId> = HashSet::new();
+    let mut queue: VecDeque<travsr_core::NodeId> = VecDeque::new();
+    let mut affected_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for node in &seed_nodes {
+        if visited.insert(node.id) {
+            queue.push_back(node.id);
+        }
+        // The file itself counts as affected.
+        if !node.vname.path.is_empty() {
+            affected_files.insert(node.vname.path.clone());
+        }
+    }
+
+    while let Some(current_id) = queue.pop_front() {
+        let incoming = match store.iter_edges_to(current_id) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("get_blast_radius edge error: {e}");
+                continue;
+            }
+        };
+
+        for edge in incoming {
+            if !matches!(edge.kind, EdgeKind::DefinesBinding | EdgeKind::RefCall) {
+                continue;
+            }
+            if visited.insert(edge.src) {
+                queue.push_back(edge.src);
+                if let Ok(Some(src_node)) = store.get_node(edge.src) {
+                    if !src_node.vname.path.is_empty() {
+                        affected_files.insert(src_node.vname.path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    affected_files.into_iter().collect::<Vec<_>>().join("\n")
+}
+
+/// Global variant of `get_blast_radius`.
+pub fn get_blast_radius_global(
+    repos: &HashMap<String, PathBuf>,
+    file: &str,
+    repo: Option<&str>,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(file) {
+        tracing::warn!("get_blast_radius_global rejected invalid arg: {reason}");
+        return String::new();
+    }
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = get_blast_radius_raw(store, file);
+        if result.is_empty() || single {
+            result
+        } else {
+            result
+                .lines()
+                .map(|l| format!("[{repo_name}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    });
+    sanitize_for_mcp(&raw)
+}
+
+// ── search_symbol ─────────────────────────────────────────────────────────────
+
+/// Find symbol definitions matching a name across the indexed graph.
+///
+/// Returns matching symbols formatted as:
+///   `fn:charge (function) — src/payment.ts`
+pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
+    if let Err(reason) = validate_mcp_arg(name) {
+        tracing::warn!("search_symbol rejected invalid arg: {reason}");
+        return String::new();
+    }
+    sanitize_for_mcp(&search_symbol_raw(store, name))
+}
+
+fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
+    let nodes = match store.search_nodes_by_name(name) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("search_symbol error: {e}");
+            return String::new();
+        }
+    };
+
+    let lines: Vec<String> = nodes
+        .iter()
+        .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
+        .collect();
+    lines.join("\n")
+}
+
+/// Global variant of `search_symbol`.
+pub fn search_symbol_global(
+    repos: &HashMap<String, PathBuf>,
+    name: &str,
+    repo: Option<&str>,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(name) {
+        tracing::warn!("search_symbol_global rejected invalid arg: {reason}");
+        return String::new();
+    }
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = search_symbol_raw(store, name);
+        if result.is_empty() || single {
+            result
+        } else {
+            result
+                .lines()
+                .map(|l| format!("[{repo_name}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    });
+    sanitize_for_mcp(&raw)
+}
+
+// ── get_repo_map ──────────────────────────────────────────────────────────────
+
+/// Return a structural overview of the indexed repository.
+///
+/// Groups all indexed nodes by file path and renders a tree annotated with
+/// symbol counts and the top symbols per file, suitable for LLM consumption:
+///
+/// ```text
+/// src/
+///   service.ts  [3 symbols]  fn:charge, class:PaymentService, fn:refund
+///   index.ts    [1 symbol]   fn:activate
+/// ```
+pub fn get_repo_map(store: &SqliteStore) -> String {
+    sanitize_for_mcp(&get_repo_map_raw(store))
+}
+
+fn get_repo_map_raw(store: &SqliteStore) -> String {
+    use std::collections::BTreeMap;
+
+    let nodes = match store.all_nodes() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_repo_map error: {e}");
+            return String::new();
+        }
+    };
+
+    if nodes.is_empty() {
+        return String::new();
+    }
+
+    // Group nodes by file path.
+    let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for node in &nodes {
+        let path = if node.vname.path.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            node.vname.path.clone()
+        };
+        // Only include named symbols (skip bare file nodes with empty signature).
+        if !node.vname.signature.is_empty() && node.kind != "file" {
+            by_file
+                .entry(path)
+                .or_default()
+                .push(node.vname.signature.clone());
+        }
+    }
+
+    const MAX_SYMBOLS_PER_FILE: usize = 5;
+    let mut lines: Vec<String> = Vec::with_capacity(by_file.len() + 1);
+
+    for (path, mut symbols) in by_file {
+        symbols.sort();
+        symbols.dedup();
+        let count = symbols.len();
+        let preview: Vec<&str> = symbols
+            .iter()
+            .take(MAX_SYMBOLS_PER_FILE)
+            .map(|s| s.as_str())
+            .collect();
+        let suffix = if count > MAX_SYMBOLS_PER_FILE {
+            format!(", … (+{})", count - MAX_SYMBOLS_PER_FILE)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "{}  [{} symbol{}]  {}{}",
+            path,
+            count,
+            if count == 1 { "" } else { "s" },
+            preview.join(", "),
+            suffix,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+/// Global variant of `get_repo_map`.
+pub fn get_repo_map_global(repos: &HashMap<String, PathBuf>, repo: Option<&str>) -> String {
+    // repo arg validated inside collect_global.
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = get_repo_map_raw(store);
+        if result.is_empty() || single {
+            result
+        } else {
+            result
+                .lines()
+                .map(|l| format!("[{repo_name}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    });
+    sanitize_for_mcp(&raw)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
