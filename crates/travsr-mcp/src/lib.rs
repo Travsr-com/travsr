@@ -14,6 +14,9 @@ mod sanitize;
 mod server;
 mod tools;
 
+// Re-exported for fuzz targets (fuzz/fuzz_targets/fuzz_mcp_parser.rs).
+pub use protocol::RpcRequest;
+
 use std::path::Path;
 
 use anyhow::Context as _;
