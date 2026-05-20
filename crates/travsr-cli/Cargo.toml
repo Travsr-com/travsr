@@ -25,12 +25,26 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tabled = { workspace = true }
+# Optional OTLP deps — only compiled with `--features otlp`
+opentelemetry         = { workspace = true, optional = true }
+opentelemetry_sdk     = { workspace = true, optional = true }
+opentelemetry-otlp    = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enables the Kùzu production backend. Requires CMake + C++ toolchain.
 # Propagates to travsr-store/kuzu which builds the Kùzu C++ library.
 kuzu = ["travsr-store/kuzu"]
+# Enable OTLP trace export via gRPC. Off by default — requires a running
+# OTLP collector (e.g. OpenTelemetry Collector, Jaeger, Tempo).
+# Configure endpoint via TRAVSR_OTLP_ENDPOINT env var (default: http://localhost:4317).
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

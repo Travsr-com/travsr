@@ -107,6 +107,8 @@ use travsr_store::Store;
 ///
 /// O(iterations × |E_reachable|) time.  Space O(|V_reachable|).
 pub fn ppr<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> Result<Vec<(NodeId, f32)>> {
+    let _span = tracing::debug_span!("ppr", seeds = seeds.len(), k = k).entered();
+
     if seeds.is_empty() {
         return Ok(Vec::new());
     }
@@ -138,7 +140,8 @@ pub fn ppr<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> Result<Vec<(NodeI
     }
 
     // ── Power iteration ───────────────────────────────────────────────────────
-    for _ in 0..max_iter {
+    let mut iterations_run: u32 = 0;
+    for iter in 0..max_iter {
         let mut r_next: HashMap<NodeId, f32> = HashMap::with_capacity(r.len());
 
         // Teleportation: (1 − α) · r₀
@@ -178,12 +181,19 @@ pub fn ppr<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> Result<Vec<(NodeI
                 .map(|(_, &v)| v)
                 .sum::<f32>();
 
+        tracing::trace!(ppr.iteration = iter, ppr.delta = delta, "ppr.iterate");
+        iterations_run = iter + 1;
         r = r_next;
 
         if delta < eps {
             break;
         }
     }
+    tracing::debug!(
+        ppr.nodes_scored = r.len(),
+        ppr.iterations = iterations_run,
+        "ppr complete"
+    );
 
     // ── Top-k extraction ──────────────────────────────────────────────────────
     let mut scores: Vec<(NodeId, f32)> = r.into_iter().collect();
@@ -209,6 +219,7 @@ fn build_weighted_subgraph<S: Store>(
     seeds: &[NodeId],
 ) -> Result<(WeightedAdj, HashMap<NodeId, ()>)> {
     use std::collections::{HashSet, VecDeque};
+    let _span = tracing::debug_span!("ppr.bfs_expand", seeds = seeds.len()).entered();
 
     const PPR_BFS_DEPTH: u8 = 6;
 
@@ -259,6 +270,12 @@ fn build_weighted_subgraph<S: Store>(
         adj.insert(node, outgoing);
     }
 
+    let total_edges: usize = adj.values().map(|v| v.len()).sum();
+    tracing::debug!(
+        nodes_visited = adj.len(),
+        edges_traversed = total_edges,
+        "ppr.bfs_expand complete"
+    );
     Ok((adj, reverse_adj))
 }
 
