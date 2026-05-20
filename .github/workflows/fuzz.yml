@@ -1,0 +1,79 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Nightly at 02:00 UTC — well outside peak CI usage.
+    - cron: '0 2 * * *'
+  # Manual trigger for ad-hoc runs (e.g. after changing a parser).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write   # needed by the "file issue on panic" step
+
+concurrency:
+  group: fuzz-${{ github.ref }}-${{ matrix.target }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # run all three targets even if one panics
+      matrix:
+        target:
+          - fuzz_mcp_parser
+          - fuzz_lsif_ingest
+          - fuzz_treesitter_indexer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key per fuzz target so builds don't collide.
+          key: fuzz-${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run ${{ matrix.target }} (5 min)
+        # cargo-fuzz reads fuzz/Cargo.toml automatically when run from the
+        # workspace root. Corpus is in fuzz/corpus/<target>/.
+        run: |
+          cargo fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} \
+            -- -max_total_time=300 -print_final_stats=1
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+
+      - name: File issue on panic
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "[fuzz] ${{ matrix.target }} found a panic ($(date -u +%Y-%m-%d))" \
+            --body "Fuzz target \`${{ matrix.target }}\` crashed during the nightly fuzz run.
+
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Crash artifacts are attached to the workflow run. To reproduce locally:
+          \`\`\`
+          cargo fuzz run ${{ matrix.target }}
+          \`\`\`"

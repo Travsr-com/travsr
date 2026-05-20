@@ -1,0 +1,37 @@
+[package]
+name = "travsr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+travsr-mcp = { path = "../crates/travsr-mcp" }
+travsr-indexer = { path = "../crates/travsr-indexer" }
+serde_json = "1"
+tempfile = "3"
+
+[[bin]]
+name = "fuzz_mcp_parser"
+path = "fuzz_targets/fuzz_mcp_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_lsif_ingest"
+path = "fuzz_targets/fuzz_lsif_ingest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_treesitter_indexer"
+path = "fuzz_targets/fuzz_treesitter_indexer.rs"
+test = false
+doc = false
+
+# Isolate from the parent workspace so cargo-fuzz can use nightly freely.
+[workspace]
+members = ["."]
