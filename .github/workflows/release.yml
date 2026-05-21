@@ -32,6 +32,10 @@ jobs:
             artifact: aarch64-apple-darwin
             os: macos-latest
             cross: false
+          - target: x86_64-pc-windows-msvc
+            artifact: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -71,10 +75,13 @@ jobs:
           RUST_TARGET="${{ matrix.target }}"
           ARTIFACT="${{ matrix.artifact }}"
           STAGE="travsr-${TAG}-${ARTIFACT}"
+          # Windows binaries are .exe; all others have no extension.
+          BIN_EXT=""
+          if [[ "$RUST_TARGET" == *windows* ]]; then BIN_EXT=".exe"; fi
           mkdir -p dist
-          cp "target/${RUST_TARGET}/release/travsr" "dist/travsr"
-          tar -czf "dist/${STAGE}.tar.gz" -C dist travsr
-          rm dist/travsr
+          cp "target/${RUST_TARGET}/release/travsr${BIN_EXT}" "dist/travsr${BIN_EXT}"
+          tar -czf "dist/${STAGE}.tar.gz" -C dist "travsr${BIN_EXT}"
+          rm "dist/travsr${BIN_EXT}"
           shasum -a 256 "dist/${STAGE}.tar.gz" > "dist/${STAGE}.sha256"
 
       - name: Check tarball size (≤ 25 MB)
