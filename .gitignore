@@ -2,6 +2,12 @@
 Travsr-Proposal.md
 Next-Gen Git Hosting_ Algorithmic Stack.md
 
+# Claude Code internal files — agent prompts, skills, local settings
+.claude/
+
+# Internal sprint planning and roadmap docs
+docs/planning/
+
 # Rust
 /target
 **/*.rs.bk
