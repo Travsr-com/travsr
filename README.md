@@ -8,6 +8,8 @@
 > hallucinations.
 
 [![CI](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml)
+[![Bench](https://github.com/raj-rkv/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/bench.yml)
+[![Phase 2 Exit](https://github.com/raj-rkv/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/phase2-exit.yml)
 [![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -352,7 +354,7 @@ Language support: **TypeScript / TSX**. Python, Go, Rust planned.
 | Algorithm | When used | Status |
 |---|---|---|
 | BFS depth-3 | All `get_dependencies` / `get_callers` queries | Available |
-| Personalized PageRank (PPR) | `get_context` and deep traversal (Phase 3) | Constants ready (α=0.85, ε=1e-6) |
+| Personalized PageRank (PPR) | `get_context` and deep traversal | Available (Phase 2) — α=0.85, ε=1e-6, p95 < 50ms on 1k-file fixture |
 | Prize-Collecting Steiner Tree | `get_execution_path` (Phase 3) | Planned |
 | k-core decomposition | Buried-middle recovery (Phase 3) | Planned |
 | 0-1 Knapsack | Token budget optimisation (Phase 3) | Planned |
@@ -379,6 +381,16 @@ returned to the client:
 Path traversal and argument injection are rejected at the tool dispatch layer
 (`../`, `..\\`, absolute paths, null bytes, `%`-encoded traversal sequences).
 
+**Release artifact signing:** Every release tarball is signed with
+[cosign keyless signing](https://docs.sigstore.dev) using the GitHub Actions
+OIDC token. SLSA v1.0 provenance is attached to every release via GitHub
+attestations. See [SECURITY.md](SECURITY.md) for verification instructions.
+
+**Supply chain auditing:** All Rust dependencies are audited on every CI run
+with [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) (CVE advisories,
+license policy, banned crates). A nightly OSV scan checks for new CVEs against
+`Cargo.lock` and `package-lock.json`.
+
 ---
 
 ## Build from Source
@@ -398,6 +410,11 @@ cp target/release/travsr $(which travsr)
 # or
 export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 ```
+
+**Platform support:** macOS (x86\_64 + arm64), Linux (x86\_64 + aarch64), Windows (x86\_64).
+Pre-built binaries are available on the [Releases](https://github.com/raj-rkv/travsr/releases) page.
+
+**MSRV:** Rust 1.75 (verified in CI on every commit).
 
 ---
 
