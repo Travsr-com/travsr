@@ -118,7 +118,7 @@ jobs:
 
       # Post the diff table as a sticky PR comment (updated on each push).
       - name: Post benchmark diff comment
-        if: github.event_name == 'pull_request' && always()
+        if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -136,11 +136,15 @@ jobs:
             FOOTER="_Baseline will be saved when master is updated._"
           fi
 
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "${HEADER}
+          BODY="${HEADER}
 
           \`\`\`
           ${TABLE}
           \`\`\`
 
           ${FOOTER}"
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --edit-last --body "${BODY}" \
+            || gh pr comment ${{ github.event.pull_request.number }} \
+               --body "${BODY}"

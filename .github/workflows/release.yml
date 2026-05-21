@@ -90,8 +90,6 @@ jobs:
         uses: sigstore/cosign-installer@v3
 
       - name: Sign tarball (keyless — GitHub OIDC)
-        env:
-          COSIGN_EXPERIMENTAL: "1"
         shell: bash
         run: |
           set -euo pipefail
@@ -161,6 +159,7 @@ jobs:
     name: publish
     needs: [build, kuzu-proof-build]
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -180,7 +179,7 @@ jobs:
           subject-path: dist/*.tar.gz
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
@@ -193,6 +192,10 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+
+      - name: Install npm dependencies
+        working-directory: packages/travsr-npm
+        run: npm ci --ignore-scripts
 
       - name: Publish npm wrapper
         working-directory: packages/travsr-npm
