@@ -10,7 +10,7 @@ mod repo;
 mod repos;
 mod status;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -201,34 +201,6 @@ fn init_tracing() {
     }
 }
 
-/// Get the list of files changed in the current HEAD commit by calling git
-/// directly via `std::process::Command`. No shell interpolation — filenames
-/// containing spaces, semicolons, or shell metacharacters are handled safely.
-fn changed_files_from_git(repo_root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let output = std::process::Command::new("git")
-        .args([
-            "diff-tree",
-            "--root",
-            "--no-commit-id",
-            "-r",
-            "--name-only",
-            "HEAD",
-        ])
-        .current_dir(repo_root)
-        .output()
-        .context("running git diff-tree in hook-run")?;
-
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|p| repo_root.join(p))
-        .collect())
-}
-
 fn is_broken_pipe(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause
@@ -291,7 +263,7 @@ async fn run() -> Result<()> {
                 travsr_store::SqliteStore::open(&db_path)?
             };
             let abs_paths: Vec<std::path::PathBuf> = if from_hook {
-                changed_files_from_git(&repo_root)?
+                travsr_daemon::changed_files_from_git(&repo_root)?
             } else {
                 paths.iter().map(|p| repo_root.join(p)).collect()
             };

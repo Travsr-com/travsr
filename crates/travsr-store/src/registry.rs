@@ -25,10 +25,19 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(travsr_home).context("creating ~/.travsr directory")?;
 
     // SEC: ~/.travsr/ and registry.json contain repo paths — restrict to owner only.
+    // A silent failure here would leave the directory world-readable, so warn loudly.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(travsr_home, std::fs::Permissions::from_mode(0o700));
+        if let Err(e) =
+            std::fs::set_permissions(travsr_home, std::fs::Permissions::from_mode(0o700))
+        {
+            tracing::warn!(
+                path = %travsr_home.display(),
+                err = %e,
+                "failed to restrict ~/.travsr/ permissions to 0700 — directory may be world-readable"
+            );
+        }
     }
 
     let mut repos = read_registry(&reg_path).unwrap_or_default();
@@ -69,13 +78,43 @@ fn write_registry_atomic(path: &Path, repos: &HashMap<String, PathBuf>) -> anyho
         .context("serializing registry")?;
 
     let tmp_path = path.with_extension("json.tmp");
+
+    // SEC-2: create the temp file with 0o600 from birth to avoid a TOCTOU window
+    // where another local process could open(2) the world-readable umask version
+    // between fs::write and the post-rename chmod. On Unix we open via
+    // OpenOptions with .mode(0o600); on other platforms we fall back to fs::write.
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .context("opening registry tmp file with 0600")?;
+        f.write_all(serialized.as_bytes())
+            .context("writing registry tmp file")?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(&tmp_path, &serialized).context("writing registry tmp file")?;
+
     std::fs::rename(&tmp_path, path).context("renaming registry into place")?;
 
+    // Belt-and-suspenders for non-Unix and exotic filesystems that may not
+    // preserve permissions across rename. A warn here is fatal-shaped — the
+    // file is on disk by now and a failed chmod leaves it readable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %path.display(),
+                err = %e,
+                "failed to restrict registry.json permissions to 0600 — file may be world-readable"
+            );
+        }
     }
     Ok(())
 }

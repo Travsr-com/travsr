@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
@@ -70,4 +70,39 @@ fn set_executable(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+/// Return the absolute paths of files changed in the current HEAD commit by
+/// invoking `git diff-tree` via [`std::process::Command`]. Never goes through
+/// a shell, so filenames containing spaces, semicolons, or shell metacharacters
+/// are handled safely.
+///
+/// `--diff-merges=first-parent` is required so merge commits report the files
+/// changed on the primary parent line. `git diff-tree HEAD` alone emits nothing
+/// on merge commits, and `--first-parent` alone is a history-walking flag that
+/// does not affect diff output. Requires git 2.31+.
+pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--name-only",
+            "--diff-merges=first-parent",
+            "HEAD",
+        ])
+        .current_dir(repo_root)
+        .output()
+        .context("running git diff-tree in hook-run")?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|p| repo_root.join(p))
+        .collect())
 }

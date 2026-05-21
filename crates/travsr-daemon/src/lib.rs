@@ -17,7 +17,7 @@ use travsr_core::{canonical_corpus, canonical_corpus_local, SIGNATURE_FORMAT_VER
 use travsr_indexer::{hash_file, ingest_lsif, link_imports, run_lsif_emitter, Indexer};
 use travsr_store::{SqliteStore, Store};
 
-pub use hook::install_hook;
+pub use hook::{changed_files_from_git, install_hook};
 
 /// Statistics returned by [`init_repo`] and displayed by `travsr init`.
 #[derive(Debug, Default)]
@@ -42,10 +42,17 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         SqliteStore::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
     // SEC: graph.db contains derived IP — restrict to owner only.
+    // A silent failure here would leave the file world-readable, so warn loudly.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %db_path.display(),
+                err = %e,
+                "failed to restrict graph.db permissions to 0600 — file may be world-readable"
+            );
+        }
     }
 
     install_hook(repo_root)?;
