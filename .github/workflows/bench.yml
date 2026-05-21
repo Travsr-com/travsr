@@ -39,7 +39,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Restore master Criterion baseline
         if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: criterion-baseline
           # restore-keys picks the most recent master snapshot
@@ -77,7 +77,7 @@ jobs:
 
       - name: Save master Criterion baseline
         if: github.event_name == 'push'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: criterion-baseline
           key: criterion-master-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}

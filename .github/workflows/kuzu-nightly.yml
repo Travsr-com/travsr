@@ -34,7 +34,7 @@ jobs:
         run: sudo apt-get install -y cmake
 
       - name: Cache kuzu C++ build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
