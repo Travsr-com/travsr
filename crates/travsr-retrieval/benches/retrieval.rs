@@ -111,5 +111,48 @@ fn bench_ppr_chain(c: &mut Criterion) {
 
 // ---------------------------------------------------------------------------
 
-criterion_group!(benches, bench_bfs_chain, bench_bfs_fan, bench_ppr_chain);
+// ---------------------------------------------------------------------------
+// 1k-file fixture — simulates a 1 000-file TypeScript repository
+// ---------------------------------------------------------------------------
+//
+// Topology: one root node (hub) connected to 999 leaf nodes via
+// DefinesBinding edges (hub → leaf).  This mirrors a realistic monorepo
+// entry-point that imports ~1 000 modules.
+//
+// BFS depth 1 from the hub visits all 1 000 nodes in a single frontier
+// expansion; this is the worst-case breadth-first fan-out at the scale
+// where p95 < 50 ms is required (Issue #32 / S7-1).
+//
+// PPR on the same graph runs power iteration over all 1 000 nodes.
+// Both benchmarks are used by `scripts/check-p95.sh` to enforce the
+// absolute 50 ms latency gate in CI.
+
+const FIXTURE_1K: usize = 1_000;
+
+fn bench_bfs_1k_fixture(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bfs/1k_fixture");
+    let (store, seed) = fan(FIXTURE_1K);
+    group.bench_function("fan-1000", |b| {
+        b.iter(|| bfs(&store, seed, 1, usize::MAX).unwrap());
+    });
+    group.finish();
+}
+
+fn bench_ppr_1k_fixture(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ppr/1k_fixture");
+    let (store, seed) = fan(FIXTURE_1K);
+    group.bench_function("fan-1000", |b| {
+        b.iter(|| ppr(&store, &[seed], 20).unwrap());
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_bfs_chain,
+    bench_bfs_fan,
+    bench_ppr_chain,
+    bench_bfs_1k_fixture,
+    bench_ppr_1k_fixture,
+);
 criterion_main!(benches);

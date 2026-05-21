@@ -59,6 +59,14 @@ jobs:
         run: cargo bench --workspace -- --save-baseline pr
 
       # ------------------------------------------------------------------
+      # Absolute p95 latency gate — 1k-file fixture must stay under 50ms
+      # (Issue #32 / S7-1). Runs on both push and pull_request so regressions
+      # are caught on feature branches before they reach master.
+      # ------------------------------------------------------------------
+      - name: Check p95 latency gate (< 50ms on 1k-file fixture)
+        run: bash scripts/check-p95.sh
+
+      # ------------------------------------------------------------------
       # On master pushes: snapshot the new baseline for future PRs
       # ------------------------------------------------------------------
       - name: Copy Criterion output to baseline cache dir
