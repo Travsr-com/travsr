@@ -1,0 +1,88 @@
+name: Phase 2 Exit Criteria
+
+# Runs alongside CI on every push to master and every PR.
+# All four Phase 2 exit criteria must pass before merging Phase 3 work.
+#
+# Exit criteria (Issue #33 / S7-2):
+#   1. PPR returns documented top-k on the 1k-file TypeScript fixture
+#   2. Indexer ingests LSIF dump in < 30 s on the fixture
+#   3. Kùzu backend passes the same correctness suite as SQLite
+#   4. Bench: query p95 under 50 ms (via scripts/check-p95.sh)
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase2-exit-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ── Criteria 1 + 2: PPR top-k correctness + LSIF ingest timing ─────────────
+  correctness:
+    name: Phase 2 correctness suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: phase2-correctness
+
+      - name: PPR top-k on 1k-file fixture
+        run: cargo test -p travsr-retrieval --test phase2 -- --nocapture
+
+      - name: LSIF ingest 1k symbols < 30 s
+        run: cargo test -p travsr-indexer --test lsif_1k -- --nocapture
+
+  # ── Criterion 3: Kùzu backend parity ────────────────────────────────────────
+  # Gated on the `kuzu` feature; skipped when Kùzu is not enabled.
+  # The parity harness asserts SQLite ≡ Kùzu for all Store trait operations.
+  kuzu-parity:
+    name: Kùzu backend parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: phase2-kuzu
+
+      - name: Run Kùzu parity suite (--features kuzu)
+        run: cargo test -p travsr-store --test parity --features kuzu -- --nocapture
+
+  # ── Criterion 4: bench p95 < 50 ms ─────────────────────────────────────────
+  bench-gate:
+    name: Bench p95 < 50 ms
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: phase2-bench
+
+      - name: Run 1k-file fixture benchmarks
+        run: cargo bench --bench retrieval -- "1k_fixture"
+
+      - name: Assert p95 < 50 ms
+        run: bash scripts/check-p95.sh
