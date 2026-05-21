@@ -94,12 +94,45 @@ async function install() {
     process.exit(1);
   }
 
+  // Verify cosign signature if cosign is installed (graceful degradation).
+  // The .bundle file contains the Sigstore keyless signature; the GitHub OIDC
+  // issuer is the expected identity. See SECURITY.md §Release Artifact Signing.
+  const bundleName = `${tarName}.bundle`;
+  const bundleUrl = `${base}/${bundleName}`;
+  const tmpTar = path.join(BIN_DIR, tarName);
+  const tmpBundle = path.join(BIN_DIR, bundleName);
+  fs.writeFileSync(tmpTar, tarball);
+  try {
+    const cosignAvailable = (() => {
+      try { execFileSync('cosign', ['version'], { stdio: 'pipe' }); return true; }
+      catch (_) { return false; }
+    })();
+    if (cosignAvailable) {
+      console.log('travsr: verifying cosign signature...');
+      const bundleData = await fetch(bundleUrl);
+      fs.writeFileSync(tmpBundle, bundleData);
+      execFileSync('cosign', [
+        'verify-blob',
+        '--bundle', tmpBundle,
+        '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com',
+        '--certificate-identity-regexp', 'https://github.com/raj-rkv/travsr/.github/workflows/release.yml',
+        tmpTar,
+      ], { stdio: 'inherit' });
+      fs.unlinkSync(tmpBundle);
+      console.log('travsr: cosign signature verified.');
+    } else {
+      console.warn('travsr: cosign not found — skipping signature verification. Install cosign to enable: https://docs.sigstore.dev/cosign/system_config/installation/');
+    }
+  } catch (cosignErr) {
+    console.warn(`travsr: cosign verification failed — ${cosignErr.message}`);
+    console.warn('travsr: proceeding with SHA256-only verification. See SECURITY.md for details.');
+    if (fs.existsSync(tmpBundle)) fs.unlinkSync(tmpBundle);
+  }
+
   // Extract binary from tarball.
   // On Windows the archive contains travsr.exe; on Unix it contains travsr.
   // tar ships with macOS, Linux, and Windows 10+ (build 17063+).
   const binName = process.platform === 'win32' ? 'travsr.exe' : 'travsr';
-  const tmpTar = path.join(BIN_DIR, tarName);
-  fs.writeFileSync(tmpTar, tarball);
   execFileSync('tar', ['-xzf', tmpTar, '-C', BIN_DIR, binName], { stdio: 'inherit' });
   fs.unlinkSync(tmpTar);
 

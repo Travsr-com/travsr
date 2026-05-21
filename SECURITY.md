@@ -59,3 +59,45 @@ We follow a **90-day responsible disclosure** policy:
 
 - Vulnerabilities in user repositories indexed by Travsr
 - Issues in third-party dependencies (report those upstream)
+
+## Release Artifact Signing
+
+Every release tarball is signed using **cosign keyless signing** via the
+[Sigstore](https://sigstore.dev) public-good transparency log. The signer
+identity is the GitHub Actions OIDC token issued for this repository's
+`release.yml` workflow.
+
+### Verify a release tarball
+
+```sh
+# Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/
+VERSION=0.3.0
+TARGET=x86_64-unknown-linux-gnu
+
+# Download tarball and bundle from the GitHub release
+curl -LO "https://github.com/raj-rkv/travsr/releases/download/v${VERSION}/travsr-v${VERSION}-${TARGET}.tar.gz"
+curl -LO "https://github.com/raj-rkv/travsr/releases/download/v${VERSION}/travsr-v${VERSION}-${TARGET}.tar.gz.bundle"
+
+# Verify
+cosign verify-blob \
+  --bundle "travsr-v${VERSION}-${TARGET}.tar.gz.bundle" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate-identity-regexp "https://github.com/raj-rkv/travsr/.github/workflows/release.yml" \
+  "travsr-v${VERSION}-${TARGET}.tar.gz"
+```
+
+### SLSA Provenance
+
+Each release also carries a **SLSA v1.0 build provenance attestation** attached
+to the GitHub release via `actions/attest-build-provenance`. Verify with:
+
+```sh
+gh attestation verify "travsr-v${VERSION}-${TARGET}.tar.gz" \
+  --repo raj-rkv/travsr
+```
+
+### npm postinstall
+
+The `travsr` npm package automatically verifies the cosign signature during
+`npm install` if `cosign` is installed on the host. If cosign is not present,
+installation falls back to SHA256 verification only with a warning.
