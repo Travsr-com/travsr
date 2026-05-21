@@ -117,7 +117,9 @@ jobs:
           key: msrv
 
       - name: Check workspace compiles on MSRV
-        run: cargo check --workspace --all-features
+        # Exclude --all-features: the `kuzu` feature requires CMake + C++
+        # toolchain and is separately tested in release.yml kuzu-proof-build.
+        run: cargo check --workspace
 
   # The VS Code extension job is intentionally not wired up yet. Sprint 3
   # will add a dedicated workflow (.github/workflows/vscode.yml) once the
