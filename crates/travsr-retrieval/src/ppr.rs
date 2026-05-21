@@ -112,8 +112,7 @@ pub fn ppr<S: Store>(
     seeds: &[NodeId],
     k: usize,
 ) -> Result<Vec<(NodeId, f32)>, TravsrError> {
-    (|| -> AnyResult<Vec<(NodeId, f32)>> { ppr_inner(store, seeds, k) })()
-        .map_err(|e| TravsrError::Internal(e.to_string()))
+    ppr_inner(store, seeds, k).map_err(|e| TravsrError::Internal(e.to_string()))
 }
 
 fn ppr_inner<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> AnyResult<Vec<(NodeId, f32)>> {
