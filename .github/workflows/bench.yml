@@ -52,11 +52,11 @@ jobs:
       # ------------------------------------------------------------------
       - name: Run benchmarks → save as "master" baseline
         if: github.event_name == 'push'
-        run: cargo bench --workspace -- --save-baseline master
+        run: cargo bench -p travsr-retrieval --bench retrieval -- --save-baseline master
 
       - name: Run benchmarks → save as "pr" baseline
         if: github.event_name == 'pull_request'
-        run: cargo bench --workspace -- --save-baseline pr
+        run: cargo bench -p travsr-retrieval --bench retrieval -- --save-baseline pr
 
       # ------------------------------------------------------------------
       # Absolute p95 latency gate — 1k-file fixture must stay under 50ms
@@ -99,17 +99,18 @@ jobs:
 
       - name: Install critcmp
         if: github.event_name == 'pull_request'
-        run: cargo install critcmp@0.1 --locked
+        run: cargo install critcmp --version '^0.1' --locked
 
-      - name: Compare baselines (threshold: +10%)
+      - name: "Compare baselines (threshold: +10%)"
         if: github.event_name == 'pull_request' && env.master_baseline_found == 'true'
         id: compare
         # critcmp exits non-zero when any benchmark regresses beyond --threshold.
         # Output is captured to bench-diff.txt for the PR comment step.
         run: |
           critcmp master pr --threshold 10 | tee bench-diff.txt
-          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
-          exit ${PIPESTATUS[0]}
+          RC=${PIPESTATUS[0]}
+          echo "exit_code=${RC}" >> "$GITHUB_ENV"
+          exit ${RC}
 
       - name: Emit raw bench numbers (no master baseline)
         if: github.event_name == 'pull_request' && env.master_baseline_found == 'false'
@@ -117,7 +118,7 @@ jobs:
 
       # Post the diff table as a sticky PR comment (updated on each push).
       - name: Post benchmark diff comment
-        if: github.event_name == 'pull_request' && always()
+        if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -135,11 +136,15 @@ jobs:
             FOOTER="_Baseline will be saved when master is updated._"
           fi
 
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "${HEADER}
+          BODY="${HEADER}
 
           \`\`\`
           ${TABLE}
           \`\`\`
 
           ${FOOTER}"
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --edit-last --body "${BODY}" \
+            || gh pr comment ${{ github.event.pull_request.number }} \
+               --body "${BODY}"

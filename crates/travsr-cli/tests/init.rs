@@ -9,6 +9,16 @@ fn git_init(dir: &std::path::Path) {
         .current_dir(dir)
         .status()
         .expect("git init failed");
+    StdCommand::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(dir)
+        .status()
+        .expect("git config email failed");
+    StdCommand::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir)
+        .status()
+        .expect("git config name failed");
 }
 
 fn travsr_init(dir: &std::path::Path) -> assert_cmd::assert::Assert {
@@ -147,4 +157,107 @@ fn status_reports_counts_after_init() {
         .expect("could not parse node count from status output");
 
     assert!(nodes > 0, "status must report at least one node after init");
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = StdCommand::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap_or_else(|_| panic!("git {args:?} failed to spawn"));
+    assert!(status.success(), "git {args:?} exited non-zero");
+}
+
+/// TEST-1: covers `travsr hook-run --from-hook` end-to-end. This is the path
+/// every developer commit takes after the security fix in hook.rs, so it must
+/// have explicit coverage.
+#[test]
+fn hook_run_from_hook_reindexes_changed_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    // Initial commit + travsr init so a baseline graph exists.
+    std::fs::write(tmp.path().join("svc.ts"), "export function foo() {}").unwrap();
+    git(tmp.path(), &["add", "svc.ts"]);
+    git(tmp.path(), &["commit", "-q", "-m", "initial"]);
+    travsr_init(tmp.path()).success();
+
+    let db_path = tmp.path().join(".travsr/graph.db");
+    let count_before = SqliteStore::open(&db_path).unwrap().node_count().unwrap();
+    assert!(count_before > 0, "initial graph must have nodes");
+
+    // Second commit adds a new function; --from-hook must pick it up via
+    // `git diff-tree HEAD` and reindex svc.ts.
+    std::fs::write(
+        tmp.path().join("svc.ts"),
+        "export function foo() {}\nexport function bar() {}",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "svc.ts"]);
+    git(tmp.path(), &["commit", "-q", "-m", "add bar"]);
+
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["hook-run", "--from-hook"])
+        .assert()
+        .success();
+
+    let count_after = SqliteStore::open(&db_path).unwrap().node_count().unwrap();
+    assert!(
+        count_after > count_before,
+        "hook-run --from-hook must reindex the changed file and add nodes for bar() \
+         (before={count_before}, after={count_after})"
+    );
+}
+
+/// BUG-1 regression: `git diff-tree HEAD` on a merge commit returns nothing
+/// without `--first-parent`. This test creates a branch, modifies a file, and
+/// merges back — the resulting merge commit's hook-run must still reindex the
+/// merged file.
+#[test]
+fn hook_run_from_hook_reindexes_after_merge_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+
+    // Baseline on main.
+    std::fs::write(tmp.path().join("svc.ts"), "export function foo() {}").unwrap();
+    git(tmp.path(), &["add", "svc.ts"]);
+    git(tmp.path(), &["commit", "-q", "-m", "initial"]);
+    travsr_init(tmp.path()).success();
+
+    let db_path = tmp.path().join(".travsr/graph.db");
+    let count_before = SqliteStore::open(&db_path).unwrap().node_count().unwrap();
+
+    // Create a feature branch with a new function, then merge back to main
+    // with --no-ff to force a merge commit (so we exercise the multi-parent path).
+    git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        tmp.path().join("svc.ts"),
+        "export function foo() {}\nexport function bar() {}",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "svc.ts"]);
+    git(tmp.path(), &["commit", "-q", "-m", "add bar on feature"]);
+    git(tmp.path(), &["checkout", "-q", "main"]);
+    git(
+        tmp.path(),
+        &["merge", "--no-ff", "-q", "-m", "merge feature", "feature"],
+    );
+
+    // HEAD is now a merge commit with two parents. --from-hook must still
+    // see svc.ts and reindex it.
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["hook-run", "--from-hook"])
+        .assert()
+        .success();
+
+    let count_after = SqliteStore::open(&db_path).unwrap().node_count().unwrap();
+    assert!(
+        count_after > count_before,
+        "hook-run --from-hook must reindex files brought in by a merge commit \
+         (--first-parent semantics; before={count_before}, after={count_after})"
+    );
 }

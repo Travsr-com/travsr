@@ -25,9 +25,9 @@ fn make_node(i: usize) -> Node {
         VName::new(
             "",
             "",
-            &format!("file_{i}.ts"),
+            format!("file_{i}.ts"),
             "typescript",
-            &format!("fn:{i}"),
+            format!("fn:{i}"),
         ),
         "function",
     )

@@ -11,14 +11,13 @@ permissions:
   contents: read
   issues: write   # needed by the "file issue on panic" step
 
-concurrency:
-  group: fuzz-${{ github.ref }}-${{ matrix.target }}
-  cancel-in-progress: true
-
 jobs:
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
+    concurrency:
+      group: fuzz-${{ github.ref }}-${{ matrix.target }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false   # run all three targets even if one panics
       matrix:

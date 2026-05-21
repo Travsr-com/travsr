@@ -63,14 +63,14 @@ impl KuzuStore {
     }
 
     /// Create a short-lived connection for one operation.
-    fn connect(&self) -> Result<kuzu::Connection<'_>> {
+    fn connect(&self) -> AnyResult<kuzu::Connection<'_>> {
         kuzu::Connection::new(&self.db).context("creating Kùzu connection")
     }
 
     /// Create the node and edge tables. Kùzu has no `CREATE … IF NOT EXISTS`
     /// for node/rel tables, so we attempt each DDL statement and swallow
     /// "already exists" errors — propagating everything else.
-    fn init_schema(&self) -> Result<()> {
+    fn init_schema(&self) -> AnyResult<()> {
         let ddl_stmts = [
             "CREATE NODE TABLE nodes(\
                 id INT64, \
