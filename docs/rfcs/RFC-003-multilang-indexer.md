@@ -1,10 +1,13 @@
 # RFC-003: Multi-Language Indexer Architecture
 
-**Status:** Accepted
+**Status:** Proposed
 **Author:** Principal Architect
 **Date:** 2026-05-21
 **Issue:** #114
+**Phase:** 3 (Sprint 8 implementation gate)
 **Crate(s) affected:** `travsr-core`, `travsr-indexer`, `travsr-daemon`
+**Depends on:** PR #143 ([ADR-005] per-language corpus naming) — must merge first.
+**Related:** RFC-002 (VName signature format versioning), ADR-002 (edge provenance), ADR-006 ([rust-analyzer subprocess trust model] — required before Phase B implementation begins in Sprint 9).
 
 ---
 
@@ -58,17 +61,6 @@ impl Language {
         }
     }
 
-    /// The signature-version prefix used in RFC-002 VName signatures.
-    /// Ensures no hash collision between same-named symbols in different
-    /// languages within the same corpus.
-    pub fn signature_prefix(self) -> &'static str {
-        match self {
-            Self::TypeScript => "ts:v1:",
-            Self::Rust       => "rust:v1:",
-            Self::Python     => "py:v1:",
-        }
-    }
-
     /// Human-readable string stored on `nodes.language` column.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -82,6 +74,23 @@ impl Language {
 
 The `language` field is added to `Node` (schema migration v4). Existing TypeScript
 rows are backfilled with `"typescript"` on migration (see `CORE-201`).
+
+**Why no per-language signature prefix?** Cross-language collision is already
+prevented by two mechanisms inherited from RFC-002 and the schema:
+
+1. RFC-002's `SIGNATURE_FORMAT_VERSION: u8` domain-separates the entire BLAKE3
+   input. Any future change to the signature vocabulary bumps this byte and
+   triggers a full re-index — the existing invariant is sufficient.
+2. The `language` field is part of the row identity at the storage layer. A
+   Rust `fn main` and a TypeScript `function main` in the same repo produce
+   distinct rows because their `language` columns differ, even if their VName
+   signatures happened to hash to the same value (probability `~2^-64`).
+
+Adding a per-language prefix inside the signature string would therefore be
+redundant. More importantly, introducing one *now* would change the signature
+vocabulary, requiring `SIGNATURE_FORMAT_VERSION` to be bumped from 1 → 2 and
+forcing every existing `.travsr/graph.db` to be fully re-indexed. There is no
+correctness benefit to justify that cost.
 
 ### 2. `LanguageIndexer` trait in `travsr-indexer`
 
@@ -170,13 +179,30 @@ pub struct Indexer {
 
 No dynamic dispatch is used — the enum match is monomorphic and zero-cost.
 
+**Lifecycle:** `Indexer` is constructed once per repo on daemon startup (or
+once per `travsr index` invocation in CLI mode) and shared via `Arc<Indexer>`
+across walker threads. The per-language sub-indexers are stateless and
+`Send + Sync`, so a single shared instance suffices.
+
 **Package resolution (pre-computed by the walker, not by parse()):**
 
 | Language | Resolution rule |
 |---|---|
 | Rust | Walk up from `abs_path` to the nearest `Cargo.toml`; read `[package] name`. Done once per crate root, memoised for all files under it. |
 | TypeScript | Read `name` from the nearest `package.json`. Done once per package dir. |
-| Python | Walk up from `abs_path` to the highest directory that still contains `__init__.py`; use that directory's name. For namespace packages (no `__init__.py`), fall back to repo-root-relative first path component. Done once per package root, memoised. |
+| Python | Walk up from `abs_path` along *contiguous* `__init__.py`-containing directories; use the topmost such directory's name (see §Python edge cases below for the precise rule). For namespace packages (PEP 420 — no `__init__.py` anywhere on the chain), fall back to the repo-root-relative first path component. Done once per package root, memoised. |
+
+**Python edge cases (worked examples):**
+
+| Layout | `abs_path` | Resolved `package` | Why |
+|---|---|---|---|
+| `repo/util.py` | `repo/util.py` | `"util"` | No package dir; single-file module. `package` = file stem. |
+| `repo/scripts/build.py` (no `__init__.py` in `scripts/`) | `repo/scripts/build.py` | `"scripts"` | PEP 420 namespace fallback: first path component below repo root. |
+| `repo/src/foo/__init__.py` + `repo/src/foo/bar.py` (no `__init__.py` in `src/`) | `repo/src/foo/bar.py` | `"foo"` | Walk up *contiguously*: `foo/` has `__init__.py`, `src/` does not — stop at `foo`. Avoids returning `"src"` for the common src-layout. |
+| `repo/a/__init__.py` + `repo/a/b/__init__.py` + `repo/a/b/c.py` | `repo/a/b/c.py` | `"a"` | Topmost contiguous `__init__.py`-bearing directory is `a/`. |
+| `repo/ns/sub/x.py` (no `__init__.py` anywhere — PEP 420 namespace pkg) | `repo/ns/sub/x.py` | `"ns"` | First path component. The namespace boundary is ambiguous in PEP 420; we pick the repo-root-relative top to keep VNames stable across the repo. |
+
+The rule **"highest *contiguous* `__init__.py` directory"** prevents `src/` from being incorrectly returned for the standard src-layout, which is a common cause of cross-repo VName collisions.
 
 **Note on `#[non_exhaustive]` scope:** `#[non_exhaustive]` on `Language` prevents
 exhaustive pattern matching in *external* crates only. Within the travsr workspace
@@ -186,6 +212,13 @@ inside travsr — the compiler itself enforces that all three dispatcher sites a
 updated together. This is intentional.
 
 ### 4. Tree-sitter vs. LSIF provenance (ADR-002 compliance)
+
+> **Security precondition for Phase B.** `rust-analyzer --lsif` executes
+> `build.rs` and proc-macros, which is arbitrary code execution in the indexed
+> repo's context. Sprint 9 implementation of Phase B is gated on **ADR-006**
+> (rust-analyzer subprocess trust model) being merged first. That ADR defines
+> the sandbox, network egress policy, and opt-in trust model. Until ADR-006
+> lands, only Phase A (Tree-sitter, no subprocess execution) ships.
 
 Each language uses a two-phase approach:
 
@@ -217,9 +250,13 @@ identical VNames. The graph merge is an upsert on VName hash — no duplicates.
 **Upsert semantics (CORE-201 must implement):**
 
 - *Nodes*: `INSERT OR REPLACE` keyed on VName hash. Phase B may encounter
-  symbols that Tree-sitter cannot see (e.g. Rust `#[derive]`-generated methods,
-  proc-macro expansions). The upsert must therefore also handle bare `INSERT`
-  for VNames not yet in the graph — Phase B creates stub nodes for these.
+  symbols that exist in the compiled crate but are not present in the source
+  AST (e.g. derive-generated methods, proc-macro expansions in Rust; the
+  equivalent in Python is `@dataclass`-synthesised methods, `attrs.define`
+  attributes, etc.). Tree-sitter parses the attributes / decorators but cannot
+  expand them — the resulting symbols only become visible to the compiler /
+  type checker. The upsert must therefore also handle bare `INSERT` for VNames
+  not yet in the graph — Phase B creates stub nodes for these.
 - *Edges*: Merge key is `(src_vname_hash, dst_vname_hash, edge_kind)`.
   Edges are **deduplicated**, not additive — inserting the same
   `(src, dst, RefCall)` edge twice produces one row. Phase B edges carry
@@ -230,15 +267,19 @@ identical VNames. The graph merge is an upsert on VName hash — no duplicates.
 
 ### 5. Corpus naming
 
-Corpus names follow ADR-005 (per-language corpus naming). Summary:
+Corpus names follow ADR-005 (per-language corpus naming) — see PR #143. Summary:
 
 - All languages in the same repo share the **same corpus** (`{git-remote-basename}`).
-- Language identity is carried by `Language::signature_prefix` in the VName
-  signature and the `language` column on `nodes`.
+- Language identity is carried by the `language` column on `nodes` and (per §1
+  above) by RFC-002's `SIGNATURE_FORMAT_VERSION` byte at the hash domain layer.
 - **Do not encode language in corpus** — this is required for Phase 4
   cross-language edges to work (both endpoints must share a corpus).
 
-Rust: `VName { corpus: "travsr", root: "", path: "crates/travsr-core/src/lib.rs", language: "rust", signature: "rust:v1:{blake3}" }`
+Rust example: `VName { corpus: "travsr", root: "", path: "crates/travsr-core/src/lib.rs", language: "rust", signature: "fn:my_function" }`
+
+(The `signature` is the symbol-level identifier emitted by the language indexer
+— e.g. `"fn:foo"`, `"struct:Foo"`. The signature is hashed together with the
+other VName components plus the `SIGNATURE_FORMAT_VERSION` byte per RFC-002.)
 
 ### 6. Test fixture strategy
 
@@ -258,7 +299,9 @@ crates/travsr-indexer/tests/
 
 Each golden file is a JSON object with `nodes: [...]` and `edges: [...]`
 matching the `ParseOutput` schema. Tests assert equality after normalising
-node order by VName hash.
+node order by VName hash. Snapshot management uses [`insta`](https://crates.io/crates/insta)
+to match the project-wide convention; `cargo insta review` is the workflow
+for accepted snapshot changes.
 
 Integration smoke test (`QA-201`): spawn `travsr init` in a temp clone of
 `crates/travsr-core` (pure Rust, no TypeScript) and assert `node_count > 0`.
@@ -268,7 +311,7 @@ Integration smoke test (`QA-201`): spawn `travsr init` in a temp clone of
 | Crate | Change |
 |---|---|
 | `travsr-core` | Add `Language` enum (no new external deps) |
-| `travsr-indexer` | Add `tree-sitter-rust = "0.23"`, `tree-sitter-python = "0.23"` |
+| `travsr-indexer` | Add `tree-sitter-rust = "=0.23.x"`, `tree-sitter-python = "=0.23.x"` (pinned to exact patch; cargo-deny advisory check runs in CI — Tree-sitter grammar CVEs have shipped historically) |
 | `travsr-daemon` | No new deps; dispatcher change only |
 | `travsr-store` | Schema migration v4 adds `language TEXT NOT NULL DEFAULT 'typescript'` column |
 
