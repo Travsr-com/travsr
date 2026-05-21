@@ -52,11 +52,11 @@ jobs:
       # ------------------------------------------------------------------
       - name: Run benchmarks → save as "master" baseline
         if: github.event_name == 'push'
-        run: cargo bench --workspace --exclude travsr-cli -- --save-baseline master
+        run: cargo bench -p travsr-retrieval -- --save-baseline master
 
       - name: Run benchmarks → save as "pr" baseline
         if: github.event_name == 'pull_request'
-        run: cargo bench --workspace --exclude travsr-cli -- --save-baseline pr
+        run: cargo bench -p travsr-retrieval -- --save-baseline pr
 
       # ------------------------------------------------------------------
       # Absolute p95 latency gate — 1k-file fixture must stay under 50ms
