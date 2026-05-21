@@ -77,6 +77,22 @@ jobs:
           rm dist/travsr
           shasum -a 256 "dist/${STAGE}.tar.gz" > "dist/${STAGE}.sha256"
 
+      - name: Check tarball size (≤ 25 MB)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          ARTIFACT="${{ matrix.artifact }}"
+          STAGE="travsr-${TAG}-${ARTIFACT}"
+          MAX_BYTES=$((25 * 1024 * 1024))
+          SIZE=$(wc -c < "dist/${STAGE}.tar.gz")
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            echo "ERROR: dist/${STAGE}.tar.gz is ${SIZE} bytes — exceeds 25 MB limit (${MAX_BYTES} bytes)."
+            echo "If Kùzu static linkage caused this, update the budget in this step and docs/adrs/ADR-004-error-taxonomy.md."
+            exit 1
+          fi
+          echo "OK: dist/${STAGE}.tar.gz = ${SIZE} bytes (limit: ${MAX_BYTES})"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -85,9 +101,39 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ── Kùzu proof-build ────────────────────────────────────────────────────────
+  # Validates that the `kuzu` feature compiles with the C++ toolchain present on
+  # a standard GitHub-hosted Linux runner. This is a compile-only check — the
+  # resulting binary is NOT published (Kùzu static linkage adds ~30-50 MB and
+  # would breach the 25 MB tarball budget). See docs/adrs/ADR-004 §Consequences
+  # and Issue #67 for the full rationale.
+  #
+  # C++ toolchain requirements per platform:
+  #   linux (x86_64):   g++ ≥ 9 (ubuntu-latest ships g++ 11)
+  #   linux (aarch64):  g++-aarch64-linux-gnu (via apt cross toolchain)
+  #   macOS:            Xcode CLT / clang++ (pre-installed on macos-latest)
+  #   Windows:          MSVC 2019+ Build Tools (pre-installed on windows-latest)
+  kuzu-proof-build:
+    name: kuzu proof-build (x86_64 linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: kuzu-proof
+
+      - name: Build travsr-cli with --features kuzu (compile check)
+        run: cargo build --release -p travsr-cli --features kuzu
+
   publish:
     name: publish
-    needs: build
+    needs: [build, kuzu-proof-build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
