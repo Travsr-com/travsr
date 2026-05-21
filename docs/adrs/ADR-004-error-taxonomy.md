@@ -63,7 +63,7 @@ IndexError           (travsr-indexer public API)
 
 RetrievalError       (travsr-retrieval public API)
   ├── Traversal(String)
-  ├── PprDivergence { iterations: u32 }
+  ├── PprDivergence { iterations: usize }
   └── Store(StoreError)
 ```
 
@@ -111,11 +111,11 @@ error code:
 | Variant | Code |
 |---|---|
 | `InvalidParams` | -32602 |
-| `Store(_)` | -32000 |
-| `Index(_)` | -32001 |
-| `Retrieval(_)` | -32002 |
-| `BudgetExceeded` | -32003 |
-| `Internal(_)` | -32603 |
+| `Store(_)` | -32001 |
+| `Index(_)` | -32003 |
+| `Retrieval(_)` | -32004 |
+| `BudgetExceeded` | -32002 |
+| `Internal(_)` | -32000 |
 
 ---
 
