@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+travsr-error = { workspace = true }
 travsr-core = { path = "../travsr-core" }
 travsr-store = { path = "../travsr-store" }
 anyhow = { workspace = true }

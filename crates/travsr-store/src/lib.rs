@@ -23,9 +23,10 @@ pub use migration_manifest::{Manifest, ManifestEntry, MigrationError};
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
+use travsr_error::StoreError;
 
 // ── SQLite migration structs (T2) ─────────────────────────────────────────────
 // Each SQL file becomes a concrete Migration so the runner can apply them
@@ -90,15 +91,19 @@ fn sqlite_migration_runner() -> MigrationRunner {
 }
 
 /// The storage interface every Travsr backend must satisfy.
+///
+/// All methods return `Result<T, StoreError>` (from `travsr-error`).
+/// Callers that use `?` in an `anyhow::Result` context get automatic
+/// conversion via `anyhow::Error: From<StoreError>`.
 pub trait Store {
     /// Persist a node, returning its assigned id.
-    fn put_node(&mut self, node: &Node) -> Result<NodeId>;
+    fn put_node(&mut self, node: &Node) -> Result<NodeId, StoreError>;
     /// Persist an edge.
-    fn put_edge(&mut self, edge: &Edge) -> Result<()>;
+    fn put_edge(&mut self, edge: &Edge) -> Result<(), StoreError>;
     /// Look up a node by id.
-    fn get_node(&self, id: NodeId) -> Result<Option<Node>>;
+    fn get_node(&self, id: NodeId) -> Result<Option<Node>, StoreError>;
     /// Return every outgoing edge from `src`.
-    fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>>;
+    fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>, StoreError>;
     /// Return outgoing edges from `src` filtered to a single [`EdgeKind`].
     ///
     /// Implementations **must** use an indexed `WHERE kind = ?` clause so that
@@ -107,7 +112,7 @@ pub trait Store {
     ///
     /// The default implementation delegates to [`Store::iter_edges_from`] and
     /// filters in Rust — backends without a kind index should override this.
-    fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>> {
+    fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>, StoreError> {
         Ok(self
             .iter_edges_from(src)?
             .into_iter()
@@ -115,7 +120,7 @@ pub trait Store {
             .collect())
     }
     /// Return every incoming edge to `dst`.
-    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>>;
+    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>, StoreError>;
 }
 
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
@@ -127,41 +132,47 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Open (or create) a SQLite-backed store at `path`, enabling WAL and
     /// running any pending migrations via [`MigrationRunner`].
-    pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening sqlite database at {}", path.display()))?;
-        Self::configure(&conn)?;
-        // Bootstrap the meta table before the runner reads the schema version.
-        Self::bootstrap_meta(&conn)?;
-        let mut store = Self { conn };
-        sqlite_migration_runner()
-            .run(&mut store)
-            .context("running SQLite migrations")?;
-        Ok(store)
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
+        (|| -> AnyResult<Self> {
+            let conn = Connection::open(path)
+                .with_context(|| format!("opening sqlite database at {}", path.display()))?;
+            Self::configure(&conn)?;
+            // Bootstrap the meta table before the runner reads the schema version.
+            Self::bootstrap_meta(&conn)?;
+            let mut store = Self { conn };
+            sqlite_migration_runner()
+                .run(&mut store)
+                .context("running SQLite migrations")?;
+            Ok(store)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Open an in-memory SQLite store. Used in tests; WAL is not available
     /// on `:memory:` connections, so journal mode falls back to MEMORY.
-    pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
-        Self::bootstrap_meta(&conn)?;
-        let mut store = Self { conn };
-        sqlite_migration_runner()
-            .run(&mut store)
-            .context("running SQLite migrations (in-memory)")?;
-        Ok(store)
+    pub fn open_in_memory() -> Result<Self, StoreError> {
+        (|| -> AnyResult<Self> {
+            let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
+            Self::bootstrap_meta(&conn)?;
+            let mut store = Self { conn };
+            sqlite_migration_runner()
+                .run(&mut store)
+                .context("running SQLite migrations (in-memory)")?;
+            Ok(store)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Create the `meta` table if it does not already exist.
     /// Must run before the migration runner, which uses meta to read the version.
-    fn bootstrap_meta(conn: &Connection) -> Result<()> {
+    fn bootstrap_meta(conn: &Connection) -> AnyResult<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .context("bootstrapping meta table")
     }
 
-    fn configure(conn: &Connection) -> Result<()> {
+    fn configure(conn: &Connection) -> AnyResult<()> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("enabling WAL journal mode")?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -172,29 +183,36 @@ impl SqliteStore {
     }
 
     /// Return the live journal mode reported by SQLite. Useful in tests.
-    pub fn journal_mode(&self) -> Result<String> {
+    pub fn journal_mode(&self) -> Result<String, StoreError> {
         self.conn
             .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
             .context("querying journal_mode")
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn node_count(&self) -> Result<u64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM nodes", [], |row| row.get(0))
-            .context("counting nodes")?;
-        Ok(n as u64)
+    pub fn node_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM nodes", [], |row| row.get(0))
+                .context("counting nodes")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn edge_count(&self) -> Result<u64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM edges", [], |row| row.get(0))
-            .context("counting edges")?;
-        Ok(n as u64)
+    pub fn edge_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM edges", [], |row| row.get(0))
+                .context("counting edges")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn get_file_hash(&self, path: &str) -> Result<Option<String>> {
+    pub fn get_file_hash(&self, path: &str) -> Result<Option<String>, StoreError> {
         self.conn
             .query_row(
                 "SELECT sha256 FROM files WHERE path = ?1",
@@ -203,9 +221,10 @@ impl SqliteStore {
             )
             .optional()
             .context("reading file hash")
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn put_file_hash(&mut self, path: &str, hex: &str) -> Result<()> {
+    pub fn put_file_hash(&mut self, path: &str, hex: &str) -> Result<(), StoreError> {
         self.conn
             .execute(
                 "INSERT INTO files(path, sha256, last_indexed_at) \
@@ -215,126 +234,139 @@ impl SqliteStore {
                    last_indexed_at = excluded.last_indexed_at",
                 params![path, hex],
             )
-            .context("writing file hash")?;
+            .context("writing file hash")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
     }
 
     /// Delete all nodes (and their edges) whose VName path equals `path`.
     /// Edges are deleted first to avoid orphan references; both operations
     /// run inside a single transaction.  Returns the number of nodes removed.
-    pub fn delete_nodes_for_path(&mut self, path: &str) -> Result<u64> {
-        let tx = self
-            .conn
-            .transaction()
-            .context("starting delete transaction")?;
+    pub fn delete_nodes_for_path(&mut self, path: &str) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting delete transaction")?;
 
-        let count: i64 = tx
-            .query_row(
-                "SELECT count(*) FROM nodes WHERE path = ?1",
+            let count: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM nodes WHERE path = ?1",
+                    params![path],
+                    |row| row.get(0),
+                )
+                .context("counting nodes to delete")?;
+
+            // Edges have no FK cascade — delete them explicitly before removing nodes.
+            tx.execute(
+                "DELETE FROM edges \
+                 WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
+                    OR dst IN (SELECT id FROM nodes WHERE path = ?1)",
                 params![path],
-                |row| row.get(0),
             )
-            .context("counting nodes to delete")?;
+            .context("deleting edges for path")?;
 
-        // Edges have no FK cascade — delete them explicitly before removing nodes.
-        tx.execute(
-            "DELETE FROM edges \
-             WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
-                OR dst IN (SELECT id FROM nodes WHERE path = ?1)",
-            params![path],
-        )
-        .context("deleting edges for path")?;
+            tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
+                .context("deleting nodes for path")?;
 
-        tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
-            .context("deleting nodes for path")?;
-
-        tx.commit().context("committing delete transaction")?;
-        Ok(count as u64)
+            tx.commit().context("committing delete transaction")?;
+            Ok(count as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>> {
+    pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>, StoreError> {
         // Log the query name (symbol/path, not file contents — SEC log-redaction rule).
         let _span = tracing::debug_span!("store.search_nodes_by_name", query = name).entered();
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, corpus, root, path, language, signature, kind \
-                 FROM nodes WHERE signature LIKE '%' || ?1 || '%' \
-                    OR path LIKE '%' || ?1 || '%'",
-            )
-            .context("preparing search query")?;
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind \
+                     FROM nodes WHERE signature LIKE '%' || ?1 || '%' \
+                        OR path LIKE '%' || ?1 || '%'",
+                )
+                .context("preparing search query")?;
 
-        let rows = stmt
-            .query_map(params![name], |row| {
-                let id = i64_to_node_id(row.get::<_, i64>(0)?);
-                let vname = VName::new(
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                );
-                let kind: String = row.get(6)?;
-                Ok(Node { id, vname, kind })
-            })
-            .context("executing search query")?;
+            let rows = stmt
+                .query_map(params![name], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    Ok(Node { id, vname, kind })
+                })
+                .context("executing search query")?;
 
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.context("decoding search row")?);
-        }
-        tracing::debug!(nodes_returned = out.len());
-        Ok(out)
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding search row")?);
+            }
+            tracing::debug!(nodes_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn all_nodes(&self) -> Result<Vec<Node>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, corpus, root, path, language, signature, kind FROM nodes")
-            .context("preparing all_nodes query")?;
-        let rows = stmt
-            .query_map([], |row| {
-                let id = i64_to_node_id(row.get::<_, i64>(0)?);
-                let vname = VName::new(
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                );
-                let kind: String = row.get(6)?;
-                Ok(Node { id, vname, kind })
-            })
-            .context("executing all_nodes query")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.context("decoding all_nodes row")?);
-        }
-        Ok(out)
+    pub fn all_nodes(&self) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, corpus, root, path, language, signature, kind FROM nodes")
+                .context("preparing all_nodes query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    Ok(Node { id, vname, kind })
+                })
+                .context("executing all_nodes query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding all_nodes row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT src, dst, kind, provenance FROM edges")
-            .context("preparing all_edges query")?;
-        let rows = stmt
-            .query_map([], |row| {
-                let src = i64_to_node_id(row.get::<_, i64>(0)?);
-                let dst = i64_to_node_id(row.get::<_, i64>(1)?);
-                let kind: String = row.get(2)?;
-                let provenance: String = row.get(3)?;
-                Ok((src, dst, kind, provenance))
-            })
-            .context("executing all_edges query")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.context("decoding all_edges row")?);
-        }
-        Ok(out)
+    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(NodeId, NodeId, String, String)>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT src, dst, kind, provenance FROM edges")
+                .context("preparing all_edges query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let src = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let dst = i64_to_node_id(row.get::<_, i64>(1)?);
+                    let kind: String = row.get(2)?;
+                    let provenance: String = row.get(3)?;
+                    Ok((src, dst, kind, provenance))
+                })
+                .context("executing all_edges query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding all_edges row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
         self.conn
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
@@ -343,16 +375,18 @@ impl SqliteStore {
             )
             .optional()
             .context("reading meta key")
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
         self.conn
             .execute(
                 "INSERT INTO meta(key, value) VALUES(?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![key, value],
             )
-            .context("writing meta key")?;
+            .context("writing meta key")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -361,20 +395,24 @@ impl SqliteStore {
     /// Returns `0` for legacy databases (pre-RFC-002) that have no such row,
     /// or databases migrated from schema v2 where the row was just added with
     /// the default value `'0'`.
-    pub fn get_signature_format_version(&self) -> Result<u8> {
-        let raw = self
-            .get_meta("signature_format_version")
-            .context("reading signature_format_version")?
-            .unwrap_or_else(|| "0".to_string());
-        raw.parse::<u8>()
-            .with_context(|| format!("invalid signature_format_version in meta: {raw}"))
+    pub fn get_signature_format_version(&self) -> Result<u8, StoreError> {
+        (|| -> AnyResult<u8> {
+            let raw = self
+                .get_meta("signature_format_version")
+                .context("reading signature_format_version")?
+                .unwrap_or_else(|| "0".to_string());
+            raw.parse::<u8>()
+                .with_context(|| format!("invalid signature_format_version in meta: {raw}"))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Write the VName signature format version. Called by the daemon after a
     /// successful full re-index to stamp the active format version.
-    pub fn set_signature_format_version(&mut self, v: u8) -> Result<()> {
+    pub fn set_signature_format_version(&mut self, v: u8) -> Result<(), StoreError> {
         self.set_meta("signature_format_version", &v.to_string())
             .context("writing signature_format_version")
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Persist an edge with LSIF (semantic) provenance.
@@ -382,7 +420,7 @@ impl SqliteStore {
     /// LSIF always wins: if an identical (src, dst, kind) row already exists
     /// with `provenance='tree-sitter'`, it is upgraded to `'lsif'`. This
     /// implements the LSIF-beats-tree-sitter precedence policy (ADR-002).
-    pub fn put_edge_lsif(&mut self, edge: &Edge) -> Result<()> {
+    pub fn put_edge_lsif(&mut self, edge: &Edge) -> Result<(), StoreError> {
         self.conn
             .execute(
                 "INSERT INTO edges(src, dst, kind, provenance) VALUES(?1, ?2, ?3, 'lsif')
@@ -393,7 +431,8 @@ impl SqliteStore {
                     edge.kind.as_str(),
                 ],
             )
-            .context("inserting lsif edge")?;
+            .context("inserting lsif edge")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
     }
 }
@@ -448,7 +487,7 @@ impl StoreMigratable for SqliteStore {
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 impl Store for SqliteStore {
-    fn put_node(&mut self, node: &Node) -> Result<NodeId> {
+    fn put_node(&mut self, node: &Node) -> Result<NodeId, StoreError> {
         let id_i64 = node_id_to_i64(node.id);
         self.conn
             .execute(
@@ -465,11 +504,12 @@ impl Store for SqliteStore {
                     node.kind,
                 ],
             )
-            .context("inserting node")?;
+            .context("inserting node")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(node.id)
     }
 
-    fn put_edge(&mut self, edge: &Edge) -> Result<()> {
+    fn put_edge(&mut self, edge: &Edge) -> Result<(), StoreError> {
         // Tree-sitter edges use DO NOTHING on conflict: they must never demote
         // an existing 'lsif' row (ADR-002). DO NOTHING is equivalent to the
         // verbose CASE expression but is explicit about intent.
@@ -483,107 +523,120 @@ impl Store for SqliteStore {
                     edge.kind.as_str(),
                 ],
             )
-            .context("inserting tree-sitter edge")?;
+            .context("inserting tree-sitter edge")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
     }
 
-    fn get_node(&self, id: NodeId) -> Result<Option<Node>> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT corpus, root, path, language, signature, kind \
-                 FROM nodes WHERE id = ?1",
-                params![node_id_to_i64(id)],
-                |row| {
-                    let vname = VName::new(
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    );
-                    let kind: String = row.get(5)?;
-                    Ok(Node { id, vname, kind })
-                },
-            )
-            .optional()
-            .context("querying node by id")?;
-        Ok(row)
+    fn get_node(&self, id: NodeId) -> Result<Option<Node>, StoreError> {
+        (|| -> AnyResult<Option<Node>> {
+            let row = self
+                .conn
+                .query_row(
+                    "SELECT corpus, root, path, language, signature, kind \
+                     FROM nodes WHERE id = ?1",
+                    params![node_id_to_i64(id)],
+                    |row| {
+                        let vname = VName::new(
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        );
+                        let kind: String = row.get(5)?;
+                        Ok(Node { id, vname, kind })
+                    },
+                )
+                .optional()
+                .context("querying node by id")?;
+            Ok(row)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>> {
+    fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>, StoreError> {
         let _span = tracing::debug_span!("store.iter_edges_from", src = src.0).entered();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT dst, kind FROM edges WHERE src = ?1")
-            .context("preparing iter_edges_from query")?;
-        let rows = stmt
-            .query_map(params![node_id_to_i64(src)], |row| {
-                let dst_i64: i64 = row.get(0)?;
-                let kind_str: String = row.get(1)?;
-                Ok((dst_i64, kind_str))
-            })
-            .context("executing iter_edges_from query")?;
+        (|| -> AnyResult<Vec<Edge>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT dst, kind FROM edges WHERE src = ?1")
+                .context("preparing iter_edges_from query")?;
+            let rows = stmt
+                .query_map(params![node_id_to_i64(src)], |row| {
+                    let dst_i64: i64 = row.get(0)?;
+                    let kind_str: String = row.get(1)?;
+                    Ok((dst_i64, kind_str))
+                })
+                .context("executing iter_edges_from query")?;
 
-        let mut out = Vec::new();
-        for row in rows {
-            let (dst_i64, kind_str) = row.context("decoding edge row")?;
-            let kind = EdgeKind::from_str(&kind_str)
-                .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
-            out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
-        }
-        tracing::debug!(edges_returned = out.len());
-        Ok(out)
+            let mut out = Vec::new();
+            for row in rows {
+                let (dst_i64, kind_str) = row.context("decoding edge row")?;
+                let kind = EdgeKind::from_str(&kind_str)
+                    .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
+                out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+            }
+            tracing::debug!(edges_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Indexed variant — uses `WHERE src = ?1 AND kind = ?2` so SQLite can
     /// satisfy the query from the `(src, dst, kind)` primary-key index without
     /// a full `src`-partition scan. Overrides the trait default.
-    fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>> {
+    fn iter_edges_from_kind(&self, src: NodeId, kind: EdgeKind) -> Result<Vec<Edge>, StoreError> {
         let _span =
             tracing::debug_span!("store.iter_edges_from_kind", src = src.0, kind = ?kind).entered();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT dst FROM edges WHERE src = ?1 AND kind = ?2")
-            .context("preparing iter_edges_from_kind query")?;
-        let rows = stmt
-            .query_map(params![node_id_to_i64(src), kind.as_str()], |row| {
-                row.get::<_, i64>(0)
-            })
-            .context("executing iter_edges_from_kind query")?;
+        (|| -> AnyResult<Vec<Edge>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT dst FROM edges WHERE src = ?1 AND kind = ?2")
+                .context("preparing iter_edges_from_kind query")?;
+            let rows = stmt
+                .query_map(params![node_id_to_i64(src), kind.as_str()], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .context("executing iter_edges_from_kind query")?;
 
-        let mut out = Vec::new();
-        for row in rows {
-            let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
-            out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
-        }
-        tracing::debug!(edges_returned = out.len());
-        Ok(out)
+            let mut out = Vec::new();
+            for row in rows {
+                let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
+                out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+            }
+            tracing::debug!(edges_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>> {
+    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>, StoreError> {
         let _span = tracing::debug_span!("store.iter_edges_to", dst = dst.0).entered();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT src, kind FROM edges WHERE dst = ?1")
-            .context("preparing iter_edges_to query")?;
-        let rows = stmt
-            .query_map(params![node_id_to_i64(dst)], |row| {
-                let src_i64: i64 = row.get(0)?;
-                let kind_str: String = row.get(1)?;
-                Ok((src_i64, kind_str))
-            })
-            .context("executing iter_edges_to query")?;
+        (|| -> AnyResult<Vec<Edge>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT src, kind FROM edges WHERE dst = ?1")
+                .context("preparing iter_edges_to query")?;
+            let rows = stmt
+                .query_map(params![node_id_to_i64(dst)], |row| {
+                    let src_i64: i64 = row.get(0)?;
+                    let kind_str: String = row.get(1)?;
+                    Ok((src_i64, kind_str))
+                })
+                .context("executing iter_edges_to query")?;
 
-        let mut out = Vec::new();
-        for row in rows {
-            let (src_i64, kind_str) = row.context("decoding edge row")?;
-            let kind = EdgeKind::from_str(&kind_str)
-                .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
-            out.push(Edge::new(i64_to_node_id(src_i64), dst, kind));
-        }
-        tracing::debug!(edges_returned = out.len());
-        Ok(out)
+            let mut out = Vec::new();
+            for row in rows {
+                let (src_i64, kind_str) = row.context("decoding edge row")?;
+                let kind = EdgeKind::from_str(&kind_str)
+                    .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
+                out.push(Edge::new(i64_to_node_id(src_i64), dst, kind));
+            }
+            tracing::debug!(edges_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 }
 

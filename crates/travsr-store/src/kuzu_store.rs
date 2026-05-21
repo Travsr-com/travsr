@@ -32,8 +32,9 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Result as AnyResult};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
+use travsr_error::StoreError;
 
 use crate::Store;
 
@@ -50,12 +51,15 @@ impl KuzuStore {
     /// Open (or create) a Kùzu database at `path` and initialise the schema.
     /// Safe to call on an already-initialised database — `init_schema` is
     /// idempotent.
-    pub fn open(path: &Path) -> Result<Self> {
-        let db = kuzu::Database::new(path, kuzu::SystemConfig::default())
-            .with_context(|| format!("opening Kùzu database at {}", path.display()))?;
-        let store = Self { db };
-        store.init_schema()?;
-        Ok(store)
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
+        (|| -> AnyResult<Self> {
+            let db = kuzu::Database::new(path, kuzu::SystemConfig::default())
+                .with_context(|| format!("opening Kùzu database at {}", path.display()))?;
+            let store = Self { db };
+            store.init_schema()?;
+            Ok(store)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Create a short-lived connection for one operation.
@@ -93,53 +97,62 @@ impl KuzuStore {
     }
 
     /// Count of nodes currently stored. Used by the parity test harness.
-    pub fn node_count(&self) -> Result<u64> {
-        let conn = self.connect().context("node_count")?;
-        let mut result = conn
-            .query("MATCH (n:nodes) RETURN count(n)")
-            .context("executing node_count")?;
-        let row = result.next().context("node_count: empty result set")?;
-        let n = extract_i64(&row, 0, "count(n)")?;
-        Ok(n as u64)
+    pub fn node_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let conn = self.connect().context("node_count")?;
+            let mut result = conn
+                .query("MATCH (n:nodes) RETURN count(n)")
+                .context("executing node_count")?;
+            let row = result.next().context("node_count: empty result set")?;
+            let n = extract_i64(&row, 0, "count(n)")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Count of edges currently stored. Used by the parity test harness.
-    pub fn edge_count(&self) -> Result<u64> {
-        let conn = self.connect().context("edge_count")?;
-        let mut result = conn
-            .query("MATCH ()-[e:edges]->() RETURN count(e)")
-            .context("executing edge_count")?;
-        let row = result.next().context("edge_count: empty result set")?;
-        let n = extract_i64(&row, 0, "count(e)")?;
-        Ok(n as u64)
+    pub fn edge_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let conn = self.connect().context("edge_count")?;
+            let mut result = conn
+                .query("MATCH ()-[e:edges]->() RETURN count(e)")
+                .context("executing edge_count")?;
+            let row = result.next().context("edge_count: empty result set")?;
+            let n = extract_i64(&row, 0, "count(e)")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Return every node in the graph. Used by the parity test harness.
-    pub fn all_nodes(&self) -> Result<Vec<Node>> {
-        let conn = self.connect().context("all_nodes")?;
-        let mut result = conn
-            .query(
-                "MATCH (n:nodes) \
-                 RETURN n.id, n.corpus, n.root, n.path, n.language, n.signature, n.kind",
-            )
-            .context("executing all_nodes")?;
+    pub fn all_nodes(&self) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let conn = self.connect().context("all_nodes")?;
+            let mut result = conn
+                .query(
+                    "MATCH (n:nodes) \
+                     RETURN n.id, n.corpus, n.root, n.path, n.language, n.signature, n.kind",
+                )
+                .context("executing all_nodes")?;
 
-        let mut out = Vec::new();
-        while let Some(row) = result.next() {
-            let id_raw = extract_i64(&row, 0, "n.id")?;
-            let corpus = extract_string(&row, 1, "n.corpus")?;
-            let root = extract_string(&row, 2, "n.root")?;
-            let path = extract_string(&row, 3, "n.path")?;
-            let language = extract_string(&row, 4, "n.language")?;
-            let signature = extract_string(&row, 5, "n.signature")?;
-            let kind = extract_string(&row, 6, "n.kind")?;
-            out.push(Node {
-                id: i64_to_node_id(id_raw),
-                vname: VName::new(corpus, root, path, language, signature),
-                kind,
-            });
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            while let Some(row) = result.next() {
+                let id_raw = extract_i64(&row, 0, "n.id")?;
+                let corpus = extract_string(&row, 1, "n.corpus")?;
+                let root = extract_string(&row, 2, "n.root")?;
+                let path = extract_string(&row, 3, "n.path")?;
+                let language = extract_string(&row, 4, "n.language")?;
+                let signature = extract_string(&row, 5, "n.signature")?;
+                let kind = extract_string(&row, 6, "n.kind")?;
+                out.push(Node {
+                    id: i64_to_node_id(id_raw),
+                    vname: VName::new(corpus, root, path, language, signature),
+                    kind,
+                });
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Return every edge as a `(src, dst, kind)` triple.
@@ -148,59 +161,65 @@ impl KuzuStore {
     /// integrity manifest. Provenance is not stored in Kùzu — the triple is the
     /// full edge identity.
     #[cfg_attr(not(feature = "kuzu"), allow(dead_code))]
-    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String)>> {
-        let conn = self.connect().context("all_edges: connecting to kuzu")?;
-        let mut result = conn
-            .query(
-                "MATCH (s:nodes)-[e:edges]->(d:nodes) \
-                 RETURN s.id, d.id, e.kind",
-            )
-            .context("all_edges: executing query")?;
+    pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(NodeId, NodeId, String)>> {
+            let conn = self.connect().context("all_edges: connecting to kuzu")?;
+            let mut result = conn
+                .query(
+                    "MATCH (s:nodes)-[e:edges]->(d:nodes) \
+                     RETURN s.id, d.id, e.kind",
+                )
+                .context("all_edges: executing query")?;
 
-        let mut out = Vec::new();
-        while let Some(row) = result.next() {
-            let src_raw = extract_i64(&row, 0, "s.id")?;
-            let dst_raw = extract_i64(&row, 1, "d.id")?;
-            let kind = extract_string(&row, 2, "e.kind")?;
-            out.push((i64_to_node_id(src_raw), i64_to_node_id(dst_raw), kind));
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            while let Some(row) = result.next() {
+                let src_raw = extract_i64(&row, 0, "s.id")?;
+                let dst_raw = extract_i64(&row, 1, "d.id")?;
+                let kind = extract_string(&row, 2, "e.kind")?;
+                out.push((i64_to_node_id(src_raw), i64_to_node_id(dst_raw), kind));
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Substring search over node signature and path fields.
     /// Mirrors [`SqliteStore::search_nodes_by_name`]. Used by the parity test harness.
-    pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>> {
-        let conn = self.connect().context("search_nodes_by_name")?;
-        let mut stmt = conn
-            .prepare(
-                "MATCH (n:nodes) \
-                 WHERE n.signature CONTAINS $name OR n.path CONTAINS $name \
-                 RETURN n.id, n.corpus, n.root, n.path, n.language, n.signature, n.kind",
-            )
-            .context("preparing search_nodes_by_name")?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("name", kuzu::Value::String(name.to_string()))],
-            )
-            .context("executing search_nodes_by_name")?;
+    pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let conn = self.connect().context("search_nodes_by_name")?;
+            let mut stmt = conn
+                .prepare(
+                    "MATCH (n:nodes) \
+                     WHERE n.signature CONTAINS $name OR n.path CONTAINS $name \
+                     RETURN n.id, n.corpus, n.root, n.path, n.language, n.signature, n.kind",
+                )
+                .context("preparing search_nodes_by_name")?;
+            let mut result = conn
+                .execute(
+                    &mut stmt,
+                    vec![("name", kuzu::Value::String(name.to_string()))],
+                )
+                .context("executing search_nodes_by_name")?;
 
-        let mut out = Vec::new();
-        while let Some(row) = result.next() {
-            let id_raw = extract_i64(&row, 0, "n.id")?;
-            let corpus = extract_string(&row, 1, "n.corpus")?;
-            let root = extract_string(&row, 2, "n.root")?;
-            let path = extract_string(&row, 3, "n.path")?;
-            let language = extract_string(&row, 4, "n.language")?;
-            let signature = extract_string(&row, 5, "n.signature")?;
-            let kind = extract_string(&row, 6, "n.kind")?;
-            out.push(Node {
-                id: i64_to_node_id(id_raw),
-                vname: VName::new(corpus, root, path, language, signature),
-                kind,
-            });
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            while let Some(row) = result.next() {
+                let id_raw = extract_i64(&row, 0, "n.id")?;
+                let corpus = extract_string(&row, 1, "n.corpus")?;
+                let root = extract_string(&row, 2, "n.root")?;
+                let path = extract_string(&row, 3, "n.path")?;
+                let language = extract_string(&row, 4, "n.language")?;
+                let signature = extract_string(&row, 5, "n.signature")?;
+                let kind = extract_string(&row, 6, "n.kind")?;
+                out.push(Node {
+                    id: i64_to_node_id(id_raw),
+                    vname: VName::new(corpus, root, path, language, signature),
+                    kind,
+                });
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 }
 
@@ -208,145 +227,160 @@ impl KuzuStore {
 
 impl Store for KuzuStore {
     /// Upsert a node — creates it if absent, updates `kind` if already present.
-    fn put_node(&mut self, node: &Node) -> Result<NodeId> {
-        let conn = self.connect().context("put_node")?;
-        let mut stmt = conn
-            .prepare(
-                "MERGE (n:nodes {id: $id}) \
-                 ON CREATE SET \
-                     n.corpus = $corpus, n.root = $root, n.path = $path, \
-                     n.language = $language, n.signature = $signature, n.kind = $kind \
-                 ON MATCH SET n.kind = $kind",
+    fn put_node(&mut self, node: &Node) -> Result<NodeId, StoreError> {
+        (|| -> AnyResult<NodeId> {
+            let conn = self.connect().context("put_node")?;
+            let mut stmt = conn
+                .prepare(
+                    "MERGE (n:nodes {id: $id}) \
+                     ON CREATE SET \
+                         n.corpus = $corpus, n.root = $root, n.path = $path, \
+                         n.language = $language, n.signature = $signature, n.kind = $kind \
+                     ON MATCH SET n.kind = $kind",
+                )
+                .context("preparing put_node")?;
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("id", kuzu::Value::Int64(node_id_to_i64(node.id))),
+                    ("corpus", kuzu::Value::String(node.vname.corpus.clone())),
+                    ("root", kuzu::Value::String(node.vname.root.clone())),
+                    ("path", kuzu::Value::String(node.vname.path.clone())),
+                    ("language", kuzu::Value::String(node.vname.language.clone())),
+                    (
+                        "signature",
+                        kuzu::Value::String(node.vname.signature.clone()),
+                    ),
+                    ("kind", kuzu::Value::String(node.kind.clone())),
+                ],
             )
-            .context("preparing put_node")?;
-        conn.execute(
-            &mut stmt,
-            vec![
-                ("id", kuzu::Value::Int64(node_id_to_i64(node.id))),
-                ("corpus", kuzu::Value::String(node.vname.corpus.clone())),
-                ("root", kuzu::Value::String(node.vname.root.clone())),
-                ("path", kuzu::Value::String(node.vname.path.clone())),
-                ("language", kuzu::Value::String(node.vname.language.clone())),
-                (
-                    "signature",
-                    kuzu::Value::String(node.vname.signature.clone()),
-                ),
-                ("kind", kuzu::Value::String(node.kind.clone())),
-            ],
-        )
-        .context("executing put_node")?;
-        Ok(node.id)
+            .context("executing put_node")?;
+            Ok(node.id)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Insert a directed edge. Idempotent — duplicate (src, dst, kind) tuples
     /// are silently ignored via MERGE.
-    fn put_edge(&mut self, edge: &Edge) -> Result<()> {
-        let conn = self.connect().context("put_edge")?;
-        let mut stmt = conn
-            .prepare(
-                "MATCH (src:nodes {id: $src}), (dst:nodes {id: $dst}) \
-                 MERGE (src)-[e:edges {kind: $kind}]->(dst)",
+    fn put_edge(&mut self, edge: &Edge) -> Result<(), StoreError> {
+        (|| -> AnyResult<()> {
+            let conn = self.connect().context("put_edge")?;
+            let mut stmt = conn
+                .prepare(
+                    "MATCH (src:nodes {id: $src}), (dst:nodes {id: $dst}) \
+                     MERGE (src)-[e:edges {kind: $kind}]->(dst)",
+                )
+                .context("preparing put_edge")?;
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("src", kuzu::Value::Int64(node_id_to_i64(edge.src))),
+                    ("dst", kuzu::Value::Int64(node_id_to_i64(edge.dst))),
+                    ("kind", kuzu::Value::String(edge.kind.as_str().to_string())),
+                ],
             )
-            .context("preparing put_edge")?;
-        conn.execute(
-            &mut stmt,
-            vec![
-                ("src", kuzu::Value::Int64(node_id_to_i64(edge.src))),
-                ("dst", kuzu::Value::Int64(node_id_to_i64(edge.dst))),
-                ("kind", kuzu::Value::String(edge.kind.as_str().to_string())),
-            ],
-        )
-        .context("executing put_edge")?;
-        Ok(())
+            .context("executing put_edge")?;
+            Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    fn get_node(&self, id: NodeId) -> Result<Option<Node>> {
-        let conn = self.connect().context("get_node")?;
-        let mut stmt = conn
-            .prepare(
-                "MATCH (n:nodes {id: $id}) \
-                 RETURN n.corpus, n.root, n.path, n.language, n.signature, n.kind",
-            )
-            .context("preparing get_node")?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("id", kuzu::Value::Int64(node_id_to_i64(id)))],
-            )
-            .context("executing get_node")?;
+    fn get_node(&self, id: NodeId) -> Result<Option<Node>, StoreError> {
+        (|| -> AnyResult<Option<Node>> {
+            let conn = self.connect().context("get_node")?;
+            let mut stmt = conn
+                .prepare(
+                    "MATCH (n:nodes {id: $id}) \
+                     RETURN n.corpus, n.root, n.path, n.language, n.signature, n.kind",
+                )
+                .context("preparing get_node")?;
+            let mut result = conn
+                .execute(
+                    &mut stmt,
+                    vec![("id", kuzu::Value::Int64(node_id_to_i64(id)))],
+                )
+                .context("executing get_node")?;
 
-        // kuzu 0.11.x: next() yields Vec<Value> directly; nulls are Value::Null.
-        let row: Vec<kuzu::Value> = match result.next() {
-            Some(r) => r,
-            None => return Ok(None),
-        };
+            // kuzu 0.11.x: next() yields Vec<Value> directly; nulls are Value::Null.
+            let row: Vec<kuzu::Value> = match result.next() {
+                Some(r) => r,
+                None => return Ok(None),
+            };
 
-        let corpus = extract_string(&row, 0, "corpus")?;
-        let root = extract_string(&row, 1, "root")?;
-        let path = extract_string(&row, 2, "path")?;
-        let language = extract_string(&row, 3, "language")?;
-        let signature = extract_string(&row, 4, "signature")?;
-        let kind = extract_string(&row, 5, "kind")?;
+            let corpus = extract_string(&row, 0, "corpus")?;
+            let root = extract_string(&row, 1, "root")?;
+            let path = extract_string(&row, 2, "path")?;
+            let language = extract_string(&row, 3, "language")?;
+            let signature = extract_string(&row, 4, "signature")?;
+            let kind = extract_string(&row, 5, "kind")?;
 
-        Ok(Some(Node {
-            id,
-            vname: VName::new(corpus, root, path, language, signature),
-            kind,
-        }))
+            Ok(Some(Node {
+                id,
+                vname: VName::new(corpus, root, path, language, signature),
+                kind,
+            }))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// O(out-degree(src))
-    fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>> {
-        let conn = self.connect().context("iter_edges_from")?;
-        let mut stmt = conn
-            .prepare(
-                "MATCH (s:nodes {id: $src})-[e:edges]->(d:nodes) \
-                 RETURN d.id, e.kind",
-            )
-            .context("preparing iter_edges_from")?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("src", kuzu::Value::Int64(node_id_to_i64(src)))],
-            )
-            .context("executing iter_edges_from")?;
+    fn iter_edges_from(&self, src: NodeId) -> Result<Vec<Edge>, StoreError> {
+        (|| -> AnyResult<Vec<Edge>> {
+            let conn = self.connect().context("iter_edges_from")?;
+            let mut stmt = conn
+                .prepare(
+                    "MATCH (s:nodes {id: $src})-[e:edges]->(d:nodes) \
+                     RETURN d.id, e.kind",
+                )
+                .context("preparing iter_edges_from")?;
+            let mut result = conn
+                .execute(
+                    &mut stmt,
+                    vec![("src", kuzu::Value::Int64(node_id_to_i64(src)))],
+                )
+                .context("executing iter_edges_from")?;
 
-        let mut edges = Vec::new();
-        while let Some(row) = result.next() {
-            let dst_raw = extract_i64(&row, 0, "d.id")?;
-            let kind_str = extract_string(&row, 1, "e.kind")?;
-            let kind = EdgeKind::from_str(&kind_str)
-                .with_context(|| format!("unknown edge kind in Kùzu: {kind_str}"))?;
-            edges.push(Edge::new(src, i64_to_node_id(dst_raw), kind));
-        }
-        Ok(edges)
+            let mut edges = Vec::new();
+            while let Some(row) = result.next() {
+                let dst_raw = extract_i64(&row, 0, "d.id")?;
+                let kind_str = extract_string(&row, 1, "e.kind")?;
+                let kind = EdgeKind::from_str(&kind_str)
+                    .with_context(|| format!("unknown edge kind in Kùzu: {kind_str}"))?;
+                edges.push(Edge::new(src, i64_to_node_id(dst_raw), kind));
+            }
+            Ok(edges)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// O(in-degree(dst))
-    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>> {
-        let conn = self.connect().context("iter_edges_to")?;
-        let mut stmt = conn
-            .prepare(
-                "MATCH (s:nodes)-[e:edges]->(d:nodes {id: $dst}) \
-                 RETURN s.id, e.kind",
-            )
-            .context("preparing iter_edges_to")?;
-        let mut result = conn
-            .execute(
-                &mut stmt,
-                vec![("dst", kuzu::Value::Int64(node_id_to_i64(dst)))],
-            )
-            .context("executing iter_edges_to")?;
+    fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>, StoreError> {
+        (|| -> AnyResult<Vec<Edge>> {
+            let conn = self.connect().context("iter_edges_to")?;
+            let mut stmt = conn
+                .prepare(
+                    "MATCH (s:nodes)-[e:edges]->(d:nodes {id: $dst}) \
+                     RETURN s.id, e.kind",
+                )
+                .context("preparing iter_edges_to")?;
+            let mut result = conn
+                .execute(
+                    &mut stmt,
+                    vec![("dst", kuzu::Value::Int64(node_id_to_i64(dst)))],
+                )
+                .context("executing iter_edges_to")?;
 
-        let mut edges = Vec::new();
-        while let Some(row) = result.next() {
-            let src_raw = extract_i64(&row, 0, "s.id")?;
-            let kind_str = extract_string(&row, 1, "e.kind")?;
-            let kind = EdgeKind::from_str(&kind_str)
-                .with_context(|| format!("unknown edge kind in Kùzu: {kind_str}"))?;
-            edges.push(Edge::new(i64_to_node_id(src_raw), dst, kind));
-        }
-        Ok(edges)
+            let mut edges = Vec::new();
+            while let Some(row) = result.next() {
+                let src_raw = extract_i64(&row, 0, "s.id")?;
+                let kind_str = extract_string(&row, 1, "e.kind")?;
+                let kind = EdgeKind::from_str(&kind_str)
+                    .with_context(|| format!("unknown edge kind in Kùzu: {kind_str}"))?;
+                edges.push(Edge::new(i64_to_node_id(src_raw), dst, kind));
+            }
+            Ok(edges)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 }
 
@@ -367,14 +401,14 @@ fn is_already_exists(e: &kuzu::Error) -> bool {
 }
 
 // kuzu 0.11.x rows are Vec<Value>; nulls are Value::Null(LogicalType).
-fn extract_string(row: &[kuzu::Value], idx: usize, field: &str) -> Result<String> {
+fn extract_string(row: &[kuzu::Value], idx: usize, field: &str) -> AnyResult<String> {
     match row.get(idx) {
         Some(kuzu::Value::String(s)) => Ok(s.clone()),
         other => bail!("expected String for '{field}' at col {idx}, got {other:?}"),
     }
 }
 
-fn extract_i64(row: &[kuzu::Value], idx: usize, field: &str) -> Result<i64> {
+fn extract_i64(row: &[kuzu::Value], idx: usize, field: &str) -> AnyResult<i64> {
     match row.get(idx) {
         Some(kuzu::Value::Int64(n)) => Ok(*n),
         other => bail!("expected Int64 for '{field}' at col {idx}, got {other:?}"),
