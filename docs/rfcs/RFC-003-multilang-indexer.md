@@ -100,12 +100,22 @@ pub trait LanguageIndexer: Send + Sync {
     ///
     /// `vname_path` — repo-relative path used as VName `path` component.
     /// `corpus`     — repo identity from ADR-005 corpus naming convention.
+    /// `package`    — ADR-005 Rule 2 sub-unit identity:
+    ///                  TypeScript: npm package name from package.json
+    ///                  Rust:       Cargo package name ([package] name)
+    ///                  Python:     top-level package dir (contains __init__.py)
+    ///
+    /// The caller (`parse_file_with_vname`) is responsible for pre-computing
+    /// `package` once per crate/module before iterating over files — this
+    /// avoids per-file Cargo.toml / __init__.py discovery and keeps parse()
+    /// O(1) with respect to filesystem access.
     fn parse(
         &self,
         path: &Path,
         source: &str,
         vname_path: &str,
         corpus: &str,
+        package: &str,
     ) -> anyhow::Result<ParseOutput>;
 }
 ```
@@ -120,24 +130,28 @@ Concrete implementors:
 
 ### 3. File-extension dispatcher
 
-`Indexer::parse_file_with_vname` is refactored to use `Language::from_extension`:
+`Indexer::parse_file_with_vname` is refactored to use `Language::from_extension`.
+The caller pre-computes `package` from the nearest `Cargo.toml` / `package.json` /
+`__init__.py` once per directory tree before iterating over files in that unit:
 
 ```rust
 pub fn parse_file_with_vname(
     &self,
     abs_path: &Path,
     vname_path: &str,
+    package: &str,     // pre-computed by caller; see §package-resolution below
 ) -> Result<ParseOutput, IndexError> {
+    let src = read_source(abs_path)?;
     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match Language::from_extension(ext) {
         Some(Language::TypeScript) =>
-            self.typescript.parse(abs_path, &read_source(abs_path)?, vname_path, &self.corpus)
+            self.typescript.parse(abs_path, &src, vname_path, &self.corpus, package)
                 .map_err(|e| IndexError::Parse { file: abs_path.to_string_lossy().into(), message: e.to_string() }),
         Some(Language::Rust) =>
-            self.rust.parse(abs_path, &read_source(abs_path)?, vname_path, &self.corpus)
+            self.rust.parse(abs_path, &src, vname_path, &self.corpus, package)
                 .map_err(|e| IndexError::Parse { file: abs_path.to_string_lossy().into(), message: e.to_string() }),
         Some(Language::Python) =>
-            self.python.parse(abs_path, &read_source(abs_path)?, vname_path, &self.corpus)
+            self.python.parse(abs_path, &src, vname_path, &self.corpus, package)
                 .map_err(|e| IndexError::Parse { file: abs_path.to_string_lossy().into(), message: e.to_string() }),
         None => Ok(ParseOutput::default()),
     }
@@ -155,6 +169,21 @@ pub struct Indexer {
 ```
 
 No dynamic dispatch is used — the enum match is monomorphic and zero-cost.
+
+**Package resolution (pre-computed by the walker, not by parse()):**
+
+| Language | Resolution rule |
+|---|---|
+| Rust | Walk up from `abs_path` to the nearest `Cargo.toml`; read `[package] name`. Done once per crate root, memoised for all files under it. |
+| TypeScript | Read `name` from the nearest `package.json`. Done once per package dir. |
+| Python | Walk up from `abs_path` to the highest directory that still contains `__init__.py`; use that directory's name. For namespace packages (no `__init__.py`), fall back to repo-root-relative first path component. Done once per package root, memoised. |
+
+**Note on `#[non_exhaustive]` scope:** `#[non_exhaustive]` on `Language` prevents
+exhaustive pattern matching in *external* crates only. Within the travsr workspace
+itself the Rust compiler still enforces exhaustive matches on `Language`. This means
+adding `Go` in Phase 4 will produce a compile error on every incomplete `match`
+inside travsr — the compiler itself enforces that all three dispatcher sites are
+updated together. This is intentional.
 
 ### 4. Tree-sitter vs. LSIF provenance (ADR-002 compliance)
 
@@ -184,6 +213,20 @@ Tree-sitter structural edges (`provenance = "tree-sitter"`) in queries.
 
 **Invariant:** A Tree-sitter node and an LSIF node for the same symbol have
 identical VNames. The graph merge is an upsert on VName hash — no duplicates.
+
+**Upsert semantics (CORE-201 must implement):**
+
+- *Nodes*: `INSERT OR REPLACE` keyed on VName hash. Phase B may encounter
+  symbols that Tree-sitter cannot see (e.g. Rust `#[derive]`-generated methods,
+  proc-macro expansions). The upsert must therefore also handle bare `INSERT`
+  for VNames not yet in the graph — Phase B creates stub nodes for these.
+- *Edges*: Merge key is `(src_vname_hash, dst_vname_hash, edge_kind)`.
+  Edges are **deduplicated**, not additive — inserting the same
+  `(src, dst, RefCall)` edge twice produces one row. Phase B edges carry
+  `provenance = "lsif"`; Phase A edges carry `provenance = "tree-sitter"`.
+  If the same edge exists in both phases (e.g. a `DefinesBinding` edge
+  emitted by both Tree-sitter and LSIF), the LSIF provenance wins on conflict
+  (higher-fidelity source).
 
 ### 5. Corpus naming
 
