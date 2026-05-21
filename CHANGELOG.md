@@ -4,6 +4,33 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v0.3.1 — 2026-05-21
+
+Security patch release on top of v0.3.0. No new features. Upgrade strongly recommended.
+
+### Security
+
+- **Git hook shell-injection fix**: The `post-commit` hook no longer passes
+  git-reported filenames through shell expansion. Previously, a filename
+  containing `;`, `$(...)`, or other shell metacharacters could execute
+  arbitrary code on every `git commit`. The hook now calls
+  `travsr hook-run --from-hook`; the binary reads changed files from git
+  directly via `std::process::Command` — no shell involved.
+
+- **File permission hardening**: `graph.db` is now created `0600` (owner
+  read/write only). `~/.travsr/` is created `0700`. `registry.json` is
+  written `0600`. Prevents other local users from enumerating indexed repos
+  or reading derived graph data.
+
+### Fixes
+
+- `travsr-retrieval`: remove redundant closure wrapping `ppr_inner`
+  (clippy `redundant_closure_call`).
+
+**Full changelog:** https://github.com/raj-rkv/travsr/compare/v0.3.0...v0.3.1
+
+---
+
 ## v0.3.0 — 2026-05-21
 
 This release closes Phase 2 of the Travsr roadmap. The production Kùzu storage
