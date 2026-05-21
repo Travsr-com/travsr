@@ -99,7 +99,7 @@ jobs:
 
       - name: Install critcmp
         if: github.event_name == 'pull_request'
-        run: cargo install critcmp@0.1 --locked
+        run: cargo install critcmp --version '^0.1' --locked
 
       - name: "Compare baselines (threshold: +10%)"
         if: github.event_name == 'pull_request' && env.master_baseline_found == 'true'
