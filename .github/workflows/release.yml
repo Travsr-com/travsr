@@ -84,7 +84,16 @@ jobs:
           cp "target/${RUST_TARGET}/release/travsr${BIN_EXT}" "dist/travsr${BIN_EXT}"
           tar -czf "dist/${STAGE}.tar.gz" -C dist "travsr${BIN_EXT}"
           rm "dist/travsr${BIN_EXT}"
-          shasum -a 256 "dist/${STAGE}.tar.gz" > "dist/${STAGE}.sha256"
+          # shasum exists on macOS+Linux but not Git Bash on windows-latest;
+          # sha256sum ships with Git for Windows and on Linux runners but not macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${STAGE}.tar.gz" > "dist/${STAGE}.sha256"
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "dist/${STAGE}.tar.gz" > "dist/${STAGE}.sha256"
+          else
+            echo "ERROR: neither sha256sum nor shasum is available on this runner" >&2
+            exit 1
+          fi
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
