@@ -313,7 +313,7 @@ Integration smoke test (`QA-201`): spawn `travsr init` in a temp clone of
 | `travsr-core` | Add `Language` enum (no new external deps) |
 | `travsr-indexer` | Add `tree-sitter-rust = "=0.23.x"`, `tree-sitter-python = "=0.23.x"` (pinned to exact patch; cargo-deny advisory check runs in CI — Tree-sitter grammar CVEs have shipped historically) |
 | `travsr-daemon` | No new deps; dispatcher change only |
-| `travsr-store` | Schema migration v4 adds `language TEXT NOT NULL DEFAULT 'typescript'` column |
+| `travsr-store` | Schema migration v4 adds `language TEXT NOT NULL DEFAULT 'typescript'` AND `package TEXT NOT NULL DEFAULT ''` columns to `nodes`; adds `language` to `edges` for provenance queries. See ADR-005 Rule 4 for the full SQL. `package` is a stored attribute only — it is **not** part of the VName / BLAKE3 hash input. |
 
 ---
 
