@@ -196,18 +196,23 @@ jobs:
             SHA256SUMS
           generate_release_notes: true
 
-      - name: Setup Node.js 20
+      - name: Setup Node.js 24
+        # Node 24 ships with npm ≥ 11.5 which supports OIDC trusted publishing.
+        # No registry-url + auth-token combo is needed — `npm publish` exchanges
+        # the GitHub OIDC token (id-token: write at workflow level) for an
+        # ephemeral npm credential, provided the package has a Trusted Publisher
+        # configured on npmjs.com pointing at this repo + workflow.
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
+          node-version: 24
 
       - name: Install npm dependencies
         working-directory: packages/travsr-npm
         run: npm ci --ignore-scripts
 
-      - name: Publish npm wrapper
+      - name: Publish npm wrapper (OIDC trusted publishing)
         working-directory: packages/travsr-npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # --provenance attaches a Sigstore-verifiable build provenance attestation
+        # to the published tarball; OIDC auth + provenance is the npm-recommended
+        # publishing posture for CI.
+        run: npm publish --access public --provenance
