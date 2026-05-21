@@ -55,6 +55,12 @@ Language identity is carried by:
 - The `Language::signature_prefix()` embedded in the VName `signature` field
   (RFC-002 format).
 
+**Scope note:** The basename rule applies to local single-developer installations.
+The cloud tier must use the full remote URL (e.g. `github.com/acme/backend`) as
+the tenant-partitioned corpus to prevent collisions between unrelated repos that
+share the same basename. Local daemon code passes the basename only; the cloud
+ingestion layer is responsible for prefixing the full URL.
+
 ### Rule 2 — VName `package` field carries the sub-unit identity
 
 | Language | `package` value | Example |
@@ -74,6 +80,7 @@ VName {
   root:      "",
   path:      "crates/travsr-store/src/lib.rs",
   language:  "rust",
+  package:   "travsr-store",
   signature: "rust:v1:<blake3-of-fn-open-in-travsr-store>"
 }
 
@@ -82,11 +89,18 @@ VName {
   root:      "",
   path:      "crates/travsr-indexer/src/lib.rs",
   language:  "rust",
+  package:   "travsr-indexer",
   signature: "rust:v1:<blake3-of-fn-open-in-travsr-indexer>"
 }
 ```
 
 The signatures differ because the blake3 input includes the `path` component.
+
+**Virtual workspace root edge case:** A workspace-level `Cargo.toml` may have
+no `[package]` section (virtual manifest). If the walk-up finds a `Cargo.toml`
+without `[package] name`, continue walking up or fall back to the
+working-directory basename. In practice this affects only files placed directly
+at the workspace root (e.g. a top-level `build.rs`), which is uncommon.
 
 ### Rule 3 — Signature version prefix per language (RFC-002 extension)
 
@@ -154,6 +168,7 @@ VName {
   root:      "",
   path:      "crates/travsr-core/src/lib.rs",
   language:  "rust",
+  package:   "travsr-core",
   signature: "rust:v1:3a9c..."
 }
 
@@ -163,6 +178,7 @@ VName {
   root:      "",
   path:      "packages/travsr-lsif-ts/src/index.ts",
   language:  "typescript",
+  package:   "travsr-lsif-ts",
   signature: "ts:v1:7f2b..."
 }
 ```
@@ -175,6 +191,7 @@ VName {
   root:      "",
   path:      "myapp/models/user.py",
   language:  "python",
+  package:   "myapp",
   signature: "py:v1:c801..."
 }
 ```
@@ -187,7 +204,11 @@ VName {
 - The Rust indexer reads `[package] name` from `Cargo.toml` via the
   `cargo_metadata` crate or by parsing the nearest `Cargo.toml` up the
   directory tree.
-- The Python indexer walks up from the source file to find the first
-  `__init__.py` and uses its parent directory name as the package.
+- The Python indexer walks up from the source file to find the **highest**
+  contiguous directory that still contains `__init__.py` and uses that
+  directory's name as the package. This correctly handles `src/` layouts
+  (e.g. `src/myapp/__init__.py` → `package = "myapp"`, not `"src"`).
+  For namespace packages (no `__init__.py` anywhere in the path), fall back
+  to the repo-root-relative first path component.
 - Both rules are encapsulated in `VName::for_rust_file(path, workspace_root)`
   and `VName::for_python_file(path, repo_root)` helpers in `travsr-core`.
