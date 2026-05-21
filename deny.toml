@@ -1,17 +1,17 @@
-# cargo-deny configuration
-# https://embarkstudios.github.io/cargo-deny/
+# cargo-deny configuration — cargo-deny 0.16+ schema
+# Migration: https://github.com/EmbarkStudios/cargo-deny/pull/611
 
 [advisories]
-# Deny packages with known security vulnerabilities
-vulnerability = "deny"
-unmaintained = "all"
-yanked = "deny"
-notice = "warn"
-# Ignore advisories that have been reviewed and accepted
+# version = 2 opts into the new advisories schema (required for cargo-deny 0.16+).
+# The old lint-level fields (vulnerability, unmaintained, notice, yanked) were
+# removed. The new schema denies all advisories by default; use ignore[] for
+# specific accepted exceptions.
+version = 2
 ignore = []
 
 [licenses]
-# Allow common permissive open-source licenses
+# Anything not in this allow list is denied. The old `deny` and `copyleft`
+# fields were removed in 0.16 — explicit allow-listing covers both.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -25,16 +25,6 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
 ]
-# Deny copyleft / viral licenses
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-    "LGPL-2.0",
-    "LGPL-2.1",
-]
-copyleft = "deny"
-# Confidence threshold for license detection (0.0-1.0)
 confidence-threshold = 0.8
 
 [bans]
