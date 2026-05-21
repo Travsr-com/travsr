@@ -204,9 +204,7 @@ fn init_tracing() {
 /// Get the list of files changed in the current HEAD commit by calling git
 /// directly via `std::process::Command`. No shell interpolation — filenames
 /// containing spaces, semicolons, or shell metacharacters are handled safely.
-fn changed_files_from_git(
-    repo_root: &std::path::Path,
-) -> anyhow::Result<Vec<std::path::PathBuf>> {
+fn changed_files_from_git(repo_root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let output = std::process::Command::new("git")
         .args([
             "diff-tree",

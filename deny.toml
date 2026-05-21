@@ -4,8 +4,8 @@
 [advisories]
 # Deny packages with known security vulnerabilities
 vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
+unmaintained = "all"
+yanked = "deny"
 notice = "warn"
 # Ignore advisories that have been reviewed and accepted
 ignore = []

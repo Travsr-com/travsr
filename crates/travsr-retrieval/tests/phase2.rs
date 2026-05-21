@@ -9,7 +9,7 @@ use travsr_store::{SqliteStore, Store};
 
 fn make_node(sig: &str) -> Node {
     Node::new(
-        VName::new("test-corpus", "", &format!("{sig}.ts"), "typescript", sig),
+        VName::new("test-corpus", "", format!("{sig}.ts"), "typescript", sig),
         "function",
     )
 }
@@ -90,5 +90,9 @@ fn bfs_1k_fan_depth_1_returns_all_nodes() {
     use travsr_retrieval::bfs;
     let (store, hub_id, _) = build_1k_fan();
     let result = bfs(&store, hub_id, 1, usize::MAX).expect("BFS must succeed");
-    assert_eq!(result.len(), 1_000, "BFS depth-1 must visit all 1 000 nodes");
+    assert_eq!(
+        result.len(),
+        1_000,
+        "BFS depth-1 must visit all 1 000 nodes"
+    );
 }

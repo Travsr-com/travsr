@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn blast_radius_includes_source_file() {
         let a = make_node("a.ts", "fn:a");
-        let store = make_store(&[a.clone()], &[]);
+        let store = make_store(std::slice::from_ref(&a), &[]);
         let result = get_blast_radius(&store, "a.ts");
         assert!(
             result.contains("a.ts"),
