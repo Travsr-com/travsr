@@ -6,10 +6,7 @@ const TRAVSR_MARKER: &str = "# installed by travsr — do not edit this line";
 
 const HOOK_BODY: &str = r#"#!/bin/sh
 # installed by travsr — do not edit this line
-CHANGED=$(git diff-tree --root --no-commit-id -r --name-only HEAD 2>/dev/null || true)
-if [ -n "$CHANGED" ]; then
-  travsr hook-run $CHANGED
-fi
+exec travsr hook-run --from-hook
 "#;
 
 const CHAIN_HOOK_BODY: &str = r#"#!/bin/sh
@@ -19,10 +16,7 @@ _dir="$(cd "$(dirname "$0")" && pwd)"
 if [ -x "$_dir/post-commit.travsr-pre.bak" ]; then
   "$_dir/post-commit.travsr-pre.bak"
 fi
-CHANGED=$(git diff-tree --root --no-commit-id -r --name-only HEAD 2>/dev/null || true)
-if [ -n "$CHANGED" ]; then
-  travsr hook-run $CHANGED
-fi
+exec travsr hook-run --from-hook
 "#;
 
 /// Install the Travsr `post-commit` hook in `repo_root/.git/hooks/`.

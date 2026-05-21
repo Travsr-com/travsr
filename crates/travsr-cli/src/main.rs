@@ -10,7 +10,7 @@ mod repo;
 mod repos;
 mod status;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -74,7 +74,11 @@ enum Command {
     /// Re-index a list of changed files (invoked by the git hook).
     #[command(hide = true)]
     HookRun {
-        /// Paths reported by `git diff --name-only`.
+        /// Invoked from the git hook — reads changed files from git directly.
+        /// Never passes filenames through the shell; prevents shell injection.
+        #[arg(long)]
+        from_hook: bool,
+        /// Paths to re-index (used when calling hook-run directly, without --from-hook).
         paths: Vec<String>,
     },
     /// Migrate the graph store to a different backend (e.g. kuzu).
@@ -197,6 +201,36 @@ fn init_tracing() {
     }
 }
 
+/// Get the list of files changed in the current HEAD commit by calling git
+/// directly via `std::process::Command`. No shell interpolation — filenames
+/// containing spaces, semicolons, or shell metacharacters are handled safely.
+fn changed_files_from_git(
+    repo_root: &std::path::Path,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--name-only",
+            "HEAD",
+        ])
+        .current_dir(repo_root)
+        .output()
+        .context("running git diff-tree in hook-run")?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|p| repo_root.join(p))
+        .collect())
+}
+
 fn is_broken_pipe(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause
@@ -251,15 +285,18 @@ async fn run() -> Result<()> {
             (false, Some(q)) => graph::run(q, depth, direction, format)?,
             (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
         },
-        Command::HookRun { paths } => {
+        Command::HookRun { from_hook, paths } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;
             let mut store = {
                 let db_path = repo_root.join(".travsr/graph.db");
                 travsr_store::SqliteStore::open(&db_path)?
             };
-            let abs_paths: Vec<std::path::PathBuf> =
-                paths.iter().map(|p| repo_root.join(p)).collect();
+            let abs_paths: Vec<std::path::PathBuf> = if from_hook {
+                changed_files_from_git(&repo_root)?
+            } else {
+                paths.iter().map(|p| repo_root.join(p)).collect()
+            };
             travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
         }
         Command::Migrate { to } => migrate::run_to(&to)?,

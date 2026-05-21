@@ -41,6 +41,13 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     let mut store =
         SqliteStore::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
+    // SEC: graph.db contains derived IP — restrict to owner only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+    }
+
     install_hook(repo_root)?;
 
     // Register in global registry so `travsr mcp --global` can find this repo.

@@ -21,8 +21,15 @@ pub fn registry_path() -> PathBuf {
 /// Non-fatal: callers should log and continue on error.
 pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
     let reg_path = registry_path();
-    std::fs::create_dir_all(reg_path.parent().expect("registry path has parent"))
-        .context("creating ~/.travsr directory")?;
+    let travsr_home = reg_path.parent().expect("registry path has parent");
+    std::fs::create_dir_all(travsr_home).context("creating ~/.travsr directory")?;
+
+    // SEC: ~/.travsr/ and registry.json contain repo paths — restrict to owner only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(travsr_home, std::fs::Permissions::from_mode(0o700));
+    }
 
     let mut repos = read_registry(&reg_path).unwrap_or_default();
     repos.insert(repo_name.to_string(), db_path.to_path_buf());
@@ -64,6 +71,12 @@ fn write_registry_atomic(path: &Path, repos: &HashMap<String, PathBuf>) -> anyho
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, &serialized).context("writing registry tmp file")?;
     std::fs::rename(&tmp_path, path).context("renaming registry into place")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
