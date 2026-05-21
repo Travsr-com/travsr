@@ -58,6 +58,7 @@ function fetch(url) {
 async function install() {
   const { target, override } = detect();
 
+  fs.mkdirSync(BIN_DIR, { recursive: true });
   const destBin = path.join(BIN_DIR, process.platform === 'win32' ? 'travsr.exe' : 'travsr');
 
   if (override) {
