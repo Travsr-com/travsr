@@ -104,11 +104,18 @@ jobs:
       - name: "Compare baselines (threshold: +10%)"
         if: github.event_name == 'pull_request' && env.master_baseline_found == 'true'
         id: compare
-        # critcmp exits non-zero when any benchmark regresses beyond --threshold.
-        # Output is captured to bench-diff.txt for the PR comment step.
+        # critcmp exits non-zero when any benchmark regresses beyond --threshold,
+        # but ALSO exits 1 with "no benchmark comparisons to show" on doc-only PRs
+        # (no Rust changes → same benchmark data → nothing to diff).
+        # Treat the empty-comparison case as a pass so doc PRs are not blocked.
         run: |
-          critcmp master pr --threshold 10 | tee bench-diff.txt
+          # Merge stderr so "no benchmark comparisons to show" lands in bench-diff.txt.
+          critcmp master pr --threshold 10 2>&1 | tee bench-diff.txt
           RC=${PIPESTATUS[0]}
+          if [ "$RC" -ne 0 ] && grep -q "no benchmark comparisons" bench-diff.txt 2>/dev/null; then
+            echo "No benchmark regressions detected (no comparisons to show — doc-only PR)."
+            RC=0
+          fi
           echo "exit_code=${RC}" >> "$GITHUB_ENV"
           exit ${RC}
 
