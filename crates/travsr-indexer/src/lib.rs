@@ -10,9 +10,12 @@ mod emit;
 mod hash;
 pub mod lsif;
 pub mod runner;
+mod rust;
 mod typescript;
 
 use std::path::Path;
+
+use travsr_core::Language;
 
 pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
@@ -135,15 +138,20 @@ impl Indexer {
         abs_path: &Path,
         vname_path: &str,
     ) -> Result<ParseOutput, IndexError> {
-        match abs_path.extension().and_then(|e| e.to_str()) {
-            Some("ts" | "tsx") => {
-                typescript::parse(&self.corpus, abs_path, vname_path).map_err(|e| {
-                    IndexError::Parse {
-                        file: abs_path.to_string_lossy().into_owned(),
-                        message: e.to_string(),
-                    }
-                })
+        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let map_err = |e: anyhow::Error| IndexError::Parse {
+            file: abs_path.to_string_lossy().into_owned(),
+            message: e.to_string(),
+        };
+        match Language::from_extension(ext) {
+            Some(Language::TypeScript) => {
+                typescript::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
             }
+            Some(Language::Rust) => {
+                rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
+            }
+            // Python parser is deferred to Sprint 10; other future languages
+            // (#[non_exhaustive]) are silently skipped until their parsers ship.
             _ => Ok(ParseOutput::default()),
         }
     }

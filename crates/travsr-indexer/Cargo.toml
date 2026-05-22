@@ -17,6 +17,7 @@ tracing = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 sha2 = { workspace = true }
+tree-sitter-rust = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
