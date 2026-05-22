@@ -159,6 +159,7 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
+                    package: String::new(),
                 });
             }
             Ok(out)
@@ -226,6 +227,7 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
+                    package: String::new(),
                 });
             }
             Ok(out)
@@ -329,6 +331,7 @@ impl Store for KuzuStore {
                 id,
                 vname: VName::new(corpus, root, path, language, signature),
                 kind,
+                package: String::new(),
             }))
         })()
         .map_err(|e| StoreError::Database(format!("{:#}", e)))

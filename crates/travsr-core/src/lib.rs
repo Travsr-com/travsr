@@ -99,6 +99,59 @@ fn sanitize_local(s: &str) -> String {
         .to_lowercase()
 }
 
+// ── Language ──────────────────────────────────────────────────────────────────
+
+/// Source language of a graph node.
+///
+/// Used by the indexer dispatcher ([`Language::from_extension`]) and stored on
+/// the `nodes.language` column. The `#[non_exhaustive]` attribute prevents
+/// external crates from writing exhaustive matches — Phase 4 will add `Go`
+/// without a breaking change. **Within the travsr workspace** the compiler
+/// still enforces exhaustive matches, so adding a variant is a compile-time
+/// forcing function that updates every dispatch site.
+///
+/// See RFC-003 and ADR-005 for the design rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Language {
+    TypeScript,
+    Rust,
+    Python,
+}
+
+impl Language {
+    /// Map a file extension to a `Language`.
+    ///
+    /// Returns `None` for unrecognised extensions — callers skip those files.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext {
+            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "rs" => Some(Self::Rust),
+            "py" | "pyi" => Some(Self::Python),
+            _ => None,
+        }
+    }
+
+    /// Human-readable string stored in the `nodes.language` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TypeScript => "typescript",
+            Self::Rust => "rust",
+            Self::Python => "python",
+        }
+    }
+
+    /// Parse from the storage string produced by [`Language::as_str`].
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "typescript" => Some(Self::TypeScript),
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            _ => None,
+        }
+    }
+}
+
 /// Kythe-style globally unique identifier for a code entity.
 ///
 /// VNames are stable across repos, languages, and time — they form the
@@ -275,18 +328,45 @@ pub struct Node {
     pub id: NodeId,
     pub vname: VName,
     pub kind: String,
+    /// Sub-unit identity within the corpus (ADR-005 Rule 2).
+    ///
+    /// Stored in `nodes.package`; **not** part of the BLAKE3 hash input.
+    /// Empty string for nodes where package identity is unknown or irrelevant.
+    ///
+    /// | Language   | Value                                       |
+    /// |------------|---------------------------------------------|
+    /// | TypeScript | npm package name from `package.json`        |
+    /// | Rust       | Cargo package name from `Cargo.toml`        |
+    /// | Python     | top-level package dir (highest `__init__.py`)|
+    pub package: String,
 }
 
 impl Node {
-    /// Build a `Node` from a `VName` and a free-form kind string. The id is
-    /// derived deterministically from the VName.
+    /// Build a `Node` from a `VName` and a free-form kind string.
+    ///
+    /// The `id` is derived deterministically from the VName. `package`
+    /// defaults to an empty string; use [`Node::with_package`] to set it.
     pub fn new(vname: VName, kind: impl Into<String>) -> Self {
         let id = vname.id();
         Self {
             id,
             vname,
             kind: kind.into(),
+            package: String::new(),
         }
+    }
+
+    /// Set the `package` field and return `self` (builder pattern).
+    ///
+    /// ```
+    /// use travsr_core::{Node, VName};
+    /// let n = Node::new(VName::new("github.com/a/b", "", "src/lib.rs", "rust", "fn:main"), "function")
+    ///     .with_package("my-crate");
+    /// assert_eq!(n.package, "my-crate");
+    /// ```
+    pub fn with_package(mut self, package: impl Into<String>) -> Self {
+        self.package = package.into();
+        self
     }
 }
 
@@ -547,5 +627,67 @@ mod tests {
             v_repo_b.id(),
             "different corpora must produce different NodeIds (cross-repo VName collision)"
         );
+    }
+
+    // ── Language enum (ADR-005 / RFC-003) ─────────────────────────────────────
+
+    #[test]
+    fn language_from_extension_covers_all_variants() {
+        assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("tsx"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("mts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("cts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
+        assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("pyi"), Some(Language::Python));
+        assert_eq!(Language::from_extension("go"), None);
+        assert_eq!(Language::from_extension("js"), None);
+        assert_eq!(Language::from_extension(""), None);
+    }
+
+    #[test]
+    fn language_as_str_and_from_str_round_trip() {
+        for lang in [Language::TypeScript, Language::Rust, Language::Python] {
+            let s = lang.as_str();
+            assert_eq!(Language::from_str(s), Some(lang), "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn language_as_str_values_are_lowercase() {
+        assert_eq!(Language::TypeScript.as_str(), "typescript");
+        assert_eq!(Language::Rust.as_str(), "rust");
+        assert_eq!(Language::Python.as_str(), "python");
+    }
+
+    #[test]
+    fn language_from_str_returns_none_for_unknown() {
+        assert_eq!(Language::from_str("go"), None);
+        assert_eq!(Language::from_str("TypeScript"), None);
+        assert_eq!(Language::from_str(""), None);
+    }
+
+    // Regression: two symbols in different languages (same file path, same sig)
+    // produce different NodeIds because language is part of the BLAKE3 input.
+    #[test]
+    fn language_field_prevents_cross_language_vname_collision() {
+        let ts = VName::new("github.com/a/b", "", "src/main.rs", "typescript", "fn:main");
+        let rs = VName::new("github.com/a/b", "", "src/main.rs", "rust", "fn:main");
+        assert_ne!(
+            ts.id(),
+            rs.id(),
+            "different language fields must produce different NodeIds"
+        );
+    }
+
+    // node.with_package() sets package without changing id.
+    #[test]
+    fn node_with_package_does_not_change_id() {
+        let vname = VName::new("github.com/a/b", "", "src/lib.rs", "rust", "fn:open");
+        let plain = Node::new(vname.clone(), "function");
+        let packaged = Node::new(vname, "function").with_package("my-crate");
+        assert_eq!(plain.id, packaged.id, "package must not affect NodeId");
+        assert_eq!(packaged.package, "my-crate");
+        assert_eq!(plain.package, "");
     }
 }
