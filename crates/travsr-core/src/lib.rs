@@ -142,6 +142,7 @@ impl Language {
     }
 
     /// Parse from the storage string produced by [`Language::as_str`].
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "typescript" => Some(Self::TypeScript),
@@ -653,7 +654,11 @@ mod tests {
     fn language_as_str_and_from_str_round_trip() {
         for lang in [Language::TypeScript, Language::Rust, Language::Python] {
             let s = lang.as_str();
-            assert_eq!(Language::from_str(s), Some(lang), "round-trip failed for {s}");
+            assert_eq!(
+                Language::from_str(s),
+                Some(lang),
+                "round-trip failed for {s}"
+            );
         }
     }
 
