@@ -34,6 +34,11 @@ const QUERIES: &str = "
 (use_declaration argument: (scoped_identifier) @use.path)
 (use_declaration argument: (identifier) @use.path)
 ";
+// DEBT(travsr-indexer): use_list and scoped_use_list nodes are not captured.
+// `use std::{fmt, io}` and `use std::fmt::{self, Display}` silently produce
+// zero import nodes and no Depends edges. Full use-tree traversal is deferred
+// to Sprint 9 (Phase B). Until then, only simple `use foo::bar` imports are
+// indexed. Track: https://github.com/raj-rkv/travsr/issues/118 (INDEX-202).
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
 /// VName path (repo-relative, forward-slash).
@@ -160,6 +165,18 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             _ => {}
         }
     }
+
+    // Dedup: a type with both `impl T` and `impl Trait for T` emits the same
+    // `impl:T` node twice. Canonicalise in-memory before returning so callers
+    // (and the store's put_node) don't perform redundant writes.
+    output.nodes.sort_unstable_by_key(|n| n.id);
+    output.nodes.dedup_by_key(|n| n.id);
+    output
+        .edges
+        .sort_unstable_by(|a, b| (a.src, a.dst).cmp(&(b.src, b.dst)));
+    output
+        .edges
+        .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
     Ok(output)
 }
@@ -415,6 +432,19 @@ mod tests {
                 .any(|e| e.src == file_id && e.dst == use_node.id && e.kind == EdgeKind::Depends),
             "expected file → use Depends edge"
         );
+    }
+
+    #[test]
+    fn impl_nodes_are_not_duplicated_for_bare_and_trait_impls() {
+        // `simple.rs` has `impl Worker { ... }` AND `impl Processor for Worker`.
+        // Both fire `impl.name` → `impl:Worker`. After dedup, exactly one node.
+        let out = parse("", &fixture_path(), "simple.rs").unwrap();
+        let count = out
+            .nodes
+            .iter()
+            .filter(|n| n.vname.signature == "impl:Worker")
+            .count();
+        assert_eq!(count, 1, "impl:Worker must appear exactly once after dedup");
     }
 
     #[test]
