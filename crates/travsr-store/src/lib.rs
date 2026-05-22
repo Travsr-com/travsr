@@ -79,6 +79,27 @@ impl Migration for V4EdgesSrcKindIdx {
     }
 }
 
+struct V5LanguagePackage;
+impl Migration for V5LanguagePackage {
+    fn version(&self) -> u32 {
+        5
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite.
+        // Guard manually so re-running after a crash (atomicity gap) is safe.
+        if !store.column_exists("nodes", "package")? {
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN package TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !store.column_exists("edges", "language")? {
+            store.exec_ddl(
+                "ALTER TABLE edges ADD COLUMN language TEXT NOT NULL DEFAULT 'typescript'",
+            )?;
+        }
+        // CREATE INDEX IF NOT EXISTS is idempotent.
+        store.exec_ddl(include_str!("migrations/v5_language_package.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -87,6 +108,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V2EdgeProvenance);
     r.register(V3SignatureFormatVersion);
     r.register(V4EdgesSrcKindIdx);
+    r.register(V5LanguagePackage);
     r
 }
 
@@ -282,7 +304,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind \
+                    "SELECT id, corpus, root, path, language, signature, kind, package \
                      FROM nodes WHERE signature LIKE '%' || ?1 || '%' \
                         OR path LIKE '%' || ?1 || '%'",
                 )
@@ -299,7 +321,13 @@ impl SqliteStore {
                         row.get::<_, String>(5)?,
                     );
                     let kind: String = row.get(6)?;
-                    Ok(Node { id, vname, kind })
+                    let package: String = row.get(7)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                    })
                 })
                 .context("executing search query")?;
 
@@ -317,7 +345,9 @@ impl SqliteStore {
         (|| -> AnyResult<Vec<Node>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, corpus, root, path, language, signature, kind FROM nodes")
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package FROM nodes",
+                )
                 .context("preparing all_nodes query")?;
             let rows = stmt
                 .query_map([], |row| {
@@ -330,7 +360,13 @@ impl SqliteStore {
                         row.get::<_, String>(5)?,
                     );
                     let kind: String = row.get(6)?;
-                    Ok(Node { id, vname, kind })
+                    let package: String = row.get(7)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                    })
                 })
                 .context("executing all_nodes query")?;
             let mut out = Vec::new();
@@ -491,9 +527,9 @@ impl Store for SqliteStore {
         let id_i64 = node_id_to_i64(node.id);
         self.conn
             .execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind",
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, package = excluded.package",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -502,6 +538,7 @@ impl Store for SqliteStore {
                     node.vname.language,
                     node.vname.signature,
                     node.kind,
+                    node.package,
                 ],
             )
             .context("inserting node")
@@ -533,7 +570,7 @@ impl Store for SqliteStore {
             let row = self
                 .conn
                 .query_row(
-                    "SELECT corpus, root, path, language, signature, kind \
+                    "SELECT corpus, root, path, language, signature, kind, package \
                      FROM nodes WHERE id = ?1",
                     params![node_id_to_i64(id)],
                     |row| {
@@ -545,7 +582,13 @@ impl Store for SqliteStore {
                             row.get::<_, String>(4)?,
                         );
                         let kind: String = row.get(5)?;
-                        Ok(Node { id, vname, kind })
+                        let package: String = row.get(6)?;
+                        Ok(Node {
+                            id,
+                            vname,
+                            kind,
+                            package,
+                        })
                     },
                 )
                 .optional()
@@ -1010,5 +1053,102 @@ mod tests {
             edges.iter().all(|e| e.dst == c.id),
             "dst must be C for all edges"
         );
+    }
+
+    // V4 (no package column) → V5 migration must add package with empty default,
+    // add language column to edges, and existing nodes must read back correctly.
+    #[test]
+    fn v4_to_v5_migration_adds_package_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v4.db");
+
+        // Simulate a v4 DB: schema version 4, nodes table without package column.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES('schema_version', '4');
+                 CREATE TABLE nodes (
+                   id INTEGER PRIMARY KEY,
+                   corpus TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL,
+                   language TEXT NOT NULL, signature TEXT NOT NULL, kind TEXT NOT NULL
+                 );
+                 CREATE TABLE edges (
+                   src INTEGER NOT NULL, dst INTEGER NOT NULL, kind TEXT NOT NULL,
+                   provenance TEXT NOT NULL DEFAULT 'tree-sitter',
+                   PRIMARY KEY (src, dst, kind)
+                 );
+                 CREATE TABLE files (
+                   path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                   last_indexed_at INTEGER NOT NULL
+                 );
+                 INSERT INTO nodes VALUES(10,'','','src/main.rs','rust','fn:main','function');",
+            )
+            .unwrap();
+        }
+
+        // Open with the v5 store — migration must add package + edges.language.
+        let store = SqliteStore::open(&db_path).expect("v4→v5 migration must succeed");
+
+        // Pre-existing node must read back with package = '' (the column default).
+        let nodes = store.all_nodes().unwrap();
+        assert_eq!(nodes.len(), 1, "pre-existing node must survive migration");
+        assert_eq!(
+            nodes[0].package, "",
+            "migrated node must default to empty package"
+        );
+
+        // Column must exist and be queryable.
+        let has_pkg = store.column_exists("nodes", "package").unwrap();
+        assert!(
+            has_pkg,
+            "nodes.package column must exist after v5 migration"
+        );
+        let has_lang = store.column_exists("edges", "language").unwrap();
+        assert!(
+            has_lang,
+            "edges.language column must exist after v5 migration"
+        );
+    }
+
+    // package field round-trips through put_node / get_node.
+    #[test]
+    fn node_package_round_trips() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new(
+                "github.com/a/b",
+                "",
+                "crates/foo/src/lib.rs",
+                "rust",
+                "fn:open",
+            ),
+            "function",
+        )
+        .with_package("foo-crate");
+        let id = store.put_node(&n).unwrap();
+        let back = store.get_node(id).unwrap().expect("node must exist");
+        assert_eq!(back.package, "foo-crate");
+    }
+
+    // search_nodes_by_name returns package field.
+    #[test]
+    fn search_nodes_by_name_returns_package() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new(
+                "github.com/a/b",
+                "",
+                "crates/bar/src/lib.rs",
+                "rust",
+                "fn:bar",
+            ),
+            "function",
+        )
+        .with_package("bar-crate");
+        store.put_node(&n).unwrap();
+        let results = store.search_nodes_by_name("fn:bar").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].package, "bar-crate");
     }
 }
