@@ -1,7 +1,11 @@
 // Travsr test fixture — small Rust file covering all node kinds extracted by
-// the Phase A structural parser (INDEX-201). Do NOT edit without updating the
-// golden snapshot tests in crates/travsr-indexer/src/rust.rs.
+// the Phase A+B structural parser (INDEX-201, INDEX-202). Do NOT edit without
+// updating the golden snapshot tests in crates/travsr-indexer/src/rust.rs.
 use std::fmt;
+use std::{collections::HashMap, io};
+
+// File-system module declaration (mod foo; without a body).
+mod helpers;
 
 pub mod utils {
     pub fn helper() -> u32 {
