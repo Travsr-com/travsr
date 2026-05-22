@@ -88,9 +88,7 @@ impl Migration for V5LanguagePackage {
         // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite.
         // Guard manually so re-running after a crash (atomicity gap) is safe.
         if !store.column_exists("nodes", "package")? {
-            store.exec_ddl(
-                "ALTER TABLE nodes ADD COLUMN package TEXT NOT NULL DEFAULT ''",
-            )?;
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN package TEXT NOT NULL DEFAULT ''")?;
         }
         if !store.column_exists("edges", "language")? {
             store.exec_ddl(
@@ -324,7 +322,12 @@ impl SqliteStore {
                     );
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
-                    Ok(Node { id, vname, kind, package })
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                    })
                 })
                 .context("executing search query")?;
 
@@ -342,7 +345,9 @@ impl SqliteStore {
         (|| -> AnyResult<Vec<Node>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, corpus, root, path, language, signature, kind, package FROM nodes")
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package FROM nodes",
+                )
                 .context("preparing all_nodes query")?;
             let rows = stmt
                 .query_map([], |row| {
@@ -356,7 +361,12 @@ impl SqliteStore {
                     );
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
-                    Ok(Node { id, vname, kind, package })
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                    })
                 })
                 .context("executing all_nodes query")?;
             let mut out = Vec::new();
@@ -573,7 +583,12 @@ impl Store for SqliteStore {
                         );
                         let kind: String = row.get(5)?;
                         let package: String = row.get(6)?;
-                        Ok(Node { id, vname, kind, package })
+                        Ok(Node {
+                            id,
+                            vname,
+                            kind,
+                            package,
+                        })
                     },
                 )
                 .optional()
@@ -1085,9 +1100,15 @@ mod tests {
 
         // Column must exist and be queryable.
         let has_pkg = store.column_exists("nodes", "package").unwrap();
-        assert!(has_pkg, "nodes.package column must exist after v5 migration");
+        assert!(
+            has_pkg,
+            "nodes.package column must exist after v5 migration"
+        );
         let has_lang = store.column_exists("edges", "language").unwrap();
-        assert!(has_lang, "edges.language column must exist after v5 migration");
+        assert!(
+            has_lang,
+            "edges.language column must exist after v5 migration"
+        );
     }
 
     // package field round-trips through put_node / get_node.
@@ -1095,7 +1116,13 @@ mod tests {
     fn node_package_round_trips() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let n = Node::new(
-            VName::new("github.com/a/b", "", "crates/foo/src/lib.rs", "rust", "fn:open"),
+            VName::new(
+                "github.com/a/b",
+                "",
+                "crates/foo/src/lib.rs",
+                "rust",
+                "fn:open",
+            ),
             "function",
         )
         .with_package("foo-crate");
@@ -1109,7 +1136,13 @@ mod tests {
     fn search_nodes_by_name_returns_package() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let n = Node::new(
-            VName::new("github.com/a/b", "", "crates/bar/src/lib.rs", "rust", "fn:bar"),
+            VName::new(
+                "github.com/a/b",
+                "",
+                "crates/bar/src/lib.rs",
+                "rust",
+                "fn:bar",
+            ),
             "function",
         )
         .with_package("bar-crate");
