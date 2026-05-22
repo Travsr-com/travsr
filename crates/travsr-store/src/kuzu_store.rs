@@ -13,11 +13,17 @@
 //! one struct without `unsafe`. `KuzuStore` stores only the `Database` and
 //! creates a fresh `Connection<'_>` per operation via `connect()`.
 //!
-//! # kuzu 0.11.x row API
-//! `QueryResult::next()` yields `Vec<kuzu::Value>` directly (not `Vec<Option<…>>`).
-//! Null columns are represented as `Value::Null(LogicalType)`. All Connection
-//! methods (`query`, `prepare`, `execute`) take `&self`, so connections do not
-//! need to be `mut`.
+//! # kuzu 0.11.3 row API (verified against crates.io + GitHub source)
+//! `QueryResult<'_>` implements `Iterator<Item = Vec<kuzu::Value>>`.
+//! `next()` returns `Option<Vec<kuzu::Value>>` — an owned vector of column
+//! values, not a reference or slice. Null columns are represented as
+//! `Value::Null(LogicalType)`. All `Connection` methods (`query`, `prepare`,
+//! `execute`) take `&self`, so connections do not need to be `mut`.
+//!
+//! Internally, `next()` calls `ffi::getNext()` which returns a
+//! `SharedPtr<FlatTuple>` and collects values via `flat_tuple_get_value` +
+//! `TryFrom<&ffi::Value>`. The resulting `Vec<kuzu::Value>` is fully owned
+//! and `Sized`, so `while let Some(row) = result.next()` is valid Rust.
 //!
 //! # Schema (Kùzu Cypher DDL)
 //! ```cypher
