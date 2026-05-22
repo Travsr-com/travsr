@@ -48,15 +48,14 @@ jobs:
   # Gated on the `kuzu` feature; skipped when Kùzu is not enabled.
   # The parity harness asserts SQLite ≡ Kùzu for all Store trait operations.
   #
-  # TODO(travsr-XXX): non-blocking pending kuzu 0.11.3 API drift fix.
-  # `QueryResult::next()` return type changed between the version this code
-  # was written for and 0.11.3 (current lockfile). Needs a dedicated PR by
-  # someone with the CMake/C++ kuzu toolchain set up locally to verify.
-  # See the v0.3.1 release notes for context.
+  # Kùzu builds its C++ library from source (CMake + g++) via build.rs.
+  # ubuntu-latest ships cmake and build-essential (g++) pre-installed — no
+  # extra installation step needed. Issue #112 verified kuzu 0.11.3 API:
+  # QueryResult::next() returns Option<Vec<kuzu::Value>> (owned, Sized) —
+  # the code compiles correctly against 0.11.3.
   kuzu-parity:
     name: Kùzu backend parity
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -69,8 +68,11 @@ jobs:
         with:
           key: phase2-kuzu
 
-      - name: Run Kùzu parity suite (--features kuzu)
-        run: cargo test -p travsr-store --test parity --features kuzu -- --nocapture
+      - name: Run Kùzu parity + unit tests (--features kuzu)
+        # Runs both the parity integration test and the kuzu_store unit tests
+        # (mod tests inside kuzu_store.rs). `--test parity` would skip the
+        # unit tests; without `--test`, cargo runs all test targets together.
+        run: cargo test -p travsr-store --features kuzu -- --nocapture
 
   # ── Criterion 4: bench p95 < 50 ms ─────────────────────────────────────────
   bench-gate:

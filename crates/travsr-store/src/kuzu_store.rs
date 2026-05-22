@@ -13,11 +13,17 @@
 //! one struct without `unsafe`. `KuzuStore` stores only the `Database` and
 //! creates a fresh `Connection<'_>` per operation via `connect()`.
 //!
-//! # kuzu 0.11.x row API
-//! `QueryResult::next()` yields `Vec<kuzu::Value>` directly (not `Vec<Option<…>>`).
-//! Null columns are represented as `Value::Null(LogicalType)`. All Connection
-//! methods (`query`, `prepare`, `execute`) take `&self`, so connections do not
-//! need to be `mut`.
+//! # kuzu 0.11.3 row API (verified against crates.io + GitHub source)
+//! `QueryResult<'_>` implements `Iterator<Item = Vec<kuzu::Value>>`.
+//! `next()` returns `Option<Vec<kuzu::Value>>` — an owned vector of column
+//! values, not a reference or slice. Null columns are represented as
+//! `Value::Null(LogicalType)`. All `Connection` methods (`query`, `prepare`,
+//! `execute`) take `&self`, so connections do not need to be `mut`.
+//!
+//! Internally, `next()` calls `ffi::getNext()` which returns a
+//! `SharedPtr<FlatTuple>` and collects values via `flat_tuple_get_value` +
+//! `TryFrom<&ffi::Value>`. The resulting `Vec<kuzu::Value>` is fully owned
+//! and `Sized`, so `while let Some(row) = result.next()` is valid Rust.
 //!
 //! # Schema (Kùzu Cypher DDL)
 //! ```cypher
@@ -49,8 +55,13 @@ pub struct KuzuStore {
 
 impl KuzuStore {
     /// Open (or create) a Kùzu database at `path` and initialise the schema.
-    /// Safe to call on an already-initialised database — `init_schema` is
-    /// idempotent.
+    ///
+    /// `path` must either **not exist** (Kùzu creates it) or point to an
+    /// **existing Kùzu database** (with data files already written by a prior
+    /// open — e.g. after a daemon restart). Passing a pre-existing *empty*
+    /// directory — such as one just created by `tempfile::tempdir()` — causes
+    /// the C++ open to throw an exception with an empty `what()` message.
+    /// `init_schema` is idempotent when the database files are already present.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         (|| -> AnyResult<Self> {
             let db = kuzu::Database::new(path, kuzu::SystemConfig::default())
@@ -59,7 +70,7 @@ impl KuzuStore {
             store.init_schema()?;
             Ok(store)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Create a short-lived connection for one operation.
@@ -107,7 +118,7 @@ impl KuzuStore {
             let n = extract_i64(&row, 0, "count(n)")?;
             Ok(n as u64)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Count of edges currently stored. Used by the parity test harness.
@@ -121,7 +132,7 @@ impl KuzuStore {
             let n = extract_i64(&row, 0, "count(e)")?;
             Ok(n as u64)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Return every node in the graph. Used by the parity test harness.
@@ -148,11 +159,16 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
+                    // DEBT(travsr-store): Kùzu schema does not yet carry `package STRING`.
+                    // Add `package STRING` to CREATE NODE TABLE and update all read/write
+                    // queries in KuzuStore. Sprint 9 prerequisite before LSIF reads Kùzu.
+                    // See: docs/adrs/ADR-005-per-lang-corpus-naming.md Rule 2.
+                    package: String::new(),
                 });
             }
             Ok(out)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Return every edge as a `(src, dst, kind)` triple.
@@ -180,7 +196,7 @@ impl KuzuStore {
             }
             Ok(out)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Substring search over node signature and path fields.
@@ -215,11 +231,16 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
+                    // DEBT(travsr-store): Kùzu schema does not yet carry `package STRING`.
+                    // Add `package STRING` to CREATE NODE TABLE and update all read/write
+                    // queries in KuzuStore. Sprint 9 prerequisite before LSIF reads Kùzu.
+                    // See: docs/adrs/ADR-005-per-lang-corpus-naming.md Rule 2.
+                    package: String::new(),
                 });
             }
             Ok(out)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 }
 
@@ -257,7 +278,7 @@ impl Store for KuzuStore {
             .context("executing put_node")?;
             Ok(node.id)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Insert a directed edge. Idempotent — duplicate (src, dst, kind) tuples
@@ -282,7 +303,7 @@ impl Store for KuzuStore {
             .context("executing put_edge")?;
             Ok(())
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     fn get_node(&self, id: NodeId) -> Result<Option<Node>, StoreError> {
@@ -318,9 +339,12 @@ impl Store for KuzuStore {
                 id,
                 vname: VName::new(corpus, root, path, language, signature),
                 kind,
+                // TODO(travsr): update Kùzu schema to include `package STRING`
+                // once the Kùzu DDL migration path is defined (Sprint 9 / LSIF path).
+                package: String::new(),
             }))
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// O(out-degree(src))
@@ -350,7 +374,7 @@ impl Store for KuzuStore {
             }
             Ok(edges)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// O(in-degree(dst))
@@ -380,7 +404,7 @@ impl Store for KuzuStore {
             }
             Ok(edges)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 }
 
@@ -436,14 +460,14 @@ mod tests {
     #[test]
     fn open_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        open_store(tmp.path());
-        open_store(tmp.path());
+        open_store(&tmp.path().join("db"));
+        open_store(&tmp.path().join("db"));
     }
 
     #[test]
     fn put_and_get_node_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let n = sample_node("fn:rt");
         let id = store.put_node(&n).unwrap();
         let back = store.get_node(id).unwrap().expect("node must exist");
@@ -453,7 +477,7 @@ mod tests {
     #[test]
     fn put_and_iter_edges() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:a");
         let b = sample_node("fn:b");
         let c = sample_node("fn:c");
@@ -484,7 +508,7 @@ mod tests {
     #[test]
     fn get_missing_node_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = open_store(tmp.path());
+        let store = open_store(&tmp.path().join("db"));
         assert!(store.get_node(NodeId(123_456_789)).unwrap().is_none());
     }
 
@@ -493,17 +517,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let n = sample_node("fn:persist");
         let id = {
-            let mut store = open_store(tmp.path());
+            let mut store = open_store(&tmp.path().join("db"));
             store.put_node(&n).unwrap()
         };
-        let store = open_store(tmp.path());
+        let store = open_store(&tmp.path().join("db"));
         assert_eq!(store.get_node(id).unwrap().as_ref(), Some(&n));
     }
 
     #[test]
     fn put_node_upsert_updates_kind() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let mut n = sample_node("fn:upsert");
         store.put_node(&n).unwrap();
         n.kind = "class".to_string();
@@ -515,7 +539,7 @@ mod tests {
     #[test]
     fn put_edge_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:a3");
         let b = sample_node("fn:b3");
         store.put_node(&a).unwrap();
@@ -537,7 +561,7 @@ mod tests {
     #[test]
     fn distinct_edge_kinds_between_same_nodes() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:ax");
         let b = sample_node("fn:bx");
         store.put_node(&a).unwrap();
@@ -559,7 +583,7 @@ mod tests {
     #[test]
     fn iter_edges_to_returns_incoming_edges() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:aa");
         let b = sample_node("fn:bb");
         let c = sample_node("fn:cc");
@@ -584,7 +608,7 @@ mod tests {
     #[test]
     fn iter_edges_from_empty_node_returns_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:lone");
         store.put_node(&a).unwrap();
         assert!(store.iter_edges_from(a.id).unwrap().is_empty());
@@ -593,7 +617,7 @@ mod tests {
     #[test]
     fn all_edge_kinds_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:kind-src");
         let b = sample_node("fn:kind-dst");
         store.put_node(&a).unwrap();
