@@ -171,9 +171,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     // (and the store's put_node) don't perform redundant writes.
     output.nodes.sort_unstable_by_key(|n| n.id);
     output.nodes.dedup_by_key(|n| n.id);
-    output
-        .edges
-        .sort_unstable_by(|a, b| (a.src, a.dst).cmp(&(b.src, b.dst)));
+    output.edges.sort_unstable_by_key(|e| (e.src, e.dst));
     output
         .edges
         .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
