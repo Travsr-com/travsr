@@ -253,8 +253,7 @@ mod tests {
     use super::*;
 
     fn fixture_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/python/simple.py")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python/simple.py")
     }
 
     #[test]
@@ -413,9 +412,9 @@ mod tests {
             .unwrap()
             .id;
         assert!(
-            out.edges.iter().any(|e| e.src == file_id
-                && e.dst == import_id
-                && e.kind == EdgeKind::Depends),
+            out.edges
+                .iter()
+                .any(|e| e.src == file_id && e.dst == import_id && e.kind == EdgeKind::Depends),
             "expected file → import:os Depends edge"
         );
     }

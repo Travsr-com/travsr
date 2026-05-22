@@ -1,8 +1,7 @@
 use travsr_indexer::Indexer;
 
 fn fixture_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/python/simple.py")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python/simple.py")
 }
 
 #[test]
