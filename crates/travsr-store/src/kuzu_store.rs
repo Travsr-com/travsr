@@ -159,8 +159,10 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
-                    // TODO(travsr): update Kùzu schema to include `package STRING`
-                    // once the Kùzu DDL migration path is defined (Sprint 9 / LSIF path).
+                    // DEBT(travsr-store): Kùzu schema does not yet carry `package STRING`.
+                    // Add `package STRING` to CREATE NODE TABLE and update all read/write
+                    // queries in KuzuStore. Sprint 9 prerequisite before LSIF reads Kùzu.
+                    // See: docs/adrs/ADR-005-per-lang-corpus-naming.md Rule 2.
                     package: String::new(),
                 });
             }
@@ -229,8 +231,10 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
-                    // TODO(travsr): update Kùzu schema to include `package STRING`
-                    // once the Kùzu DDL migration path is defined (Sprint 9 / LSIF path).
+                    // DEBT(travsr-store): Kùzu schema does not yet carry `package STRING`.
+                    // Add `package STRING` to CREATE NODE TABLE and update all read/write
+                    // queries in KuzuStore. Sprint 9 prerequisite before LSIF reads Kùzu.
+                    // See: docs/adrs/ADR-005-per-lang-corpus-naming.md Rule 2.
                     package: String::new(),
                 });
             }
