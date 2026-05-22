@@ -184,7 +184,10 @@ fn rust_candidate_paths(base: &std::path::Path) -> [String; 2] {
     [flat, dir_mod]
 }
 
-/// NodeId for a Rust `file:` node matching the VName produced by `rust::parse()`.
+/// NodeId for a Rust `file:` node — must match the VName emitted by
+/// `rust_file_node()` in rust.rs (language="rust", root="", signature="file").
+/// If either side changes, the ResolvesTo edges produced here will point to
+/// the wrong NodeId and traversal will silently miss cross-file links.
 fn rust_file_node_id(corpus: &str, path: &str) -> travsr_core::NodeId {
     travsr_core::VName::new(corpus, "", path, "rust", "file").id()
 }

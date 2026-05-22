@@ -150,6 +150,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             "mod.name" => {
                 // Distinguish `mod foo;` (file declaration, no body) from
                 // `mod foo { … }` (inline module, has body) at the AST level.
+                // capture.node is the `identifier` from `(mod_item name: (identifier))`,
+                // so its parent is always the enclosing `mod_item` node.
                 let has_body = capture
                     .node
                     .parent()

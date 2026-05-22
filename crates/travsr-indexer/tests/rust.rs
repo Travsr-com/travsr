@@ -170,3 +170,58 @@ fn link_imports_rust_grouped_self_imports_resolve() {
         "expected ≥4 ResolvesTo edges for two self:: imports (2 candidates each)"
     );
 }
+
+// ── link_imports_rust — chained super:: ──────────────────────────────────────
+
+#[test]
+fn link_imports_rust_double_super_traverses_two_levels() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub_sub = dir.path().join("a").join("b");
+    std::fs::create_dir_all(&sub_sub).unwrap();
+    let path = sub_sub.join("mod.rs");
+    std::fs::write(&path, b"use super::super::utils;").unwrap();
+    let out = Indexer::new()
+        .parse_file_with_vname(&path, "src/a/b/mod.rs")
+        .unwrap();
+
+    let edges = link_imports_rust(&out.nodes, "src/a/b/mod.rs", "");
+
+    // super::super::utils from src/a/b/mod.rs → src/utils.rs + src/utils/mod.rs
+    assert!(
+        edges.iter().any(|e| e.kind == EdgeKind::ResolvesTo),
+        "super::super:: should resolve two directory levels up"
+    );
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::ResolvesTo)
+            .count(),
+        2,
+        "double super:: must produce exactly 2 ResolvesTo candidates"
+    );
+}
+
+// ── use_as_clause — alias stripped ────────────────────────────────────────────
+
+#[test]
+fn use_as_clause_indexes_original_path_not_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lib.rs");
+    std::fs::write(&path, b"use self::engine::Core as CoreEngine;").unwrap();
+    let out = Indexer::new()
+        .parse_file_with_vname(&path, "src/lib.rs")
+        .unwrap();
+
+    assert!(
+        out.nodes
+            .iter()
+            .any(|n| n.vname.signature == "use:self::engine::Core"),
+        "use_as_clause must index the original path"
+    );
+    assert!(
+        !out.nodes
+            .iter()
+            .any(|n| n.vname.signature.contains("CoreEngine")),
+        "alias must not appear in the graph"
+    );
+}
