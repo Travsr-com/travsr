@@ -12,6 +12,22 @@ use travsr_store::{SqliteStore, Store};
 
 // ── Fixture helpers (all gated — only needed when kuzu feature is active) ─────
 
+/// Create a temporary directory and open a fresh KuzuStore inside it.
+///
+/// kuzu 0.11.x requires the database path to not exist yet — it creates the
+/// directory itself. `tempfile::tempdir()` creates the directory immediately,
+/// so passing `tmp.path()` directly fails. We append `"db"` to get a
+/// non-existing subdirectory path that kuzu can create.
+///
+/// Returns `(TempDir, KuzuStore)` — callers must bind the `TempDir` to a
+/// named variable (e.g. `_tmp`) so the directory stays alive for the test.
+#[cfg(feature = "kuzu")]
+fn kuzu_temp_store() -> (tempfile::TempDir, KuzuStore) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kz = KuzuStore::open(&tmp.path().join("db")).expect("kuzu open");
+    (tmp, kz)
+}
+
 /// Build a Node with explicit corpus/root/language kept minimal.
 #[cfg(feature = "kuzu")]
 fn make_node(sig: &str, kind: &str, path: &str) -> Node {
@@ -108,8 +124,7 @@ fn parity_node_count() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     assert_eq!(
@@ -125,8 +140,7 @@ fn parity_edge_count() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     assert_eq!(
@@ -144,8 +158,7 @@ fn parity_get_node_alpha() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_node = sq
@@ -168,8 +181,7 @@ fn parity_get_node_service() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_node = sq
@@ -190,8 +202,7 @@ fn parity_get_node_missing() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let missing_id = NodeId(999_999);
@@ -217,8 +228,7 @@ fn parity_iter_edges_from_alpha() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_edges = sq
@@ -243,8 +253,7 @@ fn parity_iter_edges_from_main() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_edges = sq
@@ -269,8 +278,7 @@ fn parity_iter_edges_from_leaf() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_edges = sq
@@ -292,8 +300,7 @@ fn parity_iter_edges_to_gamma() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_edges = sq
@@ -324,8 +331,7 @@ fn parity_iter_edges_to_alpha() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_edges = sq
@@ -357,8 +363,7 @@ fn parity_iter_edges_to_root() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_edges = sq
@@ -380,8 +385,7 @@ fn parity_search_alpha() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_results = sq
@@ -411,8 +415,7 @@ fn parity_search_service() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_results = sq
@@ -448,8 +451,7 @@ fn parity_search_partial_fn() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_results = sq.search_nodes_by_name("fn:").expect("sqlite search fn:");
@@ -478,8 +480,7 @@ fn parity_search_missing() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_results = sq
@@ -507,8 +508,7 @@ fn parity_search_by_path() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_results = sq
@@ -540,8 +540,7 @@ fn parity_all_nodes_count() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_nodes = sq.all_nodes().expect("sqlite all_nodes");
@@ -557,8 +556,7 @@ fn parity_all_nodes_ids_match() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_nodes = sq.all_nodes().expect("sqlite all_nodes");
@@ -577,8 +575,7 @@ fn parity_all_edges_count() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     let sq_edge_count = sq.all_edges().expect("sqlite all_edges").len();
@@ -612,8 +609,7 @@ fn parity_double_put_node_idempotent() {
     sq.put_node(&n.alpha)
         .expect("sqlite put_node 2 (duplicate)");
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     kz.put_node(&n.alpha).expect("kuzu put_node 1");
     kz.put_node(&n.alpha).expect("kuzu put_node 2 (duplicate)");
 
@@ -641,8 +637,7 @@ fn parity_put_edge_idempotent() {
     sq.put_edge(&edge).expect("sqlite put_edge 1");
     sq.put_edge(&edge).expect("sqlite put_edge 2 (duplicate)");
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     kz.put_node(&n.alpha).expect("kuzu put alpha");
     kz.put_node(&n.beta).expect("kuzu put beta");
     kz.put_edge(&edge).expect("kuzu put_edge 1");
@@ -671,8 +666,7 @@ fn parity_edges_from_after_add() {
     let mut sq = SqliteStore::open_in_memory().expect("sqlite open");
     build_parity_graph_sqlite(&mut sq);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut kz = KuzuStore::open(tmp.path()).expect("kuzu open");
+    let (_tmp, mut kz) = kuzu_temp_store();
     build_parity_graph_kuzu(&mut kz);
 
     // Add a new edge: beta → service (not in the original fixture)
