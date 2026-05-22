@@ -15,7 +15,7 @@ mod typescript;
 
 use std::path::Path;
 
-use travsr_core::Language;
+use travsr_core::{EdgeKind, Language};
 
 pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
@@ -69,6 +69,127 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
     }
 
     edges
+}
+
+/// Resolve within-crate Rust `use` paths and file-module declarations to
+/// `resolves-to` edges.
+///
+/// For `use self::foo::bar` / `use super::baz`, emits:
+/// ```text
+/// use:self::foo::bar  --[resolves-to]-->  file:dir/foo/bar.rs
+/// use:self::foo::bar  --[resolves-to]-->  file:dir/foo/bar/mod.rs
+/// ```
+///
+/// For `filemod:foo` (from `mod foo;` declarations), emits:
+/// ```text
+/// filemod:foo  --[resolves-to]-->  file:dir/foo.rs
+/// filemod:foo  --[resolves-to]-->  file:dir/foo/mod.rs
+/// ```
+///
+/// Both candidate paths are always emitted; only the one whose `file:` node was
+/// actually indexed will be reachable during graph traversal.
+///
+/// External crate paths (e.g. `use std::fmt`, `use tokio::Runtime`) and
+/// `crate::*` paths are silently skipped — cross-crate resolution is provided
+/// by LSIF in Sprint 9. Wildcard imports (`use foo::*`) are also skipped.
+///
+/// `corpus` must match the corpus used when file nodes were indexed (ARCH-102).
+///
+/// Call this after [`Indexer::parse_file_with_vname`] for `.rs` files and
+/// persist the returned edges alongside the parse output.
+pub fn link_imports_rust(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge> {
+    let dir = match Path::new(vname_path).parent() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let mut edges = Vec::new();
+
+    for node in nodes {
+        match node.kind.as_str() {
+            "import" => {
+                let Some(path) = node.vname.signature.strip_prefix("use:") else {
+                    continue;
+                };
+                // Wildcards (`use foo::*`) cannot resolve to a specific file.
+                if path.ends_with("::*") || path == "*" {
+                    continue;
+                }
+                if let Some(base) = resolve_rust_module_path(path, dir) {
+                    for candidate in rust_candidate_paths(&base) {
+                        let target_id = rust_file_node_id(corpus, &candidate);
+                        edges.push(Edge::new(node.id, target_id, EdgeKind::ResolvesTo));
+                    }
+                }
+            }
+            "file-module" => {
+                // `mod foo;` — resolve to foo.rs / foo/mod.rs relative to the
+                // declaring file's directory.
+                let Some(name) = node.vname.signature.strip_prefix("filemod:") else {
+                    continue;
+                };
+                let base = normalize_vname_path(&dir.join(name));
+                for candidate in rust_candidate_paths(&base) {
+                    let target_id = rust_file_node_id(corpus, &candidate);
+                    edges.push(Edge::new(node.id, target_id, EdgeKind::ResolvesTo));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    edges
+}
+
+/// Resolve a within-crate Rust module path to a base filesystem path (no
+/// extension). Returns `None` for external crate references and `crate::*`
+/// (cross-crate resolution deferred to Sprint 9 LSIF).
+///
+/// Handles:
+/// - `self::foo::bar`           → `{dir}/foo/bar`
+/// - `super::foo`               → `{parent_dir}/foo`
+/// - `super::super::foo`        → `{grandparent_dir}/foo`
+fn resolve_rust_module_path(use_path: &str, dir: &Path) -> Option<std::path::PathBuf> {
+    if let Some(rest) = use_path.strip_prefix("self::") {
+        let segments: std::path::PathBuf = rest.split("::").collect();
+        return Some(normalize_vname_path(&dir.join(segments)));
+    }
+    if use_path.starts_with("super::") {
+        let mut base = dir.to_path_buf();
+        let mut rest = use_path;
+        while let Some(stripped) = rest.strip_prefix("super::") {
+            base = base.parent().map(Path::to_path_buf)?;
+            rest = stripped;
+        }
+        if rest.is_empty() {
+            return None;
+        }
+        let segments: std::path::PathBuf = rest.split("::").collect();
+        return Some(normalize_vname_path(&base.join(segments)));
+    }
+    // `crate::*` and bare external identifiers: skip.
+    // DEBT(travsr-indexer): crate:: resolution requires the crate root path,
+    // which is not available from vname_path alone. Deferred to Sprint 9 LSIF.
+    None
+}
+
+/// Returns the two candidate repo-relative file paths for a Rust module:
+/// `{base}.rs` (flat file) and `{base}/mod.rs` (directory module).
+fn rust_candidate_paths(base: &std::path::Path) -> [String; 2] {
+    let flat = base
+        .with_extension("rs")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let dir_mod = base.join("mod.rs").to_string_lossy().replace('\\', "/");
+    [flat, dir_mod]
+}
+
+/// NodeId for a Rust `file:` node — must match the VName emitted by
+/// `rust_file_node()` in rust.rs (language="rust", root="", signature="file").
+/// If either side changes, the ResolvesTo edges produced here will point to
+/// the wrong NodeId and traversal will silently miss cross-file links.
+fn rust_file_node_id(corpus: &str, path: &str) -> travsr_core::NodeId {
+    travsr_core::VName::new(corpus, "", path, "rust", "file").id()
 }
 
 /// Normalize a logical path by resolving `.` and `..` components without

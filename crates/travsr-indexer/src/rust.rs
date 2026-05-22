@@ -18,9 +18,20 @@ const _: () = {
     assert!(PARSE_TIMEOUT_MICROS <= 30_000_000);
 };
 
-// Captures: fn, struct, enum, trait, impl, mod, const, static, use.
+// Captures: fn, struct, enum, trait, impl, mod (inline + file), const, static, use.
 // Phase A (Sprint 8): structural definitions only; semantic call/ref edges
 // are deferred to Phase B (Sprint 9, rust-analyzer LSIF).
+//
+// use_declaration is captured as a whole node (@use.decl) and walked
+// recursively by extract_use_paths() to handle all use-tree variants:
+//   use foo::bar;          → use:foo::bar
+//   use foo::{bar, baz};   → use:foo::bar, use:foo::baz
+//   use foo::bar as Baz;   → use:foo::bar  (alias ignored for graph identity)
+//   use foo::*;            → use:foo::*    (wildcard; ResolvesTo skips these)
+//
+// mod_item is captured as @mod.name for both inline modules and file-system
+// module declarations. The parse() match arm checks for the presence of a
+// `body` field at runtime: no body → file-module node; has body → module node.
 const QUERIES: &str = "
 (function_item name: (identifier) @fn.name)
 (struct_item name: (type_identifier) @struct.name)
@@ -31,14 +42,8 @@ const QUERIES: &str = "
 (mod_item name: (identifier) @mod.name)
 (const_item name: (identifier) @const.name)
 (static_item name: (identifier) @static.name)
-(use_declaration argument: (scoped_identifier) @use.path)
-(use_declaration argument: (identifier) @use.path)
+(use_declaration) @use.decl
 ";
-// DEBT(travsr-indexer): use_list and scoped_use_list nodes are not captured.
-// `use std::{fmt, io}` and `use std::fmt::{self, Display}` silently produce
-// zero import nodes and no Depends edges. Full use-tree traversal is deferred
-// to Sprint 9 (Phase B). Until then, only simple `use foo::bar` imports are
-// indexed. Track: https://github.com/raj-rkv/travsr/issues/118 (INDEX-202).
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
 /// VName path (repo-relative, forward-slash).
@@ -143,7 +148,23 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "mod.name" => {
-                let node = rust_mod_node(corpus, vname_path, text);
+                // Distinguish `mod foo;` (file declaration, no body) from
+                // `mod foo { … }` (inline module, has body) at the AST level.
+                // capture.node is the `identifier` from `(mod_item name: (identifier))`,
+                // so its parent is always the enclosing `mod_item` node.
+                let has_body = capture
+                    .node
+                    .parent()
+                    .and_then(|p| p.child_by_field_name("body"))
+                    .is_some();
+                let node = if has_body {
+                    // Inline module — structural container.
+                    rust_mod_node(corpus, vname_path, text)
+                } else {
+                    // File-system module declaration.
+                    // link_imports_rust() resolves this to foo.rs / foo/mod.rs.
+                    rust_filemod_node(corpus, vname_path, text)
+                };
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -157,10 +178,18 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
-            "use.path" => {
-                let node = rust_use_node(corpus, vname_path, text);
-                output.edges.push(emit::depends_edge(file_id, node.id));
-                output.nodes.push(node);
+            "use.decl" => {
+                // Walk the full use-tree to extract every leaf path, including
+                // grouped imports (`use std::{fmt, io}`) and renames.
+                if let Some(arg) = capture.node.child_by_field_name("argument") {
+                    let mut paths = Vec::new();
+                    extract_use_paths(arg, "", source.as_slice(), &mut paths);
+                    for path in paths {
+                        let node = rust_use_node(corpus, vname_path, &path);
+                        output.edges.push(emit::depends_edge(file_id, node.id));
+                        output.nodes.push(node);
+                    }
+                }
             }
             _ => {}
         }
@@ -215,6 +244,98 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
     }
 }
 
+// ── Use-tree walker ───────────────────────────────────────────────────────────
+
+/// Recursively walk a `use_declaration` argument subtree and collect every
+/// leaf path as a `::`-separated string.
+///
+/// Handles all use-clause variants present in tree-sitter-rust 0.21:
+/// - `identifier`         → `foo`
+/// - `scoped_identifier`  → `foo::bar`
+/// - `use_as_clause`      → `foo::bar` (alias stripped; graph identity = original path)
+/// - `use_list`           → recurse into each item with the same prefix
+/// - `scoped_use_list`    → extend prefix, recurse into list
+/// - `use_wildcard`       → `foo::*` (included; ResolvesTo resolution skips wildcards)
+///
+/// `self` inside a `use_list` (re-export of the current module) is skipped.
+fn extract_use_paths(
+    node: tree_sitter::Node<'_>,
+    prefix: &str,
+    source: &[u8],
+    out: &mut Vec<String>,
+) {
+    match node.kind() {
+        "identifier" => {
+            let name = match node.utf8_text(source) {
+                Ok(t) if t != "self" => t,
+                _ => return,
+            };
+            out.push(if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}::{name}")
+            });
+        }
+        "scoped_identifier" => {
+            // utf8_text gives the full path including `::`, e.g. `std::fmt`
+            let text = match node.utf8_text(source) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            out.push(if prefix.is_empty() {
+                text.to_owned()
+            } else {
+                format!("{prefix}::{text}")
+            });
+        }
+        "use_as_clause" => {
+            // `use foo::bar as Baz` — index by the original path, not the local alias.
+            if let Some(path_node) = node.child_by_field_name("path") {
+                extract_use_paths(path_node, prefix, source, out);
+            }
+        }
+        "use_list" => {
+            for i in 0..node.child_count() {
+                let Some(child) = node.child(i) else { continue };
+                match child.kind() {
+                    "{" | "}" | "," => {}
+                    _ => extract_use_paths(child, prefix, source, out),
+                }
+            }
+        }
+        "scoped_use_list" => {
+            // `use foo::{bar, baz}` — extend prefix with the path segment,
+            // then recurse into the list.
+            let path_text = node
+                .child_by_field_name("path")
+                .and_then(|p| p.utf8_text(source).ok())
+                .unwrap_or("");
+            let new_prefix = match (prefix.is_empty(), path_text.is_empty()) {
+                (true, _) => path_text.to_owned(),
+                (_, true) => prefix.to_owned(),
+                _ => format!("{prefix}::{path_text}"),
+            };
+            if let Some(list) = node.child_by_field_name("list") {
+                extract_use_paths(list, &new_prefix, source, out);
+            }
+        }
+        "use_wildcard" => {
+            // `use foo::*` — capture the full wildcard text so the store
+            // records a Depends edge; ResolvesTo resolution skips `::*` paths.
+            let text = match node.utf8_text(source) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            out.push(if prefix.is_empty() {
+                text.to_owned()
+            } else {
+                format!("{prefix}::{text}")
+            });
+        }
+        _ => {}
+    }
+}
+
 // ── Node constructors ─────────────────────────────────────────────────────────
 
 fn rust_file_node(corpus: &str, path: &str) -> Node {
@@ -253,6 +374,13 @@ fn rust_impl_node(corpus: &str, path: &str, name: &str) -> Node {
 
 fn rust_mod_node(corpus: &str, path: &str, name: &str) -> Node {
     Node::new(rust_vname(corpus, path, &format!("mod:{name}")), "module")
+}
+
+fn rust_filemod_node(corpus: &str, path: &str, name: &str) -> Node {
+    Node::new(
+        rust_vname(corpus, path, &format!("filemod:{name}")),
+        "file-module",
+    )
 }
 
 fn rust_const_node(corpus: &str, path: &str, name: &str) -> Node {
@@ -340,7 +468,11 @@ mod tests {
         assert!(kinds.contains(&"enum"), "missing enum node");
         assert!(kinds.contains(&"trait"), "missing trait node");
         assert!(kinds.contains(&"impl"), "missing impl node");
-        assert!(kinds.contains(&"module"), "missing module node");
+        assert!(kinds.contains(&"module"), "missing module node (inline)");
+        assert!(
+            kinds.contains(&"file-module"),
+            "missing file-module node (mod foo;)"
+        );
         assert!(kinds.contains(&"constant"), "missing constant node");
         assert!(kinds.contains(&"static"), "missing static node");
         assert!(kinds.contains(&"import"), "missing import node");
@@ -429,6 +561,47 @@ mod tests {
                 .iter()
                 .any(|e| e.src == file_id && e.dst == use_node.id && e.kind == EdgeKind::Depends),
             "expected file → use Depends edge"
+        );
+    }
+
+    #[test]
+    fn grouped_use_emits_individual_import_nodes() {
+        // simple.rs has `use std::{collections::HashMap, io}` — both paths
+        // must produce separate import nodes.
+        let out = parse("", &fixture_path(), "simple.rs").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "use:std::collections::HashMap"),
+            "expected use:std::collections::HashMap from grouped import"
+        );
+        assert!(
+            out.nodes.iter().any(|n| n.vname.signature == "use:std::io"),
+            "expected use:std::io from grouped import"
+        );
+    }
+
+    #[test]
+    fn file_module_declaration_emits_file_module_node() {
+        // simple.rs has `mod helpers;` (no body) — must emit kind "file-module".
+        let out = parse("", &fixture_path(), "simple.rs").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.kind == "file-module" && n.vname.signature == "filemod:helpers"),
+            "expected file-module node for `mod helpers;`"
+        );
+    }
+
+    #[test]
+    fn inline_module_still_emits_module_kind() {
+        // `pub mod utils { … }` has a body — must still emit kind "module".
+        let out = parse("", &fixture_path(), "simple.rs").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.kind == "module" && n.vname.signature == "mod:utils"),
+            "expected module node for inline `pub mod utils {{ … }}`"
         );
     }
 
