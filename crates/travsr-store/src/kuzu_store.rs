@@ -159,6 +159,8 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
+                    // TODO(travsr): update Kùzu schema to include `package STRING`
+                    // once the Kùzu DDL migration path is defined (Sprint 9 / LSIF path).
                     package: String::new(),
                 });
             }
@@ -227,6 +229,8 @@ impl KuzuStore {
                     id: i64_to_node_id(id_raw),
                     vname: VName::new(corpus, root, path, language, signature),
                     kind,
+                    // TODO(travsr): update Kùzu schema to include `package STRING`
+                    // once the Kùzu DDL migration path is defined (Sprint 9 / LSIF path).
                     package: String::new(),
                 });
             }
@@ -331,6 +335,8 @@ impl Store for KuzuStore {
                 id,
                 vname: VName::new(corpus, root, path, language, signature),
                 kind,
+                // TODO(travsr): update Kùzu schema to include `package STRING`
+                // once the Kùzu DDL migration path is defined (Sprint 9 / LSIF path).
                 package: String::new(),
             }))
         })()

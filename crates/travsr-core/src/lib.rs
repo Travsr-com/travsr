@@ -323,6 +323,10 @@ impl EdgeKind {
 }
 
 /// A node in the code graph.
+///
+/// `PartialEq` compares all fields including `package`. Use `node.id == other.id`
+/// for identity-only comparisons (two nodes are the same symbol regardless of
+/// their package annotation).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
