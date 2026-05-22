@@ -55,8 +55,13 @@ pub struct KuzuStore {
 
 impl KuzuStore {
     /// Open (or create) a Kùzu database at `path` and initialise the schema.
+    ///
+    /// `path` must be a **non-existing** directory path. Kùzu 0.11.x creates
+    /// the directory itself during initialisation; if `path` already exists
+    /// (even as an empty directory), the C++ open call fails with an empty
+    /// exception message. Callers should pass a path that does not yet exist.
     /// Safe to call on an already-initialised database — `init_schema` is
-    /// idempotent.
+    /// idempotent when the database files are present.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         (|| -> AnyResult<Self> {
             let db = kuzu::Database::new(path, kuzu::SystemConfig::default())
@@ -65,7 +70,7 @@ impl KuzuStore {
             store.init_schema()?;
             Ok(store)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Create a short-lived connection for one operation.
@@ -113,7 +118,7 @@ impl KuzuStore {
             let n = extract_i64(&row, 0, "count(n)")?;
             Ok(n as u64)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Count of edges currently stored. Used by the parity test harness.
@@ -127,7 +132,7 @@ impl KuzuStore {
             let n = extract_i64(&row, 0, "count(e)")?;
             Ok(n as u64)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Return every node in the graph. Used by the parity test harness.
@@ -158,7 +163,7 @@ impl KuzuStore {
             }
             Ok(out)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Return every edge as a `(src, dst, kind)` triple.
@@ -186,7 +191,7 @@ impl KuzuStore {
             }
             Ok(out)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Substring search over node signature and path fields.
@@ -225,7 +230,7 @@ impl KuzuStore {
             }
             Ok(out)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 }
 
@@ -263,7 +268,7 @@ impl Store for KuzuStore {
             .context("executing put_node")?;
             Ok(node.id)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// Insert a directed edge. Idempotent — duplicate (src, dst, kind) tuples
@@ -288,7 +293,7 @@ impl Store for KuzuStore {
             .context("executing put_edge")?;
             Ok(())
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     fn get_node(&self, id: NodeId) -> Result<Option<Node>, StoreError> {
@@ -326,7 +331,7 @@ impl Store for KuzuStore {
                 kind,
             }))
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// O(out-degree(src))
@@ -356,7 +361,7 @@ impl Store for KuzuStore {
             }
             Ok(edges)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 
     /// O(in-degree(dst))
@@ -386,7 +391,7 @@ impl Store for KuzuStore {
             }
             Ok(edges)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
 }
 
