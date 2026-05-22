@@ -56,12 +56,12 @@ pub struct KuzuStore {
 impl KuzuStore {
     /// Open (or create) a Kùzu database at `path` and initialise the schema.
     ///
-    /// `path` must be a **non-existing** directory path. Kùzu 0.11.x creates
-    /// the directory itself during initialisation; if `path` already exists
-    /// (even as an empty directory), the C++ open call fails with an empty
-    /// exception message. Callers should pass a path that does not yet exist.
-    /// Safe to call on an already-initialised database — `init_schema` is
-    /// idempotent when the database files are present.
+    /// `path` must either **not exist** (Kùzu creates it) or point to an
+    /// **existing Kùzu database** (with data files already written by a prior
+    /// open — e.g. after a daemon restart). Passing a pre-existing *empty*
+    /// directory — such as one just created by `tempfile::tempdir()` — causes
+    /// the C++ open to throw an exception with an empty `what()` message.
+    /// `init_schema` is idempotent when the database files are already present.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         (|| -> AnyResult<Self> {
             let db = kuzu::Database::new(path, kuzu::SystemConfig::default())
@@ -447,14 +447,14 @@ mod tests {
     #[test]
     fn open_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        open_store(tmp.path());
-        open_store(tmp.path());
+        open_store(&tmp.path().join("db"));
+        open_store(&tmp.path().join("db"));
     }
 
     #[test]
     fn put_and_get_node_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let n = sample_node("fn:rt");
         let id = store.put_node(&n).unwrap();
         let back = store.get_node(id).unwrap().expect("node must exist");
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn put_and_iter_edges() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:a");
         let b = sample_node("fn:b");
         let c = sample_node("fn:c");
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn get_missing_node_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = open_store(tmp.path());
+        let store = open_store(&tmp.path().join("db"));
         assert!(store.get_node(NodeId(123_456_789)).unwrap().is_none());
     }
 
@@ -504,17 +504,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let n = sample_node("fn:persist");
         let id = {
-            let mut store = open_store(tmp.path());
+            let mut store = open_store(&tmp.path().join("db"));
             store.put_node(&n).unwrap()
         };
-        let store = open_store(tmp.path());
+        let store = open_store(&tmp.path().join("db"));
         assert_eq!(store.get_node(id).unwrap().as_ref(), Some(&n));
     }
 
     #[test]
     fn put_node_upsert_updates_kind() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let mut n = sample_node("fn:upsert");
         store.put_node(&n).unwrap();
         n.kind = "class".to_string();
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn put_edge_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:a3");
         let b = sample_node("fn:b3");
         store.put_node(&a).unwrap();
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn distinct_edge_kinds_between_same_nodes() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:ax");
         let b = sample_node("fn:bx");
         store.put_node(&a).unwrap();
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn iter_edges_to_returns_incoming_edges() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:aa");
         let b = sample_node("fn:bb");
         let c = sample_node("fn:cc");
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn iter_edges_from_empty_node_returns_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:lone");
         store.put_node(&a).unwrap();
         assert!(store.iter_edges_from(a.id).unwrap().is_empty());
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn all_edge_kinds_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = open_store(tmp.path());
+        let mut store = open_store(&tmp.path().join("db"));
         let a = sample_node("fn:kind-src");
         let b = sample_node("fn:kind-dst");
         store.put_node(&a).unwrap();

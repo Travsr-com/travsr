@@ -68,8 +68,11 @@ jobs:
         with:
           key: phase2-kuzu
 
-      - name: Run Kùzu parity suite (--features kuzu)
-        run: cargo test -p travsr-store --test parity --features kuzu -- --nocapture
+      - name: Run Kùzu parity + unit tests (--features kuzu)
+        # Runs both the parity integration test and the kuzu_store unit tests
+        # (mod tests inside kuzu_store.rs). `--test parity` would skip the
+        # unit tests; without `--test`, cargo runs all test targets together.
+        run: cargo test -p travsr-store --features kuzu -- --nocapture
 
   # ── Criterion 4: bench p95 < 50 ms ─────────────────────────────────────────
   bench-gate:
