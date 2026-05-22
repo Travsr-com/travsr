@@ -45,18 +45,27 @@ jobs:
       - name: Run ${{ matrix.target }} (5 min)
         # cargo-fuzz reads fuzz/Cargo.toml automatically when run from the
         # workspace root. Corpus is in fuzz/corpus/<target>/.
+        #
+        # RUSTUP_TOOLCHAIN=nightly is required: the workspace rust-toolchain.toml
+        # pins "stable", which overrides the nightly toolchain installed above.
+        # cargo-fuzz passes -Zsanitizer=address which requires nightly. Setting
+        # RUSTUP_TOOLCHAIN takes precedence over rust-toolchain.toml.
         run: |
           cargo fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} \
             -- -max_total_time=300 -print_final_stats=1
         env:
           RUST_BACKTRACE: 1
+          RUSTUP_TOOLCHAIN: nightly
 
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          # ignore rather than error when the directory doesn't exist — this
+          # happens on any non-crash failure (toolchain error, OOM, timeout).
+          if-no-files-found: ignore
           path: |
             fuzz/artifacts/${{ matrix.target }}/
             fuzz/corpus/${{ matrix.target }}/
@@ -66,6 +75,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Only open an issue when cargo-fuzz produced a real crash artifact.
+          # Without this guard, any infra failure (toolchain error, OOM, network
+          # timeout) would open a false-positive "[fuzz] found a panic" issue.
+          if [ ! -d "fuzz/artifacts/${{ matrix.target }}" ] || \
+             [ -z "$(ls -A fuzz/artifacts/${{ matrix.target }} 2>/dev/null)" ]; then
+            echo "No crash artifacts found — skipping issue creation (non-panic failure)"
+            exit 0
+          fi
           gh issue create \
             --title "[fuzz] ${{ matrix.target }} found a panic ($(date -u +%Y-%m-%d))" \
             --body "Fuzz target \`${{ matrix.target }}\` crashed during the nightly fuzz run.
