@@ -63,6 +63,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          # ignore rather than error when the directory doesn't exist — this
+          # happens on any non-crash failure (toolchain error, OOM, timeout).
+          if-no-files-found: ignore
           path: |
             fuzz/artifacts/${{ matrix.target }}/
             fuzz/corpus/${{ matrix.target }}/
@@ -72,6 +75,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Only open an issue when cargo-fuzz produced a real crash artifact.
+          # Without this guard, any infra failure (toolchain error, OOM, network
+          # timeout) would open a false-positive "[fuzz] found a panic" issue.
+          if [ ! -d "fuzz/artifacts/${{ matrix.target }}" ] || \
+             [ -z "$(ls -A fuzz/artifacts/${{ matrix.target }} 2>/dev/null)" ]; then
+            echo "No crash artifacts found — skipping issue creation (non-panic failure)"
+            exit 0
+          fi
           gh issue create \
             --title "[fuzz] ${{ matrix.target }} found a panic ($(date -u +%Y-%m-%d))" \
             --body "Fuzz target \`${{ matrix.target }}\` crashed during the nightly fuzz run.
