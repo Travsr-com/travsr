@@ -45,12 +45,18 @@ jobs:
       - name: Run ${{ matrix.target }} (5 min)
         # cargo-fuzz reads fuzz/Cargo.toml automatically when run from the
         # workspace root. Corpus is in fuzz/corpus/<target>/.
+        #
+        # RUSTUP_TOOLCHAIN=nightly is required: the workspace rust-toolchain.toml
+        # pins "stable", which overrides the nightly toolchain installed above.
+        # cargo-fuzz passes -Zsanitizer=address which requires nightly. Setting
+        # RUSTUP_TOOLCHAIN takes precedence over rust-toolchain.toml.
         run: |
           cargo fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} \
             -- -max_total_time=300 -print_final_stats=1
         env:
           RUST_BACKTRACE: 1
+          RUSTUP_TOOLCHAIN: nightly
 
       - name: Upload crash artifacts
         if: failure()

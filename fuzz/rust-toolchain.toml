@@ -1,0 +1,7 @@
+[toolchain]
+# cargo-fuzz requires nightly for -Zsanitizer=address and coverage instrumentation.
+# This overrides the workspace-root rust-toolchain.toml (stable) when cargo is
+# invoked from inside the fuzz/ directory (e.g. `cd fuzz && cargo fuzz run ...`).
+# On CI the workflow also sets RUSTUP_TOOLCHAIN=nightly so the override applies
+# even when cargo fuzz is run from the workspace root.
+channel = "nightly"
