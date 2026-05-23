@@ -1,6 +1,6 @@
 //! Criterion benchmarks for the travsr-indexer parsing pipeline.
 //!
-//! Three benchmark groups:
+//! Benchmark groups (added in order):
 //!
 //!   rust/cold   — parse `simple.rs` fixture from scratch on every iteration.
 //!                 Measures the full Tree-sitter query + node-emit path for a
@@ -15,6 +15,13 @@
 //!                      smoke benchmark and exercises a larger, denser file.
 //!                      Skipped gracefully when the workspace root is absent
 //!                      (vendor-only CI).
+//!
+//!   python/cold — parse `simple.py` fixture from scratch each iteration.
+//!                 Exercises the Python Tree-sitter grammar + node-emit path
+//!                 (QA-221 / Sprint 10).
+//!
+//!   python/warm — parse `simple.py` **twice** per `b.iter()` call so the
+//!                 second parse sees a warm instruction cache.
 //!
 //! Phase 3 exit criterion (Issue #121): query p95 < 50 ms.
 //! The 1k-node query benchmark lives in `travsr-retrieval`; this file covers
@@ -31,6 +38,10 @@ use travsr_indexer::Indexer;
 
 fn simple_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust/simple.rs")
+}
+
+fn python_simple_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python/simple.py")
 }
 
 fn travsr_core_lib() -> Option<PathBuf> {
@@ -99,6 +110,40 @@ fn bench_rust_travsr_core(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cold parse of simple.py — full Python Tree-sitter grammar + node-emit path (QA-221).
+fn bench_python_cold(c: &mut Criterion) {
+    let fixture = python_simple_fixture();
+    let indexer = Indexer::new();
+    let mut group = c.benchmark_group("python/cold");
+    group.bench_function("simple_py", |b| {
+        b.iter(|| {
+            indexer
+                .parse_file_with_vname(&fixture, "src/simple.py")
+                .unwrap()
+        });
+    });
+    group.finish();
+}
+
+/// Warm re-index of simple.py — **two** parses per `b.iter()` call so the
+/// second parse sees a hot instruction cache (QA-221).
+fn bench_python_warm(c: &mut Criterion) {
+    let fixture = python_simple_fixture();
+    let indexer = Indexer::new();
+    let mut group = c.benchmark_group("python/warm");
+    group.bench_function("simple_py", |b| {
+        b.iter(|| {
+            let _ = indexer
+                .parse_file_with_vname(&fixture, "src/simple.py")
+                .unwrap();
+            indexer
+                .parse_file_with_vname(&fixture, "src/simple.py")
+                .unwrap()
+        });
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 
 criterion_group!(
@@ -106,5 +151,7 @@ criterion_group!(
     bench_rust_cold,
     bench_rust_warm,
     bench_rust_travsr_core,
+    bench_python_cold,
+    bench_python_warm,
 );
 criterion_main!(benches);

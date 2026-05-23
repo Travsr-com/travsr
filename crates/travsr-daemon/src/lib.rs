@@ -15,7 +15,8 @@ use anyhow::Context as _;
 use ignore::WalkBuilder;
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_file, ingest_lsif, link_imports, link_imports_rust, run_lsif_emitter, Indexer,
+    hash_file, ingest_lsif, link_imports, link_imports_python_fs, link_imports_rust,
+    run_lsif_emitter, Indexer,
 };
 use travsr_store::{SqliteStore, Store};
 
@@ -250,8 +251,9 @@ pub fn reindex_files(
         let import_edges = match Language::from_extension(ext) {
             Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
             Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
-            // DEBT(travsr-indexer): link_imports_python deferred to Sprint 10.
-            // Structural nodes are still indexed; only import-resolution edges are missing.
+            Some(Language::Python) => {
+                link_imports_python_fs(&out.nodes, &vname_path, &corpus, repo_root)
+            }
             _ => Vec::new(),
         };
         for edge in import_edges {

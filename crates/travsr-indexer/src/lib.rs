@@ -193,6 +193,156 @@ fn rust_file_node_id(corpus: &str, path: &str) -> travsr_core::NodeId {
     travsr_core::VName::new(corpus, "", path, "rust", "file").id()
 }
 
+/// Resolve Python import statements in `nodes` to `ResolvesTo` edges.
+///
+/// For each `import` node, converts the signature specifier to one or two
+/// candidate repo-relative file paths and emits `ResolvesTo` edges:
+/// ```text
+/// import:os         --[resolves-to]-->  os.py
+/// import:os         --[resolves-to]-->  os/__init__.py
+/// import:.utils     --[resolves-to]-->  {dir}/utils.py          (relative, level 1)
+/// import:..pkg      --[resolves-to]-->  {parent_dir}/pkg.py     (relative, level 2)
+/// import:.          --[resolves-to]-->  {dir}/__init__.py        (bare dot)
+/// ```
+///
+/// Both `.py` and `/__init__.py` candidates are always emitted; only the one
+/// whose `file:` node was indexed will be reachable in the graph. Third-party
+/// imports (stdlib, site-packages) produce dangling edges that are harmless —
+/// use [`link_imports_python_fs`] to filter them out when `repo_root` is available.
+///
+/// `corpus` must match the corpus used when file nodes were indexed (ARCH-102).
+pub fn link_imports_python(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge> {
+    let dir = match Path::new(vname_path).parent() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let mut edges = Vec::new();
+    for node in nodes {
+        if node.kind != "import" {
+            continue;
+        }
+        let Some(spec) = node.vname.signature.strip_prefix("import:") else {
+            continue;
+        };
+        for candidate in py_resolve_import_candidates(spec, dir) {
+            edges.push(Edge::new(
+                node.id,
+                py_file_node_id(corpus, &candidate),
+                EdgeKind::ResolvesTo,
+            ));
+        }
+    }
+    edges
+}
+
+/// Filesystem-aware variant of [`link_imports_python`] that filters out edges
+/// whose target file does not exist under `repo_root`.
+///
+/// This eliminates dangling edges for stdlib and third-party imports without
+/// inspecting site-packages. The heuristic: if neither `{repo_root}/{mod}.py`
+/// nor `{repo_root}/{mod}/__init__.py` exists on disk, the import is external.
+///
+/// `repo_root` is always available in `travsr-daemon`; use this variant there.
+/// Use the pure [`link_imports_python`] in tests or when FS access is undesirable.
+pub fn link_imports_python_fs(
+    nodes: &[Node],
+    vname_path: &str,
+    corpus: &str,
+    repo_root: &std::path::Path,
+) -> Vec<Edge> {
+    let dir = match Path::new(vname_path).parent() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let mut edges = Vec::new();
+    for node in nodes {
+        if node.kind != "import" {
+            continue;
+        }
+        let Some(spec) = node.vname.signature.strip_prefix("import:") else {
+            continue;
+        };
+        for candidate in py_resolve_import_candidates(spec, dir) {
+            if repo_root.join(&candidate).exists() {
+                edges.push(Edge::new(
+                    node.id,
+                    py_file_node_id(corpus, &candidate),
+                    EdgeKind::ResolvesTo,
+                ));
+            }
+        }
+    }
+    edges
+}
+
+/// Compute candidate repo-relative file paths for a Python import specifier.
+///
+/// Absolute (`"os.path"`) → `["os/path.py", "os/path/__init__.py"]`
+/// Relative (`".utils"`)  → `["{dir}/utils.py", "{dir}/utils/__init__.py"]`
+/// Bare dot (`"."`)       → `["{dir}/__init__.py"]`
+fn py_resolve_import_candidates(spec: &str, dir: &std::path::Path) -> Vec<String> {
+    if spec.starts_with('.') {
+        py_resolve_relative_candidates(spec, dir)
+    } else {
+        py_resolve_absolute_candidates(spec)
+    }
+}
+
+fn py_resolve_absolute_candidates(spec: &str) -> Vec<String> {
+    let base: std::path::PathBuf = spec.split('.').collect();
+    let flat = base
+        .with_extension("py")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let pkg = base
+        .join("__init__.py")
+        .to_string_lossy()
+        .replace('\\', "/");
+    vec![flat, pkg]
+}
+
+fn py_resolve_relative_candidates(spec: &str, dir: &std::path::Path) -> Vec<String> {
+    let level = spec.chars().take_while(|&c| c == '.').count();
+    let module_part = &spec[level..];
+
+    // Level 1 = same package (dir), level 2 = parent, etc.
+    let mut anchor = dir.to_path_buf();
+    for _ in 0..level.saturating_sub(1) {
+        anchor = match anchor.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return Vec::new(),
+        };
+    }
+
+    if module_part.is_empty() {
+        // `from . import X` → the package __init__.py
+        let pkg = normalize_vname_path(&anchor.join("__init__.py"))
+            .to_string_lossy()
+            .replace('\\', "/");
+        vec![pkg]
+    } else {
+        let segments: std::path::PathBuf = module_part.split('.').collect();
+        let base = normalize_vname_path(&anchor.join(segments));
+        let flat = base
+            .with_extension("py")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let pkg = base
+            .join("__init__.py")
+            .to_string_lossy()
+            .replace('\\', "/");
+        vec![flat, pkg]
+    }
+}
+
+/// NodeId for a Python `file:` node — must match the VName emitted by
+/// `python::py_file_node` (language="python", root="", signature="file").
+/// If either side changes, ResolvesTo edges produced here will point to the
+/// wrong NodeId and traversal will silently miss cross-file links.
+fn py_file_node_id(corpus: &str, path: &str) -> travsr_core::NodeId {
+    travsr_core::VName::new(corpus, "", path, "python", "file").id()
+}
+
 /// Normalize a logical path by resolving `.` and `..` components without
 /// touching the filesystem. Returns a relative path with no redundant segments.
 fn normalize_vname_path(path: &std::path::Path) -> std::path::PathBuf {

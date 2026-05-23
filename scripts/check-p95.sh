@@ -34,6 +34,8 @@ RETRIEVAL_BENCHES=(
 INDEXER_BENCHES_REQUIRED=(
   "rust_cold/simple_rs"
   "rust_warm/simple_rs"
+  "python_cold/simple_py"
+  "python_warm/simple_py"
 )
 INDEXER_BENCHES_OPTIONAL=(
   "rust_travsr_core/lib_rs"
