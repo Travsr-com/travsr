@@ -175,30 +175,24 @@ mod tests {
 
     #[test]
     fn run_ra_lsif_timeout_kills_long_running_process() {
-        // Spawn a real sleep process with a 1ms timeout to verify the kill
-        // path. Uses `sh -c 'sleep 60'` — cross-platform as long as sh exists.
-        // Skipped on Windows where `sleep` is not a shell built-in.
+        // Verify the timeout-kill polling loop using a raw `sleep` process.
+        // We deliberately bypass build_sandboxed_command here: on CI runners
+        // bwrap may be installed but user namespaces disabled at the kernel
+        // level (common in Docker), causing bwrap to exit immediately and the
+        // test to see timed_out=false. Sandbox correctness is tested separately
+        // in sandbox.rs. This test only exercises the kill-on-deadline path.
+        // Skipped on Windows where `sleep` is not available.
         #[cfg(unix)]
         {
-            use crate::sandbox::SandboxConfig;
-
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let cfg = SandboxConfig {
-                repo_root: tmp.path().to_path_buf(),
-                timeout: std::time::Duration::from_millis(200),
-                mem_limit_bytes: 4 * 1024 * 1024 * 1024,
-            };
-
-            // We test the timeout by building the command directly (bypassing
-            // ra_available) and using a long sleep as the "program".
-            let (mut cmd, _) = build_sandboxed_command("sleep", &["60"], &cfg);
-            let mut child = cmd
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("sleep must spawn");
 
-            let deadline = Instant::now() + cfg.timeout;
+            let timeout = std::time::Duration::from_millis(200);
+            let deadline = Instant::now() + timeout;
             let timed_out = loop {
                 match child.try_wait().expect("try_wait") {
                     Some(_) => break false,
