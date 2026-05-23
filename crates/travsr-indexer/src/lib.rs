@@ -12,6 +12,7 @@ pub mod lsif;
 mod python;
 pub mod runner;
 mod rust;
+pub mod sandbox;
 mod typescript;
 
 use std::path::Path;
