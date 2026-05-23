@@ -16,6 +16,28 @@ const _: () = {
     assert!(PARSE_TIMEOUT_MICROS <= 30_000_000);
 };
 
+// ── Supported Python features (Phase A, Sprint 10 — INDEX-221/222) ───────────
+//
+// Supported (structural nodes, emitted by this parser):
+//   - Top-level function definitions  → kind="function", sig="fn:<name>"
+//   - Class definitions               → kind="class",    sig="class:<name>"
+//   - Methods (inside class body)     → kind="method",   sig="method:<ClassName>.<name>"
+//   - `import X` / `import X as Z`   → kind="import",   sig="import:<module>"
+//   - `from X import Y`               → kind="import",   sig="import:<module>"
+//   - `from .X import Y` (relative)   → kind="import",   sig="import:.<module>"
+//   - `from . import Y` (bare dot)    → kind="import",   sig="import:."
+//   - `.pyi` stub files               → parsed identically to `.py`
+//
+// Known gaps (Phase A):
+//   - No ResolvesTo edges from import nodes   → provided by link_imports_python (INDEX-222)
+//   - No call/ref edges                       → deferred to Phase B (LSIF/pyright)
+//   - `from X import Y, Z` multi-name from   → only module X indexed; Y, Z skipped
+//   - Nested class definitions               → inner class methods attributed to outer class
+//   - Decorator-synthesized members          → @dataclass, @attrs.define not expanded
+//   - `__all__` exports                      → not indexed
+//   - Conditional imports (`if TYPE_CHECKING`)→ indexed as unconditional
+//   - Dynamic attributes (setattr, __slots__)→ not indexed
+
 // Captures: function_definition, class_definition, import_statement, import_from_statement.
 // Phase A (Sprint 10): structural definitions only; semantic call/ref edges
 // are deferred to Phase B (LSIF, future sprint).
@@ -204,14 +226,70 @@ fn extract_import_names(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Strin
     names
 }
 
-/// Extract the module name from a `from X import Y` statement.
-/// `from pathlib import Path` yields `Some("pathlib")`.
-/// `from . import foo` yields `None` (relative imports skipped for now).
+/// Extract the module specifier from a `from X import Y` statement.
+///
+/// Returns the raw specifier string used as the `import:{spec}` signature:
+/// - `from pathlib import Path`  → `Some("pathlib")`
+/// - `from .foo import bar`      → `Some(".foo")`
+/// - `from . import bar`         → `Some(".")`
+/// - `from ..pkg.mod import X`   → `Some("..pkg.mod")`
+///
+/// The leading-dot prefix on relative specifiers is the resolver's flag in
+/// `link_imports_python` (INDEX-222) to switch to relative resolution.
 fn extract_from_import_module(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    // tree-sitter-python: `module_name` field holds the dotted_name; if the
-    // import is relative-only (`from . import foo`) there is no module_name.
-    let module_node = node.child_by_field_name("module_name")?;
-    module_node.utf8_text(source).ok().map(str::to_string)
+    // tree-sitter-python grammar: `module_name` field holds either a
+    // `dotted_name` (absolute) or a `relative_import` node (relative).
+    if let Some(module_node) = node.child_by_field_name("module_name") {
+        if module_node.kind() == "relative_import" {
+            return extract_relative_import_spec(module_node, source);
+        }
+        return module_node.utf8_text(source).ok().map(str::to_string);
+    }
+    // Fallback: some grammar versions place `relative_import` as a bare child
+    // without a `module_name` field name (e.g. `from . import foo`).
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i) else { continue };
+        if child.kind() == "relative_import" {
+            return extract_relative_import_spec(child, source);
+        }
+    }
+    None
+}
+
+/// Build the relative import specifier from a `relative_import` AST node.
+/// Concatenates the `import_prefix` dots with the optional `dotted_name`.
+///
+/// `(relative_import (import_prefix ".") (dotted_name "foo"))` → `".foo"`
+/// `(relative_import (import_prefix "."))` → `"."`
+fn extract_relative_import_spec(rel_node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut dots = String::new();
+    let mut module_part = String::new();
+    for i in 0..rel_node.child_count() {
+        let Some(child) = rel_node.child(i) else {
+            continue;
+        };
+        match child.kind() {
+            "import_prefix" => {
+                if let Ok(t) = child.utf8_text(source) {
+                    dots.push_str(t);
+                }
+            }
+            "dotted_name" => {
+                if let Ok(t) = child.utf8_text(source) {
+                    module_part.push_str(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    if dots.is_empty() {
+        return None;
+    }
+    if module_part.is_empty() {
+        Some(dots)
+    } else {
+        Some(format!("{dots}{module_part}"))
+    }
 }
 
 // ── Node constructors ─────────────────────────────────────────────────────────
@@ -430,6 +508,48 @@ mod tests {
                 .iter()
                 .any(|n| n.vname.signature == "method:Dog.speak" && n.kind == "method"),
             "expected method:Dog.speak — overridden method must use subclass name"
+        );
+    }
+
+    #[test]
+    fn relative_import_single_dot_emits_dot_prefix_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.py");
+        std::fs::write(&path, b"from .utils import helper\n").unwrap();
+        let out = parse("", &path, "pkg/mod.py").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "import:.utils" && n.kind == "import"),
+            "expected import:.utils for `from .utils import helper`"
+        );
+    }
+
+    #[test]
+    fn relative_import_double_dot_emits_dot_dot_prefix_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep.py");
+        std::fs::write(&path, b"from ..pkg import utils\n").unwrap();
+        let out = parse("", &path, "pkg/sub/deep.py").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "import:..pkg" && n.kind == "import"),
+            "expected import:..pkg for `from ..pkg import utils`"
+        );
+    }
+
+    #[test]
+    fn relative_bare_dot_import_emits_dot_only_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("__init__.py");
+        std::fs::write(&path, b"from . import utils\n").unwrap();
+        let out = parse("", &path, "pkg/__init__.py").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "import:." && n.kind == "import"),
+            "expected import:. for `from . import utils`"
         );
     }
 }

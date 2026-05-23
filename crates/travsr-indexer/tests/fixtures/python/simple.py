@@ -1,4 +1,12 @@
-"""Simple Python fixture for tree-sitter indexer tests."""
+"""Simple Python fixture for tree-sitter indexer tests (QA-221).
+
+DO NOT EDIT without updating the golden snapshot tests in
+crates/travsr-indexer/tests/python.rs.
+
+Expected parse output (verify with: cargo test -p travsr-indexer golden_simple_py):
+  file×1  class×2  function×3  method×6  import×4  = 16 nodes
+  DefinesBinding×11  Depends×4  = 15 edges
+"""
 
 import os
 import sys
