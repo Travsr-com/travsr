@@ -11,6 +11,7 @@ mod hash;
 pub mod lsif;
 mod python;
 pub mod runner;
+pub mod sandbox;
 mod rust;
 mod typescript;
 
