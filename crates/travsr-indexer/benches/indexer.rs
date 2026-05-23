@@ -30,7 +30,7 @@
 //!   go/warm         — parse `simple.go` **twice** per `b.iter()` call so the
 //!                     second parse sees a warm instruction cache.
 //!
-//!   go/kubectl_sample — parse `kubectl_sample.go` (~270-line controller fixture
+//!   go/kubectl_sample — parse `kubectl_sample.go` (~380-line controller fixture
 //!                     representative of real-world Go). Exit criterion: < 30s
 //!                     total wall time for 10k-LOC equivalent (Issue #170).
 //!
@@ -197,9 +197,9 @@ fn bench_go_warm(c: &mut Criterion) {
     group.finish();
 }
 
-/// Parse kubectl_sample.go — a ~270-line controller fixture representative of
+/// Parse kubectl_sample.go — a ~380-line controller fixture representative of
 /// real-world Go (structs, interfaces, methods, generics, type aliases).
-/// Exit criterion: p95 < 50 ms per file (Issue #170).
+/// Exit criterion: < 30 s total for 10k-LOC equivalent (Issue #170).
 fn bench_go_kubectl_sample(c: &mut Criterion) {
     let fixture = go_kubectl_fixture();
     let indexer = Indexer::new();
