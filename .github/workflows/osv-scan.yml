@@ -20,11 +20,6 @@ jobs:
     with:
       scan-args: |-
         --lockfile=Cargo.lock
-        ./
-    permissions:
-      contents: read
-      actions: read
-      security-events: write
 
   osv-scan-npm:
     name: OSV scan (npm — travsr-lsif-ts)
@@ -32,8 +27,3 @@ jobs:
     with:
       scan-args: |-
         --lockfile=packages/travsr-lsif-ts/package-lock.json
-        ./
-    permissions:
-      contents: read
-      actions: read
-      security-events: write
