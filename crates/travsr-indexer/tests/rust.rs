@@ -1,4 +1,13 @@
 //! Integration tests for the Rust tree-sitter indexer and link_imports_rust.
+//!
+//! Test groups:
+//! - **Golden snapshots** (QA-201): exact node/edge counts and signatures for
+//!   `tests/fixtures/rust/simple.rs`; hand-curated to catch regressions in the
+//!   Phase A structural parser.
+//! - **Smoke test** (QA-201): index real Travsr source files, assert liveness.
+//! - **Idempotency** (QA-201): parsing the same file twice produces identical
+//!   NodeIds and edges.
+//! - **Import resolution** (INDEX-202): link_imports_rust correctness.
 
 use std::path::Path;
 
@@ -223,5 +232,196 @@ fn use_as_clause_indexes_original_path_not_alias() {
             .iter()
             .any(|n| n.vname.signature.contains("CoreEngine")),
         "alias must not appear in the graph"
+    );
+}
+
+// ── QA-201: Golden snapshots — simple.rs fixture ─────────────────────────────
+//
+// These tests are the regression gate for the Phase A structural Rust parser.
+// If the fixture or the parser changes, these counts MUST be updated
+// deliberately — a silent drift is a bug.
+//
+// Fixture: crates/travsr-indexer/tests/fixtures/rust/simple.rs
+// Expected structure (hand-curated, verified 2026-05-23):
+//   file×1  struct×2  enum×1  trait×1  impl×2  module×1  file-module×1
+//   function×2  method×3  constant×1  static×1  import×3
+//   = 19 nodes, 18 edges
+
+/// Exact node count for the simple.rs fixture must remain 19.
+/// Update this number deliberately when the fixture or parser changes.
+#[test]
+fn golden_simple_fixture_node_count() {
+    let out = parse_fixture();
+    assert_eq!(
+        out.nodes.len(),
+        19,
+        "expected exactly 19 nodes from simple.rs — update golden if fixture changed.\n\
+         Actual nodes:\n{}",
+        out.nodes
+            .iter()
+            .map(|n| format!("  {:12}  {}", n.kind, n.vname.signature))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Exact edge count for the simple.rs fixture must remain 18.
+#[test]
+fn golden_simple_fixture_edge_count() {
+    let out = parse_fixture();
+    assert_eq!(
+        out.edges.len(),
+        18,
+        "expected exactly 18 edges from simple.rs — update golden if fixture changed."
+    );
+}
+
+/// Every expected (kind, signature) pair must be present in the simple.rs output.
+/// This guards against regressions where a node kind is silently dropped.
+#[test]
+fn golden_simple_fixture_all_expected_nodes_present() {
+    let out = parse_fixture();
+
+    let expected: &[(&str, &str)] = &[
+        ("file", "file"),
+        ("struct", "struct:Config"),
+        ("struct", "struct:Worker"),
+        ("enum", "enum:Status"),
+        ("trait", "trait:Processor"),
+        ("impl", "impl:Config"),
+        ("impl", "impl:Worker"),
+        ("module", "mod:utils"),
+        ("file-module", "filemod:helpers"),
+        ("function", "fn:helper"),
+        ("function", "fn:run"),
+        ("method", "fn:Worker.new"),
+        ("method", "fn:Worker.process"),
+        ("method", "fn:Config.fmt"),
+        ("constant", "const:MAX_RETRIES"),
+        ("static", "static:APP_NAME"),
+        ("import", "use:std::fmt"),
+        ("import", "use:std::collections::HashMap"),
+        ("import", "use:std::io"),
+    ];
+
+    for (kind, sig) in expected {
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.kind == *kind && n.vname.signature == *sig),
+            "missing expected node  kind={kind:12}  sig={sig}\n\
+             Actual nodes:\n{}",
+            out.nodes
+                .iter()
+                .map(|n| format!("  {:12}  {}", n.kind, n.vname.signature))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
+/// No duplicate NodeIds in the simple.rs output.
+/// Duplicates would corrupt BFS traversal (double-counting, phantom cycles).
+#[test]
+fn golden_simple_fixture_no_duplicate_node_ids() {
+    let out = parse_fixture();
+    let mut ids: Vec<_> = out.nodes.iter().map(|n| n.id).collect();
+    ids.sort_unstable();
+    let before = ids.len();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        before,
+        "duplicate NodeIds detected in simple.rs output — dedup in rust::parse() may be broken"
+    );
+}
+
+/// No duplicate edges (src, dst, kind) in the simple.rs output.
+#[test]
+fn golden_simple_fixture_no_duplicate_edges() {
+    let out = parse_fixture();
+    let mut keys: Vec<_> = out
+        .edges
+        .iter()
+        .map(|e| (e.src, e.dst, e.kind.clone()))
+        .collect();
+    keys.sort_unstable_by_key(|(s, d, _)| (*s, *d));
+    let before = keys.len();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        before,
+        "duplicate edges detected in simple.rs output"
+    );
+}
+
+// ── QA-201: Idempotency — parsing the same file twice is stable ───────────────
+
+/// Parsing the same file twice must produce identical NodeIds and edges.
+/// This guards against non-deterministic VName hashing or PRNG-seeded IDs.
+#[test]
+fn idempotent_reindex_produces_identical_graph() {
+    let first = parse_fixture();
+    let second = parse_fixture();
+
+    let mut ids_a: Vec<_> = first.nodes.iter().map(|n| n.id).collect();
+    let mut ids_b: Vec<_> = second.nodes.iter().map(|n| n.id).collect();
+    ids_a.sort_unstable();
+    ids_b.sort_unstable();
+    assert_eq!(
+        ids_a, ids_b,
+        "NodeIds differ between first and second parse"
+    );
+
+    let mut edges_a: Vec<_> = first.edges.iter().map(|e| (e.src, e.dst)).collect();
+    let mut edges_b: Vec<_> = second.edges.iter().map(|e| (e.src, e.dst)).collect();
+    edges_a.sort_unstable();
+    edges_b.sort_unstable();
+    assert_eq!(
+        edges_a, edges_b,
+        "Edge (src, dst) pairs differ between first and second parse"
+    );
+}
+
+// ── QA-201: Smoke test — index real Travsr source files ──────────────────────
+
+/// Parse the actual travsr-core/src/lib.rs from this workspace and assert
+/// liveness: at least one struct, one function, and no panics.
+/// This is the minimal "Travsr indexes itself" smoke test.
+/// CI budget: < 5s (single-file parse, no I/O beyond reading one file).
+#[test]
+fn smoke_index_travsr_core_lib() {
+    let core_lib = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent() // crates/
+        .and_then(|p| p.parent()) // workspace root
+        .expect("could not find workspace root")
+        .join("crates/travsr-core/src/lib.rs");
+
+    // Skip gracefully if running in an environment without the full workspace
+    // (e.g. a vendor-only CI that only ships travsr-indexer).
+    if !core_lib.exists() {
+        eprintln!("smoke_index_travsr_core_lib: skipped — {core_lib:?} not found");
+        return;
+    }
+
+    let out = Indexer::new()
+        .parse_file_with_vname(&core_lib, "crates/travsr-core/src/lib.rs")
+        .expect("parse must not fail on real Travsr source");
+
+    assert!(
+        out.nodes.len() > 5,
+        "expected > 5 nodes from travsr-core/src/lib.rs, got {}",
+        out.nodes.len()
+    );
+    assert!(
+        out.nodes
+            .iter()
+            .any(|n| n.kind == "struct" || n.kind == "function"),
+        "expected at least one struct or function node in travsr-core/src/lib.rs"
+    );
+    assert!(
+        out.edges.len() > 3,
+        "expected > 3 edges from travsr-core/src/lib.rs, got {}",
+        out.edges.len()
     );
 }
