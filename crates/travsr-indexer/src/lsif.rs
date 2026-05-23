@@ -349,8 +349,6 @@ struct RustLsifGraph {
     ref_result_to_rs: HashMap<u64, u64>,
     /// document id → repo-relative file path.
     doc_paths: HashMap<u64, String>,
-    /// moniker vertex id → resultSet id (used for forward-ref resolution).
-    monikers: HashMap<u64, u64>,
 }
 
 /// Parse a rust-analyzer LSIF dump into an intermediate graph.
@@ -393,28 +391,22 @@ fn parse_rust_graph(dump: &str) -> anyhow::Result<RustLsifGraph> {
                     }
                 }
                 Some("moniker") => {
-                    // Store moniker vertex id → identifier for later edge resolution.
                     if let (Some(id), Some(ident)) = (
                         v.get("id").and_then(|i| i.as_u64()),
                         v.get("identifier").and_then(|i| i.as_str()),
                     ) {
-                        g.monikers.insert(id, 0); // placeholder; resolved below
-                                                  // Resolve any pending forward-refs for this moniker vertex.
+                        // Resolve any pending forward-refs that were waiting for
+                        // this moniker vertex (moniker edge arrived first).
                         for (rs_id, m_id) in &pending {
                             if *m_id == id {
                                 g.rs_monikers.insert(*rs_id, ident.to_string());
                             }
                         }
-                        // Store the identifier keyed by moniker vertex id for
-                        // new `moniker` edges that arrive after this vertex.
-                        g.monikers.insert(id, id); // real id stored for lookup below
-                                                   // We re-use the `monikers` map as id→id; store ident separately.
-                                                   // Overwrite with a sentinel we can look up in the edge pass.
-                                                   // Simpler: just store ident in a side map.
-                        g.monikers.remove(&id);
-                        // Use rs_monikers with a temporary negated key to carry ident
-                        // until the moniker edge arrives.
-                        // Encode as u64::MAX - id to avoid collision with resultSet ids.
+                        // Store ident under sentinel key so moniker edges that
+                        // arrive AFTER this vertex can look it up.
+                        // Sentinel: u64::MAX - id avoids collision with resultSet
+                        // ids, which are small sequential integers in all known
+                        // rust-analyzer LSIF versions.
                         g.rs_monikers.insert(u64::MAX - id, ident.to_string());
                     }
                 }
@@ -523,6 +515,12 @@ fn ingest_rust_edges_from_dump(dump: &str, corpus: &str) -> Vec<Edge> {
             Some(p) => p,
             None => continue,
         };
+
+        // DEBT(travsr-126): `inVs` may contain multiple reference ranges
+        // (e.g. `"inVs": [9, 10, 11]`). We emit one RefCall edge per item
+        // edge regardless of inVs count — document-level caller precision.
+        // Method-level precision requires range-to-node containment tracking,
+        // deferred to Sprint 10.
 
         // Caller: the file containing the reference site.
         let caller_path = make_relative(&g.project_root, doc_path);
