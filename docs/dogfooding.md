@@ -26,7 +26,7 @@ no-op timeout guard — install bubblewrap if you move to Linux in the future.
 
 ```bash
 # Option A — npm (downloads the prebuilt binary for your platform)
-npm install -g @travsr.com/travsr
+npm install -g travsr
 
 # Option B — build from source (requires Rust 1.75+)
 git clone https://github.com/raj-rkv/travsr.git
@@ -225,6 +225,7 @@ Once connected, the following tools are available to any MCP client:
 | `get_blast_radius` | Files that would break if this file changed | "What breaks if I edit `EdgeKind`?" |
 | `search_symbol` | Find a symbol definition by name | "Find the definition of `VName`" |
 | `get_repo_map` | Structural overview of the repo | "Give me a map of `travsr-indexer`" |
+| `get_context` | PPR traversal + knapsack token budget — the primary AI context retrieval tool (Sprint 11) | "Get context for editing the PPR implementation within 4096 tokens" |
 
 ### Sample queries to try on the Travsr repo
 
@@ -279,10 +280,14 @@ radius of changing it?"
 | Naive RAG (top-8 chunks, 512 tokens each) | 4 096 | Partial — missed 2 callers | 3.1s |
 | Full file context (send all 6 related files) | 18 400 | Yes | 8.7s |
 | **Travsr graph traversal (BFS depth 3)** | **712** | **Yes — exact** | **0.4s** |
-| **Travsr graph + PPR (top-20 nodes)** | **1 340** | **Yes — exact + context** | **0.6s** |
+| **Travsr graph + PPR (top-20 nodes)** \* | **1 340** | **Yes — exact + context** | **0.6s** |
 
 **82% fewer tokens** than naive RAG. **93% fewer tokens** than sending full files.
 The graph answer is also deterministic — run it 100 times, get the same 712 tokens.
+
+\* BFS numbers measured on commit 712e16e. PPR numbers are projected based on
+top-20 node selection from the implemented PPR algorithm; will be confirmed with
+measured values when `get_context` (PPR + knapsack) ships in Sprint 11.
 
 These numbers will vary by query complexity and repo size. The savings grow as the
 repo grows: RAG chunk overlap increases with codebase size, while graph traversal
