@@ -569,16 +569,20 @@ fn python_smoke_standalone_skips_os_keeps_pkg_utils() {
     );
 }
 
-// ── Blocked on INDEX-222 integration into golden fixture ─────────────────────
+// ── ResolvesTo golden fixture ─────────────────────────────────────────────────
 
-/// Blocked until link_imports_python is called as part of the full reindex
-/// pipeline and ResolvesTo edges are stored alongside structural nodes.
-///
-/// Once the daemon + store integration lands, remove this ignore and assert:
-///   import:os  --[ResolvesTo]-->  (no edge, stdlib skipped by fs resolver)
-///   import:pathlib --[ResolvesTo]--> (no edge, stdlib)
 #[test]
-#[ignore = "blocked on full daemon integration — link_imports_python wired in Sprint 10 (INDEX-222)"]
-fn golden_simple_py_import_resolves_to_edges_present() {
-    todo!("INDEX-222: call link_imports_python_fs, assert ResolvesTo edges for first-party imports")
+fn golden_simple_py_stdlib_imports_produce_no_resolves_to_edges() {
+    // simple.py imports only stdlib (os, sys, pathlib, typing).
+    // None of those files exist under the fixture dir, so the FS-aware
+    // resolver must return zero ResolvesTo edges.
+    let out = Indexer::new()
+        .parse_file_with_vname(&fixture_path(), "src/simple.py")
+        .unwrap();
+    let edges = link_imports_python_fs(&out.nodes, "src/simple.py", "", &fixture_dir());
+    assert!(
+        edges.is_empty(),
+        "simple.py imports only stdlib — expected 0 ResolvesTo edges, got {}: {edges:#?}",
+        edges.len()
+    );
 }
