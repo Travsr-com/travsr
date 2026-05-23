@@ -117,6 +117,7 @@ pub enum Language {
     TypeScript,
     Rust,
     Python,
+    Go,
 }
 
 impl Language {
@@ -128,6 +129,7 @@ impl Language {
             "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
+            "go" => Some(Self::Go),
             _ => None,
         }
     }
@@ -138,6 +140,7 @@ impl Language {
             Self::TypeScript => "typescript",
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::Go => "go",
         }
     }
 
@@ -148,6 +151,7 @@ impl Language {
             "typescript" => Some(Self::TypeScript),
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
+            "go" => Some(Self::Go),
             _ => None,
         }
     }
@@ -645,14 +649,19 @@ mod tests {
         assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("pyi"), Some(Language::Python));
-        assert_eq!(Language::from_extension("go"), None);
+        assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("js"), None);
         assert_eq!(Language::from_extension(""), None);
     }
 
     #[test]
     fn language_as_str_and_from_str_round_trip() {
-        for lang in [Language::TypeScript, Language::Rust, Language::Python] {
+        for lang in [
+            Language::TypeScript,
+            Language::Rust,
+            Language::Python,
+            Language::Go,
+        ] {
             let s = lang.as_str();
             assert_eq!(
                 Language::from_str(s),
@@ -667,11 +676,12 @@ mod tests {
         assert_eq!(Language::TypeScript.as_str(), "typescript");
         assert_eq!(Language::Rust.as_str(), "rust");
         assert_eq!(Language::Python.as_str(), "python");
+        assert_eq!(Language::Go.as_str(), "go");
     }
 
     #[test]
     fn language_from_str_returns_none_for_unknown() {
-        assert_eq!(Language::from_str("go"), None);
+        assert_eq!(Language::from_str("go"), Some(Language::Go));
         assert_eq!(Language::from_str("TypeScript"), None);
         assert_eq!(Language::from_str(""), None);
     }

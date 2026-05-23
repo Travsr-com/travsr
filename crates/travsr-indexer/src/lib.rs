@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod emit;
+mod go;
 mod hash;
 pub mod lsif;
 mod python;
@@ -347,6 +348,76 @@ fn py_file_node_id(corpus: &str, path: &str) -> travsr_core::NodeId {
     travsr_core::VName::new(corpus, "", path, "python", "file").id()
 }
 
+/// Resolve Go import paths in `nodes` to `ResolvesTo` edges.
+///
+/// Go import paths are module-qualified (e.g. `"github.com/foo/bar"`). Without
+/// a full module graph, we cannot reliably map them to local file paths — that
+/// is deferred to Phase 4 (Go LSIF). This function handles only the two
+/// resolvable cases:
+///
+/// 1. **Same-module imports** — when `module_root` is `Some((module_path, repo_root))`,
+///    an import whose path starts with `module_path` is mapped to a local
+///    directory:
+///    ```text
+///    import:github.com/foo/bar/pkg/util
+///      --[resolves-to]-->  pkg/util/{any}.go   (represented as pkg/util/ dir node)
+///    ```
+///    Actually we emit two candidate `file:` edges using `{rel_dir}` ↔ no single
+///    file is canonical, so we emit a ResolvesTo edge to every `*.go` file node
+///    we have indexed under that directory — this is approximated as an edge to
+///    a synthetic `file:` node whose path is `{rel_dir}` (a dir placeholder that
+///    never matches a real indexed node but is harmless).
+///
+/// 2. **Relative imports** — Go does not support relative imports (`./foo`) in
+///    module mode; this case does not arise in practice.
+///
+/// `cgo` pseudo-package (`import:C`) is always skipped — it was already filtered
+/// by the parser.
+///
+/// **DEBT-018:** Full cross-module resolution requires go.mod parsing and is
+/// deferred to Phase 4 Go LSIF sprint.
+///
+/// `corpus` must match the corpus used when file nodes were indexed (ARCH-102).
+pub fn link_imports_go(
+    nodes: &[Node],
+    _vname_path: &str,
+    corpus: &str,
+    module_root: Option<(&str, &str)>,
+) -> Vec<Edge> {
+    let mut edges = Vec::new();
+
+    for node in nodes {
+        if node.kind != "import" {
+            continue;
+        }
+        let Some(import_path) = node.vname.signature.strip_prefix("import:") else {
+            continue;
+        };
+        // Skip cgo (already filtered by parser, but defensive).
+        if import_path == "C" {
+            continue;
+        }
+        // If we have a module root, attempt same-module resolution.
+        if let Some((module_path, _repo_root)) = module_root {
+            if let Some(rel) = import_path.strip_prefix(module_path) {
+                // Strip leading slash separator.
+                let rel = rel.trim_start_matches('/');
+                if !rel.is_empty() {
+                    // Emit a ResolvesTo edge to a synthetic directory placeholder.
+                    // The daemon can use this to scope BFS traversal to all .go
+                    // files under the directory once LSIF is wired (Phase 4).
+                    let target_id = travsr_core::VName::new(corpus, "", rel, "go", "file").id();
+                    edges.push(Edge::new(node.id, target_id, EdgeKind::ResolvesTo));
+                }
+            }
+        }
+        // stdlib and third-party imports produce no edges — dangling refs would
+        // be harmless but add noise. Phase 4 LSIF provides semantic resolution.
+    }
+
+    edges
+}
+
 /// Normalize a logical path by resolving `.` and `..` components without
 /// touching the filesystem. Returns a relative path with no redundant segments.
 fn normalize_vname_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -429,6 +500,7 @@ impl Indexer {
             Some(Language::Python) => {
                 python::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
             }
+            Some(Language::Go) => go::parse(&self.corpus, abs_path, vname_path).map_err(map_err),
             // Other future languages (#[non_exhaustive]) are silently skipped
             // until their parsers ship.
             _ => Ok(ParseOutput::default()),
