@@ -10,25 +10,30 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  security-events: write
 
 jobs:
-  osv-scan:
-    name: OSV vulnerability scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+  osv-scan-rust:
+    name: OSV scan (Rust)
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.8
+    with:
+      scan-args: |-
+        --lockfile=Cargo.lock
+        ./
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
 
-      - name: Run OSV Scanner (Rust)
-        uses: google/osv-scanner-action@v2
-        with:
-          scan-args: |-
-            --lockfile=Cargo.lock
-            ./
-
-      - name: Run OSV Scanner (npm — travsr-lsif-ts)
-        uses: google/osv-scanner-action@v2
-        with:
-          scan-args: |-
-            --lockfile=packages/travsr-lsif-ts/package-lock.json
-            ./
+  osv-scan-npm:
+    name: OSV scan (npm — travsr-lsif-ts)
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.8
+    with:
+      scan-args: |-
+        --lockfile=packages/travsr-lsif-ts/package-lock.json
+        ./
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
