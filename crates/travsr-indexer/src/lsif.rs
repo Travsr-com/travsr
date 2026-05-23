@@ -627,6 +627,21 @@ mod rust_lsif_tests {
     }
 
     #[test]
+    fn ingest_rust_raw_empty_dump_returns_empty_vec() {
+        // Contract: an empty or whitespace-only dump must return Ok(vec![]),
+        // never Err. Pinned so future header-validation changes don't silently
+        // break callers that feed empty dumps (e.g. crates with no public API).
+        let edges = ingest_rust_raw("", "corp").unwrap();
+        assert!(edges.is_empty(), "empty dump must return Ok(vec![])");
+
+        let edges_ws = ingest_rust_raw("   \n  \n", "corp").unwrap();
+        assert!(
+            edges_ws.is_empty(),
+            "whitespace-only dump must return Ok(vec![])"
+        );
+    }
+
+    #[test]
     fn ingest_rust_handles_forward_referenced_monikers() {
         // moniker edge appears BEFORE the moniker vertex — must still resolve.
         let dump = r#"

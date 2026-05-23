@@ -139,6 +139,15 @@ fn corpus_is_stamped_into_caller_vname() {
     assert!(
         srcs_a.is_disjoint(&srcs_b),
         "caller NodeIds must differ across corpora — \
-         corpus is not being stamped into VNames"
+         corpus is not being stamped into caller VNames"
+    );
+
+    let dsts_a: std::collections::BTreeSet<_> = edges_a.iter().map(|e| e.dst).collect();
+    let dsts_b: std::collections::BTreeSet<_> = edges_b.iter().map(|e| e.dst).collect();
+
+    assert!(
+        dsts_a.is_disjoint(&dsts_b),
+        "callee NodeIds must also differ across corpora — \
+         corpus is not being stamped into callee VNames"
     );
 }
