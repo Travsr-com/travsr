@@ -112,7 +112,11 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         let p = entry.into_path();
         // Skip Rust build artifacts — the `target/` directory can be enormous
         // and contains no user-authored source files worth indexing.
-        if p.components().any(|c| c.as_os_str() == "target") {
+        // CORRECTNESS: strip repo_root first so we check *relative* components
+        // only. Checking the absolute path would falsely skip every file in a
+        // repo that lives under e.g. `/home/target_user/myproject/`.
+        let rel = p.strip_prefix(repo_root).unwrap_or(&p);
+        if rel.components().any(|c| c.as_os_str() == "target") {
             continue;
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -246,6 +250,8 @@ pub fn reindex_files(
         let import_edges = match Language::from_extension(ext) {
             Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
             Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
+            // DEBT(travsr-indexer): link_imports_python deferred to Sprint 10.
+            // Structural nodes are still indexed; only import-resolution edges are missing.
             _ => Vec::new(),
         };
         for edge in import_edges {
@@ -579,12 +585,19 @@ mod tests {
         );
     }
 
-    /// DAEMON-201: any path component named `target` must be skipped during the
-    /// initial walk so Rust build artifacts are never indexed.
+    /// DAEMON-201: any relative path component named `target` must be skipped
+    /// during the initial walk so Rust build artifacts are never indexed.
+    /// The `.gitignore` is intentionally left empty to ensure the component
+    /// check — not gitignore — is responsible for excluding `target/`.
     #[test]
     fn target_directory_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
+
+        // Intentionally empty gitignore — the walker's component check must do
+        // the work, not a gitignore rule. This guards against a future git
+        // template that auto-adds `target/` and masks the real mechanism.
+        std::fs::write(tmp.path().join(".gitignore"), "# intentionally empty\n").unwrap();
 
         // Simulate a Rust build artifact inside target/.
         let target_dir = tmp.path().join("target").join("debug");
