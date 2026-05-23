@@ -196,11 +196,12 @@ fn link_imports_skips_package_imports() {
         "package imports must not produce resolves-to edges"
     );
 
-    // "./status" → 2 candidates (status.ts, status.tsx)
+    // 4 relative imports (./mcp, ./status, ./codelens, ./hover) × 2 candidates
+    // each (.ts + .tsx probe) = 8 edges expected.
     assert_eq!(
         edges.len(),
-        2,
-        "only the relative './status' import should produce edges"
+        8,
+        "4 relative imports × 2 extension candidates = 8 resolves-to edges"
     );
 }
 

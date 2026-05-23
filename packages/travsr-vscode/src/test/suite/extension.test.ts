@@ -141,7 +141,7 @@ suite("VSCODE-203: CallersHoverProvider", () => {
         ? hover.contents[0].value
         : "";
     assert.ok(text.includes("Callers"));
-    assert.ok(text.includes("Blast radius: 3 files"));
+    assert.ok(text.includes("**Blast radius:**") && text.includes("3 files"));
   });
 
   test("hover shows '… and N more' when callers exceed 5", async () => {
