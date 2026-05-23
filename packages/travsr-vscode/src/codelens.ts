@@ -20,6 +20,7 @@ export const BLAST_RADIUS_SELECTOR: vscode.DocumentSelector = [
   { language: "typescriptreact" },
   { language: "rust" },
   { language: "python" },
+  { language: "go" },
 ];
 
 function formatBlastCount(n: number): string {

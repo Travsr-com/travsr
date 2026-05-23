@@ -23,6 +23,17 @@
 //!   python/warm — parse `simple.py` **twice** per `b.iter()` call so the
 //!                 second parse sees a warm instruction cache.
 //!
+//!   go/cold         — parse `simple.go` fixture from scratch each iteration.
+//!                     Exercises the Go Tree-sitter grammar + node-emit path
+//!                     (INDEX-170 / Sprint 12).
+//!
+//!   go/warm         — parse `simple.go` **twice** per `b.iter()` call so the
+//!                     second parse sees a warm instruction cache.
+//!
+//!   go/kubectl_sample — parse `kubectl_sample.go` (~270-line controller fixture
+//!                     representative of real-world Go). Exit criterion: < 30s
+//!                     total wall time for 10k-LOC equivalent (Issue #170).
+//!
 //! Phase 3 exit criterion (Issue #121): query p95 < 50 ms.
 //! The 1k-node query benchmark lives in `travsr-retrieval`; this file covers
 //! the indexer (parse) side of the latency budget.
@@ -42,6 +53,14 @@ fn simple_fixture() -> PathBuf {
 
 fn python_simple_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python/simple.py")
+}
+
+fn go_simple_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go/simple.go")
+}
+
+fn go_kubectl_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go/kubectl_sample.go")
 }
 
 fn travsr_core_lib() -> Option<PathBuf> {
@@ -144,6 +163,57 @@ fn bench_python_warm(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cold parse of simple.go — full Go Tree-sitter grammar + node-emit path (INDEX-170).
+fn bench_go_cold(c: &mut Criterion) {
+    let fixture = go_simple_fixture();
+    let indexer = Indexer::new();
+    let mut group = c.benchmark_group("go/cold");
+    group.bench_function("simple_go", |b| {
+        b.iter(|| {
+            indexer
+                .parse_file_with_vname(&fixture, "src/simple.go")
+                .unwrap()
+        });
+    });
+    group.finish();
+}
+
+/// Warm re-index of simple.go — **two** parses per `b.iter()` call so the
+/// second parse sees a hot instruction cache (INDEX-170).
+fn bench_go_warm(c: &mut Criterion) {
+    let fixture = go_simple_fixture();
+    let indexer = Indexer::new();
+    let mut group = c.benchmark_group("go/warm");
+    group.bench_function("simple_go", |b| {
+        b.iter(|| {
+            let _ = indexer
+                .parse_file_with_vname(&fixture, "src/simple.go")
+                .unwrap();
+            indexer
+                .parse_file_with_vname(&fixture, "src/simple.go")
+                .unwrap()
+        });
+    });
+    group.finish();
+}
+
+/// Parse kubectl_sample.go — a ~270-line controller fixture representative of
+/// real-world Go (structs, interfaces, methods, generics, type aliases).
+/// Exit criterion: p95 < 50 ms per file (Issue #170).
+fn bench_go_kubectl_sample(c: &mut Criterion) {
+    let fixture = go_kubectl_fixture();
+    let indexer = Indexer::new();
+    let mut group = c.benchmark_group("go/kubectl_sample");
+    group.bench_function("kubectl_sample_go", |b| {
+        b.iter(|| {
+            indexer
+                .parse_file_with_vname(&fixture, "controller/kubectl_sample.go")
+                .unwrap()
+        });
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 
 criterion_group!(
@@ -153,5 +223,8 @@ criterion_group!(
     bench_rust_travsr_core,
     bench_python_cold,
     bench_python_warm,
+    bench_go_cold,
+    bench_go_warm,
+    bench_go_kubectl_sample,
 );
 criterion_main!(benches);
