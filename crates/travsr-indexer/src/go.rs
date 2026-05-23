@@ -23,7 +23,7 @@ const _: () = {
 //   - Method declarations              → kind="method",    sig="method:<ReceiverType>.<name>"
 //   - Struct type declarations         → kind="class",     sig="class:<name>"
 //   - Interface type declarations      → kind="interface", sig="interface:<name>"
-//   - Type alias / type def            → kind="type",      sig="type:<name>"
+//   - Type alias (type X = Y)          → kind="type",      sig="type:<name>"
 //   - Top-level var / const declarations→ kind="var",      sig="var:<name>"
 //   - Import declarations              → kind="import",    sig="import:<path>"
 //
@@ -34,6 +34,8 @@ const _: () = {
 //   - `import "C"` (cgo pseudo-package) emitted and then filtered in link_imports_go
 //   - Call/ref edges deferred to Phase 4 (Go LSIF / pyright-equivalent)
 //   - Multi-value var blocks: only first name in each spec is indexed
+//   - Named type definitions (type X Y, no `=`) not indexed — DEBT-019
+//   - Methods on generic types (*Stack[T]) silently dropped — DEBT-020
 
 // ── Tree-sitter queries ───────────────────────────────────────────────────────
 //
