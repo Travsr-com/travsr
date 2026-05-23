@@ -21,18 +21,71 @@
       {
         "command": "travsr.showStatus",
         "title": "Travsr: Show Status"
+      },
+      {
+        "command": "travsr.showBlastRadius",
+        "title": "Travsr: Show Blast Radius"
+      },
+      {
+        "command": "travsr.showCallers",
+        "title": "Travsr: Show Callers"
       }
-    ]
+    ],
+    "colors": [
+      {
+        "id": "travsr.freshForeground",
+        "description": "Color for Travsr status bar when graph is fresh.",
+        "defaults": {
+          "dark": "#7cf2c5",
+          "light": "#0e7a5a",
+          "highContrast": "#7cf2c5"
+        }
+      },
+      {
+        "id": "travsr.staleForeground",
+        "description": "Color for Travsr status bar when graph is stale.",
+        "defaults": {
+          "dark": "#f59e0b",
+          "light": "#b45309",
+          "highContrast": "#f59e0b"
+        }
+      },
+      {
+        "id": "travsr.errorForeground",
+        "description": "Color for Travsr status bar when daemon is disconnected.",
+        "defaults": {
+          "dark": "#ef4444",
+          "light": "#b91c1c",
+          "highContrast": "#ef4444"
+        }
+      }
+    ],
+    "configuration": {
+      "title": "Travsr",
+      "properties": {
+        "travsr.binaryPath": {
+          "type": "string",
+          "default": "travsr",
+          "description": "Path to the travsr binary. Defaults to 'travsr' (must be on PATH)."
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "tsc --noEmit -p ./"
+    "lint": "tsc --noEmit -p ./",
+    "test": "node ./out/test/runTests.js"
+  },
+  "overrides": {
+    "serialize-javascript": ">=7.0.5"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.6",
     "@types/node": "^25.8.0",
     "@types/vscode": "^1.85.0",
     "@vscode/test-electron": "^2.3.9",
+    "mocha": "^10.3.0",
     "typescript": "^6.0.3"
   }
 }

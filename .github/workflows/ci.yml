@@ -138,8 +138,3 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
-
-  # The VS Code extension job is intentionally not wired up yet. Sprint 3
-  # will add a dedicated workflow (.github/workflows/vscode.yml) once the
-  # extension has runtime code and a committed package-lock.json. See
-  # docs/planning/SPRINT-03.md.
