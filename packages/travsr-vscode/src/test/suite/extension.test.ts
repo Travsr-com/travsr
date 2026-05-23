@@ -18,13 +18,14 @@ function makeMcp(
 }
 
 suite("VSCODE-201: BlastRadius selector covers expected languages", () => {
-  test("selector includes typescript, rust, python", () => {
+  test("selector includes typescript, rust, python, go", () => {
     const langs = (
       BLAST_RADIUS_SELECTOR as Array<{ language: string }>
     ).map((s) => s.language);
     assert.ok(langs.includes("typescript"));
     assert.ok(langs.includes("rust"));
     assert.ok(langs.includes("python"));
+    assert.ok(langs.includes("go"));
   });
 });
 

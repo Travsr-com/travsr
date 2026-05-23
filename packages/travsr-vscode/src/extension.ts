@@ -17,7 +17,8 @@ export function activate(context: vscode.ExtensionContext): void {
       .getConfiguration("travsr")
       .get<string>("binaryPath", "travsr");
 
-  const mcp = new StdioMcpClient(binary);
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const mcp = new StdioMcpClient(binary, workspaceRoot);
   context.subscriptions.push({ dispose: () => mcp.dispose() });
 
   void mcp.connect();

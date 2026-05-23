@@ -19,6 +19,7 @@ tree-sitter-typescript = { workspace = true }
 sha2 = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

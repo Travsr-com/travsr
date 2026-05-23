@@ -27,11 +27,15 @@ export class StdioMcpClient implements McpClient {
   private nextId = 1;
   private connected = false;
 
-  constructor(private readonly binary: string) {}
+  constructor(
+    private readonly binary: string,
+    private readonly cwd?: string
+  ) {}
 
   async connect(): Promise<void> {
     this.proc = cp.spawn(this.binary, ["mcp", "--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
+      cwd: this.cwd,
     });
 
     this.proc.stdout?.setEncoding("utf8");

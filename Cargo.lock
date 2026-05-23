@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-cli"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2222,7 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-daemon"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ignore",
@@ -2240,14 +2240,14 @@ dependencies = [
 
 [[package]]
 name = "travsr-error"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "travsr-indexer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -2258,6 +2258,7 @@ dependencies = [
  "travsr-core",
  "travsr-error",
  "tree-sitter",
+ "tree-sitter-go",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
@@ -2265,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-mcp"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2280,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-retrieval"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -2292,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-store"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "kuzu",
@@ -2315,6 +2316,16 @@ checksum = "df7cc499ceadd4dcdf7ec6d4cbc34ece92c3fa07821e287aedecd4416c516dca"
 dependencies = [
  "cc",
  "regex",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8d702a98d3c7e70e466456e58ff2b1ac550bf1e29b97e5770676d2fdabec00d"
+dependencies = [
+ "cc",
+ "tree-sitter",
 ]
 
 [[package]]

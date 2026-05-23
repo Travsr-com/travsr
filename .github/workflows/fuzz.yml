@@ -19,16 +19,17 @@ jobs:
       group: fuzz-${{ github.ref }}-${{ matrix.target }}
       cancel-in-progress: true
     strategy:
-      fail-fast: false   # run all three targets even if one panics
+      fail-fast: false   # run all targets even if one panics
       matrix:
         target:
           - fuzz_mcp_parser
           - fuzz_lsif_ingest
           - fuzz_treesitter_indexer
+          - fuzz_go_parser
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
