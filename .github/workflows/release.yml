@@ -169,6 +169,10 @@ jobs:
     needs: [build, kuzu-proof-build]
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
