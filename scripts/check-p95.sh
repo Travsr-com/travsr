@@ -41,17 +41,38 @@ INDEXER_BENCHES_OPTIONAL=(
 
 PASS=true
 
+# Locate the estimates.json for a given bench, checking multiple Criterion
+# output directories in order of preference:
+#   new/    — written on every bench run (canonical path)
+#   pr/     — written when --save-baseline pr is used in CI
+#   master/ — written when --save-baseline master is used on master push
+#   base/   — written when --baseline is used for comparison
+# Some Criterion versions / environments only write the named baseline and not
+# "new/"; probing all candidates makes the gate robust across environments.
+find_estimates() {
+  local BENCH="$1"
+  for SUFFIX in new pr master base; do
+    local CANDIDATE="target/criterion/${BENCH}/${SUFFIX}/estimates.json"
+    if [ -f "$CANDIDATE" ]; then
+      echo "$CANDIDATE"
+      return 0
+    fi
+  done
+  return 1
+}
+
 check_bench() {
   local BENCH="$1"
   local OPTIONAL="${2:-false}"
-  local ESTIMATES="target/criterion/${BENCH}/new/estimates.json"
 
-  if [ ! -f "$ESTIMATES" ]; then
+  local ESTIMATES
+  if ! ESTIMATES=$(find_estimates "$BENCH"); then
     if [ "$OPTIONAL" = "true" ]; then
-      echo "SKIP: ${BENCH} — criterion output not found (optional, skipping)"
+      echo "SKIP: ${BENCH} — criterion output not found in any baseline dir (optional, skipping)"
       return
     fi
-    echo "ERROR: criterion output not found at ${ESTIMATES}"
+    echo "ERROR: criterion output not found for ${BENCH}"
+    echo "       Checked: target/criterion/${BENCH}/{new,pr,master,base}/estimates.json"
     echo "       Run the relevant cargo bench command first."
     exit 1
   fi

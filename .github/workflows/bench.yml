@@ -63,11 +63,20 @@ jobs:
           cargo bench -p travsr-indexer   --bench indexer   -- --save-baseline pr
 
       # ------------------------------------------------------------------
-      # Absolute p95 latency gate — 1k-file fixture must stay under 50ms
-      # (Issue #32 / S7-1). Runs on both push and pull_request so regressions
-      # are caught on feature branches before they reach master.
+      # Indexer p95 gate — run WITHOUT --save-baseline so Criterion always
+      # writes target/criterion/.../new/estimates.json (some environments only
+      # write the named baseline, not "new/", when --save-baseline is used).
+      # check-p95.sh also probes pr/ and master/ as fallbacks (PERF-201).
       # ------------------------------------------------------------------
-      - name: Check p95 latency gate (< 50ms on 1k-file fixture)
+      - name: Run indexer benchmarks (p95 gate — no save-baseline)
+        run: cargo bench -p travsr-indexer --bench indexer
+
+      # ------------------------------------------------------------------
+      # Absolute p95 latency gate — retrieval 1k-file fixture + indexer parse.
+      # Runs on both push and pull_request so regressions are caught on feature
+      # branches before they reach master.
+      # ------------------------------------------------------------------
+      - name: Check p95 latency gate (< 50ms on all gated benchmarks)
         run: bash scripts/check-p95.sh
 
       # ------------------------------------------------------------------
