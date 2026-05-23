@@ -77,6 +77,7 @@ check_bench() {
     exit 1
   fi
 
+  local MEAN_NS
   MEAN_NS=$(python3 -c "
 import json
 with open('${ESTIMATES}') as f:

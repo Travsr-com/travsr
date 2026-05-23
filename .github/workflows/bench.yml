@@ -63,18 +63,10 @@ jobs:
           cargo bench -p travsr-indexer   --bench indexer   -- --save-baseline pr
 
       # ------------------------------------------------------------------
-      # Indexer p95 gate — run WITHOUT --save-baseline so Criterion always
-      # writes target/criterion/.../new/estimates.json (some environments only
-      # write the named baseline, not "new/", when --save-baseline is used).
-      # check-p95.sh also probes pr/ and master/ as fallbacks (PERF-201).
-      # ------------------------------------------------------------------
-      - name: Run indexer benchmarks (p95 gate — no save-baseline)
-        run: cargo bench -p travsr-indexer --bench indexer
-
-      # ------------------------------------------------------------------
       # Absolute p95 latency gate — retrieval 1k-file fixture + indexer parse.
-      # Runs on both push and pull_request so regressions are caught on feature
-      # branches before they reach master.
+      # The --save-baseline steps above already ran both benches and wrote their
+      # outputs; check-p95.sh probes new/, pr/, master/, base/ in order so it
+      # picks up whichever Criterion wrote (PERF-201).
       # ------------------------------------------------------------------
       - name: Check p95 latency gate (< 50ms on all gated benchmarks)
         run: bash scripts/check-p95.sh

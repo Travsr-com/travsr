@@ -6,8 +6,9 @@
 //!                 Measures the full Tree-sitter query + node-emit path for a
 //!                 typical small Rust file (57 lines, 19 nodes).
 //!
-//!   rust/warm   — parse `simple.rs` twice in the same iteration to simulate a
-//!                 warm re-index (hot instruction cache, no cold-start overhead).
+//!   rust/warm   — parse `simple.rs` **twice** in the same `b.iter()` call so
+//!                 the second parse sees a hot instruction cache. Measures the
+//!                 incremental re-index path where the file was just parsed.
 //!
 //!   rust/travsr_core — parse `crates/travsr-core/src/lib.rs` from the real
 //!                      Travsr workspace.  This is the "Travsr indexes itself"
@@ -59,18 +60,18 @@ fn bench_rust_cold(c: &mut Criterion) {
     group.finish();
 }
 
-/// Warm re-index of the simple.rs fixture — two consecutive parses per iter so
-/// the hot path (instruction cache warm) dominates the measurement.
+/// Warm re-index of the simple.rs fixture — **two** parses per `b.iter()` call
+/// so the second parse sees a hot instruction cache. The first parse primes the
+/// dcache and icache; the second parse is the timed "warm re-index" path.
 fn bench_rust_warm(c: &mut Criterion) {
     let fixture = simple_fixture();
     let indexer = Indexer::new();
-    // Single warm-up parse before the measurement loop.
-    let _ = indexer
-        .parse_file_with_vname(&fixture, "src/simple.rs")
-        .unwrap();
     let mut group = c.benchmark_group("rust/warm");
     group.bench_function("simple_rs", |b| {
         b.iter(|| {
+            let _ = indexer
+                .parse_file_with_vname(&fixture, "src/simple.rs")
+                .unwrap();
             indexer
                 .parse_file_with_vname(&fixture, "src/simple.rs")
                 .unwrap()
