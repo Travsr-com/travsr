@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
-use travsr_core::{canonical_corpus, canonical_corpus_local, SIGNATURE_FORMAT_VERSION};
-use travsr_indexer::{hash_file, ingest_lsif, link_imports, run_lsif_emitter, Indexer};
+use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
+use travsr_indexer::{
+    hash_file, ingest_lsif, link_imports, link_imports_rust, run_lsif_emitter, Indexer,
+};
 use travsr_store::{SqliteStore, Store};
 
 pub use hook::{changed_files_from_git, install_hook};
@@ -31,8 +33,9 @@ pub struct InitStats {
 /// Initialise a Travsr index in `repo_root`:
 /// 1. Create `.travsr/graph.db` with WAL-mode migrations.
 /// 2. Install the `post-commit` git hook.
-/// 3. Walk all `.ts`/`.tsx` files (honours `.gitignore`) and index them via
-///    the delta path so the `files` hash table is populated from the start.
+/// 3. Walk all `.ts`/`.tsx`/`.rs` files (honours `.gitignore`, skips `target/`)
+///    and index them via the delta path so the `files` hash table is populated
+///    from the start.
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     let travsr_dir = repo_root.join(".travsr");
     std::fs::create_dir_all(&travsr_dir).context("creating .travsr directory")?;
@@ -92,7 +95,7 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         .follow_links(false)
         .build();
 
-    let mut ts_paths: Vec<PathBuf> = Vec::new();
+    let mut indexable_paths: Vec<PathBuf> = Vec::new();
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -102,14 +105,23 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
             }
         };
         // Use entry.file_type() before into_path() — it does NOT follow symlinks,
-        // so symlinks pointing at .ts files are excluded. p.is_file() would follow them.
+        // so symlinks pointing at source files are excluded. p.is_file() would follow them.
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let p = entry.into_path();
-        let ext = p.extension().and_then(|e| e.to_str());
-        if matches!(ext, Some("ts" | "tsx")) {
-            ts_paths.push(p);
+        // Skip Rust build artifacts — the `target/` directory can be enormous
+        // and contains no user-authored source files worth indexing.
+        // CORRECTNESS: strip repo_root first so we check *relative* components
+        // only. Checking the absolute path would falsely skip every file in a
+        // repo that lives under e.g. `/home/target_user/myproject/`.
+        let rel = p.strip_prefix(repo_root).unwrap_or(&p);
+        if rel.components().any(|c| c.as_os_str() == "target") {
+            continue;
+        }
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if Language::from_extension(ext).is_some() {
+            indexable_paths.push(p);
         }
     }
 
@@ -117,7 +129,7 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     // including files skipped due to size or parse errors. The user-visible
     // "indexed N files" message is therefore optimistic. Fix by returning a
     // per-file success/skip result from reindex_files.
-    for abs_path in &ts_paths {
+    for abs_path in &indexable_paths {
         let edges_before = store.edge_count().unwrap_or(0);
         reindex_files(std::slice::from_ref(abs_path), repo_root, &mut store)?;
         edges_written += store.edge_count().unwrap_or(0).saturating_sub(edges_before);
@@ -233,7 +245,16 @@ pub fn reindex_files(
             }
         }
 
-        for edge in link_imports(&out.nodes, &vname_path, &corpus) {
+        // Route to the language-appropriate import resolver.
+        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let import_edges = match Language::from_extension(ext) {
+            Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
+            Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
+            // DEBT(travsr-indexer): link_imports_python deferred to Sprint 10.
+            // Structural nodes are still indexed; only import-resolution edges are missing.
+            _ => Vec::new(),
+        };
+        for edge in import_edges {
             if let Err(err) = store.put_edge(&edge) {
                 tracing::warn!("resolves-to edge write error: {err}");
             }
@@ -539,6 +560,59 @@ mod tests {
     /// version, `reindex_files` must return `Ok(())` without touching the graph.
     /// This is the core correctness guarantee — a version mismatch must never
     /// silently corrupt the graph with mixed-format NodeIds.
+    /// DAEMON-201: init_repo must walk and index `.rs` files the same way it
+    /// handles `.ts` files — at least one node must be written for a valid Rust
+    /// source file placed in the repo root.
+    #[test]
+    fn init_repo_indexes_rust_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("lib.rs"), "pub fn hello() -> u32 { 42 }").unwrap();
+
+        let stats = init_repo(tmp.path()).unwrap();
+
+        assert!(
+            stats.files_indexed >= 1,
+            "at least one Rust file must be counted as indexed"
+        );
+        assert!(
+            stats.nodes_written > 0,
+            "at least one node must be written for the Rust file"
+        );
+    }
+
+    /// DAEMON-201: any relative path component named `target` must be skipped
+    /// during the initial walk so Rust build artifacts are never indexed.
+    /// The `.gitignore` is intentionally left empty to ensure the component
+    /// check — not gitignore — is responsible for excluding `target/`.
+    #[test]
+    fn target_directory_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // Intentionally empty gitignore — the walker's component check must do
+        // the work, not a gitignore rule. This guards against a future git
+        // template that auto-adds `target/` and masks the real mechanism.
+        std::fs::write(tmp.path().join(".gitignore"), "# intentionally empty\n").unwrap();
+
+        // Simulate a Rust build artifact inside target/.
+        let target_dir = tmp.path().join("target").join("debug");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("build.rs"), "fn main() {}").unwrap();
+
+        // Real source file alongside it.
+        std::fs::write(tmp.path().join("src.rs"), "pub fn real() {}").unwrap();
+
+        let stats = init_repo(tmp.path()).unwrap();
+
+        // Only src.rs must be indexed — target/debug/build.rs must be skipped.
+        assert_eq!(
+            stats.files_indexed, 1,
+            "target/ contents must not be indexed; expected 1 file, got {}",
+            stats.files_indexed
+        );
+    }
+
     #[test]
     fn reindex_files_skips_on_version_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
