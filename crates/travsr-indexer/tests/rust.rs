@@ -340,11 +340,7 @@ fn golden_simple_fixture_no_duplicate_node_ids() {
 #[test]
 fn golden_simple_fixture_no_duplicate_edges() {
     let out = parse_fixture();
-    let mut keys: Vec<_> = out
-        .edges
-        .iter()
-        .map(|e| (e.src, e.dst, e.kind))
-        .collect();
+    let mut keys: Vec<_> = out.edges.iter().map(|e| (e.src, e.dst, e.kind)).collect();
     keys.sort_unstable_by_key(|(s, d, _)| (*s, *d));
     let before = keys.len();
     keys.dedup();
