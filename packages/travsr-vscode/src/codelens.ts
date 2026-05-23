@@ -26,26 +26,38 @@ function formatBlastCount(n: number): string {
   return n > 99 ? "99+" : String(n);
 }
 
+// Carries the document's relative path so resolveCodeLens doesn't depend on
+// activeTextEditor (which may point to a different document when lenses are
+// resolved in the background or in a side-by-side view).
+class BlastRadiusLens extends vscode.CodeLens {
+  constructor(
+    range: vscode.Range,
+    readonly file: string
+  ) {
+    super(range);
+  }
+}
+
 export class BlastRadiusCodeLensProvider implements vscode.CodeLensProvider {
   // null = resolved to 0 files (lens omitted). undefined = not yet cached.
   private readonly cache = new Map<string, vscode.CodeLens | null>();
 
   constructor(private readonly mcp: McpClient) {}
 
-  provideCodeLenses(_document: vscode.TextDocument): vscode.CodeLens[] {
-    // Return a placeholder lens at line 0; resolveCodeLens fills in the command.
+  provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+    const file = vscode.workspace.asRelativePath(document.uri, false);
     const range = new vscode.Range(0, 0, 0, 0);
-    return [new vscode.CodeLens(range)];
+    return [new BlastRadiusLens(range, file)];
   }
 
   async resolveCodeLens(
     lens: vscode.CodeLens,
     token: vscode.CancellationToken
   ): Promise<vscode.CodeLens | undefined> {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor || token.isCancellationRequested) return undefined;
+    if (token.isCancellationRequested) return undefined;
+    if (!(lens instanceof BlastRadiusLens)) return undefined;
 
-    const file = vscode.workspace.asRelativePath(editor.document.uri, false);
+    const { file } = lens;
 
     const cached = this.cache.get(file);
     if (cached === null) return undefined; // known-empty

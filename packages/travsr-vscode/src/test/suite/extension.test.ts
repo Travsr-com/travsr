@@ -43,9 +43,13 @@ suite("VSCODE-202: BlastRadiusCodeLensProvider", () => {
   test("resolveCodeLens returns undefined when count = 0", async () => {
     const mcp = makeMcp({ get_blast_radius: "" });
     const provider = new BlastRadiusCodeLensProvider(mcp);
-    const lens = new vscode.CodeLens(new vscode.Range(0, 0, 0, 0));
+    const doc = await vscode.workspace.openTextDocument({
+      language: "typescript",
+      content: "",
+    });
+    const lenses = provider.provideCodeLenses(doc);
     const result = await provider.resolveCodeLens(
-      lens,
+      lenses[0],
       new vscode.CancellationTokenSource().token
     );
     assert.strictEqual(result, undefined);
@@ -54,17 +58,13 @@ suite("VSCODE-202: BlastRadiusCodeLensProvider", () => {
   test("resolveCodeLens sets title with file count", async () => {
     const mcp = makeMcp({ get_blast_radius: "src/a.ts\nsrc/b.ts\n" });
     const provider = new BlastRadiusCodeLensProvider(mcp);
-    const lens = new vscode.CodeLens(new vscode.Range(0, 0, 0, 0));
-
-    // Open a file so activeTextEditor exists
     const doc = await vscode.workspace.openTextDocument({
       language: "typescript",
       content: "",
     });
-    await vscode.window.showTextDocument(doc);
-
+    const lenses = provider.provideCodeLenses(doc);
     const result = await provider.resolveCodeLens(
-      lens,
+      lenses[0],
       new vscode.CancellationTokenSource().token
     );
     assert.ok(result?.command?.title.includes("blast:"));
@@ -77,19 +77,27 @@ suite("VSCODE-202: BlastRadiusCodeLensProvider", () => {
     );
     const mcp = makeMcp({ get_blast_radius: lines });
     const provider = new BlastRadiusCodeLensProvider(mcp);
-    const lens = new vscode.CodeLens(new vscode.Range(0, 0, 0, 0));
-
     const doc = await vscode.workspace.openTextDocument({
       language: "typescript",
       content: "",
     });
-    await vscode.window.showTextDocument(doc);
-
+    const lenses = provider.provideCodeLenses(doc);
     const result = await provider.resolveCodeLens(
-      lens,
+      lenses[0],
       new vscode.CancellationTokenSource().token
     );
     assert.ok(result?.command?.title.includes("99+"));
+  });
+
+  test("resolveCodeLens returns undefined for untyped plain CodeLens", async () => {
+    // A lens not produced by provideCodeLenses must be safely rejected.
+    const provider = new BlastRadiusCodeLensProvider(makeMcp());
+    const plain = new vscode.CodeLens(new vscode.Range(0, 0, 0, 0));
+    const result = await provider.resolveCodeLens(
+      plain,
+      new vscode.CancellationTokenSource().token
+    );
+    assert.strictEqual(result, undefined);
   });
 });
 
@@ -134,5 +142,33 @@ suite("VSCODE-203: CallersHoverProvider", () => {
         : "";
     assert.ok(text.includes("Callers"));
     assert.ok(text.includes("Blast radius: 3 files"));
+  });
+
+  test("hover shows '… and N more' when callers exceed 5", async () => {
+    const callerLines = Array.from(
+      { length: 8 },
+      (_, i) => `[call] fn:fn${i} (function) — src/f${i}.ts`
+    ).join("\n");
+    const mcp = makeMcp({
+      get_callers: callerLines,
+      get_blast_radius: "src/x.ts",
+    });
+    const provider = new CallersHoverProvider(mcp);
+    const doc = await vscode.workspace.openTextDocument({
+      language: "typescript",
+      content: "function bar() {}\n",
+    });
+    const pos = new vscode.Position(0, 10);
+    const hover = await provider.provideHover(
+      doc,
+      pos,
+      new vscode.CancellationTokenSource().token
+    );
+    assert.ok(hover !== undefined);
+    const text =
+      hover.contents[0] instanceof vscode.MarkdownString
+        ? hover.contents[0].value
+        : "";
+    assert.ok(text.includes("… and 3 more"));
   });
 });
