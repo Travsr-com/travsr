@@ -1,42 +1,63 @@
 #!/usr/bin/env bash
-# check-p95.sh — assert that the 1k-file fixture benchmarks stay under 50 ms.
+# check-p95.sh — assert that all latency-gated benchmarks stay under 50 ms.
 #
 # Usage: ./scripts/check-p95.sh
 #
-# Reads Criterion's JSON estimates from target/criterion/ after
-# `cargo bench --bench retrieval -- 1k_fixture` has been run.
+# Reads Criterion's JSON estimates from target/criterion/ after running:
+#   cargo bench -p travsr-retrieval --bench retrieval -- 1k_fixture
+#   cargo bench -p travsr-indexer   --bench indexer
+#
 # Fails with exit code 1 if any measured mean exceeds MAX_NS.
 #
 # Criterion stores per-benchmark results in:
 #   target/criterion/<group>/<bench>/new/estimates.json
 # where estimates.json contains:
 #   { "mean": { "point_estimate": <nanoseconds (f64)>, ... }, ... }
+#
+# NOTE: Criterion maps '/' in group names to '_' in the output directory.
+#       "bfs/1k_fixture" → "bfs_1k_fixture", "rust/cold" → "rust_cold".
 
 set -euo pipefail
 
 # 50 milliseconds in nanoseconds
 MAX_NS=50000000
 
-# Criterion maps group names with '/' to '_' in the output directory.
-# The bench group "bfs/1k_fixture" becomes "bfs_1k_fixture" on disk.
-BENCHES=(
+# ── Retrieval benchmarks (query latency — 1k-file fixture) ───────────────────
+RETRIEVAL_BENCHES=(
   "bfs_1k_fixture/fan-1000"
   "ppr_1k_fixture/fan-1000"
 )
 
+# ── Indexer benchmarks (parse latency — PERF-201 / Issue #121) ───────────────
+# rust/travsr_core is optional: gracefully skipped when criterion output is
+# absent (vendor-only CI that doesn't have the full workspace).
+INDEXER_BENCHES_REQUIRED=(
+  "rust_cold/simple_rs"
+  "rust_warm/simple_rs"
+)
+INDEXER_BENCHES_OPTIONAL=(
+  "rust_travsr_core/lib_rs"
+)
+
 PASS=true
 
-for BENCH in "${BENCHES[@]}"; do
-  ESTIMATES="target/criterion/${BENCH}/new/estimates.json"
+check_bench() {
+  local BENCH="$1"
+  local OPTIONAL="${2:-false}"
+  local ESTIMATES="target/criterion/${BENCH}/new/estimates.json"
+
   if [ ! -f "$ESTIMATES" ]; then
+    if [ "$OPTIONAL" = "true" ]; then
+      echo "SKIP: ${BENCH} — criterion output not found (optional, skipping)"
+      return
+    fi
     echo "ERROR: criterion output not found at ${ESTIMATES}"
-    echo "       Run: cargo bench --bench retrieval -- 1k_fixture"
+    echo "       Run the relevant cargo bench command first."
     exit 1
   fi
 
-  # Extract mean.point_estimate (nanoseconds) using python3 (always available in CI)
   MEAN_NS=$(python3 -c "
-import json, sys
+import json
 with open('${ESTIMATES}') as f:
     d = json.load(f)
 print(int(d['mean']['point_estimate']))
@@ -49,6 +70,20 @@ print(int(d['mean']['point_estimate']))
     MS=$(python3 -c "print(f'{${MEAN_NS}/1_000_000:.3f}')")
     echo "OK:   ${BENCH} mean=${MEAN_NS}ns (${MS}ms) — within 50ms budget"
   fi
+}
+
+echo "=== Retrieval benchmarks ==="
+for BENCH in "${RETRIEVAL_BENCHES[@]}"; do
+  check_bench "$BENCH" "false"
+done
+
+echo ""
+echo "=== Indexer benchmarks (PERF-201) ==="
+for BENCH in "${INDEXER_BENCHES_REQUIRED[@]}"; do
+  check_bench "$BENCH" "false"
+done
+for BENCH in "${INDEXER_BENCHES_OPTIONAL[@]}"; do
+  check_bench "$BENCH" "true"
 done
 
 if [ "$PASS" != "true" ]; then
@@ -59,4 +94,4 @@ if [ "$PASS" != "true" ]; then
 fi
 
 echo ""
-echo "All 1k-fixture benchmarks within p95 < 50ms budget."
+echo "All gated benchmarks within p95 < 50ms budget."
