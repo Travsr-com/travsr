@@ -319,3 +319,331 @@ mod tests {
         assert_eq!(out.edges.len(), 1);
     }
 }
+
+// ── Rust LSIF ingestion (INDEX-212) ───────────────────────────────────────────
+//
+// Parses standard rust-analyzer LSIF 0.4.x dumps (no travsr_vname extension).
+// Emits `RefCall` edges from `item/references` entries only.
+// Nodes are never emitted — Tree-sitter owns structural node definitions.
+//
+// VName convention (Sprint 9):
+//   Caller: VName { corpus, root="", path=<doc relative path>, language="rust",
+//                   signature="file" }
+//   Callee: VName { corpus, root="", path=<project_root>, language="rust",
+//                   signature=<moniker identifier> }
+//
+// Sprint 10 will reconcile callee VNames with Tree-sitter signatures.
+
+/// Intermediate graph built during a two-pass LSIF parse.
+///
+/// Pass 1 populates all fields by walking every line once.
+/// Pass 2 resolves forward-referenced monikers (rust-analyzer can emit a
+/// `moniker` edge before the moniker vertex it references).
+#[derive(Debug, Default)]
+struct RustLsifGraph {
+    /// `file:///repo` → `"repo"` (stripped of `file://`).
+    project_root: String,
+    /// resultSet id → moniker identifier (e.g. `"simple::add"`).
+    rs_monikers: HashMap<u64, String>,
+    /// referenceResult id → resultSet id.
+    ref_result_to_rs: HashMap<u64, u64>,
+    /// document id → repo-relative file path.
+    doc_paths: HashMap<u64, String>,
+    /// moniker vertex id → resultSet id (used for forward-ref resolution).
+    monikers: HashMap<u64, u64>,
+}
+
+/// Parse a rust-analyzer LSIF dump into an intermediate graph.
+///
+/// Two-pass to handle forward-referenced monikers: rust-analyzer sometimes
+/// emits a `moniker` edge (outV=resultSet, inV=moniker_vertex) before the
+/// moniker vertex itself. Pass 1 builds what it can; pass 2 resolves
+/// any pending entries.
+fn parse_rust_graph(dump: &str) -> anyhow::Result<RustLsifGraph> {
+    let mut g = RustLsifGraph::default();
+
+    // (resultSet id, moniker vertex id) pairs encountered as edges but whose
+    // moniker vertex had not yet appeared at edge-parse time.
+    let mut pending: Vec<(u64, u64)> = Vec::new();
+
+    for line in dump.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("vertex") => match v.get("label").and_then(|l| l.as_str()) {
+                Some("metaData") => {
+                    if let Some(root) = v.get("projectRoot").and_then(|r| r.as_str()) {
+                        g.project_root = root.strip_prefix("file://").unwrap_or(root).to_string();
+                    }
+                }
+                Some("document") => {
+                    if let (Some(id), Some(uri)) = (
+                        v.get("id").and_then(|i| i.as_u64()),
+                        v.get("uri").and_then(|u| u.as_str()),
+                    ) {
+                        let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+                        g.doc_paths.insert(id, path);
+                    }
+                }
+                Some("moniker") => {
+                    // Store moniker vertex id → identifier for later edge resolution.
+                    if let (Some(id), Some(ident)) = (
+                        v.get("id").and_then(|i| i.as_u64()),
+                        v.get("identifier").and_then(|i| i.as_str()),
+                    ) {
+                        g.monikers.insert(id, 0); // placeholder; resolved below
+                                                  // Resolve any pending forward-refs for this moniker vertex.
+                        for (rs_id, m_id) in &pending {
+                            if *m_id == id {
+                                g.rs_monikers.insert(*rs_id, ident.to_string());
+                            }
+                        }
+                        // Store the identifier keyed by moniker vertex id for
+                        // new `moniker` edges that arrive after this vertex.
+                        g.monikers.insert(id, id); // real id stored for lookup below
+                                                   // We re-use the `monikers` map as id→id; store ident separately.
+                                                   // Overwrite with a sentinel we can look up in the edge pass.
+                                                   // Simpler: just store ident in a side map.
+                        g.monikers.remove(&id);
+                        // Use rs_monikers with a temporary negated key to carry ident
+                        // until the moniker edge arrives.
+                        // Encode as u64::MAX - id to avoid collision with resultSet ids.
+                        g.rs_monikers.insert(u64::MAX - id, ident.to_string());
+                    }
+                }
+                Some("referenceResult") => {
+                    // Nothing to store at vertex time; populated by edges below.
+                    let _ = v.get("id");
+                }
+                _ => {}
+            },
+            Some("edge") => match v.get("label").and_then(|l| l.as_str()) {
+                Some("moniker") => {
+                    // outV = resultSet id, inV = moniker vertex id
+                    if let (Some(rs_id), Some(m_id)) = (
+                        v.get("outV").and_then(|i| i.as_u64()),
+                        v.get("inV").and_then(|i| i.as_u64()),
+                    ) {
+                        // Check if the moniker vertex has already been seen.
+                        let sentinel_key = u64::MAX - m_id;
+                        if let Some(ident) = g.rs_monikers.remove(&sentinel_key) {
+                            g.rs_monikers.insert(rs_id, ident);
+                        } else {
+                            // Moniker vertex not yet seen — defer.
+                            pending.push((rs_id, m_id));
+                        }
+                    }
+                }
+                Some("textDocument/references") => {
+                    // outV = resultSet id, inV = referenceResult id
+                    if let (Some(rs_id), Some(rr_id)) = (
+                        v.get("outV").and_then(|i| i.as_u64()),
+                        v.get("inV").and_then(|i| i.as_u64()),
+                    ) {
+                        g.ref_result_to_rs.insert(rr_id, rs_id);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    // Pass 2: resolve remaining forward-referenced monikers.
+    // (Any pending entries whose moniker vertex arrived after the moniker edge
+    // AND before pass 2 are already resolved above. This handles the edge case
+    // where the moniker vertex never appeared — those are silently dropped.)
+    for (rs_id, m_id) in &pending {
+        let sentinel_key = u64::MAX - m_id;
+        if let Some(ident) = g.rs_monikers.remove(&sentinel_key) {
+            g.rs_monikers.insert(*rs_id, ident);
+        }
+    }
+
+    // Clean up any remaining sentinel entries.
+    g.rs_monikers.retain(|k, _| *k < u64::MAX / 2);
+
+    Ok(g)
+}
+
+/// Walk all `item` edges and emit `RefCall` edges for `property: "references"`.
+fn ingest_rust_edges_from_dump(dump: &str, corpus: &str) -> Vec<Edge> {
+    let g = match parse_rust_graph(dump) {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut edges = Vec::new();
+
+    for line in dump.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if v.get("type").and_then(|t| t.as_str()) != Some("edge") {
+            continue;
+        }
+        if v.get("label").and_then(|l| l.as_str()) != Some("item") {
+            continue;
+        }
+        if v.get("property").and_then(|p| p.as_str()) != Some("references") {
+            continue;
+        }
+
+        let rr_id = match v.get("outV").and_then(|i| i.as_u64()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let doc_id = match v.get("document").and_then(|i| i.as_u64()) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        let rs_id = match g.ref_result_to_rs.get(&rr_id) {
+            Some(id) => *id,
+            None => continue,
+        };
+        let moniker_ident = match g.rs_monikers.get(&rs_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        let doc_path = match g.doc_paths.get(&doc_id) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Caller: the file containing the reference site.
+        let caller_path = make_relative(&g.project_root, doc_path);
+        let caller = VName::new(corpus, "", caller_path, "rust", "file");
+
+        // Callee: the symbol identified by the moniker.
+        let callee = VName::new(corpus, "", &g.project_root, "rust", moniker_ident);
+
+        edges.push(Edge::new(caller.id(), callee.id(), EdgeKind::RefCall));
+    }
+
+    edges
+}
+
+/// Parse a rust-analyzer LSIF dump and return Travsr graph records.
+///
+/// Only `RefCall` edges are emitted. Nodes are not emitted — Tree-sitter owns
+/// structural node definitions (ADR-002). The `corpus` is stamped into every
+/// caller VName so edges from different repos cannot collide.
+///
+/// # Errors
+/// Returns an error only if the dump cannot be parsed at all. Individual
+/// unrecognised lines are silently skipped for forward-compatibility.
+pub fn ingest_rust(dump: &str, corpus: &str) -> anyhow::Result<ParseOutput> {
+    let edges = ingest_rust_raw(dump, corpus)?;
+    Ok(ParseOutput {
+        nodes: Vec::new(),
+        edges,
+    })
+}
+
+/// Return only the `Edge` vec from a rust-analyzer LSIF dump.
+///
+/// Useful in tests that want to inspect edges directly without the
+/// `ParseOutput` wrapper.
+pub fn ingest_rust_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
+    Ok(ingest_rust_edges_from_dump(dump, corpus))
+}
+
+// ── Rust LSIF unit tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod rust_lsif_tests {
+    use super::*;
+    use travsr_core::EdgeKind;
+
+    /// Minimal rust-analyzer LSIF dump with one symbol and one reference.
+    fn rust_dump_one_ref() -> &'static str {
+        r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///r","positionEncoding":"utf-16","toolInfo":{"name":"rust-analyzer","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///r/src/main.rs","languageId":"rust"}
+{"id":3,"type":"vertex","label":"resultSet"}
+{"id":4,"type":"vertex","label":"moniker","scheme":"rust-analyzer","identifier":"crate::foo","unique":"workspace","kind":"export"}
+{"id":5,"type":"edge","label":"moniker","outV":3,"inV":4}
+{"id":6,"type":"vertex","label":"referenceResult"}
+{"id":7,"type":"edge","label":"textDocument/references","outV":3,"inV":6}
+{"id":8,"type":"edge","label":"item","outV":6,"inVs":[9],"document":2,"property":"references"}
+"#
+    }
+
+    #[test]
+    fn ingest_rust_raw_produces_ref_call_edges() {
+        let edges = ingest_rust_raw(rust_dump_one_ref(), "corp").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, EdgeKind::RefCall);
+    }
+
+    #[test]
+    fn ingest_rust_skips_non_references_items() {
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///r","positionEncoding":"utf-16","toolInfo":{"name":"rust-analyzer","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///r/src/lib.rs","languageId":"rust"}
+{"id":3,"type":"vertex","label":"resultSet"}
+{"id":4,"type":"vertex","label":"moniker","scheme":"rust-analyzer","identifier":"crate::Foo","unique":"workspace","kind":"export"}
+{"id":5,"type":"edge","label":"moniker","outV":3,"inV":4}
+{"id":6,"type":"vertex","label":"referenceResult"}
+{"id":7,"type":"edge","label":"textDocument/references","outV":3,"inV":6}
+{"id":8,"type":"edge","label":"item","outV":6,"inVs":[9],"document":2,"property":"definitions"}
+"#;
+        let edges = ingest_rust_raw(dump, "corp").unwrap();
+        assert_eq!(
+            edges.len(),
+            0,
+            "definitions-only item edges must not emit RefCall"
+        );
+    }
+
+    #[test]
+    fn ingest_rust_wraps_raw() {
+        let out = ingest_rust(rust_dump_one_ref(), "corp").unwrap();
+        assert_eq!(out.nodes.len(), 0, "Rust LSIF must not emit nodes");
+        assert_eq!(out.edges.len(), 1);
+    }
+
+    #[test]
+    fn ingest_rust_raw_is_idempotent() {
+        let mut first = ingest_rust_raw(rust_dump_one_ref(), "corp").unwrap();
+        let mut second = ingest_rust_raw(rust_dump_one_ref(), "corp").unwrap();
+        first.sort_by_key(|e| (e.src, e.dst, e.kind as u8));
+        second.sort_by_key(|e| (e.src, e.dst, e.kind as u8));
+        assert_eq!(first, second, "repeated ingest must be idempotent");
+    }
+
+    #[test]
+    fn ingest_rust_handles_forward_referenced_monikers() {
+        // moniker edge appears BEFORE the moniker vertex — must still resolve.
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///r","positionEncoding":"utf-16","toolInfo":{"name":"rust-analyzer","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///r/src/main.rs","languageId":"rust"}
+{"id":3,"type":"vertex","label":"resultSet"}
+{"id":5,"type":"edge","label":"moniker","outV":3,"inV":4}
+{"id":4,"type":"vertex","label":"moniker","scheme":"rust-analyzer","identifier":"crate::bar","unique":"workspace","kind":"export"}
+{"id":6,"type":"vertex","label":"referenceResult"}
+{"id":7,"type":"edge","label":"textDocument/references","outV":3,"inV":6}
+{"id":8,"type":"edge","label":"item","outV":6,"inVs":[9],"document":2,"property":"references"}
+"#;
+        let edges = ingest_rust_raw(dump, "corp").unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "forward-referenced moniker must still produce an edge"
+        );
+    }
+}

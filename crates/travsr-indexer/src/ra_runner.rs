@@ -22,13 +22,19 @@ use crate::sandbox::{build_sandboxed_command, SandboxConfig, SandboxStatus};
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Return `true` when `rust-analyzer` is on PATH.
+///
+/// Result is cached via `OnceLock` — the probe subprocess runs at most once
+/// per process lifetime since PATH does not change during a daemon run.
 pub fn ra_available() -> bool {
-    std::process::Command::new("rust-analyzer")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    static RA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RA_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("rust-analyzer")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
 }
 
 /// Run `rust-analyzer lsif <repo_root>` inside the SEC-201 sandbox and
@@ -85,6 +91,25 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
             )
         })?;
 
+    // Drain stdout and stderr on background threads BEFORE polling for exit.
+    // rust-analyzer LSIF output can exceed the OS pipe buffer (64 KB on Linux);
+    // if we poll try_wait() without draining, the child blocks on a full pipe
+    // and never exits — causing a spurious timeout kill. The drain threads run
+    // concurrently with the polling loop and join after the child exits or is
+    // killed. O(output_size) memory — acceptable for LSIF dumps (< 10 MB).
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_thread = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
     let deadline = Instant::now() + cfg.timeout;
 
     let exit_status = loop {
@@ -92,6 +117,9 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
             Some(s) => break s,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
+                // Join drain threads so they don't dangle after we return.
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
                 anyhow::bail!(
                     "rust-analyzer lsif timed out after {}s — killed",
                     cfg.timeout.as_secs()
@@ -101,14 +129,8 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
         }
     };
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
 
     if !exit_status.success() {
         // Include first 5 lines of stderr to aid debugging without flooding logs.
