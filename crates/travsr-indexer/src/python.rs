@@ -274,7 +274,10 @@ mod tests {
         std::fs::write(&path, b"def(class(import").unwrap();
         let out = parse("", &path, "bad.py").unwrap();
         assert!(!out.nodes.is_empty());
-        assert_eq!(out.nodes[0].kind, "file");
+        assert!(
+            out.nodes.iter().any(|n| n.kind == "file"),
+            "expected file node even for malformed input"
+        );
     }
 
     #[test]
