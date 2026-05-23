@@ -10,6 +10,7 @@ mod emit;
 mod hash;
 pub mod lsif;
 mod python;
+pub mod ra_runner;
 pub mod runner;
 mod rust;
 pub mod sandbox;
@@ -21,6 +22,8 @@ use travsr_core::{EdgeKind, Language};
 
 pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
+pub use lsif::{ingest_rust, ingest_rust_raw};
+pub use ra_runner::run_ra_lsif;
 pub use runner::run_lsif_emitter;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
