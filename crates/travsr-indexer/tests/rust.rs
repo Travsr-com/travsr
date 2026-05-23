@@ -343,7 +343,7 @@ fn golden_simple_fixture_no_duplicate_edges() {
     let mut keys: Vec<_> = out
         .edges
         .iter()
-        .map(|e| (e.src, e.dst, e.kind.clone()))
+        .map(|e| (e.src, e.dst, e.kind))
         .collect();
     keys.sort_unstable_by_key(|(s, d, _)| (*s, *d));
     let before = keys.len();
