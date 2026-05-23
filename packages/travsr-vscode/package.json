@@ -2,7 +2,7 @@
   "name": "travsr-vscode",
   "displayName": "Travsr",
   "description": "Graph-native code intelligence for VS Code, powered by the local Travsr daemon over MCP.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "travsr",
   "private": true,
   "license": "MIT",

@@ -52,7 +52,7 @@ export class StdioMcpClient implements McpClient {
     await this.rpc("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "travsr-vscode", version: "0.0.1" },
+      clientInfo: { name: "travsr-vscode", version: "0.1.0" },
     });
     this.connected = true;
   }
