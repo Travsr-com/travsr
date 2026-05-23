@@ -567,11 +567,7 @@ mod tests {
     fn init_repo_indexes_rust_files() {
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
-        std::fs::write(
-            tmp.path().join("lib.rs"),
-            "pub fn hello() -> u32 { 42 }",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "pub fn hello() -> u32 { 42 }").unwrap();
 
         let stats = init_repo(tmp.path()).unwrap();
 
