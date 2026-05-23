@@ -11,8 +11,8 @@ mod hash;
 pub mod lsif;
 mod python;
 pub mod runner;
-pub mod sandbox;
 mod rust;
+pub mod sandbox;
 mod typescript;
 
 use std::path::Path;

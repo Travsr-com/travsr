@@ -69,6 +69,10 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
+      - name: Install bubblewrap (Linux sandbox breach test)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y bubblewrap
+
       - name: Run tests
         run: cargo test --workspace
 
