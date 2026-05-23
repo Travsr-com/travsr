@@ -90,8 +90,11 @@ jobs:
         with:
           key: phase2-bench
 
-      - name: Run 1k-file fixture benchmarks
-        run: cargo bench --bench retrieval -- "1k_fixture"
+      - name: Run retrieval 1k-file fixture benchmarks
+        run: cargo bench -p travsr-retrieval --bench retrieval -- "1k_fixture"
+
+      - name: Run indexer benchmarks (PERF-201)
+        run: cargo bench -p travsr-indexer --bench indexer
 
       - name: Assert p95 < 50 ms
         run: bash scripts/check-p95.sh
