@@ -52,18 +52,23 @@ jobs:
       # ------------------------------------------------------------------
       - name: Run benchmarks → save as "master" baseline
         if: github.event_name == 'push'
-        run: cargo bench -p travsr-retrieval --bench retrieval -- --save-baseline master
+        run: |
+          cargo bench -p travsr-retrieval --bench retrieval -- --save-baseline master
+          cargo bench -p travsr-indexer   --bench indexer   -- --save-baseline master
 
       - name: Run benchmarks → save as "pr" baseline
         if: github.event_name == 'pull_request'
-        run: cargo bench -p travsr-retrieval --bench retrieval -- --save-baseline pr
+        run: |
+          cargo bench -p travsr-retrieval --bench retrieval -- --save-baseline pr
+          cargo bench -p travsr-indexer   --bench indexer   -- --save-baseline pr
 
       # ------------------------------------------------------------------
-      # Absolute p95 latency gate — 1k-file fixture must stay under 50ms
-      # (Issue #32 / S7-1). Runs on both push and pull_request so regressions
-      # are caught on feature branches before they reach master.
+      # Absolute p95 latency gate — retrieval 1k-file fixture + indexer parse.
+      # The --save-baseline steps above already ran both benches and wrote their
+      # outputs; check-p95.sh probes new/, pr/, master/, base/ in order so it
+      # picks up whichever Criterion wrote (PERF-201).
       # ------------------------------------------------------------------
-      - name: Check p95 latency gate (< 50ms on 1k-file fixture)
+      - name: Check p95 latency gate (< 50ms on all gated benchmarks)
         run: bash scripts/check-p95.sh
 
       # ------------------------------------------------------------------

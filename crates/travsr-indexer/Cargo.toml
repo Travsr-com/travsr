@@ -21,4 +21,9 @@ tree-sitter-rust = { workspace = true }
 tree-sitter-python = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "indexer"
+harness = false
