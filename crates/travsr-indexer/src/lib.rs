@@ -9,6 +9,7 @@
 mod emit;
 mod hash;
 pub mod lsif;
+mod python;
 pub mod runner;
 mod rust;
 mod typescript;
@@ -271,8 +272,11 @@ impl Indexer {
             Some(Language::Rust) => {
                 rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
             }
-            // Python parser is deferred to Sprint 10; other future languages
-            // (#[non_exhaustive]) are silently skipped until their parsers ship.
+            Some(Language::Python) => {
+                python::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
+            }
+            // Other future languages (#[non_exhaustive]) are silently skipped
+            // until their parsers ship.
             _ => Ok(ParseOutput::default()),
         }
     }
