@@ -355,6 +355,53 @@ fn golden_simple_fixture_no_duplicate_edges() {
     );
 }
 
+/// No unexpected extra nodes in the simple.rs output.
+///
+/// Complements `golden_simple_fixture_all_expected_nodes_present` by catching
+/// nodes that were added by the parser but are NOT in the expected set.
+/// The count test also catches this, but this test names the offending signature
+/// directly — much faster to diagnose on a regression.
+#[test]
+fn golden_simple_fixture_no_unexpected_nodes() {
+    let out = parse_fixture();
+
+    let expected_sigs: std::collections::BTreeSet<&str> = [
+        "file",
+        "struct:Config",
+        "struct:Worker",
+        "enum:Status",
+        "trait:Processor",
+        "impl:Config",
+        "impl:Worker",
+        "mod:utils",
+        "filemod:helpers",
+        "fn:helper",
+        "fn:run",
+        "fn:Worker.new",
+        "fn:Worker.process",
+        "fn:Config.fmt",
+        "const:MAX_RETRIES",
+        "static:APP_NAME",
+        "use:std::fmt",
+        "use:std::collections::HashMap",
+        "use:std::io",
+    ]
+    .into_iter()
+    .collect();
+
+    let actual_sigs: std::collections::BTreeSet<&str> = out
+        .nodes
+        .iter()
+        .map(|n| n.vname.signature.as_str())
+        .collect();
+
+    let unexpected: Vec<_> = actual_sigs.difference(&expected_sigs).collect();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected nodes in simple.rs output (update golden if fixture changed): {unexpected:?}"
+    );
+}
+
 // ── QA-201: Idempotency — parsing the same file twice is stable ───────────────
 
 /// Parsing the same file twice must produce identical NodeIds and edges.
@@ -373,13 +420,17 @@ fn idempotent_reindex_produces_identical_graph() {
         "NodeIds differ between first and second parse"
     );
 
-    let mut edges_a: Vec<_> = first.edges.iter().map(|e| (e.src, e.dst)).collect();
-    let mut edges_b: Vec<_> = second.edges.iter().map(|e| (e.src, e.dst)).collect();
-    edges_a.sort_unstable();
-    edges_b.sort_unstable();
+    let mut edges_a: Vec<_> = first.edges.iter().map(|e| (e.src, e.dst, e.kind)).collect();
+    let mut edges_b: Vec<_> = second
+        .edges
+        .iter()
+        .map(|e| (e.src, e.dst, e.kind))
+        .collect();
+    edges_a.sort_unstable_by_key(|(s, d, _)| (*s, *d));
+    edges_b.sort_unstable_by_key(|(s, d, _)| (*s, *d));
     assert_eq!(
         edges_a, edges_b,
-        "Edge (src, dst) pairs differ between first and second parse"
+        "Edge (src, dst, kind) triples differ between first and second parse"
     );
 }
 
