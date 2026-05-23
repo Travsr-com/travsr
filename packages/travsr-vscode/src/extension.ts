@@ -64,10 +64,10 @@ export function activate(context: vscode.ExtensionContext): void {
           "travsrBlastRadius",
           `Blast radius — ${file}`,
           vscode.ViewColumn.Beside,
-          {}
+          { localResourceRoots: [] }
         );
         panel.webview.html = buildFileListHtml(
-          `Blast radius for <code>${file}</code>`,
+          `Blast radius for <code>${escHtml(file)}</code>`,
           files
         );
       }
@@ -87,10 +87,10 @@ export function activate(context: vscode.ExtensionContext): void {
           "travsrCallers",
           `Callers — ${symbol}`,
           vscode.ViewColumn.Beside,
-          {}
+          { localResourceRoots: [] }
         );
         panel.webview.html = buildFileListHtml(
-          `Callers of <code>${symbol}</code>`,
+          `Callers of <code>${escHtml(symbol)}</code>`,
           lines
         );
       }
