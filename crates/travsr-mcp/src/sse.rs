@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::Event;
@@ -99,6 +100,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/rpc", post(rpc_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        // Reject bodies larger than MAX_BODY_BYTES at middleware level before axum
+        // buffers them — prevents multi-MB heap allocations ahead of the in-handler check.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
                 tracing::info_span!(
@@ -384,6 +388,10 @@ async fn sse_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     tokio::spawn(async move {
         cancel.cancelled().await;
         state_cleanup.sessions.remove(&session_id);
+        state_cleanup.event_counters.remove(&session_id);
+        state_cleanup
+            .ring_buffers
+            .remove(&(tenant_id_cleanup.clone(), session_id));
         tracing::debug!(
             session = %session_id,
             tenant = %tenant_id_cleanup,
@@ -597,6 +605,8 @@ fn dispatch_tool_call(
                     repo_arg,
                 ),
                 "get_repo_map" => tools::get_repo_map_global(repos, repo_arg),
+                // TODO(RFC-008 / #197): replace OpenFilter with per-session RbacFilter
+                // once token-scoped RBAC is implemented for the SSE path.
                 "get_execution_path" => tools::get_execution_path_global(
                     repos,
                     args["source"].as_str().unwrap_or(""),
