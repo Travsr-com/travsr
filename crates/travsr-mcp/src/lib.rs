@@ -9,15 +9,19 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 mod protocol;
 mod sanitize;
 mod server;
 pub mod session;
+pub mod sse;
 mod tools;
 
 // Re-exported for fuzz targets (fuzz/fuzz_targets/fuzz_mcp_parser.rs).
+pub use auth::fetch_signing_keys;
 pub use protocol::RpcRequest;
 pub use session::{session_id_log_hash, Session, SessionId, SessionStore};
+pub use sse::{router as sse_router, AppState};
 
 use std::path::Path;
 
