@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn pcst_same_node_returns_single() {
         let a = node("a.rs", "fn:a");
-        let store = store_with(&[a.clone()], &[]);
+        let store = store_with(std::slice::from_ref(&a), &[]);
         let result = pcst_path(&store, a.id, a.id, &OpenFilter, 4096).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, a.id);
