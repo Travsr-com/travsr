@@ -8,8 +8,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod pcst;
 pub mod ppr;
+pub mod rbac;
+
+pub use pcst::pcst_path;
 pub use ppr::ppr;
+pub use rbac::{EdgeFilter, OpenFilter, RbacFilter};
 
 use std::collections::{HashSet, VecDeque};
 

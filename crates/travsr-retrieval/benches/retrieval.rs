@@ -13,7 +13,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
-use travsr_retrieval::{bfs, ppr};
+use travsr_retrieval::{bfs, pcst_path, ppr, OpenFilter};
 use travsr_store::{SqliteStore, Store};
 
 // ---------------------------------------------------------------------------
@@ -147,6 +147,45 @@ fn bench_ppr_1k_fixture(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// PCST benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_pcst_chain(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pcst/chain");
+    for n in [50usize, 100, 200] {
+        let nodes: Vec<Node> = (0..n).map(make_node).collect();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for node in &nodes {
+            store.put_node(node).unwrap();
+        }
+        for i in 0..n - 1 {
+            store
+                .put_edge(&Edge::new(nodes[i].id, nodes[i + 1].id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let src = nodes[0].id;
+        let snk = nodes[n - 1].id;
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| pcst_path(&store, src, snk, &OpenFilter, usize::MAX).unwrap());
+        });
+    }
+    group.finish();
+}
+
+fn bench_pcst_disconnected_fallback(c: &mut Criterion) {
+    // No path — exercises the BFS fallback path.
+    let mut group = c.benchmark_group("pcst/disconnected_fallback");
+    let (store, seed) = chain(50);
+    // Use a sink that doesn't exist — forces BFS fallback.
+    let missing_sink = NodeId(u64::MAX);
+    group.bench_function("fallback-50", |b| {
+        b.iter(|| pcst_path(&store, seed, missing_sink, &OpenFilter, usize::MAX).unwrap());
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bfs_chain,
@@ -154,5 +193,7 @@ criterion_group!(
     bench_ppr_chain,
     bench_bfs_1k_fixture,
     bench_ppr_1k_fixture,
+    bench_pcst_chain,
+    bench_pcst_disconnected_fallback,
 );
 criterion_main!(benches);

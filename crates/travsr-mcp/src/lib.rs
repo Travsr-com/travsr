@@ -12,10 +12,12 @@
 mod protocol;
 mod sanitize;
 mod server;
+pub mod session;
 mod tools;
 
 // Re-exported for fuzz targets (fuzz/fuzz_targets/fuzz_mcp_parser.rs).
 pub use protocol::RpcRequest;
+pub use session::{session_id_log_hash, Session, SessionId, SessionStore};
 
 use std::path::Path;
 

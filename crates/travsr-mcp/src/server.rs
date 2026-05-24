@@ -110,6 +110,11 @@ fn handle_tool_call(
             tools::search_symbol(store, name)
         }
         "get_repo_map" => tools::get_repo_map(store),
+        "get_execution_path" => {
+            let source = args["source"].as_str().unwrap_or("");
+            let sink = args["sink"].as_str().unwrap_or("");
+            tools::get_execution_path(store, source, sink)
+        }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -186,6 +191,19 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_execution_path",
+                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string", "description": "Source symbol name (partial match supported)" },
+                        "sink": { "type": "string", "description": "Sink symbol name (partial match supported)" }
+                    },
+                    "required": ["source", "sink"],
                     "additionalProperties": false
                 }
             }
@@ -304,6 +322,11 @@ fn handle_tool_call_global(
             tools::search_symbol_global(repos, args["name"].as_str().unwrap_or(""), repo_arg)
         }
         "get_repo_map" => tools::get_repo_map_global(repos, repo_arg),
+        "get_execution_path" => {
+            let source = args["source"].as_str().unwrap_or("");
+            let sink = args["sink"].as_str().unwrap_or("");
+            tools::get_execution_path_global(repos, source, sink, repo_arg)
+        }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
@@ -386,6 +409,20 @@ fn tools_list_global() -> serde_json::Value {
                     },
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_execution_path",
+                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string", "description": "Source symbol name (partial match supported)" },
+                        "sink": { "type": "string", "description": "Sink symbol name (partial match supported)" },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["source", "sink"],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -401,10 +438,11 @@ mod tests {
         "get_blast_radius",
         "search_symbol",
         "get_repo_map",
+        "get_execution_path",
     ];
 
     #[test]
-    fn tools_list_contains_all_five_tools() {
+    fn tools_list_contains_all_tools() {
         let list = tools_list();
         let tools = list["tools"].as_array().expect("tools must be an array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -414,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_global_contains_all_five_tools() {
+    fn tools_list_global_contains_all_tools() {
         let list = tools_list_global();
         let tools = list["tools"].as_array().expect("tools must be an array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -453,6 +491,7 @@ mod tests {
             ("get_callers", "symbol"),
             ("get_blast_radius", "file"),
             ("search_symbol", "name"),
+            ("get_execution_path", "source"),
         ];
         for list in [tools_list(), tools_list_global()] {
             let tools = list["tools"].as_array().unwrap();
