@@ -115,6 +115,30 @@ impl Migration for V6EdgeConfidence {
     }
 }
 
+struct V7RbacColumns;
+impl Migration for V7RbacColumns {
+    fn version(&self) -> u32 {
+        7
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite.
+        // Guard manually so re-running after a crash (atomicity gap) is safe.
+        if !store.column_exists("nodes", "access_corpus")? {
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN access_corpus TEXT")?;
+        }
+        // CREATE TABLE IF NOT EXISTS is idempotent — safe to re-run.
+        store.exec_ddl(
+            "CREATE TABLE IF NOT EXISTS sessions (\
+               id      TEXT PRIMARY KEY,\
+               corpus  TEXT NOT NULL,\
+               created INTEGER NOT NULL DEFAULT (unixepoch()),\
+               expires INTEGER NOT NULL\
+             )",
+        )?;
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -125,6 +149,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V4EdgesSrcKindIdx);
     r.register(V5LanguagePackage);
     r.register(V6EdgeConfidence);
+    r.register(V7RbacColumns);
     r
 }
 
@@ -1174,5 +1199,76 @@ mod tests {
         let results = store.search_nodes_by_name("fn:bar").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].package, "bar-crate");
+    }
+
+    #[test]
+    fn v7_migration_adds_access_corpus_and_sessions_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("v6.db");
+
+        // Simulate a v6 DB (no access_corpus column, no sessions table).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES('schema_version', '6');
+                 CREATE TABLE nodes (
+                   id INTEGER PRIMARY KEY, corpus TEXT NOT NULL, root TEXT NOT NULL,
+                   path TEXT NOT NULL, language TEXT NOT NULL,
+                   signature TEXT NOT NULL, kind TEXT NOT NULL,
+                   format_version INTEGER NOT NULL DEFAULT 1,
+                   package TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE edges (
+                   src INTEGER NOT NULL, dst INTEGER NOT NULL, kind TEXT NOT NULL,
+                   provenance TEXT NOT NULL DEFAULT 'tree-sitter',
+                   confidence INTEGER,
+                   PRIMARY KEY (src, dst, kind)
+                 );
+                 CREATE TABLE files (
+                   path TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+                   last_indexed_at INTEGER NOT NULL
+                 );
+                 INSERT INTO nodes VALUES(1,'corp','','a.rs','rust','fn:a','function',1,'');",
+            )
+            .unwrap();
+        }
+
+        // Open with the v7 store — migration must succeed.
+        let store = SqliteStore::open(&db_path).expect("v6→v7 migration must succeed");
+
+        // Pre-existing node must survive migration with access_corpus defaulting to NULL.
+        let node = store.get_node(travsr_core::NodeId(1)).unwrap();
+        assert!(
+            node.is_some(),
+            "pre-existing node must survive v7 migration"
+        );
+
+        // sessions table must now exist — insert + select a row.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, corpus, expires) VALUES ('tok1', 'corp', 9999999999)",
+            [],
+        )
+        .unwrap();
+        let corpus: String = conn
+            .query_row("SELECT corpus FROM sessions WHERE id = 'tok1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            corpus, "corp",
+            "sessions table round-trip must work after v7"
+        );
+
+        // access_corpus column must exist and be nullable.
+        conn.execute("UPDATE nodes SET access_corpus = 'corp' WHERE id = 1", [])
+            .unwrap();
+        let ac: Option<String> = conn
+            .query_row("SELECT access_corpus FROM nodes WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ac, Some("corp".to_string()));
     }
 }

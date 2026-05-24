@@ -16,6 +16,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+dashmap = { workspace = true }
+blake3 = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
