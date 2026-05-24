@@ -5,6 +5,7 @@ use travsr_core::{Node, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 use crate::emit;
+use crate::ffi::{FfiMarker, FfiMarkerKind};
 use crate::ParseOutput;
 
 /// Reject files larger than this before reading them into memory.
@@ -70,6 +71,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut output = ParseOutput {
         nodes: vec![file_node],
         edges: vec![],
+        ffi_markers: vec![],
     };
 
     let mut parser = Parser::new();
@@ -204,6 +206,10 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     output
         .edges
         .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+
+    // Collect FFI markers for cross-language edge resolution (RFC-005).
+    let ffi_markers = collect_ffi_markers(corpus, vname_path, &source, &tree);
+    output.ffi_markers = ffi_markers;
 
     Ok(output)
 }
@@ -406,6 +412,110 @@ fn rust_use_node(corpus: &str, path: &str, use_path: &str) -> Node {
 
 fn rust_vname(corpus: &str, path: &str, signature: &str) -> VName {
     VName::new(corpus, "", path, "rust", signature)
+}
+
+// ── FFI marker collection (RFC-005) ──────────────────────────────────────────
+
+/// Walk the AST looking for #[napi] and #[pyfunction] attribute items on functions,
+/// emitting FfiMarker records for the ffi_resolver.
+pub(crate) fn collect_ffi_markers(
+    corpus: &str,
+    vname_path: &str,
+    source: &[u8],
+    tree: &tree_sitter::Tree,
+) -> Vec<FfiMarker> {
+    let mut markers = Vec::new();
+    walk_for_ffi_attrs(corpus, vname_path, source, tree.root_node(), &mut markers);
+    markers
+}
+
+fn walk_for_ffi_attrs(
+    corpus: &str,
+    vname_path: &str,
+    source: &[u8],
+    node: tree_sitter::Node<'_>,
+    out: &mut Vec<FfiMarker>,
+) {
+    if node.kind() == "function_item" {
+        // Check sibling attribute_items before this function
+        let mut attrs: Vec<String> = Vec::new();
+        if let Some(parent) = node.parent() {
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                if child.kind() == "attribute_item" {
+                    if let Ok(text) = child.utf8_text(source) {
+                        attrs.push(text.to_string());
+                    }
+                }
+                if child.id() == node.id() {
+                    break; // only attrs before this fn node
+                }
+            }
+        }
+
+        let fn_name_node = node.child_by_field_name("name");
+        let fn_name = fn_name_node
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("")
+            .to_string();
+        if fn_name.is_empty() {
+            return;
+        }
+
+        // Determine fn node_id using the same VName scheme as rust_fn_node.
+        let vname =
+            travsr_core::VName::new(corpus, "", vname_path, "rust", format!("fn:{fn_name}"));
+        let node_id = vname.id();
+
+        for attr in &attrs {
+            let attr_clean = attr.trim();
+
+            // #[napi] or #[napi(...)]
+            if attr_clean.contains("napi") {
+                let bound_name = extract_attr_string_arg(attr_clean, "js_name");
+                if let Some(m) = FfiMarker::try_new(
+                    node_id,
+                    FfiMarkerKind::NapiExport,
+                    fn_name.clone(),
+                    bound_name,
+                    None,
+                    None::<String>,
+                    corpus,
+                ) {
+                    out.push(m);
+                }
+            }
+            // #[pyfunction] or #[pyo3(...)]
+            else if attr_clean.contains("pyfunction") || attr_clean.contains("pyo3") {
+                let bound_name = extract_attr_string_arg(attr_clean, "name");
+                if let Some(m) = FfiMarker::try_new(
+                    node_id,
+                    FfiMarkerKind::PyO3Export,
+                    fn_name.clone(),
+                    bound_name,
+                    None,
+                    None::<String>,
+                    corpus,
+                ) {
+                    out.push(m);
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_ffi_attrs(corpus, vname_path, source, child, out);
+    }
+}
+
+/// Extract `key = "value"` from an attribute string like `#[napi(js_name = "greet")]`.
+fn extract_attr_string_arg(attr: &str, key: &str) -> Option<String> {
+    let needle = format!(r#"{key} = ""#);
+    let start = attr.find(&needle)? + needle.len();
+    let rest = &attr[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

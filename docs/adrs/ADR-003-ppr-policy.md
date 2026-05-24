@@ -103,3 +103,27 @@ These overrides are intentionally **undocumented in the man page** — they are 
 1. **Token budget integration:** How does PPR ranking compose with the 0-1 knapsack token budget (Phase 3)? The top-k nodes by PPR score are the knapsack items; budget is the knapsack capacity. The knapsack solver is not yet scoped.
 2. **Multi-seed normalisation:** Should `seeds.len() > 10` trigger a warning? Large seed sets dilute the personalisation signal. A practical cap (or a warning) should be defined in Issue #29.
 3. **EdgeKind weights (DEBT-016):** When the weight table lands, the seed-distribution policy will be revisited to compare uniform vs Kythe-edge-weighted defaults on the S7-2 correctness suite.
+
+---
+
+## Amendment — S13 (2026-05-24): FFICall edge weight
+
+**New variant:** `EdgeKind::FFICall` (cross-language FFI call edge, RFC-005).
+
+**PPR weight: 0.85**
+
+Rationale: FFI edges are semantically similar to direct `RefCall` edges (they represent actual function invocations) but carry slightly less PPR mass because the confidence score introduces noise not present in in-language calls. Placing FFICall between `RefCall` (1.00) and `DefinesBinding` (0.70) reflects this.
+
+Updated weight table:
+
+| Kind              | Weight | Reasoning |
+|---|---|---|
+| `RefCall`         | 1.00   | Direct call — strongest semantic link |
+| `FFICall`         | 0.85   | Cross-language FFI call — high semantic value, slight confidence noise |
+| `DefinesBinding`  | 0.70   | Parent→child definition |
+| `Exports`         | 0.60   | Exported API surface |
+| `Depends`         | 0.50   | File import |
+| `ResolvesTo`      | 0.50   | Import→file resolution |
+| `RefImports`      | 0.40   | Named import specifier |
+| `IsImplementation`| 0.40   | Class implements interface |
+| `Overrides`       | 0.30   | Method override — weakest semantic tie |

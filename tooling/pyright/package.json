@@ -1,0 +1,10 @@
+{
+  "name": "travsr-pyright-tooling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hash-locked pyright for Travsr CI",
+  "note": "Run `npm install` in this directory to populate the full lockfile with integrity hashes before committing.",
+  "devDependencies": {
+    "pyright": "1.1.395"
+  }
+}
