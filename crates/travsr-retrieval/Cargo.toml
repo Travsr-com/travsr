@@ -14,9 +14,12 @@ travsr-core = { path = "../travsr-core" }
 travsr-store = { path = "../travsr-store" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+petgraph = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "retrieval"

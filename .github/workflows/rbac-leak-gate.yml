@@ -1,0 +1,30 @@
+name: RBAC Leak Gate
+
+on:
+  push:
+    branches: [main, master, "feature/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rbac-leak-gate:
+    name: RBAC Leak Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run RBAC leak suite
+        run: cargo test --test rbac_leak_suite -p travsr-retrieval -- --nocapture
+
+      - name: Run property tests (PCST + RBAC)
+        run: cargo test --test prop_pcst -p travsr-retrieval -- --nocapture
+
+      - name: Run migration v7 round-trip test
+        run: cargo test v7 -p travsr-store -- --nocapture

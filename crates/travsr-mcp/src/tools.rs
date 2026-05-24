@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use travsr_retrieval::{EdgeFilter, OpenFilter};
 use travsr_store::{SqliteStore, Store};
 
 use crate::sanitize::{sanitize_for_mcp, validate_mcp_arg};
@@ -481,6 +482,141 @@ fn get_repo_map_raw(store: &SqliteStore) -> String {
     }
 
     lines.join("\n")
+}
+
+// ── get_execution_path ────────────────────────────────────────────────────────
+
+/// Find a traversal path from `source` symbol to `sink` symbol through the graph.
+///
+/// Uses PCST (Prize-Collecting Steiner Tree) approximation when a path exists,
+/// falls back to BFS depth-3 on timeout (> 80ms) or disconnected graphs.
+///
+/// Output format (one line per node on path):
+///   `fn:charge (function) — src/payment.ts`
+///   `fn:processPayment (function) — src/processor.ts`
+///
+/// # SEC P0
+/// Returns empty string for both "symbol not found" and "symbol access denied".
+/// These cases are indistinguishable to the caller (prevents existence oracle).
+pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> String {
+    get_execution_path_with_filter(store, source, sink, &OpenFilter)
+}
+
+/// Authenticated variant — applies RBAC filter at traversal time.
+/// Wired to session context in S16 when `SessionStore` is integrated into the server loop.
+// DEBT(travsr-199): wire into server.rs dispatch when SessionStore lands in S16.
+#[allow(dead_code)]
+pub(crate) fn get_execution_path_authed(
+    store: &SqliteStore,
+    source: &str,
+    sink: &str,
+    filter: &dyn EdgeFilter,
+) -> String {
+    get_execution_path_with_filter(store, source, sink, filter)
+}
+
+fn get_execution_path_with_filter(
+    store: &SqliteStore,
+    source: &str,
+    sink: &str,
+    filter: &dyn EdgeFilter,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(source) {
+        tracing::warn!("get_execution_path rejected invalid source arg: {reason}");
+        return String::new();
+    }
+    if let Err(reason) = validate_mcp_arg(sink) {
+        tracing::warn!("get_execution_path rejected invalid sink arg: {reason}");
+        return String::new();
+    }
+    sanitize_for_mcp(&get_execution_path_raw(store, source, sink, filter))
+}
+
+fn get_execution_path_raw(
+    store: &SqliteStore,
+    source: &str,
+    sink: &str,
+    filter: &dyn EdgeFilter,
+) -> String {
+    // SEC P0: resolve source and sink; treat "not found" == "access denied" identically.
+    let src_node = match store.search_nodes_by_name(source) {
+        Ok(n) => n
+            .into_iter()
+            .find(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))),
+        Err(e) => {
+            tracing::warn!("get_execution_path source search error: {e}");
+            return String::new();
+        }
+    };
+
+    let sink_node = match store.search_nodes_by_name(sink) {
+        Ok(n) => n
+            .into_iter()
+            .find(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))),
+        Err(e) => {
+            tracing::warn!("get_execution_path sink search error: {e}");
+            return String::new();
+        }
+    };
+
+    // SEC P0: both outcomes (not found and access denied) produce the same empty result.
+    let (src, snk) = match (src_node, sink_node) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return String::new(),
+    };
+
+    let path = match travsr_retrieval::pcst_path(store, src.id, snk.id, filter, 4096) {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            tracing::warn!("get_execution_path pcst error: {e}");
+            return String::new();
+        }
+    };
+
+    if path.is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<String> = path
+        .iter()
+        .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
+        .collect();
+    lines.join("\n")
+}
+
+/// Global variant of `get_execution_path` — searches one named repo or all registered repos.
+///
+/// `filter` is applied at traversal time. Pass `&OpenFilter` for unauthenticated local mode;
+/// pass `&session.filter()` in authenticated mode (S16). Do NOT hardcode `&OpenFilter` at
+/// call sites — the caller owns the auth context.
+pub fn get_execution_path_global(
+    repos: &HashMap<String, PathBuf>,
+    source: &str,
+    sink: &str,
+    repo: Option<&str>,
+    filter: &dyn EdgeFilter,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(source) {
+        tracing::warn!("get_execution_path_global rejected invalid source: {reason}");
+        return String::new();
+    }
+    if let Err(reason) = validate_mcp_arg(sink) {
+        tracing::warn!("get_execution_path_global rejected invalid sink: {reason}");
+        return String::new();
+    }
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = get_execution_path_raw(store, source, sink, filter);
+        if result.is_empty() || single {
+            result
+        } else {
+            result
+                .lines()
+                .map(|l| format!("[{repo_name}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    });
+    sanitize_for_mcp(&raw)
 }
 
 /// Global variant of `get_repo_map`.
