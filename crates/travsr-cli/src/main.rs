@@ -9,6 +9,7 @@ mod init;
 mod migrate;
 mod repo;
 mod repos;
+mod serve;
 mod status;
 
 use anyhow::Result;
@@ -98,6 +99,15 @@ enum Command {
         /// Target backend. Currently supported: kuzu
         #[arg(long = "to", value_name = "BACKEND")]
         to: String,
+    },
+    /// Start the SSE/HTTP MCP server for cloud and team deployments.
+    Serve {
+        /// TCP port to bind the SSE server on.
+        #[arg(long, default_value = "3000")]
+        port: u16,
+        /// Directory containing tenant data subdirectories.
+        #[arg(long)]
+        tenants_dir: std::path::PathBuf,
     },
 }
 
@@ -287,6 +297,9 @@ async fn run() -> Result<()> {
             travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
         }
         Command::Migrate { to } => migrate::run_to(&to)?,
+        Command::Serve { port, tenants_dir } => {
+            serve::run(port, tenants_dir).await?;
+        }
     }
     Ok(())
 }
