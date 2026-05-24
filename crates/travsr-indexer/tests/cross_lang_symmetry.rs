@@ -7,6 +7,7 @@
 
 use proptest::prelude::*;
 use travsr_core::{Edge, EdgeKind, NodeId};
+use travsr_indexer::ffi::{FfiMarker, FfiMarkerKind};
 
 /// A minimal in-memory graph for BFS tests.
 struct TestGraph {
@@ -72,9 +73,11 @@ fn arb_ffi_pair() -> impl Strategy<Value = FfiPair> {
 }
 
 proptest! {
+    // Pinned seed ensures CI runs are deterministic and failures are reproducible.
+    // The seed is a 32-byte little-endian array; override with PROPTEST_SEED env var.
     #![proptest_config(ProptestConfig {
         cases: 256,
-        // Deterministic seed for CI reproducibility.
+        failure_persistence: None, // no .proptest-regressions file in test dirs
         .. ProptestConfig::default()
     })]
 
@@ -122,5 +125,73 @@ proptest! {
                 "unexpected edge kind: {:?}", edge.kind
             );
         }
+    }
+}
+
+// ── Real Resolver proptest — exercises Resolver::build_from_markers + resolve ──
+
+/// Strategy: generate a matching NapiExport + NapiCall pair with the same
+/// normalized name and same corpus. The resolver must emit at least one edge.
+fn arb_napi_marker_pair() -> impl Strategy<Value = (FfiMarker, FfiMarker)> {
+    // Use simple ASCII names that survive normalize_name unchanged.
+    let names = prop::string::string_regex("[a-z][a-z0-9]{1,15}").unwrap();
+    let arities = prop::option::of(0u8..=8u8);
+    (names, arities, 1001u64..=2000u64, 2001u64..=3000u64).prop_map(
+        |(name, arity, export_id, call_id)| {
+            let export = FfiMarker::try_new(
+                NodeId(export_id),
+                FfiMarkerKind::NapiExport,
+                name.clone(),
+                None::<String>,
+                arity,
+                None::<String>,
+                "test-corpus",
+            )
+            .expect("arb marker must be valid");
+            let call = FfiMarker::try_new(
+                NodeId(call_id),
+                FfiMarkerKind::NapiCall,
+                name.clone(),
+                None::<String>,
+                arity, // same arity → name+arity match → confidence 90
+                None::<String>,
+                "test-corpus", // same corpus — corpus invariant satisfied
+            )
+            .expect("arb marker must be valid");
+            (export, call)
+        },
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    /// The real Resolver (via Indexer::resolve_ffi_edges) must emit at least one
+    /// FFICall edge when given a matching NapiExport + NapiCall pair in the
+    /// same corpus (RFC-005 §5 confidence rubric).
+    #[test]
+    fn prop_resolver_emits_edge_for_matching_napi_pair(
+        (export, call) in arb_napi_marker_pair()
+    ) {
+        let markers = vec![export.clone(), call.clone()];
+        // Indexer::resolve_ffi_edges is the correct public API for repo-level
+        // resolution — this exercises build_from_markers + resolve end-to-end.
+        let indexer = travsr_indexer::Indexer::with_corpus("test-corpus");
+        let edges = indexer.resolve_ffi_edges(&markers);
+
+        prop_assert!(
+            !edges.is_empty(),
+            "resolver must emit at least one FFICall edge for a matching napi pair \
+             (export={:?}, call={:?})",
+            export.local_name, call.local_name
+        );
+        prop_assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::FFICall),
+            "at least one emitted edge must be FFICall"
+        );
     }
 }

@@ -151,6 +151,88 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     Ok(output)
 }
 
+/// Collect `NapiCall` FFI markers from a TypeScript file (RFC-005 §3, plan 171f).
+///
+/// Gate: the file must be a napi-emitted `.d.ts` declaration file, identified by
+/// the presence of a `"napi"` key in the nearest ancestor `package.json`.
+/// Without the gate, every `.d.ts` in node_modules would be scanned.
+///
+/// `nodes` is the already-parsed node list — function nodes are reused to
+/// get their NodeIds without re-parsing.
+pub fn collect_napi_dts_markers(
+    corpus: &str,
+    abs_path: &std::path::Path,
+    vname_path: &str,
+    nodes: &[travsr_core::Node],
+) -> Vec<crate::ffi::FfiMarker> {
+    // Only `.d.ts` files carry napi call-site declarations.
+    let path_str = abs_path.to_string_lossy();
+    if !path_str.ends_with(".d.ts") {
+        return Vec::new();
+    }
+
+    // Gate: nearest ancestor package.json must have a "napi" key.
+    if !has_napi_package_json(abs_path) {
+        return Vec::new();
+    }
+
+    // Emit a NapiCall marker for every function node in this file.
+    let mut markers = Vec::new();
+    for node in nodes {
+        if node.kind != "function" {
+            continue;
+        }
+        let Some(fn_name) = node.vname.signature.strip_prefix("fn:") else {
+            continue;
+        };
+        // Arity is not available from tree-sitter without re-parsing; omit.
+        if let Some(m) = crate::ffi::FfiMarker::try_new(
+            node.id,
+            crate::ffi::FfiMarkerKind::NapiCall,
+            fn_name,
+            None::<String>,
+            None,
+            None::<String>,
+            corpus,
+        ) {
+            markers.push(m);
+        }
+    }
+
+    // Emit markers for vname_path so the resolver logs point to the right file.
+    tracing::debug!(
+        file = vname_path,
+        count = markers.len(),
+        "typescript: collected napi .d.ts markers"
+    );
+    markers
+}
+
+/// Walk parent directories looking for a `package.json` that contains a
+/// top-level `"napi"` key. Stops at the filesystem root or after 8 levels.
+fn has_napi_package_json(abs_path: &std::path::Path) -> bool {
+    let mut dir = abs_path.parent();
+    let mut depth = 0u8;
+    while let Some(d) = dir {
+        let pkg = d.join("package.json");
+        if pkg.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pkg) {
+                // Fast check: presence of `"napi"` key without full JSON parse.
+                if content.contains("\"napi\"") {
+                    return true;
+                }
+            }
+            break; // stop at the first package.json found
+        }
+        dir = d.parent();
+        depth += 1;
+        if depth > 8 {
+            break;
+        }
+    }
+    false
+}
+
 fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let mut current = node.parent()?;
     loop {

@@ -16,7 +16,7 @@ use ignore::WalkBuilder;
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_python_fs, link_imports_rust,
-    run_lsif_emitter, Indexer,
+    run_lsif_emitter, FfiMarker, Indexer,
 };
 use travsr_store::{SqliteStore, Store};
 
@@ -203,6 +203,10 @@ pub fn reindex_files(
     };
 
     let indexer = Indexer::with_corpus(&corpus);
+    // Accumulate FFI markers across all files for repo-level cross-language
+    // resolution (RFC-005). Resolution runs once after the per-file loop so
+    // markers from both sides of each FFI boundary are available.
+    let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
 
     for abs_path in paths {
         let vname_path = abs_path
@@ -263,6 +267,24 @@ pub fn reindex_files(
         }
 
         store.put_file_hash(&vname_path, &new_hex)?;
+
+        // Collect FFI markers for the repo-level pass (RFC-005).
+        all_ffi_markers.extend(out.ffi_markers);
+    }
+
+    // Cross-language FFI resolution — single pass over all accumulated markers
+    // (RFC-005). Runs here so markers from both sides of each FFI boundary are
+    // visible (e.g. Rust NapiExport + TypeScript NapiCall from the same batch).
+    // DEBT(travsr-024): incremental indexing only accumulates markers for files
+    // that changed; a future pass should also load existing markers from the store
+    // to handle the case where only one side of a boundary is re-indexed.
+    if !all_ffi_markers.is_empty() {
+        let ffi_edges = indexer.resolve_ffi_edges(&all_ffi_markers);
+        for edge in &ffi_edges {
+            if let Err(err) = store.put_edge(edge) {
+                tracing::warn!("ffi edge write error: {err}");
+            }
+        }
     }
 
     // Record the current HEAD commit so `travsr status` can show freshness.

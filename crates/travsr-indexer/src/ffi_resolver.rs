@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use travsr_core::{Edge, NodeId};
 
 use crate::ffi::{FfiMarker, FfiMarkerKind};
+#[cfg(test)]
 use crate::ParseOutput;
 
 /// Configuration for FFI edge resolution. Populated from `[ffi]` in travsr.toml.
@@ -46,13 +47,17 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// Build the name index from all markers in `output`.
+    /// Build the name index from a slice of markers.
+    ///
+    /// This is the canonical entry point for repo-level cross-file resolution
+    /// (RFC-005): call this after all per-language parsers have run and their
+    /// markers have been accumulated into a single slice.
     ///
     /// O(M) where M = number of FfiMarkers.
-    pub fn build(output: &ParseOutput) -> Self {
+    pub fn build_from_markers(markers: &[FfiMarker]) -> Self {
         let mut name_index: HashMap<IndexKey, Vec<(NodeId, Option<u8>)>> = HashMap::new();
 
-        for marker in &output.ffi_markers {
+        for marker in markers {
             let lang = marker_language(marker);
             let key: IndexKey = (
                 marker.corpus.clone(),
@@ -66,6 +71,15 @@ impl Resolver {
         }
 
         Self { name_index }
+    }
+
+    /// Build the name index from all markers in `output`.
+    ///
+    /// Convenience wrapper for single-file tests; prefer `build_from_markers`
+    /// for production repo-level resolution.
+    #[cfg(test)]
+    pub fn build(output: &ParseOutput) -> Self {
+        Self::build_from_markers(&output.ffi_markers)
     }
 
     /// Resolve all FFI pairs and return the edges to add to the graph.
