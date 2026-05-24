@@ -437,18 +437,24 @@ fn walk_for_ffi_attrs(
     out: &mut Vec<FfiMarker>,
 ) {
     if node.kind() == "function_item" {
-        // Check sibling attribute_items before this function
+        // Collect only the attribute_items immediately preceding this function.
+        // Reset on any intervening function_item so prior functions' attrs are not inherited.
         let mut attrs: Vec<String> = Vec::new();
         if let Some(parent) = node.parent() {
+            let mut running: Vec<String> = Vec::new();
             let mut cursor = parent.walk();
             for child in parent.children(&mut cursor) {
+                if child.id() == node.id() {
+                    attrs = running;
+                    break;
+                }
                 if child.kind() == "attribute_item" {
                     if let Ok(text) = child.utf8_text(source) {
-                        attrs.push(text.to_string());
+                        running.push(text.to_string());
                     }
-                }
-                if child.id() == node.id() {
-                    break; // only attrs before this fn node
+                } else if child.kind() == "function_item" {
+                    // Previous function consumed its attrs — start fresh.
+                    running.clear();
                 }
             }
         }

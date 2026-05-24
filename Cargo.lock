@@ -2277,9 +2277,11 @@ dependencies = [
  "tracing-subscriber",
  "travsr-core",
  "travsr-daemon",
+ "travsr-indexer",
  "travsr-mcp",
  "travsr-retrieval",
  "travsr-store",
+ "walkdir",
 ]
 
 [[package]]

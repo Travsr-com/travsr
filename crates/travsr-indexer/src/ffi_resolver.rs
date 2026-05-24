@@ -98,11 +98,12 @@ impl Resolver {
                 // Call-site markers look for their export counterpart
                 FfiMarkerKind::NapiCall => ("rust", score_napi),
                 FfiMarkerKind::PyO3Call => ("rust", score_pyo3),
-                FfiMarkerKind::GoCallC => ("c", score_cgo),
-                // Export markers are indexed as targets, not sources — skip
-                FfiMarkerKind::NapiExport
-                | FfiMarkerKind::PyO3Export
-                | FfiMarkerKind::CgoExport => continue,
+                // CgoExport is on the Go side; looks for the synthetic "c" target.
+                FfiMarkerKind::CgoExport => ("c", score_cgo),
+                // Indexed-target markers — skip as sources
+                FfiMarkerKind::NapiExport | FfiMarkerKind::PyO3Export | FfiMarkerKind::GoCallC => {
+                    continue
+                }
             };
 
             // Corpus invariant: only match within the same corpus.
@@ -162,12 +163,18 @@ fn normalize_name(s: &str) -> String {
 }
 
 /// Determine the language string for a marker's node side.
+///
+/// This controls which key slot the marker occupies in the name index.
+/// Export-side markers are indexed as targets; call-site markers are sources.
+/// For cgo: CgoExport lives on the Go function ("go"), GoCallC lives on the
+/// synthetic C node ("c") so the resolver can look it up as a "c" target.
 fn marker_language(m: &FfiMarker) -> &'static str {
     match m.kind {
-        FfiMarkerKind::NapiExport | FfiMarkerKind::PyO3Export | FfiMarkerKind::CgoExport => "rust",
+        FfiMarkerKind::NapiExport | FfiMarkerKind::PyO3Export => "rust",
+        FfiMarkerKind::CgoExport => "go",
         FfiMarkerKind::NapiCall => "typescript",
         FfiMarkerKind::PyO3Call => "python",
-        FfiMarkerKind::GoCallC => "go",
+        FfiMarkerKind::GoCallC => "c",
     }
 }
 

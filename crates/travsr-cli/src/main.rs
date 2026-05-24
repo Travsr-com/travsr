@@ -4,6 +4,7 @@
 
 mod ask;
 mod graph;
+mod index;
 mod init;
 mod migrate;
 mod repo;
@@ -70,6 +71,17 @@ enum Command {
         /// Output format.
         #[arg(short, long, default_value = "tree")]
         format: graph::Format,
+    },
+    /// Index a directory of source files and emit a graph JSON (for CI / tooling).
+    Index {
+        /// Directory to index recursively.
+        dir: std::path::PathBuf,
+        /// Output path for the graph JSON.
+        #[arg(long, short)]
+        output: std::path::PathBuf,
+        /// Corpus label for emitted nodes.
+        #[arg(long, default_value = "ci")]
+        corpus: String,
     },
     /// Re-index a list of changed files (invoked by the git hook).
     #[command(hide = true)]
@@ -240,6 +252,11 @@ async fn run() -> Result<()> {
                 travsr_mcp::serve_stdio(&db_path)?;
             }
         }
+        Command::Index {
+            dir,
+            output,
+            corpus,
+        } => index::run(&dir, &output, &corpus)?,
         Command::Repos => repos::run()?,
         Command::Status => status::run()?,
         Command::Ask { query } => ask::run(&query)?,

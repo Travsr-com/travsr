@@ -26,6 +26,7 @@ const _: () = {
 const QUERIES: &str = r"
 (class_declaration name: (type_identifier) @class.name)
 (function_declaration name: (identifier) @fn.name)
+(function_signature name: (identifier) @fn.name)
 (method_definition name: (property_identifier) @method.name)
 (lexical_declaration (variable_declarator name: (identifier) @var.name))
 (variable_declaration (variable_declarator name: (identifier) @var.name))
