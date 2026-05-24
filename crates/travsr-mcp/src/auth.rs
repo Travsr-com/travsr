@@ -264,7 +264,11 @@ mod tests {
         // non-canonical encoding that the decoder rejects as BadTokenFormat
         // instead of BadMac. The second-to-last char has no such constraint.
         let len = token.len();
-        let replacement = if &token[len - 2..len - 1] == "A" { "B" } else { "A" };
+        let replacement = if &token[len - 2..len - 1] == "A" {
+            "B"
+        } else {
+            "A"
+        };
         token = format!("{}{}{}", &token[..len - 2], replacement, &token[len - 1..]);
         let result = verify_token(&token, &[key]);
         assert!(matches!(result, Err(AuthError::BadMac)));
