@@ -39,7 +39,7 @@ sha2 = "0.11"
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 tempfile = "3"
-tree-sitter = "0.22"
+tree-sitter = "0.26"
 tree-sitter-typescript = "0.21"
 tree-sitter-rust = "0.21"
 tree-sitter-python = "0.21"
