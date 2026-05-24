@@ -41,3 +41,11 @@ out/
 .env
 .env.local
 .env.*.local
+
+# Terraform
+infra/oci-terraform/.terraform/
+infra/oci-terraform/terraform.tfstate
+infra/oci-terraform/terraform.tfstate.backup
+infra/oci-terraform/terraform.tfvars
+infra/oci-terraform/*.tfplan
+infra/oci-terraform/crash.log

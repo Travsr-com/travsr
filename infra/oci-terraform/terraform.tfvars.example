@@ -1,0 +1,95 @@
+# terraform.tfvars.example
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to terraform.tfvars and fill in every value before running
+# `terraform plan` or `terraform apply`.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   $EDITOR terraform.tfvars
+#
+# terraform.tfvars is gitignored (contains secrets). NEVER commit it.
+# .terraform.lock.hcl IS committed — it pins the provider version hash.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── OCI API credentials ──────────────────────────────────────────────────────
+
+# Where to find: OCI Console → top-right avatar → Tenancy: <name>
+# Then: Tenancy Details page → OCID (copy button)
+tenancy_ocid = "<FILL_IN>"
+
+# Where to find: OCI Console → top-right avatar → My Profile → OCID (copy button)
+user_ocid = "<FILL_IN>"
+
+# Where to find: OCI Console → My Profile → API Keys → the fingerprint column
+# next to the key you uploaded (format: xx:xx:xx:...:xx)
+fingerprint = "<FILL_IN>"
+
+# Absolute path on the operator's machine to the PEM private key that
+# corresponds to the fingerprint above.
+# Example: "/Users/yourname/.oci/oci_api_key.pem"
+private_key_path = "<FILL_IN>"
+
+# ── Region ───────────────────────────────────────────────────────────────────
+
+# Your OCI home region (where Always Free resources live).
+# Default is ap-mumbai-1 — change if your tenancy's home region differs.
+# Where to find: OCI Console → top-right region selector (e.g., "US East (Ashburn)" = us-ashburn-1)
+region = "ap-mumbai-1"
+
+# ── Compartment ──────────────────────────────────────────────────────────────
+
+# Where to find: OCI Console → Identity & Security → Compartments
+# Use the root compartment OCID or create a dedicated "travsr" compartment.
+compartment_ocid = "<FILL_IN>"
+
+# ── Compute ──────────────────────────────────────────────────────────────────
+
+# Contents of your SSH public key (the full line from ~/.ssh/id_ed25519.pub).
+# Example: "ssh-ed25519 AAAAC3Nza... user@host"
+ssh_public_key = "<FILL_IN>"
+
+# Human-readable display name for the instance in OCI Console.
+instance_display_name = "travsr-mcp-server"
+
+# ── Availability domain ──────────────────────────────────────────────────────
+
+# Where to find: OCI Console → Compute → Instances → Create Instance → Placement
+# Format example: "tUwm:AP-MUMBAI-1-AD-1"
+# For Mumbai there is only one AD. Other regions may have up to 3.
+# Alternatively: `oci iam availability-domain list --output table` via OCI CLI.
+availability_domain = "<FILL_IN>"
+
+# ── Image OCID ───────────────────────────────────────────────────────────────
+
+# Must be Ubuntu 22.04 Minimal for ARM64 (aarch64) in your chosen region.
+# Where to find:
+#   OCI Console → Compute → Images → Platform Images
+#   Filter: Publisher = Canonical, OS = Ubuntu 22.04 Minimal
+#   Shape compatibility: VM.Standard.A1.Flex (Ampere ARM)
+#   Copy the OCID for your region.
+# Note: Image OCIDs differ per region — use the one matching your `region` above.
+image_ocid = "<FILL_IN>"
+
+# ── Networking ───────────────────────────────────────────────────────────────
+
+# VCN CIDR — leave as default unless you have an existing VCN to peer with.
+vcn_cidr = "10.0.0.0/16"
+
+# Public subnet CIDR — must be within vcn_cidr.
+subnet_cidr = "10.0.1.0/24"
+
+# ── Block volume ─────────────────────────────────────────────────────────────
+
+# 50 GB is the Always Free limit. WARNING: reducing this after first apply
+# is destructive — OCI cannot shrink volumes.
+block_volume_size_gb = 50
+
+# ── OCIR (Container Registry) ────────────────────────────────────────────────
+
+# Object Storage namespace (same as OCIR namespace) for your tenancy.
+# Where to find: OCI Console → Developer Services → Container Registry
+# The namespace is displayed at the top of the page.
+# Alternatively: `oci os ns get` via OCI CLI.
+ocir_namespace = "<FILL_IN>"
+
+# Repository name within OCIR. Default matches the systemd service image tag.
+ocir_repo_name = "travsr-mcp"
