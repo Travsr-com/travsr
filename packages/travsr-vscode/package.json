@@ -4,8 +4,11 @@
   "description": "Graph-native code intelligence for VS Code, powered by the local Travsr daemon over MCP.",
   "version": "0.1.0",
   "publisher": "travsr",
-  "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/raj-rkv/travsr"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
