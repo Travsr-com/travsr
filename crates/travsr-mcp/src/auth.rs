@@ -258,9 +258,14 @@ mod tests {
     fn bad_mac_returns_error() {
         let key = make_key();
         let mut token = make_token("acme-corp", "mcp", now_ts(), &key);
-        // Corrupt the last char of the MAC.
-        token.pop();
-        token.push(if token.ends_with('A') { 'B' } else { 'A' });
+        // Corrupt the second-to-last character of the MAC. The final base64url
+        // character of a 32-byte MAC has constrained padding bits (only 16 valid
+        // values), so replacing it with an arbitrary char can produce a
+        // non-canonical encoding that the decoder rejects as BadTokenFormat
+        // instead of BadMac. The second-to-last char has no such constraint.
+        let len = token.len();
+        let replacement = if &token[len - 2..len - 1] == "A" { "B" } else { "A" };
+        token = format!("{}{}{}", &token[..len - 2], replacement, &token[len - 1..]);
         let result = verify_token(&token, &[key]);
         assert!(matches!(result, Err(AuthError::BadMac)));
     }
