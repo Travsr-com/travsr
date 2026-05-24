@@ -230,7 +230,7 @@ ExecStart=/usr/bin/docker run \
     -v /data/tenants:/data/tenants \
     --env-file /etc/travsr/env \
     ${TRAVSR_IMAGE} \
-    serve --sse --port 3000 --tenants-dir /data/tenants
+    serve --port 3000 --tenants-dir /data/tenants
 ExecStop=/usr/bin/docker stop travsr-mcp
 
 [Install]
