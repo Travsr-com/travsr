@@ -7,10 +7,13 @@
 #![forbid(unsafe_code)]
 
 mod emit;
+pub mod ffi;
+mod ffi_resolver;
 mod go;
 mod hash;
 pub mod lsif;
 mod python;
+pub mod python_lsif;
 pub mod ra_runner;
 pub mod runner;
 mod rust;
@@ -21,6 +24,8 @@ use std::path::Path;
 
 use travsr_core::{EdgeKind, Language};
 
+pub use ffi::{FfiMarker, FfiMarkerKind};
+pub use ffi_resolver::FfiConfig;
 pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{ingest_rust, ingest_rust_raw};
@@ -440,6 +445,28 @@ fn normalize_vname_path(path: &std::path::Path) -> std::path::PathBuf {
 pub struct ParseOutput {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    /// FFI boundary markers collected by per-language indexers.
+    /// Consumed by `ffi_resolver` in the second pass.
+    pub ffi_markers: Vec<crate::ffi::FfiMarker>,
+}
+
+impl ParseOutput {
+    /// Merge `other` into `self`, deduplicating edges on `(src, dst, kind)`.
+    /// Nodes are appended without dedup (dedup happens in each indexer's parse fn).
+    pub fn merge_deduped(&mut self, other: ParseOutput) {
+        self.nodes.extend(other.nodes);
+        let existing: std::collections::HashSet<(
+            travsr_core::NodeId,
+            travsr_core::NodeId,
+            travsr_core::EdgeKind,
+        )> = self.edges.iter().map(|e| (e.src, e.dst, e.kind)).collect();
+        for edge in other.edges {
+            if !existing.contains(&(edge.src, edge.dst, edge.kind)) {
+                self.edges.push(edge);
+            }
+        }
+        self.ffi_markers.extend(other.ffi_markers);
+    }
 }
 
 /// Streaming indexer that walks a repository and emits graph records.
@@ -450,6 +477,7 @@ pub struct ParseOutput {
 #[derive(Debug, Default)]
 pub struct Indexer {
     corpus: String,
+    ffi_config: ffi_resolver::FfiConfig,
 }
 
 impl Indexer {
@@ -457,6 +485,7 @@ impl Indexer {
     pub fn new() -> Self {
         Self {
             corpus: String::new(),
+            ffi_config: ffi_resolver::FfiConfig::default(),
         }
     }
 
@@ -465,7 +494,18 @@ impl Indexer {
     pub fn with_corpus(corpus: impl Into<String>) -> Self {
         Self {
             corpus: corpus.into(),
+            ffi_config: ffi_resolver::FfiConfig::default(),
         }
+    }
+
+    /// Override the FFI resolver configuration (RFC-005).
+    ///
+    /// Call this after [`Indexer::with_corpus`] (or on a value from [`Indexer::new`])
+    /// to control the emit threshold, enable/disable FFI resolution, or adjust
+    /// the pyright timeout.
+    pub fn with_ffi_config(mut self, cfg: ffi_resolver::FfiConfig) -> Self {
+        self.ffi_config = cfg;
+        self
     }
 
     /// Parse a single source file into nodes and edges.
@@ -480,6 +520,10 @@ impl Indexer {
 
     /// Parse `abs_path` using `vname_path` as the stable, repo-relative path
     /// stored in every emitted VName (closes DEBT-012).
+    ///
+    /// FFI markers are collected into `ParseOutput.ffi_markers` but NOT resolved
+    /// here — resolution requires markers from multiple files. Call
+    /// [`Indexer::resolve_ffi_edges`] after parsing all files in the batch.
     pub fn parse_file_with_vname(
         &self,
         abs_path: &Path,
@@ -490,20 +534,75 @@ impl Indexer {
             file: abs_path.to_string_lossy().into_owned(),
             message: e.to_string(),
         };
-        match Language::from_extension(ext) {
+        let mut output = match Language::from_extension(ext) {
             Some(Language::TypeScript) => {
-                typescript::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
+                typescript::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
             }
             Some(Language::Rust) => {
-                rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
+                rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
             }
             Some(Language::Python) => {
-                python::parse(&self.corpus, abs_path, vname_path).map_err(map_err)
+                let mut ts_out =
+                    python::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?;
+                // Best-effort semantic enrichment via pyright (RFC-005 §3).
+                // Runs after tree-sitter; failures are logged and silently ignored.
+                let pyright_out = python_lsif::parse_python_with_pyright(
+                    abs_path,
+                    std::time::Duration::from_secs(self.ffi_config.pyright_timeout_secs),
+                )
+                .unwrap_or_default();
+                ts_out.merge_deduped(pyright_out);
+                ts_out
             }
-            Some(Language::Go) => go::parse(&self.corpus, abs_path, vname_path).map_err(map_err),
+            Some(Language::Go) => go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?,
             // Other future languages (#[non_exhaustive]) are silently skipped
             // until their parsers ship.
-            _ => Ok(ParseOutput::default()),
+            _ => ParseOutput::default(),
+        };
+
+        // Collect per-language FFI call-site markers (RFC-005 §3).
+        match Language::from_extension(ext) {
+            Some(Language::TypeScript) => {
+                let napi_markers = typescript::collect_napi_dts_markers(
+                    &self.corpus,
+                    abs_path,
+                    vname_path,
+                    &output.nodes,
+                );
+                output.ffi_markers.extend(napi_markers);
+            }
+            Some(Language::Python) => {
+                let pyo3_markers = python::collect_pyo3_pyi_markers(
+                    &self.corpus,
+                    abs_path,
+                    vname_path,
+                    &output.nodes,
+                );
+                output.ffi_markers.extend(pyo3_markers);
+            }
+            _ => {}
         }
+
+        Ok(output)
+    }
+
+    /// Resolve cross-language FFI edges from markers accumulated across multiple files.
+    ///
+    /// This is the correct entry point for RFC-005 resolution: call this after
+    /// parsing all files in a batch so markers from both sides of each FFI boundary
+    /// are present (e.g. Rust `NapiExport` and TypeScript `NapiCall`).
+    pub fn resolve_ffi_edges(&self, markers: &[crate::ffi::FfiMarker]) -> Vec<Edge> {
+        if markers.is_empty() {
+            return Vec::new();
+        }
+        let resolver = ffi_resolver::Resolver::build_from_markers(markers);
+        let edges = resolver.resolve(markers, &self.ffi_config);
+        if !edges.is_empty() {
+            tracing::info!(
+                count = edges.len(),
+                "ffi_resolver: emitted cross-language edges (repo-level pass)"
+            );
+        }
+        edges
     }
 }

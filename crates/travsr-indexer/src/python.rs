@@ -77,6 +77,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut output = ParseOutput {
         nodes: vec![file_node],
         edges: vec![],
+        ffi_markers: vec![],
     };
 
     let mut parser = Parser::new();
@@ -290,6 +291,61 @@ fn extract_relative_import_spec(rel_node: tree_sitter::Node<'_>, source: &[u8]) 
     } else {
         Some(format!("{dots}{module_part}"))
     }
+}
+
+/// Collect `PyO3Call` FFI markers from a `.pyi` stub file (RFC-005 §3, plan 171g).
+///
+/// Gate: the file must be a native extension stub, identified by a filename
+/// starting with `_` (e.g. `_native.pyi`, `_rust_module.pyi`). This mirrors
+/// the Python convention for C-extension modules. Without this gate, every
+/// `.pyi` file (including hand-written stubs) would be scanned.
+///
+/// Emits one `PyO3Call` marker per function definition in the stub.
+pub(crate) fn collect_pyo3_pyi_markers(
+    corpus: &str,
+    abs_path: &std::path::Path,
+    vname_path: &str,
+    nodes: &[Node],
+) -> Vec<crate::ffi::FfiMarker> {
+    // Only `.pyi` stub files.
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext != "pyi" {
+        return Vec::new();
+    }
+
+    // Gate: filename must start with `_` (native extension stub convention).
+    let filename = abs_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !filename.starts_with('_') {
+        return Vec::new();
+    }
+
+    let mut markers = Vec::new();
+    for node in nodes {
+        if node.kind != "function" {
+            continue;
+        }
+        let Some(fn_name) = node.vname.signature.strip_prefix("fn:") else {
+            continue;
+        };
+        if let Some(m) = crate::ffi::FfiMarker::try_new(
+            node.id,
+            crate::ffi::FfiMarkerKind::PyO3Call,
+            fn_name,
+            None::<String>,
+            None,
+            None::<String>,
+            corpus,
+        ) {
+            markers.push(m);
+        }
+    }
+
+    tracing::debug!(
+        file = vname_path,
+        count = markers.len(),
+        "python: collected pyo3 .pyi markers"
+    );
+    markers
 }
 
 // ── Node constructors ─────────────────────────────────────────────────────────

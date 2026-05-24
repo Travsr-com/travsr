@@ -239,25 +239,37 @@ pub struct NodeId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeKind {
     /// File / module import. Corresponds to Kythe `%kythe/edge/depends`.
+    #[serde(rename = "depends")]
     Depends,
     /// Call-site reference. Corresponds to Kythe `%kythe/edge/ref/call`.
+    #[serde(rename = "ref/call")]
     RefCall,
     /// Definition-binding edge (parent → child in the AST).
+    #[serde(rename = "defines/binding")]
     DefinesBinding,
     /// A symbol exported from a module.
+    #[serde(rename = "exports")]
     Exports,
     /// An import node resolved to the file node it targets.
     /// Connects `import:./foo` → `file:foo.ts`, enabling transitive
     /// caller traversal across file boundaries.
+    #[serde(rename = "resolves-to")]
     ResolvesTo,
     /// Named import specifier reference emitted by the LSIF pipeline.
     /// Distinguishes semantic import references from file-level `Depends` edges.
+    #[serde(rename = "ref/imports")]
     RefImports,
     /// Class-to-interface implementation edge emitted by the LSIF pipeline.
+    #[serde(rename = "is-implementation")]
     IsImplementation,
     /// Method override edge emitted by the LSIF pipeline when a subclass
     /// method shadows a same-named method in the base class.
+    #[serde(rename = "overrides")]
     Overrides,
+    /// Cross-language FFI call edge (RFC-005). Confidence lives on `Edge.confidence`
+    /// so `EdgeKind` stays `Copy`. PPR weight: 0.85 (ADR-003 amendment, 2026-05-24).
+    #[serde(rename = "ffi/call")]
+    FFICall,
 }
 
 impl EdgeKind {
@@ -272,6 +284,7 @@ impl EdgeKind {
             Self::RefImports => "ref/imports",
             Self::IsImplementation => "is-implementation",
             Self::Overrides => "overrides",
+            Self::FFICall => "ffi/call",
         }
     }
 
@@ -307,6 +320,7 @@ impl EdgeKind {
             Self::RefImports => 0.40,
             Self::IsImplementation => 0.40,
             Self::Overrides => 0.30,
+            Self::FFICall => 0.85,
         }
     }
 
@@ -322,6 +336,7 @@ impl EdgeKind {
             "ref/imports" => Some(Self::RefImports),
             "is-implementation" => Some(Self::IsImplementation),
             "overrides" => Some(Self::Overrides),
+            "ffi/call" => Some(Self::FFICall),
             _ => None,
         }
     }
@@ -385,11 +400,36 @@ pub struct Edge {
     pub src: NodeId,
     pub dst: NodeId,
     pub kind: EdgeKind,
+    /// Confidence score 0..=100 for cross-language FFI edges (RFC-005).
+    /// `None` for all non-FFI edges. Stored in `edges.confidence` (migration v6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
 }
 
 impl Edge {
     pub fn new(src: NodeId, dst: NodeId, kind: EdgeKind) -> Self {
-        Self { src, dst, kind }
+        Self {
+            src,
+            dst,
+            kind,
+            confidence: None,
+        }
+    }
+
+    /// Build a cross-language FFI edge with a confidence score (RFC-005).
+    ///
+    /// `confidence` must be in `0..=100`. Panics in debug builds if violated.
+    pub fn ffi_call(src: NodeId, dst: NodeId, confidence: u8) -> Self {
+        debug_assert!(
+            confidence <= 100,
+            "confidence must be 0..=100, got {confidence}"
+        );
+        Self {
+            src,
+            dst,
+            kind: EdgeKind::FFICall,
+            confidence: Some(confidence),
+        }
     }
 }
 
@@ -439,6 +479,7 @@ mod tests {
             EdgeKind::RefImports,
             EdgeKind::IsImplementation,
             EdgeKind::Overrides,
+            EdgeKind::FFICall,
         ] {
             assert_eq!(EdgeKind::from_str(kind.as_str()), Some(kind));
         }
@@ -473,6 +514,7 @@ mod tests {
             EdgeKind::RefImports,
             EdgeKind::IsImplementation,
             EdgeKind::Overrides,
+            EdgeKind::FFICall,
         ] {
             let w = kind.ppr_weight();
             assert!(
@@ -708,5 +750,48 @@ mod tests {
         assert_eq!(plain.id, packaged.id, "package must not affect NodeId");
         assert_eq!(packaged.package, "my-crate");
         assert_eq!(plain.package, "");
+    }
+
+    #[test]
+    fn edge_ffi_call_builder_sets_confidence() {
+        let e = Edge::ffi_call(NodeId(1), NodeId(2), 90);
+        assert_eq!(e.kind, EdgeKind::FFICall);
+        assert_eq!(e.confidence, Some(90));
+    }
+
+    #[test]
+    fn edge_new_has_no_confidence() {
+        let e = Edge::new(NodeId(1), NodeId(2), EdgeKind::RefCall);
+        assert_eq!(e.confidence, None);
+    }
+
+    #[test]
+    fn edge_kind_ffi_call_roundtrip() {
+        assert_eq!(EdgeKind::FFICall.as_str(), "ffi/call");
+        assert_eq!(EdgeKind::from_str("ffi/call"), Some(EdgeKind::FFICall));
+    }
+
+    #[test]
+    fn ppr_weight_ffi_call_is_between_refcall_and_defines_binding() {
+        assert!(EdgeKind::FFICall.ppr_weight() < EdgeKind::RefCall.ppr_weight());
+        assert!(EdgeKind::FFICall.ppr_weight() > EdgeKind::DefinesBinding.ppr_weight());
+        assert!((EdgeKind::FFICall.ppr_weight() - 0.85_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn edge_serde_roundtrip_with_confidence() {
+        let e = Edge::ffi_call(NodeId(42), NodeId(99), 75);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"confidence\":75"));
+        let e2: Edge = serde_json::from_str(&json).unwrap();
+        assert_eq!(e2.confidence, Some(75));
+    }
+
+    #[test]
+    fn edge_serde_roundtrip_without_confidence_field() {
+        // JSON produced before v6 (no confidence field) must deserialize to None
+        let json = r#"{"src":1,"dst":2,"kind":"ref/call"}"#;
+        let e: Edge = serde_json::from_str(json).unwrap();
+        assert_eq!(e.confidence, None);
     }
 }

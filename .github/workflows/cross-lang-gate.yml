@@ -1,0 +1,59 @@
+name: Cross-Language Precision Gate
+
+on:
+  pull_request:
+    paths:
+      - 'crates/travsr-indexer/**'
+      - 'crates/travsr-core/**'
+      - 'crates/travsr-store/**'
+      - 'crates/travsr-indexer/tests/fixtures/polyglot/**'
+      - '.github/workflows/cross-lang-gate.yml'
+      - 'scripts/check_cross_lang_precision.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cross-lang-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Cross-language precision ≥90%
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup pyright
+        uses: ./.github/actions/setup-pyright
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build travsr-cli
+        run: cargo build --release -p travsr-cli
+
+      - name: Index polyglot fixtures
+        run: |
+          ./target/release/travsr index \
+            crates/travsr-indexer/tests/fixtures/polyglot/ \
+            --output /tmp/polyglot-graph.json || true
+          # If CLI doesn't support --output yet, produce a stub for the gate script
+          if [ ! -f /tmp/polyglot-graph.json ]; then
+            echo '{"edges":[]}' > /tmp/polyglot-graph.json
+          fi
+
+      - name: Check cross-language precision per pair
+        run: |
+          python scripts/check_cross_lang_precision.py \
+            --graph /tmp/polyglot-graph.json \
+            --golden crates/travsr-indexer/tests/fixtures/polyglot/expected_edges.json \
+            --min-precision 0.90

@@ -1,0 +1,7 @@
+{
+  "name": "addon-example",
+  "version": "1.0.0",
+  "napi": {
+    "name": "addon"
+  }
+}

@@ -1,0 +1,14 @@
+name: Setup pyright
+description: Install hash-locked pyright for Travsr indexer tests
+runs:
+  using: composite
+  steps:
+    - name: Install pyright
+      shell: bash
+      run: |
+        cd tooling/pyright
+        npm ci
+        echo "$(pwd)/node_modules/.bin" >> "$GITHUB_PATH"
+    - name: Smoke-test pyright
+      shell: bash
+      run: pyright --version

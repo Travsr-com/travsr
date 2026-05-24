@@ -100,6 +100,21 @@ impl Migration for V5LanguagePackage {
     }
 }
 
+struct V6EdgeConfidence;
+impl Migration for V6EdgeConfidence {
+    fn version(&self) -> u32 {
+        6
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite.
+        // Guard manually so re-running after a crash (atomicity gap) is safe.
+        if !store.column_exists("edges", "confidence")? {
+            store.exec_ddl(include_str!("migrations/v6_edge_confidence.sql"))?;
+        }
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -109,6 +124,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V3SignatureFormatVersion);
     r.register(V4EdgesSrcKindIdx);
     r.register(V5LanguagePackage);
+    r.register(V6EdgeConfidence);
     r
 }
 
@@ -459,12 +475,13 @@ impl SqliteStore {
     pub fn put_edge_lsif(&mut self, edge: &Edge) -> Result<(), StoreError> {
         self.conn
             .execute(
-                "INSERT INTO edges(src, dst, kind, provenance) VALUES(?1, ?2, ?3, 'lsif')
-                 ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'lsif'",
+                "INSERT INTO edges(src, dst, kind, provenance, confidence) VALUES(?1, ?2, ?3, 'lsif', ?4)
+                 ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'lsif', confidence = excluded.confidence",
                 params![
                     node_id_to_i64(edge.src),
                     node_id_to_i64(edge.dst),
                     edge.kind.as_str(),
+                    edge.confidence.map(|c| c as i64),
                 ],
             )
             .context("inserting lsif edge")
@@ -552,12 +569,13 @@ impl Store for SqliteStore {
         // verbose CASE expression but is explicit about intent.
         self.conn
             .execute(
-                "INSERT INTO edges(src, dst, kind, provenance) VALUES(?1, ?2, ?3, 'tree-sitter')
+                "INSERT INTO edges(src, dst, kind, provenance, confidence) VALUES(?1, ?2, ?3, 'tree-sitter', ?4)
                  ON CONFLICT(src, dst, kind) DO NOTHING",
                 params![
                     node_id_to_i64(edge.src),
                     node_id_to_i64(edge.dst),
                     edge.kind.as_str(),
+                    edge.confidence.map(|c| c as i64),
                 ],
             )
             .context("inserting tree-sitter edge")
@@ -603,22 +621,28 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT dst, kind FROM edges WHERE src = ?1")
+                .prepare("SELECT dst, kind, confidence FROM edges WHERE src = ?1")
                 .context("preparing iter_edges_from query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(src)], |row| {
                     let dst_i64: i64 = row.get(0)?;
                     let kind_str: String = row.get(1)?;
-                    Ok((dst_i64, kind_str))
+                    let confidence: Option<i64> = row.get(2)?;
+                    Ok((dst_i64, kind_str, confidence))
                 })
                 .context("executing iter_edges_from query")?;
 
             let mut out = Vec::new();
             for row in rows {
-                let (dst_i64, kind_str) = row.context("decoding edge row")?;
+                let (dst_i64, kind_str, confidence) = row.context("decoding edge row")?;
                 let kind = EdgeKind::from_str(&kind_str)
                     .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
-                out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+                out.push(Edge {
+                    src,
+                    dst: i64_to_node_id(dst_i64),
+                    kind,
+                    confidence: confidence.map(|c| c as u8),
+                });
             }
             tracing::debug!(edges_returned = out.len());
             Ok(out)

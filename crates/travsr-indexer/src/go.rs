@@ -5,6 +5,7 @@ use travsr_core::{Node, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 use crate::emit;
+use crate::ffi::{FfiMarker, FfiMarkerKind};
 use crate::ParseOutput;
 
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
@@ -107,6 +108,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut output = ParseOutput {
         nodes: vec![file_node],
         edges: vec![],
+        ffi_markers: vec![],
     };
 
     let mut parser = Parser::new();
@@ -243,6 +245,11 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .edges
         .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
+    // Collect cgo FFI markers and synthetic C destination nodes (RFC-005).
+    let (cgo_markers, c_nodes) = collect_cgo_markers(corpus, vname_path, &source);
+    output.nodes.extend(c_nodes);
+    output.ffi_markers.extend(cgo_markers);
+
     Ok(output)
 }
 
@@ -332,6 +339,82 @@ fn go_import_node(corpus: &str, path: &str, import_path: &str) -> Node {
 
 fn go_vname(corpus: &str, path: &str, signature: &str) -> VName {
     VName::new(corpus, "", path, "go", signature)
+}
+
+// ── FFI marker collection (RFC-005, cgo) ─────────────────────────────────────
+
+/// Scan for cgo FFI markers: `import "C"` blocks, `//export` directives,
+/// and `C.<name>` call sites. Also synthesizes destination C VNames.
+///
+/// Returns (markers, synthetic_c_nodes) — the synthetic nodes give the
+/// ffi_resolver a destination NodeId for Go→C edges.
+pub(crate) fn collect_cgo_markers(
+    corpus: &str,
+    vname_path: &str,
+    source: &[u8],
+) -> (Vec<FfiMarker>, Vec<Node>) {
+    let mut markers = Vec::new();
+    let mut c_nodes = Vec::new();
+
+    let source_str = match std::str::from_utf8(source) {
+        Ok(s) => s,
+        Err(_) => return (markers, c_nodes),
+    };
+
+    let has_cgo = source_str.contains(r#"import "C""#);
+    if !has_cgo {
+        return (markers, c_nodes);
+    }
+
+    // Scan for //export <Name> directives
+    for line in source_str.lines() {
+        let trimmed = line.trim();
+        if let Some(export_name) = trimmed.strip_prefix("//export ") {
+            let name = export_name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            // Synthetic C destination VName (RFC-005: <cgo_synthetic>/ prefix)
+            let basename = std::path::Path::new(vname_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown.go");
+            let c_path = format!("<cgo_synthetic>/{basename}");
+            let c_vname = VName::new(corpus, "", &c_path, "c", format!("fn:{name}"));
+            let c_node = Node::new(c_vname.clone(), "function");
+            let c_node_id = c_node.id;
+            c_nodes.push(c_node);
+
+            // Go-side export marker
+            let go_vname = VName::new(corpus, "", vname_path, "go", format!("fn:{name}"));
+            if let Some(m) = FfiMarker::try_new(
+                go_vname.id(),
+                FfiMarkerKind::CgoExport,
+                name,
+                None::<String>,
+                None,
+                None::<String>,
+                corpus,
+            ) {
+                markers.push(m);
+            }
+
+            // C-side destination marker (so resolver can match Go→C)
+            if let Some(m) = FfiMarker::try_new(
+                c_node_id,
+                FfiMarkerKind::GoCallC,
+                name,
+                None::<String>,
+                None,
+                Some("cgo"),
+                corpus,
+            ) {
+                markers.push(m);
+            }
+        }
+    }
+
+    (markers, c_nodes)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

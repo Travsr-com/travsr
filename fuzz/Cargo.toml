@@ -38,6 +38,12 @@ path = "fuzz_targets/fuzz_go_parser.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_pyright_lsif_parser"
+path = "fuzz_targets/fuzz_pyright_lsif_parser.rs"
+test = false
+doc = false
+
 # Isolate from the parent workspace so cargo-fuzz can use nightly freely.
 [workspace]
 members = ["."]
