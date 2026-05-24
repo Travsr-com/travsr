@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Optional OTLP telemetry — only pulled in when the `otlp` feature is enabled
 # in a binary crate (e.g. travsr-cli). Not compiled for normal builds.
 opentelemetry         = { version = "0.24", default-features = false, features = ["trace"] }
-opentelemetry_sdk     = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry_sdk     = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp    = { version = "0.17", features = ["tonic"] }
 tracing-opentelemetry = "0.25"
 rusqlite = { version = "0.39", features = ["bundled"] }
