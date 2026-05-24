@@ -21,33 +21,15 @@ use dashmap::DashMap;
 pub struct SessionId(pub [u8; 32]);
 
 impl SessionId {
-    /// Generate a new random session ID.
+    /// Generate a new random session ID using the OS CSPRNG.
     ///
-    /// Uses `rand`-free approach: XOR of current timestamp nanos with a
-    /// thread-local counter seeded from the process start time. This is
-    /// sufficient for local-first session isolation; cloud tier S16 will
-    /// replace with `getrandom`.
+    /// Uses `getrandom` (OS-backed CSPRNG) for all 32 bytes of entropy.
+    /// Panics if the OS CSPRNG is unavailable (should never happen on any
+    /// supported platform). Cloud tier S16 may switch to a ring-based KDF
+    /// for additional auditability, but this is the correct minimum bar.
     pub fn generate() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-
         let mut bytes = [0u8; 32];
-        let a = ts
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let b = count
-            .wrapping_mul(2862933555777941757)
-            .wrapping_add(3037000493);
-        bytes[..8].copy_from_slice(&a.to_le_bytes());
-        bytes[8..16].copy_from_slice(&b.to_le_bytes());
-        bytes[16..24].copy_from_slice(&(a ^ b).to_le_bytes());
-        bytes[24..32].copy_from_slice(&(a.wrapping_add(b)).to_le_bytes());
+        getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
         Self(bytes)
     }
 
@@ -118,7 +100,7 @@ pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// The authoritative store. SQLite persistence is a write-only mirror.
 pub struct SessionStore {
-    sessions: DashMap<Vec<u8>, Session>,
+    sessions: DashMap<[u8; 32], Session>,
 }
 
 impl Default for SessionStore {
@@ -146,8 +128,8 @@ impl SessionStore {
             allowed_corpora: allowed_corpora.into_iter().map(Into::into).collect(),
             expires_at: Instant::now() + ttl,
         };
-        // Key is raw bytes to avoid allocation on lookup.
-        self.sessions.insert(id.0.to_vec(), session.clone());
+        // Key is the raw [u8; 32] array — Copy, no heap allocation on lookup.
+        self.sessions.insert(id.0, session.clone());
         tracing::debug!(
             session = %session_id_log_hash(&id),
             "session created"
@@ -159,12 +141,14 @@ impl SessionStore {
     ///
     /// Expired sessions are evicted on lookup (lazy expiry).
     pub fn get(&self, id: &SessionId) -> Option<Session> {
-        let key = id.0.to_vec();
-        let session = self.sessions.get(&key)?.clone();
+        let session = self.sessions.get(&id.0)?.clone();
         if session.is_expired() {
             drop(session);
-            self.sessions.remove(&key);
-            tracing::debug!("session expired and evicted on lookup");
+            self.sessions.remove(&id.0);
+            tracing::debug!(
+                session = %session_id_log_hash(id),
+                "session expired and evicted on lookup"
+            );
             return None;
         }
         Some(session)
@@ -172,7 +156,7 @@ impl SessionStore {
 
     /// Explicitly revoke a session.
     pub fn revoke(&self, id: &SessionId) {
-        if self.sessions.remove(&id.0.to_vec()).is_some() {
+        if self.sessions.remove(&id.0).is_some() {
             tracing::debug!(
                 session = %session_id_log_hash(id),
                 "session revoked"

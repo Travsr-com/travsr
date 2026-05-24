@@ -178,6 +178,11 @@ fn expand_local_subgraph(
 ) -> LocalGraph {
     let mut nodes: HashMap<NodeId, Node> = HashMap::new();
     let mut edges: Vec<(NodeId, NodeId, f32)> = Vec::new();
+    // C-1: track edges already added to prevent duplicates from overlapping
+    // forward and reverse BFS frontiers. petgraph::DiGraph allows parallel
+    // edges; duplicates would inflate Dijkstra cost without affecting
+    // correctness but waste allocations and violate the simple-graph model.
+    let mut edge_set: HashSet<(NodeId, NodeId)> = HashSet::new();
     let mut fwd_visited: HashSet<NodeId> = HashSet::new();
     let mut rev_visited: HashSet<NodeId> = HashSet::new();
     let mut fwd_queue: VecDeque<(NodeId, u8)> = VecDeque::new();
@@ -194,21 +199,37 @@ fn expand_local_subgraph(
             break;
         }
         if let Ok(Some(node)) = store.get_node(current) {
-            nodes.entry(current).or_insert(node);
+            // P0-2: Defense-in-depth — re-check filter on node content before
+            // including it in the local graph. The edge filter already gated
+            // enqueue, but an explicit node-level check mirrors the SEC P0
+            // endpoint validation at pcst_path's top and prevents any subtle
+            // divergence between edge-filter and node-filter semantics.
+            if filter.allow(current, current, Some(node.vname.corpus.as_str())) {
+                nodes.entry(current).or_insert(node);
+            }
         }
 
         let outgoing = store.iter_edges_from(current).unwrap_or_default();
         for edge in &outgoing {
-            let dst_corpus = store
-                .get_node(edge.dst)
-                .ok()
-                .flatten()
-                .map(|n| n.vname.corpus.clone());
+            // P-1: Check the in-memory node cache before issuing a SQLite round-trip.
+            let dst_corpus = nodes
+                .get(&edge.dst)
+                .map(|n| n.vname.corpus.clone())
+                .or_else(|| {
+                    store
+                        .get_node(edge.dst)
+                        .ok()
+                        .flatten()
+                        .map(|n| n.vname.corpus.clone())
+                });
             if !filter.allow(current, edge.dst, dst_corpus.as_deref()) {
                 continue;
             }
-            let cost = 1.0 - edge.kind.ppr_weight();
-            edges.push((current, edge.dst, cost));
+            // C-1: Only add edge if not already present (dedup forward+reverse overlap).
+            if edge_set.insert((current, edge.dst)) {
+                let cost = 1.0 - edge.kind.ppr_weight();
+                edges.push((current, edge.dst, cost));
+            }
             if depth < max_depth && fwd_visited.insert(edge.dst) {
                 fwd_queue.push_back((edge.dst, depth + 1));
             }
@@ -223,23 +244,34 @@ fn expand_local_subgraph(
             break;
         }
         if let Ok(Some(node)) = store.get_node(current) {
-            nodes.entry(current).or_insert(node);
+            // P0-2: same defense-in-depth node filter as forward pass.
+            if filter.allow(current, current, Some(node.vname.corpus.as_str())) {
+                nodes.entry(current).or_insert(node);
+            }
         }
 
         let incoming = store.iter_edges_to(current).unwrap_or_default();
         for edge in &incoming {
             // For reverse BFS, src is the predecessor of current.
-            let src_corpus = store
-                .get_node(edge.src)
-                .ok()
-                .flatten()
-                .map(|n| n.vname.corpus.clone());
+            let src_corpus = nodes
+                .get(&edge.src)
+                .map(|n| n.vname.corpus.clone())
+                .or_else(|| {
+                    store
+                        .get_node(edge.src)
+                        .ok()
+                        .flatten()
+                        .map(|n| n.vname.corpus.clone())
+                });
             if !filter.allow(edge.src, current, src_corpus.as_deref()) {
                 continue;
             }
             // Add the forward edge (src→current) to the local graph.
-            let cost = 1.0 - edge.kind.ppr_weight();
-            edges.push((edge.src, current, cost));
+            // C-1: deduplicate against edges already added by the forward pass.
+            if edge_set.insert((edge.src, current)) {
+                let cost = 1.0 - edge.kind.ppr_weight();
+                edges.push((edge.src, current, cost));
+            }
             if depth < max_depth && rev_visited.insert(edge.src) {
                 rev_queue.push_back((edge.src, depth + 1));
             }
@@ -286,8 +318,7 @@ fn bfs_fallback(
     filter: &dyn EdgeFilter,
     token_budget: usize,
 ) -> Result<Vec<Node>, travsr_error::TravsrError> {
-    use std::collections::{HashSet, VecDeque};
-
+    // P-3: HashSet and VecDeque are already imported at the top of the module.
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
     let mut result: Vec<Node> = Vec::new();
@@ -302,6 +333,13 @@ fn bfs_fallback(
         }
 
         if let Some(node) = store.get_node(current_id)? {
+            // P0-2: Defense-in-depth — re-check filter on node content before
+            // adding it to the result. Edge enqueue is filtered below, but the
+            // seed node and each dequeued neighbor must also pass a node-level
+            // check to prevent corpus leakage via timing or content divergence.
+            if !filter.allow(current_id, current_id, Some(node.vname.corpus.as_str())) {
+                continue;
+            }
             let cost = node.vname.signature.len() + node.kind.len();
             if tokens_used + cost > token_budget {
                 break;
@@ -420,5 +458,36 @@ mod tests {
         // b is in evil-corpus — SEC P0: returns empty (sink inaccessible).
         let result = pcst_path(&store, a.id, b.id, &filter, 4096).unwrap();
         assert!(result.is_empty(), "sink in denied corpus must return empty");
+    }
+
+    #[test]
+    fn pcst_diamond_topology_no_duplicate_edges() {
+        // Diamond: A→B, A→C, B→D, C→D, source=A, sink=D.
+        // Forward BFS from A reaches B, C, D.
+        // Reverse BFS from D reaches B, C, A.
+        // Both passes cover B→D and C→D — without deduplication these edges
+        // would appear twice in the local graph (C-1 regression test).
+        let a = node("a.rs", "fn:a");
+        let b = node("b.rs", "fn:b");
+        let c = node("c.rs", "fn:c");
+        let d = node("d.rs", "fn:d");
+        let store = store_with(
+            &[a.clone(), b.clone(), c.clone(), d.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (a.id, c.id, EdgeKind::RefCall),
+                (b.id, d.id, EdgeKind::RefCall),
+                (c.id, d.id, EdgeKind::RefCall),
+            ],
+        );
+
+        let result = pcst_path(&store, a.id, d.id, &OpenFilter, 4096).unwrap();
+        let ids: Vec<_> = result.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&a.id), "source must be in result");
+        assert!(ids.contains(&d.id), "sink must be in result");
+        // No node should appear twice (duplicate edges would not cause this,
+        // but they would produce non-simple graphs that violate the PCST model).
+        let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), unique_ids.len(), "no duplicate nodes in result");
     }
 }

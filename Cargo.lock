@@ -2381,6 +2381,7 @@ dependencies = [
  "assert_cmd",
  "blake3",
  "dashmap",
+ "getrandom 0.2.17",
  "serde",
  "serde_json",
  "tempfile",

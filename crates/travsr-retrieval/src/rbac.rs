@@ -43,7 +43,7 @@ impl EdgeFilter for OpenFilter {
 /// Corpus-scoped RBAC filter. Only traverses to nodes whose `vname.corpus`
 /// is in `allowed_corpora`. Unknown corpus → deny (fail-closed).
 pub struct RbacFilter {
-    pub allowed_corpora: HashSet<String>,
+    pub(crate) allowed_corpora: HashSet<String>,
 }
 
 impl RbacFilter {

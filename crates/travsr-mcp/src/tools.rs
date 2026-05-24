@@ -504,8 +504,9 @@ pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> Stri
 
 /// Authenticated variant — applies RBAC filter at traversal time.
 /// Wired to session context in S16 when `SessionStore` is integrated into the server loop.
+// DEBT(travsr-199): wire into server.rs dispatch when SessionStore lands in S16.
 #[allow(dead_code)]
-pub fn get_execution_path_authed(
+pub(crate) fn get_execution_path_authed(
     store: &SqliteStore,
     source: &str,
     sink: &str,
@@ -584,11 +585,16 @@ fn get_execution_path_raw(
 }
 
 /// Global variant of `get_execution_path` — searches one named repo or all registered repos.
+///
+/// `filter` is applied at traversal time. Pass `&OpenFilter` for unauthenticated local mode;
+/// pass `&session.filter()` in authenticated mode (S16). Do NOT hardcode `&OpenFilter` at
+/// call sites — the caller owns the auth context.
 pub fn get_execution_path_global(
     repos: &HashMap<String, PathBuf>,
     source: &str,
     sink: &str,
     repo: Option<&str>,
+    filter: &dyn EdgeFilter,
 ) -> String {
     if let Err(reason) = validate_mcp_arg(source) {
         tracing::warn!("get_execution_path_global rejected invalid source: {reason}");
@@ -599,7 +605,7 @@ pub fn get_execution_path_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_execution_path_raw(store, source, sink, &OpenFilter);
+        let result = get_execution_path_raw(store, source, sink, filter);
         if result.is_empty() || single {
             result
         } else {

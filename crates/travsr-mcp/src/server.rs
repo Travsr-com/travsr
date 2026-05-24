@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::protocol::{INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR};
 use crate::tools;
 use crate::{protocol::RpcRequest, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
+use travsr_retrieval::OpenFilter;
 use travsr_store::{registry, SqliteStore};
 
 pub fn run(store: &SqliteStore) -> anyhow::Result<()> {
@@ -325,7 +326,7 @@ fn handle_tool_call_global(
         "get_execution_path" => {
             let source = args["source"].as_str().unwrap_or("");
             let sink = args["sink"].as_str().unwrap_or("");
-            tools::get_execution_path_global(repos, source, sink, repo_arg)
+            tools::get_execution_path_global(repos, source, sink, repo_arg, &OpenFilter)
         }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
