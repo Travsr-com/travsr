@@ -192,6 +192,16 @@ pub struct SqliteStore {
     conn: Connection,
 }
 
+impl Drop for SqliteStore {
+    fn drop(&mut self) {
+        // Best-effort WAL truncation on clean shutdown — shrinks graph.db-wal
+        // to zero bytes so the next open starts with no WAL replay overhead.
+        // TRUNCATE mode requires an exclusive lock; it silently skips if any
+        // reader holds a shared lock, which is always a safe WAL state.
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+}
+
 impl SqliteStore {
     /// Open (or create) a SQLite-backed store at `path`, enabling WAL and
     /// running any pending migrations via [`MigrationRunner`].
@@ -242,6 +252,24 @@ impl SqliteStore {
             .context("setting synchronous=NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign_keys pragma")?;
+        // Cap page cache to 64 MB (negative value = kibibytes).
+        // Without this the default grows proportionally with graph size and
+        // was the primary cause of ~700 MB RSS per daemon process.
+        conn.pragma_update(None, "cache_size", -65536i64)
+            .context("setting cache_size")?;
+        // Checkpoint the WAL every 500 pages (~2 MB) instead of the SQLite
+        // default of 1000 pages, so the WAL file stays small at rest.
+        conn.pragma_update(None, "wal_autocheckpoint", 500i32)
+            .context("setting wal_autocheckpoint")?;
+        // Keep temp tables in memory instead of writing to /tmp files.
+        conn.pragma_update(None, "temp_store", "MEMORY")
+            .context("setting temp_store=MEMORY")?;
+        // Disable memory-mapped I/O. Without this, SQLite maps the entire DB
+        // file into the process virtual address space. On a large graph.db
+        // (hundreds of MB) every daemon process shows that many MB of RSS —
+        // and multiple processes each get their own mapping of the same file.
+        conn.pragma_update(None, "mmap_size", 0i64)
+            .context("disabling mmap_size")?;
         Ok(())
     }
 

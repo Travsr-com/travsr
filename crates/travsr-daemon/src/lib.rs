@@ -90,7 +90,6 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
     let mut files_indexed: u64 = 0;
-    let mut edges_written: u64 = 0;
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
@@ -132,12 +131,16 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     // including files skipped due to size or parse errors. The user-visible
     // "indexed N files" message is therefore optimistic. Fix by returning a
     // per-file success/skip result from reindex_files.
+    //
+    // PERF: Two COUNT(*) per file (N files → 2N full-table scans) was causing
+    // WAL page-cache bloat during large init_repo runs. Replaced with two
+    // total counts: one snapshot before the loop, one after.
+    let edges_before = store.edge_count().unwrap_or(0);
     for abs_path in &indexable_paths {
-        let edges_before = store.edge_count().unwrap_or(0);
         reindex_files(std::slice::from_ref(abs_path), repo_root, &mut store)?;
-        edges_written += store.edge_count().unwrap_or(0).saturating_sub(edges_before);
         files_indexed += 1;
     }
+    let edges_written = store.edge_count().unwrap_or(0).saturating_sub(edges_before);
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
@@ -300,15 +303,14 @@ pub fn reindex_files(
         }
     }
 
-    // LSIF semantic pass — only when at least one TypeScript file was in the
-    // delta. This avoids a whole-project TS compile on every commit that only
-    // touches Rust/config files. Full file-level delta is DEBT(travsr-25).
-    let any_ts = paths
-        .iter()
-        .any(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("ts" | "tsx")));
-    if any_ts {
-        run_lsif_pass(repo_root, store);
-    }
+    // PERF-002: The LSIF semantic pass was running on every `reindex_files`
+    // call that touched any .ts file, including every post-commit hook run.
+    // `run_lsif_emitter` buffers the entire tsc JSON output into a String
+    // (200-500 MB for large projects) before parsing. Running this on every
+    // commit caused a repeated 200-500 MB RSS spike.
+    //
+    // The LSIF pass now runs only from `init_repo` (full initial index).
+    // Per-commit LSIF delta is tracked as DEBT(travsr-25).
 
     Ok(())
 }
@@ -744,6 +746,9 @@ impl Daemon {
             SqliteStore::open(&db_path).context("opening graph.db")?,
         ));
 
+        // Bounded channel: 256 events max. The single indexer worker below drains
+        // this channel one event at a time, so back-pressure naturally throttles
+        // the watcher rather than letting thousands of events queue up in memory.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<watcher::WatchEvent>(256);
         let start_time = std::time::Instant::now();
 
@@ -780,6 +785,31 @@ impl Daemon {
         #[cfg(unix)]
         let sock_shutdown = Arc::new(tokio::sync::Notify::new());
 
+        // ── Single dedicated indexer worker ───────────────────────────────────
+        // PERF-001: Previously the event loop spawned a new blocking thread for
+        // every incoming WatchEvent. Under a large checkout or IDE auto-save
+        // flood (e.g. 100 events in < 500 ms) this created up to 100 OS threads
+        // simultaneously. All of them immediately blocked on `store.lock()`,
+        // serialising anyway — so the only effect was ~800 MB of wasted thread
+        // stacks (100 threads × 8 MB stack = 800 MB RSS spike).
+        //
+        // The fix: a single `spawn_blocking` worker owns a `std::sync::mpsc`
+        // receiver and processes events one at a time. The Tokio async loop
+        // forwards `WatchEvent`s through a std channel (`index_tx`) to this
+        // worker. No new threads are ever spawned for indexing — at most ONE
+        // blocking thread handles indexing at any time.
+        let (index_tx, index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        let indexer_worker = {
+            let store_worker = Arc::clone(&store);
+            let repo_worker = Arc::clone(&repo_root_arc);
+            tokio::task::spawn_blocking(move || {
+                while let Ok(ev) = index_rx.recv() {
+                    handle_watch_event(ev, &repo_worker, &store_worker);
+                }
+                tracing::debug!("indexer worker exiting — channel closed");
+            })
+        };
+
         loop {
             // tokio::select! does not support #[cfg] on individual branches,
             // so we use two complete select! blocks, one per platform.
@@ -788,11 +818,11 @@ impl Daemon {
                 let sock_shutdown_wait = sock_shutdown.notified();
                 tokio::select! {
                     Some(ev) = rx.recv() => {
-                        let store = Arc::clone(&store);
-                        let repo = Arc::clone(&repo_root_arc);
-                        tokio::task::spawn_blocking(move || {
-                            handle_watch_event(ev, &repo, &store);
-                        });
+                        // Forward to the dedicated indexer worker — never spawn a
+                        // new thread here (PERF-001).
+                        if index_tx.send(ev).is_err() {
+                            tracing::warn!("indexer worker has exited; dropping watch event");
+                        }
                     }
                     Ok((conn, _)) = listener.accept() => {
                         let store = Arc::clone(&store);
@@ -853,11 +883,11 @@ impl Daemon {
             {
                 tokio::select! {
                     Some(ev) = rx.recv() => {
-                        let store = Arc::clone(&store);
-                        let repo = Arc::clone(&repo_root_arc);
-                        tokio::task::spawn_blocking(move || {
-                            handle_watch_event(ev, &repo, &store);
-                        });
+                        // Forward to the dedicated indexer worker — never spawn a
+                        // new thread here (PERF-001).
+                        if index_tx.send(ev).is_err() {
+                            tracing::warn!("indexer worker has exited; dropping watch event");
+                        }
                     }
                     _ = gc_tick.tick() => {
                         tracing::debug!(
@@ -873,13 +903,27 @@ impl Daemon {
             }
         }
 
-        // Drain any pending watch events before exiting.
+        // 1. Signal the indexer worker: drop index_tx to close the std channel.
+        //    The worker will drain any remaining events then exit its recv() loop.
+        drop(index_tx);
+        // 2. Drain remaining events in the Tokio mpsc channel (not yet forwarded
+        //    to the worker) directly on this thread.
         rx.close();
         while let Ok(ev) = rx.try_recv() {
             let store = Arc::clone(&store);
             let repo = repo_root.clone();
             handle_watch_event(ev, &repo, &store);
         }
+        // 3. Wait for the indexer worker to finish draining index_rx and exit.
+        //    Without this await, the tokio runtime would wait for the detached
+        //    spawn_blocking task at shutdown, which caused the test hang.
+        //    30s is generous; in practice the worker exits in milliseconds once
+        //    index_tx is dropped.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            indexer_worker,
+        )
+        .await;
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);

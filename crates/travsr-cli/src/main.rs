@@ -127,7 +127,7 @@ enum DaemonAction {
     Restart,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Suppress the broken-pipe panic from `println!` when a pipe consumer
     // closes early (e.g. `travsr graph --all --format dot | head`).
@@ -140,9 +140,15 @@ async fn main() {
         std::process::exit(1);
     }));
 
+    // Parse CLI args BEFORE initialising any subsystems.
+    // Clap exits immediately for --version and --help via process::exit, so
+    // init_tracing() (which may start the OTLP exporter or its background
+    // tasks) must not run first — otherwise those simple queries hang.
+    let cli = Cli::parse();
+
     init_tracing();
 
-    let result = run().await;
+    let result = run(cli).await;
 
     // Flush stdout before exiting. Ignore broken pipe — the pipe consumer
     // closed early (e.g. `| head`), which is not an error on our side.
@@ -240,8 +246,7 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
     })
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init => init::run()?,
         Command::Daemon { action } => {
@@ -252,6 +257,16 @@ async fn run() -> Result<()> {
                     if foreground {
                         travsr_daemon::Daemon::run(repo_root).await?;
                     } else {
+                        // Guard: if a daemon is already responding on the socket,
+                        // don't spawn another one. Each `daemon start` call was
+                        // otherwise spawning a new background child (visible,
+                        // 700 MB each) because the check happened *inside* the
+                        // child after it was already running.
+                        let sock = repo_root.join(".travsr/daemon.sock");
+                        if send_daemon_command(&sock, r#"{"op":"status"}"#).is_ok() {
+                            eprintln!("travsr daemon is already running");
+                            return Ok(());
+                        }
                         // Spawn background child: re-exec with --foreground.
                         let exe = std::env::current_exe().context("finding current exe")?;
                         std::process::Command::new(exe)

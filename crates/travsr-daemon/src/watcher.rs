@@ -46,6 +46,20 @@ impl Drop for WatcherHandle {
 /// Debounce window — coalesce rapid saves into a single reindex call.
 const DEBOUNCE_MS: u64 = 500;
 
+/// Hard cap on the debounce table size.
+///
+/// At ~150 bytes per entry (PathBuf + PendingKind + Instant + HashMap overhead)
+/// this limits the table to ~15 MB. During a pathological event flood (e.g. a
+/// `git checkout` touching 100k+ files while the single indexer worker is
+/// saturated), the bounded tokio channel back-pressures the flush thread which
+/// lets the debounce table grow unboundedly without this cap.
+///
+/// Policy: updates to *already-pending* paths coalesce as normal. Brand-new
+/// paths beyond the cap are dropped with a throttled warning. The post-commit
+/// hook reconciles via `git diff-tree` on the next commit; `travsr init`
+/// always fully recovers the graph.
+const MAX_PENDING: usize = 100_000;
+
 const SKIP_DIRS: &[&str] = &[
     ".git",
     ".travsr",
@@ -170,6 +184,7 @@ pub fn spawn(
             // `raw_rx` unblocks when `raw_tx` is dropped (watcher is dropped above
             // when this scope exits, but we need to exit the loop first).
             // Use a timeout-based recv to periodically check the stop flag.
+            let mut dropped_total: u64 = 0;
             loop {
                 if stop_event.load(Ordering::Acquire) {
                     break;
@@ -208,10 +223,27 @@ pub fn spawn(
                             let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
                             let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
                             // A Remove always wins over a pending Upsert for the same path.
+                            // Updates to existing pending paths always coalesce — only
+                            // brand-new paths are gated by MAX_PENDING.
                             match guard.get(path) {
                                 Some((PendingKind::Remove, _)) if kind == PendingKind::Upsert => {}
-                                _ => {
+                                Some(_) => {
                                     guard.insert(path.clone(), (kind, deadline));
+                                }
+                                None => {
+                                    if guard.len() < MAX_PENDING {
+                                        guard.insert(path.clone(), (kind, deadline));
+                                    } else {
+                                        dropped_total += 1;
+                                        if dropped_total == 1 || dropped_total % 10_000 == 0 {
+                                            tracing::warn!(
+                                                dropped = dropped_total,
+                                                cap = MAX_PENDING,
+                                                "watcher debounce table full — new paths \
+                                                 dropped (run `travsr init` to reconcile)"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
