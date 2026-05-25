@@ -20,6 +20,8 @@ use travsr_indexer::{
 };
 use travsr_store::{SqliteStore, Store};
 
+#[cfg(unix)]
+pub use hook::try_dispatch_to_daemon;
 pub use hook::{changed_files_from_git, install_hook};
 
 /// Statistics returned by [`init_repo`] and displayed by `travsr init`.
@@ -667,7 +669,24 @@ mod tests {
     }
 }
 
-/// The Travsr daemon process (event loop wires in Sprint 3).
+/// Messages sent to the daemon's control socket.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+enum ControlRequest {
+    ReindexCommit { sha: String },
+    ReindexPaths { paths: Vec<PathBuf> },
+    Status,
+    Shutdown,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ControlResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// The Travsr daemon — owns the file watcher, indexer worker, and control socket.
 #[derive(Debug, Default)]
 pub struct Daemon {
     _private: (),
@@ -678,8 +697,256 @@ impl Daemon {
         Self::default()
     }
 
-    pub fn run() -> anyhow::Result<()> {
-        tracing::info!("travsr-daemon: event loop stub — Sprint 3");
+    /// Run the daemon event loop. Acquires an exclusive lockfile, starts the
+    /// file watcher, control socket, and GC ticker. Blocks until SIGTERM/SIGINT.
+    pub async fn run(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
+        use fs2::FileExt as _;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let travsr_dir = repo_root.join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).context("creating .travsr")?;
+
+        // Acquire exclusive lockfile — OS releases the lock on process death.
+        let lock_path = travsr_dir.join("daemon.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .context("opening daemon.lock")?;
+        lock_file.try_lock_exclusive().map_err(|_| {
+            // Read PID for a helpful error message.
+            let pid = std::fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .map(|p| format!(" PID={p}"))
+                .unwrap_or_default();
+            anyhow::anyhow!("another travsr daemon is already running{pid}")
+        })?;
+        // Write our PID into the lockfile for `daemon status`.
+        use std::io::Write as _;
+        write!(&lock_file, "{}", std::process::id())?;
+
+        let db_path = travsr_dir.join("graph.db");
+        let store = Arc::new(Mutex::new(
+            SqliteStore::open(&db_path).context("opening graph.db")?,
+        ));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<watcher::WatchEvent>(256);
+        let start_time = std::time::Instant::now();
+        let _watcher_handle =
+            watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
+
+        // Control socket — Unix domain socket at .travsr/daemon.sock.
+        let sock_path = travsr_dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&sock_path); // clean up stale socket
+        let listener = UnixListener::bind(&sock_path).context("binding daemon.sock")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        let mut gc_tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
+
+        tracing::info!(
+            repo = %repo_root.display(),
+            sock = %sock_path.display(),
+            "travsr daemon started"
+        );
+
+        let repo_root_arc = Arc::new(repo_root.clone());
+        // Notify used for socket-initiated shutdown signal (no unsafe needed).
+        let sock_shutdown = Arc::new(tokio::sync::Notify::new());
+
+        loop {
+            let sock_shutdown_wait = sock_shutdown.notified();
+            tokio::select! {
+                Some(ev) = rx.recv() => {
+                    let store = Arc::clone(&store);
+                    let repo = Arc::clone(&repo_root_arc);
+                    tokio::task::spawn_blocking(move || {
+                        handle_watch_event(ev, &repo, &store);
+                    });
+                }
+                Ok((conn, _)) = listener.accept() => {
+                    let store = Arc::clone(&store);
+                    let repo = Arc::clone(&repo_root_arc);
+                    let sd_notify = Arc::clone(&sock_shutdown);
+                    tokio::spawn(async move {
+                        let (reader, mut writer) = conn.into_split();
+                        let mut lines = BufReader::new(reader).lines();
+                        if let Ok(Some(line)) = lines.next_line().await {
+                            let (resp, shutdown_requested) =
+                                handle_control_message(&line, &repo, &store);
+                            let _ = writer
+                                .write_all(
+                                    format!(
+                                        "{}\n",
+                                        serde_json::to_string(&resp)
+                                            .unwrap_or_default()
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                            if shutdown_requested {
+                                sd_notify.notify_one();
+                            }
+                        }
+                    });
+                }
+                _ = gc_tick.tick() => {
+                    tracing::debug!(
+                        "daemon heartbeat — uptime {}s",
+                        start_time.elapsed().as_secs()
+                    );
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("travsr daemon shutting down (SIGINT)");
+                    break;
+                }
+                _ = sock_shutdown_wait => {
+                    tracing::info!("travsr daemon shutting down (control socket)");
+                    break;
+                }
+            }
+        }
+
+        // Drain any pending watch events before exiting.
+        rx.close();
+        while let Ok(ev) = rx.try_recv() {
+            let store = Arc::clone(&store);
+            let repo = repo_root.clone();
+            handle_watch_event(ev, &repo, &store);
+        }
+
+        let _ = std::fs::remove_file(&sock_path);
+        drop(lock_file);
+        tracing::info!("travsr daemon stopped");
         Ok(())
+    }
+}
+
+fn handle_watch_event(
+    ev: watcher::WatchEvent,
+    repo_root: &std::path::Path,
+    store: &std::sync::Mutex<SqliteStore>,
+) {
+    use watcher::WatchEvent;
+    match ev {
+        WatchEvent::Upsert(path) => {
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
+                tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed");
+            }
+        }
+        WatchEvent::Remove(path) => {
+            let vname_path = path
+                .strip_prefix(repo_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = s.delete_nodes_for_path(&vname_path) {
+                tracing::warn!(path=%path.display(), err=%e, "watcher delete failed");
+            }
+        }
+        WatchEvent::Rename { from, to } => {
+            let from_vname = from
+                .strip_prefix(repo_root)
+                .unwrap_or(&from)
+                .to_string_lossy()
+                .replace('\\', "/");
+            {
+                let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = s.delete_nodes_for_path(&from_vname) {
+                    tracing::warn!(err=%e, "watcher rename-delete failed");
+                }
+            }
+            {
+                let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = reindex_files(std::slice::from_ref(&to), repo_root, &mut s) {
+                    tracing::warn!(err=%e, "watcher rename-index failed");
+                }
+            }
+        }
+    }
+}
+
+/// Returns `(response, should_shutdown)`.
+fn handle_control_message(
+    line: &str,
+    repo_root: &std::path::Path,
+    store: &std::sync::Mutex<SqliteStore>,
+) -> (ControlResponse, bool) {
+    match serde_json::from_str::<ControlRequest>(line) {
+        Ok(ControlRequest::ReindexCommit { sha }) => {
+            tracing::info!(sha=%sha, "control: reindex-commit");
+            let paths = changed_files_from_git(repo_root).unwrap_or_default();
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
+                tracing::warn!(err=%e, "control reindex failed");
+                return (
+                    ControlResponse {
+                        ok: false,
+                        message: Some(e.to_string()),
+                    },
+                    false,
+                );
+            }
+            (
+                ControlResponse {
+                    ok: true,
+                    message: Some(format!("reindexed {} paths", paths.len())),
+                },
+                false,
+            )
+        }
+        Ok(ControlRequest::ReindexPaths { paths }) => {
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
+                return (
+                    ControlResponse {
+                        ok: false,
+                        message: Some(e.to_string()),
+                    },
+                    false,
+                );
+            }
+            (
+                ControlResponse {
+                    ok: true,
+                    message: None,
+                },
+                false,
+            )
+        }
+        Ok(ControlRequest::Status) => (
+            ControlResponse {
+                ok: true,
+                message: Some("running".to_string()),
+            },
+            false,
+        ),
+        Ok(ControlRequest::Shutdown) => {
+            // Signal the event loop to stop via the broadcast channel.
+            (
+                ControlResponse {
+                    ok: true,
+                    message: None,
+                },
+                true,
+            )
+        }
+        Err(e) => (
+            ControlResponse {
+                ok: false,
+                message: Some(format!("parse error: {e}")),
+            },
+            false,
+        ),
     }
 }

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 
@@ -105,4 +106,42 @@ pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
         .filter(|l| !l.is_empty())
         .map(|p| repo_root.join(p))
         .collect())
+}
+
+/// Attempt to dispatch the current commit reindex to a running daemon via the
+/// Unix domain control socket at `.travsr/daemon.sock`.
+///
+/// Returns `true` if the daemon accepted the request; `false` if no daemon is
+/// running or the write fails. Write timeout is capped at 50 ms so the git
+/// hook never perceptibly blocks a commit.
+///
+/// # Panics
+/// Never — hook must never panic.
+#[cfg(unix)]
+pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
+    use std::io::Write as _;
+
+    let sock = repo_root.join(".travsr/daemon.sock");
+    if !sock.exists() {
+        return false;
+    }
+    let Ok(mut conn) = std::os::unix::net::UnixStream::connect(&sock) else {
+        return false;
+    };
+    let _ = conn.set_write_timeout(Some(Duration::from_millis(50)));
+    let sha = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let msg = format!(r#"{{"op":"reindex-commit","sha":"{sha}"}}"#);
+    writeln!(conn, "{msg}").is_ok()
 }

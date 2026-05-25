@@ -19,7 +19,13 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 walkdir = { workspace = true }
 ignore = { workspace = true }
-notify = { workspace = true }
+notify = { workspace = true, features = ["macos_kqueue"] }
+fs2 = { workspace = true }
+tracing-appender = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true }
