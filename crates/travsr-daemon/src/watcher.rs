@@ -18,6 +18,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use travsr_core::Language;
@@ -27,7 +28,6 @@ use travsr_core::Language;
 pub enum WatchEvent {
     Upsert(PathBuf),
     Remove(PathBuf),
-    Rename { from: PathBuf, to: PathBuf },
 }
 
 /// A handle to the running watcher threads. Drop to signal shutdown.
@@ -169,8 +169,14 @@ pub fn spawn(
                                 continue;
                             }
 
+                            // Name(From) is the "old path" half of a rename — treat
+                            // it as Remove so deleted nodes are tombstoned.
+                            // Name(To) and all other events are Upsert.
                             let kind = match event.kind {
-                                EventKind::Remove(_) => PendingKind::Remove,
+                                EventKind::Remove(_)
+                                | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                                    PendingKind::Remove
+                                }
                                 _ => PendingKind::Upsert,
                             };
 

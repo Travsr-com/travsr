@@ -888,25 +888,6 @@ fn handle_watch_event(
                 tracing::warn!(path=%path.display(), err=%e, "watcher delete failed");
             }
         }
-        WatchEvent::Rename { from, to } => {
-            let from_vname = from
-                .strip_prefix(repo_root)
-                .unwrap_or(&from)
-                .to_string_lossy()
-                .replace('\\', "/");
-            {
-                let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = s.delete_nodes_for_path(&from_vname) {
-                    tracing::warn!(err=%e, "watcher rename-delete failed");
-                }
-            }
-            {
-                let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = reindex_files(std::slice::from_ref(&to), repo_root, &mut s) {
-                    tracing::warn!(err=%e, "watcher rename-index failed");
-                }
-            }
-        }
     }
 }
 

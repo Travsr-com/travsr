@@ -277,7 +277,7 @@ async fn run() -> Result<()> {
                     let sock = repo_root.join(".travsr/daemon.sock");
                     // Best-effort stop — ignore errors if daemon not running.
                     let _ = send_daemon_command(&sock, r#"{"op":"shutdown"}"#);
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let exe = std::env::current_exe().context("finding current exe")?;
                     std::process::Command::new(exe)
                         .args(["daemon", "start", "--foreground"])
