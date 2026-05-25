@@ -7,8 +7,8 @@
   "license": "MIT",
   "icon": "icon.png",
   "galleryBanner": {
-    "color": "#F6F1ED",
-    "theme": "light"
+    "color": "#1A1A1A",
+    "theme": "dark"
   },
   "repository": {
     "type": "git",
@@ -18,20 +18,24 @@
   "bugs": {
     "url": "https://github.com/raj-rkv/travsr/issues"
   },
+  "qna": "https://github.com/raj-rkv/travsr/discussions",
+  "pricing": "Free",
   "keywords": [
-    "code intelligence",
+    "mcp",
+    "code-intelligence",
     "graph",
-    "MCP",
-    "blast radius",
-    "call graph",
-    "AI",
-    "code navigation"
+    "ai",
+    "claude",
+    "copilot",
+    "blast-radius",
+    "call-graph"
   ],
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Programming Languages",
+    "AI",
     "Other"
   ],
   "main": "./out/extension.js",

@@ -29,7 +29,8 @@ export class StdioMcpClient implements McpClient {
 
   constructor(
     private readonly binary: string,
-    private readonly cwd?: string
+    private readonly cwd?: string,
+    private readonly version: string = "0.0.0"
   ) {}
 
   async connect(): Promise<void> {
@@ -56,7 +57,7 @@ export class StdioMcpClient implements McpClient {
     await this.rpc("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "travsr-vscode", version: "0.1.0" },
+      clientInfo: { name: "travsr-vscode", version: this.version },
     });
     this.connected = true;
   }

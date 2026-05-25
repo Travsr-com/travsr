@@ -18,7 +18,11 @@ export function activate(context: vscode.ExtensionContext): void {
       .get<string>("binaryPath", "travsr");
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  const mcp = new StdioMcpClient(binary, workspaceRoot);
+  const version: string =
+    typeof context.extension.packageJSON?.version === "string"
+      ? context.extension.packageJSON.version
+      : "0.0.0";
+  const mcp = new StdioMcpClient(binary, workspaceRoot, version);
   context.subscriptions.push({ dispose: () => mcp.dispose() });
 
   void mcp.connect();
