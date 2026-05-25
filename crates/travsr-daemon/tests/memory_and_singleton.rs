@@ -163,9 +163,8 @@ async fn rss_flood_under_200mb() {
         let path = tmp.path().join(format!("flood_{i:04}.ts"));
         // Each write is a distinct content so the SHA-256 always differs and
         // reindex_files cannot skip via the hash-cache fast path.
-        let content = format!(
-            "export class Flood{i} {{ id = {i}; process() {{ return {i} * 2; }} }}\n"
-        );
+        let content =
+            format!("export class Flood{i} {{ id = {i}; process() {{ return {i} * 2; }} }}\n");
         std::fs::write(&path, content).expect("write flood file");
     }
     let flood_write_elapsed = flood_start.elapsed();
@@ -230,12 +229,22 @@ async fn rss_flood_under_200mb() {
 
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    // Graceful shutdown — same fix as the Linux variant.
-    let sock_path = tmp.path().join(".travsr/daemon.sock");
-    graceful_shutdown(&sock_path, daemon_task).await;
+    // Graceful shutdown on Unix (UnixStream available); abort on Windows.
+    #[cfg(unix)]
+    {
+        let sock_path = tmp.path().join(".travsr/daemon.sock");
+        graceful_shutdown(&sock_path, daemon_task).await;
+    }
+    #[cfg(not(unix))]
+    {
+        daemon_task.abort();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     // No RSS assertion on non-Linux — the test still validates no panic/deadlock.
-    println!("rss_flood_under_200mb: RSS check skipped on non-Linux platform (no /proc/self/status)");
+    println!(
+        "rss_flood_under_200mb: RSS check skipped on non-Linux platform (no /proc/self/status)"
+    );
 }
 
 // ── test 2: duplicate-daemon singleton enforcement (Unix only) ────────────────
@@ -263,9 +272,7 @@ async fn daemon_start_twice_single_process() {
     let repo_root_2 = tmp.path().to_path_buf();
 
     // Start the first daemon — should succeed and keep running.
-    let daemon1 = tokio::spawn(async move {
-        travsr_daemon::Daemon::run(repo_root_1).await
-    });
+    let daemon1 = tokio::spawn(async move { travsr_daemon::Daemon::run(repo_root_1).await });
 
     // Give daemon 1 enough time to acquire the lock, create the socket, and
     // enter its select! loop.

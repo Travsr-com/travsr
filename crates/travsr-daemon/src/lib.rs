@@ -919,11 +919,7 @@ impl Daemon {
         //    spawn_blocking task at shutdown, which caused the test hang.
         //    30s is generous; in practice the worker exits in milliseconds once
         //    index_tx is dropped.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            indexer_worker,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), indexer_worker).await;
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
