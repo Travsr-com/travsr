@@ -10,6 +10,7 @@
  * Degrades gracefully when the daemon is unavailable.
  */
 
+import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import type { McpClient } from "./mcp";
@@ -51,7 +52,7 @@ class PlaceholderNode extends vscode.TreeItem {
   }
 }
 
-type TreeNode = SectionNode | EntryNode | PlaceholderNode;
+export type TreeNode = SectionNode | EntryNode | PlaceholderNode;
 
 // ── provider ───────────────────────────────────────────────────────────────
 
@@ -108,7 +109,7 @@ export class TravsrTreeDataProvider
         }, 300);
       }),
 
-      { dispose: () => this._onDidChangeTreeData.dispose() }
+      { dispose: () => { clearTimeout(this.selectionDebounce); this._onDidChangeTreeData.dispose(); } }
     );
   }
 
@@ -157,10 +158,10 @@ export class TravsrTreeDataProvider
       const raw = await this.mcp.callTool("get_dependencies", { file });
       const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
       return lines.map((line) => {
-        // Format: "import:./mcp" or "import:vscode"
-        const m = /^(\w+):(.+)$/.exec(line);
+        // Format: "import:./mcp", "import:@scope/pkg", "type-import:./bar"
+        const m = /^([^:]+):(.+)$/.exec(line);
         const kind = m?.[1] ?? "import";
-        const dep = m?.[2] ?? line;
+        const dep = (m?.[2] ?? line).trim();
         const filePath = dep.startsWith(".")
           ? this.resolveLocalDep(file, dep)
           : undefined;
@@ -198,8 +199,10 @@ export class TravsrTreeDataProvider
   private resolveLocalDep(fromFile: string, dep: string): string | undefined {
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!wsRoot) return undefined;
-    // Try .ts first, then .tsx
     const base = path.resolve(wsRoot, path.dirname(fromFile), dep);
-    return base + ".ts";
+    for (const ext of [".ts", ".tsx", ".js", ".jsx"]) {
+      if (fs.existsSync(base + ext)) return base + ext;
+    }
+    return base + ".ts"; // fallback: let vscode.open surface a missing-file error
   }
 }

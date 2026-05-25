@@ -240,6 +240,61 @@ suite("VSCODE-204: TravsrTreeDataProvider — Callers section", () => {
   });
 });
 
+suite("VSCODE-204: TravsrTreeDataProvider — edge cases", () => {
+  test("dep line with space after colon still gets open-file command (dep is trimmed)", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: "import: ./mcp\n" }),
+      makeContext()
+    );
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(depsSection);
+    assert.strictEqual(entry.label, "./mcp", "dep must be trimmed");
+    assert.ok(entry.command !== undefined, "trimmed local dep must still get open-file command");
+  });
+
+  test("dep line with scoped package kind is parsed correctly", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: "import:@scope/package\n" }),
+      makeContext()
+    );
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(depsSection);
+    assert.strictEqual(entry.label, "@scope/package");
+    assert.strictEqual(entry.description, "import");
+    assert.strictEqual(entry.command, undefined, "scoped package must not get open-file command");
+  });
+
+  test("MCP throwing on get_dependencies returns placeholder, not crash", async () => {
+    const mcp: import("../../mcp").McpClient = {
+      callTool: async () => { throw new Error("daemon offline"); },
+      isConnected: () => false,
+      dispose: () => undefined,
+    };
+    const provider = new TravsrTreeDataProvider(mcp, makeContext());
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(depsSection);
+    assert.strictEqual(children.length, 1);
+    assert.ok((children[0].label as string).includes("No dependencies found"));
+  });
+
+  test("MCP throwing on get_callers returns placeholder, not crash", async () => {
+    const mcp: import("../../mcp").McpClient = {
+      callTool: async () => { throw new Error("daemon offline"); },
+      isConnected: () => false,
+      dispose: () => undefined,
+    };
+    const provider = new TravsrTreeDataProvider(mcp, makeContext());
+    setSymbol(provider, "myFn");
+    const [, callersSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(callersSection);
+    assert.strictEqual(children.length, 1);
+    assert.ok((children[0].label as string).includes("No callers found"));
+  });
+});
+
 suite("VSCODE-204: TravsrTreeDataProvider — refresh", () => {
   test("refresh() fires onDidChangeTreeData", (done) => {
     const provider = new TravsrTreeDataProvider(makeMcp(), makeContext());
