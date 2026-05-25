@@ -1,15 +1,37 @@
 {
   "name": "travsr-vscode",
   "displayName": "Travsr",
-  "description": "Graph-native code intelligence for VS Code, powered by the local Travsr daemon over MCP.",
-  "version": "0.1.0",
+  "description": "Graph-native code intelligence for VS Code. Live call graph, blast radius, and callers — powered by the local Travsr daemon over MCP.",
+  "version": "0.1.1",
   "publisher": "travsr",
-  "private": true,
   "license": "MIT",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#F6F1ED",
+    "theme": "light"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/raj-rkv/travsr"
+  },
+  "homepage": "https://travsr.com",
+  "bugs": {
+    "url": "https://github.com/raj-rkv/travsr/issues"
+  },
+  "keywords": [
+    "code intelligence",
+    "graph",
+    "MCP",
+    "blast radius",
+    "call graph",
+    "AI",
+    "code navigation"
+  ],
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
+    "Programming Languages",
     "Other"
   ],
   "main": "./out/extension.js",
