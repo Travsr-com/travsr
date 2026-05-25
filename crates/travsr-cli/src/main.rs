@@ -12,7 +12,7 @@ mod repos;
 mod serve;
 mod status;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -113,9 +113,18 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
-    Start,
+    /// Start the daemon (detaches to background unless --foreground is given).
+    Start {
+        /// Run the daemon in the foreground (default: background).
+        #[arg(long, default_value_t = false)]
+        foreground: bool,
+    },
+    /// Stop the running daemon.
     Stop,
+    /// Check whether the daemon is running.
     Status,
+    /// Stop the running daemon and start a fresh one.
+    Restart,
 }
 
 #[tokio::main]
@@ -235,12 +244,52 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => init::run()?,
-        Command::Daemon { action } => match action {
-            DaemonAction::Start => travsr_daemon::Daemon::run()?,
-            DaemonAction::Stop | DaemonAction::Status => {
-                tracing::info!("travsr daemon {:?}: stub — Sprint 3", action);
+        Command::Daemon { action } => {
+            let cwd = std::env::current_dir()?;
+            let repo_root = repo::find_git_root(&cwd)?;
+            match action {
+                DaemonAction::Start { foreground } => {
+                    if foreground {
+                        travsr_daemon::Daemon::run(repo_root).await?;
+                    } else {
+                        // Spawn background child: re-exec with --foreground.
+                        let exe = std::env::current_exe().context("finding current exe")?;
+                        std::process::Command::new(exe)
+                            .args(["daemon", "start", "--foreground"])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .context("spawning background daemon")?;
+                        eprintln!("travsr daemon started in background");
+                    }
+                }
+                DaemonAction::Stop => {
+                    let sock = repo_root.join(".travsr/daemon.sock");
+                    send_daemon_command(&sock, r#"{"op":"shutdown"}"#)?;
+                }
+                DaemonAction::Status => {
+                    let sock = repo_root.join(".travsr/daemon.sock");
+                    let resp = send_daemon_command(&sock, r#"{"op":"status"}"#)?;
+                    println!("{resp}");
+                }
+                DaemonAction::Restart => {
+                    let sock = repo_root.join(".travsr/daemon.sock");
+                    // Best-effort stop — ignore errors if daemon not running.
+                    let _ = send_daemon_command(&sock, r#"{"op":"shutdown"}"#);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let exe = std::env::current_exe().context("finding current exe")?;
+                    std::process::Command::new(exe)
+                        .args(["daemon", "start", "--foreground"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .context("respawning daemon")?;
+                    eprintln!("travsr daemon restarted in background");
+                }
             }
-        },
+        }
         Command::Mcp {
             stdio: _,
             global,
@@ -285,6 +334,15 @@ async fn run() -> Result<()> {
         Command::HookRun { from_hook, paths } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;
+
+            // Prefer dispatching to a running daemon — it reindexes async and
+            // never blocks the git commit. Fall back to in-process indexing when
+            // no daemon is running.
+            #[cfg(unix)]
+            if travsr_daemon::try_dispatch_to_daemon(&repo_root) {
+                return Ok(());
+            }
+
             let mut store = {
                 let db_path = repo_root.join(".travsr/graph.db");
                 travsr_store::SqliteStore::open(&db_path)?
@@ -302,4 +360,27 @@ async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Send a JSON command to the running daemon's Unix domain socket and return
+/// the trimmed response line. Times out after 5 seconds.
+#[cfg(unix)]
+fn send_daemon_command(sock: &std::path::Path, msg: &str) -> anyhow::Result<String> {
+    use std::io::{BufRead as _, Write as _};
+    let mut conn = std::os::unix::net::UnixStream::connect(sock).with_context(|| {
+        format!(
+            "daemon not running (socket not found at {})",
+            sock.display()
+        )
+    })?;
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    writeln!(conn, "{msg}")?;
+    let mut resp = String::new();
+    std::io::BufReader::new(conn).read_line(&mut resp)?;
+    Ok(resp.trim().to_string())
+}
+
+#[cfg(not(unix))]
+fn send_daemon_command(_sock: &std::path::Path, _msg: &str) -> anyhow::Result<String> {
+    anyhow::bail!("daemon control socket not yet supported on Windows")
 }

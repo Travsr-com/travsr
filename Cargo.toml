@@ -63,6 +63,8 @@ uuid             = { version = "1", features = ["v4"] }
 base64           = "0.22"
 tokio-util       = { version = "0.7", features = ["rt"] }
 tokio-stream     = "0.1"
+fs2              = "0.4"
+tracing-appender = "0.2"
 
 [profile.release]
 lto = "thin"

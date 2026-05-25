@@ -1,0 +1,90 @@
+//! Integration tests for the file watcher.
+//!
+//! These tests spin up a real inotify/kqueue watcher via the `notify` crate
+//! and verify that the correct `WatchEvent` variants are emitted for file
+//! creations and that skip rules are applied correctly.
+
+use std::time::Instant;
+use tokio::sync::mpsc;
+use travsr_daemon::watcher::{spawn, WatchEvent};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_detects_ts_file_creation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let _handle = spawn(tmp.path(), tx, Instant::now()).unwrap();
+
+    // Give the watcher time to initialise and register the kqueue/inotify watch.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if let Some(WatchEvent::Upsert(p)) = rx.recv().await {
+                if p.ends_with("app.ts") {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("watcher must emit Upsert for app.ts within 3 s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_ignores_target_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let _handle = spawn(tmp.path(), tx, Instant::now()).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let target = tmp.path().join("target/debug");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("lib.rs"), "fn main() {}").unwrap();
+
+    // No event should arrive for target/ contents within 1.5 s.
+    let got_event = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+    assert!(
+        got_event.is_err(),
+        "watcher must ignore target/ directory, but got: {got_event:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_ignores_non_source_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let _handle = spawn(tmp.path(), tx, Instant::now()).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Write an ignored file first, then a source file.
+    std::fs::write(tmp.path().join("README.md"), "# readme").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    std::fs::write(tmp.path().join("app.ts"), "export {}").unwrap();
+
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match rx.recv().await {
+                Some(WatchEvent::Upsert(p)) if p.ends_with("app.ts") => return p,
+                Some(WatchEvent::Upsert(p)) if p.ends_with("README.md") => {
+                    panic!(
+                        "watcher must not emit events for README.md, got: {}",
+                        p.display()
+                    );
+                }
+                _ => {} // other events (dir creation etc.) — keep draining
+            }
+        }
+    })
+    .await
+    .expect("must receive Upsert for app.ts within 3 s");
+
+    assert!(
+        ev.ends_with("app.ts"),
+        "expected app.ts, got: {}",
+        ev.display()
+    );
+}
