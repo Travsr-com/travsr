@@ -669,7 +669,8 @@ mod tests {
     }
 }
 
-/// Messages sent to the daemon's control socket.
+/// Messages sent to the daemon's control socket (Unix only).
+#[cfg(unix)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 enum ControlRequest {
@@ -679,6 +680,7 @@ enum ControlRequest {
     Shutdown,
 }
 
+#[cfg(unix)]
 #[derive(Debug, serde::Serialize)]
 struct ControlResponse {
     ok: bool,
@@ -702,7 +704,9 @@ impl Daemon {
     pub async fn run(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
         use fs2::FileExt as _;
         use std::sync::{Arc, Mutex};
+        #[cfg(unix)]
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        #[cfg(unix)]
         use tokio::net::UnixListener;
 
         let travsr_dir = repo_root.join(".travsr");
@@ -739,9 +743,12 @@ impl Daemon {
         let _watcher_handle =
             watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
 
-        // Control socket — Unix domain socket at .travsr/daemon.sock.
+        // Control socket — Unix domain socket at .travsr/daemon.sock (Unix only).
+        #[cfg(unix)]
         let sock_path = travsr_dir.join("daemon.sock");
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path); // clean up stale socket
+        #[cfg(unix)]
         let listener = UnixListener::bind(&sock_path).context("binding daemon.sock")?;
         #[cfg(unix)]
         {
@@ -752,65 +759,91 @@ impl Daemon {
         let mut gc_tick = tokio::time::interval(std::time::Duration::from_secs(300));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
-        tracing::info!(
-            repo = %repo_root.display(),
-            sock = %sock_path.display(),
-            "travsr daemon started"
-        );
+        tracing::info!(repo = %repo_root.display(), "travsr daemon started");
+        #[cfg(unix)]
+        tracing::info!(sock = %sock_path.display(), "control socket bound");
 
         let repo_root_arc = Arc::new(repo_root.clone());
-        // Notify used for socket-initiated shutdown signal (no unsafe needed).
+        // Notify used for socket-initiated shutdown signal (Unix only).
+        #[cfg(unix)]
         let sock_shutdown = Arc::new(tokio::sync::Notify::new());
 
         loop {
-            let sock_shutdown_wait = sock_shutdown.notified();
-            tokio::select! {
-                Some(ev) = rx.recv() => {
-                    let store = Arc::clone(&store);
-                    let repo = Arc::clone(&repo_root_arc);
-                    tokio::task::spawn_blocking(move || {
-                        handle_watch_event(ev, &repo, &store);
-                    });
-                }
-                Ok((conn, _)) = listener.accept() => {
-                    let store = Arc::clone(&store);
-                    let repo = Arc::clone(&repo_root_arc);
-                    let sd_notify = Arc::clone(&sock_shutdown);
-                    tokio::spawn(async move {
-                        let (reader, mut writer) = conn.into_split();
-                        let mut lines = BufReader::new(reader).lines();
-                        if let Ok(Some(line)) = lines.next_line().await {
-                            let (resp, shutdown_requested) =
-                                handle_control_message(&line, &repo, &store);
-                            let _ = writer
-                                .write_all(
-                                    format!(
-                                        "{}\n",
-                                        serde_json::to_string(&resp)
-                                            .unwrap_or_default()
+            // tokio::select! does not support #[cfg] on individual branches,
+            // so we use two complete select! blocks, one per platform.
+            #[cfg(unix)]
+            {
+                let sock_shutdown_wait = sock_shutdown.notified();
+                tokio::select! {
+                    Some(ev) = rx.recv() => {
+                        let store = Arc::clone(&store);
+                        let repo = Arc::clone(&repo_root_arc);
+                        tokio::task::spawn_blocking(move || {
+                            handle_watch_event(ev, &repo, &store);
+                        });
+                    }
+                    Ok((conn, _)) = listener.accept() => {
+                        let store = Arc::clone(&store);
+                        let repo = Arc::clone(&repo_root_arc);
+                        let sd_notify = Arc::clone(&sock_shutdown);
+                        tokio::spawn(async move {
+                            let (reader, mut writer) = conn.into_split();
+                            let mut lines = BufReader::new(reader).lines();
+                            if let Ok(Some(line)) = lines.next_line().await {
+                                let (resp, shutdown_requested) =
+                                    handle_control_message(&line, &repo, &store);
+                                let _ = writer
+                                    .write_all(
+                                        format!(
+                                            "{}\n",
+                                            serde_json::to_string(&resp)
+                                                .unwrap_or_default()
+                                        )
+                                        .as_bytes(),
                                     )
-                                    .as_bytes(),
-                                )
-                                .await;
-                            if shutdown_requested {
-                                sd_notify.notify_one();
+                                    .await;
+                                if shutdown_requested {
+                                    sd_notify.notify_one();
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
+                    _ = gc_tick.tick() => {
+                        tracing::debug!(
+                            "daemon heartbeat — uptime {}s",
+                            start_time.elapsed().as_secs()
+                        );
+                    }
+                    _ = &mut shutdown => {
+                        tracing::info!("travsr daemon shutting down (SIGINT)");
+                        break;
+                    }
+                    _ = sock_shutdown_wait => {
+                        tracing::info!("travsr daemon shutting down (control socket)");
+                        break;
+                    }
                 }
-                _ = gc_tick.tick() => {
-                    tracing::debug!(
-                        "daemon heartbeat — uptime {}s",
-                        start_time.elapsed().as_secs()
-                    );
-                }
-                _ = &mut shutdown => {
-                    tracing::info!("travsr daemon shutting down (SIGINT)");
-                    break;
-                }
-                _ = sock_shutdown_wait => {
-                    tracing::info!("travsr daemon shutting down (control socket)");
-                    break;
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    Some(ev) = rx.recv() => {
+                        let store = Arc::clone(&store);
+                        let repo = Arc::clone(&repo_root_arc);
+                        tokio::task::spawn_blocking(move || {
+                            handle_watch_event(ev, &repo, &store);
+                        });
+                    }
+                    _ = gc_tick.tick() => {
+                        tracing::debug!(
+                            "daemon heartbeat — uptime {}s",
+                            start_time.elapsed().as_secs()
+                        );
+                    }
+                    _ = &mut shutdown => {
+                        tracing::info!("travsr daemon shutting down");
+                        break;
+                    }
                 }
             }
         }
@@ -823,6 +856,7 @@ impl Daemon {
             handle_watch_event(ev, &repo, &store);
         }
 
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
         drop(lock_file);
         tracing::info!("travsr daemon stopped");
@@ -877,6 +911,7 @@ fn handle_watch_event(
 }
 
 /// Returns `(response, should_shutdown)`.
+#[cfg(unix)]
 fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,

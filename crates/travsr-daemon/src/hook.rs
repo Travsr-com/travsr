@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::Context as _;
 
@@ -120,6 +119,7 @@ pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
 #[cfg(unix)]
 pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
     use std::io::Write as _;
+    use std::time::Duration;
 
     let sock = repo_root.join(".travsr/daemon.sock");
     if !sock.exists() {
