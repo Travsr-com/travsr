@@ -19,7 +19,7 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 walkdir = { workspace = true }
 ignore = { workspace = true }
-notify = { workspace = true, features = ["macos_kqueue"] }
+notify = { workspace = true }
 fs2 = { workspace = true }
 tracing-appender = { workspace = true }
 serde = { workspace = true }

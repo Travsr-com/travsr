@@ -740,14 +740,20 @@ impl Daemon {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<watcher::WatchEvent>(256);
         let start_time = std::time::Instant::now();
+
+        // Remove stale socket BEFORE starting the watcher. The kqueue backend
+        // (macos_kqueue feature) opens every file during its initial recursive
+        // scan; a leftover socket from a previous run causes open() → ENOTSUP
+        // which aborts the entire watch setup and silently kills file watching.
+        #[cfg(unix)]
+        let sock_path = travsr_dir.join("daemon.sock");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&sock_path);
+
         let _watcher_handle =
             watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
 
         // Control socket — Unix domain socket at .travsr/daemon.sock (Unix only).
-        #[cfg(unix)]
-        let sock_path = travsr_dir.join("daemon.sock");
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(&sock_path); // clean up stale socket
         #[cfg(unix)]
         let listener = UnixListener::bind(&sock_path).context("binding daemon.sock")?;
         #[cfg(unix)]

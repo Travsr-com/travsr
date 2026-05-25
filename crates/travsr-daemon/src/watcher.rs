@@ -57,6 +57,11 @@ enum PendingKind {
 
 /// Spawn the file-system watcher. Returns a `WatcherHandle`; drop it to stop.
 ///
+/// Blocks until the underlying kqueue/inotify watch is fully established and
+/// skip directories have been unwatched. This guarantees that when `spawn`
+/// returns, the caller can safely create files in `.travsr/` (e.g. the daemon
+/// control socket) without triggering kqueue ENOTSUP errors.
+///
 /// Events that originate from files whose mtime predates `start_time`
 /// (FSEvents on macOS can replay old events on startup) are silently dropped.
 pub fn spawn(
@@ -115,6 +120,12 @@ pub fn spawn(
         })
         .expect("failed to spawn watcher flush thread");
 
+    // Ready channel: the event thread signals Ok(()) once the watch is fully
+    // set up and skip dirs are unwatched. spawn() blocks on this before
+    // returning so the caller cannot create the socket before kqueue is done
+    // scanning — preventing the ENOTSUP race on .travsr/daemon.sock.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+
     // ── Event-processing thread ───────────────────────────────────────────────
     // Owns the `RecommendedWatcher` so it lives on a stable OS thread.
     let stop_event = Arc::clone(&stop);
@@ -132,14 +143,19 @@ pub fn spawn(
                 Ok(w) => w,
                 Err(e) => {
                     tracing::error!("failed to create file watcher: {e}");
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("failed to create watcher: {e}")));
                     return;
                 }
             };
 
             if let Err(e) = watcher.watch(&repo_root, RecursiveMode::Recursive) {
                 tracing::error!("failed to watch {}: {e}", repo_root.display());
+                let _ = ready_tx.send(Err(anyhow::anyhow!("failed to watch repo: {e}")));
                 return;
             }
+
+            // Signal ready — watch is established, caller can proceed.
+            let _ = ready_tx.send(Ok(()));
 
             // Block on raw events until the stop flag is set.
             // `raw_rx` unblocks when `raw_tx` is dropped (watcher is dropped above
@@ -202,6 +218,13 @@ pub fn spawn(
             // `watcher` is dropped here, which stops the kernel watch.
         })
         .expect("failed to spawn watcher event thread");
+
+    // Block until the event thread confirms the watch is established.
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("watcher event thread exited before signalling ready"),
+    }
 
     Ok(WatcherHandle {
         stop,
