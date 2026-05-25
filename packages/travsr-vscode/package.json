@@ -43,6 +43,24 @@
     "onStartupFinished"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "travsrGraph",
+          "title": "Travsr",
+          "icon": "icon.png"
+        }
+      ]
+    },
+    "views": {
+      "travsrGraph": [
+        {
+          "id": "travsrGraph",
+          "name": "Travsr Graph",
+          "when": "true"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "travsr.showStatus",
@@ -55,8 +73,26 @@
       {
         "command": "travsr.showCallers",
         "title": "Travsr: Show Callers"
+      },
+      {
+        "command": "travsr.showWelcome",
+        "title": "Travsr: Show Welcome"
+      },
+      {
+        "command": "travsr.refreshGraph",
+        "title": "Travsr: Refresh Graph",
+        "icon": "$(refresh)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "travsr.refreshGraph",
+          "when": "view == travsrGraph",
+          "group": "navigation"
+        }
+      ]
+    },
     "colors": [
       {
         "id": "travsr.freshForeground",
