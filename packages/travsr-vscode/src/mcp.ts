@@ -30,7 +30,7 @@ export class StdioMcpClient implements McpClient {
   constructor(
     private readonly binary: string,
     private readonly cwd?: string,
-    private readonly version: string = "0.1.1"
+    private readonly version: string = "0.0.0"
   ) {}
 
   async connect(): Promise<void> {
