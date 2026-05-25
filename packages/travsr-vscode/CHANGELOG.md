@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0] — 2026-05-26
+
+### Added
+
+- Activity Bar panel (Travsr Graph) showing live Dependencies and Callers for the active file and cursor symbol, debounced on selection change.
+- First-run welcome WebView panel shown on initial activation; re-openable via `Travsr: Show Welcome` command.
+- `travsr.refreshGraph` command wired to the panel's refresh button.
+- Cache invalidation on file save across all three providers (status bar, code lens, hover, tree).
+
 ## [0.1.1] — 2026-05-24
 
 ### Changed
