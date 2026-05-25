@@ -209,6 +209,7 @@ pub fn reindex_files(
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.
     let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+    let mut any_changed = false;
 
     for abs_path in paths {
         let vname_path = abs_path
@@ -269,6 +270,7 @@ pub fn reindex_files(
         }
 
         store.put_file_hash(&vname_path, &new_hex)?;
+        any_changed = true;
 
         // Collect FFI markers for the repo-level pass (RFC-005).
         all_ffi_markers.extend(out.ffi_markers);
@@ -290,8 +292,12 @@ pub fn reindex_files(
     }
 
     // Record the current HEAD commit so `travsr status` can show freshness.
-    if let Ok(sha) = read_head_commit_sha(repo_root) {
-        let _ = store.set_meta("last_commit", &sha);
+    // Only write when at least one file actually changed — avoids stamping
+    // noise events (sockets, gitignored files, directories) as a real reindex.
+    if any_changed {
+        if let Ok(sha) = read_head_commit_sha(repo_root) {
+            let _ = store.set_meta("last_commit", &sha);
+        }
     }
 
     // LSIF semantic pass — only when at least one TypeScript file was in the
@@ -796,8 +802,21 @@ impl Daemon {
                             let (reader, mut writer) = conn.into_split();
                             let mut lines = BufReader::new(reader).lines();
                             if let Ok(Some(line)) = lines.next_line().await {
+                                // reindex_files blocks on I/O and the store mutex —
+                                // run on the blocking thread pool so we don't stall
+                                // the Tokio executor.
                                 let (resp, shutdown_requested) =
-                                    handle_control_message(&line, &repo, &store);
+                                    tokio::task::spawn_blocking(move || {
+                                        handle_control_message(&line, repo.as_path(), &store)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|_| (
+                                        ControlResponse {
+                                            ok: false,
+                                            message: Some("internal error".to_string()),
+                                        },
+                                        false,
+                                    ));
                                 let _ = writer
                                     .write_all(
                                         format!(

@@ -88,3 +88,46 @@ async fn watcher_ignores_non_source_files() {
         ev.display()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_ignores_vscode_test_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let _handle = spawn(tmp.path(), tx, Instant::now()).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let vscode_test = tmp.path().join(".vscode-test");
+    std::fs::create_dir_all(&vscode_test).unwrap();
+    std::fs::write(vscode_test.join("runner.ts"), "export {}").unwrap();
+
+    // No event should arrive for .vscode-test/ contents.
+    let got_event = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+    assert!(
+        got_event.is_err(),
+        "watcher must ignore .vscode-test/, but got: {got_event:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_ignores_unix_socket_files() {
+    use std::os::unix::net::UnixListener;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let _handle = spawn(tmp.path(), tx, Instant::now()).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Bind a Unix socket inside the watched directory — should be filtered out.
+    let sock_path = tmp.path().join("test.sock");
+    let _listener = UnixListener::bind(&sock_path).unwrap();
+
+    // No event should arrive for the socket file.
+    let got_event = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+    assert!(
+        got_event.is_err(),
+        "watcher must ignore socket files, but got: {got_event:?}"
+    );
+}
