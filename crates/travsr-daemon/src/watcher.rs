@@ -46,7 +46,16 @@ impl Drop for WatcherHandle {
 /// Debounce window — coalesce rapid saves into a single reindex call.
 const DEBOUNCE_MS: u64 = 500;
 
-const SKIP_DIRS: &[&str] = &[".git", ".travsr", "target", "node_modules", "dist", ".next"];
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".travsr",
+    "target",
+    "node_modules",
+    "dist",
+    ".next",
+    ".vscode",
+    ".vscode-test",
+];
 
 /// Internal pending-event entry for the debounce table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,9 +244,14 @@ pub fn spawn(
 
 fn build_gitignore(repo_root: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(repo_root);
-    let gitignore_path = repo_root.join(".gitignore");
-    if gitignore_path.exists() {
-        let _ = builder.add(gitignore_path);
+    for entry in walkdir::WalkDir::new(repo_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && entry.file_name() == ".gitignore" {
+            let _ = builder.add(entry.into_path());
+        }
     }
     builder.build().unwrap_or(Gitignore::empty())
 }
@@ -255,10 +269,11 @@ fn should_skip(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
     if gitignore.matched(rel, path.is_dir()).is_ignore() {
         return true;
     }
-    // Only pass through files with a supported language extension.
-    if path.is_file() {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        return Language::from_extension(ext).is_none();
+    // Sockets, directories, FIFOs, and other non-regular entries have no
+    // indexable content — skip them rather than letting them fall through.
+    if !path.is_file() {
+        return true;
     }
-    false
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    Language::from_extension(ext).is_none()
 }
