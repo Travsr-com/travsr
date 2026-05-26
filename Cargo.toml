@@ -65,6 +65,10 @@ tokio-util       = { version = "0.7", features = ["rt"] }
 tokio-stream     = "0.1"
 fs2              = "0.4"
 tracing-appender = "0.2"
+# Pin cxx-build to match cxx — both must be the same version or kuzu's
+# C++ bridge symbols are undefined at link time (cxx-build 1.0.194 breaks
+# the kuzu 0.11.3 bridge that was generated against cxx-build 1.0.138).
+cxx-build = "=1.0.138"
 
 [profile.release]
 lto = "thin"
