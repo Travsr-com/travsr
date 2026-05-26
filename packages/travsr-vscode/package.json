@@ -82,6 +82,10 @@
         "command": "travsr.refreshGraph",
         "title": "Travsr: Refresh Graph",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "travsr.downloadBinary",
+        "title": "Travsr: Download Binary"
       }
     ],
     "menus": {
@@ -127,8 +131,8 @@
       "properties": {
         "travsr.binaryPath": {
           "type": "string",
-          "default": "travsr",
-          "description": "Path to the travsr binary. Defaults to 'travsr' (must be on PATH)."
+          "default": "",
+          "description": "Absolute path to the travsr binary. Leave empty to auto-detect from PATH or use the built-in installer."
         }
       }
     }

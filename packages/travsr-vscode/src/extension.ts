@@ -1,10 +1,13 @@
 /**
  * Extension entry point — wires MCP client, status bar, code lens, hover,
- * Activity Bar tree view, and first-run welcome page.
+ * Activity Bar tree view, first-run welcome page, binary auto-installer,
+ * and actionable error toasts.
  */
 
+import * as fs from "fs";
 import * as vscode from "vscode";
 import { StdioMcpClient } from "./mcp";
+import { MutableMcpClientProxy } from "./clientProxy";
 import { createStatusBarItem } from "./status";
 import {
   BlastRadiusCodeLensProvider,
@@ -13,43 +16,54 @@ import {
 import { CallersHoverProvider, HOVER_SELECTOR } from "./hover";
 import { TravsrTreeDataProvider } from "./tree";
 import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
+import {
+  installBinary,
+  checkOnPath,
+  resolveInstallDir,
+  resolveInstallPath,
+  DOWNLOAD_VERSION,
+} from "./installer";
 
 export function activate(context: vscode.ExtensionContext): void {
-  const binary =
-    vscode.workspace
-      .getConfiguration("travsr")
-      .get<string>("binaryPath", "travsr");
+  const channel = vscode.window.createOutputChannel("Travsr");
+  context.subscriptions.push(channel);
+
+  const configured =
+    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
+  const binary = configured || "travsr";
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const version: string =
     typeof context.extension.packageJSON?.version === "string"
       ? context.extension.packageJSON.version
       : "0.0.0";
-  const mcp = new StdioMcpClient(binary, workspaceRoot, version);
-  context.subscriptions.push({ dispose: () => mcp.dispose() });
 
-  void mcp.connect();
+  // Create the raw MCP client and wrap it in a mutable proxy so all
+  // providers can be wired once and survive a binary install + reconnect.
+  const rawClient = new StdioMcpClient(binary, workspaceRoot, version);
+  const proxy = new MutableMcpClientProxy(rawClient);
+  context.subscriptions.push({ dispose: () => proxy.dispose() });
 
-  // Status bar (VSCODE-201)
-  createStatusBarItem(context, mcp);
+  wireDisconnectHandler(rawClient, proxy, context, workspaceRoot, version, channel);
+  void rawClient.connect();
+
+  // Status bar (VSCODE-201) — reconnect-aware
+  createStatusBarItem(context, proxy, (cb) => proxy.onReconnect(cb));
 
   // Code lens (VSCODE-202)
-  const codeLensProvider = new BlastRadiusCodeLensProvider(mcp);
+  const codeLensProvider = new BlastRadiusCodeLensProvider(proxy);
   context.subscriptions.push(
-    vscode.languages.registerCodeLensProvider(
-      BLAST_RADIUS_SELECTOR,
-      codeLensProvider
-    )
+    vscode.languages.registerCodeLensProvider(BLAST_RADIUS_SELECTOR, codeLensProvider)
   );
 
   // Hover (VSCODE-203)
-  const hoverProvider = new CallersHoverProvider(mcp);
+  const hoverProvider = new CallersHoverProvider(proxy);
   context.subscriptions.push(
     vscode.languages.registerHoverProvider(HOVER_SELECTOR, hoverProvider)
   );
 
   // Activity Bar tree view (VSCODE-204)
-  const treeProvider = new TravsrTreeDataProvider(mcp, context);
+  const treeProvider = new TravsrTreeDataProvider(proxy, context);
   context.subscriptions.push(
     vscode.window.createTreeView("travsrGraph", {
       treeDataProvider: treeProvider,
@@ -69,11 +83,43 @@ export function activate(context: vscode.ExtensionContext): void {
   // First-run welcome page (VSCODE-204)
   showWelcomeIfFirstRun(context);
 
-  // Commands
+  // ── Commands ─────────────────────────────────────────────────────────────
+
+  // Status bar click → Quick Pick (VSCODE-205)
   context.subscriptions.push(
-    vscode.commands.registerCommand("travsr.showStatus", () => {
-      const status = mcp.isConnected() ? "connected" : "disconnected";
-      void vscode.window.showInformationMessage(`Travsr daemon: ${status}`);
+    vscode.commands.registerCommand("travsr.showStatus", async () => {
+      type ItemId = "restart" | "settings" | "output" | "disable";
+      const items: (vscode.QuickPickItem & { id: ItemId })[] = [
+        { label: "$(refresh) Restart daemon",         id: "restart" },
+        { label: "$(gear) Open settings",             id: "settings" },
+        { label: "$(output) Show output channel",     id: "output" },
+        { label: "$(circle-slash) Disable extension", id: "disable" },
+      ];
+      const pick = await vscode.window.showQuickPick(items, {
+        placeHolder: "Travsr actions",
+      });
+      if (!pick) return;
+      const id = pick.id;
+      switch (id) {
+        case "restart":
+          await doRestart(proxy, context, workspaceRoot, version, channel);
+          break;
+        case "settings":
+          await vscode.commands.executeCommand(
+            "workbench.action.openSettings",
+            "travsr"
+          );
+          break;
+        case "output":
+          channel.show();
+          break;
+        case "disable":
+          await vscode.commands.executeCommand(
+            "workbench.extensions.action.disableExtension",
+            context.extension.id
+          );
+          break;
+      }
     })
   );
 
@@ -99,7 +145,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "travsr.showCallers",
       async (symbol: string) => {
-        const raw = await mcp.callTool("get_callers", { symbol });
+        const raw = await proxy.callTool("get_callers", { symbol });
         const lines = raw
           .split("\n")
           .map((l) => l.trim())
@@ -127,15 +173,166 @@ export function activate(context: vscode.ExtensionContext): void {
       treeProvider.refresh()
     )
   );
+
+  // Manual download command — also reachable from the command palette
+  context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.downloadBinary", async () => {
+      await runDownloadFlow(proxy, context, workspaceRoot, version, channel);
+    })
+  );
+
+  // Binary check on activation — async, non-blocking; providers are already
+  // wired and degrade gracefully until the daemon connects.
+  void checkBinaryAndPrompt(proxy, context, workspaceRoot, version, channel, configured);
 }
 
 export function deactivate(): void {
   return;
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+async function checkBinaryAndPrompt(
+  proxy: MutableMcpClientProxy,
+  context: vscode.ExtensionContext,
+  workspaceRoot: string | undefined,
+  version: string,
+  channel: vscode.OutputChannel,
+  configured: string
+): Promise<void> {
+  // 1. Explicit path configured and exists on disk → nothing to do.
+  if (configured && configured !== "travsr" && fs.existsSync(configured)) return;
+
+  // 2. Check ~/.travsr/bin (default install location).
+  const installPath = resolveInstallPath(resolveInstallDir());
+  if (fs.existsSync(installPath)) {
+    // Found at default location — persist the path and reconnect so the
+    // status bar turns green without requiring a window reload.
+    await vscode.workspace
+      .getConfiguration("travsr")
+      .update("binaryPath", installPath, vscode.ConfigurationTarget.Global);
+    const newRaw = new StdioMcpClient(installPath, workspaceRoot, version);
+    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel);
+    await newRaw.connect();
+    proxy.swapAndDispose(newRaw);
+    return;
+  }
+
+  // 3. Check PATH — daemon may have been installed via npm or Homebrew.
+  if (checkOnPath("travsr")) return;
+
+  // 4. Binary not found anywhere — prompt once.
+  const choice = await vscode.window.showInformationMessage(
+    `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`,
+    "Download",
+    "Dismiss"
+  );
+  if (choice === "Download") {
+    await runDownloadFlow(proxy, context, workspaceRoot, version, channel);
+  }
+}
+
+async function runDownloadFlow(
+  proxy: MutableMcpClientProxy,
+  context: vscode.ExtensionContext,
+  workspaceRoot: string | undefined,
+  version: string,
+  channel: vscode.OutputChannel
+): Promise<void> {
+  try {
+    const binPath = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Installing Travsr v${DOWNLOAD_VERSION}…`,
+        cancellable: false,
+      },
+      (progress) =>
+        installBinary(DOWNLOAD_VERSION, (msg) => {
+          channel.appendLine(msg);
+          progress.report({ message: msg });
+        })
+    );
+
+    await vscode.workspace
+      .getConfiguration("travsr")
+      .update("binaryPath", binPath, vscode.ConfigurationTarget.Global);
+
+    // Auto-reconnect: spin up a new client with the installed binary.
+    const newRaw = new StdioMcpClient(binPath, workspaceRoot, version);
+    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel);
+    await newRaw.connect();
+    proxy.swapAndDispose(newRaw); // fires onReconnect → status bar re-polls
+
+    void vscode.window.showInformationMessage(
+      `Travsr v${DOWNLOAD_VERSION} installed successfully.`
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    channel.appendLine(`[ERROR] Install failed: ${msg}`);
+    void vscode.window
+      .showErrorMessage(
+        `Travsr download failed: ${msg}`,
+        "Show logs"
+      )
+      .then((action) => {
+        if (action === "Show logs") channel.show();
+      });
+  }
+}
+
+async function doRestart(
+  proxy: MutableMcpClientProxy,
+  context: vscode.ExtensionContext,
+  workspaceRoot: string | undefined,
+  version: string,
+  channel: vscode.OutputChannel
+): Promise<void> {
+  const configured =
+    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
+  const binary = configured || "travsr";
+  channel.appendLine("Restarting Travsr daemon…");
+  const newRaw = new StdioMcpClient(binary, workspaceRoot, version);
+  wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel);
+  await newRaw.connect();
+  proxy.swapAndDispose(newRaw);
+  channel.appendLine("Travsr daemon restarted.");
+}
+
+function wireDisconnectHandler(
+  client: StdioMcpClient,
+  proxy: MutableMcpClientProxy,
+  context: vscode.ExtensionContext,
+  workspaceRoot: string | undefined,
+  version: string,
+  channel: vscode.OutputChannel
+): void {
+  const sub = client.onDisconnect(async () => {
+    sub.dispose(); // one-shot — prevents double-firing on explicit restart
+    const action = await vscode.window.showWarningMessage(
+      "Travsr daemon offline",
+      "Restart",
+      "Configure",
+      "Show logs"
+    );
+    if (action === "Restart") {
+      await doRestart(proxy, context, workspaceRoot, version, channel);
+    } else if (action === "Configure") {
+      await vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "travsr.binaryPath"
+      );
+    } else if (action === "Show logs") {
+      channel.show();
+    }
+  });
+}
+
 function buildFileListHtml(title: string, items: string[]): string {
   const rows = items
-    .map((f) => `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`)
+    .map(
+      (f) =>
+        `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`
+    )
     .join("\n");
   return `<!DOCTYPE html><html><body style="padding:16px">
 <h3>${title}</h3>
