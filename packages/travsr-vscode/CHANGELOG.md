@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0] — 2026-05-27
+
+### Added
+
+- CI publish pipeline: `vsce package` + `vsce publish` + `ovsx publish` triggered automatically on `vscode-v*` tags, with a `dry_run` dispatch option.
+- VS Code test matrix expanded to 15 combinations (3 OS × 5 VS Code versions: 1.85, 1.90, 1.95, stable, insiders).
+- GitHub Environment gate (`marketplace`) on the publish job — every tag-triggered publish requires manual approval before marketplace steps run.
+- `.vsix` artifact uploaded to GitHub Release on every tag push.
+
+### Fixed
+
+- `.vscodeignore` now excludes `out/test/**` — compiled test files were being bundled into the `.vsix` (18 files / 32 KB, down from 28 files / 49 KB).
+
 ## [0.3.0] — 2026-05-26
 
 ### Added
