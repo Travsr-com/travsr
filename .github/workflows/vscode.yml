@@ -21,24 +21,48 @@ concurrency:
 
 jobs:
   build-test:
-    name: build + test (${{ matrix.os }})
+    name: build + test (${{ matrix.os }}, VS Code ${{ matrix.vscodeVersion }})
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
           - macos-latest
+          - windows-latest
+        vscodeVersion:
+          - '1.85.0'
+          - '1.90.0'
+          - '1.95.0'
+          - 'stable'
+        include:
+          # insiders is a rolling nightly — allowed to fail without blocking the PR
+          - os: ubuntu-latest
+            vscodeVersion: 'insiders'
+            experimental: true
+          - os: macos-latest
+            vscodeVersion: 'insiders'
+            experimental: true
+          - os: windows-latest
+            vscodeVersion: 'insiders'
+            experimental: true
+        exclude:
+          # VS Code 1.85.0 on Windows has known runner/Electron instability
+          - os: windows-latest
+            vscodeVersion: '1.85.0'
+    continue-on-error: ${{ matrix.experimental == true }}
     runs-on: ${{ matrix.os }}
+    env:
+      VSCODE_VERSION: ${{ matrix.vscodeVersion }}
     defaults:
       run:
         working-directory: packages/travsr-vscode
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -60,6 +84,50 @@ jobs:
         if: runner.os == 'Linux'
         run: xvfb-run -a npm test
 
-      - name: Run extension tests (macOS)
-        if: runner.os == 'macOS'
+      - name: Run extension tests (macOS / Windows)
+        if: runner.os != 'Linux'
         run: npm test
+
+  package:
+    name: Package .vsix
+    needs: build-test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/travsr-vscode
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: packages/travsr-vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run lint
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Package .vsix
+        run: npx vsce package --no-dependencies
+
+      - name: Verify .vsix has no test files
+        run: |
+          if npx vsce ls --tree 2>&1 | grep -q "out/test/"; then
+            echo "ERROR: out/test/ files found in .vsix — check .vscodeignore"
+            exit 1
+          fi
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: travsr-vscode-vsix
+          path: packages/travsr-vscode/*.vsix

@@ -6,6 +6,7 @@ async function main(): Promise<void> {
   const extensionTestsPath = path.resolve(__dirname, "./suite/index");
 
   await runTests({
+    version: (process.env["VSCODE_VERSION"] as string | undefined) ?? "stable",
     extensionDevelopmentPath,
     extensionTestsPath,
     launchArgs: [
