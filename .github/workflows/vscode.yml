@@ -34,7 +34,22 @@ jobs:
           - '1.90.0'
           - '1.95.0'
           - 'stable'
-          - 'insiders'
+        include:
+          # insiders is a rolling nightly — allowed to fail without blocking the PR
+          - os: ubuntu-latest
+            vscodeVersion: 'insiders'
+            experimental: true
+          - os: macos-latest
+            vscodeVersion: 'insiders'
+            experimental: true
+          - os: windows-latest
+            vscodeVersion: 'insiders'
+            experimental: true
+        exclude:
+          # VS Code 1.85.0 on Windows has known runner/Electron instability
+          - os: windows-latest
+            vscodeVersion: '1.85.0'
+    continue-on-error: ${{ matrix.experimental == true }}
     runs-on: ${{ matrix.os }}
     env:
       VSCODE_VERSION: ${{ matrix.vscodeVersion }}
@@ -95,11 +110,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Type-check
+        run: npm run lint
+
       - name: Compile
         run: npm run compile
 
       - name: Package .vsix
         run: npx vsce package --no-dependencies
+
+      - name: Verify .vsix has no test files
+        run: |
+          if npx vsce ls --tree 2>&1 | grep -q "out/test/"; then
+            echo "ERROR: out/test/ files found in .vsix — check .vscodeignore"
+            exit 1
+          fi
 
       - name: Upload .vsix artifact
         uses: actions/upload-artifact@v4
