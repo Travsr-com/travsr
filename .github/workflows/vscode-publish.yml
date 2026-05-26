@@ -79,6 +79,7 @@ jobs:
     name: Publish to Marketplace + Open VSX
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
+    environment: marketplace
     runs-on: ubuntu-latest
     permissions:
       contents: write   # scoped to this job only — needed for GitHub Release upload
