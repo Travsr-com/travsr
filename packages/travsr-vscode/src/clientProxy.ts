@@ -25,6 +25,7 @@ export class MutableMcpClientProxy implements McpClient {
   }
 
   dispose(): void {
+    this.reconnectListeners.clear();
     this.inner.dispose();
   }
 

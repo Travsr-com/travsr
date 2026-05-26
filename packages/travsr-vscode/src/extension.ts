@@ -88,19 +88,18 @@ export function activate(context: vscode.ExtensionContext): void {
   // Status bar click → Quick Pick (VSCODE-205)
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.showStatus", async () => {
-      const items = [
-        { label: "$(refresh) Restart daemon", id: "restart" },
-        { label: "$(gear) Open settings",     id: "settings" },
-        { label: "$(output) Show output channel", id: "output" },
+      type ItemId = "restart" | "settings" | "output" | "disable";
+      const items: (vscode.QuickPickItem & { id: ItemId })[] = [
+        { label: "$(refresh) Restart daemon",         id: "restart" },
+        { label: "$(gear) Open settings",             id: "settings" },
+        { label: "$(output) Show output channel",     id: "output" },
         { label: "$(circle-slash) Disable extension", id: "disable" },
-      ] as const;
-      type ItemId = (typeof items)[number]["id"];
-      const pick = await vscode.window.showQuickPick(
-        items as unknown as vscode.QuickPickItem[],
-        { placeHolder: "Travsr actions" }
-      );
+      ];
+      const pick = await vscode.window.showQuickPick(items, {
+        placeHolder: "Travsr actions",
+      });
       if (!pick) return;
-      const id = (pick as unknown as { id: ItemId }).id;
+      const id = pick.id;
       switch (id) {
         case "restart":
           await doRestart(proxy, context, workspaceRoot, version, channel);
@@ -207,10 +206,15 @@ async function checkBinaryAndPrompt(
   // 2. Check ~/.travsr/bin (default install location).
   const installPath = resolveInstallPath(resolveInstallDir());
   if (fs.existsSync(installPath)) {
-    // Found at default location — persist the path so future lookups skip this check.
+    // Found at default location — persist the path and reconnect so the
+    // status bar turns green without requiring a window reload.
     await vscode.workspace
       .getConfiguration("travsr")
       .update("binaryPath", installPath, vscode.ConfigurationTarget.Global);
+    const newRaw = new StdioMcpClient(installPath, workspaceRoot, version);
+    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel);
+    await newRaw.connect();
+    proxy.swapAndDispose(newRaw);
     return;
   }
 
@@ -242,9 +246,10 @@ async function runDownloadFlow(
         title: `Installing Travsr v${DOWNLOAD_VERSION}…`,
         cancellable: false,
       },
-      () =>
+      (progress) =>
         installBinary(DOWNLOAD_VERSION, (msg) => {
           channel.appendLine(msg);
+          progress.report({ message: msg });
         })
     );
 

@@ -69,6 +69,7 @@ export class StdioMcpClient implements McpClient {
       capabilities: {},
       clientInfo: { name: "travsr-vscode", version: this.version },
     });
+    if (!this.proc) throw new Error("travsr process exited during initialization");
     this.connected = true;
   }
 

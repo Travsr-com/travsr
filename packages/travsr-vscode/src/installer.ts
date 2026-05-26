@@ -67,6 +67,7 @@ async function fetchBuffer(url: string, maxRedirects = 5): Promise<Buffer> {
             return;
           }
           if (res.statusCode !== 200) {
+            res.resume();
             reject(new Error(`HTTP ${res.statusCode ?? "?"} from ${currentUrl}`));
             return;
           }
@@ -90,7 +91,10 @@ export function verifyChecksum(
   const entry = sumsText
     .split("\n")
     .map((l) => l.trim())
-    .find((l) => l.endsWith(tarName));
+    .find((l) => {
+      const parts = l.split(/\s+/);
+      return parts.length >= 2 && parts[parts.length - 1] === tarName;
+    });
   if (!entry) throw new Error(`SHA256SUMS entry not found for ${tarName}`);
   const expectedHash = entry.split(/\s+/)[0];
   const actualHash = crypto.createHash("sha256").update(tarball).digest("hex");
