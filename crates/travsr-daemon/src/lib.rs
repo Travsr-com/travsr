@@ -903,17 +903,18 @@ impl Daemon {
             }
         }
 
-        // 1. Signal the indexer worker: drop index_tx to close the std channel.
-        //    The worker will drain any remaining events then exit its recv() loop.
-        drop(index_tx);
-        // 2. Drain remaining events in the Tokio mpsc channel (not yet forwarded
-        //    to the worker) directly on this thread.
+        // 1. Drain remaining events from the Tokio mpsc channel into the indexer
+        //    worker's std channel before signalling shutdown. This avoids calling
+        //    handle_watch_event (blocking SQLite I/O) directly on the async
+        //    executor thread, which would stall the current_thread runtime if the
+        //    worker concurrently holds store.lock().
         rx.close();
         while let Ok(ev) = rx.try_recv() {
-            let store = Arc::clone(&store);
-            let repo = repo_root.clone();
-            handle_watch_event(ev, &repo, &store);
+            let _ = index_tx.send(ev);
         }
+        // 2. Signal the indexer worker: drop index_tx to close the std channel.
+        //    The worker drains any remaining events from index_rx then exits.
+        drop(index_tx);
         // 3. Wait for the indexer worker to finish draining index_rx and exit.
         //    Without this await, the tokio runtime would wait for the detached
         //    spawn_blocking task at shutdown, which caused the test hang.

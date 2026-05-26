@@ -222,11 +222,16 @@ pub fn spawn(
 
                             let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
                             let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
-                            // A Remove always wins over a pending Upsert for the same path.
+                            // Coalesce rules:
+                            // - Upsert → Remove: Remove wins (file deleted, pending write discarded).
+                            // - Remove → Upsert: Upsert wins (file recreated; must re-index).
+                            // - Upsert → Upsert / Remove → Remove: update deadline, keep kind.
                             // Updates to existing pending paths always coalesce — only
                             // brand-new paths are gated by MAX_PENDING.
                             match guard.get(path) {
-                                Some((PendingKind::Remove, _)) if kind == PendingKind::Upsert => {}
+                                Some((PendingKind::Upsert, _)) if kind == PendingKind::Remove => {
+                                    guard.insert(path.clone(), (PendingKind::Remove, deadline));
+                                }
                                 Some(_) => {
                                     guard.insert(path.clone(), (kind, deadline));
                                 }
