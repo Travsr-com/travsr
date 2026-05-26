@@ -1,0 +1,64 @@
+name: VS Code Extension — Publish
+
+on:
+  push:
+    tags:
+      - 'vscode-v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (package only, no publish)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # to upload release assets
+
+jobs:
+  publish:
+    name: Package + Publish
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/travsr-vscode
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: packages/travsr-vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run lint
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Package .vsix
+        run: npx vsce package --no-dependencies
+
+      - name: Upload .vsix to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/travsr-vscode/*.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ !inputs.dry_run && startsWith(github.ref, 'refs/tags/') }}
+        run: npx vsce publish --no-dependencies --pat $VSCE_PAT
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Publish to Open VSX Registry
+        if: ${{ !inputs.dry_run && startsWith(github.ref, 'refs/tags/') }}
+        run: npx ovsx publish *.vsix --pat $OVSX_PAT
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
