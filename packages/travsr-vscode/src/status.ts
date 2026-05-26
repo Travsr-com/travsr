@@ -45,7 +45,8 @@ function formatCount(n: number): string {
 
 export function createStatusBarItem(
   context: vscode.ExtensionContext,
-  client: McpClient
+  client: McpClient,
+  onReconnect?: (cb: () => void) => { dispose(): void }
 ): vscode.StatusBarItem {
   const item = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
@@ -142,6 +143,18 @@ export function createStatusBarItem(
 
   const pollTimer = setInterval(() => void poll(), 30_000);
   context.subscriptions.push({ dispose: () => clearInterval(pollTimer) });
+
+  // On reconnect (after binary install or daemon restart): reset to connecting
+  // and immediately re-poll so the status bar turns green within one poll cycle.
+  if (onReconnect) {
+    context.subscriptions.push(
+      onReconnect(() => {
+        state = "connecting";
+        render();
+        void poll();
+      })
+    );
+  }
 
   // On save: switch to indexing, re-query after 2 s
   context.subscriptions.push(

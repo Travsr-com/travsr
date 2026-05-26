@@ -26,12 +26,18 @@ export class StdioMcpClient implements McpClient {
   private pending = new Map<number, (text: string) => void>();
   private nextId = 1;
   private connected = false;
+  private readonly disconnectListeners = new Set<() => void>();
 
   constructor(
     private readonly binary: string,
     private readonly cwd?: string,
     private readonly version: string = "0.0.0"
   ) {}
+
+  onDisconnect(cb: () => void): { dispose(): void } {
+    this.disconnectListeners.add(cb);
+    return { dispose: () => this.disconnectListeners.delete(cb) };
+  }
 
   async connect(): Promise<void> {
     this.proc = cp.spawn(this.binary, ["mcp", "--stdio"], {
@@ -46,10 +52,14 @@ export class StdioMcpClient implements McpClient {
     });
 
     const onExit = (): void => {
+      const wasConnected = this.connected;
       this.connected = false;
       this.proc = null;
       for (const resolve of this.pending.values()) resolve("");
       this.pending.clear();
+      if (wasConnected) {
+        for (const cb of this.disconnectListeners) cb();
+      }
     };
     this.proc.on("exit", onExit);
     this.proc.on("error", onExit);

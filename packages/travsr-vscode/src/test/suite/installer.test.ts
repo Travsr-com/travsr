@@ -1,0 +1,172 @@
+import * as assert from "assert";
+import * as crypto from "crypto";
+import * as os from "os";
+import * as path from "path";
+import {
+  resolveTargetTriple,
+  resolveInstallDir,
+  resolveInstallPath,
+  buildDownloadUrl,
+  buildSumsUrl,
+  verifyChecksum,
+} from "../../installer";
+
+// ── resolveTargetTriple ────────────────────────────────────────────────────
+
+suite("VSCODE-205: installer — resolveTargetTriple", () => {
+  test("linux/x64 → x86_64-unknown-linux-gnu", () => {
+    assert.strictEqual(resolveTargetTriple("linux", "x64"), "x86_64-unknown-linux-gnu");
+  });
+
+  test("linux/arm64 → aarch64-unknown-linux-gnu", () => {
+    assert.strictEqual(resolveTargetTriple("linux", "arm64"), "aarch64-unknown-linux-gnu");
+  });
+
+  test("darwin/x64 → x86_64-apple-darwin", () => {
+    assert.strictEqual(resolveTargetTriple("darwin", "x64"), "x86_64-apple-darwin");
+  });
+
+  test("darwin/arm64 → aarch64-apple-darwin", () => {
+    assert.strictEqual(resolveTargetTriple("darwin", "arm64"), "aarch64-apple-darwin");
+  });
+
+  test("win32/x64 → x86_64-pc-windows-msvc", () => {
+    assert.strictEqual(resolveTargetTriple("win32", "x64"), "x86_64-pc-windows-msvc");
+  });
+
+  test("unknown platform throws with platform and arch in message", () => {
+    assert.throws(
+      () => resolveTargetTriple("freebsd", "x64"),
+      (e: Error) => e.message.includes("freebsd") && e.message.includes("x64")
+    );
+  });
+
+  test("known platform with unknown arch throws", () => {
+    assert.throws(
+      () => resolveTargetTriple("linux", "mips"),
+      (e: Error) => e.message.includes("linux") && e.message.includes("mips")
+    );
+  });
+});
+
+// ── resolveInstallDir ──────────────────────────────────────────────────────
+
+suite("VSCODE-205: installer — resolveInstallDir", () => {
+  test("returns path ending in .travsr/bin", () => {
+    const dir = resolveInstallDir();
+    assert.ok(
+      dir.endsWith(path.join(".travsr", "bin")),
+      `expected to end with .travsr/bin, got: ${dir}`
+    );
+  });
+
+  test("is rooted at os.homedir()", () => {
+    const dir = resolveInstallDir();
+    assert.ok(dir.startsWith(os.homedir()), `expected to start with homedir, got: ${dir}`);
+  });
+});
+
+// ── resolveInstallPath ─────────────────────────────────────────────────────
+
+suite("VSCODE-205: installer — resolveInstallPath", () => {
+  test("unix (linux): filename is 'travsr'", () => {
+    const p = resolveInstallPath("/home/user/.travsr/bin", "linux");
+    assert.ok(p.endsWith(`${path.sep}travsr`), `unexpected: ${p}`);
+    assert.ok(!p.endsWith(".exe"), "must not end with .exe on linux");
+  });
+
+  test("unix (darwin): filename is 'travsr'", () => {
+    const p = resolveInstallPath("/Users/user/.travsr/bin", "darwin");
+    assert.ok(p.endsWith(`${path.sep}travsr`), `unexpected: ${p}`);
+  });
+
+  test("win32: filename is 'travsr.exe'", () => {
+    const p = resolveInstallPath("C:\\Users\\user\\.travsr\\bin", "win32");
+    assert.ok(p.endsWith("travsr.exe"), `expected travsr.exe, got: ${p}`);
+  });
+});
+
+// ── buildDownloadUrl ───────────────────────────────────────────────────────
+
+suite("VSCODE-205: installer — buildDownloadUrl", () => {
+  test("url contains version and triple", () => {
+    const url = buildDownloadUrl("0.5.0", "x86_64-unknown-linux-gnu");
+    assert.ok(url.includes("v0.5.0"), `version missing: ${url}`);
+    assert.ok(url.includes("x86_64-unknown-linux-gnu"), `triple missing: ${url}`);
+  });
+
+  test("url starts with GitHub releases base", () => {
+    const url = buildDownloadUrl("0.5.0", "aarch64-apple-darwin");
+    assert.ok(
+      url.startsWith("https://github.com/raj-rkv/travsr/releases/download/"),
+      `unexpected: ${url}`
+    );
+  });
+
+  test("url ends with .tar.gz", () => {
+    const url = buildDownloadUrl("0.5.0", "x86_64-pc-windows-msvc");
+    assert.ok(url.endsWith(".tar.gz"), `expected .tar.gz suffix, got: ${url}`);
+  });
+
+  test("tarball name embeds both version and triple", () => {
+    const url = buildDownloadUrl("1.2.3", "x86_64-apple-darwin");
+    assert.ok(url.includes("travsr-v1.2.3-x86_64-apple-darwin.tar.gz"), `unexpected: ${url}`);
+  });
+});
+
+// ── buildSumsUrl ───────────────────────────────────────────────────────────
+
+suite("VSCODE-205: installer — buildSumsUrl", () => {
+  test("url points to SHA256SUMS under the correct release tag", () => {
+    const url = buildSumsUrl("0.5.0");
+    assert.ok(url.includes("v0.5.0"), `version missing: ${url}`);
+    assert.ok(url.endsWith("SHA256SUMS"), `expected SHA256SUMS suffix, got: ${url}`);
+  });
+});
+
+// ── verifyChecksum ─────────────────────────────────────────────────────────
+
+function makeSums(tarName: string, tarball: Buffer): Buffer {
+  const hash = crypto.createHash("sha256").update(tarball).digest("hex");
+  return Buffer.from(`${hash}  ${tarName}\n`, "utf8");
+}
+
+suite("VSCODE-205: installer — verifyChecksum", () => {
+  test("passes when checksum matches", () => {
+    const tarball = Buffer.from("fake tarball contents");
+    const tarName = "travsr-v0.5.0-x86_64-unknown-linux-gnu.tar.gz";
+    assert.doesNotThrow(() => verifyChecksum(tarball, tarName, makeSums(tarName, tarball)));
+  });
+
+  test("throws SHA256 mismatch when content is tampered", () => {
+    const tarball = Buffer.from("correct contents");
+    const tampered = Buffer.from("tampered contents");
+    const tarName = "travsr-v0.5.0-x86_64-unknown-linux-gnu.tar.gz";
+    assert.throws(
+      () => verifyChecksum(tampered, tarName, makeSums(tarName, tarball)),
+      /SHA256 mismatch/
+    );
+  });
+
+  test("throws not found when tarName absent from SHA256SUMS", () => {
+    const tarball = Buffer.from("contents");
+    const sumsForOther = makeSums("travsr-v0.4.0-other.tar.gz", tarball);
+    assert.throws(
+      () => verifyChecksum(tarball, "travsr-v0.5.0-missing.tar.gz", sumsForOther),
+      /not found/
+    );
+  });
+
+  test("handles multiple entries in SHA256SUMS (correct entry selected)", () => {
+    const tarball = Buffer.from("my tarball");
+    const tarName = "travsr-v0.5.0-aarch64-apple-darwin.tar.gz";
+    const hash = crypto.createHash("sha256").update(tarball).digest("hex");
+    const sumsWithMultiple = Buffer.from(
+      `aaaa1111  travsr-v0.5.0-x86_64-apple-darwin.tar.gz\n` +
+      `${hash}  ${tarName}\n` +
+      `bbbb2222  travsr-v0.5.0-x86_64-unknown-linux-gnu.tar.gz\n`,
+      "utf8"
+    );
+    assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sumsWithMultiple));
+  });
+});
