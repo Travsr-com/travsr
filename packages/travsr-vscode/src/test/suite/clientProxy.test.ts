@@ -234,4 +234,22 @@ suite("S17-5: clientProxy — setOnInvoke", () => {
     await proxy.callTool("get_blast_radius");
     assert.deepStrictEqual(seen, ["get_callers", "get_blast_radius"]);
   });
+
+  test("second setOnInvoke call replaces first — first callback must not fire", async () => {
+    const proxy = new MutableMcpClientProxy(makeMcpStub());
+    let countA = 0;
+    let countB = 0;
+    proxy.setOnInvoke(() => countA++);
+    proxy.setOnInvoke(() => countB++);
+    await proxy.callTool("get_dependencies");
+    assert.strictEqual(countA, 0, "first callback must be replaced, not composed");
+    assert.strictEqual(countB, 1);
+  });
+
+  test("throwing onInvoke does not abort the tool call", async () => {
+    const proxy = new MutableMcpClientProxy(makeMcpStub());
+    proxy.setOnInvoke(() => { throw new Error("telemetry SDK exploded"); });
+    const result = await proxy.callTool("get_repo_map");
+    assert.strictEqual(result, "result", "inner callTool must still return despite hook throw");
+  });
 });

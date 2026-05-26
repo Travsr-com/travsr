@@ -53,7 +53,10 @@ export function createStatusBarItem(
     position === "right"
       ? vscode.StatusBarAlignment.Right
       : vscode.StatusBarAlignment.Left;
-  const item = vscode.window.createStatusBarItem(alignment, 100);
+  // For Left: higher priority = further left (we want near-left = 100).
+  // For Right: higher priority = further left of the right group (we want near-right = 10).
+  const priority = position === "right" ? 10 : 100;
+  const item = vscode.window.createStatusBarItem(alignment, priority);
   item.command = "travsr.showStatus";
   context.subscriptions.push(item);
 

@@ -69,10 +69,15 @@ suite("S17-5: telemetry — sendEvent", () => {
     assert.doesNotThrow(() => sendEvent(null, EVT_ACTIVATED));
   });
 
-  test("sendEvent(null, ...) is a no-op — stub receives zero calls", () => {
+  test("sendEvent(null, ...) is a no-op — sendTelemetryEvent is never reached", () => {
+    // Pass null explicitly — no stub involved. The preceding doesNotThrow test
+    // already confirms null-path safety; this test ensures the null-guard is
+    // what prevents dispatch (not some other reason) by verifying a real stub
+    // passed separately to the same event name DOES get called.
     const stub = makeTelemetryStub();
-    sendEvent(null, EVT_MCP_INVOKED);
-    assert.strictEqual(stub.calls.length, 0);
+    sendEvent(null, EVT_MCP_INVOKED);                                  // null → no call
+    sendEvent(stub as unknown as TelemetryReporter, EVT_MCP_INVOKED);  // non-null → call
+    assert.strictEqual(stub.calls.length, 1, "stub must be reachable via non-null reporter");
   });
 
   test("sendEvent fires sendTelemetryEvent with correct event name", () => {
@@ -98,6 +103,12 @@ suite("S17-5: telemetry — sendEvent", () => {
       file: "src/foo.ts",
     });
     assert.deepStrictEqual(stub.calls[0].props, { tool: "get_callers", file: "src/foo.ts" });
+  });
+
+  test("sendEvent with explicit undefined props passes undefined, not {}", () => {
+    const stub = makeTelemetryStub();
+    sendEvent(stub as unknown as TelemetryReporter, EVT_ACTIVATED, undefined);
+    assert.strictEqual(stub.calls[0].props, undefined);
   });
 
   test("sendEvent called multiple times accumulates separate calls", () => {

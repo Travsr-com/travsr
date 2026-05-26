@@ -46,11 +46,19 @@ export function activate(context: vscode.ExtensionContext): void {
     channel.appendLine(`Cloud endpoint configured: ${cloudEndpoint}`);
   }
 
-  const reporter = createTelemetryReporter(telemetryEnabled);
+  let reporter = createTelemetryReporter(telemetryEnabled);
   if (reporter !== null) {
     context.subscriptions.push(reporter);
   }
   sendEvent(reporter, EVT_ACTIVATED);
+
+  // Re-evaluate reporter when the user toggles global VS Code telemetry mid-session.
+  context.subscriptions.push(
+    vscode.env.onDidChangeTelemetryEnabled((enabled) => {
+      reporter?.dispose();
+      reporter = enabled && telemetryEnabled ? createTelemetryReporter(true) : null;
+    })
+  );
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const version: string =
@@ -66,10 +74,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   proxy.setOnInvoke((name) => sendEvent(reporter, EVT_MCP_INVOKED, { tool: name }));
 
-  wireDisconnectHandler(
-    rawClient, proxy, context, workspaceRoot, version, channel,
-    () => sendEvent(reporter, EVT_DAEMON_FAILED)
-  );
+  const onDaemonFailed = (): void => sendEvent(reporter, EVT_DAEMON_FAILED);
+
+  wireDisconnectHandler(rawClient, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
   void rawClient.connect();
 
   // Status bar (VSCODE-201) — reconnect-aware
@@ -127,7 +134,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const id = pick.id;
       switch (id) {
         case "restart":
-          await doRestart(proxy, context, workspaceRoot, version, channel);
+          await doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed);
           break;
         case "settings":
           await vscode.commands.executeCommand(
@@ -202,13 +209,13 @@ export function activate(context: vscode.ExtensionContext): void {
   // Manual download command — also reachable from the command palette
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.downloadBinary", async () => {
-      await runDownloadFlow(proxy, context, workspaceRoot, version, channel);
+      await runDownloadFlow(proxy, context, workspaceRoot, version, channel, onDaemonFailed);
     })
   );
 
   // Binary check on activation — async, non-blocking; providers are already
   // wired and degrade gracefully until the daemon connects.
-  void checkBinaryAndPrompt(proxy, context, workspaceRoot, version, channel, configured);
+  void checkBinaryAndPrompt(proxy, context, workspaceRoot, version, channel, configured, onDaemonFailed);
 }
 
 export function deactivate(): void {
@@ -223,7 +230,8 @@ async function checkBinaryAndPrompt(
   workspaceRoot: string | undefined,
   version: string,
   channel: vscode.OutputChannel,
-  configured: string
+  configured: string,
+  onDaemonFailed?: () => void
 ): Promise<void> {
   // 1. Explicit path configured and exists on disk → nothing to do.
   if (configured && configured !== "travsr" && fs.existsSync(configured)) return;
@@ -237,7 +245,7 @@ async function checkBinaryAndPrompt(
       .getConfiguration("travsr")
       .update("binaryPath", installPath, vscode.ConfigurationTarget.Global);
     const newRaw = new StdioMcpClient(installPath, workspaceRoot, version);
-    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel);
+    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
     await newRaw.connect();
     proxy.swapAndDispose(newRaw);
     return;
@@ -262,7 +270,8 @@ async function runDownloadFlow(
   context: vscode.ExtensionContext,
   workspaceRoot: string | undefined,
   version: string,
-  channel: vscode.OutputChannel
+  channel: vscode.OutputChannel,
+  onDaemonFailed?: () => void
 ): Promise<void> {
   try {
     const binPath = await vscode.window.withProgress(
@@ -284,7 +293,7 @@ async function runDownloadFlow(
 
     // Auto-reconnect: spin up a new client with the installed binary.
     const newRaw = new StdioMcpClient(binPath, workspaceRoot, version);
-    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel);
+    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
     await newRaw.connect();
     proxy.swapAndDispose(newRaw); // fires onReconnect → status bar re-polls
 
@@ -310,14 +319,15 @@ async function doRestart(
   context: vscode.ExtensionContext,
   workspaceRoot: string | undefined,
   version: string,
-  channel: vscode.OutputChannel
+  channel: vscode.OutputChannel,
+  onDaemonFailed?: () => void
 ): Promise<void> {
   const configured =
     vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
   const binary = configured || "travsr";
   channel.appendLine("Restarting Travsr daemon…");
   const newRaw = new StdioMcpClient(binary, workspaceRoot, version);
-  wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel);
+  wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
   await newRaw.connect();
   proxy.swapAndDispose(newRaw);
   channel.appendLine("Travsr daemon restarted.");
@@ -342,7 +352,7 @@ function wireDisconnectHandler(
       "Show logs"
     );
     if (action === "Restart") {
-      await doRestart(proxy, context, workspaceRoot, version, channel);
+      await doRestart(proxy, context, workspaceRoot, version, channel, onDisconnect);
     } else if (action === "Configure") {
       await vscode.commands.executeCommand(
         "workbench.action.openSettings",

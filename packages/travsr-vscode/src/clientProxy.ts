@@ -22,7 +22,7 @@ export class MutableMcpClientProxy implements McpClient {
   }
 
   callTool(name: string, args?: Record<string, string>): Promise<string> {
-    this.onInvoke?.(name);
+    try { this.onInvoke?.(name); } catch { /* telemetry hook must not abort tool calls */ }
     return this.inner.callTool(name, args);
   }
 
