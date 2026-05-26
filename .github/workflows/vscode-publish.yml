@@ -114,7 +114,7 @@ jobs:
 
       - name: Publish to VS Code Marketplace
         if: ${{ !inputs.dry_run }}
-        run: npx vsce publish --no-dependencies
+        run: npx vsce publish --no-dependencies --packagePath ${{ needs.build.outputs.vsix_name }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
