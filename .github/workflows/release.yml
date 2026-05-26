@@ -127,7 +127,7 @@ jobs:
           echo "OK: dist/${STAGE}.tar.gz = ${SIZE} bytes (limit: ${MAX_BYTES})"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: travsr-${{ github.ref_name }}-${{ matrix.artifact }}
           path: dist/
