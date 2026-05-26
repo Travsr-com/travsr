@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-daemon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "fs2",
@@ -2906,14 +2906,14 @@ dependencies = [
 
 [[package]]
 name = "travsr-error"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "travsr-indexer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -2933,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2963,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-retrieval"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -2978,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "kuzu",

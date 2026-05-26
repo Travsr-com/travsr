@@ -23,14 +23,34 @@ import {
   resolveInstallPath,
   DOWNLOAD_VERSION,
 } from "./installer";
+import {
+  createTelemetryReporter,
+  sendEvent,
+  EVT_ACTIVATED,
+  EVT_MCP_INVOKED,
+  EVT_DAEMON_FAILED,
+} from "./telemetry";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
   context.subscriptions.push(channel);
 
-  const configured =
-    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
+  const cfg = vscode.workspace.getConfiguration("travsr");
+  const configured = cfg.get<string>("binaryPath", "") ?? "";
   const binary = configured || "travsr";
+  const statusBarPosition = cfg.get<"left" | "right">("statusBarPosition", "left");
+  const cloudEndpoint = cfg.get<string>("cloudEndpoint", "") ?? "";
+  const telemetryEnabled = cfg.get<boolean>("telemetry.enabled", false) ?? false;
+
+  if (cloudEndpoint) {
+    channel.appendLine(`Cloud endpoint configured: ${cloudEndpoint}`);
+  }
+
+  const reporter = createTelemetryReporter(telemetryEnabled);
+  if (reporter !== null) {
+    context.subscriptions.push(reporter);
+  }
+  sendEvent(reporter, EVT_ACTIVATED);
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const version: string =
@@ -44,11 +64,16 @@ export function activate(context: vscode.ExtensionContext): void {
   const proxy = new MutableMcpClientProxy(rawClient);
   context.subscriptions.push({ dispose: () => proxy.dispose() });
 
-  wireDisconnectHandler(rawClient, proxy, context, workspaceRoot, version, channel);
+  proxy.setOnInvoke((name) => sendEvent(reporter, EVT_MCP_INVOKED, { tool: name }));
+
+  wireDisconnectHandler(
+    rawClient, proxy, context, workspaceRoot, version, channel,
+    () => sendEvent(reporter, EVT_DAEMON_FAILED)
+  );
   void rawClient.connect();
 
   // Status bar (VSCODE-201) — reconnect-aware
-  createStatusBarItem(context, proxy, (cb) => proxy.onReconnect(cb));
+  createStatusBarItem(context, proxy, (cb) => proxy.onReconnect(cb), statusBarPosition);
 
   // Code lens (VSCODE-202)
   const codeLensProvider = new BlastRadiusCodeLensProvider(proxy);
@@ -304,10 +329,12 @@ function wireDisconnectHandler(
   context: vscode.ExtensionContext,
   workspaceRoot: string | undefined,
   version: string,
-  channel: vscode.OutputChannel
+  channel: vscode.OutputChannel,
+  onDisconnect?: () => void
 ): void {
   const sub = client.onDisconnect(async () => {
     sub.dispose(); // one-shot — prevents double-firing on explicit restart
+    onDisconnect?.();
     const action = await vscode.window.showWarningMessage(
       "Travsr daemon offline",
       "Restart",

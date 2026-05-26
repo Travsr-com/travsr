@@ -133,6 +133,22 @@
           "type": "string",
           "default": "",
           "description": "Absolute path to the travsr binary. Leave empty to auto-detect from PATH or use the built-in installer."
+        },
+        "travsr.statusBarPosition": {
+          "type": "string",
+          "enum": ["left", "right"],
+          "default": "left",
+          "description": "Which side of the VS Code status bar the Travsr indicator appears on."
+        },
+        "travsr.cloudEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Remote SSE endpoint URL. Leave empty to use local daemon over stdio."
+        },
+        "travsr.telemetry.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Send anonymous usage events to Travsr (extension activated, MCP tool invoked, daemon connection failures). No file paths, symbol names, or graph data are ever sent."
         }
       }
     }
@@ -145,6 +161,9 @@
   },
   "overrides": {
     "serialize-javascript": ">=7.0.5"
+  },
+  "dependencies": {
+    "@vscode/extension-telemetry": "^0.9.8"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.6",
