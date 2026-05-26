@@ -109,7 +109,7 @@ jobs:
 
       - name: Upload .vsix to GitHub Release
         # pinned to commit SHA for softprops/action-gh-release v2
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
         with:
           files: packages/travsr-vscode/*.vsix
 
