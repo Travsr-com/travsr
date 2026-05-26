@@ -11,12 +11,18 @@ import type { McpClient } from "./mcp";
 export class MutableMcpClientProxy implements McpClient {
   private inner: McpClient;
   private readonly reconnectListeners = new Set<() => void>();
+  private onInvoke?: (toolName: string) => void;
 
   constructor(inner: McpClient) {
     this.inner = inner;
   }
 
+  setOnInvoke(cb: (toolName: string) => void): void {
+    this.onInvoke = cb;
+  }
+
   callTool(name: string, args?: Record<string, string>): Promise<string> {
+    try { this.onInvoke?.(name); } catch { /* telemetry hook must not abort tool calls */ }
     return this.inner.callTool(name, args);
   }
 

@@ -46,12 +46,17 @@ function formatCount(n: number): string {
 export function createStatusBarItem(
   context: vscode.ExtensionContext,
   client: McpClient,
-  onReconnect?: (cb: () => void) => { dispose(): void }
+  onReconnect?: (cb: () => void) => { dispose(): void },
+  position?: "left" | "right"
 ): vscode.StatusBarItem {
-  const item = vscode.window.createStatusBarItem(
-    vscode.StatusBarAlignment.Left,
-    100
-  );
+  const alignment =
+    position === "right"
+      ? vscode.StatusBarAlignment.Right
+      : vscode.StatusBarAlignment.Left;
+  // For Left: higher priority = further left (we want near-left = 100).
+  // For Right: higher priority = further left of the right group (we want near-right = 10).
+  const priority = position === "right" ? 10 : 100;
+  const item = vscode.window.createStatusBarItem(alignment, priority);
   item.command = "travsr.showStatus";
   context.subscriptions.push(item);
 
