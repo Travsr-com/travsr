@@ -31,6 +31,10 @@ pub struct InitStats {
     /// Net change in node count (positive = added, negative = removed).
     pub nodes_written: i64,
     pub edges_written: u64,
+    /// Absolute node count after init (for "up to date" display on re-runs).
+    pub total_nodes: u64,
+    /// Absolute edge count after init (for "up to date" display on re-runs).
+    pub total_edges: u64,
 }
 
 /// Initialise a Travsr index in `repo_root`:
@@ -64,12 +68,16 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     install_hook(repo_root)?;
 
     // Register in global registry so `travsr mcp --global` can find this repo.
-    let repo_name = repo_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-    if let Err(e) = travsr_store::registry::register(repo_name, &db_path) {
-        tracing::warn!("registry update failed (non-fatal): {e}");
+    // TRAVSR_DISABLE_REGISTRY=1 bypasses registration — set in tests and CI to
+    // prevent temp-dir paths polluting ~/.travsr/registry.json.
+    if std::env::var("TRAVSR_DISABLE_REGISTRY").as_deref() != Ok("1") {
+        let repo_name = repo_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        if let Err(e) = travsr_store::registry::register(repo_name, &db_path) {
+            tracing::warn!("registry update failed (non-fatal): {e}");
+        }
     }
 
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
@@ -118,7 +126,11 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         // only. Checking the absolute path would falsely skip every file in a
         // repo that lives under e.g. `/home/target_user/myproject/`.
         let rel = p.strip_prefix(repo_root).unwrap_or(&p);
-        if rel.components().any(|c| c.as_os_str() == "target") {
+        if rel.components().any(|c| {
+            crate::watcher::SKIP_DIRS
+                .iter()
+                .any(|skip| c.as_os_str() == *skip)
+        }) {
             continue;
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -148,10 +160,20 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
     run_lsif_pass(repo_root, &mut store);
 
+    // Always stamp last_commit after init — independent of whether any file
+    // changed. Fixes the regression where reindex_files's any_changed guard
+    // suppressed the stamp on clean re-runs (PR #207).
+    if let Ok(sha) = read_head_commit_sha(repo_root) {
+        let _ = store.set_meta("last_commit", &sha);
+    }
+
+    let total_edges = store.edge_count().unwrap_or(0);
     Ok(InitStats {
         files_indexed,
         nodes_written: nodes_after - nodes_before,
         edges_written,
+        total_nodes: nodes_after as u64,
+        total_edges,
     })
 }
 
@@ -673,6 +695,103 @@ mod tests {
             store.get_signature_format_version().unwrap(),
             0,
             "version must not be updated by reindex on mismatch"
+        );
+    }
+
+    #[test]
+    fn init_repo_skips_registry_when_env_var_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
+
+        let home_tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_tmp.path());
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+
+        let _ = init_repo(tmp.path()).unwrap();
+
+        let registry_path = home_tmp.path().join(".travsr").join("registry.json");
+        assert!(
+            !registry_path.exists(),
+            "registry.json must not be created when TRAVSR_DISABLE_REGISTRY=1"
+        );
+
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn claude_directory_is_skipped_during_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        let claude_src = tmp
+            .path()
+            .join(".claude")
+            .join("worktrees")
+            .join("session-1");
+        std::fs::create_dir_all(&claude_src).unwrap();
+        std::fs::write(claude_src.join("agent.ts"), "export const x = 1;").unwrap();
+
+        std::fs::write(tmp.path().join("real.ts"), "export class Real {}").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        let stats = init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        assert_eq!(
+            stats.files_indexed, 1,
+            ".claude/ contents must be skipped; expected 1 file (real.ts), got {}",
+            stats.files_indexed
+        );
+    }
+
+    #[test]
+    fn init_repo_stamps_last_commit_on_rerun_when_no_files_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        let _ = init_repo(tmp.path()).unwrap();
+        let _ = init_repo(tmp.path()).unwrap(); // re-run — all hashes match
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(
+            store.get_meta("last_commit").unwrap().is_some(),
+            "last_commit must be stamped after re-init even when no files changed"
+        );
+    }
+
+    #[test]
+    fn init_repo_returns_nonzero_total_counts_on_rerun() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("app.ts"), "export class App { run() {} }").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        let _ = init_repo(tmp.path()).unwrap();
+        let stats = init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        assert_eq!(stats.nodes_written, 0, "no new nodes on re-run");
+        assert!(
+            stats.total_nodes > 0,
+            "total_nodes must reflect existing graph on re-run, got {}",
+            stats.total_nodes
         );
     }
 }

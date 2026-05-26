@@ -8,13 +8,22 @@ pub fn run() -> anyhow::Result<()> {
     let repo_root = find_git_root(&cwd)?;
     let stats = travsr_daemon::init_repo(&repo_root)?;
     let db_path = repo_root.join(".travsr/graph.db");
-    println!(
-        "indexed {} files, {} nodes, {} edges → {}",
-        stats.files_indexed,
-        stats.nodes_written,
-        stats.edges_written,
-        db_path.display()
-    );
+    if stats.nodes_written == 0 && stats.edges_written == 0 {
+        println!(
+            "graph up to date: {} nodes, {} edges → {}",
+            stats.total_nodes,
+            stats.total_edges,
+            db_path.display()
+        );
+    } else {
+        println!(
+            "indexed {} files, +{} nodes, +{} edges → {}",
+            stats.files_indexed,
+            stats.nodes_written,
+            stats.edges_written,
+            db_path.display()
+        );
+    }
 
     // DEBT-013 closed: hint users whose repo has no commits yet so
     // `travsr status` showing last_commit: (none) is not confusing.
