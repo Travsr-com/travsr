@@ -495,19 +495,46 @@ fn get_repo_map_raw(store: &SqliteStore) -> String {
 /// Always returns a non-empty string — callers can check `nodes: 0` for an
 /// empty graph. No sanitization needed: the output contains no user data.
 pub fn get_graph_stats(store: &SqliteStore) -> String {
-    let nodes = store.node_count().unwrap_or(0);
-    let edges = store.edge_count().unwrap_or(0);
+    let nodes = match store.node_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_graph_stats node_count error: {e}");
+            0
+        }
+    };
+    let edges = match store.edge_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_graph_stats edge_count error: {e}");
+            0
+        }
+    };
     format!("nodes: {nodes}\nedges: {edges}")
 }
 
 /// Global variant of `get_graph_stats` — sums across all registered repos.
+///
+/// Input validation for `repo` is performed by `collect_global`; do not bypass that helper.
 pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&str>) -> String {
     let mut total_nodes: u64 = 0;
     let mut total_edges: u64 = 0;
+    // DEBT(cloud-launch): counts must be filtered to caller's EdgeFilter scope before SSE ships
     collect_global(repos, repo, |store, _repo_name, _single| {
-        total_nodes += store.node_count().unwrap_or(0);
-        total_edges += store.edge_count().unwrap_or(0);
-        String::new()
+        total_nodes += match store.node_count() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("get_graph_stats_global node_count error: {e}");
+                0
+            }
+        };
+        total_edges += match store.edge_count() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("get_graph_stats_global edge_count error: {e}");
+                0
+            }
+        };
+        String::new() // accumulation done via captured mutables; return value unused
     });
     format!("nodes: {total_nodes}\nedges: {total_edges}")
 }
@@ -769,6 +796,23 @@ mod tests {
         let result = get_blast_radius(&store, "a.ts");
         assert!(result.contains("a.ts"));
         assert!(result.contains("b.ts"));
+    }
+
+    // ── get_graph_stats unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn get_graph_stats_empty_graph() {
+        let store = make_store(&[], &[]);
+        assert_eq!(get_graph_stats(&store), "nodes: 0\nedges: 0");
+    }
+
+    #[test]
+    fn get_graph_stats_counts_match_store() {
+        use travsr_core::EdgeKind;
+        let a = make_node("a.ts", "fn:a");
+        let b = make_node("b.ts", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::Depends)]);
+        assert_eq!(get_graph_stats(&store), "nodes: 2\nedges: 1");
     }
 
     // ── get_repo_map unit tests ───────────────────────────────────────────────
