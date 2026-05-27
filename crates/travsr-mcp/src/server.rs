@@ -111,6 +111,7 @@ fn handle_tool_call(
             tools::search_symbol(store, name)
         }
         "get_repo_map" => tools::get_repo_map(store),
+        "get_graph_stats" => tools::get_graph_stats(store),
         "get_execution_path" => {
             let source = args["source"].as_str().unwrap_or("");
             let sink = args["sink"].as_str().unwrap_or("");
@@ -205,6 +206,15 @@ fn tools_list() -> serde_json::Value {
                         "sink": { "type": "string", "description": "Sink symbol name (partial match supported)" }
                     },
                     "required": ["source", "sink"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_graph_stats",
+                "description": "Return accurate node and edge counts from the indexed graph.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
                     "additionalProperties": false
                 }
             }
@@ -323,6 +333,7 @@ fn handle_tool_call_global(
             tools::search_symbol_global(repos, args["name"].as_str().unwrap_or(""), repo_arg)
         }
         "get_repo_map" => tools::get_repo_map_global(repos, repo_arg),
+        "get_graph_stats" => tools::get_graph_stats_global(repos, repo_arg),
         "get_execution_path" => {
             let source = args["source"].as_str().unwrap_or("");
             let sink = args["sink"].as_str().unwrap_or("");
@@ -424,6 +435,17 @@ fn tools_list_global() -> serde_json::Value {
                     "required": ["source", "sink"],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_graph_stats",
+                "description": "Return accurate node and edge counts from the indexed graph.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Sums all repos if omitted." }
+                    },
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -440,6 +462,7 @@ mod tests {
         "search_symbol",
         "get_repo_map",
         "get_execution_path",
+        "get_graph_stats",
     ];
 
     #[test]
