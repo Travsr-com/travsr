@@ -366,6 +366,50 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Delete all nodes (and their edges) whose VName path starts with `prefix`.
+    ///
+    /// Used by `init_repo` to purge ghost nodes from directories that were added
+    /// to `SKIP_DIRS` after a previous index run (e.g. `.claude/worktrees/`).
+    /// Edges are deleted first; both run in a single transaction.
+    /// Returns the number of nodes removed.
+    ///
+    /// Deliberately NOT on the [`Store`] trait — this is a SqliteStore-specific
+    /// cleanup operation for the daemon init path.
+    pub fn delete_nodes_for_path_prefix(&mut self, prefix: &str) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let pattern = format!("{prefix}%");
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting prefix-delete transaction")?;
+
+            let count: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM nodes WHERE path LIKE ?1",
+                    params![pattern],
+                    |row| row.get(0),
+                )
+                .context("counting nodes to prefix-delete")?;
+
+            // Edges have no FK cascade — delete them explicitly before removing nodes.
+            tx.execute(
+                "DELETE FROM edges \
+                 WHERE src IN (SELECT id FROM nodes WHERE path LIKE ?1) \
+                    OR dst IN (SELECT id FROM nodes WHERE path LIKE ?1)",
+                params![pattern],
+            )
+            .context("deleting edges for path prefix")?;
+
+            tx.execute("DELETE FROM nodes WHERE path LIKE ?1", params![pattern])
+                .context("deleting nodes for path prefix")?;
+
+            tx.commit()
+                .context("committing prefix-delete transaction")?;
+            Ok(count as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>, StoreError> {
         // Log the query name (symbol/path, not file contents — SEC log-redaction rule).
         let _span = tracing::debug_span!("store.search_nodes_by_name", query = name).entered();
@@ -957,6 +1001,47 @@ mod tests {
             "edge referencing a.ts must be removed"
         );
         assert!(store.get_node(b.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_nodes_for_path_prefix_removes_matching_nodes_and_edges() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = node_with_path(".claude/worktrees/session-1/agent.ts", "fn:agent");
+        let b = node_with_path(".claude/worktrees/session-2/helper.ts", "fn:helper");
+        let c = node_with_path("src/real.ts", "fn:real");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&c).unwrap();
+        store
+            .put_edge(&Edge::new(a.id, c.id, EdgeKind::Depends))
+            .unwrap();
+
+        let deleted = store.delete_nodes_for_path_prefix(".claude/").unwrap();
+        assert_eq!(deleted, 2, "two .claude/ nodes must be removed");
+        assert_eq!(
+            store.node_count().unwrap(),
+            1,
+            "src/real.ts node must survive"
+        );
+        assert_eq!(
+            store.edge_count().unwrap(),
+            0,
+            "edge referencing .claude/ node must be removed"
+        );
+        assert!(
+            store.get_node(c.id).unwrap().is_some(),
+            "real node must be intact"
+        );
+    }
+
+    #[test]
+    fn delete_nodes_for_path_prefix_returns_zero_for_no_match() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = node_with_path("src/real.ts", "fn:real");
+        store.put_node(&n).unwrap();
+        let deleted = store.delete_nodes_for_path_prefix(".claude/").unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.node_count().unwrap(), 1);
     }
 
     #[test]
