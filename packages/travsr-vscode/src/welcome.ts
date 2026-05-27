@@ -9,6 +9,9 @@ import * as vscode from "vscode";
 
 const WELCOME_SHOWN_KEY = "travsr.welcomeShown";
 
+// Module-level ref so re-running the command reveals the existing panel.
+let currentPanel: vscode.WebviewPanel | undefined;
+
 export function showWelcomeIfFirstRun(context: vscode.ExtensionContext): void {
   if (context.globalState.get<boolean>(WELCOME_SHOWN_KEY, false)) return;
   void context.globalState.update(WELCOME_SHOWN_KEY, true);
@@ -16,13 +19,18 @@ export function showWelcomeIfFirstRun(context: vscode.ExtensionContext): void {
 }
 
 export function showWelcome(): void {
-  const panel = vscode.window.createWebviewPanel(
+  if (currentPanel) {
+    currentPanel.reveal(vscode.ViewColumn.One);
+    return;
+  }
+  currentPanel = vscode.window.createWebviewPanel(
     "travsrWelcome",
     "Welcome to Travsr",
     vscode.ViewColumn.One,
     { localResourceRoots: [], enableScripts: false }
   );
-  panel.webview.html = getHtml();
+  currentPanel.onDidDispose(() => { currentPanel = undefined; });
+  currentPanel.webview.html = getHtml();
 }
 
 function getHtml(): string {
