@@ -445,6 +445,12 @@ fn read_head_commit_sha(repo_root: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+    use std::sync::Mutex;
+
+    // Rust tests run in parallel; TRAVSR_DISABLE_REGISTRY and HOME are
+    // process-global env vars. Serialize every test that mutates them through
+    // this lock to prevent races on Windows and Linux multi-threaded test runs.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn git_init(dir: &std::path::Path) {
         StdCommand::new("git")
@@ -717,6 +723,7 @@ mod tests {
 
     #[test]
     fn init_repo_skips_registry_when_env_var_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
@@ -739,6 +746,7 @@ mod tests {
 
     #[test]
     fn claude_directory_is_skipped_during_init() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
 
@@ -765,6 +773,7 @@ mod tests {
 
     #[test]
     fn init_repo_purges_ghost_nodes_from_skip_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Pre-populate the DB with a ghost node that looks like it came from a
         // previous run that indexed .claude/ before it was added to SKIP_DIRS.
         // Verifies that init_repo tombstones it even though the file no longer
@@ -814,6 +823,7 @@ mod tests {
 
     #[test]
     fn init_repo_stamps_last_commit_on_rerun_when_no_files_changed() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
@@ -844,6 +854,7 @@ mod tests {
 
     #[test]
     fn init_repo_returns_nonzero_total_counts_on_rerun() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join("app.ts"), "export class App { run() {} }").unwrap();
