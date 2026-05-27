@@ -409,6 +409,7 @@ fn send_daemon_command(_sock: &std::path::Path, _msg: &str) -> anyhow::Result<St
 fn daemon_is_running(sock: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
+            // Blocking sleep is safe: no concurrent async tasks exist at daemon-start time.
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
         if send_daemon_command(sock, r#"{"op":"status"}"#).is_ok() {
