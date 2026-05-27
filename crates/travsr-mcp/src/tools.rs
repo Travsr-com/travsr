@@ -484,6 +484,34 @@ fn get_repo_map_raw(store: &SqliteStore) -> String {
     lines.join("\n")
 }
 
+// ── get_graph_stats ───────────────────────────────────────────────────────────
+
+/// Return accurate node and edge counts directly from the SQLite store.
+///
+/// Output format (newline-separated key-value pairs):
+///   `nodes: 2121`
+///   `edges: 8432`
+///
+/// Always returns a non-empty string — callers can check `nodes: 0` for an
+/// empty graph. No sanitization needed: the output contains no user data.
+pub fn get_graph_stats(store: &SqliteStore) -> String {
+    let nodes = store.node_count().unwrap_or(0);
+    let edges = store.edge_count().unwrap_or(0);
+    format!("nodes: {nodes}\nedges: {edges}")
+}
+
+/// Global variant of `get_graph_stats` — sums across all registered repos.
+pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&str>) -> String {
+    let mut total_nodes: u64 = 0;
+    let mut total_edges: u64 = 0;
+    collect_global(repos, repo, |store, _repo_name, _single| {
+        total_nodes += store.node_count().unwrap_or(0);
+        total_edges += store.edge_count().unwrap_or(0);
+        String::new()
+    });
+    format!("nodes: {total_nodes}\nedges: {total_edges}")
+}
+
 // ── get_execution_path ────────────────────────────────────────────────────────
 
 /// Find a traversal path from `source` symbol to `sink` symbol through the graph.
