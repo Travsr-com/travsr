@@ -60,7 +60,8 @@ const DEBOUNCE_MS: u64 = 500;
 /// always fully recovers the graph.
 const MAX_PENDING: usize = 100_000;
 
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
+    ".claude",
     ".git",
     ".travsr",
     "target",

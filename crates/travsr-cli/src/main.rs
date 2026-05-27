@@ -263,7 +263,7 @@ async fn run(cli: Cli) -> Result<()> {
                         // 700 MB each) because the check happened *inside* the
                         // child after it was already running.
                         let sock = repo_root.join(".travsr/daemon.sock");
-                        if send_daemon_command(&sock, r#"{"op":"status"}"#).is_ok() {
+                        if daemon_is_running(&sock, 3, 300) {
                             eprintln!("travsr daemon is already running");
                             return Ok(());
                         }
@@ -398,4 +398,41 @@ fn send_daemon_command(sock: &std::path::Path, msg: &str) -> anyhow::Result<Stri
 #[cfg(not(unix))]
 fn send_daemon_command(_sock: &std::path::Path, _msg: &str) -> anyhow::Result<String> {
     anyhow::bail!("daemon control socket not yet supported on Windows")
+}
+
+/// Retry pinging the daemon socket up to `attempts` times with `delay_ms` between tries.
+///
+/// launchd `KeepAlive: true` restarts the daemon after `daemon stop`, so the
+/// socket may briefly vanish during restart. Without retries, a `daemon start`
+/// call immediately after `daemon stop` could incorrectly spawn a second daemon.
+#[cfg(unix)]
+fn daemon_is_running(sock: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
+    for i in 0..attempts {
+        if i > 0 {
+            // Blocking sleep is safe: no concurrent async tasks exist at daemon-start time.
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        if send_daemon_command(sock, r#"{"op":"status"}"#).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn daemon_is_running(_sock: &std::path::Path, _attempts: u32, _delay_ms: u64) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_is_running_returns_false_when_no_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("nonexistent.sock");
+        // Attempts=1, delay=0 — must not block.
+        assert!(!daemon_is_running(&sock, 1, 0));
+    }
 }

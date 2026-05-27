@@ -38,6 +38,29 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
 
     let ffi_edges = indexer.resolve_ffi_edges(&all_markers);
 
+    // Emit all indexed nodes sorted by (path, signature) for deterministic output.
+    let node_entries: Vec<serde_json::Value> = {
+        let mut nodes: Vec<&Node> = all_nodes.values().collect();
+        nodes.sort_by(|a, b| {
+            a.vname
+                .path
+                .cmp(&b.vname.path)
+                .then_with(|| a.vname.signature.cmp(&b.vname.signature))
+        });
+        nodes
+            .into_iter()
+            .map(|n| {
+                serde_json::json!({
+                    "corpus": n.vname.corpus,
+                    "language": n.vname.language,
+                    "path": n.vname.path,
+                    "signature": n.vname.signature,
+                    "kind": n.kind,
+                })
+            })
+            .collect()
+    };
+
     let mut edge_entries: Vec<serde_json::Value> = Vec::new();
     for edge in &ffi_edges {
         let (Some(src), Some(dst)) = (all_nodes.get(&edge.src), all_nodes.get(&edge.dst)) else {
@@ -62,6 +85,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
 
     let out = serde_json::json!({
         "schema_version": 1,
+        "nodes": node_entries,
         "edges": edge_entries,
     });
 
