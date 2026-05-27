@@ -25,7 +25,9 @@
 
 use std::path::Path;
 use std::process::Command as StdCommand;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
