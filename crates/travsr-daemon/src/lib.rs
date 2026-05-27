@@ -28,7 +28,8 @@ pub use hook::{changed_files_from_git, install_hook};
 #[derive(Debug, Default)]
 pub struct InitStats {
     pub files_indexed: u64,
-    /// Net change in node count (positive = added, negative = removed).
+    /// Net change in node count. `i64` to allow negative values if nodes are
+    /// removed in the future (e.g. delete-by-file support); currently always >= 0.
     pub nodes_written: i64,
     pub edges_written: u64,
     /// Absolute node count after init (for "up to date" display on re-runs).
@@ -66,6 +67,19 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     }
 
     install_hook(repo_root)?;
+
+    // GHOST-NODE PURGE: directories added to SKIP_DIRS after a previous run may
+    // have left stale nodes in graph.db. The hash-delta loop skips files that
+    // no longer exist on disk, so those nodes are never tombstoned incrementally.
+    // Purge before the walk so no ghost nodes survive a re-init.
+    for &skip_dir in crate::watcher::SKIP_DIRS {
+        let prefix = format!("{skip_dir}/");
+        match store.delete_nodes_for_path_prefix(&prefix) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(skip_dir, purged = n, "purged ghost nodes for skip dir"),
+            Err(e) => tracing::warn!(skip_dir, err = %e, "ghost-node purge failed (non-fatal)"),
+        }
+    }
 
     // Register in global registry so `travsr mcp --global` can find this repo.
     // TRAVSR_DISABLE_REGISTRY=1 bypasses registration — set in tests and CI to
@@ -152,13 +166,16 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         reindex_files(std::slice::from_ref(abs_path), repo_root, &mut store)?;
         files_indexed += 1;
     }
-    let edges_written = store.edge_count().unwrap_or(0).saturating_sub(edges_before);
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
     // LSIF semantic pass — adds RefCall edges on top of structural edges.
     // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
     run_lsif_pass(repo_root, &mut store);
+
+    // Capture edges_written AFTER the LSIF pass so RefCall edges are included
+    // in the delta shown by `travsr init` on first run.
+    let edges_written = store.edge_count().unwrap_or(0).saturating_sub(edges_before);
 
     // Always stamp last_commit after init — independent of whether any file
     // changed. Fixes the regression where reindex_files's any_changed guard
@@ -167,7 +184,7 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         let _ = store.set_meta("last_commit", &sha);
     }
 
-    let total_edges = store.edge_count().unwrap_or(0);
+    let total_edges = edges_before + edges_written;
     Ok(InitStats {
         files_indexed,
         nodes_written: nodes_after - nodes_before,
@@ -743,6 +760,55 @@ mod tests {
             stats.files_indexed, 1,
             ".claude/ contents must be skipped; expected 1 file (real.ts), got {}",
             stats.files_indexed
+        );
+    }
+
+    #[test]
+    fn init_repo_purges_ghost_nodes_from_skip_dirs() {
+        // Pre-populate the DB with a ghost node that looks like it came from a
+        // previous run that indexed .claude/ before it was added to SKIP_DIRS.
+        // Verifies that init_repo tombstones it even though the file no longer
+        // changes (hash-delta loop would skip it).
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let db_path = travsr_dir.join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+                .unwrap();
+            let ghost = travsr_core::Node::new(
+                travsr_core::VName::new(
+                    "",
+                    "",
+                    ".claude/worktrees/session-x/agent.ts",
+                    "typescript",
+                    "fn:ghost",
+                ),
+                "function",
+            );
+            store.put_node(&ghost).unwrap();
+            assert_eq!(
+                store.node_count().unwrap(),
+                1,
+                "ghost node must exist before init"
+            );
+        }
+
+        std::fs::write(tmp.path().join("real.ts"), "export class Real {}").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let ghosts = store.search_nodes_by_name("ghost").unwrap();
+        assert!(
+            ghosts.is_empty(),
+            "ghost node must be purged by init_repo, found: {ghosts:?}"
         );
     }
 
