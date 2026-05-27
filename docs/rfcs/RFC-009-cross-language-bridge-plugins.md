@@ -53,9 +53,24 @@ pub trait CrossLanguageBridge: Send + Sync {
     /// and the EdgeKind::FFICall provenance field.
     fn mechanism(&self) -> &'static str;
 
+    /// Expected SCIP scheme for the source-language indexer. Used by the
+    /// registry's scheme-check guard to prevent intra-corpus
+    /// mechanism-spoofing (e.g. a compromised `scip-java` emitting a symbol
+    /// claiming to be `scip-typescript`). MUST match exactly — not a prefix
+    /// or pattern.
+    fn source_language_scheme(&self) -> &'static str;
+
+    /// Expected SCIP scheme for the target-language indexer. Same role as
+    /// `source_language_scheme` but for the dst side.
+    fn target_language_scheme(&self) -> &'static str;
+
     /// Given two SCIP symbols — one from each language — can this bridge
     /// assert that they refer to the same callable across the FFI boundary?
     /// Returns None if the symbols are unrelated; Some(_) if they match.
+    ///
+    /// The registry has already verified corpus equality and scheme match
+    /// before invoking this method (§3); the implementation only needs to
+    /// reason about package + descriptor + mechanism-specific signals.
     fn resolve(&self, src: &ScipSymbol, dst: &ScipSymbol) -> Option<BridgeMatch>;
 }
 
@@ -108,6 +123,14 @@ The `napi` bridge plugin's `resolve()` checks:
 
 The Kythe VName is derived **after** the bridge match by the surrounding registry — the plugin itself does not synthesize VNames. This keeps the corpus invariant (ADR-005, RFC-005 §corpus-invariant) enforced in one place rather than scattered across plugins.
 
+**Three structural checks the registry performs before invoking `resolve()` (see §3 for the implementation):**
+
+1. **Corpus equality** — `src.corpus() == dst.corpus()`. RFC-005 §corpus-invariant requires this; per-package pruning alone is insufficient because the same package name can exist in two different repos under multi-repo indexing.
+2. **Scheme match** — `src.scheme == bridge.source_language_scheme()` and likewise for `dst`. Defends against intra-corpus mechanism-spoofing where a compromised SCIP indexer (e.g. malicious `scip-java`) emits symbols claiming to belong to another language's scheme. Without this check, the bridge would happily emit a confidence-100 edge to a forged cross-language target.
+3. **Package equality within the same corpus** — `src.package == dst.package`. The performance pre-filter; combined with #1 above, this means a bridge only compares symbols that genuinely belong to the same FFI-bound unit.
+
+These three checks are the registry's responsibility, not the plugin's. A bridge plugin assumes all three have already passed and reasons only about descriptor matching and mechanism-specific signals.
+
 ### 3. The `BridgeRegistry`
 
 ```rust
@@ -152,9 +175,23 @@ impl BridgeRegistry {
 
             for src in srcs {
                 for dst in dsts {
+                    // MANDATORY corpus invariant (RFC-005 §corpus-invariant,
+                    // ADR-005). Two SCIP symbols can share a package name across
+                    // corpora — e.g. `npm:react` in two different repos under
+                    // multi-repo indexing. Per-package pruning alone is NOT
+                    // sufficient; the corpus check must come first.
+                    if src.corpus() != dst.corpus() { continue; }
+
                     // Per-package pruning: only compare symbols from the same
-                    // SCIP package. Cuts ~99% of pairs in practice.
+                    // SCIP package within the same corpus. Cuts ~99% of pairs.
                     if src.package != dst.package { continue; }
+
+                    // MANDATORY scheme check (RFC-009 §2). Prevents one SCIP
+                    // indexer from forging symbols claiming to belong to another
+                    // language's scheme — defends against intra-corpus
+                    // mechanism-spoofing.
+                    if src.scheme != bridge.source_language_scheme() { continue; }
+                    if dst.scheme != bridge.target_language_scheme() { continue; }
 
                     if let Some(m) = bridge.resolve(src, dst) {
                         edges.push(FFICallEdge {

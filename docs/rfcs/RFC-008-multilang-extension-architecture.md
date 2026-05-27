@@ -48,9 +48,9 @@ This RFC defines the architectural envelope that resolves all four pain points. 
 ┌─────────────────────────────────────────────────────────────────┐
 │                  travsr-ingest (Phase B) — NEW                  │
 │                                                                 │
-│  LsifInvoker / ScipInvoker trait (per-language plugin)          │
+│  LanguageInvoker trait (per-language plugin; format() chooses) │
 │         ↓                                                       │
-│  lsif.rs / scip.rs  (format parsers — see ADR-009)              │
+│  lsif.rs / scip.rs  (format parsers — see ADR-009 §rule-3)      │
 │         ↓                                                       │
 │  ParseOutput (semantic)                                         │
 │         ↓                                                       │
@@ -100,6 +100,18 @@ imports         = { node = "import_header", target_extraction = "identifier_path
 ```
 
 **Why TOML, not Rust code?** TOML descriptors keep the per-language extension surface declarative. Community contributors can submit a `.toml` file and a grammar dependency without writing Rust. The downside — TOML cannot express grammar-specific quirks (e.g. JSX's interleaved expression/element grammar) — is handled by an optional `LanguageDescriptor.custom_module` field that names a Rust module providing post-processing hooks. We expect ~80% of languages to need no custom module; the remaining ~20% drop down to Rust.
+
+**Descriptor trust model (normative — resolves Q2 from earlier drafts).** Following the precedent of ADR-006 Rule 1 (*"daemon never enables LSIF indexing based on content found inside the repo itself"*), descriptor loading is gated as follows:
+
+| Source | Loaded? | `custom_module` permitted? |
+|--------|---------|---------------------------|
+| `travsr-indexer/langs/*.toml` (built-in, shipped with the crate) | Yes, unconditionally | Yes — `custom_module` must resolve to a statically-linked module in the `travsr-indexer` crate |
+| `~/.config/travsr/langs/*.toml` (user-local config) | Yes, unconditionally | Yes — `custom_module` must resolve to a built-in module path (no user-supplied code; statically-linked only) |
+| `<repo>/.travsr/langs/*.toml` (repo-local) | **No, refused by default.** Requires `travsr config set descriptors.trust <repo-path> true` (same primitive as ADR-006 `rust-analyzer.trust`) | **Never** — `custom_module` is rejected with a hard error in any repo-local descriptor regardless of trust setting |
+
+A repo-local descriptor without a corresponding home-directory trust entry causes the daemon to emit a `tracing::warn!` and skip the descriptor. The trust entry is per-canonical-corpus (ARCH-102), matching ADR-006's `rust-analyzer.trust.<canonical-corpus>` schema.
+
+A malicious repo committing `.travsr/langs/evil.toml` with `custom_module = "evil::backdoor"` produces zero code execution: (a) the repo-local descriptor is refused until the user opts in via home-config, (b) even with opt-in, `custom_module` in a non-built-in descriptor is hard-rejected. Phase 5 may relax this once a plugin signing / capability model exists; the ADR-016 follow-up tracks that work.
 
 **Built-in descriptors at the start of Phase 4:**
 
@@ -189,15 +201,17 @@ The `lsif.rs` and `ffi_resolver.rs` moves are the only sources of churn for down
 
 ### 7. Phased rollout
 
-| Sprint | Deliverable |
-|--------|-------------|
-| S12 | Create `travsr-ingest` crate; move `lsif.rs` + `ffi_resolver.rs`; daemon wires both crates. Zero functional change — pure structural refactor with green fixtures. |
-| S13 | Implement `LanguageDescriptor` TOML loader + `GenericTreeSitterIndexer`. Migrate Go and Python parsers to descriptors. TypeScript and Rust remain hardcoded (custom modules) for one more sprint. |
-| S14 | Add SCIP parser (`scip.rs`) and `ScipInvoker` trait. First SCIP language: Java via `scip-java`. |
-| S15 | Extract `CrossLanguageBridge` trait from `ffi_resolver.rs`; convert existing three pairs to plugins; add `jni` bridge. |
-| S16 | Phase 4 exit: two new languages (Java + Kotlin) on the correctness suite. |
+| Sprint | Deliverable | Security gates |
+|--------|-------------|----------------|
+| S12 | Create `travsr-ingest` crate; move `lsif.rs` + `ffi_resolver.rs`; daemon wires both crates. Zero functional change — pure structural refactor with green fixtures. | Principal Security Engineer review of `travsr-ingest` crate boundary (ADR-010). |
+| S13 | Implement `LanguageDescriptor` TOML loader + `GenericTreeSitterIndexer`. Migrate Go to descriptor. TypeScript, Rust, and Python remain hardcoded (custom modules) for now. | **ADR-016 (TOML descriptor trust model) MUST be merged in the same sprint.** Loader must reject repo-local descriptors without home-config opt-in and reject `custom_module` outside built-in descriptors. |
+| S14 | Add SCIP parser (`scip.rs`) and unified `LanguageInvoker` trait (per ADR-009 §rule-3). First SCIP language: Java via `scip-java`. Migrate Python to descriptor. | **ADR-011 (`scip-java` subprocess trust model) MUST be merged in the same sprint.** Java SCIP invoker MUST NOT land without sandbox model signed off by Principal Security Engineer. |
+| S15 | Extract `CrossLanguageBridge` trait from `ffi_resolver.rs`; convert existing three pairs to plugins; add `jni` bridge. | **ADR-015 (bridge plugin panic-isolation specification) MUST be merged in the same sprint.** **ADR-012 (`scip-typescript` trust model) IF `scip-typescript` is adopted in this sprint.** |
+| S16 | Phase 4 exit: two new languages (Java + Kotlin) on the correctness suite. | **ADR-013 (`scip-kotlin` subprocess trust model) MUST be merged in the same sprint.** |
 
 Each sprint exit is gated on the existing golden fixtures (RFC-003 §6) plus new fixtures for the added language.
+
+**Normative invoker-introduction rule (resolves Q3 from earlier drafts):** Any sprint landing a new subprocess invoker (LSIF or SCIP) MUST be blocked on the corresponding ADR-006-style subprocess trust appendix being merged in the same sprint, with explicit sign-off from the Principal Security Engineer. This is not a "track as follow-up" item — it is a hard merge gate. A sprint that ships a new invoker without its trust ADR is non-conforming and must be reverted.
 
 ---
 
@@ -236,13 +250,13 @@ Rejected. rust-analyzer's LSIF output remains the highest-fidelity source of Rus
 
 ## Unresolved Questions
 
-1. **TOML descriptor versioning.** When the descriptor schema evolves (new field added), older third-party descriptors should continue to load with sensible defaults. Need a `descriptor_version` field and a forward-compat policy. Deferred to S13 implementation review.
+1. **TOML descriptor versioning.** When the descriptor schema evolves (new field added), older third-party descriptors should continue to load with sensible defaults. **Resolved direction:** require `descriptor_version` from day-1 of S13 — refuse to load any descriptor without it. Easier than retrofitting. The exact forward-compat policy (semver vs monotonic integer) is finalized in the S13 implementation PR.
 
-2. **Custom module discovery and trust.** When a TOML descriptor declares `custom_module = "travsr_extras::ruby"`, how does the daemon decide whether to load it? For built-in descriptors this is straightforward (statically linked). For user-supplied descriptors that name an external crate, Principal Security Engineer review is required before S13 ships. Likely answer: built-in only for Phase 4, defer external module loading to Phase 5.
+2. **Cross-language confidence threshold tuning per bridge.** RFC-005 set a global threshold of 30. With SCIP's standardized symbols, the threshold should likely be 100 for static FFI bridges and a lower number for dynamic ones. RFC-009 §confidence model proposes per-bridge thresholds; final values will come out of S15 fixture work.
 
-3. **SCIP indexer subprocess sandboxing.** ADR-006 covers `rust-analyzer`. Other SCIP indexers (`scip-java`, `scip-typescript`, `scip-go`) have different trust profiles. Each needs an ADR-006-style appendix. Tracked as a series of follow-up ADRs (ADR-011..ADR-014, one per indexer family).
+3. **Custom module gating in Phase 5.** §2 normatively restricts `custom_module` to built-in descriptors for Phase 4. Phase 5 may relax this once a plugin signing / capability model exists. ADR-016 (TOML descriptor trust model) tracks the Phase 4 work; a separate Phase 5 ADR will define the relaxation policy if/when community demand justifies it.
 
-4. **Cross-language confidence threshold tuning per bridge.** RFC-005 set a global threshold of 30. With SCIP's standardized symbols, the threshold should likely be 100 for static FFI bridges and a lower number for dynamic ones. RFC-009 §confidence model proposes per-bridge thresholds; final values will come out of S15 fixture work.
+*Note:* The previous Q2 (custom module trust) and Q3 (SCIP invoker sandboxing) have been promoted to normative decisions in §2 and §7 respectively. They are no longer unresolved.
 
 ---
 

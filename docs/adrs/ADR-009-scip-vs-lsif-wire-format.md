@@ -77,12 +77,13 @@ A single trait covers both — there is no separate `LsifInvoker` / `ScipInvoker
 
 The cross-language bridge plugin system (RFC-009) operates on `ScipSymbol`. LSIF-only languages cannot participate in cross-language resolution without a shim that produces SCIP-equivalent symbols.
 
-Two shim paths exist:
+**Permitted shim path — LSIF → SCIP transcoder.** Sourcegraph maintains [`lsif-go-to-scip`](https://github.com/sourcegraph/scip) and similar tools. For LSIF-only languages where a transcoder exists, the invoker can run LSIF → SCIP at ingest time. The transcoder produces real SCIP symbols carrying real package metadata derived from the source repository's build configuration, so the corpus invariant (RFC-005, ADR-005) is preserved naturally.
 
-1. **LSIF → SCIP transcoder.** Sourcegraph maintains [`lsif-go-to-scip`](https://github.com/sourcegraph/scip) and similar tools. For LSIF-only languages where a transcoder exists, the invoker can run LSIF → SCIP at ingest time. The fidelity loss is minimal for the symbol fields bridges care about.
-2. **Synthetic SCIP symbol generation.** For LSIF-only languages without a transcoder, the LSIF parser can synthesize a SCIP-equivalent symbol string from the LSIF result type (package, version, range). This is a fallback with reduced confidence for cross-language matches.
+**Forbidden shim path — synthetic SCIP symbol generation.** An earlier draft of this ADR proposed synthesizing SCIP-equivalent symbol strings from LSIF result types (package, version, range) as a fallback for LSIF-only languages without a transcoder. **This path is rejected.** LSIF result types do not carry verified corpus identity; a synthesized symbol enters the bridge registry without a verified corpus and can match a real SCIP symbol from a different corpus, violating RFC-005's mandatory `src.corpus == dst.corpus` invariant. Synthetic symbols are explicitly disallowed in any code path that feeds the `BridgeRegistry`.
 
-Neither shim is required for Phase 4 — the three existing LSIF languages (TypeScript, Rust, Python) already participate in cross-language resolution via the legacy code path being migrated in S15 (RFC-009 §built-in-plugins at Phase 4 entry).
+**Practical implication.** An LSIF-only language with no available transcoder participates in the Phase A (Tree-sitter structural) graph but does **not** participate in cross-language bridge resolution until a real SCIP indexer or a real transcoder lands for it. This is by design — the alternative trades correctness for coverage, and Travsr's non-negotiable principle #1 ("algorithms first, LLM last") forbids that trade.
+
+Neither shim is required for Phase 4 — the three existing LSIF languages (TypeScript, Rust, Python) already participate in cross-language resolution via the legacy code path being migrated in S15 (RFC-009 §built-in-plugins at Phase 4 entry), which uses the existing FFI-marker model from `travsr-indexer/src/ffi.rs` rather than SCIP symbols.
 
 ### Rule 5 — Provenance tagging per ADR-002
 

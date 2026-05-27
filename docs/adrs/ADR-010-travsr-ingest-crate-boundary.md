@@ -77,13 +77,13 @@ The dependency table in CLAUDE.md is updated:
 
 **Moves from `travsr-indexer` to `travsr-ingest`:**
 
-| File / module | Reason |
-|---------------|--------|
-| `lsif.rs` | LSIF JSON-LD parser — Phase B |
-| `python_lsif.rs` | Python-specific LSIF handling |
-| `ra_runner.rs` | rust-analyzer subprocess invocation |
-| `sandbox.rs` | ADR-006 sandbox primitives — used only by subprocess invokers |
-| `ffi_resolver.rs` | Cross-language resolver — operates on merged ingest output (becomes `bridges/` under RFC-009) |
+| Source path | Destination path | Reason |
+|-------------|------------------|--------|
+| `travsr-indexer/src/lsif.rs` | `travsr-ingest/src/lsif.rs` | LSIF JSON-LD parser — Phase B |
+| `travsr-indexer/src/python_lsif.rs` | `travsr-ingest/src/python_lsif.rs` | Python-specific LSIF handling. **Cross-crate-import note:** `travsr-indexer/src/python.rs` currently `use`s items from `python_lsif`. The S12 PR breaks this import by making `python_lsif` invisible to `travsr-indexer`. Resolution: the helper functions in `python_lsif.rs` that `python.rs` actually consumes (`extract_module_path`, `normalize_import`) move to `travsr-core::python_common` in the same PR. The pure LSIF-handling code stays in `travsr-ingest`. |
+| `travsr-indexer/src/ra_runner.rs` | `travsr-ingest/src/ra_runner.rs` | rust-analyzer subprocess invocation |
+| `travsr-indexer/src/sandbox.rs` | `travsr-ingest/src/sandbox.rs` | ADR-006 sandbox primitives — used only by subprocess invokers |
+| `travsr-indexer/src/ffi_resolver.rs` | `travsr-ingest/src/bridges/legacy.rs` | Cross-language resolver — operates on merged ingest output. Named `legacy.rs` (not `mod.rs`) to signal that this is the pre-plugin implementation; RFC-009's S15 work converts it into the plugin form under `bridges/`. The `bridges/mod.rs` skeleton is added in S12 alongside `legacy.rs` to host the future `CrossLanguageBridge` trait. |
 
 **Stays in `travsr-indexer`:**
 
@@ -147,19 +147,52 @@ members = [
 ]
 ```
 
-`cargo deny` policy receives a per-crate scope:
+**The crate boundary is enforced mechanically, not by convention.** `cargo-deny`'s `[bans]` table is workspace-wide, not per-crate — it cannot natively express "crate X may depend on Y, but crate Z may not." We therefore use a two-part CI strategy:
+
+**Part 1 — Workspace-wide ban (cargo-deny):** disallow any subprocess-spawning or protobuf crate from entering the workspace except through the allowlist. Catches accidental top-level additions to `Cargo.lock`.
 
 ```toml
-# deny.toml
-[bans.travsr-ingest]
-# Only travsr-ingest may depend on subprocess-spawning crates.
-allow = ["tokio-process", "duct", "prost"]
+# deny.toml (workspace-scoped)
+[bans]
+multiple-versions = "warn"
 
-[bans.travsr-indexer]
-deny = ["tokio-process", "duct"]  # Tree-sitter parsing must not spawn subprocesses
+# These crates are permitted somewhere in the workspace, but the per-crate
+# script (Part 2) enforces that they only appear in travsr-ingest's
+# dependency tree.
+skip = [
+  { name = "tokio-process", version = "*" },
+  { name = "duct",          version = "*" },
+  { name = "prost",         version = "*" },
+  { name = "prost-derive",  version = "*" },
+  { name = "prost-types",   version = "*" },
+]
 ```
 
-`cargo depgraph` runs in CI (per CLAUDE.md §module-boundary-rules) and asserts no edge from `travsr-indexer` → `travsr-ingest` or vice versa.
+**Part 2 — Per-crate enforcement (CI script):** run `cargo tree` against each crate that MUST NOT see the restricted deps, and fail CI if any appear:
+
+```yaml
+# .github/workflows/crate-boundary.yml — runs on every PR
+- name: Assert travsr-indexer has no subprocess or protobuf deps
+  run: |
+    FORBIDDEN="tokio-process|duct|prost"
+    if cargo tree -p travsr-indexer --edges normal --prefix none \
+       | grep -E "^(${FORBIDDEN})\\b"; then
+      echo "::error::travsr-indexer depends on a forbidden crate (ADR-010 §rule-4)"
+      exit 1
+    fi
+
+- name: Assert travsr-core has no subprocess deps
+  run: |
+    if cargo tree -p travsr-core --edges normal --prefix none \
+       | grep -E "^(tokio-process|duct)\\b"; then
+      echo "::error::travsr-core depends on a subprocess-spawning crate"
+      exit 1
+    fi
+```
+
+This is a real, working mechanism — verified against the current `cargo-deny` 0.14.x feature set. The earlier draft of this ADR proposed a `[bans.<crate>] allow = [...]` syntax that does not exist in `cargo-deny`; that draft is superseded by this two-part approach.
+
+**Part 3 — Dependency-graph assertion:** `cargo depgraph` runs in the same workflow and asserts no edge from `travsr-indexer` → `travsr-ingest` or vice versa, satisfying the CLAUDE.md §module-boundary-rules guarantee.
 
 ---
 
@@ -177,17 +210,40 @@ Add to workspace members. Add minimal `Cargo.toml` declaring `travsr-core` as th
 
 ### Step 2 — Move files with `git mv`
 
-Use `git mv` (not delete + create) to preserve `git blame` history:
+Use `git mv` (not delete + create) to preserve `git blame` history. Create the `bridges/` subdirectory before the final `git mv`:
 
 ```sh
-git mv crates/travsr-indexer/src/lsif.rs           crates/travsr-ingest/src/lsif.rs
-git mv crates/travsr-indexer/src/python_lsif.rs    crates/travsr-ingest/src/python_lsif.rs
-git mv crates/travsr-indexer/src/ra_runner.rs      crates/travsr-ingest/src/ra_runner.rs
-git mv crates/travsr-indexer/src/sandbox.rs        crates/travsr-ingest/src/sandbox.rs
-git mv crates/travsr-indexer/src/ffi_resolver.rs   crates/travsr-ingest/src/bridges/legacy.rs
+# 1. Extract shared Python helpers to travsr-core so python.rs (staying in
+#    indexer) and python_lsif.rs (moving to ingest) can both depend on them
+#    without creating a forbidden ingest ← indexer edge. This is a small
+#    surgical refactor done first so subsequent moves stay byte-identical.
+git mv crates/travsr-indexer/src/python_common.rs   crates/travsr-core/src/python_common.rs
+# (If python_common.rs does not yet exist, the helpers are extracted from
+#  python_lsif.rs into a new travsr-core module in the same commit.)
+
+# 2. Move LSIF / subprocess / sandbox primitives.
+git mv crates/travsr-indexer/src/lsif.rs            crates/travsr-ingest/src/lsif.rs
+git mv crates/travsr-indexer/src/python_lsif.rs     crates/travsr-ingest/src/python_lsif.rs
+git mv crates/travsr-indexer/src/ra_runner.rs       crates/travsr-ingest/src/ra_runner.rs
+git mv crates/travsr-indexer/src/sandbox.rs         crates/travsr-ingest/src/sandbox.rs
+
+# 3. Move the legacy FFI resolver into the new bridges/ namespace. The
+#    `bridges/mod.rs` skeleton is added in the same commit to host the
+#    `CrossLanguageBridge` trait that RFC-009 §1 introduces in S15.
+mkdir -p crates/travsr-ingest/src/bridges
+git mv crates/travsr-indexer/src/ffi_resolver.rs    crates/travsr-ingest/src/bridges/legacy.rs
 ```
 
-The `ffi_resolver.rs` → `bridges/legacy.rs` rename signals that the file is the pre-plugin implementation. RFC-009's S15 work converts it to plugin form; in S12 it ships as-is to keep the PR purely structural.
+The `ffi_resolver.rs` → `bridges/legacy.rs` rename signals that the file is the pre-plugin implementation. RFC-009's S15 work converts it to plugin form; in S12 it ships as-is to keep the PR purely structural. The `bridges/mod.rs` skeleton is added (not via `git mv` — new file) in the same commit and re-exports `legacy::*` so existing call sites resolve without further edits.
+
+**Module-level audit anchor.** The new `bridges/legacy.rs` opens with a module-level `//!` doc comment that flags it for ADR-006 scope:
+
+```rust
+//! Legacy pre-plugin FFI resolver, relocated from `travsr-indexer` in S12
+//! (ADR-010). This code runs inside `travsr-ingest` and is therefore in scope
+//! for ADR-006-style subprocess-trust review. Converted to plugin form in
+//! S15 per RFC-009.
+```
 
 ### Step 3 — Update imports
 
