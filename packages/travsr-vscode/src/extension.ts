@@ -120,19 +120,22 @@ export function activate(context: vscode.ExtensionContext): void {
   // Status bar click → Quick Pick (VSCODE-205)
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.showStatus", async () => {
-      type ItemId = "restart" | "settings" | "output" | "disable";
-      const items: (vscode.QuickPickItem & { id: ItemId })[] = [
-        { label: "$(refresh) Restart daemon",         id: "restart" },
-        { label: "$(gear) Open settings",             id: "settings" },
-        { label: "$(output) Show output channel",     id: "output" },
-        { label: "$(circle-slash) Disable extension", id: "disable" },
+      type ItemId = "restart" | "settings" | "output" | "disable" | "close";
+      type ActionItem = vscode.QuickPickItem & { id: ItemId };
+      const items: vscode.QuickPickItem[] = [
+        { label: "$(refresh) Restart daemon",         id: "restart"  } as ActionItem,
+        { label: "$(gear) Open settings",             id: "settings" } as ActionItem,
+        { label: "$(output) Show output channel",     id: "output"   } as ActionItem,
+        { label: "$(circle-slash) Disable extension", id: "disable"  } as ActionItem,
+        { label: "", kind: vscode.QuickPickItemKind.Separator },
+        { label: "$(close) Close",                    id: "close"    } as ActionItem,
       ];
       const pick = await vscode.window.showQuickPick(items, {
         placeHolder: "Travsr actions",
       });
-      if (!pick) return;
-      const id = pick.id;
-      switch (id) {
+      // Separator items cannot be selected; plain QuickPickItems have no id.
+      if (!pick || !("id" in pick)) return;
+      switch ((pick as ActionItem).id) {
         case "restart":
           await doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed);
           break;
@@ -145,11 +148,25 @@ export function activate(context: vscode.ExtensionContext): void {
         case "output":
           channel.show();
           break;
-        case "disable":
-          await vscode.commands.executeCommand(
-            "workbench.extensions.action.disableExtension",
-            context.extension.id
+        case "disable": {
+          const answer = await vscode.window.showWarningMessage(
+            "Disable Travsr extension?",
+            { modal: true },
+            "Disable"
           );
+          if (answer !== "Disable") break;
+          // VS Code does not expose a reliable programmatic self-disable API.
+          // Navigate to the extension page so the user can click Disable there.
+          await vscode.commands.executeCommand(
+            "workbench.extensions.search",
+            `@id:${context.extension.id}`
+          );
+          void vscode.window.showInformationMessage(
+            'Right-click Travsr in the Extensions panel and select "Disable".'
+          );
+          break;
+        }
+        case "close":
           break;
       }
     })
@@ -158,16 +175,27 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "travsr.showBlastRadius",
-      (file: string, files: string[]) => {
+      async (file: string, files?: string[]) => {
+        // files is pre-fetched when called from the code lens (arguments: [file, files]).
+        // When called from the hover card markdown link only [file] is encoded in the URI,
+        // so re-fetch here to avoid passing undefined to buildFileListHtml.
         const panel = vscode.window.createWebviewPanel(
           "travsrBlastRadius",
           `Blast radius — ${file}`,
           vscode.ViewColumn.Beside,
           { localResourceRoots: [] }
         );
+        panel.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:16px">Loading…</body></html>`;
+        const actualFiles =
+          files ??
+          (await proxy.callTool("get_blast_radius", { file }))
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+        if (!panel.visible && files === undefined) return;
         panel.webview.html = buildFileListHtml(
           `Blast radius for <code>${escHtml(file)}</code>`,
-          files
+          actualFiles
         );
       }
     )

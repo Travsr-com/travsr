@@ -42,7 +42,13 @@ function formatCallerLine(line: string): string {
 }
 
 export class CallersHoverProvider implements vscode.HoverProvider {
-  private readonly cache = new Map<string, HoverData | null>();
+  // callerCache: keyed by "file::symbol" so same-named symbols in different
+  // files get independent cache entries (e.g. `id` in auth.ts vs api.ts).
+  // blastCache: keyed by file — blast radius is file-scoped, not symbol-scoped,
+  // so N hovers in one file share one blast radius fetch.
+  // null = fetched, empty result; key absent = not yet fetched.
+  private readonly callerCache = new Map<string, string[] | null>();
+  private readonly blastCache = new Map<string, number>();
 
   constructor(private readonly mcp: McpClient) {}
 
@@ -58,41 +64,40 @@ export class CallersHoverProvider implements vscode.HoverProvider {
     if (!symbol || symbol.length < 2) return undefined;
 
     const file = vscode.workspace.asRelativePath(document.uri, false);
-    const cacheKey = `${file}::${symbol}`;
+    const callerKey = `${file}::${symbol}`;
 
-    const cached = this.cache.get(cacheKey);
-    if (cached === null) return undefined; // known-empty
-    if (cached !== undefined) return buildHover(symbol, file, cached, wordRange);
+    const hasCallers = this.callerCache.has(callerKey);
+    const hasBlast = this.blastCache.has(file);
 
     try {
       const [callersRaw, blastRaw] = await Promise.all([
-        this.mcp.callTool("get_callers", { symbol }),
-        this.mcp.callTool("get_blast_radius", { file }),
+        hasCallers ? Promise.resolve("") : this.mcp.callTool("get_callers", { symbol }),
+        hasBlast   ? Promise.resolve("") : this.mcp.callTool("get_blast_radius", { file }),
       ]);
 
       if (token.isCancellationRequested) return undefined;
 
-      const callers = parseCallers(callersRaw);
-      const blastCount = blastRaw
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean).length;
+      const callers = hasCallers
+        ? (this.callerCache.get(callerKey) ?? [])
+        : parseCallers(callersRaw);
+      if (!hasCallers) this.callerCache.set(callerKey, callers.length > 0 ? callers : null);
 
-      if (callers.length === 0 && blastCount === 0) {
-        this.cache.set(cacheKey, null);
-        return undefined;
-      }
+      const blastCount = hasBlast
+        ? (this.blastCache.get(file) ?? 0)
+        : blastRaw.split("\n").map((l) => l.trim()).filter(Boolean).length;
+      if (!hasBlast) this.blastCache.set(file, blastCount);
 
-      const data: HoverData = { callers, blastCount };
-      this.cache.set(cacheKey, data);
-      return buildHover(symbol, file, data, wordRange);
+      if (callers.length === 0 && blastCount === 0) return undefined;
+
+      return buildHover(symbol, file, { callers, blastCount }, wordRange);
     } catch {
       return undefined;
     }
   }
 
   clearCache(): void {
-    this.cache.clear();
+    this.callerCache.clear();
+    this.blastCache.clear();
   }
 }
 

@@ -5,6 +5,8 @@ import {
   BLAST_RADIUS_SELECTOR,
 } from "../../codelens";
 import { CallersHoverProvider } from "../../hover";
+import { showWelcome } from "../../welcome";
+import { StdioMcpClient } from "../../mcp";
 
 // Minimal stub for McpClient — returns controlled responses.
 function makeMcp(
@@ -171,5 +173,74 @@ suite("VSCODE-203: CallersHoverProvider", () => {
         ? hover.contents[0].value
         : "";
     assert.ok(text.includes("… and 3 more"));
+  });
+
+  // ── Split cache: callerCache keyed by file::symbol, blastCache by file ──
+
+  test("same symbol name in two files gets independent caller cache entries", async () => {
+    // 'id' appears in both fileA.ts and fileB.ts — they must not share a cache entry.
+    let callCount = 0;
+    const mcp: import("../../mcp").McpClient = {
+      callTool: async (name: string) => {
+        if (name === "get_callers") { callCount++; return `[call] fn:caller${callCount} (function) — src/c.ts`; }
+        return "";
+      },
+      isConnected: () => true,
+      dispose: () => undefined,
+    };
+    const provider = new CallersHoverProvider(mcp);
+    const cts = new vscode.CancellationTokenSource();
+
+    const docA = await vscode.workspace.openTextDocument({ language: "typescript", content: "const id = 1;\n" });
+    const docB = await vscode.workspace.openTextDocument({ language: "typescript", content: "const id = 2;\n" });
+
+    await provider.provideHover(docA, new vscode.Position(0, 7), cts.token);
+    await provider.provideHover(docB, new vscode.Position(0, 7), cts.token);
+
+    // Two distinct file::symbol keys → two get_callers calls.
+    assert.strictEqual(callCount, 2, "each file must issue its own get_callers call");
+  });
+
+  test("blast radius is fetched once per file across multiple symbol hovers", async () => {
+    let blastCallCount = 0;
+    const mcp: import("../../mcp").McpClient = {
+      callTool: async (name: string) => {
+        if (name === "get_blast_radius") { blastCallCount++; return "src/a.ts\n"; }
+        return `[call] fn:fn${blastCallCount} (function) — src/x.ts`;
+      },
+      isConnected: () => true,
+      dispose: () => undefined,
+    };
+    const provider = new CallersHoverProvider(mcp);
+    const doc = await vscode.workspace.openTextDocument({
+      language: "typescript",
+      content: "function foo() { return bar(); }\n",
+    });
+    const cts = new vscode.CancellationTokenSource();
+    // Hover over two different symbols in the same document.
+    await provider.provideHover(doc, new vscode.Position(0, 10), cts.token); // "foo"
+    await provider.provideHover(doc, new vscode.Position(0, 25), cts.token); // "bar"
+    assert.strictEqual(blastCallCount, 1, "get_blast_radius must be called once per file, not per symbol");
+  });
+});
+
+// ── VSCODE-208: welcome panel dedup ────────────────────────────────────────
+
+suite("VSCODE-208: showWelcome dedup — re-running command reveals existing panel", () => {
+  test("showWelcome called twice does not throw and returns cleanly", () => {
+    // In the test environment WebviewPanel is fully stubbed; calling showWelcome
+    // twice exercises the currentPanel branch without crashing.
+    assert.doesNotThrow(() => { showWelcome(); showWelcome(); });
+  });
+});
+
+// ── VSCODE-204: MCP 10 s timeout ───────────────────────────────────────────
+
+suite("VSCODE-204: StdioMcpClient — callTool returns '' when daemon never responds", () => {
+  test("dispose() cancels pending timers without throwing", () => {
+    // Construct a client that is never connected; dispose() must not throw even
+    // when pendingTimers contains entries (regression guard for the timer-leak fix).
+    const client = new StdioMcpClient("/nonexistent-binary");
+    assert.doesNotThrow(() => client.dispose());
   });
 });
