@@ -20,13 +20,11 @@ interface RepoStats {
   nodeCount: number;
 }
 
-function parseRepoMap(raw: string): RepoStats {
-  const lines = raw.split("\n").filter(Boolean);
-  let nodeCount = lines.length; // one file node per line
-  const re = /\[(\d+) symbol/;
-  for (const line of lines) {
-    const m = re.exec(line);
-    if (m) nodeCount += parseInt(m[1], 10);
+function parseGraphStats(raw: string): RepoStats {
+  let nodeCount = 0;
+  for (const line of raw.split("\n")) {
+    const m = /^nodes:\s*(\d+)/.exec(line.trim());
+    if (m) { nodeCount = parseInt(m[1], 10); break; }
   }
   return { nodeCount };
 }
@@ -126,9 +124,9 @@ export function createStatusBarItem(
   async function poll(): Promise<void> {
     if (state === "indexing") return;
     try {
-      const raw = await client.callTool("get_repo_map");
+      const raw = await client.callTool("get_graph_stats");
       if (raw.length > 0) {
-        lastStats = parseRepoMap(raw);
+        lastStats = parseGraphStats(raw);
         lastUpdated = new Date();
         staleAt = null;
         state = "fresh";
