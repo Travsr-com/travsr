@@ -179,18 +179,20 @@ export function activate(context: vscode.ExtensionContext): void {
         // files is pre-fetched when called from the code lens (arguments: [file, files]).
         // When called from the hover card markdown link only [file] is encoded in the URI,
         // so re-fetch here to avoid passing undefined to buildFileListHtml.
-        const actualFiles =
-          files ??
-          (await proxy.callTool("get_blast_radius", { file }))
-            .split("\n")
-            .map((l) => l.trim())
-            .filter(Boolean);
         const panel = vscode.window.createWebviewPanel(
           "travsrBlastRadius",
           `Blast radius — ${file}`,
           vscode.ViewColumn.Beside,
           { localResourceRoots: [] }
         );
+        panel.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:16px">Loading…</body></html>`;
+        const actualFiles =
+          files ??
+          (await proxy.callTool("get_blast_radius", { file }))
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+        if (!panel.visible && files === undefined) return;
         panel.webview.html = buildFileListHtml(
           `Blast radius for <code>${escHtml(file)}</code>`,
           actualFiles

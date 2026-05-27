@@ -24,6 +24,7 @@ export class StdioMcpClient implements McpClient {
   private proc: cp.ChildProcess | null = null;
   private buffer = "";
   private pending = new Map<number, (text: string) => void>();
+  private readonly pendingTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private nextId = 1;
   private connected = false;
   private readonly disconnectListeners = new Set<() => void>();
@@ -94,12 +95,14 @@ export class StdioMcpClient implements McpClient {
       this.proc?.stdin?.write(line);
       // Guard against a hung daemon: resolve with "" after 10 s so callers
       // never wait indefinitely and the pending entry is cleaned up.
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
+          this.pendingTimers.delete(id);
           resolve("");
         }
       }, 10_000);
+      this.pendingTimers.set(id, timer);
     });
   }
 
@@ -114,6 +117,8 @@ export class StdioMcpClient implements McpClient {
           const resolve = this.pending.get(msg.id);
           if (resolve) {
             this.pending.delete(msg.id);
+            clearTimeout(this.pendingTimers.get(msg.id));
+            this.pendingTimers.delete(msg.id);
             resolve(msg.result?.content?.[0]?.text ?? "");
           }
         }
@@ -125,6 +130,8 @@ export class StdioMcpClient implements McpClient {
           const resolve = this.pending.get(id);
           if (resolve) {
             this.pending.delete(id);
+            clearTimeout(this.pendingTimers.get(id));
+            this.pendingTimers.delete(id);
             resolve("");
           }
         }
@@ -134,6 +141,8 @@ export class StdioMcpClient implements McpClient {
 
   dispose(): void {
     this.connected = false;
+    for (const timer of this.pendingTimers.values()) clearTimeout(timer);
+    this.pendingTimers.clear();
     this.proc?.kill();
     this.proc = null;
   }

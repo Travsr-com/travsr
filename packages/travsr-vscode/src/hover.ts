@@ -42,11 +42,13 @@ function formatCallerLine(line: string): string {
 }
 
 export class CallersHoverProvider implements vscode.HoverProvider {
-  // Callers are per-symbol; blast radius is per-file — split caches to avoid
-  // redundant get_blast_radius calls when hovering multiple symbols in one file.
+  // callerCache: keyed by "file::symbol" so same-named symbols in different
+  // files get independent cache entries (e.g. `id` in auth.ts vs api.ts).
+  // blastCache: keyed by file — blast radius is file-scoped, not symbol-scoped,
+  // so N hovers in one file share one blast radius fetch.
   // null = fetched, empty result; key absent = not yet fetched.
   private readonly callerCache = new Map<string, string[] | null>();
-  private readonly blastCache = new Map<string, number | null>();
+  private readonly blastCache = new Map<string, number>();
 
   constructor(private readonly mcp: McpClient) {}
 
@@ -62,8 +64,9 @@ export class CallersHoverProvider implements vscode.HoverProvider {
     if (!symbol || symbol.length < 2) return undefined;
 
     const file = vscode.workspace.asRelativePath(document.uri, false);
+    const callerKey = `${file}::${symbol}`;
 
-    const hasCallers = this.callerCache.has(symbol);
+    const hasCallers = this.callerCache.has(callerKey);
     const hasBlast = this.blastCache.has(file);
 
     try {
@@ -75,14 +78,14 @@ export class CallersHoverProvider implements vscode.HoverProvider {
       if (token.isCancellationRequested) return undefined;
 
       const callers = hasCallers
-        ? (this.callerCache.get(symbol) ?? [])
+        ? (this.callerCache.get(callerKey) ?? [])
         : parseCallers(callersRaw);
-      if (!hasCallers) this.callerCache.set(symbol, callers.length > 0 ? callers : null);
+      if (!hasCallers) this.callerCache.set(callerKey, callers.length > 0 ? callers : null);
 
       const blastCount = hasBlast
         ? (this.blastCache.get(file) ?? 0)
         : blastRaw.split("\n").map((l) => l.trim()).filter(Boolean).length;
-      if (!hasBlast) this.blastCache.set(file, blastCount > 0 ? blastCount : null);
+      if (!hasBlast) this.blastCache.set(file, blastCount);
 
       if (callers.length === 0 && blastCount === 0) return undefined;
 
