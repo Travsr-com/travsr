@@ -64,6 +64,7 @@ export function createStatusBarItem(
   let lastStats: RepoStats | null = null;
   let lastUpdated: Date | null = null;
   let staleAt: Date | null = null;
+  let saveDebounce: ReturnType<typeof setTimeout> | undefined;
 
   function render(): void {
     const staleLabel =
@@ -167,7 +168,8 @@ export function createStatusBarItem(
       if (state === "fresh") {
         state = "indexing";
         render();
-        setTimeout(() => void poll(), 2_000);
+        clearTimeout(saveDebounce);
+        saveDebounce = setTimeout(() => void poll(), 2_000);
       }
     })
   );

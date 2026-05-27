@@ -203,6 +203,6 @@ export class TravsrTreeDataProvider
     for (const ext of [".ts", ".tsx", ".js", ".jsx"]) {
       if (fs.existsSync(base + ext)) return base + ext;
     }
-    return base + ".ts"; // fallback: let vscode.open surface a missing-file error
+    return undefined; // dep could not be resolved — no navigation is better than a wrong path
   }
 }

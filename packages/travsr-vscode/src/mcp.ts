@@ -92,6 +92,14 @@ export class StdioMcpClient implements McpClient {
         JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
       this.pending.set(id, resolve);
       this.proc?.stdin?.write(line);
+      // Guard against a hung daemon: resolve with "" after 10 s so callers
+      // never wait indefinitely and the pending entry is cleaned up.
+      setTimeout(() => {
+        if (this.pending.has(id)) {
+          this.pending.delete(id);
+          resolve("");
+        }
+      }, 10_000);
     });
   }
 
@@ -110,7 +118,16 @@ export class StdioMcpClient implements McpClient {
           }
         }
       } catch {
-        // Malformed line — skip.
+        // Try to rescue the pending entry so it doesn't leak on malformed JSON.
+        const m = /"id"\s*:\s*(\d+)/.exec(line);
+        if (m) {
+          const id = parseInt(m[1], 10);
+          const resolve = this.pending.get(id);
+          if (resolve) {
+            this.pending.delete(id);
+            resolve("");
+          }
+        }
       }
     }
   }
