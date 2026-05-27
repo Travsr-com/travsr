@@ -51,6 +51,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
             .into_iter()
             .map(|n| {
                 serde_json::json!({
+                    "corpus": n.vname.corpus,
                     "language": n.vname.language,
                     "path": n.vname.path,
                     "signature": n.vname.signature,
