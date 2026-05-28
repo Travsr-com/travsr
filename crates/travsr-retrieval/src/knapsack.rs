@@ -328,10 +328,10 @@ mod tests {
         for mask in 0..(1u32 << n) {
             let mut cost = 0usize;
             let mut value = 0u64;
-            for i in 0..n {
+            for (i, (node, score)) in items.iter().enumerate() {
                 if mask & (1 << i) != 0 {
-                    cost += token_cost(&items[i].0);
-                    value += ((items[i].1 * SCORE_SCALE as f32).round() as u32).max(1) as u64;
+                    cost += token_cost(node);
+                    value += ((*score * SCORE_SCALE as f32).round() as u32).max(1) as u64;
                 }
             }
             if cost <= budget && value > best {
