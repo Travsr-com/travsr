@@ -42,7 +42,7 @@ use crate::scip::ScipSymbol;
 
 /// One implementor per (source_language, target_language, mechanism) triple.
 /// A plugin is stateless and shareable across threads.
-pub trait CrossLanguageBridge: Send + Sync {
+pub trait CrossLanguageBridge: Send + Sync + std::panic::UnwindSafe {
     /// Source language of the call site.
     fn source_language(&self) -> Language;
 
@@ -123,11 +123,11 @@ The `napi` bridge plugin's `resolve()` checks:
 
 The Kythe VName is derived **after** the bridge match by the surrounding registry — the plugin itself does not synthesize VNames. This keeps the corpus invariant (ADR-005, RFC-005 §corpus-invariant) enforced in one place rather than scattered across plugins.
 
-**Three structural checks the registry performs before invoking `resolve()` (see §3 for the implementation):**
+**Three structural checks the registry performs before invoking `resolve()`, in this order (see §3 for the implementation):**
 
 1. **Corpus equality** — `src.corpus() == dst.corpus()`. RFC-005 §corpus-invariant requires this; per-package pruning alone is insufficient because the same package name can exist in two different repos under multi-repo indexing.
-2. **Scheme match** — `src.scheme == bridge.source_language_scheme()` and likewise for `dst`. Defends against intra-corpus mechanism-spoofing where a compromised SCIP indexer (e.g. malicious `scip-java`) emits symbols claiming to belong to another language's scheme. Without this check, the bridge would happily emit a confidence-100 edge to a forged cross-language target.
-3. **Package equality within the same corpus** — `src.package == dst.package`. The performance pre-filter; combined with #1 above, this means a bridge only compares symbols that genuinely belong to the same FFI-bound unit.
+2. **Scheme match** — `src.scheme == bridge.source_language_scheme()` and likewise for `dst`. This is the **security gate** and runs second, before the package pre-filter. A spoofed package name would pass the package equality check if the scheme gate came after it — an attacker who controls `scip-java` output could emit a symbol with the Rust package name, and a package-first check would then invoke a Rust bridge on attacker-controlled data. Placing the scheme check second prevents this.
+3. **Package equality within the same corpus** — `src.package == dst.package`. The **performance pre-filter**; combined with #1 above, this cuts ~99% of candidate pairs. It runs after the scheme gate because it is an efficiency optimization, not a correctness or security gate.
 
 These three checks are the registry's responsibility, not the plugin's. A bridge plugin assumes all three have already passed and reasons only about descriptor matching and mechanism-specific signals.
 
@@ -182,16 +182,20 @@ impl BridgeRegistry {
                     // sufficient; the corpus check must come first.
                     if src.corpus() != dst.corpus() { continue; }
 
-                    // Per-package pruning: only compare symbols from the same
-                    // SCIP package within the same corpus. Cuts ~99% of pairs.
-                    if src.package != dst.package { continue; }
-
-                    // MANDATORY scheme check (RFC-009 §2). Prevents one SCIP
-                    // indexer from forging symbols claiming to belong to another
-                    // language's scheme — defends against intra-corpus
-                    // mechanism-spoofing.
+                    // MANDATORY scheme check — security gate (RFC-009 §2).
+                    // Prevents a compromised SCIP indexer from forging symbols
+                    // claiming to belong to another language's scheme (intra-corpus
+                    // mechanism-spoofing). Must run BEFORE the package pre-filter:
+                    // a spoofed package name would pass the package equality check
+                    // if the scheme gate came after it.
                     if src.scheme != bridge.source_language_scheme() { continue; }
                     if dst.scheme != bridge.target_language_scheme() { continue; }
+
+                    // Per-package pruning: only compare symbols from the same
+                    // SCIP package within the same corpus. Cuts ~99% of pairs.
+                    // Runs last because it is a performance filter, not a security
+                    // gate — the scheme check above already excluded forgeries.
+                    if src.package != dst.package { continue; }
 
                     if let Some(m) = bridge.resolve(src, dst) {
                         edges.push(FFICallEdge {
@@ -237,6 +241,24 @@ get_blast_radius(python_fn) →
 PCST (`get_execution_path`) likewise finds connecting subgraphs through intermediate languages without needing a direct plugin.
 
 **C as lingua franca.** Most non-trivial FFI in real codebases goes through C (Python/Ruby/Lua/R extension APIs all bottom out at C; Rust and Go expose C ABIs). One plugin per language bridging to C provides full N-language coverage transitively. Direct plugins are only required for pairs that bypass C: N-API (TS↔Rust direct), JVM languages (Java↔Kotlin direct), Swift↔ObjC (Obj-C runtime).
+
+**Concrete transitive path example (unblocks the S15 `cgo` bridge implementation).** A Go function that calls a C function that is implemented in Rust produces this edge chain:
+
+```
+Go fn  →[FFICall, mechanism="cgo", confidence=100]→  C synthetic node
+C synthetic node  →[RefCall, confidence=100]→  Rust fn
+```
+
+C synthetic nodes are introduced by the `cgo` bridge plugin:
+
+- `NodeKind::CExport`
+- `corpus` = the Go repo's corpus (same corpus as the `cgo` call site — corpus invariant preserved)
+- `language = "c"` (the scheme field in the synthetic SCIP symbol)
+- `descriptor` = the exported C symbol name from the `//export <name>` directive
+
+The `pyo3` bridge (Python → Rust) follows the same pattern when Rust exposes a C-compatible ABI layer. At retrieval time, `get_blast_radius(rust_fn)` traverses `RefCall` edges inbound to the C synthetic node, then `FFICall` edges inbound to the C synthetic node from Go, finding the Go call sites — no direct Go↔Rust plugin required.
+
+Traversal depth limit for transitive cross-language paths: the same BFS depth-3 limit (MVP) or PPR convergence (production) as same-language traversal. No special casing for synthetic C nodes.
 
 The implication for Phase 4 scope: the planned plugin set (napi, pyo3, cgo, jni, kotlin-jvm) plus future swift-objc covers the vast majority of polyglot repos without combinatorial explosion.
 
@@ -293,15 +315,31 @@ A plugin that panics is **dropped from the registry for the remainder of the dae
 
 ### 9. Testing strategy
 
-Each bridge ships with three test tiers:
+Each bridge ships with four test tiers:
 
-1. **Unit tests in the plugin module.** Pure resolve() tests with hand-constructed `ScipSymbol` pairs covering the confidence rubric tiers. Lives in `travsr-ingest/src/bridges/<mechanism>.rs` `#[cfg(test)]`.
+1. **Unit tests in the plugin module.** Pure `resolve()` tests with hand-constructed `ScipSymbol` pairs covering the confidence rubric tiers, including **negative-path cases**. Lives in `travsr-ingest/src/bridges/<mechanism>.rs` `#[cfg(test)]`.
+
+   Required negative cases (per bridge):
+   - A symbol pair with confidence < 30 must produce `None` (no edge emitted).
+   - A symbol pair from the wrong language pair for this bridge must produce `None`.
+   - A symbol pair with matching package but mismatched descriptor must produce `None` (no edge emitted on descriptor mismatch alone).
+
+   A bridge that emits edges for all inputs would fail these cases. Without explicit negative-path tests, a broken bridge that always returns `Some(BridgeMatch { confidence: 100, .. })` would pass the positive-path tests.
 
 2. **Integration fixtures.** A polyglot fixture per bridge under `travsr-ingest/tests/fixtures/<mechanism>/` with both sides of the FFI binding plus a golden JSON of expected edges. Snapshot-managed with `insta` (per RFC-003 §6 convention).
 
-3. **Property-based tests for the registry.** Verifies the RFC-005 §symmetry-property invariant for every (src_lang, dst_lang) pair in the polyglot fixture, generalized to the plugin set.
+3. **Property-based tests for the registry.** Three required properties (using `proptest`), asserting post-B1 fix invariants:
+   - `prop_resolve_all_never_emits_cross_corpus_edge` — for any symbol pair with differing corpora, `resolve_all` emits zero edges.
+   - `prop_resolve_all_rejects_scheme_mismatch` — for any symbol pair where `src.scheme != bridge.source_language_scheme()`, `resolve_all` emits zero edges.
+   - `prop_resolve_all_package_mismatch_zero_edges` — for any symbol pair within the same corpus and with correct schemes but differing packages, `resolve_all` emits zero edges.
+   
+   Also verifies the RFC-005 §symmetry-property invariant for every (src_lang, dst_lang) pair in the polyglot fixture, generalized to the plugin set.
 
-The combined polyglot fixture (added in S15) is a single repo with TypeScript + Rust + Python + Go + Java that exercises every built-in bridge and validates transitive paths.
+4. **Transitive traversal fixture (added in S15).** The combined polyglot fixture (TypeScript + Rust + Python + Go + Java) must include at least one golden assertion for a **transitive** cross-language path — e.g. calling `get_blast_radius` on a Rust function that is exposed via both `napi` (TS→Rust) and `pyo3` (Python→Rust) and asserting that the result reaches TypeScript and Python call sites through the intermediate Rust node. This tier guards against a regression where direct FFICall edges are emitted correctly but the traversal engine fails to cross language boundaries.
+
+   Required golden assertion:
+   - Input: the Rust `get_callers` entrypoint in the fixture (bound via napi to TypeScript and via pyo3 to Python).
+   - Expected: `get_blast_radius` result includes at least one TypeScript call site and at least one Python call site, reached via FFICall edges, within depth-3 BFS.
 
 ---
 

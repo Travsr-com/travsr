@@ -80,7 +80,7 @@ The dependency table in CLAUDE.md is updated:
 | Source path | Destination path | Reason |
 |-------------|------------------|--------|
 | `travsr-indexer/src/lsif.rs` | `travsr-ingest/src/lsif.rs` | LSIF JSON-LD parser — Phase B |
-| `travsr-indexer/src/python_lsif.rs` | `travsr-ingest/src/python_lsif.rs` | Python-specific LSIF handling. **Cross-crate-import note:** `travsr-indexer/src/python.rs` currently `use`s items from `python_lsif`. The S12 PR breaks this import by making `python_lsif` invisible to `travsr-indexer`. Resolution: the helper functions in `python_lsif.rs` that `python.rs` actually consumes (`extract_module_path`, `normalize_import`) move to `travsr-core::python_common` in the same PR. The pure LSIF-handling code stays in `travsr-ingest`. |
+| `travsr-indexer/src/python_lsif.rs` | `travsr-ingest/src/python_lsif.rs` | Python-specific LSIF handling. **Cross-crate-import note:** `travsr-indexer/src/python.rs` currently `use`s items from `python_lsif`. The S12 PR breaks this import by making `python_lsif` invisible to `travsr-indexer`. Resolution: the helper functions in `python_lsif.rs` that `python.rs` actually consumes (`extract_module_path`, `normalize_import`) move to `travsr-indexer::common::python` in the same PR (not `travsr-core` — that crate is language-agnostic graph primitives; Python AST helpers have no place there, and placing them there sets a precedent for polluting `travsr-core` with Go helpers, Java helpers, etc. over Phase 4). Since `python.rs` stays in `travsr-indexer` and is the only consumer of these helpers, they belong there. The pure LSIF-handling code stays in `travsr-ingest`. |
 | `travsr-indexer/src/ra_runner.rs` | `travsr-ingest/src/ra_runner.rs` | rust-analyzer subprocess invocation |
 | `travsr-indexer/src/sandbox.rs` | `travsr-ingest/src/sandbox.rs` | ADR-006 sandbox primitives — used only by subprocess invokers |
 | `travsr-indexer/src/ffi_resolver.rs` | `travsr-ingest/src/bridges/legacy.rs` | Cross-language resolver — operates on merged ingest output. Named `legacy.rs` (not `mod.rs`) to signal that this is the pre-plugin implementation; RFC-009's S15 work converts it into the plugin form under `bridges/`. The `bridges/mod.rs` skeleton is added in S12 alongside `legacy.rs` to host the future `CrossLanguageBridge` trait. |
@@ -213,13 +213,19 @@ Add to workspace members. Add minimal `Cargo.toml` declaring `travsr-core` as th
 Use `git mv` (not delete + create) to preserve `git blame` history. Create the `bridges/` subdirectory before the final `git mv`:
 
 ```sh
-# 1. Extract shared Python helpers to travsr-core so python.rs (staying in
-#    indexer) and python_lsif.rs (moving to ingest) can both depend on them
-#    without creating a forbidden ingest ← indexer edge. This is a small
-#    surgical refactor done first so subsequent moves stay byte-identical.
-git mv crates/travsr-indexer/src/python_common.rs   crates/travsr-core/src/python_common.rs
-# (If python_common.rs does not yet exist, the helpers are extracted from
-#  python_lsif.rs into a new travsr-core module in the same commit.)
+# 1. Extract shared Python helpers into travsr-indexer::common::python.
+#    `python.rs` (staying in travsr-indexer) currently uses `extract_module_path`
+#    and `normalize_import` from `python_lsif.rs`. Once `python_lsif.rs` moves
+#    to travsr-ingest, those helpers become invisible to travsr-indexer.
+#    Moving them to travsr-indexer::common::python keeps them in the same crate
+#    as the only consumer (python.rs) without introducing any cross-crate edge.
+#    travsr-core is NOT the right home — it is language-agnostic graph primitives;
+#    Python AST helpers would set a precedent for polluting it with per-language
+#    logic across Phase 4.
+mkdir -p crates/travsr-indexer/src/common
+# (If common/python.rs does not yet exist, the helpers are extracted from
+#  python_lsif.rs into a new travsr-indexer::common::python module in the same
+#  commit before the git mv steps below.)
 
 # 2. Move LSIF / subprocess / sandbox primitives.
 git mv crates/travsr-indexer/src/lsif.rs            crates/travsr-ingest/src/lsif.rs
@@ -270,6 +276,8 @@ Add the `cargo deny` per-crate rules. Add the `cargo depgraph` assertion job to 
 ### Step 7 — Verify fixtures green
 
 The full golden-fixture suite (TypeScript, Rust, Python from Sprint 8; Go from Sprint 11) must pass byte-identically. This is the PR gate. Any divergence means the move introduced a bug — root-cause and fix before merge.
+
+**CI job ordering is normative.** The crate-boundary check (§rule-4 Part 2 `cargo tree` CI script) MUST run **before** the fixture check in the CI workflow. A re-export (`pub use travsr_indexer::lsif::*`) would allow old import paths to compile while silently violating the crate boundary — the fixture tests would still pass because the code compiles, but the structural guarantee of the ADR would be broken. The boundary check catches this; the fixture check does not. In `.github/workflows/crate-boundary.yml`, place the `cargo tree` assertion step before the `cargo test --fixtures` step in the same job (or make the fixture job depend on the boundary job via `needs:`).
 
 ### Step 8 — Update CLAUDE.md
 

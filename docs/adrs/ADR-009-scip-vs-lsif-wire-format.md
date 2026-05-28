@@ -63,11 +63,26 @@ Each language's invoker declares which parser to feed its output to. The dispatc
 ```rust
 pub enum WireFormat { Lsif, Scip }
 
+/// Maps to the three rows of the descriptor trust matrix in RFC-008 §2.
+/// Used by the daemon orchestrator to decide which ADR-006 sandbox primitives
+/// to apply before invoking a subprocess.
+pub enum TrustLevel {
+    /// Shipped inside the `travsr-ingest` crate binary — unconditionally trusted.
+    Builtin,
+    /// Loaded from `~/.config/travsr/langs/*.toml` — runs without subprocess
+    /// sandbox, but `custom_module` must resolve to a built-in module path.
+    UserLocal,
+    /// Loaded from `<repo>/.travsr/langs/*.toml` — requires explicit per-repo
+    /// opt-in via `travsr config set descriptors.trust <path> true`.
+    /// `custom_module` is hard-rejected regardless of trust setting.
+    RepoLocal,
+}
+
 pub trait LanguageInvoker: Send + Sync {
     fn language(&self) -> Language;
     fn format(&self) -> WireFormat;
     fn invoke(&self, root: &Path) -> Result<Box<dyn Read>, InvokerError>;
-    fn trust_level(&self) -> TrustLevel;  // see ADR-006
+    fn trust_level(&self) -> TrustLevel;  // see ADR-006 and RFC-008 §2
 }
 ```
 

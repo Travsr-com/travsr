@@ -106,7 +106,7 @@ imports         = { node = "import_header", target_extraction = "identifier_path
 | Source | Loaded? | `custom_module` permitted? |
 |--------|---------|---------------------------|
 | `travsr-indexer/langs/*.toml` (built-in, shipped with the crate) | Yes, unconditionally | Yes — `custom_module` must resolve to a statically-linked module in the `travsr-indexer` crate |
-| `~/.config/travsr/langs/*.toml` (user-local config) | Yes, unconditionally | Yes — `custom_module` must resolve to a built-in module path (no user-supplied code; statically-linked only) |
+| `~/.config/travsr/langs/*.toml` (user-local config) | Yes, unconditionally | Yes — `custom_module` must resolve to a built-in module path (no user-supplied code; statically-linked only). Validation is against a `const` slice of permitted module paths compiled into the binary at build time — not a runtime string match. This prevents bypass via future crate additions that happen to share a path prefix. |
 | `<repo>/.travsr/langs/*.toml` (repo-local) | **No, refused by default.** Requires `travsr config set descriptors.trust <repo-path> true` (same primitive as ADR-006 `rust-analyzer.trust`) | **Never** — `custom_module` is rejected with a hard error in any repo-local descriptor regardless of trust setting |
 
 A repo-local descriptor without a corresponding home-directory trust entry causes the daemon to emit a `tracing::warn!` and skip the descriptor. The trust entry is per-canonical-corpus (ARCH-102), matching ADR-006's `rust-analyzer.trust.<canonical-corpus>` schema.
