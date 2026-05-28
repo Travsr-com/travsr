@@ -8,7 +8,7 @@
 
 use proptest::prelude::*;
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
-use travsr_retrieval::{pcst_path, OpenFilter, RbacFilter};
+use travsr_retrieval::{pcst_path, token_cost, OpenFilter, RbacFilter};
 use travsr_store::{SqliteStore, Store};
 
 fn make_store(nodes: &[Node], edges: &[(NodeId, NodeId, EdgeKind)]) -> SqliteStore {
@@ -101,17 +101,15 @@ proptest! {
             token_budget,
         ).unwrap();
 
-        // Calculate the token cost as pcst does: sig.len() + kind.len()
-        let total_cost: usize = result
-            .iter()
-            .map(|n| n.vname.signature.len() + n.kind.len())
-            .sum();
+        // Calculate the token cost using the canonical token_cost function.
+        let total_cost: usize = result.iter().map(token_cost).sum();
 
         // The PCST implementation may include source/sink even if over budget —
         // accept that up to 2 nodes (src+sink) may exceed by their cost.
-        let src_sink_cost = result.iter()
+        let src_sink_cost = result
+            .iter()
             .filter(|n| n.id == nodes[0].id || n.id == nodes[chain_len - 1].id)
-            .map(|n| n.vname.signature.len() + n.kind.len())
+            .map(token_cost)
             .sum::<usize>();
 
         prop_assert!(

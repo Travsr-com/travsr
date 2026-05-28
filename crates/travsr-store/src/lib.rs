@@ -24,7 +24,7 @@ pub use migration_manifest::{Manifest, ManifestEntry, MigrationError};
 use std::path::Path;
 
 use anyhow::{Context, Result as AnyResult};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 use travsr_error::StoreError;
 
@@ -184,6 +184,8 @@ pub trait Store {
     }
     /// Return every incoming edge to `dst`.
     fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>, StoreError>;
+    /// Batch-fetch nodes by id. Unknown ids are silently skipped.
+    fn get_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>, StoreError>;
 }
 
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
@@ -801,6 +803,52 @@ impl Store for SqliteStore {
             Ok(out)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn get_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>, StoreError> {
+        // SQLite SQLITE_MAX_VARIABLE_NUMBER is 999 by default; chunk to stay within it.
+        const CHUNK: usize = 999;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, corpus, root, path, language, signature, kind, package \
+                 FROM nodes WHERE id IN ({placeholders})"
+            );
+            (|| -> AnyResult<()> {
+                let mut stmt = self
+                    .conn
+                    .prepare(&sql)
+                    .context("preparing get_nodes query")?;
+                let id_params: Vec<i64> = chunk.iter().map(|id| node_id_to_i64(*id)).collect();
+                let rows = stmt
+                    .query_map(params_from_iter(id_params.iter()), |row| {
+                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                        let vname = VName::new(
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        );
+                        let kind: String = row.get(6)?;
+                        let package: String = row.get(7)?;
+                        Ok(Node {
+                            id,
+                            vname,
+                            kind,
+                            package,
+                        })
+                    })
+                    .context("executing get_nodes query")?;
+                for r in rows {
+                    out.push(r.context("decoding get_nodes row")?);
+                }
+                Ok(())
+            })()
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+        Ok(out)
     }
 }
 

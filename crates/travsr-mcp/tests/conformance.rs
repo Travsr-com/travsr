@@ -419,3 +419,276 @@ fn mcp_malformed_json_returns_parse_error() {
         "malformed JSON must return JSON-RPC -32700 (PARSE_ERROR)"
     );
 }
+
+// ── get_context conformance tests ─────────────────────────────────────────────
+
+#[test]
+fn mcp_get_context_returns_text_content() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"charge","token_budget":1000}}}"#,
+        ],
+    );
+    assert_eq!(
+        responses.len(),
+        2,
+        "expected initialize + tool/call responses"
+    );
+    let content = &responses[1]["result"]["content"][0];
+    assert_eq!(
+        content["type"], "text",
+        "get_context content must have type=text"
+    );
+}
+
+#[test]
+fn mcp_get_context_response_is_wrapped_in_envelope() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"charge","token_budget":1000}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content.text must be a string");
+    assert!(
+        text.starts_with("<travsr-data>"),
+        "get_context must start with <travsr-data>, got: {text}"
+    );
+    assert!(
+        text.ends_with("</travsr-data>"),
+        "get_context must end with </travsr-data>, got: {text}"
+    );
+}
+
+#[test]
+fn mcp_get_context_missing_query_arg_returns_text() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    // Missing query — should degrade gracefully (empty string fallback), not RPC error.
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"token_budget":500}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let resp = &responses[1];
+    assert!(
+        resp.get("result").is_some(),
+        "missing query must use result, not error"
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "must not return RPC error for missing query"
+    );
+    assert_eq!(
+        resp["result"]["content"][0]["type"], "text",
+        "response must have type=text"
+    );
+}
+
+#[test]
+fn mcp_get_context_nonexistent_symbol_returns_not_found_envelope() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"zzz_nonexistent_symbol_xyz","token_budget":1000}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let resp = &responses[1];
+    assert!(
+        resp.get("result").is_some(),
+        "not-found must use result, not error"
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "must not return RPC error for not-found query"
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.starts_with("<travsr-data>"),
+        "not-found response must be in envelope, got: {text}"
+    );
+}
+
+#[test]
+fn mcp_get_context_oversized_budget_returns_error_message_not_rpc_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    // token_budget = 100_000 > MAX_CONTEXT_BUDGET (32_000) — must return result, not error.
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"charge","token_budget":100000}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let resp = &responses[1];
+    assert!(
+        resp.get("result").is_some(),
+        "oversized budget must use result, not error"
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "must not return RPC error for oversized budget"
+    );
+}
+
+#[test]
+fn mcp_get_context_result_is_not_an_error_for_empty_graph() {
+    // Empty repo (no TypeScript files) — graph is empty, get_context must return result.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    git_init(tmp.path());
+    // Run travsr init on an empty repo (no source files).
+    std::process::Command::new(cargo_bin("travsr"))
+        .arg("init")
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("travsr init on empty repo");
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"anything","token_budget":1000}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let resp = &responses[1];
+    assert!(
+        resp.get("result").is_some(),
+        "empty graph must use result, not error"
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "must not return RPC error for empty graph"
+    );
+}
+
+#[test]
+fn mcp_get_context_token_budget_defaults_when_omitted() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    // No token_budget argument — server must default to 4096, not panic.
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"charge"}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let resp = &responses[1];
+    assert!(
+        resp.get("result").is_some(),
+        "omitted token_budget must use result, not error"
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "must not return RPC error when token_budget omitted"
+    );
+    assert_eq!(
+        resp["result"]["content"][0]["type"], "text",
+        "response must have type=text"
+    );
+}
+
+#[test]
+fn mcp_get_context_output_does_not_contain_raw_angle_brackets() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"charge","token_budget":2000}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    // Strip the known envelope tags before checking for raw angle brackets.
+    let inner = text
+        .strip_prefix("<travsr-data>")
+        .unwrap_or(text)
+        .strip_suffix("</travsr-data>")
+        .unwrap_or(text);
+    assert!(
+        !inner.contains('<') && !inner.contains('>'),
+        "inner content must not contain raw angle brackets; got: {inner}"
+    );
+}
+
+#[test]
+fn mcp_get_context_is_in_tools_list() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools must be an array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(
+        names.contains(&"get_context"),
+        "tools/list must include get_context; got: {names:?}"
+    );
+}
+
+#[test]
+fn mcp_get_context_path_traversal_arg_is_rejected() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    // Path traversal in query must be rejected gracefully — result, not error.
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_context","arguments":{"query":"../etc/passwd","token_budget":1000}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 2);
+    let resp = &responses[1];
+    assert!(
+        resp.get("result").is_some(),
+        "path traversal must use result, not error"
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "must not return RPC error for path traversal query"
+    );
+}

@@ -117,6 +117,11 @@ fn handle_tool_call(
             let sink = args["sink"].as_str().unwrap_or("");
             tools::get_execution_path(store, source, sink)
         }
+        "get_context" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
+            tools::get_context(store, query, token_budget)
+        }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -137,7 +142,7 @@ fn handle_tool_call(
 
 fn tools_list() -> serde_json::Value {
     serde_json::json!({
-        "_schemaVersion": "1.0.0",
+        "_schemaVersion": "1.1.0",
         "tools": [
             {
                 "name": "get_dependencies",
@@ -215,6 +220,19 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_context",
+                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Symbol name or free-text query (1–200 chars)" },
+                        "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." }
+                    },
+                    "required": ["query"],
                     "additionalProperties": false
                 }
             }
@@ -339,6 +357,11 @@ fn handle_tool_call_global(
             let sink = args["sink"].as_str().unwrap_or("");
             tools::get_execution_path_global(repos, source, sink, repo_arg, &OpenFilter)
         }
+        "get_context" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
+            tools::get_context_global(repos, query, token_budget, repo_arg)
+        }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
@@ -357,7 +380,7 @@ fn handle_tool_call_global(
 
 fn tools_list_global() -> serde_json::Value {
     serde_json::json!({
-        "_schemaVersion": "1.0.0",
+        "_schemaVersion": "1.1.0",
         "tools": [
             {
                 "name": "get_dependencies",
@@ -446,6 +469,20 @@ fn tools_list_global() -> serde_json::Value {
                     },
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_context",
+                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Symbol name or free-text query (1–200 chars)" },
+                        "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -463,6 +500,7 @@ mod tests {
         "get_repo_map",
         "get_execution_path",
         "get_graph_stats",
+        "get_context",
     ];
 
     #[test]
@@ -516,6 +554,7 @@ mod tests {
             ("get_blast_radius", "file"),
             ("search_symbol", "name"),
             ("get_execution_path", "source"),
+            ("get_context", "query"),
         ];
         for list in [tools_list(), tools_list_global()] {
             let tools = list["tools"].as_array().unwrap();

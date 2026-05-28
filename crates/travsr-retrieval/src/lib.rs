@@ -8,10 +8,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod knapsack;
 pub mod pcst;
 pub mod ppr;
 pub mod rbac;
 
+pub use knapsack::{
+    context_candidates, knapsack, token_cost, DP_CELL_LIMIT, MAX_CONTEXT_BUDGET, SCORE_SCALE,
+    TOKEN_CHARS_PER_TOKEN,
+};
 pub use pcst::pcst_path;
 pub use ppr::ppr;
 pub use rbac::{EdgeFilter, OpenFilter, RbacFilter};
@@ -56,7 +61,7 @@ pub fn bfs(
         }
 
         if let Some(node) = store.get_node(current_id)? {
-            let cost = node.vname.signature.len() + node.kind.len();
+            let cost = crate::knapsack::token_cost(&node);
             if tokens_used + cost > token_budget {
                 break;
             }
@@ -164,7 +169,7 @@ mod tests {
     fn bfs_respects_token_budget() {
         let a = node("a.ts", "fn:a");
         let b = node("b.ts", "fn:b");
-        let a_cost = a.vname.signature.len() + a.kind.len();
+        let a_cost = crate::knapsack::token_cost(&a);
         let store = store_with_nodes_and_edges(
             &[a.clone(), b.clone()],
             &[(a.id, b.id, EdgeKind::DefinesBinding)],

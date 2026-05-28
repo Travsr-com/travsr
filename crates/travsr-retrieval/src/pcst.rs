@@ -133,7 +133,7 @@ pub fn pcst_path(
     let mut tokens_used = 0;
     for id in result_ids {
         if let Some(node) = store.get_node(id)? {
-            let cost = node.vname.signature.len() + node.kind.len();
+            let cost = crate::knapsack::token_cost(&node);
             if tokens_used + cost > token_budget {
                 break;
             }
@@ -340,7 +340,7 @@ fn bfs_fallback(
             if !filter.allow(current_id, current_id, Some(node.vname.corpus.as_str())) {
                 continue;
             }
-            let cost = node.vname.signature.len() + node.kind.len();
+            let cost = crate::knapsack::token_cost(&node);
             if tokens_used + cost > token_budget {
                 break;
             }
