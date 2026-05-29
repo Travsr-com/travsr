@@ -103,7 +103,7 @@ fn escape_tags(s: &str) -> String {
 /// Use this when the caller needs to append a footer before wrapping, to avoid
 /// the footer being truncated or double-sanitized. Call [`wrap_envelope`] after
 /// appending the footer.
-pub fn sanitize_mcp_body_with_limit(raw: &str, limit: usize) -> String {
+pub(crate) fn sanitize_mcp_body_with_limit(raw: &str, limit: usize) -> String {
     let truncated = truncate_to_byte_limit(raw, limit);
     let stripped = strip_control_chars(truncated);
     escape_tags(&stripped)

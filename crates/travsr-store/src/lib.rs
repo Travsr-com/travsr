@@ -185,6 +185,7 @@ pub trait Store {
     /// Return every incoming edge to `dst`.
     fn iter_edges_to(&self, dst: NodeId) -> Result<Vec<Edge>, StoreError>;
     /// Batch-fetch nodes by id. Unknown ids are silently skipped.
+    /// Output order is not guaranteed to match input order.
     fn get_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>, StoreError>;
 }
 

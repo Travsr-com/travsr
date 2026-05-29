@@ -230,9 +230,22 @@ mod tests {
             items.push((small.clone(), 0.5_f32));
         }
 
-        let result = knapsack(items, big_cost * 3);
-        // Must not be empty — something should fit.
-        assert!(!result.is_empty());
+        let budget = big_cost * 3;
+        let result = knapsack(items, budget);
+
+        // Budget is respected.
+        let total_cost: usize = result.iter().map(token_cost).sum();
+        assert!(
+            total_cost <= budget,
+            "total cost {total_cost} exceeds budget {budget}"
+        );
+
+        // The 5 smalls collectively outvalue the 1 big; DP must select more than 1 node.
+        assert!(
+            result.len() > 1,
+            "DP should select multiple small nodes, got {} node(s)",
+            result.len()
+        );
     }
 
     #[test]
