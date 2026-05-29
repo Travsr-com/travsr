@@ -882,13 +882,22 @@ const MAX_GRAPH_JSON_NODES: usize = 200;
 /// Returns `{"nodes":[...],"edges":[...]}`.
 /// Unlike prose tools, output is NOT sanitized — it is structured JSON consumed
 /// by the VS Code graph panel, not forwarded to an LLM as freetext.
-pub fn get_graph_json(store: &SqliteStore, query: &str, direction: &str, depth: u8) -> String {
-    if let Err(reason) = validate_mcp_arg(query) {
-        tracing::warn!("get_graph_json rejected invalid arg: {reason}");
-        return "{}".to_string();
+pub fn get_graph_json(
+    store: &SqliteStore,
+    query: &str,
+    direction: &str,
+    depth: u8,
+    kind_filter: &str,
+) -> String {
+    // Empty query is valid when kind_filter=="file" (returns full import graph).
+    if !(query.is_empty() && kind_filter == "file") {
+        if let Err(reason) = validate_mcp_arg(query) {
+            tracing::warn!("get_graph_json rejected invalid arg: {reason}");
+            return "{}".to_string();
+        }
     }
     let depth = depth.clamp(1, 4);
-    get_graph_json_raw(store, query, direction, depth)
+    get_graph_json_raw(store, query, direction, depth, kind_filter)
 }
 
 fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
@@ -901,15 +910,67 @@ fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
     }
 }
 
-fn get_graph_json_raw(store: &SqliteStore, query: &str, direction: &str, depth: u8) -> String {
+/// Unique JSON id/label for a node.
+/// File nodes have `signature == "file"` (shared across all files), so we use
+/// `path` instead to keep Cytoscape ids distinct.
+fn node_json_id(node: &CoreNode) -> &str {
+    if node.kind == "file" {
+        &node.vname.path
+    } else {
+        &node.vname.signature
+    }
+}
+
+/// Short display label — basename for files, full signature for everything else.
+fn node_json_label(node: &CoreNode) -> &str {
+    if node.kind == "file" {
+        node.vname
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&node.vname.path)
+    } else {
+        &node.vname.signature
+    }
+}
+
+fn get_graph_json_raw(
+    store: &SqliteStore,
+    query: &str,
+    direction: &str,
+    depth: u8,
+    kind_filter: &str,
+) -> String {
     use std::collections::{HashSet, VecDeque};
 
-    let seed_nodes = match store.search_nodes_by_name(query) {
+    // File mode with empty query: search broadly by path separator to seed all file nodes.
+    let search_term = if kind_filter == "file" && query.is_empty() {
+        "."
+    } else {
+        query
+    };
+    let seed_nodes_raw = match store.search_nodes_by_name(search_term) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("get_graph_json search error: {e}");
             return r#"{"nodes":[],"edges":[]}"#.to_string();
         }
+    };
+
+    // Filter seeds to the requested kind when kind_filter is set.
+    let seed_nodes: Vec<_> = if !kind_filter.is_empty() {
+        seed_nodes_raw
+            .into_iter()
+            .filter(|n| {
+                serde_json::to_value(&n.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some(kind_filter)
+            })
+            .collect()
+    } else {
+        seed_nodes_raw
     };
 
     if seed_nodes.is_empty() {
@@ -942,13 +1003,18 @@ fn get_graph_json_raw(store: &SqliteStore, query: &str, direction: &str, depth: 
             _ => continue,
         };
 
+        // Skip nodes that don't match the kind filter.
+        if !kind_filter.is_empty() && node.kind != kind_filter {
+            continue;
+        }
+
         let score = {
             let raw = 0.7_f64.powi(i32::from(hop));
             (raw * 1000.0).round() / 1000.0
         };
         let mut node_obj = serde_json::json!({
-            "id":      node.vname.signature,
-            "label":   node.vname.signature,
+            "id":      node_json_id(&node),
+            "label":   node_json_label(&node),
             "kind":    node.kind,
             "path":    node.vname.path,
             "package": node.package,
@@ -963,15 +1029,87 @@ fn get_graph_json_raw(store: &SqliteStore, query: &str, direction: &str, depth: 
             continue;
         }
 
-        // Outgoing edges (deps direction)
+        // File mode: the import schema uses a two-hop chain
+        //   file --[Depends]--> import_node --[ResolvesTo]--> file
+        // Look through the intermediary to emit direct file→file edges.
+        if kind_filter == "file" {
+            use travsr_core::EdgeKind;
+            if direction == "deps" || direction == "both" {
+                if let Ok(dep_edges) = store.iter_edges_from(current_id) {
+                    for dep in &dep_edges {
+                        if !matches!(dep.kind, EdgeKind::Depends) {
+                            continue;
+                        }
+                        if let Ok(res_edges) = store.iter_edges_from(dep.dst) {
+                            for res in &res_edges {
+                                if !matches!(res.kind, EdgeKind::ResolvesTo) {
+                                    continue;
+                                }
+                                if let Ok(Some(target)) = store.get_node(res.dst) {
+                                    if target.kind != "file" {
+                                        continue;
+                                    }
+                                    if edge_seen.insert((current_id, target.id)) {
+                                        edges_out.push(serde_json::json!({
+                                            "source": node_json_id(&node),
+                                            "target": node_json_id(&target),
+                                            "kind":   "imports",
+                                        }));
+                                    }
+                                    if visited.insert(target.id) {
+                                        queue.push_back((target.id, hop + 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if direction == "callers" || direction == "both" {
+                // Reverse: who imports this file?
+                //   importer_file --[Depends]--> import_node --[ResolvesTo]--> current_file
+                if let Ok(rev_res_edges) = store.iter_edges_to(current_id) {
+                    for rev_res in &rev_res_edges {
+                        if !matches!(rev_res.kind, EdgeKind::ResolvesTo) {
+                            continue;
+                        }
+                        if let Ok(rev_dep_edges) = store.iter_edges_to(rev_res.src) {
+                            for rev_dep in &rev_dep_edges {
+                                if !matches!(rev_dep.kind, EdgeKind::Depends) {
+                                    continue;
+                                }
+                                if let Ok(Some(source)) = store.get_node(rev_dep.src) {
+                                    if source.kind != "file" {
+                                        continue;
+                                    }
+                                    if edge_seen.insert((source.id, current_id)) {
+                                        edges_out.push(serde_json::json!({
+                                            "source": node_json_id(&source),
+                                            "target": node_json_id(&node),
+                                            "kind":   "imports",
+                                        }));
+                                    }
+                                    if visited.insert(source.id) {
+                                        queue.push_back((source.id, hop + 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue; // skip normal edge traversal
+        }
+
+        // Normal traversal (symbol mode)
         if direction == "deps" || direction == "both" {
             if let Ok(edges) = store.iter_edges_from(current_id) {
                 for edge in &edges {
                     if edge_seen.insert((edge.src, edge.dst)) {
                         if let Ok(Some(dst)) = store.get_node(edge.dst) {
                             edges_out.push(serde_json::json!({
-                                "source": node.vname.signature,
-                                "target": dst.vname.signature,
+                                "source": node_json_id(&node),
+                                "target": node_json_id(&dst),
                                 "kind":   edge_kind_str(&edge.kind),
                             }));
                         }
@@ -983,15 +1121,14 @@ fn get_graph_json_raw(store: &SqliteStore, query: &str, direction: &str, depth: 
             }
         }
 
-        // Incoming edges (callers direction)
         if direction == "callers" || direction == "both" {
             if let Ok(edges) = store.iter_edges_to(current_id) {
                 for edge in &edges {
                     if edge_seen.insert((edge.src, edge.dst)) {
                         if let Ok(Some(src)) = store.get_node(edge.src) {
                             edges_out.push(serde_json::json!({
-                                "source": src.vname.signature,
-                                "target": node.vname.signature,
+                                "source": node_json_id(&src),
+                                "target": node_json_id(&node),
                                 "kind":   edge_kind_str(&edge.kind),
                             }));
                         }
@@ -1023,10 +1160,13 @@ pub fn get_graph_json_global(
     direction: &str,
     depth: u8,
     repo: Option<&str>,
+    kind_filter: &str,
 ) -> String {
-    if let Err(reason) = validate_mcp_arg(query) {
-        tracing::warn!("get_graph_json_global rejected invalid arg: {reason}");
-        return "{}".to_string();
+    if !(query.is_empty() && kind_filter == "file") {
+        if let Err(reason) = validate_mcp_arg(query) {
+            tracing::warn!("get_graph_json_global rejected invalid arg: {reason}");
+            return "{}".to_string();
+        }
     }
     let depth = depth.clamp(1, 4);
 
@@ -1059,7 +1199,7 @@ pub fn get_graph_json_global(
         }
         match SqliteStore::open(db_path) {
             Ok(store) => {
-                let raw = get_graph_json_raw(&store, query, direction, depth);
+                let raw = get_graph_json_raw(&store, query, direction, depth, kind_filter);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,

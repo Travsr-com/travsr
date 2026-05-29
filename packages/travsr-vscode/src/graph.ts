@@ -32,7 +32,7 @@ export interface GraphData {
 }
 
 type WebviewMessage =
-  | { command: "query"; query: string; direction: string; depth: number }
+  | { command: "query"; query: string; direction: string; depth: number; kind_filter?: string }
   | { command: "goToDefinition"; path: string }
   | { command: "showBlastRadius"; path: string };
 
@@ -84,13 +84,15 @@ export class GraphPanel {
   async query(
     query: string,
     direction = "both",
-    depth = 2
+    depth = 2,
+    kindFilter = ""
   ): Promise<void> {
-    this.panel.title = `Travsr: ${query}`;
+    this.panel.title = kindFilter === "file" ? "Travsr: File Graph" : `Travsr: ${query}`;
     const raw = await this.client.callTool("get_graph_json", {
       query,
       direction,
       depth: String(depth),
+      kind_filter: kindFilter,
     });
     let data: GraphData = { nodes: [], edges: [] };
     try {
@@ -104,10 +106,14 @@ export class GraphPanel {
   }
 
   private handleMessage(msg: WebviewMessage): void {
-    if (msg.command === "query" && msg.query) {
-      void this.query(msg.query, msg.direction, msg.depth);
+    if (msg.command === "query" && (msg.query || msg.kind_filter === "file")) {
+      void this.query(msg.query, msg.direction, msg.depth, msg.kind_filter ?? "");
     } else if (msg.command === "goToDefinition" && msg.path) {
-      void vscode.commands.executeCommand("vscode.open", vscode.Uri.file(msg.path));
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+      const uri = msg.path.startsWith("/")
+        ? vscode.Uri.file(msg.path)
+        : root ? vscode.Uri.joinPath(root, msg.path) : vscode.Uri.file(msg.path);
+      void vscode.commands.executeCommand("vscode.open", uri);
     } else if (msg.command === "showBlastRadius" && msg.path) {
       void vscode.commands.executeCommand("travsr.showBlastRadius", msg.path);
     }
@@ -362,6 +368,9 @@ export function buildLoadingHtml(): string {
   .legend-line.dotted { background: repeating-linear-gradient(90deg, var(--gold) 0, var(--gold) 2px, transparent 2px, transparent 5px); height: 1px; }
   .legend-row.var-row-legend { opacity: 0.4; }
   .legend-row.var-row-legend.visible { opacity: 1; }
+  .legend-row.non-file-legend { opacity: 1; transition: opacity 0.2s; }
+  .legend-row.non-file-legend.dimmed-file { opacity: 0.25; }
+  #statusMode { color: var(--green); font-weight: 600; }
   .graph-wrap { position: relative; flex: 1; overflow: hidden; display: flex; }
   .minimap {
     position: absolute; bottom: 10px; right: 12px;
@@ -416,7 +425,11 @@ export function buildLoadingHtml(): string {
   </div>
   <div class="sep"></div>
   <button class="btn" id="btn-vars" onclick="toggleVars()" title="Show / hide exported variable nodes">
-    ⬡ Vars <span id="varCount" style="color:#d7ba7d;margin-left:2px">0</span>
+    ⬡ Vars <span id="varCount" style="color:var(--gold);margin-left:2px">0</span>
+  </button>
+  <div class="sep"></div>
+  <button class="btn" id="btn-files" onclick="setFilesMode(!filesMode)" title="Show file dependency graph — imports only">
+    ▭ Files
   </button>
   <div class="toolbar-right">
     <button class="btn" onclick="cy.fit(null,30)">⊡ Fit</button>
@@ -433,14 +446,14 @@ export function buildLoadingHtml(): string {
     <div class="var-banner" id="varBanner"></div>
     <div class="legend">
       <div class="legend-title">Node types</div>
-      <div class="legend-row"><div class="legend-dot"     style="background:#569cd6"></div> function</div>
-      <div class="legend-row"><div class="legend-diamond" style="background:#4ec9b0"></div> class</div>
-      <div class="legend-row"><div class="legend-rect"    style="background:#808080"></div> file</div>
-      <div class="legend-row"><div class="legend-dot"     style="background:#c586c0"></div> interface</div>
+      <div class="legend-row non-file-legend"><div class="legend-dot"     style="background:#86df86"></div> function</div>
+      <div class="legend-row non-file-legend"><div class="legend-diamond" style="background:#fcd053"></div> class</div>
+      <div class="legend-row"><div class="legend-rect"    style="background:#b3b3b3"></div> file</div>
+      <div class="legend-row non-file-legend"><div class="legend-dot"     style="background:#e2d4ca"></div> interface</div>
       <div class="legend-row var-row-legend" id="legend-var"><div class="legend-tag"></div> variable</div>
       <div style="margin-top:8px" class="legend-title">Edges</div>
-      <div class="legend-row"><div class="legend-line" style="background:#4a9eff"></div> calls</div>
-      <div class="legend-row"><div class="legend-line" style="background:#ce9178"></div> defines</div>
+      <div class="legend-row non-file-legend"><div class="legend-line" style="background:#86df86"></div> calls</div>
+      <div class="legend-row non-file-legend"><div class="legend-line" style="background:#c8b7ab"></div> defines</div>
       <div class="legend-row"><div class="legend-line dashed"></div> imports</div>
       <div class="legend-row var-row-legend"><div class="legend-line dotted"></div> reads (var)</div>
     </div>
@@ -465,6 +478,7 @@ export function buildLoadingHtml(): string {
   <div class="status-right">
     <div class="status-item" id="statusGraph">— nodes · — edges</div>
     <div class="status-item" id="statusDepth">depth 2</div>
+    <div class="status-item" id="statusMode"></div>
     <div class="status-item" id="statusQuery">—</div>
   </div>
 </div>
@@ -483,6 +497,7 @@ cytoscape.use(cytoscapeDagre);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let varsVisible = false;
+let filesMode = false;
 let currentDirection = 'both';
 let currentLayout = 'dagre';
 
@@ -601,10 +616,10 @@ window.addEventListener('message', event => {
 // ── Search: send query to extension ──────────────────────────────────────────
 function submitQuery() {
   const query = document.getElementById('searchInput').value.trim();
-  if (!query) return;
+  if (!query && !filesMode) return;
   const depth = parseInt(document.getElementById('depthSlider').value, 10);
   document.getElementById('statusDepth').textContent = 'depth ' + depth;
-  vscode.postMessage({ command: 'query', query, direction: currentDirection, depth });
+  vscode.postMessage({ command: 'query', query, direction: currentDirection, depth, kind_filter: filesMode ? 'file' : '' });
 }
 
 document.getElementById('searchInput').addEventListener('keydown', e => {
@@ -615,8 +630,23 @@ let _debounceTimer = null;
 function debouncedQuery() {
   clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
-    if (document.getElementById('searchInput').value.trim()) submitQuery();
+    if (document.getElementById('searchInput').value.trim() || filesMode) submitQuery();
   }, 400);
+}
+
+function setFilesMode(active) {
+  filesMode = active;
+  document.getElementById('btn-files').classList.toggle('active', active);
+  document.getElementById('statusMode').textContent = active ? '· file graph' : '';
+  // Dim non-file legend rows when in file mode (same pattern as vars)
+  document.querySelectorAll('.non-file-legend').forEach(el => el.classList.toggle('dimmed-file', active));
+  if (active) {
+    flashBanner('File dependency graph · imports only');
+    document.getElementById('emptyHint').innerHTML = 'File graph active — showing module imports<br><span style="color:var(--fg-subtle);font-size:10px">Clear Files mode to search symbols</span>';
+  } else {
+    document.getElementById('emptyHint').innerHTML = 'Type a symbol name and press <kbd>Enter</kbd> to explore the graph';
+  }
+  if (active || document.getElementById('searchInput').value.trim()) submitQuery();
 }
 
 // ── Status bar (counts only visible nodes/edges) ──────────────────────────────

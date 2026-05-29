@@ -126,7 +126,8 @@ fn handle_tool_call(
             let query = args["query"].as_str().unwrap_or("");
             let direction = args["direction"].as_str().unwrap_or("both");
             let depth = args["depth"].as_u64().unwrap_or(2).min(4) as u8;
-            tools::get_graph_json(store, query, direction, depth)
+            let kind_filter = args["kind_filter"].as_str().unwrap_or("");
+            tools::get_graph_json(store, query, direction, depth, kind_filter)
         }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
@@ -248,9 +249,10 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars)" },
+                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
-                        "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" }
+                        "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
+                        "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." }
                     },
                     "required": ["query"],
                     "additionalProperties": false
@@ -386,7 +388,8 @@ fn handle_tool_call_global(
             let query = args["query"].as_str().unwrap_or("");
             let direction = args["direction"].as_str().unwrap_or("both");
             let depth = args["depth"].as_u64().unwrap_or(2).min(4) as u8;
-            tools::get_graph_json_global(repos, query, direction, depth, repo_arg)
+            let kind_filter = args["kind_filter"].as_str().unwrap_or("");
+            tools::get_graph_json_global(repos, query, direction, depth, repo_arg, kind_filter)
         }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
@@ -516,9 +519,10 @@ fn tools_list_global() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars)" },
+                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
+                        "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
                         "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
                     },
                     "required": ["query"],
