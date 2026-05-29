@@ -121,6 +121,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     Ok(t) => t,
                     Err(_) => continue,
                 };
+                let line = capture.node.start_position().row as u32 + 1;
                 // capture.node is the identifier; its parent is function_definition.
                 // Pass function_definition so find_parent_class looks at the outer context.
                 let parent_class = capture
@@ -129,10 +130,10 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     .and_then(|fd| find_parent_class(fd, source.as_slice()));
                 let (node, src_id) = if let Some(class_name) = parent_class {
                     let class_id = py_class_node(corpus, vname_path, &class_name).id;
-                    let n = py_method_node(corpus, vname_path, &class_name, text);
+                    let n = py_method_node(corpus, vname_path, &class_name, text).with_line(line);
                     (n, class_id)
                 } else {
-                    let n = py_fn_node(corpus, vname_path, text);
+                    let n = py_fn_node(corpus, vname_path, text).with_line(line);
                     (n, file_id)
                 };
                 output.edges.push(emit::defines_edge(src_id, node.id));
@@ -143,7 +144,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     Ok(t) => t,
                     Err(_) => continue,
                 };
-                let node = py_class_node(corpus, vname_path, text);
+                let line = capture.node.start_position().row as u32 + 1;
+                let node = py_class_node(corpus, vname_path, text).with_line(line);
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }

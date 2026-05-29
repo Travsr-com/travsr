@@ -363,6 +363,9 @@ pub struct Node {
     /// | Rust       | Cargo package name from `Cargo.toml`        |
     /// | Python     | top-level package dir (highest `__init__.py`)|
     pub package: String,
+    /// 1-based source line of the symbol's definition site.
+    /// `None` for file-kind nodes and synthetic import nodes.
+    pub line: Option<u32>,
 }
 
 impl Node {
@@ -370,6 +373,7 @@ impl Node {
     ///
     /// The `id` is derived deterministically from the VName. `package`
     /// defaults to an empty string; use [`Node::with_package`] to set it.
+    /// `line` defaults to `None`; use [`Node::with_line`] to set it.
     pub fn new(vname: VName, kind: impl Into<String>) -> Self {
         let id = vname.id();
         Self {
@@ -377,6 +381,7 @@ impl Node {
             vname,
             kind: kind.into(),
             package: String::new(),
+            line: None,
         }
     }
 
@@ -390,6 +395,12 @@ impl Node {
     /// ```
     pub fn with_package(mut self, package: impl Into<String>) -> Self {
         self.package = package.into();
+        self
+    }
+
+    /// Set the `line` field (1-based) and return `self` (builder pattern).
+    pub fn with_line(mut self, line: u32) -> Self {
+        self.line = Some(line);
         self
     }
 }

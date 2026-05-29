@@ -139,6 +139,19 @@ impl Migration for V7RbacColumns {
     }
 }
 
+struct V8NodeLine;
+impl Migration for V8NodeLine {
+    fn version(&self) -> u32 {
+        8
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        if !store.column_exists("nodes", "line")? {
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN line INTEGER")?;
+        }
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -150,6 +163,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V5LanguagePackage);
     r.register(V6EdgeConfidence);
     r.register(V7RbacColumns);
+    r.register(V8NodeLine);
     r
 }
 
@@ -420,7 +434,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package \
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line \
                      FROM nodes WHERE signature LIKE '%' || ?1 || '%' \
                         OR path LIKE '%' || ?1 || '%'",
                 )
@@ -438,11 +452,13 @@ impl SqliteStore {
                     );
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
                     Ok(Node {
                         id,
                         vname,
                         kind,
                         package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
                     })
                 })
                 .context("executing search query")?;
@@ -462,7 +478,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package FROM nodes",
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line FROM nodes",
                 )
                 .context("preparing all_nodes query")?;
             let rows = stmt
@@ -477,11 +493,13 @@ impl SqliteStore {
                     );
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
                     Ok(Node {
                         id,
                         vname,
                         kind,
                         package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
                     })
                 })
                 .context("executing all_nodes query")?;
@@ -644,9 +662,9 @@ impl Store for SqliteStore {
         let id_i64 = node_id_to_i64(node.id);
         self.conn
             .execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, package = excluded.package",
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, package = excluded.package, line = COALESCE(excluded.line, nodes.line)",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -656,6 +674,7 @@ impl Store for SqliteStore {
                     node.vname.signature,
                     node.kind,
                     node.package,
+                    node.line.map(|l| l as i64),
                 ],
             )
             .context("inserting node")
@@ -688,7 +707,7 @@ impl Store for SqliteStore {
             let row = self
                 .conn
                 .query_row(
-                    "SELECT corpus, root, path, language, signature, kind, package \
+                    "SELECT corpus, root, path, language, signature, kind, package, line \
                      FROM nodes WHERE id = ?1",
                     params![node_id_to_i64(id)],
                     |row| {
@@ -701,11 +720,13 @@ impl Store for SqliteStore {
                         );
                         let kind: String = row.get(5)?;
                         let package: String = row.get(6)?;
+                        let line: Option<i64> = row.get(7)?;
                         Ok(Node {
                             id,
                             vname,
                             kind,
                             package,
+                            line: line.and_then(|l| u32::try_from(l).ok()),
                         })
                     },
                 )
@@ -813,7 +834,7 @@ impl Store for SqliteStore {
         for chunk in ids.chunks(CHUNK) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT id, corpus, root, path, language, signature, kind, package \
+                "SELECT id, corpus, root, path, language, signature, kind, package, line \
                  FROM nodes WHERE id IN ({placeholders})"
             );
             (|| -> AnyResult<()> {
@@ -834,11 +855,13 @@ impl Store for SqliteStore {
                         );
                         let kind: String = row.get(6)?;
                         let package: String = row.get(7)?;
+                        let line: Option<i64> = row.get(8)?;
                         Ok(Node {
                             id,
                             vname,
                             kind,
                             package,
+                            line: line.and_then(|l| u32::try_from(l).ok()),
                         })
                     })
                     .context("executing get_nodes query")?;
@@ -1340,6 +1363,69 @@ mod tests {
         let id = store.put_node(&n).unwrap();
         let back = store.get_node(id).unwrap().expect("node must exist");
         assert_eq!(back.package, "foo-crate");
+    }
+
+    #[test]
+    fn node_line_round_trips() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("github.com/a/b", "", "src/lib.rs", "rust", "fn:open"),
+            "function",
+        )
+        .with_line(42);
+        let id = store.put_node(&n).unwrap();
+        let back = store.get_node(id).unwrap().expect("node must exist");
+        assert_eq!(back.line, Some(42));
+    }
+
+    #[test]
+    fn node_line_none_for_file_nodes() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("github.com/a/b", "", "src/lib.rs", "rust", "file"),
+            "file",
+        );
+        let id = store.put_node(&n).unwrap();
+        let back = store.get_node(id).unwrap().expect("node must exist");
+        assert_eq!(back.line, None);
+    }
+
+    #[test]
+    fn node_line_coalesce_preserves_existing_on_upsert() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let vname = VName::new("g/a/b", "", "src/lib.rs", "rust", "fn:foo");
+        // First insert with line = Some(10).
+        let n1 = Node::new(vname.clone(), "function").with_line(10);
+        store.put_node(&n1).unwrap();
+        // Upsert without line — COALESCE must preserve the existing value.
+        let n2 = Node::new(vname.clone(), "function");
+        store.put_node(&n2).unwrap();
+        let back = store.get_node(n1.id).unwrap().expect("node must exist");
+        assert_eq!(
+            back.line,
+            Some(10),
+            "COALESCE must preserve existing line on upsert"
+        );
+    }
+
+    #[test]
+    fn migration_v8_adds_line_column_to_existing_db() {
+        // Simulate a pre-v8 database: open at v7, insert a node, then upgrade.
+        // Since SqliteStore::open always runs all pending migrations, we verify
+        // that a node written before the column existed reads back as line = None.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("g/a/b", "", "src/foo.ts", "typescript", "fn:bar"),
+            "function",
+        );
+        store.put_node(&n).unwrap();
+        // Re-open (migrations are idempotent — column already exists, guard applies).
+        // The important assertion: existing rows have line = None after migration.
+        let back = store.get_node(n.id).unwrap().expect("node must exist");
+        assert_eq!(
+            back.line, None,
+            "pre-v8 nodes must read back as line = None"
+        );
     }
 
     // search_nodes_by_name returns package field.

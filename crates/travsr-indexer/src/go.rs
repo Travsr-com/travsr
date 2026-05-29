@@ -170,7 +170,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
-                let node = go_fn_node(corpus, vname_path, &name);
+                let line = anchor.node.start_position().row as u32 + 1;
+                let node = go_fn_node(corpus, vname_path, &name).with_line(line);
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -184,7 +185,18 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 };
                 let recv = strip_generics(&recv).to_owned();
                 let class_id = go_class_node(corpus, vname_path, &recv).id;
-                let node = go_method_node(corpus, vname_path, &recv, &method_name);
+                // Use method.name capture for the line, not recv.type (anchor) —
+                // recv.type points to the receiver identifier, not the method name.
+                let line = m
+                    .captures
+                    .iter()
+                    .find(|c| {
+                        capture_names.get(c.index as usize).map(|s| s.as_str())
+                            == Some("method.name")
+                    })
+                    .map(|c| c.node.start_position().row as u32 + 1)
+                    .unwrap_or_else(|| anchor.node.start_position().row as u32 + 1);
+                let node = go_method_node(corpus, vname_path, &recv, &method_name).with_line(line);
                 output.edges.push(emit::defines_edge(class_id, node.id));
                 output.nodes.push(node);
             }
@@ -193,7 +205,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
-                let node = go_class_node(corpus, vname_path, &name);
+                let line = anchor.node.start_position().row as u32 + 1;
+                let node = go_class_node(corpus, vname_path, &name).with_line(line);
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -202,7 +215,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
-                let node = go_iface_node(corpus, vname_path, &name);
+                let line = anchor.node.start_position().row as u32 + 1;
+                let node = go_iface_node(corpus, vname_path, &name).with_line(line);
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -211,7 +225,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
-                let node = go_type_node(corpus, vname_path, &name);
+                let line = anchor.node.start_position().row as u32 + 1;
+                let node = go_type_node(corpus, vname_path, &name).with_line(line);
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -219,7 +234,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 let Some(name) = find_cap_text(&m, "var.name") else {
                     continue;
                 };
-                let node = go_var_node(corpus, vname_path, &name);
+                let line = anchor.node.start_position().row as u32 + 1;
+                let node = go_var_node(corpus, vname_path, &name).with_line(line);
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }

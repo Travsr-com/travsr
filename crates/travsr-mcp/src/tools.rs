@@ -1021,6 +1021,7 @@ fn get_graph_json_raw(
             "path":    node.vname.path,
             "package": node.package,
             "score":   score,
+            "line":    node.line,
         });
         if hop == 0 {
             node_obj["root"] = serde_json::Value::Bool(true);
@@ -1382,6 +1383,35 @@ mod tests {
     }
 
     /// File-kind nodes must not appear as symbols in the map.
+    #[test]
+    fn get_graph_json_includes_line_for_symbol_nodes() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let sym = Node::new(
+            VName::new("test", "", "src/foo.ts", "typescript", "fn:bar"),
+            "function",
+        )
+        .with_line(42);
+        let file = Node::new(
+            VName::new("test", "", "src/foo.ts", "typescript", "file"),
+            "file",
+        );
+        store.put_node(&sym).unwrap();
+        store.put_node(&file).unwrap();
+
+        let json = get_graph_json(&store, "fn:bar", "both", 1, "");
+        assert!(
+            json.contains("\"line\":42"),
+            "symbol node must carry line in JSON: {json}"
+        );
+
+        let file_json = get_graph_json(&store, "src/foo.ts", "both", 1, "file");
+        assert!(
+            file_json.contains("\"line\":null"),
+            "file node must have null line in JSON: {file_json}"
+        );
+    }
+
     #[test]
     fn get_repo_map_excludes_file_kind_nodes() {
         use travsr_core::VName;
