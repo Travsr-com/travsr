@@ -1021,6 +1021,7 @@ fn get_graph_json_raw(
             "path":    node.vname.path,
             "package": node.package,
             "score":   score,
+            "line":    node.line,
         });
         if hop == 0 {
             node_obj["root"] = serde_json::Value::Bool(true);

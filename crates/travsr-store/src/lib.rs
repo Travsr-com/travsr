@@ -115,6 +115,19 @@ impl Migration for V6EdgeConfidence {
     }
 }
 
+struct V8NodeLine;
+impl Migration for V8NodeLine {
+    fn version(&self) -> u32 {
+        8
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        if !store.column_exists("nodes", "line")? {
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN line INTEGER")?;
+        }
+        Ok(())
+    }
+}
+
 struct V7RbacColumns;
 impl Migration for V7RbacColumns {
     fn version(&self) -> u32 {
@@ -150,6 +163,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V5LanguagePackage);
     r.register(V6EdgeConfidence);
     r.register(V7RbacColumns);
+    r.register(V8NodeLine);
     r
 }
 
@@ -420,7 +434,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package \
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line \
                      FROM nodes WHERE signature LIKE '%' || ?1 || '%' \
                         OR path LIKE '%' || ?1 || '%'",
                 )
@@ -438,11 +452,13 @@ impl SqliteStore {
                     );
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
                     Ok(Node {
                         id,
                         vname,
                         kind,
                         package,
+                        line: line.map(|l| l as u32),
                     })
                 })
                 .context("executing search query")?;
@@ -462,7 +478,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package FROM nodes",
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line FROM nodes",
                 )
                 .context("preparing all_nodes query")?;
             let rows = stmt
@@ -477,11 +493,13 @@ impl SqliteStore {
                     );
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
                     Ok(Node {
                         id,
                         vname,
                         kind,
                         package,
+                        line: line.map(|l| l as u32),
                     })
                 })
                 .context("executing all_nodes query")?;
@@ -644,9 +662,9 @@ impl Store for SqliteStore {
         let id_i64 = node_id_to_i64(node.id);
         self.conn
             .execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, package = excluded.package",
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, package = excluded.package, line = excluded.line",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -656,6 +674,7 @@ impl Store for SqliteStore {
                     node.vname.signature,
                     node.kind,
                     node.package,
+                    node.line.map(|l| l as i64),
                 ],
             )
             .context("inserting node")
@@ -688,7 +707,7 @@ impl Store for SqliteStore {
             let row = self
                 .conn
                 .query_row(
-                    "SELECT corpus, root, path, language, signature, kind, package \
+                    "SELECT corpus, root, path, language, signature, kind, package, line \
                      FROM nodes WHERE id = ?1",
                     params![node_id_to_i64(id)],
                     |row| {
@@ -701,11 +720,13 @@ impl Store for SqliteStore {
                         );
                         let kind: String = row.get(5)?;
                         let package: String = row.get(6)?;
+                        let line: Option<i64> = row.get(7)?;
                         Ok(Node {
                             id,
                             vname,
                             kind,
                             package,
+                            line: line.map(|l| l as u32),
                         })
                     },
                 )
@@ -813,7 +834,7 @@ impl Store for SqliteStore {
         for chunk in ids.chunks(CHUNK) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT id, corpus, root, path, language, signature, kind, package \
+                "SELECT id, corpus, root, path, language, signature, kind, package, line \
                  FROM nodes WHERE id IN ({placeholders})"
             );
             (|| -> AnyResult<()> {
@@ -834,11 +855,13 @@ impl Store for SqliteStore {
                         );
                         let kind: String = row.get(6)?;
                         let package: String = row.get(7)?;
+                        let line: Option<i64> = row.get(8)?;
                         Ok(Node {
                             id,
                             vname,
                             kind,
                             package,
+                            line: line.map(|l| l as u32),
                         })
                     })
                     .context("executing get_nodes query")?;

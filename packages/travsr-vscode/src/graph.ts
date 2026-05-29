@@ -18,6 +18,7 @@ export interface GraphNode {
   package: string;
   score: number;
   root?: boolean;
+  line?: number;
 }
 
 export interface GraphEdge {
@@ -33,7 +34,7 @@ export interface GraphData {
 
 type WebviewMessage =
   | { command: "query"; query: string; direction: string; depth: number; kind_filter?: string }
-  | { command: "goToDefinition"; path: string }
+  | { command: "goToDefinition"; path: string; line?: number }
   | { command: "showBlastRadius"; path: string };
 
 export class GraphPanel {
@@ -118,7 +119,17 @@ export class GraphPanel {
       const uri = msg.path.startsWith("/")
         ? vscode.Uri.file(msg.path)
         : root ? vscode.Uri.joinPath(root, msg.path) : vscode.Uri.file(msg.path);
-      void vscode.commands.executeCommand("vscode.open", uri);
+      if (msg.line) {
+        void (async () => {
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const lineIdx = msg.line! - 1;
+          await vscode.window.showTextDocument(doc, {
+            selection: new vscode.Range(lineIdx, 0, lineIdx, 0),
+          });
+        })();
+      } else {
+        void vscode.commands.executeCommand("vscode.open", uri);
+      }
     } else if (msg.command === "showBlastRadius" && msg.path) {
       void vscode.commands.executeCommand("travsr.showBlastRadius", msg.path);
     }
@@ -589,7 +600,7 @@ window.addEventListener('message', event => {
 
   const data = msg.data || { nodes: [], edges: [] };
   const nodes = (data.nodes || []).map(n => ({
-    data: { id: n.id, label: n.label, kind: n.kind, path: n.path, pkg: n.package, score: n.score, root: n.root || false }
+    data: { id: n.id, label: n.label, kind: n.kind, path: n.path, pkg: n.package, score: n.score, root: n.root || false, line: n.line }
   }));
   const edges = (data.edges || []).map(e => ({
     data: { id: e.source + '->' + e.target, source: e.source, target: e.target, kind: e.kind }
@@ -852,7 +863,7 @@ function updateDetailPanel(d, ele) {
     <div class="detail-section">
       <div class="detail-section-title" onclick="toggleSection(this)">Actions <span class="collapse-icon">▾</span></div>
       <div class="collapsible-body" style="max-height:200px">
-        \${d.path ? '<button class="btn-action" onclick="vscode.postMessage({command:\\'goToDefinition\\',path:\\'' + d.path + '\\'})"><span>↗</span> Go to definition</button>' : ''}
+        \${d.path ? '<button class="btn-action" onclick="vscode.postMessage({command:\\'goToDefinition\\',path:\\'' + d.path + '\\'' + (d.line ? ',line:' + d.line : '') + '})"><span>↗</span> Go to definition</button>' : ''}
         \${d.kind !== 'var' ? '<button class="btn-action hot" onclick="vscode.postMessage({command:\\'showBlastRadius\\',path:\\'' + (d.path||'') + '\\'})"><span>⊗</span> Show blast radius</button>' : ''}
         <button class="btn-action secondary" onclick="navigator.clipboard.writeText(\\'' + d.id + '\\').then(()=>flashBanner('VName copied'))"><span>⧉</span> Copy VName</button>
       </div>

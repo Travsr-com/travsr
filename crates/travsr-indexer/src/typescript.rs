@@ -110,15 +110,16 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             Err(_) => continue,
         };
 
+        let line = capture.node.start_position().row as u32 + 1;
         match cap_name.as_str() {
             "class.name" => {
-                let node = emit::class_node(corpus, vname_path, text);
+                let node = emit::class_node(corpus, vname_path, text).with_line(line);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "fn.name" => {
-                let node = emit::fn_node(corpus, vname_path, text);
+                let node = emit::fn_node(corpus, vname_path, text).with_line(line);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
@@ -128,18 +129,19 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 let class_name = find_parent_class_name(capture.node, source.as_slice())
                     .unwrap_or_else(|| "<anonymous>".to_string());
                 let class_id = emit::class_node(corpus, vname_path, &class_name).id;
-                let node = emit::method_node(corpus, vname_path, &class_name, text);
+                let node = emit::method_node(corpus, vname_path, &class_name, text).with_line(line);
                 let edge = emit::defines_edge(class_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "var.name" => {
-                let node = emit::var_node(corpus, vname_path, text);
+                let node = emit::var_node(corpus, vname_path, text).with_line(line);
                 let edge = emit::defines_edge(file_id, node.id);
                 output.nodes.push(node);
                 output.edges.push(edge);
             }
             "import.source" => {
+                // Import nodes are synthetic — no definition line.
                 let node = emit::import_node(corpus, vname_path, text);
                 let edge = emit::depends_edge(file_id, node.id);
                 output.nodes.push(node);
