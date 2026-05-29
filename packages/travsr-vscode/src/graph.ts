@@ -195,7 +195,7 @@ export function buildLoadingHtml(): string {
     border-radius: 4px; color: var(--fg); font-size: 11px;
     padding: 4px 8px 4px 24px; outline: none; transition: border-color 120ms;
   }
-  .search-input:focus { border-color: var(--green); }
+  .search-input:focus { border-color: var(--green); box-shadow: 0 0 0 2px #86df8644; }
   .search-input::placeholder { color: var(--fg-subtle); }
   .sep { width: 1px; height: 18px; background: var(--border); flex-shrink: 0; }
   .btn-group { display: flex; gap: 1px; }
@@ -466,7 +466,7 @@ export function buildLoadingHtml(): string {
   <div class="detail">
     <div class="detail-header"><span>⬡</span> Node Detail</div>
     <div class="detail-body" id="detailBody">
-      <div style="color:#555;font-size:11px;margin-top:20px;text-align:center">
+      <div style="color:var(--fg-subtle);font-size:11px;margin-top:20px;text-align:center">
         Click a node to see details
       </div>
     </div>
@@ -765,7 +765,7 @@ function updateDetailPanel(d, ele) {
 
   const varsInFileSection = sameFileVars.length > 0 ? \`
     <div class="detail-section">
-      <div class="detail-section-title" onclick="toggleSection(this)" style="color:#d7ba7daa">
+      <div class="detail-section-title" onclick="toggleSection(this)" style="color:#fcd053aa">
         Variables in file (\${sameFileVars.length}) <span class="collapse-icon">▾</span>
       </div>
       <div class="collapsible-body" style="max-height:300px">
@@ -775,34 +775,34 @@ function updateDetailPanel(d, ele) {
             '<span class="var-name">' + n.data('label') + '</span>' +
             '<span class="var-refs">' + (n.data('refs')||0) + ' refs</span></li>').join('')}
         </ul>
-        <div style="font-size:10px;color:#555;margin-top:6px;font-style:italic">Click to focus in graph</div>
+        <div style="font-size:10px;color:var(--fg-subtle);margin-top:6px;font-style:italic">Click to focus in graph</div>
       </div>
     </div>\` : '';
 
   const readsSection = d.kind === 'var' ? \`
     <div class="detail-section">
-      <div class="detail-section-title" onclick="toggleSection(this)" style="color:#d7ba7daa">
+      <div class="detail-section-title" onclick="toggleSection(this)" style="color:#fcd053aa">
         Read by (\${readsIn.length || d.refs || 0}) <span class="collapse-icon">▾</span>
       </div>
       <div class="collapsible-body" style="max-height:200px">
         <ul class="edge-list">
           \${readsIn.length
-            ? readsIn.map(e => '<li><span class="edge-arrow" style="color:#d7ba7d">←</span> ' + e.data('source') + ' <span class="edge-type reads">reads</span></li>').join('')
-            : '<li style="color:#555;font-style:italic">expand graph depth to see readers</li>'}
+            ? readsIn.map(e => '<li><span class="edge-arrow" style="color:#fcd053">←</span> ' + e.data('source') + ' <span class="edge-type reads">reads</span></li>').join('')
+            : '<li style="color:var(--fg-subtle);font-style:italic">expand graph depth to see readers</li>'}
         </ul>
       </div>
     </div>\` : '';
 
   const readsOutSection = readsOut.length > 0 ? \`
     <div class="detail-section">
-      <div class="detail-section-title" onclick="toggleSection(this)" style="color:#d7ba7daa">
+      <div class="detail-section-title" onclick="toggleSection(this)" style="color:#fcd053aa">
         Reads variables (\${readsOut.length}) <span class="collapse-icon">▾</span>
       </div>
       <div class="collapsible-body" style="max-height:200px">
         <ul class="edge-list">
-          \${readsOut.map(e => '<li><span class="edge-arrow" style="color:#d7ba7d">→</span> ' + e.data('target') + ' <span class="edge-type reads">reads</span></li>').join('')}
+          \${readsOut.map(e => '<li><span class="edge-arrow" style="color:#fcd053">→</span> ' + e.data('target') + ' <span class="edge-type reads">reads</span></li>').join('')}
         </ul>
-        \${!varsVisible ? '<div style="font-size:10px;color:#555;margin-top:4px;font-style:italic">Enable Vars toggle to see these nodes</div>' : ''}
+        \${!varsVisible ? '<div style="font-size:10px;color:var(--fg-subtle);margin-top:4px;font-style:italic">Enable Vars toggle to see these nodes</div>' : ''}
       </div>
     </div>\` : '';
 
@@ -817,7 +817,7 @@ function updateDetailPanel(d, ele) {
       <div>
         <div class="node-sig">\${d.label}</div>
         <span class="node-kind-tag" style="background:\${color}1a;color:\${color}">\${d.varKind || d.kind}</span>
-        \${d.kind==='var' ? '<div style="font-size:10px;color:#858585;margin-top:2px">read in <span style="color:#d7ba7d;font-weight:600">' + (d.refs||0) + '</span> places</div>' : ''}
+        \${d.kind==='var' ? '<div style="font-size:10px;color:var(--fg-subtle);margin-top:2px">read in <span style="color:#fcd053;font-weight:600">' + (d.refs||0) + '</span> places</div>' : ''}
       </div>
     </div>
     <div class="detail-section">
@@ -836,7 +836,7 @@ function updateDetailPanel(d, ele) {
         <div class="detail-row"><span class="detail-key">token cost</span><span class="detail-val">\${tokenCost}</span></div>
       </div>
     </div>
-    \${edgeCount > 0 ? '<div class="detail-section"><div class="detail-section-title" onclick="toggleSection(this)">Edges (' + edgeCount + ') <span class="collapse-icon">▾</span></div><div class="collapsible-body" style="max-height:200px"><ul class="edge-list">' + (edgeItems||'<li style="color:#555">No structural edges</li>') + '</ul></div></div>' : ''}
+    \${edgeCount > 0 ? '<div class="detail-section"><div class="detail-section-title" onclick="toggleSection(this)">Edges (' + edgeCount + ') <span class="collapse-icon">▾</span></div><div class="collapsible-body" style="max-height:200px"><ul class="edge-list">' + (edgeItems||'<li style="color:var(--fg-subtle)">No structural edges</li>') + '</ul></div></div>' : ''}
     \${readsSection}
     \${readsOutSection}
     \${varsInFileSection}
@@ -844,7 +844,7 @@ function updateDetailPanel(d, ele) {
       <div class="detail-section-title" onclick="toggleSection(this)">Actions <span class="collapse-icon">▾</span></div>
       <div class="collapsible-body" style="max-height:200px">
         \${d.path ? '<button class="btn-action" onclick="vscode.postMessage({command:\\'goToDefinition\\',path:\\'' + d.path + '\\'})"><span>↗</span> Go to definition</button>' : ''}
-        \${d.kind !== 'var' ? '<button class="btn-action hot" onclick="vscode.postMessage({command:\\'showBlastRadius\\',path:\\'' + (d.path||'') + '\\'})"><span>💥</span> Show blast radius</button>' : ''}
+        \${d.kind !== 'var' ? '<button class="btn-action hot" onclick="vscode.postMessage({command:\\'showBlastRadius\\',path:\\'' + (d.path||'') + '\\'})"><span>⊗</span> Show blast radius</button>' : ''}
         <button class="btn-action secondary" onclick="navigator.clipboard.writeText(\\'' + d.id + '\\').then(()=>flashBanner('VName copied'))"><span>⧉</span> Copy VName</button>
       </div>
     </div>
@@ -880,7 +880,7 @@ function resetLayout() {
     ? { name:'dagre', rankDir:'TB', nodeSep:55, rankSep:75, padding:30 }
     : currentLayout === 'circle'
     ? { name:'circle', padding:40 }
-    : { name:'cose', animate:true, randomize:false, padding:40, nodeRepulsion:8000 };
+    : { name:'cose', animate:!window.matchMedia('(prefers-reduced-motion: reduce)').matches, randomize:false, padding:40, nodeRepulsion:8000 };
   cy.layout(opts).run();
 }
 
@@ -891,7 +891,7 @@ function drawMinimap() {
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0,0,W,H);
-  ctx.fillStyle = '#1e1e1e';
+  ctx.fillStyle = '#1a1a1a';
   ctx.fillRect(0,0,W,H);
   const visible = cy.elements().filter(e => e.style('display') !== 'none');
   const bb = visible.boundingBox();
@@ -903,7 +903,7 @@ function drawMinimap() {
     ctx.beginPath();
     ctx.moveTo(ox+(s.x-bb.x1)*scale, oy+(s.y-bb.y1)*scale);
     ctx.lineTo(ox+(t.x-bb.x1)*scale, oy+(t.y-bb.y1)*scale);
-    ctx.strokeStyle = e.data('kind') === 'reads' ? '#d7ba7d44' : '#444';
+    ctx.strokeStyle = e.data('kind') === 'reads' ? '#fcd05344' : '#4d4d4d';
     ctx.lineWidth = 0.7; ctx.stroke();
   });
   visible.nodes().forEach(n => {

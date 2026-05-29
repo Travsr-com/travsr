@@ -889,6 +889,11 @@ pub fn get_graph_json(
     depth: u8,
     kind_filter: &str,
 ) -> String {
+    // Only "" (all kinds) and "file" are valid kind_filter values.
+    if !matches!(kind_filter, "" | "file") {
+        tracing::warn!("get_graph_json rejected unknown kind_filter: {kind_filter}");
+        return "{}".to_string();
+    }
     // Empty query is valid when kind_filter=="file" (returns full import graph).
     if !(query.is_empty() && kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
@@ -906,18 +911,27 @@ fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
         EdgeKind::DefinesBinding => "defines",
         EdgeKind::RefCall => "calls",
         EdgeKind::Depends => "imports",
-        _ => "reads",
+        EdgeKind::ResolvesTo => "resolves-to",
+        EdgeKind::Exports => "exports",
+        EdgeKind::RefImports => "ref/imports",
+        EdgeKind::IsImplementation => "is-implementation",
+        EdgeKind::Overrides => "overrides",
+        EdgeKind::FFICall => "ffi/call",
     }
 }
 
-/// Unique JSON id/label for a node.
-/// File nodes have `signature == "file"` (shared across all files), so we use
-/// `path` instead to keep Cytoscape ids distinct.
-fn node_json_id(node: &CoreNode) -> &str {
+/// Unique JSON id for a node.
+/// File nodes all share `signature == "file"`, so we use `path` (prefixed with
+/// corpus when non-empty) to keep Cytoscape ids distinct across repos.
+fn node_json_id(node: &CoreNode) -> String {
     if node.kind == "file" {
-        &node.vname.path
+        if node.vname.corpus.is_empty() {
+            node.vname.path.clone()
+        } else {
+            format!("{}:{}", node.vname.corpus, node.vname.path)
+        }
     } else {
-        &node.vname.signature
+        node.vname.signature.clone()
     }
 }
 
@@ -944,6 +958,7 @@ fn get_graph_json_raw(
     use std::collections::{HashSet, VecDeque};
 
     // File mode with empty query: search broadly by path separator to seed all file nodes.
+    // DEBT(travsr): replace "." sentinel with an explicit all-files store query
     let search_term = if kind_filter == "file" && query.is_empty() {
         "."
     } else {
@@ -961,13 +976,7 @@ fn get_graph_json_raw(
     let seed_nodes: Vec<_> = if !kind_filter.is_empty() {
         seed_nodes_raw
             .into_iter()
-            .filter(|n| {
-                serde_json::to_value(&n.kind)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .as_deref()
-                    == Some(kind_filter)
-            })
+            .filter(|n| n.kind == kind_filter)
             .collect()
     } else {
         seed_nodes_raw
@@ -982,7 +991,7 @@ fn get_graph_json_raw(
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
     let mut nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut edges_out: Vec<serde_json::Value> = Vec::new();
-    let mut edge_seen: HashSet<(NodeId, NodeId)> = HashSet::new();
+    let mut edge_seen: HashSet<(NodeId, NodeId, &'static str)> = HashSet::new();
 
     for node in &seed_nodes {
         if visited.insert(node.id) {
@@ -991,13 +1000,6 @@ fn get_graph_json_raw(
     }
 
     while let Some((current_id, hop)) = queue.pop_front() {
-        if nodes_out.len() >= MAX_GRAPH_JSON_NODES {
-            tracing::warn!(
-                "get_graph_json hit node cap ({MAX_GRAPH_JSON_NODES}) for query '{query}'"
-            );
-            break;
-        }
-
         let node = match store.get_node(current_id) {
             Ok(Some(n)) => n,
             _ => continue,
@@ -1025,6 +1027,13 @@ fn get_graph_json_raw(
         }
         nodes_out.push(node_obj);
 
+        if nodes_out.len() >= MAX_GRAPH_JSON_NODES {
+            tracing::warn!(
+                "get_graph_json hit node cap ({MAX_GRAPH_JSON_NODES}) for query '{query}'"
+            );
+            continue;
+        }
+
         if hop >= depth {
             continue;
         }
@@ -1049,7 +1058,7 @@ fn get_graph_json_raw(
                                     if target.kind != "file" {
                                         continue;
                                     }
-                                    if edge_seen.insert((current_id, target.id)) {
+                                    if edge_seen.insert((current_id, target.id, "imports")) {
                                         edges_out.push(serde_json::json!({
                                             "source": node_json_id(&node),
                                             "target": node_json_id(&target),
@@ -1082,7 +1091,7 @@ fn get_graph_json_raw(
                                     if source.kind != "file" {
                                         continue;
                                     }
-                                    if edge_seen.insert((source.id, current_id)) {
+                                    if edge_seen.insert((source.id, current_id, "imports")) {
                                         edges_out.push(serde_json::json!({
                                             "source": node_json_id(&source),
                                             "target": node_json_id(&node),
@@ -1105,12 +1114,13 @@ fn get_graph_json_raw(
         if direction == "deps" || direction == "both" {
             if let Ok(edges) = store.iter_edges_from(current_id) {
                 for edge in &edges {
-                    if edge_seen.insert((edge.src, edge.dst)) {
+                    let kind_s = edge_kind_str(&edge.kind);
+                    if edge_seen.insert((edge.src, edge.dst, kind_s)) {
                         if let Ok(Some(dst)) = store.get_node(edge.dst) {
                             edges_out.push(serde_json::json!({
                                 "source": node_json_id(&node),
                                 "target": node_json_id(&dst),
-                                "kind":   edge_kind_str(&edge.kind),
+                                "kind":   kind_s,
                             }));
                         }
                     }
@@ -1124,12 +1134,13 @@ fn get_graph_json_raw(
         if direction == "callers" || direction == "both" {
             if let Ok(edges) = store.iter_edges_to(current_id) {
                 for edge in &edges {
-                    if edge_seen.insert((edge.src, edge.dst)) {
+                    let kind_s = edge_kind_str(&edge.kind);
+                    if edge_seen.insert((edge.src, edge.dst, kind_s)) {
                         if let Ok(Some(src)) = store.get_node(edge.src) {
                             edges_out.push(serde_json::json!({
                                 "source": node_json_id(&src),
                                 "target": node_json_id(&node),
-                                "kind":   edge_kind_str(&edge.kind),
+                                "kind":   kind_s,
                             }));
                         }
                     }
