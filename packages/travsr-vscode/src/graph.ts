@@ -45,8 +45,9 @@ export class GraphPanel {
 
   private constructor(
     private readonly client: McpClient,
-    _context: vscode.ExtensionContext
+    context: vscode.ExtensionContext
   ) {
+    const extUri = context.extensionUri;
     this.panel = vscode.window.createWebviewPanel(
       GraphPanel.viewType,
       "Travsr: Graph",
@@ -54,11 +55,15 @@ export class GraphPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [],
+        localResourceRoots: [extUri],
       }
     );
 
-    this.panel.webview.html = buildLoadingHtml();
+    const logoUri = this.panel.webview
+      .asWebviewUri(vscode.Uri.joinPath(extUri, "icon.png"))
+      .toString();
+    const cspSource = this.panel.webview.cspSource;
+    this.panel.webview.html = buildLoadingHtml(logoUri, cspSource);
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 
@@ -131,13 +136,14 @@ export class GraphPanel {
 
 // ── Webview HTML ──────────────────────────────────────────────────────────────
 
-export function buildLoadingHtml(): string {
+export function buildLoadingHtml(logoUri?: string, cspSource?: string): string {
+  const imgSrc = cspSource ? `img-src ${cspSource};` : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://cdnjs.cloudflare.com https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://cdnjs.cloudflare.com https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; ${imgSrc}">
 <title>Travsr Graph</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.29.2/cytoscape.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
@@ -175,6 +181,7 @@ export function buildLoadingHtml(): string {
     flex-shrink: 0; user-select: none;
   }
   .titlebar-icon { font-size: 13px; color: var(--green); }
+  .titlebar-logo { width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0; }
   .titlebar-title { font-size: 12px; color: var(--fg); font-weight: 500; letter-spacing: 0.1px; }
   .titlebar-badge {
     background: #cf6a0a; color: #fbfaf9; font-size: 9px;
@@ -392,7 +399,9 @@ export function buildLoadingHtml(): string {
 <body>
 
 <div class="titlebar">
-  <span class="titlebar-icon">⬡</span>
+  ${logoUri
+    ? `<img src="${logoUri}" class="titlebar-logo" alt="Travsr">`
+    : `<span class="titlebar-icon">⬡</span>`}
   <span class="titlebar-title">Travsr: Code Graph</span>
   <span class="titlebar-badge">MCP</span>
 </div>
