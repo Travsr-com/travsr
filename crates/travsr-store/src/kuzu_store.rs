@@ -406,6 +406,12 @@ impl Store for KuzuStore {
         })()
         .map_err(|e| StoreError::Database(format!("{:#}", e)))
     }
+
+    fn get_nodes(&self, _ids: &[NodeId]) -> Result<Vec<Node>, StoreError> {
+        Err(StoreError::Database(
+            "get_nodes not yet implemented for KuzuStore".into(),
+        ))
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

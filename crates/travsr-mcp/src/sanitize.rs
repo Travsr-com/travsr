@@ -67,6 +67,12 @@ fn strip_control_chars(s: &str) -> String {
             if (0x80..=0x9F).contains(&cp) {
                 return false;
             }
+            // Strip Unicode bidi-override characters (T8 prompt-injection vector).
+            // LRE, RLE, PDF, LRO, RLO (\u{202A}–\u{202E}) and
+            // LRI, RLI, FSI, PDI (\u{2066}–\u{2069}).
+            if (0x202A..=0x202E).contains(&cp) || (0x2066..=0x2069).contains(&cp) {
+                return false;
+            }
             true
         })
         .collect()
@@ -92,11 +98,22 @@ fn escape_tags(s: &str) -> String {
     s.replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Sanitize body content with a caller-supplied byte limit, without wrapping in an envelope.
+///
+/// Use this when the caller needs to append a footer before wrapping, to avoid
+/// the footer being truncated or double-sanitized. Call [`wrap_envelope`] after
+/// appending the footer.
+pub(crate) fn sanitize_mcp_body_with_limit(raw: &str, limit: usize) -> String {
+    let truncated = truncate_to_byte_limit(raw, limit);
+    let stripped = strip_control_chars(truncated);
+    escape_tags(&stripped)
+}
+
 /// Wrap content in the structural `<travsr-data>` envelope.
 ///
 /// The LLM must treat everything inside this tag as data, not instructions.
 /// The MCP tool description documents this contract explicitly.
-fn wrap_envelope(content: &str) -> String {
+pub(crate) fn wrap_envelope(content: &str) -> String {
     if content.is_empty() {
         "<travsr-data></travsr-data>".to_string()
     } else {

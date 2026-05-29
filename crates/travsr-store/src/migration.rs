@@ -224,6 +224,9 @@ mod tests {
         fn iter_edges_to(&self, _: NodeId) -> Result<Vec<Edge>, StoreError> {
             Ok(Vec::new())
         }
+        fn get_nodes(&self, _: &[NodeId]) -> Result<Vec<Node>, StoreError> {
+            Ok(Vec::new())
+        }
     }
 
     impl StoreMigratable for FakeStore {
@@ -351,6 +354,9 @@ mod tests {
             }
             fn iter_edges_to(&self, id: NodeId) -> Result<Vec<Edge>, StoreError> {
                 self.inner.iter_edges_to(id)
+            }
+            fn get_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>, StoreError> {
+                self.inner.get_nodes(ids)
             }
         }
         impl StoreMigratable for VersionCapture {

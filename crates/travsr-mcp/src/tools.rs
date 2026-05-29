@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use travsr_retrieval::{EdgeFilter, OpenFilter};
+use travsr_core::{Node as CoreNode, NodeId};
+use travsr_retrieval::{
+    context_candidates, knapsack, token_cost, EdgeFilter, OpenFilter, MAX_CONTEXT_BUDGET,
+    TOKEN_CHARS_PER_TOKEN,
+};
 use travsr_store::{SqliteStore, Store};
 
-use crate::sanitize::{sanitize_for_mcp, validate_mcp_arg};
+use crate::sanitize::{
+    sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, wrap_envelope,
+};
 
 /// Return the import targets (Depends edges) of the given file path.
 /// Empty string when nothing is found — callers must NOT return an RPC error
@@ -690,6 +696,179 @@ pub fn get_repo_map_global(repos: &HashMap<String, PathBuf>, repo: Option<&str>)
         }
     });
     sanitize_for_mcp(&raw)
+}
+
+// ── get_context ───────────────────────────────────────────────────────────────
+
+/// Retrieve the most relevant context for `query` within `token_budget` tokens.
+///
+/// Pipeline: validate → seed lookup (RBAC-filtered) → PPR → get_nodes →
+/// knapsack → format → sanitize → append footer → wrap envelope.
+///
+/// # SEC P0
+/// Returns identical output for "not found" and "access denied" to prevent
+/// existence oracle attacks. Seeds are filtered through the `OpenFilter` so
+/// callers cannot distinguish missing vs denied symbols.
+pub fn get_context(store: &SqliteStore, query: &str, token_budget: usize) -> String {
+    get_context_with_filter(store, query, token_budget, &OpenFilter)
+}
+
+/// Authenticated variant — applies RBAC filter at seed lookup and node fetch.
+#[allow(dead_code)]
+pub(crate) fn get_context_authed(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    filter: &dyn EdgeFilter,
+) -> String {
+    get_context_with_filter(store, query, token_budget, filter)
+}
+
+/// Raw variant — returns body without envelope. Used by global aggregation to
+/// prevent double-sanitization when multiple stores are aggregated before wrapping.
+pub(crate) fn get_context_raw(store: &SqliteStore, query: &str, token_budget: usize) -> String {
+    get_context_body(store, query, token_budget, &OpenFilter)
+}
+
+fn get_context_with_filter(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    filter: &dyn EdgeFilter,
+) -> String {
+    let body = get_context_body(store, query, token_budget, filter);
+    wrap_envelope(&body)
+}
+
+fn get_context_body(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    filter: &dyn EdgeFilter,
+) -> String {
+    // SEC-002: validate before any store access.
+    if let Err(reason) = validate_mcp_arg(query) {
+        tracing::warn!("get_context rejected invalid query arg: {reason}");
+        return String::new();
+    }
+    // Defense-in-depth budget guard (RFC-010 §3.3).
+    if token_budget > MAX_CONTEXT_BUDGET {
+        return "token_budget exceeds maximum allowed value".to_string();
+    }
+    if token_budget == 0 {
+        return String::new();
+    }
+
+    // Seed lookup: up to 5 seeds matching query, RBAC-filtered (SEC P0).
+    let seeds: Vec<NodeId> = match store.search_nodes_by_name(query) {
+        Ok(nodes) => nodes
+            .into_iter()
+            .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+            .take(5)
+            .map(|n| n.id)
+            .collect(),
+        Err(e) => {
+            tracing::warn!("get_context seed search error: {e}");
+            return String::new();
+        }
+    };
+
+    // SEC P0: identical response for "not found" and "access denied".
+    if seeds.is_empty() {
+        return format!("No symbols matching '{query}' found in the graph.");
+    }
+
+    // PPR over the seed set.
+    let ppr_scores = match travsr_retrieval::ppr(store, &seeds, context_candidates()) {
+        Ok(scores) => scores,
+        Err(e) => {
+            tracing::warn!("get_context ppr error: {e}");
+            return String::new();
+        }
+    };
+
+    if ppr_scores.is_empty() {
+        return format!("No symbols matching '{query}' found in the graph.");
+    }
+
+    // Build score map for keyed join (prevents node/score misalignment).
+    let score_map: HashMap<NodeId, f32> = ppr_scores.iter().cloned().collect();
+    let node_ids: Vec<NodeId> = ppr_scores.into_iter().map(|(id, _)| id).collect();
+
+    // Batch-fetch nodes.
+    let fetched = match store.get_nodes(&node_ids) {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            tracing::warn!("get_context get_nodes error: {e}");
+            return String::new();
+        }
+    };
+
+    // Post-filter fetched nodes through RBAC and join with scores.
+    let items: Vec<(CoreNode, f32)> = fetched
+        .into_iter()
+        .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+        .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
+        .collect();
+
+    if items.is_empty() {
+        return format!("No symbols matching '{query}' found in the graph.");
+    }
+
+    // Knapsack selection.
+    let selected = knapsack(items, token_budget);
+    let n_nodes = selected.len();
+    let total_tokens: usize = selected.iter().map(token_cost).sum();
+
+    // Format body lines.
+    let lines: Vec<String> = selected
+        .iter()
+        .map(|n| {
+            format!(
+                "{} ({}) — {} [package: {}]",
+                n.vname.signature, n.kind, n.vname.path, n.package
+            )
+        })
+        .collect();
+    let body = lines.join("\n");
+
+    // Sanitize body (no envelope yet — footer is appended after).
+    let sanitized = sanitize_mcp_body_with_limit(
+        &body,
+        (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
+    );
+
+    // Append footer then wrap — footer is always present, never truncated.
+    format!("{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens]")
+}
+
+/// Global variant of `get_context` — searches one named repo or all registered repos.
+pub fn get_context_global(
+    repos: &HashMap<String, PathBuf>,
+    query: &str,
+    token_budget: usize,
+    repo: Option<&str>,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(query) {
+        tracing::warn!("get_context_global rejected invalid query: {reason}");
+        return wrap_envelope("");
+    }
+    if token_budget > MAX_CONTEXT_BUDGET {
+        return wrap_envelope("token_budget exceeds maximum allowed value");
+    }
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = get_context_raw(store, query, token_budget);
+        if result.is_empty() || single {
+            result
+        } else {
+            result
+                .lines()
+                .map(|l| format!("[{repo_name}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    });
+    wrap_envelope(&raw)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
