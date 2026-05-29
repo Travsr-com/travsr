@@ -119,7 +119,7 @@ export class GraphPanel {
       const uri = msg.path.startsWith("/")
         ? vscode.Uri.file(msg.path)
         : root ? vscode.Uri.joinPath(root, msg.path) : vscode.Uri.file(msg.path);
-      if (msg.line) {
+      if (msg.line != null) {
         void (async () => {
           const doc = await vscode.workspace.openTextDocument(uri);
           const lineIdx = msg.line! - 1;
