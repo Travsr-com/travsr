@@ -122,6 +122,12 @@ fn handle_tool_call(
             let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
             tools::get_context(store, query, token_budget)
         }
+        "get_graph_json" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let direction = args["direction"].as_str().unwrap_or("both");
+            let depth = args["depth"].as_u64().unwrap_or(2).min(4) as u8;
+            tools::get_graph_json(store, query, direction, depth)
+        }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -231,6 +237,20 @@ fn tools_list() -> serde_json::Value {
                     "properties": {
                         "query": { "type": "string", "description": "Symbol name or free-text query (1–200 chars)" },
                         "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_graph_json",
+                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars)" },
+                        "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
+                        "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" }
                     },
                     "required": ["query"],
                     "additionalProperties": false
@@ -362,6 +382,12 @@ fn handle_tool_call_global(
             let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
             tools::get_context_global(repos, query, token_budget, repo_arg)
         }
+        "get_graph_json" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let direction = args["direction"].as_str().unwrap_or("both");
+            let depth = args["depth"].as_u64().unwrap_or(2).min(4) as u8;
+            tools::get_graph_json_global(repos, query, direction, depth, repo_arg)
+        }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
@@ -483,6 +509,21 @@ fn tools_list_global() -> serde_json::Value {
                     "required": ["query"],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_graph_json",
+                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars)" },
+                        "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
+                        "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -501,6 +542,7 @@ mod tests {
         "get_execution_path",
         "get_graph_stats",
         "get_context",
+        "get_graph_json",
     ];
 
     #[test]
@@ -555,6 +597,7 @@ mod tests {
             ("search_symbol", "name"),
             ("get_execution_path", "source"),
             ("get_context", "query"),
+            ("get_graph_json", "query"),
         ];
         for list in [tools_list(), tools_list_global()] {
             let tools = list["tools"].as_array().unwrap();

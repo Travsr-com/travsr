@@ -871,6 +871,229 @@ pub fn get_context_global(
     wrap_envelope(&raw)
 }
 
+// ── get_graph_json ────────────────────────────────────────────────────────────
+
+/// Max nodes returned by `get_graph_json` to keep MCP payloads manageable.
+const MAX_GRAPH_JSON_NODES: usize = 200;
+
+/// Return a subgraph around `query` as structured JSON for graph renderers.
+///
+/// BFS from seed node(s) matching `query`, respecting `direction` and `depth`.
+/// Returns `{"nodes":[...],"edges":[...]}`.
+/// Unlike prose tools, output is NOT sanitized — it is structured JSON consumed
+/// by the VS Code graph panel, not forwarded to an LLM as freetext.
+pub fn get_graph_json(store: &SqliteStore, query: &str, direction: &str, depth: u8) -> String {
+    if let Err(reason) = validate_mcp_arg(query) {
+        tracing::warn!("get_graph_json rejected invalid arg: {reason}");
+        return "{}".to_string();
+    }
+    let depth = depth.clamp(1, 4);
+    get_graph_json_raw(store, query, direction, depth)
+}
+
+fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
+    use travsr_core::EdgeKind;
+    match kind {
+        EdgeKind::DefinesBinding => "defines",
+        EdgeKind::RefCall => "calls",
+        EdgeKind::Depends => "imports",
+        _ => "reads",
+    }
+}
+
+fn get_graph_json_raw(store: &SqliteStore, query: &str, direction: &str, depth: u8) -> String {
+    use std::collections::{HashSet, VecDeque};
+
+    let seed_nodes = match store.search_nodes_by_name(query) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_graph_json search error: {e}");
+            return r#"{"nodes":[],"edges":[]}"#.to_string();
+        }
+    };
+
+    if seed_nodes.is_empty() {
+        return r#"{"nodes":[],"edges":[]}"#.to_string();
+    }
+
+    // (NodeId, hop_distance)
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
+    let mut nodes_out: Vec<serde_json::Value> = Vec::new();
+    let mut edges_out: Vec<serde_json::Value> = Vec::new();
+    let mut edge_seen: HashSet<(NodeId, NodeId)> = HashSet::new();
+
+    for node in &seed_nodes {
+        if visited.insert(node.id) {
+            queue.push_back((node.id, 0));
+        }
+    }
+
+    while let Some((current_id, hop)) = queue.pop_front() {
+        if nodes_out.len() >= MAX_GRAPH_JSON_NODES {
+            tracing::warn!(
+                "get_graph_json hit node cap ({MAX_GRAPH_JSON_NODES}) for query '{query}'"
+            );
+            break;
+        }
+
+        let node = match store.get_node(current_id) {
+            Ok(Some(n)) => n,
+            _ => continue,
+        };
+
+        let score = {
+            let raw = 0.7_f64.powi(i32::from(hop));
+            (raw * 1000.0).round() / 1000.0
+        };
+        let mut node_obj = serde_json::json!({
+            "id":      node.vname.signature,
+            "label":   node.vname.signature,
+            "kind":    node.kind,
+            "path":    node.vname.path,
+            "package": node.package,
+            "score":   score,
+        });
+        if hop == 0 {
+            node_obj["root"] = serde_json::Value::Bool(true);
+        }
+        nodes_out.push(node_obj);
+
+        if hop >= depth {
+            continue;
+        }
+
+        // Outgoing edges (deps direction)
+        if direction == "deps" || direction == "both" {
+            if let Ok(edges) = store.iter_edges_from(current_id) {
+                for edge in &edges {
+                    if edge_seen.insert((edge.src, edge.dst)) {
+                        if let Ok(Some(dst)) = store.get_node(edge.dst) {
+                            edges_out.push(serde_json::json!({
+                                "source": node.vname.signature,
+                                "target": dst.vname.signature,
+                                "kind":   edge_kind_str(&edge.kind),
+                            }));
+                        }
+                    }
+                    if visited.insert(edge.dst) {
+                        queue.push_back((edge.dst, hop + 1));
+                    }
+                }
+            }
+        }
+
+        // Incoming edges (callers direction)
+        if direction == "callers" || direction == "both" {
+            if let Ok(edges) = store.iter_edges_to(current_id) {
+                for edge in &edges {
+                    if edge_seen.insert((edge.src, edge.dst)) {
+                        if let Ok(Some(src)) = store.get_node(edge.src) {
+                            edges_out.push(serde_json::json!({
+                                "source": src.vname.signature,
+                                "target": node.vname.signature,
+                                "kind":   edge_kind_str(&edge.kind),
+                            }));
+                        }
+                    }
+                    if visited.insert(edge.src) {
+                        queue.push_back((edge.src, hop + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    match serde_json::to_string(&serde_json::json!({
+        "nodes": nodes_out,
+        "edges": edges_out,
+    })) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("get_graph_json serialization error: {e}");
+            "{}".to_string()
+        }
+    }
+}
+
+/// Global variant of `get_graph_json` — merges subgraphs across repos, deduping by node id.
+pub fn get_graph_json_global(
+    repos: &HashMap<String, PathBuf>,
+    query: &str,
+    direction: &str,
+    depth: u8,
+    repo: Option<&str>,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(query) {
+        tracing::warn!("get_graph_json_global rejected invalid arg: {reason}");
+        return "{}".to_string();
+    }
+    let depth = depth.clamp(1, 4);
+
+    let candidates: Vec<(&str, &PathBuf)> = match repo {
+        Some(name) => {
+            if let Err(reason) = validate_mcp_arg(name) {
+                tracing::warn!("get_graph_json_global rejected invalid repo arg: {reason}");
+                return "{}".to_string();
+            }
+            match repos.get_key_value(name) {
+                Some((k, v)) => vec![(k.as_str(), v)],
+                None => {
+                    tracing::warn!("repo '{name}' not found in registry");
+                    return r#"{"nodes":[],"edges":[]}"#.to_string();
+                }
+            }
+        }
+        None => repos.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+    };
+
+    let mut all_nodes: Vec<serde_json::Value> = Vec::new();
+    let mut all_edges: Vec<serde_json::Value> = Vec::new();
+    let mut seen_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_edge_keys: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    for (_repo_name, db_path) in candidates {
+        if !db_path.exists() {
+            continue;
+        }
+        match SqliteStore::open(db_path) {
+            Ok(store) => {
+                let raw = get_graph_json_raw(&store, query, direction, depth);
+                let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                for node in parsed["nodes"].as_array().into_iter().flatten() {
+                    let id = node["id"].as_str().unwrap_or("").to_string();
+                    if !id.is_empty() && seen_node_ids.insert(id) {
+                        all_nodes.push(node.clone());
+                    }
+                }
+                for edge in parsed["edges"].as_array().into_iter().flatten() {
+                    let src = edge["source"].as_str().unwrap_or("").to_string();
+                    let tgt = edge["target"].as_str().unwrap_or("").to_string();
+                    if !src.is_empty() && seen_edge_keys.insert((src, tgt)) {
+                        all_edges.push(edge.clone());
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+        }
+    }
+
+    match serde_json::to_string(&serde_json::json!({
+        "nodes": all_nodes,
+        "edges": all_edges,
+    })) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("get_graph_json_global serialization error: {e}");
+            "{}".to_string()
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

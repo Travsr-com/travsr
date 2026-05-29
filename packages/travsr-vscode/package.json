@@ -86,12 +86,30 @@
       {
         "command": "travsr.downloadBinary",
         "title": "Travsr: Download Binary"
+      },
+      {
+        "command": "travsr.showGraph",
+        "title": "Travsr: Show Graph",
+        "icon": "$(type-hierarchy)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "travsr.showGraph",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g",
+        "when": "editorFocus"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "travsr.refreshGraph",
+          "when": "view == travsrGraph",
+          "group": "navigation"
+        },
+        {
+          "command": "travsr.showGraph",
           "when": "view == travsrGraph",
           "group": "navigation"
         }

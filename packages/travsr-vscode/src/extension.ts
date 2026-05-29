@@ -16,6 +16,7 @@ import {
 import { CallersHoverProvider, HOVER_SELECTOR } from "./hover";
 import { TravsrTreeDataProvider } from "./tree";
 import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
+import { GraphPanel } from "./graph";
 import {
   installBinary,
   checkOnPath,
@@ -226,6 +227,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.showWelcome", () => showWelcome())
+  );
+
+  // Graph panel (VSCODE-245)
+  context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.showGraph", () => {
+      const panel = GraphPanel.show(proxy, context);
+      const activeEditor = vscode.window.activeTextEditor;
+      if (activeEditor) {
+        const rel = vscode.workspace.asRelativePath(
+          activeEditor.document.fileName
+        );
+        void panel.query(rel);
+      }
+    })
   );
 
   context.subscriptions.push(
