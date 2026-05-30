@@ -2,9 +2,9 @@
 //! These tests verify the sandbox policy enforcements defined in ADR-017.
 //! Tests that require bwrap (Linux) are skipped on other platforms.
 
+use travsr_plugin_host::phase_b::catalog::{lookup, SandboxRequirement};
 use travsr_plugin_host::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 use travsr_plugin_host::trust::TrustConfig;
-use travsr_plugin_host::phase_b::catalog::{lookup, SandboxRequirement};
 
 // 1. Egress blocked — Standard sandbox denies network
 #[test]
@@ -139,10 +139,7 @@ fn sandbox_repo_root_is_read_only() {
         "sh",
         &[
             "-c",
-            &format!(
-                "echo test > {} 2>&1; echo $?",
-                breach_path.display()
-            ),
+            &format!("echo test > {} 2>&1; echo $?", breach_path.display()),
         ],
         repo.path(),
         scratch.path(),
@@ -296,9 +293,9 @@ fn elevated_policy_accepts_valid_fields() {
 
 #[test]
 fn sidecar_stub_disabled_health_is_isolated() {
-    use travsr_plugin_host::transport::{Sidecar, Transport, PluginHealth};
-    use travsr_plugin_protocol::{InvokeRequest, ParseRequest};
     use std::path::PathBuf;
+    use travsr_plugin_host::transport::{PluginHealth, Sidecar, Transport};
+    use travsr_plugin_protocol::{InvokeRequest, ParseRequest};
 
     // A disabled Sidecar (stub) returns Err without panicking — daemon continues
     let sidecar = Sidecar::stub("java");

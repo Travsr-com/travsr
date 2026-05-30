@@ -15,12 +15,23 @@ pub struct ParseCache {
 }
 
 impl ParseCache {
-    pub fn new() -> Self { Self { store: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            store: HashMap::new(),
+        }
+    }
     pub fn get(&self, plugin_version: &str, file_hash: [u8; 32]) -> Option<&ParseResponse> {
-        self.store.get(&CacheKey { plugin_version: plugin_version.to_string(), file_hash })
+        self.store.get(&CacheKey {
+            plugin_version: plugin_version.to_string(),
+            file_hash,
+        })
     }
     pub fn insert(&mut self, key: CacheKey, resp: ParseResponse) {
         self.store.insert(key, resp);
     }
 }
-impl Default for ParseCache { fn default() -> Self { Self::new() } }
+impl Default for ParseCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}

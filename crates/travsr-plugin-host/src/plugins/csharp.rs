@@ -1,5 +1,5 @@
-use travsr_core::Language;
 use super::generic::LanguageConfig;
+use travsr_core::Language;
 
 pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::CSharp,
@@ -15,11 +15,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (using_directive) @import
 "#,
     capture_kinds: &[
-        ("class.name",     "class",     "class"),
+        ("class.name", "class", "class"),
         ("interface.name", "interface", "interface"),
-        ("struct.name",    "class",     "class"),
-        ("enum.name",      "enum",      "enum"),
-        ("fn.name",        "function",  "fn"),
-        ("import",         "import",    "import"),
+        ("struct.name", "class", "class"),
+        ("enum.name", "enum", "enum"),
+        ("fn.name", "function", "fn"),
+        ("import", "import", "import"),
     ],
 };

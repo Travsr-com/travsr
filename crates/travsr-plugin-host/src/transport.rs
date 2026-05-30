@@ -1,12 +1,12 @@
+use crate::sandbox::policy::SandboxUnavailable;
 use std::io::{BufReader, BufWriter};
 use std::sync::{Arc, Mutex};
 use travsr_error::IndexError;
 use travsr_plugin_protocol::{
-    Plugin, ParseRequest, ParseResponse, InvokeRequest, InvokeResponse,
-    HandshakeRequest, PluginRequest, PluginResponse, PROTOCOL_VERSION,
     codec::{decode_message, write_message},
+    HandshakeRequest, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
+    PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };
-use crate::sandbox::policy::SandboxUnavailable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginHealth {
@@ -32,7 +32,9 @@ pub struct InProcess {
 
 impl InProcess {
     pub fn new(plugin: impl Plugin + 'static) -> Self {
-        Self { plugin: Arc::new(plugin) }
+        Self {
+            plugin: Arc::new(plugin),
+        }
     }
 }
 
@@ -47,7 +49,9 @@ impl Transport for InProcess {
         Err(IndexError::PhaseNotSupported)
     }
 
-    fn health(&self) -> PluginHealth { PluginHealth::Ok }
+    fn health(&self) -> PluginHealth {
+        PluginHealth::Ok
+    }
 }
 
 // ── Sidecar I/O types ─────────────────────────────────────────────────────────
@@ -106,39 +110,43 @@ impl Sidecar {
                 message: format!("failed to create scratch dir: {e}"),
             })?;
         let args = ["__plugin", lang];
-        let mut cmd = Self::build_cmd(program, &args, repo_root, scratch.path())
-            .map_err(|e| IndexError::Parse {
+        let mut cmd = Self::build_cmd(program, &args, repo_root, scratch.path()).map_err(|e| {
+            IndexError::Parse {
                 file: format!("plugin:{lang}"),
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
         cmd.stdin(std::process::Stdio::piped())
-           .stdout(std::process::Stdio::piped())
-           .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
 
         let mut child = cmd.spawn().map_err(|e| IndexError::Parse {
             file: format!("plugin:{lang}"),
             message: format!("spawn failed: {e}"),
         })?;
 
-        let stdin  = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let mut writer = BufWriter::new(stdin);
         let mut reader = BufReader::new(stdout);
 
         // Handshake
-        write_message(&mut writer, &PluginRequest::Handshake(HandshakeRequest {
-            daemon_protocol_version: PROTOCOL_VERSION,
-        })).map_err(|e| IndexError::Parse {
+        write_message(
+            &mut writer,
+            &PluginRequest::Handshake(HandshakeRequest {
+                daemon_protocol_version: PROTOCOL_VERSION,
+            }),
+        )
+        .map_err(|e| IndexError::Parse {
             file: format!("plugin:{lang}"),
             message: e.to_string(),
         })?;
 
-        let hs: PluginResponse = decode_message(&mut reader)
-            .map_err(|e| IndexError::Parse {
-                file: format!("plugin:{lang}"),
-                message: e.to_string(),
-            })?;
+        let hs: PluginResponse = decode_message(&mut reader).map_err(|e| IndexError::Parse {
+            file: format!("plugin:{lang}"),
+            message: e.to_string(),
+        })?;
 
         let plugin_version = match hs {
             PluginResponse::Handshake(h) => {
@@ -150,10 +158,12 @@ impl Sidecar {
                 }
                 h.plugin_version
             }
-            _ => return Err(IndexError::Parse {
-                file: format!("plugin:{lang}"),
-                message: "expected HandshakeResponse".into(),
-            }),
+            _ => {
+                return Err(IndexError::Parse {
+                    file: format!("plugin:{lang}"),
+                    message: "expected HandshakeResponse".into(),
+                })
+            }
         };
 
         Ok(Self {
@@ -234,7 +244,9 @@ impl Transport for Sidecar {
             }),
             Err(_e) => {
                 self.mark_crashed();
-                Err(IndexError::PluginCrashed { language: self.language.clone() })
+                Err(IndexError::PluginCrashed {
+                    language: self.language.clone(),
+                })
             }
         }
     }
@@ -269,28 +281,37 @@ impl Transport for Sidecar {
             }),
             Err(_e) => {
                 self.mark_crashed();
-                Err(IndexError::PluginCrashed { language: self.language.clone() })
+                Err(IndexError::PluginCrashed {
+                    language: self.language.clone(),
+                })
             }
         }
     }
 
     fn health(&self) -> PluginHealth {
-        self.health.lock().map(|h| h.clone()).unwrap_or_else(|_| {
-            PluginHealth::Disabled("health lock poisoned".into())
-        })
+        self.health
+            .lock()
+            .map(|h| h.clone())
+            .unwrap_or_else(|_| PluginHealth::Disabled("health lock poisoned".into()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use travsr_plugin_protocol::{ParseResponse, InvokeResponse};
+    use travsr_plugin_protocol::{InvokeResponse, ParseResponse};
 
     struct NoOpPlugin;
     impl Plugin for NoOpPlugin {
-        fn language(&self) -> travsr_core::Language { travsr_core::Language::TypeScript }
-        fn extensions(&self) -> &[&str] { &["ts"] }
-        fn supports_phase_b(&self) -> bool { false }
+        fn language(&self) -> travsr_core::Language {
+            travsr_core::Language::TypeScript
+        }
+        fn extensions(&self) -> &[&str] {
+            &["ts"]
+        }
+        fn supports_phase_b(&self) -> bool {
+            false
+        }
         fn parse(&self, _req: &travsr_plugin_protocol::ParseRequest) -> ParseResponse {
             ParseResponse::default()
         }
@@ -302,8 +323,13 @@ mod tests {
     #[test]
     fn in_process_invoke_phase_b_returns_phase_not_supported() {
         let t = InProcess::new(NoOpPlugin);
-        let req = InvokeRequest { root: std::path::PathBuf::from(".") };
-        assert!(matches!(t.invoke_phase_b(req), Err(IndexError::PhaseNotSupported)));
+        let req = InvokeRequest {
+            root: std::path::PathBuf::from("."),
+        };
+        assert!(matches!(
+            t.invoke_phase_b(req),
+            Err(IndexError::PhaseNotSupported)
+        ));
     }
 
     #[test]

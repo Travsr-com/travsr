@@ -1,26 +1,26 @@
-use std::sync::Arc;
-use travsr_plugin_protocol::{HandshakeResponse, PROTOCOL_VERSION};
 use crate::dispatcher::Dispatcher;
-use crate::transport::InProcess;
 use crate::plugins::generic::GenericTreeSitterPlugin;
-use crate::plugins::typescript::TypeScriptPlugin;
-use crate::plugins::rust::RustPlugin;
-use crate::plugins::python::PythonPlugin;
 use crate::plugins::go::GoPlugin;
 use crate::plugins::java::JavaPlugin;
+use crate::plugins::python::PythonPlugin;
+use crate::plugins::rust::RustPlugin;
+use crate::plugins::typescript::TypeScriptPlugin;
+use crate::transport::InProcess;
+use std::sync::Arc;
+use travsr_plugin_protocol::{HandshakeResponse, PROTOCOL_VERSION};
 
 /// Maps canonical language name → expected fuzz target filename under fuzz/fuzz_targets/.
 /// ADR-017 Rule 4: in-process grammars MUST have a fuzz target.
 const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("typescript", "fuzz_treesitter_indexer.rs"),
-    ("rust",       "fuzz_treesitter_indexer.rs"), // shared indexer target covers Rust
-    ("python",     "fuzz_pyright_lsif_parser.rs"),
-    ("go",         "fuzz_go_parser.rs"),
-    ("java",       "fuzz_java_parser.rs"),   // TODO: create this fuzz target
-    ("kotlin",     "fuzz_kotlin_parser.rs"), // TODO: create this fuzz target
-    ("ruby",       "fuzz_ruby_parser.rs"),   // TODO: create this fuzz target
-    ("csharp",     "fuzz_csharp_parser.rs"), // TODO: create this fuzz target
-    ("php",        "fuzz_php_parser.rs"),    // TODO: create this fuzz target
+    ("rust", "fuzz_treesitter_indexer.rs"), // shared indexer target covers Rust
+    ("python", "fuzz_pyright_lsif_parser.rs"),
+    ("go", "fuzz_go_parser.rs"),
+    ("java", "fuzz_java_parser.rs"), // TODO: create this fuzz target
+    ("kotlin", "fuzz_kotlin_parser.rs"), // TODO: create this fuzz target
+    ("ruby", "fuzz_ruby_parser.rs"), // TODO: create this fuzz target
+    ("csharp", "fuzz_csharp_parser.rs"), // TODO: create this fuzz target
+    ("php", "fuzz_php_parser.rs"),   // TODO: create this fuzz target
 ];
 
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process
@@ -105,26 +105,53 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
                 supports_phase_b: $phase_b,
             };
             let t = Arc::new(InProcess::new($plugin));
-            dispatcher.register(hs, t).expect("built-in plugin registration failed");
+            dispatcher
+                .register(hs, t)
+                .expect("built-in plugin registration failed");
         }};
     }
 
     // Languages with specialised Phase A logic or Phase B support
-    register!(TypeScriptPlugin, "typescript", &["ts", "tsx", "mts", "cts"], true);
-    register!(RustPlugin,       "rust",       &["rs"],                       true);
-    register!(PythonPlugin,     "python",     &["py", "pyi"],                false);
-    register!(GoPlugin,         "go",         &["go"],                       false);
-    register!(JavaPlugin,       "java",       &["java"],                     false);
+    register!(
+        TypeScriptPlugin,
+        "typescript",
+        &["ts", "tsx", "mts", "cts"],
+        true
+    );
+    register!(RustPlugin, "rust", &["rs"], true);
+    register!(PythonPlugin, "python", &["py", "pyi"], false);
+    register!(GoPlugin, "go", &["go"], false);
+    register!(JavaPlugin, "java", &["java"], false);
 
     // Languages driven entirely by GenericTreeSitterPlugin (config-only, no special logic)
     check_fuzz_target("kotlin");
-    register_generic(dispatcher, &version, &crate::plugins::kotlin::CONFIG, tree_sitter_kotlin::language());
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::kotlin::CONFIG,
+        tree_sitter_kotlin::language(),
+    );
     check_fuzz_target("ruby");
-    register_generic(dispatcher, &version, &crate::plugins::ruby::CONFIG,   tree_sitter_ruby::language());
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::ruby::CONFIG,
+        tree_sitter_ruby::language(),
+    );
     check_fuzz_target("csharp");
-    register_generic(dispatcher, &version, &crate::plugins::csharp::CONFIG, tree_sitter_c_sharp::language());
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::csharp::CONFIG,
+        tree_sitter_c_sharp::language(),
+    );
     check_fuzz_target("php");
-    register_generic(dispatcher, &version, &crate::plugins::php::CONFIG,    tree_sitter_php::language_php());
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::php::CONFIG,
+        tree_sitter_php::language_php(),
+    );
     // Swift: blocked — all available tree-sitter-swift crates require tree-sitter ^0.21
     // which conflicts with workspace tree-sitter = "0.22". Re-enable when a compatible crate ships.
 }
@@ -144,5 +171,7 @@ fn register_generic(
         supports_phase_b: false,
     };
     let t = Arc::new(InProcess::new(plugin));
-    dispatcher.register(hs, t).expect("generic plugin registration failed");
+    dispatcher
+        .register(hs, t)
+        .expect("generic plugin registration failed");
 }

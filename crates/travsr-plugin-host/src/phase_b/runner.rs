@@ -108,8 +108,8 @@ pub fn run_phase_b(entry: &PhaseBEntry, root: &Path) -> anyhow::Result<InvokeRes
         }
         OutputFormat::Scip => {
             if scip_output.exists() {
-                let out = travsr_indexer::ingest_scip(&scip_output, "")
-                    .context("SCIP ingest failed")?;
+                let out =
+                    travsr_indexer::ingest_scip(&scip_output, "").context("SCIP ingest failed")?;
                 // scratch is still alive here — drop happens after this block
                 Ok(InvokeResponse {
                     nodes: out.nodes,

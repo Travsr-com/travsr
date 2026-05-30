@@ -192,7 +192,8 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         }
         if !pb_nodes.is_empty() || !pb_edges.is_empty() {
             tracing::info!(
-                nodes = pb_nodes.len(), edges = pb_edges.len(),
+                nodes = pb_nodes.len(),
+                edges = pb_edges.len(),
                 "phase B indexing complete"
             );
         }

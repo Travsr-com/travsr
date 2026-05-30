@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use travsr_core::{Node, Edge};
 use crate::ffi_marker::FfiMarker;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use travsr_core::{Edge, Node};
 
 /// Current protocol version. Bump on any breaking wire change.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -38,7 +38,9 @@ pub struct InvokeResponse {
 }
 
 impl InvokeResponse {
-    pub fn unsupported() -> Self { Self::default() }
+    pub fn unsupported() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

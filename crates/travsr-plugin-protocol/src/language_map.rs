@@ -5,14 +5,14 @@ use travsr_core::Language;
 pub fn language_from_proto_str(s: &str) -> Option<Language> {
     match s {
         "typescript" | "javascript" => Some(Language::TypeScript),
-        "rust"   => Some(Language::Rust),
+        "rust" => Some(Language::Rust),
         "python" => Some(Language::Python),
-        "go"     => Some(Language::Go),
-        "java"   => Some(Language::Java),
+        "go" => Some(Language::Go),
+        "java" => Some(Language::Java),
         "kotlin" => Some(Language::Kotlin),
-        "ruby"   => Some(Language::Ruby),
+        "ruby" => Some(Language::Ruby),
         "csharp" => Some(Language::CSharp),
-        "php"    => Some(Language::Php),
+        "php" => Some(Language::Php),
         _ => None,
     }
 }
@@ -41,7 +41,7 @@ mod tests {
     #[test]
     fn unknown_language_returns_none() {
         assert_eq!(language_from_proto_str("TypeScript"), None); // case-sensitive
-        assert_eq!(language_from_proto_str("Kotlin"), None);     // case-sensitive
+        assert_eq!(language_from_proto_str("Kotlin"), None); // case-sensitive
         assert_eq!(language_from_proto_str(""), None);
     }
 }

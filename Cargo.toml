@@ -85,8 +85,8 @@ cxx-build = "=1.0.138"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
 toml = "0.8"
-scip  = "0.7"
-prost = "0.13"
+scip      = "0.7"
+protobuf  = "3"
 
 [profile.release]
 lto = "thin"

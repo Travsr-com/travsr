@@ -65,7 +65,10 @@ fn cmd_list() -> Result<()> {
     let config = load_config();
     let today = chrono::Local::now().date_naive();
 
-    println!("{:<12} {:<26} {:<10} STATUS", "LANGUAGE", "PACKAGE", "SANDBOX");
+    println!(
+        "{:<12} {:<26} {:<10} STATUS",
+        "LANGUAGE", "PACKAGE", "SANDBOX"
+    );
     println!("{}", "-".repeat(80));
 
     for entry in CATALOG {

@@ -8,11 +8,9 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use tree_sitter::{Parser, Query, QueryCursor};
 use travsr_core::{Language, Node, VName};
-use travsr_plugin_protocol::{
-    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
-};
+use travsr_plugin_protocol::{InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin};
+use tree_sitter::{Parser, Query, QueryCursor};
 
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
@@ -46,21 +44,30 @@ impl GenericTreeSitterPlugin {
     /// Panics at startup if the query string is invalid — misconfiguration
     /// should be caught at development time, not silently at runtime.
     pub fn new(config: &'static LanguageConfig, grammar: tree_sitter::Language) -> Self {
-        let compiled_query = Query::new(&grammar, config.queries)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "invalid tree-sitter query for language {:?}: {e}",
-                    config.language.as_str()
-                )
-            });
-        Self { config, grammar, compiled_query }
+        let compiled_query = Query::new(&grammar, config.queries).unwrap_or_else(|e| {
+            panic!(
+                "invalid tree-sitter query for language {:?}: {e}",
+                config.language.as_str()
+            )
+        });
+        Self {
+            config,
+            grammar,
+            compiled_query,
+        }
     }
 }
 
 impl Plugin for GenericTreeSitterPlugin {
-    fn language(&self) -> Language { self.config.language }
-    fn extensions(&self) -> &[&str] { self.config.extensions }
-    fn supports_phase_b(&self) -> bool { false }
+    fn language(&self) -> Language {
+        self.config.language
+    }
+    fn extensions(&self) -> &[&str] {
+        self.config.extensions
+    }
+    fn supports_phase_b(&self) -> bool {
+        false
+    }
 
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
         parse_generic(
@@ -101,8 +108,8 @@ fn parse_generic(
         .len();
     anyhow::ensure!(size <= MAX_FILE_BYTES, "file too large: {size} bytes");
 
-    let source = std::fs::read(abs_path)
-        .with_context(|| format!("reading {}", abs_path.display()))?;
+    let source =
+        std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
     let mut parser = Parser::new();
     parser.set_language(grammar).context("set language")?;
@@ -119,9 +126,7 @@ fn parse_generic(
 
     for m in cursor.matches(query, tree.root_node(), source.as_slice()) {
         for cap in m.captures {
-            let cap_name = *capture_names
-                .get(cap.index as usize)
-                .unwrap_or(&"");
+            let cap_name = *capture_names.get(cap.index as usize).unwrap_or(&"");
 
             // Find the config entry for this capture
             let Some(&(_, node_kind, sig_prefix)) = config
@@ -158,5 +163,9 @@ fn parse_generic(
         }
     }
 
-    Ok(ParseResponse { nodes, edges: vec![], ffi_markers: vec![] })
+    Ok(ParseResponse {
+        nodes,
+        edges: vec![],
+        ffi_markers: vec![],
+    })
 }

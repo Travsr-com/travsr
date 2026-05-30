@@ -1,5 +1,5 @@
-use travsr_core::Language;
 use super::generic::LanguageConfig;
+use travsr_core::Language;
 
 pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::Kotlin,
@@ -11,9 +11,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (import_header) @import
 "#,
     capture_kinds: &[
-        ("class.name",  "class",    "class"),
-        ("object.name", "object",   "class"),
-        ("fn.name",     "function", "fn"),
-        ("import",      "import",   "import"),
+        ("class.name", "class", "class"),
+        ("object.name", "object", "class"),
+        ("fn.name", "function", "fn"),
+        ("import", "import", "import"),
     ],
 };

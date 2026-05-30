@@ -106,9 +106,7 @@ impl Resolver {
                 FfiMarkerKind::NapiExport
                 | FfiMarkerKind::PyO3Export
                 | FfiMarkerKind::GoCallC
-                | FfiMarkerKind::JniExport => {
-                    continue
-                }
+                | FfiMarkerKind::JniExport => continue,
             };
 
             // Corpus invariant: only match within the same corpus.

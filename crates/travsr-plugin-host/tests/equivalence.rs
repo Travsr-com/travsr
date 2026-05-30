@@ -50,11 +50,7 @@ fn normalize(out: &mut travsr_indexer::ParseOutput) {
 
 /// Assert that old and new paths produce identical nodes and edges.
 /// FfiMarkers are compared by count only (kind mapping is validated separately).
-fn assert_equivalent(
-    lang: &str,
-    abs_path: &Path,
-    vname_path: &str,
-) {
+fn assert_equivalent(lang: &str, abs_path: &Path, vname_path: &str) {
     let mut old = old_parse(abs_path, vname_path);
     let mut new = new_parse(abs_path, vname_path);
 
@@ -62,9 +58,11 @@ fn assert_equivalent(
     normalize(&mut new);
 
     assert_eq!(
-        old.nodes.len(), new.nodes.len(),
+        old.nodes.len(),
+        new.nodes.len(),
         "{lang}: node count mismatch — old={}, new={}",
-        old.nodes.len(), new.nodes.len()
+        old.nodes.len(),
+        new.nodes.len()
     );
 
     for (i, (o, n)) in old.nodes.iter().zip(new.nodes.iter()).enumerate() {
@@ -79,9 +77,11 @@ fn assert_equivalent(
     }
 
     assert_eq!(
-        old.edges.len(), new.edges.len(),
+        old.edges.len(),
+        new.edges.len(),
         "{lang}: edge count mismatch — old={}, new={}",
-        old.edges.len(), new.edges.len()
+        old.edges.len(),
+        new.edges.len()
     );
 
     for (i, (o, n)) in old.edges.iter().zip(new.edges.iter()).enumerate() {
@@ -91,7 +91,8 @@ fn assert_equivalent(
     }
 
     assert_eq!(
-        old.ffi_markers.len(), new.ffi_markers.len(),
+        old.ffi_markers.len(),
+        new.ffi_markers.len(),
         "{lang}: ffi_marker count mismatch"
     );
 }
@@ -262,11 +263,13 @@ fn cache_hit_produces_identical_output() {
         .expect("second parse (cache hit)");
 
     assert_eq!(
-        first.nodes.len(), second.nodes.len(),
+        first.nodes.len(),
+        second.nodes.len(),
         "cache hit changed node count"
     );
     assert_eq!(
-        first.edges.len(), second.edges.len(),
+        first.edges.len(),
+        second.edges.len(),
         "cache hit changed edge count"
     );
 }
@@ -282,28 +285,47 @@ fn java_golden_fixture_produces_expected_nodes() {
     let out = new_parse(fixture, "src/PaymentService.java");
 
     // Must have a file node
-    assert!(out.nodes.iter().any(|n| n.kind == "file"), "missing file node");
+    assert!(
+        out.nodes.iter().any(|n| n.kind == "file"),
+        "missing file node"
+    );
 
     // Must find PaymentService class
     assert!(
-        out.nodes.iter().any(|n| n.kind == "class"
-            && n.vname.signature.contains("PaymentService")),
+        out.nodes
+            .iter()
+            .any(|n| n.kind == "class" && n.vname.signature.contains("PaymentService")),
         "missing PaymentService class\nnodes: {:?}",
-        out.nodes.iter().map(|n| (&n.kind, &n.vname.signature)).collect::<Vec<_>>()
+        out.nodes
+            .iter()
+            .map(|n| (&n.kind, &n.vname.signature))
+            .collect::<Vec<_>>()
     );
 
     // Must find methods
-    let methods: Vec<_> = out.nodes.iter()
+    let methods: Vec<_> = out
+        .nodes
+        .iter()
         .filter(|n| n.kind == "method" || n.kind == "constructor" || n.kind == "function")
         .collect();
-    assert!(methods.len() >= 2, "expected ≥2 methods, got {}", methods.len());
+    assert!(
+        methods.len() >= 2,
+        "expected ≥2 methods, got {}",
+        methods.len()
+    );
 
     // Must find imports
-    assert!(out.nodes.iter().any(|n| n.kind == "import"), "missing import nodes");
+    assert!(
+        out.nodes.iter().any(|n| n.kind == "import"),
+        "missing import nodes"
+    );
 
     // Old Indexer returns empty for Java — PluginIndexer adds real content
     let old = old_parse(fixture, "src/PaymentService.java");
-    assert!(out.nodes.len() > old.nodes.len(), "PluginIndexer should produce more than old empty path");
+    assert!(
+        out.nodes.len() > old.nodes.len(),
+        "PluginIndexer should produce more than old empty path"
+    );
 }
 
 // ── Kotlin golden fixture ─────────────────────────────────────────────────────
@@ -316,16 +338,26 @@ fn kotlin_golden_fixture_produces_expected_nodes() {
     }
     let out = new_parse(fixture, "src/PaymentService.kt");
 
-    assert!(out.nodes.iter().any(|n| n.kind == "file"), "missing file node");
     assert!(
-        out.nodes.iter().any(|n| n.kind == "class"
-            && n.vname.signature.contains("PaymentService")),
+        out.nodes.iter().any(|n| n.kind == "file"),
+        "missing file node"
+    );
+    assert!(
+        out.nodes
+            .iter()
+            .any(|n| n.kind == "class" && n.vname.signature.contains("PaymentService")),
         "missing PaymentService class\nnodes: {:?}",
-        out.nodes.iter().map(|n| (&n.kind, &n.vname.signature)).collect::<Vec<_>>()
+        out.nodes
+            .iter()
+            .map(|n| (&n.kind, &n.vname.signature))
+            .collect::<Vec<_>>()
     );
     let fns: Vec<_> = out.nodes.iter().filter(|n| n.kind == "function").collect();
     assert!(fns.len() >= 1, "expected ≥1 function, got {}", fns.len());
 
     let old = old_parse(fixture, "src/PaymentService.kt");
-    assert!(out.nodes.len() > old.nodes.len(), "PluginIndexer should produce more than old empty path");
+    assert!(
+        out.nodes.len() > old.nodes.len(),
+        "PluginIndexer should produce more than old empty path"
+    );
 }

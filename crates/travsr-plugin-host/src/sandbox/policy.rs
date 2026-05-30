@@ -20,12 +20,21 @@ pub enum SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn validate(&self) -> Result<(), SandboxUnavailable> {
-        if let Self::Elevated { reason, approved_by, .. } = self {
+        if let Self::Elevated {
+            reason,
+            approved_by,
+            ..
+        } = self
+        {
             if reason.is_empty() {
-                return Err(SandboxUnavailable("Elevated.reason must not be empty".into()));
+                return Err(SandboxUnavailable(
+                    "Elevated.reason must not be empty".into(),
+                ));
             }
             if approved_by.is_empty() {
-                return Err(SandboxUnavailable("Elevated.approved_by must not be empty".into()));
+                return Err(SandboxUnavailable(
+                    "Elevated.approved_by must not be empty".into(),
+                ));
             }
         }
         Ok(())

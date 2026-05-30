@@ -17,7 +17,10 @@ pub mod trust;
 
 pub use dispatcher::Dispatcher;
 pub use indexer::PluginIndexer;
-pub use phase_b::{lookup as lookup_phase_b, CATALOG as PHASE_B_CATALOG, PhaseBEntry, OutputFormat, SandboxRequirement};
+pub use phase_b::{
+    lookup as lookup_phase_b, OutputFormat, PhaseBEntry, SandboxRequirement,
+    CATALOG as PHASE_B_CATALOG,
+};
 pub use registry::probe_sandbox;
 pub use sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 pub use transport::{InProcess, PluginHealth, Sidecar, Transport};

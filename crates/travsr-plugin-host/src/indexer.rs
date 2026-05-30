@@ -1,10 +1,10 @@
-use std::path::Path;
-use travsr_error::IndexError;
-use travsr_indexer::{hash_file, ParseOutput};
 use crate::cache::{CacheKey, ParseCache};
 use crate::dispatcher::Dispatcher;
 use crate::plugins::response_to_output;
 use crate::registry::register_builtins;
+use std::path::Path;
+use travsr_error::IndexError;
+use travsr_indexer::{hash_file, ParseOutput};
 
 /// Drop-in replacement for travsr_indexer::Indexer.
 /// Routes files through the plugin Dispatcher, caches results by
@@ -20,7 +20,11 @@ impl PluginIndexer {
         let corpus = corpus.into();
         let mut dispatcher = Dispatcher::new(&corpus);
         register_builtins(&mut dispatcher);
-        Self { corpus, dispatcher, cache: ParseCache::new() }
+        Self {
+            corpus,
+            dispatcher,
+            cache: ParseCache::new(),
+        }
     }
 
     /// Parse a file. Caches by (CARGO_PKG_VERSION, sha256). Returns ParseOutput
@@ -35,7 +39,10 @@ impl PluginIndexer {
             message: e.to_string(),
         })?;
         let version = env!("CARGO_PKG_VERSION");
-        let key = CacheKey { plugin_version: version.to_string(), file_hash };
+        let key = CacheKey {
+            plugin_version: version.to_string(),
+            file_hash,
+        };
 
         // Cache hit
         if let Some(cached) = self.cache.get(version, file_hash) {
@@ -44,7 +51,10 @@ impl PluginIndexer {
 
         // Cache miss: dispatch through plugin
         let corpus = self.dispatcher.corpus.clone();
-        let resp = match self.dispatcher.parse_file(abs_path, vname_path, &corpus, "")? {
+        let resp = match self
+            .dispatcher
+            .parse_file(abs_path, vname_path, &corpus, "")?
+        {
             Some(r) => r,
             None => return Ok(ParseOutput::default()),
         };
@@ -64,7 +74,8 @@ impl PluginIndexer {
         if !trust.is_trusted(&self.corpus) {
             tracing::info!(
                 "Phase B skipped for corpus '{}' — run: travsr lang add <lang> --corpus {}",
-                self.corpus, self.corpus
+                self.corpus,
+                self.corpus
             );
             return (vec![], vec![]);
         }
@@ -76,7 +87,9 @@ impl PluginIndexer {
         //    rust-analyzer). Spawn a Sidecar so the call runs sandboxed per ADR-017.
         let current_exe = std::env::current_exe().unwrap_or_default();
         let exe_str = current_exe.to_string_lossy().into_owned();
-        let req = travsr_plugin_protocol::InvokeRequest { root: repo_root.to_path_buf() };
+        let req = travsr_plugin_protocol::InvokeRequest {
+            root: repo_root.to_path_buf(),
+        };
 
         for lang in self.dispatcher.phase_b_languages() {
             match crate::transport::Sidecar::spawn(lang, &exe_str, repo_root) {

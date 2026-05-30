@@ -1,10 +1,10 @@
+use crate::transport::Transport;
 use std::collections::HashMap;
 use std::sync::Arc;
 use travsr_error::IndexError;
 use travsr_plugin_protocol::{
-    HandshakeResponse, ParseRequest, ParseResponse, language_from_proto_str, PROTOCOL_VERSION,
+    language_from_proto_str, HandshakeResponse, ParseRequest, ParseResponse, PROTOCOL_VERSION,
 };
-use crate::transport::Transport;
 
 /// Maps file extension → Transport. Built from plugin handshakes.
 /// Replaces the RFC-003 enum-match dispatcher.
@@ -37,7 +37,9 @@ impl Dispatcher {
             });
         }
         if language_from_proto_str(&handshake.language).is_none() {
-            return Err(IndexError::UnknownLanguage { reported: handshake.language });
+            return Err(IndexError::UnknownLanguage {
+                reported: handshake.language,
+            });
         }
         self.phase_b_flags
             .insert(handshake.language.clone(), handshake.supports_phase_b);
@@ -85,9 +87,9 @@ impl Dispatcher {
     /// is invoked once per language, not once per extension.
     pub fn transports(&self) -> impl Iterator<Item = &Arc<dyn Transport>> {
         let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-        self.by_ext.values().filter(move |t| {
-            seen.insert(Arc::as_ptr(*t) as *const ())
-        })
+        self.by_ext
+            .values()
+            .filter(move |t| seen.insert(Arc::as_ptr(*t) as *const ()))
     }
 }
 
@@ -98,7 +100,12 @@ mod tests {
     #[test]
     fn unknown_extension_returns_none() {
         let d = Dispatcher::new("github.com/acme/foo");
-        let result = d.parse_file(std::path::Path::new("main.xyz"), "main.xyz", "github.com/acme/foo", "acme");
+        let result = d.parse_file(
+            std::path::Path::new("main.xyz"),
+            "main.xyz",
+            "github.com/acme/foo",
+            "acme",
+        );
         assert!(matches!(result, Ok(None)));
     }
 

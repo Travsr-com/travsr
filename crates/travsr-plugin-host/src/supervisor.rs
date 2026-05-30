@@ -13,7 +13,10 @@ pub struct Supervisor {
 
 impl Supervisor {
     pub fn new() -> Self {
-        Self { crash_counts: HashMap::new(), disabled: HashMap::new() }
+        Self {
+            crash_counts: HashMap::new(),
+            disabled: HashMap::new(),
+        }
     }
 
     pub fn record_crash(&mut self, language: &str, reason: &str) {
@@ -21,7 +24,8 @@ impl Supervisor {
         *count += 1;
         warn!("plugin crash #{} for {language}: {reason}", count);
         if *count >= MAX_CRASHES {
-            self.disabled.insert(language.to_string(), reason.to_string());
+            self.disabled
+                .insert(language.to_string(), reason.to_string());
             warn!("plugin {language} permanently disabled for this daemon run (>{MAX_CRASHES} crashes)");
         }
     }
@@ -31,4 +35,8 @@ impl Supervisor {
     }
 }
 
-impl Default for Supervisor { fn default() -> Self { Self::new() } }
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}

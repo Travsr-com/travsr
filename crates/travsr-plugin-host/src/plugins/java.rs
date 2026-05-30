@@ -129,8 +129,7 @@ fn parse_java_file(
                         .trim_end_matches(';')
                         .trim()
                         .to_string();
-                    let vn =
-                        VName::new(corpus, "", vname_path, "java", format!("import:{module}"));
+                    let vn = VName::new(corpus, "", vname_path, "java", format!("import:{module}"));
                     nodes.push(Node::new(vn, "import").with_line(line));
                 }
                 _ => {}

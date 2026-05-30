@@ -1,5 +1,5 @@
-use travsr_core::Language;
 use super::generic::LanguageConfig;
+use travsr_core::Language;
 
 pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::Php,
@@ -14,10 +14,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (namespace_use_clause) @import
 "#,
     capture_kinds: &[
-        ("class.name",     "class",     "class"),
+        ("class.name", "class", "class"),
         ("interface.name", "interface", "interface"),
-        ("enum.name",      "enum",      "enum"),
-        ("fn.name",        "function",  "fn"),
-        ("import",         "import",    "import"),
+        ("enum.name", "enum", "enum"),
+        ("fn.name", "function", "fn"),
+        ("import", "import", "import"),
     ],
 };

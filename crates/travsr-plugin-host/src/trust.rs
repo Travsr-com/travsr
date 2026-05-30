@@ -12,7 +12,9 @@ impl TrustConfig {
     /// A corpus is trusted if TRAVSR_TRUST_<CORPUS_SANITIZED>=1 is set,
     /// OR if the global config file has plugins.trust.<corpus> = true.
     pub fn new() -> Self {
-        Self { trusted_corpora: HashSet::new() }
+        Self {
+            trusted_corpora: HashSet::new(),
+        }
     }
 
     pub fn trust(&mut self, corpus: impl Into<String>) {
@@ -33,10 +35,16 @@ impl TrustConfig {
     /// Load trusted corpora from ~/.travsr/lang.toml (written by `travsr lang add --corpus`).
     pub fn from_disk() -> Self {
         let mut cfg = Self::new();
-        let Some(home) = dirs::home_dir() else { return cfg };
+        let Some(home) = dirs::home_dir() else {
+            return cfg;
+        };
         let path = home.join(".travsr").join("lang.toml");
-        let Ok(content) = std::fs::read_to_string(&path) else { return cfg };
-        let Ok(table) = toml::from_str::<toml::Value>(&content) else { return cfg };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return cfg;
+        };
+        let Ok(table) = toml::from_str::<toml::Value>(&content) else {
+            return cfg;
+        };
         if let Some(corpora) = table.get("trusted_corpora").and_then(|v| v.as_array()) {
             for c in corpora {
                 if let Some(s) = c.as_str() {
@@ -50,10 +58,16 @@ impl TrustConfig {
 
 /// Read the `registered` language list from ~/.travsr/lang.toml.
 pub fn registered_languages_from_disk() -> Vec<String> {
-    let Some(home) = dirs::home_dir() else { return vec![] };
+    let Some(home) = dirs::home_dir() else {
+        return vec![];
+    };
     let path = home.join(".travsr").join("lang.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else { return vec![] };
-    let Ok(table) = toml::from_str::<toml::Value>(&content) else { return vec![] };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let Ok(table) = toml::from_str::<toml::Value>(&content) else {
+        return vec![];
+    };
     table
         .get("registered")
         .and_then(|v| v.as_array())

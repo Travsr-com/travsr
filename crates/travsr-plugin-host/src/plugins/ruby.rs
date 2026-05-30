@@ -1,5 +1,5 @@
-use travsr_core::Language;
 use super::generic::LanguageConfig;
+use travsr_core::Language;
 
 pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::Ruby,
@@ -11,8 +11,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (singleton_method name: (identifier) @fn.name)
 "#,
     capture_kinds: &[
-        ("class.name",  "class",    "class"),
-        ("module.name", "class",    "class"),
-        ("fn.name",     "function", "fn"),
+        ("class.name", "class", "class"),
+        ("module.name", "class", "class"),
+        ("fn.name", "function", "fn"),
     ],
 };

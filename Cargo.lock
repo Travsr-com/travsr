@@ -3113,7 +3113,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "proptest",
- "prost",
+ "protobuf",
  "scip",
  "serde_json",
  "sha2",
