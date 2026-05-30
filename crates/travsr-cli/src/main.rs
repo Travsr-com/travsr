@@ -129,6 +129,15 @@ enum DaemonAction {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Hidden subcommand: __plugin <lang>
+    // Invoked by the daemon's sidecar supervisor to run a built-in language plugin.
+    // Not user-facing — intentionally absent from --help output.
+    if let Some("__plugin") = std::env::args().nth(1).as_deref() {
+        let lang = std::env::args().nth(2).unwrap_or_default();
+        travsr_plugin_sdk::run_builtin(&lang);
+        return;
+    }
+
     // Suppress the broken-pipe panic from `println!` when a pipe consumer
     // closes early (e.g. `travsr graph --all --format dot | head`).
     std::panic::set_hook(Box::new(|info| {

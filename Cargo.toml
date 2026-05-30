@@ -3,14 +3,15 @@ resolver = "2"
 members = [
     "crates/travsr-error",
     "crates/travsr-core",
+    "crates/travsr-plugin-protocol",
+    "crates/travsr-plugin-sdk",
+    "crates/travsr-plugin-host",
     "crates/travsr-indexer",
     "crates/travsr-store",
     "crates/travsr-retrieval",
     "crates/travsr-mcp",
     "crates/travsr-daemon",
     "crates/travsr-cli",
-    "crates/travsr-plugin-protocol",
-    "crates/travsr-plugin-sdk",
 ]
 
 [workspace.package]
@@ -22,7 +23,10 @@ repository = "https://github.com/Travsr-com/travsr"
 rust-version = "1.75"
 
 [workspace.dependencies]
-travsr-error = { path = "crates/travsr-error" }
+travsr-error           = { path = "crates/travsr-error" }
+travsr-plugin-protocol = { path = "crates/travsr-plugin-protocol" }
+travsr-plugin-sdk      = { path = "crates/travsr-plugin-sdk" }
+travsr-plugin-host     = { path = "crates/travsr-plugin-host" }
 anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }

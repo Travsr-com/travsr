@@ -13,6 +13,7 @@ travsr-core = { path = "../travsr-core" }
 travsr-mcp = { path = "../travsr-mcp" }
 travsr-indexer = { path = "../travsr-indexer" }
 travsr-store = { path = "../travsr-store" }
+travsr-plugin-host = { path = "../travsr-plugin-host" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
