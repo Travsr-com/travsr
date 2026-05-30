@@ -12,13 +12,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/raj-rkv/travsr"
+    "url": "https://github.com/Travsr-com/travsr"
   },
   "homepage": "https://travsr.com",
   "bugs": {
-    "url": "https://github.com/raj-rkv/travsr/issues"
+    "url": "https://github.com/Travsr-com/travsr/issues"
   },
-  "qna": "https://github.com/raj-rkv/travsr/discussions",
+  "qna": "https://github.com/Travsr-com/travsr/discussions",
   "pricing": "Free",
   "keywords": [
     "mcp",

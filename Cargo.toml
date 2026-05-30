@@ -16,7 +16,7 @@ version = "0.6.0"
 edition = "2021"
 license = "MIT"
 authors = ["Travsr Contributors"]
-repository = "https://github.com/raj-rkv/travsr"
+repository = "https://github.com/Travsr-com/travsr"
 rust-version = "1.75"
 
 [workspace.dependencies]
