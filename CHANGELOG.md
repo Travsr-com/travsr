@@ -4,6 +4,90 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v0.6.0 - 2026-05-31
+
+This release ships the complete Phase 2 retrieval stack, the VS Code graph panel,
+line-number storage for go-to-definition, and a new `get_graph_stats` introspection
+tool. All seven MCP tools are now fully implemented.
+
+### Retrieval
+
+- **0-1 knapsack token-budget enforcer** (`travsr-retrieval`): Implements RFC-010.
+  Given a set of PPR-scored nodes and a token budget, the knapsack solver selects
+  the highest-value subgraph that fits the budget. Powers the `get_context` MCP tool
+  and `travsr ask`.
+
+- **`get_context` MCP tool**: Full PPR traversal ranked by relevance, budget-capped
+  by the knapsack solver. Accepts an optional `token_budget` argument; defaults to
+  the workspace-wide constant `MAX_CONTEXT_BUDGET`.
+
+- **`travsr ask` upgraded to PPR + knapsack**: The CLI `ask` command now uses the
+  full retrieval pipeline instead of raw BFS. Results are scored by PPR and trimmed
+  to the token budget.
+
+### VS Code Extension
+
+- **Cytoscape.js graph panel** (`travsr-vscode`): A `WebviewPanel` rendering the
+  live dependency graph for the active file. Supports kind filtering, two-hop import
+  traversal, unique file node IDs, and the Travsr brand logo in the titlebar. Open
+  via the sidebar or `Travsr: Show Graph` in the command palette.
+
+- **`get_graph_stats` integration**: The status bar node count now reads from the
+  `get_graph_stats` MCP tool instead of a stale cached value.
+
+- **Bug fixes** (PR #226): Cache key collision, timer leak, loading state
+  inconsistency, duplicate welcome panel, and blast-radius called per-symbol instead
+  of per-file.
+
+### MCP
+
+- **`get_graph_stats` tool** (`travsr-mcp`): Returns accurate live node and edge
+  counts for the indexed graph. Used by the VS Code status bar.
+
+### Core / Indexer
+
+- **Line numbers stored on nodes** (PR #249, #250): Every non-file, non-import node
+  now carries a 1-based `line` field populated by all four Tree-sitter parsers
+  (TypeScript, Rust, Python, Go). The `travsr-mcp` and `travsr-vscode` layers
+  forward the field to callers. Enables go-to-definition in IDE integrations.
+
+### Daemon / CLI
+
+- **Daemon reliability fixes** (PR #223): Registry guard prevents double-registration
+  on concurrent `travsr init` calls; `SKIP_DIRS` now respected during walk; `init`
+  totals match actual indexed counts.
+
+- **`travsr index` JSON fixes**: Retry daemon status ping 3x before reporting running;
+  include all indexed nodes in JSON output; add `corpus` field to each node entry.
+
+- **`delete_nodes_for_path_prefix`** (`travsr-store`): New store primitive used by
+  the daemon when a directory is deleted between commits.
+
+### CI
+
+- **Fuzz corpus seeds** (PR #251): Added missing seed files for `fuzz_go_parser`,
+  `fuzz_pcst_session`, and `fuzz_pyright_lsif_parser`; the nightly fuzz job no longer
+  fails with empty-corpus errors.
+
+- **Release tag glob fix**: `release.yml` tag pattern no longer matches `vscode-v*`
+  tags, preventing spurious binary publish runs on VS Code extension releases.
+
+### Architecture
+
+- **RFC-011 - Two-transport plugin architecture**: Defines how future language plugins
+  expose both an in-process tree-sitter path (fast, zero-IPC) and an out-of-process
+  LSP/LSIF path (accurate, sandboxed). Adopted in ADR-017.
+
+- **ADR-017 - Unified plugin sandbox trust model**: Establishes the trust boundary
+  for out-of-process plugins and the capability set they may request.
+
+- **RFC-008, RFC-009, ADR-009, ADR-010**: Multi-language extension architecture docs
+  covering TypeScript, Python, Go, and Rust LSIF integration strategies.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.5.1...v0.6.0
+
+---
+
 ## v0.3.1 — 2026-05-21
 
 Security patch release on top of v0.3.0. No new features. Upgrade strongly recommended.
