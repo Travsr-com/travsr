@@ -1,7 +1,6 @@
 //! Generic Phase B runner — executes any catalog entry against a repo root.
 //! LSIF output is ingested via travsr_indexer::ingest_lsif.
-//! SCIP output: stub (returns empty InvokeResponse with warning) — full SCIP
-//! ingestion is a separate sprint deliverable.
+//! SCIP output is ingested via travsr_indexer::ingest_scip.
 
 use crate::phase_b::catalog::{OutputFormat, PhaseBEntry};
 use anyhow::Context as _;
@@ -15,6 +14,11 @@ const PHASE_B_TIMEOUT: Duration = Duration::from_secs(300);
 /// Run a Phase B tool for a repo root and return the graph output.
 /// Blocks until the tool exits or the timeout is reached.
 pub fn run_phase_b(entry: &PhaseBEntry, root: &Path) -> anyhow::Result<InvokeResponse> {
+    // Create a scratch dir for SCIP output files. Kept alive until after ingest.
+    let scratch = tempfile::TempDir::new().context("creating SCIP output scratch dir")?;
+    let scip_output = scratch.path().join("index.scip");
+    let scip_out_str = scip_output.to_string_lossy().into_owned();
+
     // Substitute path placeholders in args
     let root_str = root.to_string_lossy();
     let tsconfig = root.join("tsconfig.json");
@@ -26,6 +30,7 @@ pub fn run_phase_b(entry: &PhaseBEntry, root: &Path) -> anyhow::Result<InvokeRes
         .map(|&a| {
             a.replace("{root}", &root_str)
                 .replace("{tsconfig}", &tsconfig_str)
+                .replace("{output}", &scip_out_str)
         })
         .collect();
 
@@ -102,20 +107,23 @@ pub fn run_phase_b(entry: &PhaseBEntry, root: &Path) -> anyhow::Result<InvokeRes
             })
         }
         OutputFormat::Scip => {
-            // TODO(travsr): #254 — implement SCIP protobuf ingestion
-            // scip-go, scip-java, scip-php etc. emit binary protobuf to a file,
-            // not JSON to stdout. Full SCIP ingestion requires:
-            //   1. Write output to a temp file (--output flag)
-            //   2. Parse the SCIP protobuf
-            //   3. Convert to travsr Node/Edge
-            // Tracked separately. For now return empty output with a warning.
-            warn!(
-                lang = entry.language,
-                "SCIP ingestion not yet implemented — Phase B output from `{}` discarded. \
-                 Tracking issue #254.",
-                entry.command
-            );
-            Ok(InvokeResponse::default())
+            if scip_output.exists() {
+                let out = travsr_indexer::ingest_scip(&scip_output, "")
+                    .context("SCIP ingest failed")?;
+                // scratch is still alive here — drop happens after this block
+                Ok(InvokeResponse {
+                    nodes: out.nodes,
+                    edges: out.edges,
+                })
+            } else {
+                warn!(
+                    lang = entry.language,
+                    "SCIP tool `{}` produced no output at {} — check tool installation",
+                    entry.command,
+                    scip_output.display()
+                );
+                Ok(InvokeResponse::default())
+            }
         }
     }
 }

@@ -23,7 +23,47 @@ impl TrustConfig {
         self.trusted_corpora.contains(corpus)
     }
 }
-impl Default for TrustConfig { fn default() -> Self { Self::new() } }
+impl Default for TrustConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrustConfig {
+    /// Load trusted corpora from ~/.travsr/lang.toml (written by `travsr lang add --corpus`).
+    pub fn from_disk() -> Self {
+        let mut cfg = Self::new();
+        let Some(home) = dirs::home_dir() else { return cfg };
+        let path = home.join(".travsr").join("lang.toml");
+        let Ok(content) = std::fs::read_to_string(&path) else { return cfg };
+        let Ok(table) = toml::from_str::<toml::Value>(&content) else { return cfg };
+        if let Some(corpora) = table.get("trusted_corpora").and_then(|v| v.as_array()) {
+            for c in corpora {
+                if let Some(s) = c.as_str() {
+                    cfg.trust(s);
+                }
+            }
+        }
+        cfg
+    }
+}
+
+/// Read the `registered` language list from ~/.travsr/lang.toml.
+pub fn registered_languages_from_disk() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else { return vec![] };
+    let path = home.join(".travsr").join("lang.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else { return vec![] };
+    let Ok(table) = toml::from_str::<toml::Value>(&content) else { return vec![] };
+    table
+        .get("registered")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 mod tests {

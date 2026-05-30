@@ -11,11 +11,17 @@ use crate::transport::Transport;
 pub struct Dispatcher {
     pub corpus: String,
     by_ext: HashMap<String, Arc<dyn Transport>>,
+    /// language → supports_phase_b, populated during register().
+    phase_b_flags: HashMap<String, bool>,
 }
 
 impl Dispatcher {
     pub fn new(corpus: impl Into<String>) -> Self {
-        Self { corpus: corpus.into(), by_ext: HashMap::new() }
+        Self {
+            corpus: corpus.into(),
+            by_ext: HashMap::new(),
+            phase_b_flags: HashMap::new(),
+        }
     }
 
     /// Register a plugin transport from its handshake. Fail-fast on version or language mismatch.
@@ -33,10 +39,21 @@ impl Dispatcher {
         if language_from_proto_str(&handshake.language).is_none() {
             return Err(IndexError::UnknownLanguage { reported: handshake.language });
         }
+        self.phase_b_flags
+            .insert(handshake.language.clone(), handshake.supports_phase_b);
         for ext in handshake.extensions {
             self.by_ext.insert(ext, Arc::clone(&transport));
         }
         Ok(())
+    }
+
+    /// Return canonical language strings for plugins that declared supports_phase_b = true.
+    pub fn phase_b_languages(&self) -> Vec<&str> {
+        self.phase_b_flags
+            .iter()
+            .filter(|(_, &v)| v)
+            .map(|(k, _)| k.as_str())
+            .collect()
     }
 
     /// Dispatch a file parse. Returns Ok(None) for unrecognised extensions.

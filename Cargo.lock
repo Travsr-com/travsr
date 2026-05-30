@@ -1915,6 +1915,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "protobuf"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
+dependencies = [
+ "once_cell",
+ "protobuf-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf-support"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2287,6 +2307,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scip"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4d0e81b39f590b2edbe2369760641511898ed34062aed2e18e6d05eead3d6b7"
+dependencies = [
+ "protobuf",
 ]
 
 [[package]]
@@ -3084,6 +3113,8 @@ dependencies = [
  "anyhow",
  "criterion",
  "proptest",
+ "prost",
+ "scip",
  "serde_json",
  "sha2",
  "tempfile",
@@ -3132,10 +3163,12 @@ name = "travsr-plugin-host"
 version = "0.5.1"
 dependencies = [
  "anyhow",
+ "dirs",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "toml",
  "tracing",
  "travsr-core",
  "travsr-error",

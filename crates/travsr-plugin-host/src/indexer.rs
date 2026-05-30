@@ -63,22 +63,53 @@ impl PluginIndexer {
     ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
         if !trust.is_trusted(&self.corpus) {
             tracing::info!(
-                "Phase B skipped for corpus '{}' — run: travsr config set plugins.trust.{} true",
+                "Phase B skipped for corpus '{}' — run: travsr lang add <lang> --corpus {}",
                 self.corpus, self.corpus
             );
             return (vec![], vec![]);
         }
+
         let mut all_nodes = Vec::new();
         let mut all_edges = Vec::new();
+
+        // 1. Built-in languages with Phase B (TypeScript via travsr-lsif-ts, Rust via
+        //    rust-analyzer). Spawn a Sidecar so the call runs sandboxed per ADR-017.
+        let current_exe = std::env::current_exe().unwrap_or_default();
+        let exe_str = current_exe.to_string_lossy().into_owned();
         let req = travsr_plugin_protocol::InvokeRequest { root: repo_root.to_path_buf() };
-        for transport in self.dispatcher.transports() {
-            if transport.health() != crate::transport::PluginHealth::Ok { continue; }
-            match transport.invoke_phase_b(req.clone()) {
-                Ok(resp) => { all_nodes.extend(resp.nodes); all_edges.extend(resp.edges); }
-                Err(travsr_error::IndexError::PhaseNotSupported) => {}
-                Err(e) => tracing::warn!("Phase B transport error: {e}"),
+
+        for lang in self.dispatcher.phase_b_languages() {
+            match crate::transport::Sidecar::spawn(lang, &exe_str, repo_root) {
+                Ok(sidecar) => {
+                    match crate::transport::Transport::invoke_phase_b(&sidecar, req.clone()) {
+                        Ok(resp) => {
+                            all_nodes.extend(resp.nodes);
+                            all_edges.extend(resp.edges);
+                        }
+                        Err(travsr_error::IndexError::PhaseNotSupported) => {}
+                        Err(e) => tracing::warn!("Phase B {lang}: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("Phase B sidecar spawn {lang}: {e}"),
             }
         }
+
+        // 2. Catalog Phase B tools (scip-go, scip-java, etc.) registered in
+        //    ~/.travsr/lang.toml.
+        let registered = crate::trust::registered_languages_from_disk();
+        for entry in crate::phase_b::catalog::CATALOG {
+            if !registered.iter().any(|r| r == entry.language) {
+                continue;
+            }
+            match crate::phase_b::runner::run_phase_b(entry, repo_root) {
+                Ok(resp) => {
+                    all_nodes.extend(resp.nodes);
+                    all_edges.extend(resp.edges);
+                }
+                Err(e) => tracing::warn!("Phase B {}: {e}", entry.language),
+            }
+        }
+
         (all_nodes, all_edges)
     }
 

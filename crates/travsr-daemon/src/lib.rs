@@ -177,7 +177,7 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
     // Runs once per full init, not per commit (PERF-002). Trust gate inside.
     {
-        let trust = travsr_plugin_host::trust::TrustConfig::new();
+        let trust = travsr_plugin_host::trust::TrustConfig::from_disk();
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
         let (pb_nodes, pb_edges) = phase_b_indexer.invoke_phase_b_all(repo_root, &trust);
         for node in &pb_nodes {
