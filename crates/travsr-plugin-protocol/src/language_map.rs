@@ -8,6 +8,8 @@ pub fn language_from_proto_str(s: &str) -> Option<Language> {
         "rust"   => Some(Language::Rust),
         "python" => Some(Language::Python),
         "go"     => Some(Language::Go),
+        "java"   => Some(Language::Java),
+        "kotlin" => Some(Language::Kotlin),
         _ => None,
     }
 }
@@ -27,6 +29,8 @@ mod tests {
             ("rust", Language::Rust),
             ("python", Language::Python),
             ("go", Language::Go),
+            ("java", Language::Java),
+            ("kotlin", Language::Kotlin),
         ] {
             assert_eq!(language_from_proto_str(s), Some(expected), "failed for {s}");
         }
@@ -34,7 +38,7 @@ mod tests {
     #[test]
     fn unknown_language_returns_none() {
         assert_eq!(language_from_proto_str("TypeScript"), None); // case-sensitive
-        assert_eq!(language_from_proto_str("kotlin"), None);
+        assert_eq!(language_from_proto_str("Kotlin"), None);     // case-sensitive
         assert_eq!(language_from_proto_str(""), None);
     }
 }

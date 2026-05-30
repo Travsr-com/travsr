@@ -6,6 +6,8 @@ use crate::plugins::typescript::TypeScriptPlugin;
 use crate::plugins::rust::RustPlugin;
 use crate::plugins::python::PythonPlugin;
 use crate::plugins::go::GoPlugin;
+use crate::plugins::java::JavaPlugin;
+use crate::plugins::kotlin::KotlinPlugin;
 
 /// Register all first-party in-process plugins into `dispatcher`.
 /// Called once when PluginIndexer is created.
@@ -30,4 +32,6 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
     register!(RustPlugin,       "rust",       &["rs"],                       true);
     register!(PythonPlugin,     "python",     &["py", "pyi"],                false);
     register!(GoPlugin,         "go",         &["go"],                       false);
+    register!(JavaPlugin,       "java",       &["java"],                     false);
+    register!(KotlinPlugin,     "kotlin",     &["kt", "kts"],                false);
 }

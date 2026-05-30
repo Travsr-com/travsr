@@ -20,6 +20,10 @@ pub enum FfiMarkerKind {
     PyO3Call,
     /// Go `C.<name>` call-site in a cgo file.
     GoCallC,
+    /// Java `native` method export (P5-S4, consumed by JNI bridge in P5-S5).
+    JniExport,
+    /// Call into Java via JNI from Go or Rust.
+    JniCall,
 }
 
 /// A single FFI boundary marker emitted by a per-language indexer.

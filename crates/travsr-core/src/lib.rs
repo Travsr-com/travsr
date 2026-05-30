@@ -118,6 +118,8 @@ pub enum Language {
     Rust,
     Python,
     Go,
+    Java,
+    Kotlin,
 }
 
 impl Language {
@@ -130,6 +132,8 @@ impl Language {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
             "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "kt" | "kts" => Some(Self::Kotlin),
             _ => None,
         }
     }
@@ -141,6 +145,8 @@ impl Language {
             Self::Rust => "rust",
             Self::Python => "python",
             Self::Go => "go",
+            Self::Java => "java",
+            Self::Kotlin => "kotlin",
         }
     }
 
@@ -152,6 +158,8 @@ impl Language {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
             "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "kotlin" => Some(Self::Kotlin),
             _ => None,
         }
     }

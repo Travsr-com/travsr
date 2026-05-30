@@ -19,6 +19,9 @@ tracing    = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 tempfile   = { workspace = true }
+tree-sitter        = { workspace = true }
+tree-sitter-java   = { workspace = true }
+tree-sitter-kotlin = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
