@@ -2962,6 +2962,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "travsr-plugin-protocol"
+version = "0.5.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "travsr-core",
+ "travsr-error",
+]
+
+[[package]]
+name = "travsr-plugin-sdk"
+version = "0.5.1"
+dependencies = [
+ "serde_json",
+ "tracing",
+ "travsr-core",
+ "travsr-plugin-protocol",
+]
+
+[[package]]
 name = "travsr-retrieval"
 version = "0.5.1"
 dependencies = [

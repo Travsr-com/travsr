@@ -1,0 +1,40 @@
+use travsr_core::Language;
+
+/// Map a canonical proto language string to a Language variant.
+/// Case-sensitive. Returns None for unrecognised values.
+pub fn language_from_proto_str(s: &str) -> Option<Language> {
+    match s {
+        "typescript" | "javascript" => Some(Language::TypeScript),
+        "rust"   => Some(Language::Rust),
+        "python" => Some(Language::Python),
+        "go"     => Some(Language::Go),
+        _ => None,
+    }
+}
+
+pub fn language_to_proto_str(lang: Language) -> &'static str {
+    lang.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn known_languages_round_trip() {
+        for (s, expected) in [
+            ("typescript", Language::TypeScript),
+            ("javascript", Language::TypeScript),
+            ("rust", Language::Rust),
+            ("python", Language::Python),
+            ("go", Language::Go),
+        ] {
+            assert_eq!(language_from_proto_str(s), Some(expected), "failed for {s}");
+        }
+    }
+    #[test]
+    fn unknown_language_returns_none() {
+        assert_eq!(language_from_proto_str("TypeScript"), None); // case-sensitive
+        assert_eq!(language_from_proto_str("kotlin"), None);
+        assert_eq!(language_from_proto_str(""), None);
+    }
+}

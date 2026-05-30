@@ -9,6 +9,8 @@ members = [
     "crates/travsr-mcp",
     "crates/travsr-daemon",
     "crates/travsr-cli",
+    "crates/travsr-plugin-protocol",
+    "crates/travsr-plugin-sdk",
 ]
 
 [workspace.package]

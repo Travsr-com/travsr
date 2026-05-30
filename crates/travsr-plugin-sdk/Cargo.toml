@@ -1,0 +1,15 @@
+[package]
+name = "travsr-plugin-sdk"
+description = "Travsr plugin SDK — run-loop and ergonomics for plugin authors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+travsr-plugin-protocol = { path = "../travsr-plugin-protocol" }
+travsr-core = { path = "../travsr-core" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
