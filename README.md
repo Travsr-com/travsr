@@ -182,16 +182,15 @@ In global mode, tools that accept a `file` or `symbol` argument also accept
 an optional `repo` parameter to target a specific registered repo. Omitting
 `repo` searches all registered repos.
 
-| Tool | Required | Optional | Description | Status |
-|---|---|---|---|---|
-| `get_dependencies(file)` | `file` — file path | `repo` | Return all imports/dependencies of a file | Available |
-| `get_callers(symbol)` | `symbol` — symbol name | `repo` | Return all nodes with an incoming edge to a symbol | Available |
-| `get_blast_radius(file)` | `file` — file path | `repo` | Return the set of files transitively affected if the given file changes | Phase 3 |
-| `search_symbol(name)` | `name` — symbol name | `repo` | Find symbol definitions matching a name across the indexed graph | Phase 3 |
-| `get_repo_map` | — | `repo` | Return a structural overview of the indexed repository | Phase 3 |
-
-> Phase 3 tools are registered and respond with well-formed JSON-RPC. Full
-> graph traversal implementations (PPR + PCST + k-core) ship in Phase 3.
+| Tool | Required | Optional | Description |
+|---|---|---|---|
+| `get_dependencies(file)` | `file` — file path | `repo` | Return all imports/dependencies of a file |
+| `get_callers(symbol)` | `symbol` — symbol name | `repo` | Return all nodes with an incoming edge to a symbol |
+| `get_blast_radius(file)` | `file` — file path | `repo` | Return the set of files transitively affected if the given file changes |
+| `search_symbol(name)` | `name` — symbol name | `repo` | Find symbol definitions matching a name across the indexed graph |
+| `get_repo_map` | — | `repo` | Return a structural overview of the indexed repository |
+| `get_execution_path(source, sink)` | `source`, `sink` — symbol names | `repo` | Return the PCST-optimal execution path between two symbols |
+| `get_context(query, token_budget)` | `query` — search term | `repo`, `token_budget` | PPR traversal ranked by relevance, budget-capped by 0-1 knapsack |
 
 ---
 
@@ -201,7 +200,7 @@ an optional `repo` parameter to target a specific registered repo. Omitting
 travsr init                      Index the repo, install git hook, register globally
 travsr repos                     List all globally registered repos
 travsr status                    Show node/edge counts, schema version, last-indexed SHA
-travsr ask <query>               BFS symbol lookup from the terminal (partial match)
+travsr ask <query>               PPR + knapsack symbol lookup from the terminal (partial match)
 travsr migrate --to kuzu         Migrate the graph store from SQLite to Kùzu backend
 travsr mcp --stdio               Start the MCP stdio server (single-repo, cwd-based)
 travsr mcp --stdio --global      Start the MCP stdio server (all registered repos)
@@ -303,6 +302,21 @@ travsr graph --all --format json
 
 ---
 
+## VS Code Extension
+
+Install the **Travsr** extension from the VS Code Marketplace (`travsr.travsr-vscode`).
+
+The extension connects to your local Travsr daemon over MCP and adds:
+
+- **Status bar**: daemon connection state and indexed node count
+- **Code lens**: inline "N callers" annotations on function definitions
+- **Hover**: dependency list on import statements
+- **Graph panel**: interactive dependency graph rendered with Cytoscape.js; supports kind filtering and two-hop import traversal; open via the Travsr sidebar or the command palette (`Travsr: Show Graph`)
+
+The extension uses your installed `travsr` binary. Set `travsr.binaryPath` in VS Code settings to override the binary location.
+
+---
+
 ## Storage Backends
 
 | Backend | Flag | Best for | Status |
@@ -347,17 +361,17 @@ travsr migrate --to kuzu   (optional, kuzu build only)
 re-indexed automatically. The graph is also fully queryable immediately after
 `travsr init`, before any commit.
 
-Language support: **TypeScript / TSX**. Python, Go, Rust planned.
+Language support: **TypeScript / TSX, Rust, Python, Go**.
 
 ### Retrieval algorithms
 
 | Algorithm | When used | Status |
 |---|---|---|
-| BFS depth-3 | All `get_dependencies` / `get_callers` queries | Available |
-| Personalized PageRank (PPR) | `get_context` and deep traversal | Available (Phase 2) — α=0.85, ε=1e-6, p95 < 50ms on 1k-file fixture |
-| Prize-Collecting Steiner Tree | `get_execution_path` (Phase 3) | Planned |
-| k-core decomposition | Buried-middle recovery (Phase 3) | Planned |
-| 0-1 Knapsack | Token budget optimisation (Phase 3) | Planned |
+| BFS depth-3 | `get_dependencies` / `get_callers` queries | Available |
+| Personalized PageRank (PPR) | `get_context` and deep traversal | Available (α=0.15, ε=1e-6, p95 < 50ms on 1k-file fixture) |
+| 0-1 Knapsack | Token budget cap on `get_context` results | Available |
+| Prize-Collecting Steiner Tree | `get_execution_path`: optimal path between two symbols | Available |
+| k-core decomposition | Buried-middle recovery | Planned |
 
 ### Edge kinds
 

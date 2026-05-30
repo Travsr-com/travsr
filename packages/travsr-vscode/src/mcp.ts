@@ -32,7 +32,7 @@ export class StdioMcpClient implements McpClient {
   constructor(
     private readonly binary: string,
     private readonly cwd?: string,
-    private readonly version: string = "0.3.0"
+    private readonly version: string = "0.5.0"
   ) {}
 
   onDisconnect(cb: () => void): { dispose(): void } {
