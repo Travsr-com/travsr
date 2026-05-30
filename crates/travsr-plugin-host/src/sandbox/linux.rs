@@ -33,7 +33,15 @@ pub fn build_sandboxed_command(
     cmd.args(["--bind", scratch.as_ref(), scratch.as_ref()]);   // scratch: rw
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]);      // repo: ro
     cmd.args(["--die-with-parent", "--"]);
-    cmd.arg(program).args(args);
+    // Resource caps (ADR-017 Rule 1): 4 GiB virtual memory + 300s CPU via ulimit.
+    let quoted_args = args.iter()
+        .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
+        .collect::<Vec<_>>().join(" ");
+    let inner = format!(
+        "ulimit -v 4194304 2>/dev/null; ulimit -t 300 2>/dev/null; exec '{}' {}",
+        program.replace('\'', r"'\''"), quoted_args
+    );
+    cmd.args(["sh", "-c", &inner]);
     cmd.env_clear();
     for key in ENV_ALLOWLIST {
         if let Ok(val) = std::env::var(key) { cmd.env(key, val); }

@@ -68,6 +68,8 @@ pub struct Sidecar {
     child: Option<Mutex<std::process::Child>>,
     io: Option<Mutex<SidecarIo>>,
     health: Mutex<PluginHealth>,
+    /// Per-invocation scratch tmpdir (ADR-017 Rule 1 — read-write, cleaned up on drop).
+    _scratch: Option<tempfile::TempDir>,
 }
 
 impl Sidecar {
@@ -81,6 +83,7 @@ impl Sidecar {
             health: Mutex::new(PluginHealth::Disabled(
                 "Sidecar spawn not yet implemented (P5-S3)".into(),
             )),
+            _scratch: None,
         }
     }
 
@@ -92,10 +95,18 @@ impl Sidecar {
         lang: &str,
         program: &str,
         repo_root: &std::path::Path,
-        scratch_dir: &std::path::Path,
     ) -> Result<Self, IndexError> {
+        // Create per-invocation scratch tmpdir (ADR-017 Rule 1).
+        // Dropped when Sidecar drops — guarantees cleanup even on error paths.
+        let scratch = tempfile::Builder::new()
+            .prefix("travsr-plugin-")
+            .tempdir()
+            .map_err(|e| IndexError::Parse {
+                file: format!("plugin:{lang}"),
+                message: format!("failed to create scratch dir: {e}"),
+            })?;
         let args = ["__plugin", lang];
-        let mut cmd = Self::build_cmd(program, &args, repo_root, scratch_dir)
+        let mut cmd = Self::build_cmd(program, &args, repo_root, scratch.path())
             .map_err(|e| IndexError::Parse {
                 file: format!("plugin:{lang}"),
                 message: e.to_string(),
@@ -151,6 +162,7 @@ impl Sidecar {
             child: Some(Mutex::new(child)),
             io: Some(Mutex::new((writer, reader))),
             health: Mutex::new(PluginHealth::Ok),
+            _scratch: Some(scratch),
         })
     }
 

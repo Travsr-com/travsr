@@ -63,6 +63,15 @@ impl Dispatcher {
             None => Ok(None),
         }
     }
+
+    /// Iterate over unique transports — deduplicates by Arc pointer so Phase B
+    /// is invoked once per language, not once per extension.
+    pub fn transports(&self) -> impl Iterator<Item = &Arc<dyn Transport>> {
+        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        self.by_ext.values().filter(move |t| {
+            seen.insert(Arc::as_ptr(*t) as *const ())
+        })
+    }
 }
 
 #[cfg(test)]

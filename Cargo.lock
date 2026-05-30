@@ -3030,6 +3030,7 @@ dependencies = [
  "travsr-daemon",
  "travsr-indexer",
  "travsr-mcp",
+ "travsr-plugin-host",
  "travsr-plugin-sdk",
  "travsr-retrieval",
  "travsr-store",

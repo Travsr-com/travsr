@@ -53,13 +53,41 @@ impl PluginIndexer {
         Ok(response_to_output(resp))
     }
 
+    /// Phase B: semantic indexing for all trusted, registered languages.
+    /// Called from `init_repo` once per full index — not per commit.
+    /// ADR-017 Rule 3: checks trust before any code-executing subprocess spawns.
+    pub fn invoke_phase_b_all(
+        &self,
+        repo_root: &std::path::Path,
+        trust: &crate::trust::TrustConfig,
+    ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
+        if !trust.is_trusted(&self.corpus) {
+            tracing::info!(
+                "Phase B skipped for corpus '{}' — run: travsr config set plugins.trust.{} true",
+                self.corpus, self.corpus
+            );
+            return (vec![], vec![]);
+        }
+        let mut all_nodes = Vec::new();
+        let mut all_edges = Vec::new();
+        let req = travsr_plugin_protocol::InvokeRequest { root: repo_root.to_path_buf() };
+        for transport in self.dispatcher.transports() {
+            if transport.health() != crate::transport::PluginHealth::Ok { continue; }
+            match transport.invoke_phase_b(req.clone()) {
+                Ok(resp) => { all_nodes.extend(resp.nodes); all_edges.extend(resp.edges); }
+                Err(travsr_error::IndexError::PhaseNotSupported) => {}
+                Err(e) => tracing::warn!("Phase B transport error: {e}"),
+            }
+        }
+        (all_nodes, all_edges)
+    }
+
     /// Resolve cross-language FFI edges from accumulated markers.
     /// Delegates to the existing travsr_indexer resolver.
     pub fn resolve_ffi_edges(
         &self,
         markers: &[travsr_indexer::FfiMarker],
     ) -> Vec<travsr_core::Edge> {
-        // Use a temporary Indexer just for FFI resolution (it's stateless for this call)
         travsr_indexer::Indexer::with_corpus(&self.corpus).resolve_ffi_edges(markers)
     }
 }
