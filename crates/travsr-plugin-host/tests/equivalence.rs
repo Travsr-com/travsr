@@ -270,3 +270,62 @@ fn cache_hit_produces_identical_output() {
         "cache hit changed edge count"
     );
 }
+
+// ── Java golden fixture ───────────────────────────────────────────────────────
+
+#[test]
+fn java_golden_fixture_produces_expected_nodes() {
+    let fixture = std::path::Path::new("tests/fixtures/Hello.java");
+    if !fixture.exists() {
+        panic!("fixture missing: tests/fixtures/Hello.java");
+    }
+    let out = new_parse(fixture, "src/PaymentService.java");
+
+    // Must have a file node
+    assert!(out.nodes.iter().any(|n| n.kind == "file"), "missing file node");
+
+    // Must find PaymentService class
+    assert!(
+        out.nodes.iter().any(|n| n.kind == "class"
+            && n.vname.signature.contains("PaymentService")),
+        "missing PaymentService class\nnodes: {:?}",
+        out.nodes.iter().map(|n| (&n.kind, &n.vname.signature)).collect::<Vec<_>>()
+    );
+
+    // Must find methods
+    let methods: Vec<_> = out.nodes.iter()
+        .filter(|n| n.kind == "method" || n.kind == "constructor" || n.kind == "function")
+        .collect();
+    assert!(methods.len() >= 2, "expected ≥2 methods, got {}", methods.len());
+
+    // Must find imports
+    assert!(out.nodes.iter().any(|n| n.kind == "import"), "missing import nodes");
+
+    // Old Indexer returns empty for Java — PluginIndexer adds real content
+    let old = old_parse(fixture, "src/PaymentService.java");
+    assert!(out.nodes.len() > old.nodes.len(), "PluginIndexer should produce more than old empty path");
+}
+
+// ── Kotlin golden fixture ─────────────────────────────────────────────────────
+
+#[test]
+fn kotlin_golden_fixture_produces_expected_nodes() {
+    let fixture = std::path::Path::new("tests/fixtures/Hello.kt");
+    if !fixture.exists() {
+        panic!("fixture missing: tests/fixtures/Hello.kt");
+    }
+    let out = new_parse(fixture, "src/PaymentService.kt");
+
+    assert!(out.nodes.iter().any(|n| n.kind == "file"), "missing file node");
+    assert!(
+        out.nodes.iter().any(|n| n.kind == "class"
+            && n.vname.signature.contains("PaymentService")),
+        "missing PaymentService class\nnodes: {:?}",
+        out.nodes.iter().map(|n| (&n.kind, &n.vname.signature)).collect::<Vec<_>>()
+    );
+    let fns: Vec<_> = out.nodes.iter().filter(|n| n.kind == "function").collect();
+    assert!(fns.len() >= 1, "expected ≥1 function, got {}", fns.len());
+
+    let old = old_parse(fixture, "src/PaymentService.kt");
+    assert!(out.nodes.len() > old.nodes.len(), "PluginIndexer should produce more than old empty path");
+}
