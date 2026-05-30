@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use tree_sitter::{Parser, Query, QueryCursor};
 use travsr_core::{Language, Node, VName};
 use travsr_plugin_protocol::{
     FfiMarker as WireFfi, FfiMarkerKind as WireKind, InvokeRequest, InvokeResponse, ParseRequest,
     ParseResponse, Plugin,
 };
+use tree_sitter::{Parser, Query, QueryCursor};
 
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 const PARSE_TIMEOUT_MICROS: u64 = 5_000_000; // 5 seconds
@@ -81,21 +81,20 @@ fn parse_java_file(
 
             match *cap_name {
                 "class.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", &format!("class:{text}"));
+                    let vn = VName::new(corpus, "", vname_path, "java", format!("class:{text}"));
                     nodes.push(Node::new(vn, "class").with_line(line));
                 }
                 "interface.name" => {
                     let vn =
-                        VName::new(corpus, "", vname_path, "java", &format!("interface:{text}"));
+                        VName::new(corpus, "", vname_path, "java", format!("interface:{text}"));
                     nodes.push(Node::new(vn, "interface").with_line(line));
                 }
                 "enum.name" => {
-                    let vn =
-                        VName::new(corpus, "", vname_path, "java", &format!("enum:{text}"));
+                    let vn = VName::new(corpus, "", vname_path, "java", format!("enum:{text}"));
                     nodes.push(Node::new(vn, "enum").with_line(line));
                 }
                 "method.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", &format!("fn:{text}"));
+                    let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
                     // Check for native modifier on the parent method_declaration node.
                     let is_native = cap
                         .node
@@ -119,8 +118,7 @@ fn parse_java_file(
                     }
                 }
                 "constructor.name" => {
-                    let vn =
-                        VName::new(corpus, "", vname_path, "java", &format!("fn:{text}"));
+                    let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
                     nodes.push(Node::new(vn, "constructor").with_line(line));
                 }
                 "import" => {
@@ -131,13 +129,8 @@ fn parse_java_file(
                         .trim_end_matches(';')
                         .trim()
                         .to_string();
-                    let vn = VName::new(
-                        corpus,
-                        "",
-                        vname_path,
-                        "java",
-                        &format!("import:{module}"),
-                    );
+                    let vn =
+                        VName::new(corpus, "", vname_path, "java", format!("import:{module}"));
                     nodes.push(Node::new(vn, "import").with_line(line));
                 }
                 _ => {}

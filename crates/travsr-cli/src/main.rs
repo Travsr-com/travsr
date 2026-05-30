@@ -136,17 +136,26 @@ enum DaemonAction {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Hidden subcommand: __plugin <lang>
-    // Invoked by the daemon's sidecar supervisor to run a built-in language plugin.
-    // Not user-facing — intentionally absent from --help output.
+    // Invoked by the daemon's Sidecar::spawn() to run a built-in Phase A plugin
+    // over stdin/stdout. Not user-facing — absent from --help output.
+    // Must be checked before Clap parses args (Clap would reject `__plugin`).
     if let Some("__plugin") = std::env::args().nth(1).as_deref() {
         let lang = std::env::args().nth(2).unwrap_or_default();
+        use travsr_plugin_host::plugins;
         match lang.as_str() {
-            "typescript" | "javascript" => panic!("TypeScript plugin: wire impl in P5-S2"),
-            "rust"   => panic!("Rust plugin: wire impl in P5-S2"),
-            "python" => panic!("Python plugin: wire impl in P5-S2"),
-            "go"     => panic!("Go plugin: wire impl in P5-S2"),
-            other    => panic!("unknown built-in plugin language: {other:?}"),
+            "typescript" | "javascript" => {
+                travsr_plugin_sdk::run_plugin(plugins::typescript::TypeScriptPlugin)
+            }
+            "rust" => travsr_plugin_sdk::run_plugin(plugins::rust::RustPlugin),
+            "python" => travsr_plugin_sdk::run_plugin(plugins::python::PythonPlugin),
+            "go" => travsr_plugin_sdk::run_plugin(plugins::go::GoPlugin),
+            "java" => travsr_plugin_sdk::run_plugin(plugins::java::JavaPlugin),
+            other => {
+                eprintln!("travsr: unknown plugin language {other:?}");
+                std::process::exit(1);
+            }
         }
+        return;
     }
 
     // Suppress the broken-pipe panic from `println!` when a pipe consumer
@@ -159,22 +168,6 @@ async fn main() {
         eprintln!("{info}");
         std::process::exit(1);
     }));
-
-    // Sidecar mode: `travsr __plugin <language>` — dispatch to a built-in
-    // Phase A plugin. This argv check must happen before Clap parses args so
-    // the plugin can read its own stdin/stdout protocol without Clap consuming
-    // any arguments.
-    if let Some("__plugin") = std::env::args().nth(1).as_deref() {
-        let lang = std::env::args().nth(2).unwrap_or_default();
-        // TODO(P5-S2): wire real plugin implementations here.
-        match lang.as_str() {
-            "typescript" | "javascript" => panic!("TypeScript plugin: wire impl in P5-S2"),
-            "rust" => panic!("Rust plugin: wire impl in P5-S2"),
-            "python" => panic!("Python plugin: wire impl in P5-S2"),
-            "go" => panic!("Go plugin: wire impl in P5-S2"),
-            other => panic!("unknown built-in plugin language: {other:?}"),
-        }
-    }
 
     // Parse CLI args BEFORE initialising any subsystems.
     // Clap exits immediately for --version and --help via process::exit, so

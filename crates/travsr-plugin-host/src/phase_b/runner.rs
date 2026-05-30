@@ -3,12 +3,12 @@
 //! SCIP output: stub (returns empty InvokeResponse with warning) — full SCIP
 //! ingestion is a separate sprint deliverable.
 
+use crate::phase_b::catalog::{OutputFormat, PhaseBEntry};
+use anyhow::Context as _;
 use std::path::Path;
 use std::time::Duration;
-use anyhow::Context as _;
 use tracing::warn;
 use travsr_plugin_protocol::InvokeResponse;
-use crate::phase_b::catalog::{OutputFormat, PhaseBEntry};
 
 const PHASE_B_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -20,10 +20,14 @@ pub fn run_phase_b(entry: &PhaseBEntry, root: &Path) -> anyhow::Result<InvokeRes
     let tsconfig = root.join("tsconfig.json");
     let tsconfig_str = tsconfig.to_string_lossy();
 
-    let args: Vec<String> = entry.args.iter().map(|&a| {
-        a.replace("{root}", &root_str)
-         .replace("{tsconfig}", &tsconfig_str)
-    }).collect();
+    let args: Vec<String> = entry
+        .args
+        .iter()
+        .map(|&a| {
+            a.replace("{root}", &root_str)
+                .replace("{tsconfig}", &tsconfig_str)
+        })
+        .collect();
 
     // Check tool is available
     which_tool(entry.command).with_context(|| {
@@ -36,35 +40,53 @@ pub fn run_phase_b(entry: &PhaseBEntry, root: &Path) -> anyhow::Result<InvokeRes
     // Run the tool
     let mut cmd = std::process::Command::new(entry.command);
     cmd.args(&args)
-       .stdout(std::process::Stdio::piped())
-       .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("failed to spawn `{}`", entry.command))?;
 
-    // Enforce wall-clock timeout
+    // Drain stdout and stderr on background threads so the child is never
+    // blocked on a full pipe buffer (classic deadlock for multi-MB LSIF output).
+    let stdout_handle = {
+        let pipe = child.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = std::io::BufReader::new(pipe).read_to_string(&mut buf);
+            buf
+        })
+    };
+    let stderr_handle = {
+        let pipe = child.stderr.take().expect("piped stderr");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = std::io::BufReader::new(pipe).read_to_string(&mut buf);
+            buf
+        })
+    };
+
+    // Enforce wall-clock timeout. Pipes are drained above so child can make progress.
     let deadline = std::time::Instant::now() + PHASE_B_TIMEOUT;
     let status = loop {
         match child.try_wait().context("polling Phase B tool")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                anyhow::bail!("`{}` timed out after {}s", entry.command, PHASE_B_TIMEOUT.as_secs());
+                anyhow::bail!(
+                    "`{}` timed out after {}s",
+                    entry.command,
+                    PHASE_B_TIMEOUT.as_secs()
+                );
             }
             None => std::thread::sleep(Duration::from_millis(200)),
         }
     };
 
-    let mut stdout = String::new();
-    let mut stderr_out = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        use std::io::Read;
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        use std::io::Read;
-        let _ = err.read_to_string(&mut stderr_out);
-    }
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr_out = stderr_handle.join().unwrap_or_default();
 
     if !status.success() {
         anyhow::bail!("`{}` exited with {status}: {stderr_out}", entry.command);
@@ -73,9 +95,11 @@ pub fn run_phase_b(entry: &PhaseBEntry, root: &Path) -> anyhow::Result<InvokeRes
     // Ingest output
     match entry.output_format {
         OutputFormat::Lsif => {
-            let out = travsr_indexer::ingest_lsif(&stdout)
-                .context("LSIF ingest failed")?;
-            Ok(InvokeResponse { nodes: out.nodes, edges: out.edges })
+            let out = travsr_indexer::ingest_lsif(&stdout).context("LSIF ingest failed")?;
+            Ok(InvokeResponse {
+                nodes: out.nodes,
+                edges: out.edges,
+            })
         }
         OutputFormat::Scip => {
             // TODO(travsr): #254 — implement SCIP protobuf ingestion
