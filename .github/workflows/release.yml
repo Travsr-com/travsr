@@ -98,7 +98,7 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign tarball (keyless — GitHub OIDC)
+      - name: Sign tarball (keyless - GitHub OIDC)
         shell: bash
         run: |
           set -euo pipefail
@@ -120,7 +120,7 @@ jobs:
           MAX_BYTES=$((25 * 1024 * 1024))
           SIZE=$(wc -c < "dist/${STAGE}.tar.gz")
           if [ "$SIZE" -gt "$MAX_BYTES" ]; then
-            echo "ERROR: dist/${STAGE}.tar.gz is ${SIZE} bytes — exceeds 25 MB limit (${MAX_BYTES} bytes)."
+            echo "ERROR: dist/${STAGE}.tar.gz is ${SIZE} bytes - exceeds 25 MB limit (${MAX_BYTES} bytes)."
             echo "If Kùzu static linkage caused this, update the budget in this step and docs/adrs/ADR-004-error-taxonomy.md."
             exit 1
           fi
@@ -136,7 +136,7 @@ jobs:
 
   # ── Kùzu proof-build ────────────────────────────────────────────────────────
   # Validates that the `kuzu` feature compiles with the C++ toolchain present on
-  # a standard GitHub-hosted Linux runner. This is a compile-only check — the
+  # a standard GitHub-hosted Linux runner. This is a compile-only check - the
   # resulting binary is NOT published (Kùzu static linkage adds ~30-50 MB and
   # would breach the 25 MB tarball budget). See docs/adrs/ADR-004 §Consequences
   # and Issue #67 for the full rationale.
@@ -201,14 +201,10 @@ jobs:
           generate_release_notes: true
 
       - name: Setup Node.js 24
-        # Node 24 ships with npm ≥ 11.5 which supports OIDC trusted publishing.
-        # No registry-url + auth-token combo is needed — `npm publish` exchanges
-        # the GitHub OIDC token (id-token: write at workflow level) for an
-        # ephemeral npm credential, provided the package has a Trusted Publisher
-        # configured on npmjs.com pointing at this repo + workflow.
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Install npm dependencies
         working-directory: packages/travsr-npm
