@@ -27,6 +27,7 @@ jobs:
           - fuzz_treesitter_indexer
           - fuzz_go_parser
           - fuzz_pyright_lsif_parser
+          - fuzz_pcst_session
 
     steps:
       - name: Checkout

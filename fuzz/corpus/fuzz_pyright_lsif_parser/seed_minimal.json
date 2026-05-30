@@ -1,0 +1,9 @@
+{"$schema":"https://raw.githubusercontent.com/microsoft/language-server-protocol/main/indexFormat/specification.md","id":1,"type":"vertex","label":"metaData","version":"0.5.0","projectRoot":"file:///project","positionEncoding":"utf-16"}
+{"id":2,"type":"vertex","label":"project","kind":"python"}
+{"id":3,"type":"vertex","label":"document","uri":"file:///project/fuzz.py","languageId":"python","contents":"ZGVmIGZvbygpOiBwYXNz"}
+{"id":4,"type":"vertex","label":"range","start":{"line":0,"character":4},"end":{"line":0,"character":7}}
+{"id":5,"type":"vertex","label":"resultSet"}
+{"id":6,"type":"edge","label":"next","outV":4,"inV":5}
+{"id":7,"type":"vertex","label":"definitionResult"}
+{"id":8,"type":"edge","label":"textDocument/definition","outV":5,"inV":7}
+{"id":9,"type":"edge","label":"item","outV":7,"inVs":[4],"document":3}
