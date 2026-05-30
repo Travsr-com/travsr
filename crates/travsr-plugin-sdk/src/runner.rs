@@ -39,15 +39,3 @@ pub fn run_plugin<P: Plugin>(plugin: P) {
         }
     }
 }
-
-/// Entry point for the `__plugin <lang>` hidden subcommand.
-/// P5-S1: stubs only. Real plugin impls wire up in P5-S2.
-pub fn run_builtin(lang: &str) {
-    match lang {
-        "typescript" | "javascript" => panic!("TypeScript plugin: wire impl in P5-S2"),
-        "rust"   => panic!("Rust plugin: wire impl in P5-S2"),
-        "python" => panic!("Python plugin: wire impl in P5-S2"),
-        "go"     => panic!("Go plugin: wire impl in P5-S2"),
-        other    => panic!("unknown built-in plugin language: {other:?}"),
-    }
-}

@@ -8,4 +8,4 @@ pub use travsr_plugin_protocol::{
 };
 
 mod runner;
-pub use runner::{run_builtin, run_plugin};
+pub use runner::run_plugin;
