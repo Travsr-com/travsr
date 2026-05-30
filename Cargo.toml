@@ -52,6 +52,11 @@ tree-sitter-python = "0.21"
 tree-sitter-go = "0.21"
 tree-sitter-java   = "0.21"
 tree-sitter-kotlin = "0.3"
+tree-sitter-ruby    = "0.21"
+tree-sitter-c-sharp = "0.21"
+tree-sitter-php     = "0.22"
+# tree-sitter-swift: all available crates require tree-sitter ^0.21, conflicts with
+# workspace tree-sitter = "0.22". Blocked until a 0.22-compatible Swift grammar ships.
 walkdir = "2"
 ignore = "0.4"
 assert_cmd = "2"

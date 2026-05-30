@@ -120,6 +120,10 @@ pub enum Language {
     Go,
     Java,
     Kotlin,
+    Ruby,
+    CSharp,
+    Php,
+    // Swift: grammar crate blocked on tree-sitter version conflict; variant reserved.
 }
 
 impl Language {
@@ -134,6 +138,9 @@ impl Language {
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
             "kt" | "kts" => Some(Self::Kotlin),
+            "rb" | "rake" | "gemspec" => Some(Self::Ruby),
+            "cs" => Some(Self::CSharp),
+            "php" | "phtml" | "php8" => Some(Self::Php),
             _ => None,
         }
     }
@@ -147,6 +154,9 @@ impl Language {
             Self::Go => "go",
             Self::Java => "java",
             Self::Kotlin => "kotlin",
+            Self::Ruby => "ruby",
+            Self::CSharp => "csharp",
+            Self::Php => "php",
         }
     }
 
@@ -160,6 +170,9 @@ impl Language {
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
             "kotlin" => Some(Self::Kotlin),
+            "ruby" => Some(Self::Ruby),
+            "csharp" => Some(Self::CSharp),
+            "php" => Some(Self::Php),
             _ => None,
         }
     }

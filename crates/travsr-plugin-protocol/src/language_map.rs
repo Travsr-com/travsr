@@ -10,6 +10,9 @@ pub fn language_from_proto_str(s: &str) -> Option<Language> {
         "go"     => Some(Language::Go),
         "java"   => Some(Language::Java),
         "kotlin" => Some(Language::Kotlin),
+        "ruby"   => Some(Language::Ruby),
+        "csharp" => Some(Language::CSharp),
+        "php"    => Some(Language::Php),
         _ => None,
     }
 }

@@ -22,6 +22,9 @@ tempfile   = { workspace = true }
 tree-sitter        = { workspace = true }
 tree-sitter-java   = { workspace = true }
 tree-sitter-kotlin = { workspace = true }
+tree-sitter-ruby    = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-php     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

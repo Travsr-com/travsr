@@ -2990,8 +2990,11 @@ dependencies = [
  "travsr-indexer",
  "travsr-plugin-protocol",
  "tree-sitter",
+ "tree-sitter-c-sharp",
  "tree-sitter-java",
  "tree-sitter-kotlin",
+ "tree-sitter-php",
+ "tree-sitter-ruby",
 ]
 
 [[package]]
@@ -3058,6 +3061,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-c-sharp"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8997ad04502208449025114e434c9024a33a74e700513c702a9d2cac6522a771"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
 name = "tree-sitter-go"
 version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3088,10 +3101,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-php"
+version = "0.22.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1be890bd043986cc26b69968698e508dbd40060805e482f226dc873a63a88d60"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
 name = "tree-sitter-python"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4066c6cf678f962f8c2c4561f205945c84834cce73d981e71392624fdc390a9"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-ruby"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0031f687c0772f2dad7b77104c43428611099a1804c81244ada21560f41f0b1"
 dependencies = [
  "cc",
  "tree-sitter",
