@@ -1,6 +1,12 @@
-use std::sync::Arc;
+use std::io::{BufReader, BufWriter};
+use std::sync::{Arc, Mutex};
 use travsr_error::IndexError;
-use travsr_plugin_protocol::{Plugin, ParseRequest, ParseResponse, InvokeRequest, InvokeResponse};
+use travsr_plugin_protocol::{
+    Plugin, ParseRequest, ParseResponse, InvokeRequest, InvokeResponse,
+    HandshakeRequest, PluginRequest, PluginResponse, PROTOCOL_VERSION,
+    codec::{decode_message, write_message},
+};
+use crate::sandbox::policy::SandboxUnavailable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginHealth {
@@ -44,31 +50,223 @@ impl Transport for InProcess {
     fn health(&self) -> PluginHealth { PluginHealth::Ok }
 }
 
+// ── Sidecar I/O types ─────────────────────────────────────────────────────────
+
+type SidecarIo = (
+    BufWriter<std::process::ChildStdin>,
+    BufReader<std::process::ChildStdout>,
+);
+
 /// Subprocess transport. Spawns under ADR-017 SandboxPolicy::Standard.
-/// P5-S1: skeleton only — real subprocess spawn + IPC lands in P5-S3.
+/// Uses interior Mutex for I/O so the trait can stay `&self` (Send+Sync).
 pub struct Sidecar {
-    #[allow(dead_code)] // language tag reserved for P5-S3 IPC handshake
     language: String,
-    health: PluginHealth,
+    #[allow(dead_code)]
+    plugin_version: String,
+    /// None for stub instances (P5-S1 compatibility).
+    #[allow(dead_code)] // held for process lifetime; drop kills the subprocess
+    child: Option<Mutex<std::process::Child>>,
+    io: Option<Mutex<SidecarIo>>,
+    health: Mutex<PluginHealth>,
 }
 
 impl Sidecar {
+    /// Kept for test compatibility (P5-S1 skeleton).
     pub fn stub(language: impl Into<String>) -> Self {
         Self {
             language: language.into(),
-            health: PluginHealth::Disabled("Sidecar spawn not yet implemented (P5-S3)".into()),
+            plugin_version: String::new(),
+            child: None,
+            io: None,
+            health: Mutex::new(PluginHealth::Disabled(
+                "Sidecar spawn not yet implemented (P5-S3)".into(),
+            )),
+        }
+    }
+
+    /// Spawn the plugin binary under the ADR-017 sandbox.
+    ///
+    /// `program` is the path to the travsr binary (same executable, `__plugin`
+    /// sub-command). `lang` is the canonical language string (e.g. "rust").
+    pub fn spawn(
+        lang: &str,
+        program: &str,
+        repo_root: &std::path::Path,
+        scratch_dir: &std::path::Path,
+    ) -> Result<Self, IndexError> {
+        let args = ["__plugin", lang];
+        let mut cmd = Self::build_cmd(program, &args, repo_root, scratch_dir)
+            .map_err(|e| IndexError::Parse {
+                file: format!("plugin:{lang}"),
+                message: e.to_string(),
+            })?;
+
+        cmd.stdin(std::process::Stdio::piped())
+           .stdout(std::process::Stdio::piped())
+           .stderr(std::process::Stdio::null());
+
+        let mut child = cmd.spawn().map_err(|e| IndexError::Parse {
+            file: format!("plugin:{lang}"),
+            message: format!("spawn failed: {e}"),
+        })?;
+
+        let stdin  = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut writer = BufWriter::new(stdin);
+        let mut reader = BufReader::new(stdout);
+
+        // Handshake
+        write_message(&mut writer, &PluginRequest::Handshake(HandshakeRequest {
+            daemon_protocol_version: PROTOCOL_VERSION,
+        })).map_err(|e| IndexError::Parse {
+            file: format!("plugin:{lang}"),
+            message: e.to_string(),
+        })?;
+
+        let hs: PluginResponse = decode_message(&mut reader)
+            .map_err(|e| IndexError::Parse {
+                file: format!("plugin:{lang}"),
+                message: e.to_string(),
+            })?;
+
+        let plugin_version = match hs {
+            PluginResponse::Handshake(h) => {
+                if h.protocol_version != PROTOCOL_VERSION {
+                    return Err(IndexError::ProtocolVersionMismatch {
+                        expected: PROTOCOL_VERSION,
+                        got: h.protocol_version,
+                    });
+                }
+                h.plugin_version
+            }
+            _ => return Err(IndexError::Parse {
+                file: format!("plugin:{lang}"),
+                message: "expected HandshakeResponse".into(),
+            }),
+        };
+
+        Ok(Self {
+            language: lang.to_string(),
+            plugin_version,
+            child: Some(Mutex::new(child)),
+            io: Some(Mutex::new((writer, reader))),
+            health: Mutex::new(PluginHealth::Ok),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_cmd(
+        program: &str,
+        args: &[&str],
+        repo_root: &std::path::Path,
+        scratch: &std::path::Path,
+    ) -> Result<std::process::Command, SandboxUnavailable> {
+        crate::sandbox::linux::build_sandboxed_command(program, args, repo_root, scratch)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_cmd(
+        program: &str,
+        args: &[&str],
+        repo_root: &std::path::Path,
+        scratch: &std::path::Path,
+    ) -> Result<std::process::Command, SandboxUnavailable> {
+        crate::sandbox::macos::build_sandboxed_command(program, args, repo_root, scratch)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn build_cmd(
+        _p: &str,
+        _a: &[&str],
+        _r: &std::path::Path,
+        _s: &std::path::Path,
+    ) -> Result<std::process::Command, SandboxUnavailable> {
+        Err(SandboxUnavailable("unsupported platform".into()))
+    }
+
+    fn mark_crashed(&self) {
+        if let Ok(mut h) = self.health.lock() {
+            *h = PluginHealth::Disabled(format!("plugin {} crashed", self.language));
         }
     }
 }
 
 impl Transport for Sidecar {
-    fn parse(&self, _req: ParseRequest) -> Result<ParseResponse, IndexError> {
-        Err(IndexError::PhaseNotSupported)
+    fn parse(&self, req: ParseRequest) -> Result<ParseResponse, IndexError> {
+        let io_lock = match &self.io {
+            Some(m) => m,
+            None => return Err(IndexError::PhaseNotSupported),
+        };
+        let mut io = io_lock.lock().map_err(|_| IndexError::PluginCrashed {
+            language: self.language.clone(),
+        })?;
+        let (writer, reader) = &mut *io;
+
+        if let Err(e) = write_message(writer, &PluginRequest::Parse(req)) {
+            self.mark_crashed();
+            return Err(IndexError::Parse {
+                file: format!("plugin:{}", self.language),
+                message: e.to_string(),
+            });
+        }
+
+        match decode_message::<PluginResponse>(reader) {
+            Ok(PluginResponse::Parse(resp)) => Ok(resp),
+            Ok(PluginResponse::Error(e)) => Err(IndexError::Parse {
+                file: e.file,
+                message: e.message,
+            }),
+            Ok(_) => Err(IndexError::Parse {
+                file: format!("plugin:{}", self.language),
+                message: "unexpected response type".into(),
+            }),
+            Err(_e) => {
+                self.mark_crashed();
+                Err(IndexError::PluginCrashed { language: self.language.clone() })
+            }
+        }
     }
-    fn invoke_phase_b(&self, _req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
-        Err(IndexError::PhaseNotSupported)
+
+    fn invoke_phase_b(&self, req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+        let io_lock = match &self.io {
+            Some(m) => m,
+            None => return Err(IndexError::PhaseNotSupported),
+        };
+        let mut io = io_lock.lock().map_err(|_| IndexError::PluginCrashed {
+            language: self.language.clone(),
+        })?;
+        let (writer, reader) = &mut *io;
+
+        if let Err(e) = write_message(writer, &PluginRequest::Invoke(req)) {
+            self.mark_crashed();
+            return Err(IndexError::Parse {
+                file: format!("plugin:{}", self.language),
+                message: e.to_string(),
+            });
+        }
+
+        match decode_message::<PluginResponse>(reader) {
+            Ok(PluginResponse::Invoke(resp)) => Ok(resp),
+            Ok(PluginResponse::Error(e)) => Err(IndexError::Parse {
+                file: e.file,
+                message: e.message,
+            }),
+            Ok(_) => Err(IndexError::Parse {
+                file: format!("plugin:{}", self.language),
+                message: "unexpected response type".into(),
+            }),
+            Err(_e) => {
+                self.mark_crashed();
+                Err(IndexError::PluginCrashed { language: self.language.clone() })
+            }
+        }
     }
-    fn health(&self) -> PluginHealth { self.health.clone() }
+
+    fn health(&self) -> PluginHealth {
+        self.health.lock().map(|h| h.clone()).unwrap_or_else(|_| {
+            PluginHealth::Disabled("health lock poisoned".into())
+        })
+    }
 }
 
 #[cfg(test)]

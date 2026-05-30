@@ -16,8 +16,9 @@ use ignore::WalkBuilder;
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_python_fs, link_imports_rust,
-    run_lsif_emitter, FfiMarker, Indexer,
+    run_lsif_emitter, FfiMarker,
 };
+use travsr_plugin_host::PluginIndexer;
 use travsr_store::{SqliteStore, Store};
 
 #[cfg(unix)]
@@ -246,7 +247,7 @@ pub fn reindex_files(
         }
     };
 
-    let indexer = Indexer::with_corpus(&corpus);
+    let mut indexer = PluginIndexer::new(&corpus);
     // Accumulate FFI markers across all files for repo-level cross-language
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.

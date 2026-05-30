@@ -109,6 +109,9 @@ pub enum IndexError {
 
     #[error("plugin reported unknown language: {reported:?}")]
     UnknownLanguage { reported: String },
+
+    #[error("plugin {language:?} crashed")]
+    PluginCrashed { language: String },
 }
 
 /// Errors originating in the retrieval layer (BFS, PPR, PCST).
