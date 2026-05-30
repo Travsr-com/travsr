@@ -78,8 +78,18 @@ fn cmd_list() -> Result<()> {
             .map(|c| c.is_approved(entry.language))
             .unwrap_or(false);
 
+        let sandbox_ok = sandbox_available();
         let status = if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
             "needs approval (travsr lang approve)".to_string()
+        } else if registered && on_path && !sandbox_ok {
+            // ADR-017 Rule 2: fail-closed — no unsandboxed fallback
+            #[cfg(target_os = "linux")]
+            let hint = "install bubblewrap: sudo apt-get install bubblewrap";
+            #[cfg(target_os = "macos")]
+            let hint = "sandbox-exec unavailable — Phase B disabled";
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let hint = "sandbox not available on this platform";
+            format!("disabled (sandbox unavailable — {hint})")
         } else if registered && on_path {
             "\u{2713} active".to_string()
         } else if registered && !on_path {
@@ -277,4 +287,15 @@ fn save_config(config: &LangConfig) -> Result<()> {
 fn which(name: &str) -> bool {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .any(|dir| dir.join(name).is_file())
+}
+
+/// Check whether the OS sandbox mechanism is available on this machine.
+/// ADR-017 Rule 2: if unavailable, Phase B is disabled (no unsandboxed fallback).
+fn sandbox_available() -> bool {
+    #[cfg(target_os = "linux")]
+    return which("bwrap");
+    #[cfg(target_os = "macos")]
+    return which("sandbox-exec");
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return false;
 }
