@@ -19,7 +19,8 @@ travsr-daemon = { path = "../travsr-daemon" }
 travsr-mcp = { path = "../travsr-mcp" }
 travsr-store = { path = "../travsr-store" }
 travsr-retrieval = { path = "../travsr-retrieval" }
-travsr-plugin-sdk = { path = "../travsr-plugin-sdk" }
+travsr-plugin-sdk  = { path = "../travsr-plugin-sdk" }
+travsr-plugin-host = { path = "../travsr-plugin-host" }
 walkdir = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

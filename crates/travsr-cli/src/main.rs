@@ -140,8 +140,13 @@ async fn main() {
     // Not user-facing — intentionally absent from --help output.
     if let Some("__plugin") = std::env::args().nth(1).as_deref() {
         let lang = std::env::args().nth(2).unwrap_or_default();
-        travsr_plugin_sdk::run_builtin(&lang);
-        return;
+        match lang.as_str() {
+            "typescript" | "javascript" => panic!("TypeScript plugin: wire impl in P5-S2"),
+            "rust"   => panic!("Rust plugin: wire impl in P5-S2"),
+            "python" => panic!("Python plugin: wire impl in P5-S2"),
+            "go"     => panic!("Go plugin: wire impl in P5-S2"),
+            other    => panic!("unknown built-in plugin language: {other:?}"),
+        }
     }
 
     // Suppress the broken-pipe panic from `println!` when a pipe consumer
