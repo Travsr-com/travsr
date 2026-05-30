@@ -1,7 +1,7 @@
 //! Linux sandbox (bubblewrap + optional Landlock). Fail-closed per ADR-017 Rule 2.
+use crate::sandbox::policy::SandboxUnavailable;
 use std::path::Path;
 use std::process::Command;
-use crate::sandbox::policy::SandboxUnavailable;
 
 /// Permitted env vars (ADR-017 Rule 1). TMPDIR set by caller to scratch dir.
 pub const ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL"];
@@ -22,29 +22,46 @@ pub fn build_sandboxed_command(
     let scratch = scratch_dir.to_string_lossy();
 
     let mut cmd = Command::new("bwrap");
-    cmd.args(["--unshare-net", "--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+    cmd.args([
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--unshare-ipc",
+    ]);
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
         cmd.args(["--ro-bind-try", path, path]);
     }
-    for path in ["/etc/alternatives", "/etc/localtime", "/etc/ld.so.cache", "/etc/ld.so.conf"] {
+    for path in [
+        "/etc/alternatives",
+        "/etc/localtime",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.conf",
+    ] {
         cmd.args(["--ro-bind-try", path, path]);
     }
     cmd.args(["--proc", "/proc", "--dev", "/dev"]);
-    cmd.args(["--bind", scratch.as_ref(), scratch.as_ref()]);   // scratch: rw
-    cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]);      // repo: ro
+    // Create a tmpfs at /tmp so bind mounts of scratch dirs under /tmp work.
+    cmd.args(["--tmpfs", "/tmp"]);
+    cmd.args(["--bind", scratch.as_ref(), scratch.as_ref()]); // scratch: rw
+    cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
     cmd.args(["--die-with-parent", "--"]);
     // Resource caps (ADR-017 Rule 1): 4 GiB virtual memory + 300s CPU via ulimit.
-    let quoted_args = args.iter()
+    let quoted_args = args
+        .iter()
         .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
-        .collect::<Vec<_>>().join(" ");
+        .collect::<Vec<_>>()
+        .join(" ");
     let inner = format!(
         "ulimit -v 4194304 2>/dev/null; ulimit -t 300 2>/dev/null; exec '{}' {}",
-        program.replace('\'', r"'\''"), quoted_args
+        program.replace('\'', r"'\''"),
+        quoted_args
     );
     cmd.args(["sh", "-c", &inner]);
     cmd.env_clear();
     for key in ENV_ALLOWLIST {
-        if let Ok(val) = std::env::var(key) { cmd.env(key, val); }
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
     }
     cmd.env("TMPDIR", scratch.as_ref());
     Ok(cmd)
@@ -52,14 +69,22 @@ pub fn build_sandboxed_command(
 
 #[cfg(target_os = "linux")]
 fn bwrap_available() -> bool {
-    Command::new("bwrap").arg("--version")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().is_ok()
+    Command::new("bwrap")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn build_sandboxed_command(
-    _p: &str, _a: &[&str], _r: &Path, _s: &Path,
+    _p: &str,
+    _a: &[&str],
+    _r: &Path,
+    _s: &Path,
 ) -> Result<Command, SandboxUnavailable> {
-    Err(SandboxUnavailable("Linux sandbox not available on this platform".into()))
+    Err(SandboxUnavailable(
+        "Linux sandbox not available on this platform".into(),
+    ))
 }

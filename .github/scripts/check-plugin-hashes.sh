@@ -22,7 +22,8 @@ while IFS='=' read -r crate recorded_hash; do
         continue
     fi
 
-    actual_hash=$(find "$src_dir" -type f -name "*.rs" | sort | xargs sha256sum 2>/dev/null | sha256sum | awk '{print $1}')
+    # Hash file contents only (not paths) so the hash is identical across macOS and Linux.
+    actual_hash=$(find "$src_dir" -type f -name "*.rs" | sort | xargs cat 2>/dev/null | sha256sum | awk '{print $1}')
 
     if [[ "$actual_hash" != "$recorded_hash" ]]; then
         echo "ERROR: $crate source changed but plugin_version not bumped"

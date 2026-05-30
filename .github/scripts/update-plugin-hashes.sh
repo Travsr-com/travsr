@@ -11,7 +11,8 @@ echo "" >> "$LOCK_FILE"
 
 for src_dir in "$CRATES_DIR"/travsr-plugin-*/src; do
     crate=$(basename "$(dirname "$src_dir")")
-    hash=$(find "$src_dir" -type f -name "*.rs" | sort | xargs sha256sum 2>/dev/null | sha256sum | awk '{print $1}')
+    # Hash file contents only (not paths) so the hash is identical across macOS and Linux.
+    hash=$(find "$src_dir" -type f -name "*.rs" | sort | xargs cat 2>/dev/null | sha256sum | awk '{print $1}')
     echo "$crate = $hash" >> "$LOCK_FILE"
     echo "Updated: $crate = ${hash:0:16}..."
 done

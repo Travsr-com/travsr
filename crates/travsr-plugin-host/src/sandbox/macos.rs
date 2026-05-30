@@ -1,4 +1,5 @@
 //! macOS sandbox (sandbox-exec / Seatbelt). Fail-closed per ADR-017 Rule 2.
+#[cfg(target_os = "macos")]
 use crate::sandbox::linux::ENV_ALLOWLIST;
 use crate::sandbox::policy::SandboxUnavailable;
 use std::path::Path;
