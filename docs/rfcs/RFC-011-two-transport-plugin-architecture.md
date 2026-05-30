@@ -3,8 +3,8 @@
 **Status:** Proposed
 **Author:** Principal Architect
 **Date:** 2026-05-30
-**Phase:** 4 (Sprint 12 design gate; implementation S12–S16)
-**Crate(s) affected:** `travsr-core`, `travsr-indexer`, `travsr-ingest`, `travsr-daemon`, `travsr-plugin-protocol` (new), `travsr-plugin-sdk` (new)
+**Phase:** 5 (Phase 5 Sprint 1 design gate; implementation Phase 5 S1–S5)
+**Crate(s) affected:** `travsr-core`, `travsr-indexer`, `travsr-ingest`, `travsr-daemon`, `travsr-plugin-protocol` (new), `travsr-plugin-sdk` (new), `travsr-plugin-host` (new)
 **Supersedes (in part):** RFC-003 §2 (hardcoded `LanguageIndexer` implementors), RFC-003 §3 (enum-match dispatcher), RFC-008 §2 (`LanguageDescriptor` TOML loader + `GenericTreeSitterIndexer`)
 **Related:** RFC-005 (cross-language edge resolution), RFC-008 (multi-language extension architecture — the umbrella this RFC redirects), RFC-009 (cross-language bridge plugins), ADR-005 (per-language corpus naming), ADR-009 (SCIP vs LSIF wire format), ADR-010 (`travsr-ingest` crate boundary), **ADR-017 (unified plugin sandbox & trust model — MUST merge in the same sprint)**
 
@@ -44,7 +44,9 @@ The insight: **transport is orthogonal to edge determination.** Tree-sitter and 
 A plugin is a unit that parses files of one language. It is implemented once per language and is transport-agnostic — the same `impl` is callable in-process or driven over the wire.
 
 ```rust
-// travsr-plugin-sdk/src/lib.rs
+// travsr-plugin-protocol/src/lib.rs
+// travsr-plugin-sdk re-exports this trait and adds ergonomic helpers (run_plugin(),
+// default Frame codec wiring) so plugin authors never import travsr-plugin-protocol directly.
 use travsr_core::Language;
 use travsr_plugin_protocol::{ParseRequest, ParseResponse, InvokeRequest, InvokeResponse};
 
@@ -83,7 +85,10 @@ pub trait Plugin: Send + Sync {
 ### 2. The `Transport` trait
 
 ```rust
-// travsr-indexer/src/transport.rs
+// travsr-plugin-host/src/transport.rs
+// This crate is the only crate that depends on travsr-plugin-protocol from the
+// indexer tier. travsr-indexer and travsr-ingest depend on travsr-core only
+// (CLAUDE.md hard rule); travsr-plugin-host wraps both and owns the trust boundary.
 
 /// How the daemon reaches a plugin. The dispatcher holds one boxed transport
 /// per extension and never knows or cares which variant it is.
@@ -97,6 +102,10 @@ pub trait Transport: Send + Sync {
 /// address space. PERMITTED ONLY for first-party, monorepo-bundled Phase A
 /// grammars (ADR-017 §in-process-restriction). NEVER for Phase B. NEVER for
 /// `--command` community plugins.
+///
+/// **Normative:** `InProcess::invoke_phase_b` MUST return
+/// `Err(IndexError::PhaseNotSupported)`. Returning `Ok` with empty output would
+/// silently mask a misconfiguration; panicking violates the no-unwrap rule.
 pub struct InProcess { plugin: Box<dyn Plugin> }
 
 /// Subprocess speaking the framed protobuf protocol (§4), spawned under the
@@ -147,12 +156,18 @@ A new crate at the lowest tier — depends on `travsr-core` **only** — hosting
 
 ```
 travsr-core
-  ├── travsr-plugin-protocol   ← NEW: protobuf schema + frame codec (depends: travsr-core)
-  ├── travsr-plugin-sdk        ← NEW: Plugin trait + run_plugin() loop (depends: travsr-plugin-protocol)
-  ├── travsr-indexer           ← Transport trait, dispatcher (depends: travsr-plugin-protocol)
-  ├── travsr-ingest            ← Phase B invokers + bridges (depends: travsr-plugin-protocol)
-  └── travsr-store → travsr-retrieval → travsr-mcp → travsr-daemon → travsr-cli
+  ├── travsr-plugin-protocol   ← NEW: Plugin trait + protobuf schema + frame codec (depends: travsr-core)
+  ├── travsr-plugin-sdk        ← NEW: re-exports Plugin + run_plugin() ergonomics (depends: travsr-plugin-protocol)
+  ├── travsr-indexer           ← Tree-sitter parse pipeline (depends: travsr-core only — UNCHANGED)
+  ├── travsr-ingest            ← Phase B invokers + bridges (depends: travsr-indexer per ADR-010)
+  ├── travsr-plugin-host       ← NEW: Transport trait, dispatcher, sidecar supervisor
+  │                               (depends: travsr-plugin-protocol + travsr-indexer + travsr-ingest)
+  └── travsr-store → travsr-retrieval → travsr-mcp → travsr-daemon
+                                                        (depends: travsr-mcp + travsr-plugin-host)
+                                                        → travsr-cli
 ```
+
+`travsr-plugin-host` is the **only** crate in the indexer tier that imports `travsr-plugin-protocol`. Neither `travsr-indexer` nor `travsr-ingest` reference it directly, preserving the CLAUDE.md hard dep rules.
 
 ```protobuf
 // travsr-plugin-protocol/proto/plugin.proto
@@ -178,7 +193,7 @@ message HandshakeRequest  { uint32 daemon_protocol_version = 1; }
 message HandshakeResponse {
   uint32          protocol_version = 1;   // monotonic; daemon fail-fasts on mismatch
   string          plugin_version   = 2;   // semver; part of the cache key (§6)
-  string          language         = 3;
+  string          language         = 3;   // normative literals: see table below
   repeated string extensions       = 4;
   bool            supports_phase_b = 5;
 }
@@ -199,6 +214,22 @@ message InvokeRequest  { string root = 1; }
 message InvokeResponse { repeated Node nodes = 1; repeated Edge edges = 2; }
 message ErrorResponse  { string file = 1; string message = 2; }   // file-scoped, non-fatal
 ```
+
+**Normative language string mapping.** `HandshakeResponse.language` MUST be one of the following canonical lowercase strings. The daemon maps them to `travsr_core::Language` variants; an unrecognised value causes the daemon to refuse registration with `IndexError::UnknownLanguage { reported: String }` and log the raw string at `tracing::warn!` — it is never silently accepted or aliased.
+
+| Proto string | `Language` enum variant |
+|---|---|
+| `"typescript"` | `Language::TypeScript` |
+| `"javascript"` | `Language::JavaScript` |
+| `"rust"` | `Language::Rust` |
+| `"python"` | `Language::Python` |
+| `"go"` | `Language::Go` |
+| `"java"` | `Language::Java` |
+| `"kotlin"` | `Language::Kotlin` |
+| `"c"` | `Language::C` |
+| `"cpp"` | `Language::Cpp` |
+
+The mapping is case-sensitive; `"TypeScript"` is an error. New variants extend this table in the implementation PR that ships the language — no RFC amendment required.
 
 **Wire framing:** 4-byte big-endian length prefix + protobuf payload, over the child's stdin/stdout — the same framing discipline as the MCP stdio server (RFC-004), deliberately **not** MCP and **not** a listening socket. See §9 (this does not breach the MCP-only non-negotiable).
 
@@ -273,15 +304,17 @@ CLAUDE.md #4 governs the **external** interface: clients (IDEs, agents) reach Tr
 
 ## Phased rollout (re-baselines RFC-008 §7)
 
+> **Sprint numbering note:** Phase 4 sprints ran S12–S17 (S12 = Go Tree-sitter indexer through S17 = VS Code Marketplace, all merged). The table below uses **Phase 5 sprint numbers (P5-S1–P5-S5)** to avoid corrupting sprint tracking.
+
 | Sprint | Deliverable | Gate |
 |--------|-------------|------|
-| S12 | Create `travsr-plugin-protocol` + `travsr-plugin-sdk`; `Transport` trait + dispatcher behind the existing path; supervisor + sandbox spawn helper. Zero functional change — fixtures green. | **ADR-017 MUST be merged in the same sprint** (sandbox + trust). Tech Lead reviews crate-dependency tiers. |
-| S13 | Migrate TypeScript, Rust, Python to in-process plugins. Delete `LanguageIndexer` + enum dispatcher. Land the `(plugin_version, sha256)` cache. | Transport-equivalence property test green (below). |
-| S14 | Phase B over the sidecar transport: first SCIP language (Java via `scip-java`) and rust-analyzer LSIF relocated to sidecar invokers. | Sandbox policy (ADR-017) signed off by Security; **fail-closed** verified. |
-| S15 | Cross-language bridges (RFC-009) consume merged plugin output; add `jni`. | RFC-009 bridge panic-isolation (now folded into ADR-017). |
-| S16 | Phase 4 exit: Java + Kotlin green as plugins. | Per-language golden fixtures + transitive cross-language fixture (RFC-009 §9). |
+| P5-S1 | Create `travsr-plugin-protocol` + `travsr-plugin-sdk` + `travsr-plugin-host`; `Transport` trait + dispatcher behind the existing path; supervisor + sandbox spawn helper. Zero functional change — fixtures green. | **ADR-017 MUST be merged in the same sprint** (sandbox + trust). Tech Lead reviews crate-dependency tiers. |
+| P5-S2 | Migrate TypeScript, Rust, Python to in-process plugins. Delete `LanguageIndexer` + enum dispatcher. Land the `(plugin_version, sha256)` cache. | Transport-equivalence property test green (below). |
+| P5-S3 | Phase B over the sidecar transport: first SCIP language (Java via `scip-java`) and rust-analyzer LSIF relocated to sidecar invokers. | Sandbox policy (ADR-017) signed off by Security; **fail-closed** verified. |
+| P5-S4 | Cross-language bridges (RFC-009) consume merged plugin output; add `jni`. | RFC-009 bridge panic-isolation (now folded into ADR-017). |
+| P5-S5 | Phase 5 milestone: Java + Kotlin green as plugins. | Per-language golden fixtures + transitive cross-language fixture (RFC-009 §9). |
 
-Community plugins (`--command`, published SDK, registry) are **deferred to Phase 5** per CTO decision (2026-05-30). Phase 4 ships built-in plugins only; the sandbox earns its battle-testing before the external surface opens.
+Community plugins (`--command`, published SDK, registry) are **deferred to Phase 6** per CTO decision (2026-05-30). Phase 5 ships built-in plugins only; the sandbox earns its battle-testing before the external surface opens.
 
 ---
 

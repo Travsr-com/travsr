@@ -40,17 +40,44 @@ SandboxPolicy::Standard
               scratch tmpdir     → READ-WRITE (per-invocation, removed after)
               everything else    → DENY
   resources:  CPU / RAM / wall-clock caps enforced
-  env:        scrubbed allowlist (no inherited secrets, tokens, or creds)
+  env:        scrubbed allowlist — permitted set:
+                PATH    (toolchain discovery)
+                LANG    (locale)
+                LC_ALL  (locale)
+                TMPDIR  (set to the per-invocation scratch dir; NOT the user's $TMPDIR)
+              Any variable beyond this list requires explicit justification recorded here.
+              No HOME, no CARGO_HOME, no GIT_*, no SSH_*, no AWS_* / GCP_* / AZURE_*,
+              no CI, no GITHUB_TOKEN, no NPM_TOKEN, and no other credential-carrying vars.
 ```
 
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 
 | Platform | Primary mechanism | Fallback |
 |---|---|---|
-| Linux (incl. OCI A1 / aarch64) | seccomp-bpf syscall filter + Landlock FS rules + network namespace | bubblewrap if Landlock unavailable |
-| macOS | `sandbox-exec` (Seatbelt) profile | — |
+| Linux (incl. OCI A1 / aarch64) | **bubblewrap** (outer namespace + seccomp-bpf container) + **Landlock** FS rules (additive, if kernel ≥ 5.13) | bubblewrap without Landlock if kernel < 5.13; plugin **disabled** (fail-closed) if bubblewrap is absent |
+| macOS | `sandbox-exec` (Seatbelt) profile | **plugin disabled (fail-closed per Rule 2)** — if `sandbox-exec` is absent or returns non-zero at spawn time, treat identically to a missing sandbox: disable the plugin, emit `tracing::warn!`, surface as `disabled (sandbox unavailable)` in `travsr language list` |
 
-The policy is defined **once**, reviewed **once**, and applied at every spawn. Adding a language does not re-open the policy. A language whose toolchain needs an exception (e.g. legitimate network access to fetch a toolchain component) does not get a new ADR — it gets a reviewed, named exception (`SandboxPolicy::Elevated { … }`) recorded in `travsr.toml` and surfaced to the user; the **default** is always `Standard`.
+The policy is defined **once**, reviewed **once**, and applied at every spawn. Adding a language does not re-open the policy. A language whose toolchain needs an exception (e.g. legitimate network access to fetch a toolchain component) does not get a new ADR — it gets a reviewed, named exception recorded in `travsr.toml` and surfaced to the user; the **default** is always `Standard`.
+
+`SandboxPolicy::Elevated` is defined normatively as:
+
+```rust
+pub struct SandboxPolicy::Elevated {
+    /// Explicit allowlist of hosts the plugin may reach. No wildcards. No CIDR ranges.
+    /// Example: vec!["repo1.maven.org".to_string(), "plugins.gradle.org".to_string()]
+    permitted_hosts: Vec<String>,
+    /// One-sentence human-readable justification recorded in travsr.toml and shown in
+    /// `travsr language list`. Required; empty string is rejected at parse time.
+    reason: String,
+    /// GitHub username/handle of the Security reviewer who approved this exception.
+    approved_by: String,
+    /// ISO-8601 date the approval was recorded (e.g. "2026-06-01"). Approvals older
+    /// than 12 months require re-review.
+    approved_date: String,
+}
+```
+
+Approval requirement: any use of `SandboxPolicy::Elevated` must be reviewed and signed off by the Principal Security Engineer before the implementation PR merges. Self-approval is forbidden. If an exception would require a wildcard host (e.g. `*.gradle.org`) or disable the network-deny rule entirely, it cannot be granted under `Elevated` — escalate to CTO.
 
 ### Rule 2 — Fail-closed (non-negotiable)
 
@@ -80,7 +107,7 @@ The in-process transport (RFC-011 §10) runs first-party Tree-sitter grammars (C
 In-process eligibility requires **all** of:
 
 1. **First-party** — the grammar crate is a workspace dependency carried in the monorepo (never a `--command` plugin).
-2. **Pinned** — exact patch version (`=0.23.x`), `cargo-deny` advisory gate in CI (Tree-sitter grammar CVEs have shipped historically — RFC-003 §7).
+2. **Pinned** — exact patch version (e.g. `=0.23.4`; `x` is not valid Cargo semver after `=`), `cargo-deny` advisory gate in CI (Tree-sitter grammar CVEs have shipped historically — RFC-003 §7). The pinned version must be updated in `deny.toml` on every grammar bump and reviewed in the PR that changes it.
 3. **Fuzzed** — a `cargo-fuzz` target exists for the grammar under `fuzz/` and runs in the nightly fuzz workflow.
 4. **Fixture-gated** — golden fixtures (RFC-003 §6) gate every change.
 
@@ -89,6 +116,8 @@ Any grammar that cannot meet all four runs under the **Sidecar** transport inste
 ### Rule 5 — Cache and IPC integrity
 
 - **Cache keys are daemon-computed.** The parse cache (RFC-011 §6) is keyed by `(plugin_version, sha256(file))` where the `sha256` is computed by the **daemon**, never reported by the plugin. A plugin cannot select or forge a cache slot. `plugin_version` (from the handshake) is a hard invalidation component; a plugin-logic change that fails to bump it is a freshness bug, not a security bypass, but the daemon additionally records the running `plugin_version` in graph metadata so drift is detectable (`travsr status`).
+
+  **CI enforcement gate (normative):** The CI pipeline MUST compute a content hash of each plugin crate's `src/` tree (e.g. `sha256sum $(find crates/travsr-plugin-<lang>/src -type f | sort)`) and store it alongside `plugin_version` in a `plugin-hashes.lock` file committed to the repo. On every CI run the pipeline re-hashes the source tree and asserts it matches the recorded hash if and only if `plugin_version` is unchanged. A source-tree change with no `plugin_version` bump fails CI with a mandatory error message naming the affected plugin. This makes the "forgot to bump" failure mode a build error rather than a silent stale-cache bug.
 - **Protocol version is fail-fast.** A plugin whose `protocol_version` the daemon does not support is refused at registration (RFC-011 §4) — never driven with a mismatched contract that could mis-decode into forged nodes/edges.
 - **The IPC channel is not externally reachable.** stdin/stdout to a spawned child; no listening socket; carries no client data. It does not widen the network attack surface and does not breach MCP-only (RFC-011 §9).
 
