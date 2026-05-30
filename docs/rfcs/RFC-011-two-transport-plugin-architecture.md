@@ -48,7 +48,8 @@ A plugin is a unit that parses files of one language. It is implemented once per
 // travsr-plugin-sdk re-exports this trait and adds ergonomic helpers (run_plugin(),
 // default Frame codec wiring) so plugin authors never import travsr-plugin-protocol directly.
 use travsr_core::Language;
-use travsr_plugin_protocol::{ParseRequest, ParseResponse, InvokeRequest, InvokeResponse};
+// ParseRequest, ParseResponse, InvokeRequest, InvokeResponse are types in this crate;
+// they are referenced directly — no self-import needed.
 
 /// Implemented once per language. Stateless and `Send + Sync` so a single
 /// instance is shared across walker threads (in-process) or owns one child
@@ -350,7 +351,7 @@ Rejected for Phase 4 (consistent with RFC-009 §6). A `dlopen`'d plugin shares t
 
 ## Drawbacks
 
-- **Front-loaded refactor.** The protocol, SDK, transport, and supervisor land in S12–S13 before any new language ships. Net scope is *lower* for built-ins (the handshake deletes the TOML loader) but the up-front cost delays the first new language. PM owns the re-baseline; mitigation is to migrate built-ins one at a time keeping fixtures green.
+- **Front-loaded refactor.** The protocol, SDK, transport, and supervisor land in P5-S1–P5-S2 before any new language ships. Net scope is *lower* for built-ins (the handshake deletes the TOML loader) but the up-front cost delays the first new language. PM owns the re-baseline; mitigation is to migrate built-ins one at a time keeping fixtures green.
 - **Two crash domains to reason about.** In-process (first-party) and sidecar (untrusted) fail differently. §10 documents both; QA tests both.
 - **Tarball size.** Bundling ~6 grammars in the multiplexed binary approaches the 25 MB tarball gate. Mitigation: feature-flag grammars for slim builds (DevOps).
 - **Binary surface area.** One executable now contains the CLI, the daemon, and every built-in plugin. The `__plugin` subcommand must be hidden and must not widen the user-facing CLI.
@@ -360,7 +361,7 @@ Rejected for Phase 4 (consistent with RFC-009 §6). A `dlopen`'d plugin shares t
 ## Unresolved Questions
 
 1. **Per-directory parse batching.** §5 sends one `ParseRequest` per file. A `ParseBatchRequest` (one request per directory) would further cut sidecar round-trips ~10×. Deferred — path-passing + the cache already make the per-file cost negligible; revisit only if a bench shows IPC dominating.
-2. **In-process eligibility for non-grammar first-party logic.** §3 restricts in-process to Tree-sitter Phase A. If a future first-party Phase A parser needs more than Tree-sitter (e.g. TypeScript's JSX interleaving — RFC-008's old `custom_module` case), does it stay in-process? Direction: yes, provided it executes no untrusted code and meets the §10 fuzzing bar. Finalized in the S13 implementation PR.
+2. **In-process eligibility for non-grammar first-party logic.** §3 restricts in-process to Tree-sitter Phase A. If a future first-party Phase A parser needs more than Tree-sitter (e.g. TypeScript's JSX interleaving — RFC-008's old `custom_module` case), does it stay in-process? Direction: yes, provided it executes no untrusted code and meets the §10 fuzzing bar. Finalized in the P5-S2 implementation PR.
 3. **Phase 5 community trust.** The `--command` sandbox (ADR-017) covers execution, but plugin *authenticity* (signing, a registry trust root) is Phase 5 scope. Tracked alongside the deferred SDK-publishing work.
 
 ---

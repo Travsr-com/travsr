@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-30
 **Status:** Proposed
-**Phase:** 4 (Sprint 12 — structural prerequisite for S13–S16)
+**Phase:** 5 (P5-S1 — structural prerequisite for P5-S2–P5-S5)
 **Author:** Principal Security Engineer
 **Supersedes:** ADR-006 (rust-analyzer subprocess trust model) — generalised here
 **Obviates:** the planned per-tool ADR chain referenced by RFC-008 §7 — ADR-011 (`scip-java` trust), ADR-012 (`scip-typescript` trust), ADR-013 (`scip-kotlin` trust), ADR-015 (bridge plugin panic-isolation), ADR-016 (TOML descriptor trust). These are **not written**; their concerns fold into this single ADR.
@@ -59,21 +59,26 @@ Mechanism by platform (DevOps owns the implementation, Security owns the policy)
 
 The policy is defined **once**, reviewed **once**, and applied at every spawn. Adding a language does not re-open the policy. A language whose toolchain needs an exception (e.g. legitimate network access to fetch a toolchain component) does not get a new ADR — it gets a reviewed, named exception recorded in `travsr.toml` and surfaced to the user; the **default** is always `Standard`.
 
-`SandboxPolicy::Elevated` is defined normatively as:
+`SandboxPolicy` is defined normatively as an enum; `Elevated` is the exception variant:
 
 ```rust
-pub struct SandboxPolicy::Elevated {
-    /// Explicit allowlist of hosts the plugin may reach. No wildcards. No CIDR ranges.
-    /// Example: vec!["repo1.maven.org".to_string(), "plugins.gradle.org".to_string()]
-    permitted_hosts: Vec<String>,
-    /// One-sentence human-readable justification recorded in travsr.toml and shown in
-    /// `travsr language list`. Required; empty string is rejected at parse time.
-    reason: String,
-    /// GitHub username/handle of the Security reviewer who approved this exception.
-    approved_by: String,
-    /// ISO-8601 date the approval was recorded (e.g. "2026-06-01"). Approvals older
-    /// than 12 months require re-review.
-    approved_date: String,
+pub enum SandboxPolicy {
+    /// The default — applied to every Sidecar spawn unless an explicit exception is approved.
+    Standard,
+    /// Exception variant — requires PSE sign-off before any implementation PR merges.
+    Elevated {
+        /// Explicit allowlist of hosts the plugin may reach. No wildcards. No CIDR ranges.
+        /// Example: vec!["repo1.maven.org".to_string(), "plugins.gradle.org".to_string()]
+        permitted_hosts: Vec<String>,
+        /// One-sentence human-readable justification recorded in travsr.toml and shown in
+        /// `travsr language list`. Required; empty string is rejected at parse time.
+        reason: String,
+        /// GitHub username/handle of the Security reviewer who approved this exception.
+        approved_by: String,
+        /// ISO-8601 date the approval was recorded (e.g. "2026-06-01"). Approvals older
+        /// than 12 months require re-review.
+        approved_date: String,
+    },
 }
 ```
 
@@ -153,7 +158,7 @@ Any grammar that cannot meet all four runs under the **Sidecar** transport inste
 - **Resource caps:** a plugin exceeding the wall-clock cap is killed and the file marked failed without hanging the index run.
 - **Cache integrity:** a plugin-supplied cache key is ignored; only the daemon-computed `(plugin_version, sha256)` selects a slot.
 
-(These are merge-gating for any sprint landing a Sidecar plugin — S12 onward.)
+(These are merge-gating for any sprint landing a Sidecar plugin — P5-S1 onward.)
 
 ---
 
@@ -169,7 +174,7 @@ Any grammar that cannot meet all four runs under the **Sidecar** transport inste
 ## Consequences
 
 **Positive:**
-- One sandbox review instead of N. Adding a language is no longer gated on a bespoke trust ADR — it inherits `SandboxPolicy::Standard`, and only a genuine exception (network, elevated FS) triggers a (named, recorded) review. This unblocks RFC-011's S14–S16 language additions without per-language Security re-litigation.
+- One sandbox review instead of N. Adding a language is no longer gated on a bespoke trust ADR — it inherits `SandboxPolicy::Standard`, and only a genuine exception (network, elevated FS) triggers a (named, recorded) review. This unblocks RFC-011's P5-S3–P5-S5 language additions without per-language Security re-litigation.
 - Net posture **improvement** over RFC-008: the sandbox boundary is structural (enforced at the transport layer for *every* untrusted spawn) rather than per-tool and easy to forget.
 - The fail-closed rule removes the most common real-world sandbox bypass (the "tool missing, run anyway" fallback).
 
