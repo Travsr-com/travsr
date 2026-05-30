@@ -6,6 +6,7 @@ mod ask;
 mod graph;
 mod index;
 mod init;
+mod lang;
 mod migrate;
 mod repo;
 mod repos;
@@ -109,6 +110,11 @@ enum Command {
         #[arg(long)]
         tenants_dir: std::path::PathBuf,
     },
+    /// Manage Phase B language tools (semantic analysis).
+    Lang {
+        #[command(subcommand)]
+        action: lang::LangCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -148,6 +154,22 @@ async fn main() {
         eprintln!("{info}");
         std::process::exit(1);
     }));
+
+    // Sidecar mode: `travsr __plugin <language>` — dispatch to a built-in
+    // Phase A plugin. This argv check must happen before Clap parses args so
+    // the plugin can read its own stdin/stdout protocol without Clap consuming
+    // any arguments.
+    if let Some("__plugin") = std::env::args().nth(1).as_deref() {
+        let lang = std::env::args().nth(2).unwrap_or_default();
+        // TODO(P5-S2): wire real plugin implementations here.
+        match lang.as_str() {
+            "typescript" | "javascript" => panic!("TypeScript plugin: wire impl in P5-S2"),
+            "rust" => panic!("Rust plugin: wire impl in P5-S2"),
+            "python" => panic!("Python plugin: wire impl in P5-S2"),
+            "go" => panic!("Go plugin: wire impl in P5-S2"),
+            other => panic!("unknown built-in plugin language: {other:?}"),
+        }
+    }
 
     // Parse CLI args BEFORE initialising any subsystems.
     // Clap exits immediately for --version and --help via process::exit, so
@@ -382,6 +404,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Serve { port, tenants_dir } => {
             serve::run(port, tenants_dir).await?;
         }
+        Command::Lang { action } => lang::run(action)?,
     }
     Ok(())
 }
