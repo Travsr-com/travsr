@@ -8,8 +8,7 @@ impl Plugin for PythonPlugin {
     fn language(&self) -> Language { Language::Python }
     fn extensions(&self) -> &[&str] { &["py", "pyi"] }
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
-        let vname = req.path.to_string_lossy().replace('\\', "/");
-        match travsr_indexer::python_parse(&req.corpus, &req.path, &vname) {
+        match travsr_indexer::python_parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(mut out) => {
                 // Best-effort pyright enrichment (same as old Indexer path)
                 let pyright = travsr_indexer::python_lsif::parse_python_with_pyright(

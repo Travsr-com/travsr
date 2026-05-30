@@ -8,7 +8,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseRequest {
+    /// Absolute path on disk — used to read/mmap the file.
     pub path: PathBuf,
+    /// Repo-relative path used in VName construction (the stable graph key).
+    /// Must match the `vname_path` passed to `Indexer::parse_file_with_vname`.
+    pub vname_path: String,
     pub corpus: String,
     pub package: String,
     /// Populated only for git-blob indexing (content not on disk).

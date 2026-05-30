@@ -40,9 +40,11 @@ impl Dispatcher {
     }
 
     /// Dispatch a file parse. Returns Ok(None) for unrecognised extensions.
+    /// `vname_path` is the repo-relative path used in VName construction.
     pub fn parse_file(
         &self,
         path: &std::path::Path,
+        vname_path: &str,
         corpus: &str,
         package: &str,
     ) -> Result<Option<ParseResponse>, IndexError> {
@@ -51,6 +53,7 @@ impl Dispatcher {
             Some(t) => {
                 let req = ParseRequest {
                     path: path.to_path_buf(),
+                    vname_path: vname_path.to_string(),
                     corpus: corpus.to_string(),
                     package: package.to_string(),
                     source: None,
@@ -69,7 +72,7 @@ mod tests {
     #[test]
     fn unknown_extension_returns_none() {
         let d = Dispatcher::new("github.com/acme/foo");
-        let result = d.parse_file(std::path::Path::new("main.xyz"), "github.com/acme/foo", "acme");
+        let result = d.parse_file(std::path::Path::new("main.xyz"), "main.xyz", "github.com/acme/foo", "acme");
         assert!(matches!(result, Ok(None)));
     }
 

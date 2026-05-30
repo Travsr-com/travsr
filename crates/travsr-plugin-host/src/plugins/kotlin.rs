@@ -33,8 +33,7 @@ impl Plugin for KotlinPlugin {
     }
 
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
-        let vname_path = req.path.to_string_lossy().replace('\\', "/");
-        parse_kotlin_file(&req.corpus, &req.path, &vname_path).unwrap_or_else(|e| {
+        parse_kotlin_file(&req.corpus, &req.path, &req.vname_path).unwrap_or_else(|e| {
             tracing::warn!("kotlin parse {}: {e}", req.path.display());
             ParseResponse::default()
         })

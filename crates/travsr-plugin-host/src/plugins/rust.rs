@@ -9,7 +9,7 @@ impl Plugin for RustPlugin {
     fn extensions(&self) -> &[&str] { &["rs"] }
     fn supports_phase_b(&self) -> bool { travsr_indexer::ra_runner::ra_available() }
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
-        match travsr_indexer::rust_parse(&req.corpus, &req.path, &req.path.to_string_lossy().replace('\\', "/")) {
+        match travsr_indexer::rust_parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(out) => parse_output_to_response(out),
             Err(e) => { tracing::warn!("rust parse {}: {e}", req.path.display()); ParseResponse::default() }
         }

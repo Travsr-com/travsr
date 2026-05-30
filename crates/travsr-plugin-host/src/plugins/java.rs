@@ -36,8 +36,7 @@ impl Plugin for JavaPlugin {
     }
 
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
-        let vname_path = req.path.to_string_lossy().replace('\\', "/");
-        parse_java_file(&req.corpus, &req.path, &vname_path).unwrap_or_else(|e| {
+        parse_java_file(&req.corpus, &req.path, &req.vname_path).unwrap_or_else(|e| {
             tracing::warn!("java parse {}: {e}", req.path.display());
             ParseResponse::default()
         })

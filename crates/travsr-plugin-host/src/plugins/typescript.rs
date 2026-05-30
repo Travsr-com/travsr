@@ -17,7 +17,7 @@ impl Plugin for TypeScriptPlugin {
                 Ok(mut tmp) => {
                     let _ = tmp.write_all(src_bytes);
                     let _ = tmp.flush();
-                    match travsr_indexer::typescript_parse(&req.corpus, tmp.path(), &req.path.to_string_lossy()) {
+                    match travsr_indexer::typescript_parse(&req.corpus, tmp.path(), &req.vname_path) {
                         Ok(out) => return parse_output_to_response(out),
                         Err(e) => { tracing::warn!("ts parse (blob): {e}"); return ParseResponse::default(); }
                     }
@@ -25,7 +25,7 @@ impl Plugin for TypeScriptPlugin {
                 Err(e) => { tracing::warn!("tempfile: {e}"); return ParseResponse::default(); }
             }
         }
-        match travsr_indexer::typescript_parse(&req.corpus, &req.path, &req.path.to_string_lossy().replace('\\', "/")) {
+        match travsr_indexer::typescript_parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(out) => parse_output_to_response(out),
             Err(e) => { tracing::warn!("ts parse {}: {e}", req.path.display()); ParseResponse::default() }
         }

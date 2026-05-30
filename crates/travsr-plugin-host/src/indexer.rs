@@ -28,7 +28,7 @@ impl PluginIndexer {
     pub fn parse_file_with_vname(
         &mut self,
         abs_path: &Path,
-        _vname_path: &str,
+        vname_path: &str,
     ) -> Result<ParseOutput, IndexError> {
         let file_hash = hash_file(abs_path).map_err(|e| IndexError::Parse {
             file: abs_path.display().to_string(),
@@ -44,7 +44,7 @@ impl PluginIndexer {
 
         // Cache miss: dispatch through plugin
         let corpus = self.dispatcher.corpus.clone();
-        let resp = match self.dispatcher.parse_file(abs_path, &corpus, "")? {
+        let resp = match self.dispatcher.parse_file(abs_path, vname_path, &corpus, "")? {
             Some(r) => r,
             None => return Ok(ParseOutput::default()),
         };
