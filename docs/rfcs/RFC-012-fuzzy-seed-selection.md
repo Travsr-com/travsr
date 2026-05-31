@@ -530,7 +530,7 @@ Rejected. Marginal recall improvement (~3 points BEIR) not worth the 4x storage 
 
 - **Schema:** migration v8 (L1, default) and v9 (L3, embedding feature only) are forward-only. Old daemons reading newer databases are protected by the existing schema-version gate.
 - **API:** `search_symbol` and `get_context` JSON schemas are unchanged across all three layers. The `name` and `query` argument semantics broaden (any query that worked before still works); no client code must change.
-- **Determinism:** unchanged on identical inputs at each layer. L1 ranking is deterministic (FTS5 BM25). L2 is deterministic given a fixed model + `temperature=0`. L3 is deterministic given a fixed model binary.
+- **Determinism:** unchanged on identical inputs at each layer. L1 ranking is deterministic (FTS5 BM25). L2 is best-effort stable given a fixed model deployment (`temperature=0` reduces variance but does not guarantee bit-identical output across providers or hardware — see §2.3); the true determinism floor is the daemon receiving identical structured inputs. L3 is deterministic given a fixed model binary.
 - **Performance:** L1 adds ~0.5 ms p50, ~2 ms p99 - within the existing p95 < 50 ms budget by 25x. L2 adds one LLM round-trip on the client side (not counted against server budget). L3 adds ~12-30 ms only on L1 miss.
 
 ---
