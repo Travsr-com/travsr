@@ -11,7 +11,7 @@ pub fn build_sandboxed_command(
     program: &str,
     args: &[&str],
     repo_root: &Path,
-    _scratch_dir: &Path,
+    scratch_dir: &Path,
 ) -> Result<Command, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
