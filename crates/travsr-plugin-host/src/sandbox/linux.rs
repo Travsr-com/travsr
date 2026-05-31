@@ -18,12 +18,22 @@ static NET_UNSHARE_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 #[cfg(target_os = "linux")]
 fn net_unshare_supported() -> bool {
     *NET_UNSHARE_OK.get_or_init(|| {
+        // Mount /lib and /lib64 alongside /usr so the dynamic linker
+        // (/lib64/ld-linux-x86-64.so.2) is reachable inside the probe sandbox.
+        // On merged-usr systems these are host symlinks → /usr/lib{,64}; they
+        // don't appear automatically inside bwrap's fresh tmpfs root.
         Command::new("bwrap")
             .args([
                 "--unshare-net",
                 "--ro-bind-try",
                 "/usr",
                 "/usr",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
                 "--proc",
                 "/proc",
                 "--dev",
@@ -169,11 +179,22 @@ static BWRAP_FUNCTIONAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 #[cfg(target_os = "linux")]
 fn bwrap_available() -> bool {
     *BWRAP_FUNCTIONAL.get_or_init(|| {
+        // Mount /lib and /lib64 alongside /usr so the dynamic linker
+        // (/lib64/ld-linux-x86-64.so.2) is reachable inside the probe sandbox.
+        // On merged-usr systems (Ubuntu 22.04+) /lib and /lib64 are host
+        // symlinks → /usr/lib{,64}; they don't appear automatically inside
+        // bwrap's fresh tmpfs root, causing execvp("true") to fail with ENOENT.
         Command::new("bwrap")
             .args([
                 "--ro-bind-try",
                 "/usr",
                 "/usr",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
                 "--proc",
                 "/proc",
                 "--dev",

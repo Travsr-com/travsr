@@ -85,7 +85,10 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
           # Verify bwrap can actually create a sandbox — fail this step loudly if not,
           # so any remaining restriction is caught before cargo test runs.
-          bwrap --ro-bind-try /usr /usr --proc /proc --dev /dev -- true
+          # Include /lib and /lib64: on merged-usr systems these are host symlinks
+          # to /usr/lib{,64} and must be mounted explicitly inside bwrap's tmpfs root
+          # so the dynamic linker (/lib64/ld-linux-x86-64.so.2) is reachable.
+          bwrap --ro-bind-try /usr /usr --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 --proc /proc --dev /dev -- true
 
       - name: Run tests
         run: cargo test --workspace
