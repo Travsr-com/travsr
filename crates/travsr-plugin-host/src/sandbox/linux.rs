@@ -11,7 +11,7 @@ pub fn build_sandboxed_command(
     program: &str,
     args: &[&str],
     repo_root: &Path,
-    scratch_dir: &Path,
+    _scratch_dir: &Path,
 ) -> Result<Command, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
@@ -19,10 +19,14 @@ pub fn build_sandboxed_command(
         ));
     }
     let repo = repo_root.to_string_lossy();
-    let scratch = scratch_dir.to_string_lossy();
 
     let mut cmd = Command::new("bwrap");
+    // --unshare-user maps the real UID to root inside the namespace, which is
+    // required for --tmpfs to create a writable mount (tmpfs root is mode 0755
+    // owned by the mapped UID; without the user NS the process runs as the real
+    // UID 1001 on CI and cannot write to a root-owned directory).
     cmd.args([
+        "--unshare-user",
         "--unshare-net",
         "--unshare-pid",
         "--unshare-uts",
