@@ -24,13 +24,18 @@
 //! - **Wall-clock timeout**: enforced by the caller via [`SandboxConfig::timeout`]
 //! - **Virtual-memory limit**: set via `ulimit -v` inside the sandbox shell
 //!
-//! ## Fail-open policy
+//! ## Sandbox availability
 //!
-//! When the sandbox tool is absent (Linux without `bwrap`), the subprocess
-//! runs **unsandboxed** and [`SandboxStatus::Unavailable`] is returned.
-//! **Callers MUST log this at `error` level** — not `warn` — to make the
-//! missing confinement visible. Production deployments should install
-//! `bubblewrap` so the sandbox is always active.
+//! When the sandbox tool is absent or cannot create namespaces (Linux without
+//! a functional `bwrap`), [`SandboxStatus::Unavailable`] is returned alongside
+//! a runnable-but-unsandboxed command. **Callers MUST log this at `error`
+//! level** — not `warn` — and MUST NOT silently proceed.
+//!
+//! ADR-017 Rule 2 (fail-closed) applies to the plugin-host sidecar path.
+//! The indexer sandbox is a separate, older subsystem covering rust-analyzer
+//! LSIF invocations; aligning it fully to Result-based fail-closed is tracked
+//! as a follow-up refactor. The CI gate in `sandbox_blocks_write_outside_repo_and_tmp`
+//! panics when bwrap is non-functional in CI, making the gap visible.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -283,14 +288,33 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+// Cached functional probe — same pattern as the plugin-host sandbox.
+// Avoids false "available" result when bwrap is on PATH but cannot create
+// user namespaces (e.g. Docker-in-Docker, AppArmor-restricted runners).
+#[cfg(target_os = "linux")]
+static BWRAP_FUNCTIONAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 #[cfg(target_os = "linux")]
 fn bwrap_available() -> bool {
-    Command::new("bwrap")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    *BWRAP_FUNCTIONAL.get_or_init(|| {
+        Command::new("bwrap")
+            .args([
+                "--ro-bind-try",
+                "/usr",
+                "/usr",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+                "true",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -340,14 +364,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn sandbox_blocks_write_outside_repo_and_tmp() {
         if !bwrap_available() {
-            // Hard-fail in CI so the workflow misconfiguration is caught early.
+            // Hard-fail in CI so missing or non-functional bwrap is caught early.
+            // The probe checks both PATH presence and namespace capability.
             if std::env::var("CI").is_ok() {
                 panic!(
-                    "bwrap must be installed in CI for the sandbox breach test. \
+                    "bwrap must be installed and functional in CI (user namespaces enabled). \
                      Add `sudo apt-get install -y bubblewrap` before `cargo test`."
                 );
             }
-            eprintln!("SKIP: bwrap not found — sandbox isolation test skipped");
+            eprintln!("SKIP: bwrap not functional — sandbox isolation test skipped");
             return;
         }
 

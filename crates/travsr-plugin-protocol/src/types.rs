@@ -29,6 +29,11 @@ pub struct ParseResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvokeRequest {
     pub root: PathBuf,
+    /// Corpus identifier (e.g. `github.com/org/repo`). Used by SCIP ingest to
+    /// produce correct VNames. Defaults to empty string for backwards compatibility
+    /// with plugin binaries that predate this field.
+    #[serde(default)]
+    pub corpus: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

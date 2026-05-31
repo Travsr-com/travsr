@@ -325,6 +325,7 @@ mod tests {
         let t = InProcess::new(NoOpPlugin);
         let req = InvokeRequest {
             root: std::path::PathBuf::from("."),
+            corpus: String::new(),
         };
         assert!(matches!(
             t.invoke_phase_b(req),

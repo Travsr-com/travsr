@@ -89,6 +89,8 @@ impl PluginIndexer {
         let exe_str = current_exe.to_string_lossy().into_owned();
         let req = travsr_plugin_protocol::InvokeRequest {
             root: repo_root.to_path_buf(),
+            // TODO: thread corpus from trust/registry config when available.
+            corpus: String::new(),
         };
 
         for lang in self.dispatcher.phase_b_languages() {

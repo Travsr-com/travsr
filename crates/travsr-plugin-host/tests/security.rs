@@ -397,6 +397,7 @@ fn sidecar_stub_disabled_health_is_isolated() {
 
     // invoke_phase_b also returns Err gracefully
     let invoke_req = InvokeRequest {
+        corpus: String::new(),
         root: PathBuf::from("."),
     };
     let invoke_result = sidecar.invoke_phase_b(invoke_req);
