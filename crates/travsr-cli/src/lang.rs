@@ -118,7 +118,7 @@ fn cmd_list() -> Result<()> {
         } else if wrapper_only {
             format!(
                 "wrapper-only  ({} installed, {} missing — {})",
-                entry.provider_binary.unwrap_or("built-in"),
+                entry.provider_binary.unwrap(),
                 entry.command,
                 entry.underlying_tool_hint,
             )

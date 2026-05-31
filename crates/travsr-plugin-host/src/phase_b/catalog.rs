@@ -34,7 +34,8 @@ pub struct PhaseBEntry {
     /// How to install the underlying tool (scip-*, rust-analyzer, etc.) when the
     /// travsr-lang-* wrapper is already installed but the tool itself is missing.
     /// Shown in the "wrapper-only" state by `travsr lang list`.
-    /// Empty string for in-tree builtins that need no underlying tool check.
+    /// Empty string for builtins where no separate tool install is needed
+    /// (e.g. typescript/javascript install travsr-lsif-ts via their npm package).
     pub underlying_tool_hint: &'static str,
     /// The travsr-lang binary name for this language, e.g. "travsr-lang-go".
     /// None for in-tree builtins (rust, typescript) that spawn via __plugin.
