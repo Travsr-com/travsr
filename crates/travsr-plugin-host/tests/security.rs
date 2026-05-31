@@ -169,11 +169,13 @@ fn sandbox_scratch_dir_is_writable() {
 
     let repo = tempfile::tempdir().expect("tempdir");
     let scratch = tempfile::tempdir().expect("scratch");
-    let write_path = scratch.path().join("write_test.txt");
+    // Inside the sandbox scratch is mounted at /travsr-scratch (fixed path).
+    // Write there; on the host the file appears under scratch.path().
+    let host_write_path = scratch.path().join("write_test.txt");
 
     let cmd = build_sandboxed_command(
         "sh",
-        &["-c", &format!("echo ok > {}", write_path.display())],
+        &["-c", "echo ok > /travsr-scratch/write_test.txt"],
         repo.path(),
         scratch.path(),
     );
@@ -186,7 +188,11 @@ fn sandbox_scratch_dir_is_writable() {
             let status = cmd.status().expect("spawn");
             assert!(
                 status.success(),
-                "sandbox blocked write to scratch dir — should be writable"
+                "sandbox blocked write to /travsr-scratch — should be writable"
+            );
+            assert!(
+                host_write_path.exists(),
+                "file written inside sandbox should appear on the host scratch dir"
             );
         }
     }
