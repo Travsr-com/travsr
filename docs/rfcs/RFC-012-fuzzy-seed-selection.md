@@ -5,7 +5,7 @@
 | **Status** | Draft |
 | **Author** | Tech Lead |
 | **Date** | 2026-05-31 |
-| **Issue** | #TBD |
+| **Issue** | #258 |
 | **Phase** | 4 (post-v0.6.0) → Phase 5 staging |
 | **Crate(s) affected** | `travsr-store`, `travsr-mcp`, `travsr-retrieval`, `travsr-cli` |
 | **Depends on** | RFC-004 (MCP tool schemas), RFC-010 (knapsack), ADR-003 (PPR policy) |
