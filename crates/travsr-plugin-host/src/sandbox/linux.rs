@@ -48,7 +48,10 @@ pub fn build_sandboxed_command(
 ) -> Result<Command, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
-            "bwrap not on PATH — install bubblewrap or this plugin stays disabled".into(),
+            "bubblewrap (bwrap) is not available or cannot create sandboxes on this host \
+             (not on PATH, or kernel namespace support is restricted); \
+             install bubblewrap and verify unprivileged user namespaces are enabled"
+                .into(),
         ));
     }
     let repo = repo_root.to_string_lossy();
@@ -60,13 +63,17 @@ pub fn build_sandboxed_command(
     // runtimes) bwrap exits non-zero with "RTM_NEWADDR: Operation not permitted".
     // We fall back to skipping network isolation on such hosts rather than
     // aborting the entire sandbox invocation.
+    // ADR-017 Rule 2: fail-closed. Network isolation is a primary egress control;
+    // silently dropping it is not an acceptable degradation for any policy level.
     if net_unshare_supported() {
         cmd.arg("--unshare-net");
     } else {
-        tracing::warn!(
-            "bwrap --unshare-net not supported on this host (loopback blocked); \
-             running without network isolation"
-        );
+        return Err(SandboxUnavailable(
+            "bwrap --unshare-net not supported on this host (loopback blocked inside \
+             the network namespace); plugin disabled per ADR-017 Rule 2 — to run on a \
+             host without network-namespace support, request an Elevated policy \
+             exception via ADR-017 §Elevated".into(),
+        ));
     }
     cmd.args(["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
@@ -122,7 +129,8 @@ pub fn bwrap_is_on_path() -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // Cached probe: can bwrap actually create a sandbox on this host?

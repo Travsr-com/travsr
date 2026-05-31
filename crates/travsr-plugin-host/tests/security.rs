@@ -29,16 +29,16 @@ fn sandbox_standard_denies_network() {
     );
 
     match cmd {
-        Err(SandboxUnavailable(_)) => {
-            // Panic only when bwrap is not installed at all. If it is installed but
-            // cannot create namespaces (e.g. Docker-in-Docker on GitHub Actions),
-            // bwrap_available() returns false and we skip gracefully.
-            if std::env::var("CI").is_ok()
-                && !travsr_plugin_host::sandbox::linux::bwrap_is_on_path()
-            {
-                panic!("bwrap must be available in CI (install bubblewrap)");
+        Err(SandboxUnavailable(ref msg)) => {
+            // In CI, bwrap must be installed AND functional. Panic loud whenever
+            // build_sandboxed_command returns Err — whether because bwrap is absent,
+            // cannot namespace, or cannot isolate the network. A skipped network-egress
+            // test in CI is a blind spot that defeats ADR-017 Rule 2.
+            // Only skip on developer machines where bwrap is genuinely absent.
+            if std::env::var("CI").is_ok() {
+                panic!("sandbox unavailable in CI: {msg}");
             }
-            eprintln!("SKIP: bwrap not functional on this host");
+            eprintln!("SKIP: {msg}");
         }
         Ok(mut cmd) => {
             let output = cmd.output().expect("spawn");
@@ -153,8 +153,11 @@ fn sandbox_repo_root_is_read_only() {
     );
 
     match cmd {
-        Err(_) => {
-            eprintln!("SKIP: bwrap not available");
+        Err(SandboxUnavailable(ref msg)) => {
+            if std::env::var("CI").is_ok() {
+                panic!("sandbox unavailable in CI: {msg}");
+            }
+            eprintln!("SKIP: {msg}");
         }
         Ok(mut cmd) => {
             let _ = cmd.output();

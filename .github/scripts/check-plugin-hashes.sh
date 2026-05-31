@@ -9,6 +9,17 @@ LOCK_FILE="plugin-hashes.lock"
 CRATES_DIR="crates"
 FAILED=0
 
+# Portable SHA-256: prefer sha256sum (GNU coreutils / Linux), fall back to
+# shasum -a 256 (macOS / BSD). Fail loudly if neither is available.
+if command -v sha256sum &>/dev/null; then
+    SHA256=sha256sum
+elif command -v shasum &>/dev/null; then
+    SHA256="shasum -a 256"
+else
+    echo "ERROR: neither sha256sum nor shasum found on PATH" >&2
+    exit 1
+fi
+
 while IFS='=' read -r crate recorded_hash; do
     [[ "$crate" =~ ^#.*$ ]] && continue  # skip comments
     [[ -z "$crate" ]] && continue
@@ -23,7 +34,9 @@ while IFS='=' read -r crate recorded_hash; do
     fi
 
     # Hash file contents only (not paths) so the hash is identical across macOS and Linux.
-    actual_hash=$(find "$src_dir" -type f -name "*.rs" | sort | xargs cat 2>/dev/null | sha256sum | awk '{print $1}')
+    # Use a while-read loop instead of xargs to avoid xargs reading from stdin when find
+    # produces no output (which causes an indefinite hang on GNU xargs or wrong hash on BSD).
+    actual_hash=$(find "$src_dir" -type f -name "*.rs" | sort | while IFS= read -r f; do cat -- "$f"; done | $SHA256 | awk '{print $1}')
 
     if [[ "$actual_hash" != "$recorded_hash" ]]; then
         echo "ERROR: $crate source changed but plugin_version not bumped"
