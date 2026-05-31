@@ -8,7 +8,8 @@
 | **Issue** | #258 |
 | **Phase** | 4 (post-v0.6.0) -> Phase 5 |
 | **Crate(s) affected** | `travsr-store`, `travsr-mcp`, `travsr-retrieval`, `travsr-cli`, `travsr-embed` (new) |
-| **Depends on** | RFC-004 (MCP tool schemas), RFC-007 (MCP SSE transport), RFC-010 (knapsack), ADR-003 (PPR policy), ADR-004 (error taxonomy / tarball budget) |
+| **Depends on** | RFC-004 (MCP tool schemas, Accepted), RFC-007 (MCP SSE transport, Accepted), RFC-010 (knapsack, Accepted), ADR-003 (PPR policy, Accepted), ADR-004 (error taxonomy / tarball budget, Accepted) |
+| **Decision owner** | Principal Architect (ratification gate before Draft → Accepted) |
 
 ---
 
@@ -105,6 +106,9 @@ All three layers funnel into `search_nodes_fuzzy`. From the rest of the codebase
 -- FTS5 contentless virtual table over node identifiers.
 -- Contentless mode (content='') keeps the FTS index from duplicating
 -- node data; we look up the row in `nodes` by id after a match.
+-- The `tokens` column in nodes_fts_map (below) is REQUIRED to support
+-- FTS5 delete commands: contentless tables cannot recover the original
+-- tokenized values, so we must supply them explicitly for retraction.
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     tokens,            -- pre-tokenized signature + path + kind
     content='',
@@ -112,16 +116,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
 );
 
 -- Map FTS rowid back to node id (NodeId is 32 BLAKE3 bytes - not an integer).
+-- `tokens` is stored here (not in the contentless FTS table) so that
+-- incremental reindex can issue the FTS5 'delete' command with the exact
+-- original tokenized values — the only way to retract a contentless row.
+-- Omitting `tokens` would make stale FTS rows unretractable on rename/delete.
 CREATE TABLE IF NOT EXISTS nodes_fts_map (
-    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
-    node_id BLOB NOT NULL UNIQUE
+    rowid    INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id  BLOB    NOT NULL UNIQUE,
+    tokens   TEXT    NOT NULL  -- retained for FTS5 delete; must match the inserted value exactly
 );
 
 CREATE INDEX IF NOT EXISTS nodes_fts_map_node_id_idx
     ON nodes_fts_map(node_id);
 ```
 
-Tokenizer choice: **trigram**, not `unicode61` or `porter`. Trigram catches `dispatch` in `dispatch_tool_call` regardless of word boundaries and tolerates a single character typo. The cost is a larger FTS index (~3x the contentless table) but per-node payload is small (~80 bytes), so total overhead on the Travsr-self-index is ~200 KB.
+Tokenizer choice: **trigram**, not `unicode61` or `porter`. Trigram catches `dispatch` in `dispatch_tool_call` regardless of word boundaries and tolerates a single character typo. The FTS index is ~3x the size of the raw token data; per-node payload is small (~80 bytes), so total overhead on the Travsr-self-index is ~200 KB — well under the CI acceptance criterion of < 5% of `graph.db` (Acceptance Criteria L1).
 
 ### 1.2 Tokenizer: `tokenize_identifier`
 
@@ -150,10 +159,13 @@ Rules:
 - Emit each piece lowercased
 - Emit the original string lowercased as one extra token to preserve substring search
 
+**Known limitation — tokens shorter than 3 characters:** FTS5 `trigram` only indexes and matches character sequences ≥ 3 characters. `tokenize_identifier` legitimately emits 2-char tokens (`ts`, `id`, `db`, `fs`, `by`). These 2-char tokens are not searchable via the FTS5 path. Mitigation: step 1 of `search_nodes_fuzzy` is an exact-substring match that runs *before* the FTS path; any query that contains or is a short identifier will still resolve correctly via substring. The FTS path is only reached on substring miss, so the practical impact is limited to natural-language queries that are *only* 2-char tokens — an unlikely case. Tracked in Open Question #2.
+
 ### 1.3 Indexing path
 
-`SqliteStore::put_node` gains a sibling write:
+`SqliteStore::put_node` gains three sibling operations covering the full write/update/delete lifecycle. This is non-optional: omitting delete/update would silently drift the FTS index away from the live graph on every incremental reindex, violating the "always fresh" non-negotiable.
 
+**Insert (`put_node_fts`):**
 ```rust
 fn put_node_fts(&self, node: &Node) -> Result<(), StoreError> {
     let tokens = format!(
@@ -163,9 +175,26 @@ fn put_node_fts(&self, node: &Node) -> Result<(), StoreError> {
         node.kind,
         node.vname.language
     );
-    // upsert into nodes_fts_map to get rowid, then insert into nodes_fts.
+    // 1. Upsert into nodes_fts_map (node_id, tokens) → get rowid.
+    //    Store `tokens` — required to retract the FTS row later.
+    // 2. INSERT INTO nodes_fts(rowid, tokens) VALUES(?, ?)
 }
 ```
+
+**Delete (`delete_node_fts`):** Called from every node-removal path (`reindex_files` when a symbol is renamed or removed):
+```rust
+fn delete_node_fts(&self, node_id: &NodeId) -> Result<(), StoreError> {
+    // 1. SELECT rowid, tokens FROM nodes_fts_map WHERE node_id = ?
+    //    (tokens was stored at insert time — contentless FTS cannot recover it)
+    // 2. Issue the FTS5 special delete command:
+    //    INSERT INTO nodes_fts(nodes_fts, rowid, tokens) VALUES('delete', ?, ?)
+    // 3. DELETE FROM nodes_fts_map WHERE node_id = ?
+}
+```
+
+This is the only correct retraction path for contentless FTS5 tables: the original tokenized string must be supplied explicitly. Storing `tokens` in `nodes_fts_map` makes this possible without reading back from the FTS virtual table (which contentless tables do not support).
+
+**Update:** A symbol rename is a `delete_node_fts(old_id)` followed by `put_node_fts(new_node)`. There is no in-place FTS5 row update for contentless tables.
 
 Called from every node-write path (initial index, `reindex_files`, migration v8 backfill).
 
@@ -182,6 +211,14 @@ impl SqliteStore {
     /// 4. Else return empty.
     ///
     /// Always capped at 50 results to bound PPR seed-set size.
+    ///
+    /// **Seed K passed to PPR:** `search_nodes_fuzzy` returns at most 50 nodes.
+    /// All of them are handed to PPR as seeds (K = |results|, bounded at 50).
+    /// L3 internally fetches its top-10 by cosine distance; these are merged into
+    /// the same 50-node output cap, not added on top. This reconciles §3.7 (LIMIT 10)
+    /// with the 50-node cap here and the client fan-out re-cap in §2.4: 10 is the
+    /// per-layer L3 fetch limit; 50 is the unified seed-set limit across all layers.
+    /// See ADR-003 for the rationale behind the 50-seed bound on PPR diffusion.
     pub fn search_nodes_fuzzy(&self, query: &str) -> Result<Vec<Node>, StoreError>;
 }
 ```
@@ -200,11 +237,22 @@ No new MCP tools. No JSON schema changes (the `name` and `query` arguments stay 
 
 ### 1.6 Migration backfill
 
-`v8` runs after the existing schema upgrade. Backfill is a single `INSERT … SELECT` from `nodes` into the FTS table; on the Travsr-self-index (2.6k nodes) this is sub-second. For users with larger graphs, backfill runs once at upgrade time inside the migration transaction - no separate `travsr reindex` step required.
+`v8` runs after the existing schema upgrade. Backfill is a single `INSERT … SELECT` from `nodes` into the FTS table; on the Travsr-self-index (2.6k nodes) this is sub-second. For users with larger graphs, backfill runs once at upgrade time inside the migration transaction - no separate `travsr reindex` step required. **Large-repo caveat:** for graphs with >500k nodes the single transaction holds a WAL write lock for the duration of tokenize+insert. If this becomes a measured issue in Phase 5 telemetry, the backfill can be chunked into batches of 10k rows with intermediate commits; this is deferred rather than pre-optimized.
 
 ---
 
 ## Detailed Design - L2: LLM Query Translator
+
+### 2.0 Explicit decision: L2 default-on and "algorithms first, LLM last"
+
+L2 ships default-on. This is a deliberate, owned exception to the "algorithms first, LLM last" manifesto — not an oversight — and must be ratified explicitly here rather than implied.
+
+**Why L2 default-on does not violate the manifesto:**
+- "Algorithms first, LLM last" means the *daemon* does not use LLMs to determine edges, relationships, or traversal. That invariant holds: the daemon receives only structured symbol-name inputs; all graph traversal (PPR, knapsack, PCST) remains fully deterministic and LLM-free.
+- L2 is a *query-translation UX layer* in the MCP client. It converts a user's natural-language phrasing into symbol-name fragments that L1 can look up. It never touches the graph itself.
+- If L2 is absent or fails, the experience degrades to L1 (deterministic substring + FTS), never below it. Default-on is therefore a UX improvement with a deterministic floor.
+
+**What this RFC explicitly decides:** L2 may be client-side default-on. Any future proposal to move LLM involvement into the *daemon* (server-side) or to use LLMs to determine graph edges or traversal order requires a new RFC and Principal Architect sign-off. This RFC draws that line, not just permits L2.
 
 ### 2.1 Where it lives
 
@@ -259,17 +307,21 @@ Respond with ONLY the JSON object, no prose, no markdown.
 Question: {{userQuery}}
 ```
 
-The translator is deterministic from the LLM's perspective (`temperature=0`). Two identical natural-language queries against the same model version produce the same `StructuredQuery`. The deterministic-by-input property of the daemon is preserved end-to-end.
+The translator uses `temperature=0` for best-effort stability. In practice, `temperature=0` does not guarantee bit-identical output across providers, model versions, or inference hardware (batching schedules, MoE routing, and quantization all introduce variance). Two identical queries *usually* produce the same `StructuredQuery` against a fixed model deployment, but this is not a hard guarantee. The **actual** end-to-end determinism guarantee is on the daemon side: identical structured inputs to `search_nodes_fuzzy` always produce identical outputs. L1 provides the true determinism floor; L2 is best-effort stable on top of it.
 
 ### 2.4 Client-side fan-out
 
 ```typescript
 async function fuzzyQuery(nl: string): Promise<Node[]> {
   const sq = await translator.translate(nl);
+  // The up-to-5 search_symbol calls are issued concurrently — this is the
+  // user-facing latency path and sequential fan-out would multiply round-trip time.
+  const results = await Promise.all(
+    sq.symbols.map(sym => mcp.callTool("search_symbol", { name: sym }))
+  );
   const seenIds = new Set<string>();
   const merged: Node[] = [];
-  for (const sym of sq.symbols) {
-    const nodes = await mcp.callTool("search_symbol", { name: sym });
+  for (const nodes of results) {
     for (const n of nodes) {
       if (seenIds.has(n.id)) continue;
       if (sq.paths && !matchAny(n.path, sq.paths)) continue;
@@ -400,6 +452,12 @@ Never embeds function bodies. The graph already captures structural relationship
 fn search_nodes_fuzzy_l3(query: &str) -> Result<Vec<Node>, StoreError> {
     let embedding = travsr_embed::embed(query)?;  // ~12-30 ms
     let rows = conn.query_row(
+        // LIMIT 10: L3 fetches the top-10 nearest neighbours by cosine distance.
+        // These are merged into the shared 50-node cap of search_nodes_fuzzy, not
+        // added on top of it. When L3 fires, L1 has already returned 0 results, so
+        // the effective seed K passed to PPR is at most 10 from L3 alone — well
+        // within the 50-seed bound in ADR-003. The 50-node cap in search_nodes_fuzzy
+        // is the unified ceiling across all layers.
         "SELECT node_rowid, distance FROM nodes_vec
          WHERE embedding MATCH ? ORDER BY distance LIMIT 10",
         params![embedding.as_bytes()],
@@ -481,7 +539,7 @@ Rejected. Marginal recall improvement (~3 points BEIR) not worth the 4x storage 
 
 1. **Should `search_symbol` expose the fuzzy fallback explicitly?** Option A: tools.rs hides the layering and clients see one tool that "just works." Option B: add a `fuzzy: bool` argument so deterministic clients can opt out. Lean: A - the tool's job is "find symbols by name"; whether it uses substring, FTS, or vectors underneath is an implementation detail.
 2. **Non-ASCII identifier tokenization.** `tokenize_identifier` splits ASCII case boundaries only. CJK / Cyrillic identifiers emit as one trigram blob. Acceptable for v1; flag in QA-014.
-3. **FTS / vec index rebuild on schema migrations v10+.** If a future migration alters `nodes.signature`, the FTS and vec tables can drift. Solve via a checksum row in `nodes_fts_map` that triggers a rebuild on mismatch. Defer to L1 implementation.
+3. **FTS / vec index freshness on schema migrations v10+.** If a future migration alters `nodes.signature`, the FTS and vec tables can drift. Solve via a checksum row in `nodes_fts_map` that triggers a rebuild on mismatch. Defer to L1 implementation. **Note:** per-commit incremental reindex (the common case) is addressed in §1.3 via `delete_node_fts` / `put_node_fts`; the delete/retract path stores `tokens` in `nodes_fts_map` precisely to make contentless-FTS retraction correct. This open question covers only the forward-schema-migration drift case, not incremental reindex.
 4. **Telemetry for layer hit rate.** Need a metric for "L1 hit", "L1 miss -> L2 used", "L1+L2 miss -> L3 used", "all-miss -> empty." Reuse the existing `tracing` span counters; expose via the metrics endpoint added in RFC-007. Drives the decision of whether L3 ever leaves opt-in.
 5. **Model attestation for L3.** Should the model SHA-256 be signed alongside the binary via cosign (mirroring release artifact signing)? Lean: yes, because a swapped model silently changes retrieval behavior in a way users cannot detect. Defer to Phase 5 security review.
 6. **L2 model choice.** The translator prompt is fixed but the model is not. Default = whatever the MCP client already has access to (Claude, GPT, local). Should the prompt be tuned per-model? Lean: no - keep it portable, accept ~5% recall variance across models.
