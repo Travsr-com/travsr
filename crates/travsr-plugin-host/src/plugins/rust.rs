@@ -30,7 +30,7 @@ impl Plugin for RustPlugin {
             ..Default::default()
         };
         match run_ra_lsif(&req.root, &cfg) {
-            Ok(Some(dump)) => match ingest_rust(&dump, "") {
+            Ok(Some(dump)) => match ingest_rust(&dump, &req.corpus) {
                 Ok(out) => InvokeResponse {
                     nodes: out.nodes,
                     edges: out.edges,

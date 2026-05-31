@@ -18,7 +18,6 @@ pub mod ra_runner;
 pub mod runner;
 mod rust;
 pub mod sandbox;
-mod scip_ingest;
 mod typescript;
 
 use std::path::Path;
@@ -32,7 +31,6 @@ pub use lsif::ingest as ingest_lsif;
 pub use lsif::{ingest_rust, ingest_rust_raw};
 pub use ra_runner::run_ra_lsif;
 pub use runner::run_lsif_emitter;
-pub use scip_ingest::ingest_scip;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
 

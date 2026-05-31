@@ -2,6 +2,7 @@ use crate::cache::{CacheKey, ParseCache};
 use crate::dispatcher::Dispatcher;
 use crate::plugins::response_to_output;
 use crate::registry::register_builtins;
+use crate::resolver::PluginResolver;
 use std::path::Path;
 use travsr_error::IndexError;
 use travsr_indexer::{hash_file, ParseOutput};
@@ -73,74 +74,55 @@ impl PluginIndexer {
     ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
         if !trust.is_trusted(&self.corpus) {
             tracing::info!(
-                "Phase B skipped for corpus '{}' — run: travsr lang add <lang> --corpus {}",
-                self.corpus,
+                "Phase B skipped for corpus '{}' — add trust first",
                 self.corpus
             );
             return (vec![], vec![]);
         }
 
+        let current_exe = std::env::current_exe()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let builtin_langs: Vec<String> = self
+            .dispatcher
+            .phase_b_languages()
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let resolver = crate::resolver::CompositeResolver::new(vec![
+            Box::new(crate::resolver::BuiltinResolver::new(
+                current_exe,
+                builtin_langs,
+            )),
+            Box::new(crate::resolver::CatalogResolver::new()),
+        ]);
+
         let mut all_nodes = Vec::new();
         let mut all_edges = Vec::new();
 
-        // 1. Built-in languages with Phase B (TypeScript via travsr-lsif-ts, Rust via
-        //    rust-analyzer). Spawn a Sidecar so the call runs sandboxed per ADR-017.
-        let current_exe = std::env::current_exe().unwrap_or_default();
-        let exe_str = current_exe.to_string_lossy().into_owned();
-        let req = travsr_plugin_protocol::InvokeRequest {
-            root: repo_root.to_path_buf(),
-            // TODO: thread corpus from trust/registry config when available.
-            corpus: String::new(),
-        };
+        for lang in resolver.providable_languages() {
+            let spec = match resolver.resolve(&lang) {
+                Some(s) => s,
+                None => continue,
+            };
 
-        for lang in self.dispatcher.phase_b_languages() {
-            match crate::transport::Sidecar::spawn(lang, &exe_str, repo_root) {
-                Ok(sidecar) => {
-                    match crate::transport::Transport::invoke_phase_b(&sidecar, req.clone()) {
-                        Ok(resp) => {
-                            all_nodes.extend(resp.nodes);
-                            all_edges.extend(resp.edges);
-                        }
-                        Err(travsr_error::IndexError::PhaseNotSupported) => {}
-                        Err(e) => tracing::warn!("Phase B {lang}: {e}"),
+            let req = travsr_plugin_protocol::InvokeRequest {
+                root: repo_root.to_path_buf(),
+                corpus: self.corpus.clone(),
+            };
+
+            match crate::transport::Sidecar::spawn(&spec, repo_root) {
+                Ok(sidecar) => match crate::transport::Transport::invoke_phase_b(&sidecar, req) {
+                    Ok(resp) => {
+                        all_nodes.extend(resp.nodes);
+                        all_edges.extend(resp.edges);
                     }
-                }
+                    Err(travsr_error::IndexError::PhaseNotSupported) => {}
+                    Err(e) => tracing::warn!("Phase B {lang}: {e}"),
+                },
                 Err(e) => tracing::warn!("Phase B sidecar spawn {lang}: {e}"),
-            }
-        }
-
-        // 2. Catalog Phase B tools (scip-go, scip-java, etc.) registered in
-        //    ~/.travsr/lang.toml.
-        //
-        // NOTE: this direct catalog runner is the interim path. Per RFC-011 the
-        // language Phase B logic is moving to the separate `travsr-lang` repo and
-        // will run via the sandboxed Sidecar transport. Until then we must not run
-        // a `RequiresElevated` tool here: it needs the Elevated network-allowlist
-        // sandbox (ADR-017 Rule 1) which this direct path does NOT apply. Running
-        // it would mean full unrestricted network + environment — the exact threat
-        // ADR-017 exists to contain. Fail-closed per Rule 2.
-        let registered = crate::trust::registered_languages_from_disk();
-        for entry in crate::phase_b::catalog::CATALOG {
-            if !registered.iter().any(|r| r == entry.language) {
-                continue;
-            }
-            if entry.sandbox == crate::phase_b::catalog::SandboxRequirement::RequiresElevated {
-                tracing::warn!(
-                    lang = entry.language,
-                    "Phase B skipped (fail-closed, ADR-017 Rule 2): '{}' is RequiresElevated and \
-                     needs the Elevated network-allowlist sandbox, which the interim catalog \
-                     runner does not apply. It will run sandboxed once relocated to the \
-                     travsr-lang sidecar.",
-                    entry.language
-                );
-                continue;
-            }
-            match crate::phase_b::runner::run_phase_b(entry, repo_root) {
-                Ok(resp) => {
-                    all_nodes.extend(resp.nodes);
-                    all_edges.extend(resp.edges);
-                }
-                Err(e) => tracing::warn!("Phase B {}: {e}", entry.language),
             }
         }
 

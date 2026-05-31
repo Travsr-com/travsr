@@ -172,7 +172,7 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 
     // LSIF semantic pass — adds RefCall edges on top of structural edges.
     // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
-    run_lsif_pass(repo_root, &mut store);
+    run_lsif_pass(repo_root, &corpus, &mut store);
 
     // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
     // Runs once per full init, not per commit (PERF-002). Trust gate inside.
@@ -384,7 +384,7 @@ pub fn reindex_files(
 ///
 /// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
 /// warnings and silently skipped — they must never fail the overall index.
-fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
+fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) {
     let tsconfig = repo_root.join("tsconfig.json");
     if !tsconfig.exists() {
         return;
@@ -398,7 +398,7 @@ fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
         }
     };
 
-    let lsif_out = match ingest_lsif(&dump) {
+    let lsif_out = match ingest_lsif(&dump, corpus) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("lsif ingest error: {e}");

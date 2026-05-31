@@ -61,7 +61,7 @@ impl Plugin for TypeScriptPlugin {
             return InvokeResponse::default();
         }
         match travsr_indexer::run_lsif_emitter(&tsconfig) {
-            Ok(dump) => match travsr_indexer::ingest_lsif(&dump) {
+            Ok(dump) => match travsr_indexer::ingest_lsif(&dump, &req.corpus) {
                 Ok(lsif_out) => InvokeResponse {
                     nodes: lsif_out.nodes,
                     edges: lsif_out.edges,

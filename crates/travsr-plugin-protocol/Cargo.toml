@@ -9,8 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-travsr-core  = { path = "../travsr-core",  version = "0.6.1" }
-travsr-error = { path = "../travsr-error", version = "0.6.1" }
+travsr-core  = { path = "../travsr-core",  version = "0.7.0" }
+travsr-error = { path = "../travsr-error", version = "0.7.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

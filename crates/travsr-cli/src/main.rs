@@ -147,11 +147,8 @@ async fn main() {
                 travsr_plugin_sdk::run_plugin(plugins::typescript::TypeScriptPlugin)
             }
             "rust" => travsr_plugin_sdk::run_plugin(plugins::rust::RustPlugin),
-            "python" => travsr_plugin_sdk::run_plugin(plugins::python::PythonPlugin),
-            "go" => travsr_plugin_sdk::run_plugin(plugins::go::GoPlugin),
-            "java" => travsr_plugin_sdk::run_plugin(plugins::java::JavaPlugin),
             other => {
-                eprintln!("travsr: unknown plugin language {other:?}");
+                eprintln!("unknown __plugin language: {other}");
                 std::process::exit(1);
             }
         }

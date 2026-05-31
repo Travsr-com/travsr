@@ -91,15 +91,15 @@ impl Sidecar {
         }
     }
 
-    /// Spawn the plugin binary under the ADR-017 sandbox.
+    /// Spawn the plugin binary under the ADR-017 sandbox described by `spec`.
     ///
-    /// `program` is the path to the travsr binary (same executable, `__plugin`
-    /// sub-command). `lang` is the canonical language string (e.g. "rust").
+    /// `spec.program` is the binary to execute; `spec.args` are its arguments;
+    /// `spec.policy` controls the sandbox level applied before spawning.
     pub fn spawn(
-        lang: &str,
-        program: &str,
+        spec: &crate::resolver::PluginSpec,
         repo_root: &std::path::Path,
     ) -> Result<Self, IndexError> {
+        let lang = &spec.language;
         // Create per-invocation scratch tmpdir (ADR-017 Rule 1).
         // Dropped when Sidecar drops — guarantees cleanup even on error paths.
         let scratch = tempfile::Builder::new()
@@ -109,12 +109,17 @@ impl Sidecar {
                 file: format!("plugin:{lang}"),
                 message: format!("failed to create scratch dir: {e}"),
             })?;
-        let args = ["__plugin", lang];
-        let mut cmd = Self::build_cmd(program, &args, repo_root, scratch.path()).map_err(|e| {
-            IndexError::Parse {
-                file: format!("plugin:{lang}"),
-                message: e.to_string(),
-            }
+        let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+        let mut cmd = Self::build_cmd(
+            &spec.program,
+            &args,
+            repo_root,
+            scratch.path(),
+            &spec.policy,
+        )
+        .map_err(|e| IndexError::Parse {
+            file: format!("plugin:{lang}"),
+            message: e.to_string(),
         })?;
 
         cmd.stdin(std::process::Stdio::piped())
@@ -182,8 +187,9 @@ impl Sidecar {
         args: &[&str],
         repo_root: &std::path::Path,
         scratch: &std::path::Path,
+        policy: &crate::sandbox::policy::SandboxPolicy,
     ) -> Result<std::process::Command, SandboxUnavailable> {
-        crate::sandbox::linux::build_sandboxed_command(program, args, repo_root, scratch)
+        crate::sandbox::linux::build_sandboxed_command(program, args, repo_root, scratch, policy)
     }
 
     #[cfg(target_os = "macos")]
@@ -192,8 +198,9 @@ impl Sidecar {
         args: &[&str],
         repo_root: &std::path::Path,
         scratch: &std::path::Path,
+        policy: &crate::sandbox::policy::SandboxPolicy,
     ) -> Result<std::process::Command, SandboxUnavailable> {
-        crate::sandbox::macos::build_sandboxed_command(program, args, repo_root, scratch)
+        crate::sandbox::macos::build_sandboxed_command(program, args, repo_root, scratch, policy)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -202,6 +209,7 @@ impl Sidecar {
         _a: &[&str],
         _r: &std::path::Path,
         _s: &std::path::Path,
+        _policy: &crate::sandbox::policy::SandboxPolicy,
     ) -> Result<std::process::Command, SandboxUnavailable> {
         Err(SandboxUnavailable("unsupported platform".into()))
     }

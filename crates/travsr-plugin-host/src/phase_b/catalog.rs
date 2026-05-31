@@ -31,6 +31,12 @@ pub struct PhaseBEntry {
     pub sandbox: SandboxRequirement,
     /// Shown by `travsr lang list` and `travsr lang add` when tool is absent.
     pub install_hint: &'static str,
+    /// The travsr-lang binary name for this language, e.g. "travsr-lang-go".
+    /// None for in-tree builtins (rust, typescript) that spawn via __plugin.
+    pub provider_binary: Option<&'static str>,
+    /// For RequiresElevated languages: the network hosts their build tool contacts.
+    /// Empty for Standard sandbox languages.
+    pub elevated_hosts: &'static [&'static str],
 }
 
 pub static CATALOG: &[PhaseBEntry] = &[
@@ -42,6 +48,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/typescript  (installs travsr-lsif-ts)",
+        provider_binary: None,
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "javascript",
@@ -51,6 +59,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/typescript  (installs travsr-lsif-ts)",
+        provider_binary: None,
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "rust",
@@ -60,6 +70,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/rust  (or: rustup component add rust-analyzer)",
+        provider_binary: None,
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "go",
@@ -69,6 +81,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/go  (or: go install github.com/sourcegraph/scip-go/cmd/scip-go@latest)",
+        provider_binary: Some("travsr-lang-go"),
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "python",
@@ -78,6 +92,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/python  (or: pip install scip-python)",
+        provider_binary: Some("travsr-lang-python"),
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "java",
@@ -87,6 +103,13 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr/java  — PSE approval required (Maven/Gradle network access)",
+        provider_binary: Some("travsr-lang-java"),
+        elevated_hosts: &[
+            "repo1.maven.org",
+            "repo.maven.apache.org",
+            "plugins.gradle.org",
+            "jcenter.bintray.com",
+        ],
     },
     PhaseBEntry {
         language: "kotlin",
@@ -96,6 +119,12 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr/kotlin  — PSE approval required (scip-java covers Kotlin via Gradle)",
+        provider_binary: Some("travsr-lang-kotlin"),
+        elevated_hosts: &[
+            "repo1.maven.org",
+            "repo.maven.apache.org",
+            "plugins.gradle.org",
+        ],
     },
     PhaseBEntry {
         language: "scala",
@@ -105,6 +134,13 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr/scala  — PSE approval required (sbt dependency resolution)",
+        provider_binary: Some("travsr-lang-scala"),
+        elevated_hosts: &[
+            "repo1.maven.org",
+            "repo.maven.apache.org",
+            "plugins.sbt.org",
+            "jcenter.bintray.com",
+        ],
     },
     PhaseBEntry {
         language: "ruby",
@@ -114,6 +150,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/ruby  (experimental)",
+        provider_binary: Some("travsr-lang-ruby"),
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "php",
@@ -123,6 +161,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/php",
+        provider_binary: Some("travsr-lang-php"),
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "csharp",
@@ -132,6 +172,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr/csharp  — PSE approval required (NuGet restore)",
+        provider_binary: Some("travsr-lang-csharp"),
+        elevated_hosts: &["api.nuget.org", "www.nuget.org"],
     },
     PhaseBEntry {
         language: "cpp",
@@ -141,6 +183,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/cpp  (requires compile_commands.json)",
+        provider_binary: Some("travsr-lang-cpp"),
+        elevated_hosts: &[],
     },
     PhaseBEntry {
         language: "c",
@@ -150,6 +194,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr/c  (requires compile_commands.json)",
+        provider_binary: Some("travsr-lang-c"),
+        elevated_hosts: &[],
     },
 ];
 

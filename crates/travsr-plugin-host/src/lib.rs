@@ -10,6 +10,7 @@ pub mod indexer;
 pub mod phase_b;
 pub mod plugins;
 pub mod registry;
+pub mod resolver;
 pub mod sandbox;
 pub mod supervisor;
 pub mod transport;

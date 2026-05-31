@@ -87,7 +87,7 @@ fn lsif_ingest_1k_symbols_under_30s() {
     let dump = generate_lsif_dump(1_000, 500);
 
     let start = Instant::now();
-    let out = ingest_lsif(&dump).expect("LSIF ingest must succeed");
+    let out = ingest_lsif(&dump, "").expect("LSIF ingest must succeed");
     let elapsed = start.elapsed();
 
     // Correctness: edges were emitted

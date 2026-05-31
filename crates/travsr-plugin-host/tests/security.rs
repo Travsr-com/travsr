@@ -26,6 +26,7 @@ fn sandbox_standard_denies_network() {
         ],
         repo.path(),
         scratch.path(),
+        &SandboxPolicy::Standard,
     );
 
     match cmd {
@@ -67,7 +68,13 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
         use travsr_plugin_host::sandbox::macos::build_sandboxed_command;
         let repo = tempfile::tempdir().expect("tempdir");
         let scratch = tempfile::tempdir().expect("scratch");
-        let result = build_sandboxed_command("sh", &["-c", "true"], repo.path(), scratch.path());
+        let result = build_sandboxed_command(
+            "sh",
+            &["-c", "true"],
+            repo.path(),
+            scratch.path(),
+            &SandboxPolicy::Standard,
+        );
         // On Linux, the macOS builder always returns Err
         assert!(
             result.is_err(),
@@ -80,7 +87,13 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
         use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
         let repo = tempfile::tempdir().expect("tempdir");
         let scratch = tempfile::tempdir().expect("scratch");
-        let result = build_sandboxed_command("sh", &["-c", "true"], repo.path(), scratch.path());
+        let result = build_sandboxed_command(
+            "sh",
+            &["-c", "true"],
+            repo.path(),
+            scratch.path(),
+            &SandboxPolicy::Standard,
+        );
         assert!(
             result.is_err(),
             "Linux sandbox builder should return Err on macOS"
@@ -94,8 +107,22 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
         use travsr_plugin_host::sandbox::macos::build_sandboxed_command as macos_build;
         let repo = tempfile::tempdir().expect("tempdir");
         let scratch = tempfile::tempdir().expect("scratch");
-        assert!(linux_build("sh", &[], repo.path(), scratch.path()).is_err());
-        assert!(macos_build("sh", &[], repo.path(), scratch.path()).is_err());
+        assert!(linux_build(
+            "sh",
+            &[],
+            repo.path(),
+            scratch.path(),
+            &SandboxPolicy::Standard
+        )
+        .is_err());
+        assert!(macos_build(
+            "sh",
+            &[],
+            repo.path(),
+            scratch.path(),
+            &SandboxPolicy::Standard
+        )
+        .is_err());
     }
 }
 
@@ -150,6 +177,7 @@ fn sandbox_repo_root_is_read_only() {
         ],
         repo.path(),
         scratch.path(),
+        &SandboxPolicy::Standard,
     );
 
     match cmd {
@@ -184,6 +212,7 @@ fn sandbox_scratch_dir_is_writable() {
         &["-c", "echo ok > /travsr-scratch/write_test.txt"],
         repo.path(),
         scratch.path(),
+        &SandboxPolicy::Standard,
     );
 
     match cmd {

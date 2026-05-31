@@ -1,5 +1,5 @@
 //! Linux sandbox (bubblewrap + optional Landlock). Fail-closed per ADR-017 Rule 2.
-use crate::sandbox::policy::SandboxUnavailable;
+use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 use std::path::Path;
 use std::process::Command;
 
@@ -45,6 +45,7 @@ pub fn build_sandboxed_command(
     args: &[&str],
     repo_root: &Path,
     scratch_dir: &Path,
+    policy: &SandboxPolicy,
 ) -> Result<Command, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
@@ -54,26 +55,50 @@ pub fn build_sandboxed_command(
                 .into(),
         ));
     }
+
+    // For Elevated policy, validate fields first (fail-closed per ADR-017 Rule 2).
+    if let SandboxPolicy::Elevated { .. } = policy {
+        policy.validate()?;
+    }
+
     let repo = repo_root.to_string_lossy();
     let scratch = scratch_dir.to_string_lossy();
 
     let mut cmd = Command::new("bwrap");
-    // --unshare-net is probed at first use: on hosts where loopback setup inside
-    // the new network namespace is blocked (e.g. GitHub Actions, some container
-    // runtimes) bwrap exits non-zero with "RTM_NEWADDR: Operation not permitted".
-    // We fall back to skipping network isolation on such hosts rather than
-    // aborting the entire sandbox invocation.
-    // ADR-017 Rule 2: fail-closed. Network isolation is a primary egress control;
-    // silently dropping it is not an acceptable degradation for any policy level.
-    if net_unshare_supported() {
-        cmd.arg("--unshare-net");
-    } else {
-        return Err(SandboxUnavailable(
-            "bwrap --unshare-net not supported on this host (loopback blocked inside \
-             the network namespace); plugin disabled per ADR-017 Rule 2 — to run on a \
-             host without network-namespace support, request an Elevated policy \
-             exception via ADR-017 §Elevated".into(),
-        ));
+
+    match policy {
+        SandboxPolicy::Standard => {
+            // --unshare-net is probed at first use: on hosts where loopback setup
+            // inside the new network namespace is blocked (e.g. GitHub Actions,
+            // some container runtimes) bwrap exits non-zero with
+            // "RTM_NEWADDR: Operation not permitted".
+            // ADR-017 Rule 2: fail-closed. Network isolation is a primary egress
+            // control; silently dropping it is not an acceptable degradation.
+            if net_unshare_supported() {
+                cmd.arg("--unshare-net");
+            } else {
+                return Err(SandboxUnavailable(
+                    "bwrap --unshare-net not supported on this host (loopback blocked \
+                     inside the network namespace); plugin disabled per ADR-017 Rule 2 \
+                     — to run on a host without network-namespace support, request an \
+                     Elevated policy exception via ADR-017 §Elevated"
+                        .into(),
+                ));
+            }
+        }
+        SandboxPolicy::Elevated {
+            permitted_hosts, ..
+        } => {
+            // Elevated: FS confinement via bwrap still applies, but --unshare-net
+            // is intentionally skipped so the plugin can reach its permitted hosts.
+            // Host-level filtering (firewall / egress proxy) must enforce the
+            // permitted_hosts list — bwrap has no per-host network rule support.
+            tracing::info!(
+                permitted_hosts = ?permitted_hosts,
+                "ADR-017 Elevated policy: network namespace isolation disabled; \
+                 plugin may reach permitted hosts (enforce via egress controls)"
+            );
+        }
     }
     cmd.args(["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
@@ -170,6 +195,7 @@ pub fn build_sandboxed_command(
     _a: &[&str],
     _r: &Path,
     _s: &Path,
+    _policy: &SandboxPolicy,
 ) -> Result<Command, SandboxUnavailable> {
     Err(SandboxUnavailable(
         "Linux sandbox not available on this platform".into(),
