@@ -39,7 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry         = { version = "0.24", default-features = false, features = ["trace"] }
 opentelemetry_sdk     = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp    = { version = "0.17", features = ["tonic"] }
-tracing-opentelemetry = "0.25"
+tracing-opentelemetry = "0.33"
 rusqlite = { version = "0.39", features = ["bundled"] }
 sha2 = "0.11"
 clap = { version = "4", features = ["derive"] }
