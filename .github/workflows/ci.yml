@@ -69,9 +69,26 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      - name: Install bubblewrap (Linux sandbox breach test)
+      - name: Install bubblewrap (Linux sandbox enforcement tests)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04+ ships an AppArmor profile that blocks bwrap from creating
+          # mount/user namespaces even with sudo. Unload the profile so our sandbox
+          # enforcement tests (security.rs) can actually run bwrap.
+          for profile in /etc/apparmor.d/bwrap /etc/apparmor.d/usr.bin.bwrap; do
+            if [ -f "$profile" ]; then
+              sudo apparmor_parser -R "$profile" && echo "Unloaded AppArmor profile: $profile" || true
+            fi
+          done
+          # Also disable the global AppArmor user-namespace restriction (Ubuntu 24.04 kernel).
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          # Verify bwrap can actually create a sandbox — fail this step loudly if not,
+          # so any remaining restriction is caught before cargo test runs.
+          # Include /lib and /lib64: on merged-usr systems these are host symlinks
+          # to /usr/lib{,64} and must be mounted explicitly inside bwrap's tmpfs root
+          # so the dynamic linker (/lib64/ld-linux-x86-64.so.2) is reachable.
+          bwrap --ro-bind-try /usr /usr --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 --proc /proc --dev /dev -- true
 
       - name: Run tests
         run: cargo test --workspace
@@ -138,3 +155,11 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
+
+  plugin-hashes:
+    name: plugin-hashes.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify plugin source hashes (ADR-017 Rule 5)
+        run: bash .github/scripts/check-plugin-hashes.sh

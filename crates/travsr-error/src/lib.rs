@@ -100,6 +100,18 @@ pub enum IndexError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("plugin phase not supported for this transport")]
+    PhaseNotSupported,
+
+    #[error("plugin protocol version mismatch: expected {expected}, got {got}")]
+    ProtocolVersionMismatch { expected: u32, got: u32 },
+
+    #[error("plugin reported unknown language: {reported:?}")]
+    UnknownLanguage { reported: String },
+
+    #[error("plugin {language:?} crashed")]
+    PluginCrashed { language: String },
 }
 
 /// Errors originating in the retrieval layer (BFS, PPR, PCST).

@@ -118,6 +118,15 @@ pub enum Language {
     Rust,
     Python,
     Go,
+    Java,
+    Kotlin,
+    Ruby,
+    CSharp,
+    Php,
+    Scala,
+    Cpp,
+    C,
+    // Swift: grammar crate blocked on tree-sitter version conflict; variant reserved.
 }
 
 impl Language {
@@ -130,6 +139,14 @@ impl Language {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
             "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "kt" | "kts" => Some(Self::Kotlin),
+            "rb" | "rake" | "gemspec" => Some(Self::Ruby),
+            "cs" => Some(Self::CSharp),
+            "php" | "phtml" | "php8" => Some(Self::Php),
+            "scala" | "sc" => Some(Self::Scala),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
+            "c" | "h" => Some(Self::C),
             _ => None,
         }
     }
@@ -141,6 +158,14 @@ impl Language {
             Self::Rust => "rust",
             Self::Python => "python",
             Self::Go => "go",
+            Self::Java => "java",
+            Self::Kotlin => "kotlin",
+            Self::Ruby => "ruby",
+            Self::CSharp => "csharp",
+            Self::Php => "php",
+            Self::Scala => "scala",
+            Self::Cpp => "cpp",
+            Self::C => "c",
         }
     }
 
@@ -152,6 +177,14 @@ impl Language {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
             "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "kotlin" => Some(Self::Kotlin),
+            "ruby" => Some(Self::Ruby),
+            "csharp" => Some(Self::CSharp),
+            "php" => Some(Self::Php),
+            "scala" => Some(Self::Scala),
+            "cpp" => Some(Self::Cpp),
+            "c" => Some(Self::C),
             _ => None,
         }
     }

@@ -34,6 +34,36 @@ pub use runner::run_lsif_emitter;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
 
+/// Public bridge for travsr-plugin-host wrappers (RFC-011 P5-S2).
+pub fn typescript_parse(
+    corpus: &str,
+    path: &std::path::Path,
+    vname_path: &str,
+) -> anyhow::Result<ParseOutput> {
+    typescript::parse(corpus, path, vname_path)
+}
+pub fn rust_parse(
+    corpus: &str,
+    path: &std::path::Path,
+    vname_path: &str,
+) -> anyhow::Result<ParseOutput> {
+    rust::parse(corpus, path, vname_path)
+}
+pub fn python_parse(
+    corpus: &str,
+    path: &std::path::Path,
+    vname_path: &str,
+) -> anyhow::Result<ParseOutput> {
+    python::parse(corpus, path, vname_path)
+}
+pub fn go_parse(
+    corpus: &str,
+    path: &std::path::Path,
+    vname_path: &str,
+) -> anyhow::Result<ParseOutput> {
+    go::parse(corpus, path, vname_path)
+}
+
 /// Resolve relative imports in `nodes` to `resolves-to` edges.
 ///
 /// For each import node whose module specifier starts with `./` or `../`,

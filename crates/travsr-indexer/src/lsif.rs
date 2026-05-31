@@ -40,8 +40,8 @@ use crate::ParseOutput;
 /// Returns an error only if the entire dump is empty or unparseable. Partial
 /// failures (unrecognised lines, missing vnames) are logged at trace level and
 /// skipped so the daemon can continue indexing.
-pub fn ingest(dump: &str) -> anyhow::Result<ParseOutput> {
-    let edges = ingest_raw(dump).context("ingesting LSIF dump")?;
+pub fn ingest(dump: &str, corpus: &str) -> anyhow::Result<ParseOutput> {
+    let edges = ingest_raw(dump, corpus).context("ingesting LSIF dump")?;
     Ok(ParseOutput {
         nodes: Vec::new(), // LSIF adds edges only; Tree-sitter owns nodes
         edges,
@@ -63,7 +63,7 @@ struct LsifGraph {
     doc_paths: HashMap<u64, String>,
 }
 
-fn parse_graph(dump: &str) -> anyhow::Result<LsifGraph> {
+fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
     let mut graph = LsifGraph::default();
 
     for line in dump.lines() {
@@ -109,7 +109,7 @@ fn parse_graph(dump: &str) -> anyhow::Result<LsifGraph> {
                     if !path.is_empty() && !sig.is_empty() {
                         graph
                             .result_sets
-                            .insert(id, VName::new("", "", path, "typescript", sig));
+                            .insert(id, VName::new(corpus, "", path, "typescript", sig));
                     }
                 }
             }
@@ -134,8 +134,8 @@ fn parse_graph(dump: &str) -> anyhow::Result<LsifGraph> {
 ///
 /// Separated from `ingest` so that unit tests can feed synthetic dumps without
 /// going through the `ParseOutput` wrapper.
-pub fn ingest_raw(dump: &str) -> anyhow::Result<Vec<Edge>> {
-    let graph = parse_graph(dump).context("parsing LSIF graph metadata")?;
+pub fn ingest_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
+    let graph = parse_graph(dump, corpus).context("parsing LSIF graph metadata")?;
 
     let mut edges = Vec::new();
 
@@ -181,7 +181,7 @@ pub fn ingest_raw(dump: &str) -> anyhow::Result<Vec<Edge>> {
 
         // Caller = the file node at the call site (file-level precision for Sprint 4).
         // DEBT(travsr-25): upgrade to method-level caller once containment tracking lands.
-        let caller_id = VName::new("", "", caller_path.as_str(), "typescript", "file").id();
+        let caller_id = VName::new(corpus, "", caller_path.as_str(), "typescript", "file").id();
         let callee_id = callee_vname.id();
 
         // Intra-file edges (caller_path == callee_vname.path) are intentionally
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn ingest_raw_produces_ref_call_edge() {
         let dump = minimal_dump("svc.ts", "fn:charge", "caller.ts");
-        let edges = ingest_raw(&dump).unwrap();
+        let edges = ingest_raw(&dump, "").unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].kind, EdgeKind::RefCall);
 
@@ -275,7 +275,7 @@ mod tests {
 {"id":6,"type":"edge","label":"item","outV":4,"inVs":[10],"document":2,"property":"references"}
 {"id":7,"type":"edge","label":"item","outV":4,"inVs":[11],"document":2,"property":"references"}
 "#;
-        let edges = ingest_raw(dump).unwrap();
+        let edges = ingest_raw(dump, "").unwrap();
         assert_eq!(edges.len(), 2, "two item edges → two raw RefCall edges");
         assert!(edges.iter().all(|e| e.kind == EdgeKind::RefCall));
     }
@@ -286,7 +286,7 @@ mod tests {
         // they become meaningful for blast-radius once caller precision upgrades
         // from FILE to METHOD level in a follow-on sprint.
         let dump = minimal_dump("same.ts", "fn:bar", "same.ts");
-        let edges = ingest_raw(&dump).unwrap();
+        let edges = ingest_raw(&dump, "").unwrap();
         assert_eq!(edges.len(), 1, "intra-file RefCall edge must be kept");
         assert_eq!(edges[0].kind, EdgeKind::RefCall);
     }
@@ -301,7 +301,7 @@ mod tests {
 {"id":5,"type":"edge","label":"textDocument/references","outV":3,"inV":4}
 {"id":6,"type":"edge","label":"item","outV":4,"inVs":[9],"document":2,"property":"references"}
 "#;
-        let edges = ingest_raw(dump).unwrap();
+        let edges = ingest_raw(dump, "").unwrap();
         assert_eq!(edges.len(), 0, "no vname → no edge");
     }
 
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn ingest_wraps_ingest_raw() {
         let dump = minimal_dump("svc.ts", "class:Svc", "other.ts");
-        let out = ingest(&dump).unwrap();
+        let out = ingest(&dump, "").unwrap();
         assert_eq!(out.nodes.len(), 0);
         assert_eq!(out.edges.len(), 1);
     }

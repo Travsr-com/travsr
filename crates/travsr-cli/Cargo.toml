@@ -19,9 +19,12 @@ travsr-daemon = { path = "../travsr-daemon" }
 travsr-mcp = { path = "../travsr-mcp" }
 travsr-store = { path = "../travsr-store" }
 travsr-retrieval = { path = "../travsr-retrieval" }
+travsr-plugin-sdk  = { path = "../travsr-plugin-sdk" }
+travsr-plugin-host = { path = "../travsr-plugin-host" }
 walkdir = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -29,6 +32,9 @@ tracing-subscriber = { workspace = true }
 tabled = { workspace = true }
 axum = { workspace = true }
 dashmap = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }
 # Optional OTLP deps — only compiled with `--features otlp`
 opentelemetry         = { workspace = true, optional = true }
 opentelemetry_sdk     = { workspace = true, optional = true }

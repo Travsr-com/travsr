@@ -1,0 +1,35 @@
+[package]
+name = "travsr-plugin-host"
+description = "Travsr plugin host — Transport trait, dispatcher, sidecar supervisor, ADR-017 sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+travsr-plugin-protocol = { path = "../travsr-plugin-protocol" }
+travsr-core            = { path = "../travsr-core" }
+travsr-error           = { path = "../travsr-error" }
+travsr-indexer         = { path = "../travsr-indexer" }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tempfile   = { workspace = true }
+dirs       = { workspace = true }
+toml       = { workspace = true }
+tree-sitter        = { workspace = true }
+tree-sitter-java   = { workspace = true }
+tree-sitter-kotlin = { workspace = true }
+tree-sitter-ruby    = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-php     = { workspace = true }
+tree-sitter-scala   = { workspace = true }
+tree-sitter-cpp     = { workspace = true }
+tree-sitter-c       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

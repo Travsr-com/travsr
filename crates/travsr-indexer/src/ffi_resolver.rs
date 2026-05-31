@@ -100,10 +100,13 @@ impl Resolver {
                 FfiMarkerKind::PyO3Call => ("rust", score_pyo3),
                 // CgoExport is on the Go side; looks for the synthetic "c" target.
                 FfiMarkerKind::CgoExport => ("c", score_cgo),
+                // JniCall: call into Java via JNI — looks for "java" export target.
+                FfiMarkerKind::JniCall => ("java", score_jni as ScoreFn),
                 // Indexed-target markers — skip as sources
-                FfiMarkerKind::NapiExport | FfiMarkerKind::PyO3Export | FfiMarkerKind::GoCallC => {
-                    continue
-                }
+                FfiMarkerKind::NapiExport
+                | FfiMarkerKind::PyO3Export
+                | FfiMarkerKind::GoCallC
+                | FfiMarkerKind::JniExport => continue,
             };
 
             // Corpus invariant: only match within the same corpus.
@@ -175,6 +178,10 @@ fn marker_language(m: &FfiMarker) -> &'static str {
         FfiMarkerKind::NapiCall => "typescript",
         FfiMarkerKind::PyO3Call => "python",
         FfiMarkerKind::GoCallC => "c",
+        // JniExport: the Java side is the target; indexed under "java".
+        FfiMarkerKind::JniExport => "java",
+        // JniCall: the call originates from Rust/Go; source is not Java.
+        FfiMarkerKind::JniCall => "rust",
     }
 }
 
@@ -208,11 +215,15 @@ fn score_pyo3(src: &FfiMarker, dst_arity: Option<u8>) -> u8 {
 fn score_cgo(src: &FfiMarker, _dst_arity: Option<u8>) -> u8 {
     // cgo //export + matching C name = exact → 90; no arity info available.
     if src.bound_name.is_none() {
-        // Exact name match via normalize_name (already confirmed by index lookup)
         90
     } else {
         70
     }
+}
+
+fn score_jni(_src: &FfiMarker, _dst_arity: Option<u8>) -> u8 {
+    // JNI name matching is always exact (JNI mangling is deterministic).
+    90
 }
 
 #[cfg(test)]

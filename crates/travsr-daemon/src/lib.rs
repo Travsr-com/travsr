@@ -16,8 +16,9 @@ use ignore::WalkBuilder;
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_python_fs, link_imports_rust,
-    run_lsif_emitter, FfiMarker, Indexer,
+    run_lsif_emitter, FfiMarker,
 };
+use travsr_plugin_host::PluginIndexer;
 use travsr_store::{SqliteStore, Store};
 
 #[cfg(unix)]
@@ -171,7 +172,32 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 
     // LSIF semantic pass — adds RefCall edges on top of structural edges.
     // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
-    run_lsif_pass(repo_root, &mut store);
+    run_lsif_pass(repo_root, &corpus, &mut store);
+
+    // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
+    // Runs once per full init, not per commit (PERF-002). Trust gate inside.
+    {
+        let trust = travsr_plugin_host::trust::TrustConfig::from_disk();
+        let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
+        let (pb_nodes, pb_edges) = phase_b_indexer.invoke_phase_b_all(repo_root, &trust);
+        for node in &pb_nodes {
+            if let Err(e) = store.put_node(node) {
+                tracing::warn!("phase B node write error: {e}");
+            }
+        }
+        for edge in &pb_edges {
+            if let Err(e) = store.put_edge(edge) {
+                tracing::warn!("phase B edge write error: {e}");
+            }
+        }
+        if !pb_nodes.is_empty() || !pb_edges.is_empty() {
+            tracing::info!(
+                nodes = pb_nodes.len(),
+                edges = pb_edges.len(),
+                "phase B indexing complete"
+            );
+        }
+    }
 
     // Capture edges_written AFTER the LSIF pass so RefCall edges are included
     // in the delta shown by `travsr init` on first run.
@@ -246,7 +272,7 @@ pub fn reindex_files(
         }
     };
 
-    let indexer = Indexer::with_corpus(&corpus);
+    let mut indexer = PluginIndexer::new(&corpus);
     // Accumulate FFI markers across all files for repo-level cross-language
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.
@@ -358,7 +384,7 @@ pub fn reindex_files(
 ///
 /// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
 /// warnings and silently skipped — they must never fail the overall index.
-fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
+fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) {
     let tsconfig = repo_root.join("tsconfig.json");
     if !tsconfig.exists() {
         return;
@@ -372,7 +398,7 @@ fn run_lsif_pass(repo_root: &Path, store: &mut SqliteStore) {
         }
     };
 
-    let lsif_out = match ingest_lsif(&dump) {
+    let lsif_out = match ingest_lsif(&dump, corpus) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("lsif ingest error: {e}");
