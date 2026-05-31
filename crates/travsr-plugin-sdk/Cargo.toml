@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-travsr-plugin-protocol = { path = "../travsr-plugin-protocol" }
-travsr-core = { path = "../travsr-core" }
+travsr-plugin-protocol = { path = "../travsr-plugin-protocol", version = "0.5.1" }
+travsr-core            = { path = "../travsr-core",            version = "0.5.1" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
