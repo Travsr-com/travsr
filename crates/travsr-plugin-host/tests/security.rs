@@ -30,10 +30,15 @@ fn sandbox_standard_denies_network() {
 
     match cmd {
         Err(SandboxUnavailable(_)) => {
-            if std::env::var("CI").is_ok() {
+            // Panic only when bwrap is not installed at all. If it is installed but
+            // cannot create namespaces (e.g. Docker-in-Docker on GitHub Actions),
+            // bwrap_available() returns false and we skip gracefully.
+            if std::env::var("CI").is_ok()
+                && !travsr_plugin_host::sandbox::linux::bwrap_is_on_path()
+            {
                 panic!("bwrap must be available in CI (install bubblewrap)");
             }
-            eprintln!("SKIP: bwrap not available");
+            eprintln!("SKIP: bwrap not functional on this host");
         }
         Ok(mut cmd) => {
             let output = cmd.output().expect("spawn");

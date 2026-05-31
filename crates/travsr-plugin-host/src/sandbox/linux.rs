@@ -112,14 +112,48 @@ pub fn build_sandboxed_command(
     Ok(cmd)
 }
 
+/// Returns true if `bwrap` is on PATH (installed).
+/// Use this to distinguish "not installed" from "installed but cannot namespace" —
+/// the CI panic in sandbox tests should only fire for the former.
 #[cfg(target_os = "linux")]
-fn bwrap_available() -> bool {
+pub fn bwrap_is_on_path() -> bool {
     Command::new("bwrap")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
+}
+
+// Cached probe: can bwrap actually create a sandbox on this host?
+// On some CI runners (Docker-in-Docker, AppArmor-restricted kernels) bwrap is
+// installed but cannot create user namespaces. We detect this once and treat such
+// hosts as sandbox-unavailable so callers receive Err(SandboxUnavailable) and skip
+// gracefully instead of spawning a bwrap that exits non-zero.
+#[cfg(target_os = "linux")]
+static BWRAP_FUNCTIONAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn bwrap_available() -> bool {
+    *BWRAP_FUNCTIONAL.get_or_init(|| {
+        Command::new("bwrap")
+            .args([
+                "--ro-bind-try",
+                "/usr",
+                "/usr",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+                "true",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
