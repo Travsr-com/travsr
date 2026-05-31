@@ -21,6 +21,9 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("ruby", "fuzz_ruby_parser.rs"), // TODO: create this fuzz target
     ("csharp", "fuzz_csharp_parser.rs"), // TODO: create this fuzz target
     ("php", "fuzz_php_parser.rs"),   // TODO: create this fuzz target
+    ("scala", "fuzz_scala_parser.rs"), // TODO: create this fuzz target
+    ("cpp", "fuzz_cpp_parser.rs"),   // TODO: create this fuzz target
+    ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
 ];
 
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process
@@ -151,6 +154,27 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         &version,
         &crate::plugins::php::CONFIG,
         tree_sitter_php::language_php(),
+    );
+    check_fuzz_target("scala");
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::scala::CONFIG,
+        tree_sitter_scala::language(),
+    );
+    check_fuzz_target("cpp");
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::cpp::CONFIG,
+        tree_sitter_cpp::language(),
+    );
+    check_fuzz_target("c");
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::c::CONFIG,
+        tree_sitter_c::language(),
     );
     // Swift: blocked — all available tree-sitter-swift crates require tree-sitter ^0.21
     // which conflicts with workspace tree-sitter = "0.22". Re-enable when a compatible crate ships.

@@ -13,6 +13,9 @@ pub fn language_from_proto_str(s: &str) -> Option<Language> {
         "ruby" => Some(Language::Ruby),
         "csharp" => Some(Language::CSharp),
         "php" => Some(Language::Php),
+        "scala" => Some(Language::Scala),
+        "cpp" => Some(Language::Cpp),
+        "c" => Some(Language::C),
         _ => None,
     }
 }
@@ -34,6 +37,9 @@ mod tests {
             ("go", Language::Go),
             ("java", Language::Java),
             ("kotlin", Language::Kotlin),
+            ("scala", Language::Scala),
+            ("cpp", Language::Cpp),
+            ("c", Language::C),
         ] {
             assert_eq!(language_from_proto_str(s), Some(expected), "failed for {s}");
         }

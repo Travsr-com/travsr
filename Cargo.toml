@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 license = "MIT"
 authors = ["Travsr Contributors"]
@@ -55,6 +55,9 @@ tree-sitter-kotlin = "0.3"
 tree-sitter-ruby    = "0.21"
 tree-sitter-c-sharp = "0.21"
 tree-sitter-php     = "0.22"
+tree-sitter-scala   = "0.22"
+tree-sitter-cpp     = "0.22"
+tree-sitter-c       = "0.21"
 # tree-sitter-swift: all available crates require tree-sitter ^0.21, conflicts with
 # workspace tree-sitter = "0.22". Blocked until a 0.22-compatible Swift grammar ships.
 walkdir = "2"
