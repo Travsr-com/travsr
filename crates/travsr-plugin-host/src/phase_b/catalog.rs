@@ -31,6 +31,11 @@ pub struct PhaseBEntry {
     pub sandbox: SandboxRequirement,
     /// Shown by `travsr lang list` and `travsr lang add` when tool is absent.
     pub install_hint: &'static str,
+    /// How to install the underlying tool (scip-*, rust-analyzer, etc.) when the
+    /// travsr-lang-* wrapper is already installed but the tool itself is missing.
+    /// Shown in the "wrapper-only" state by `travsr lang list`.
+    /// Empty string for in-tree builtins that need no underlying tool check.
+    pub underlying_tool_hint: &'static str,
     /// The travsr-lang binary name for this language, e.g. "travsr-lang-go".
     /// None for in-tree builtins (rust, typescript) that spawn via __plugin.
     pub provider_binary: Option<&'static str>,
@@ -48,6 +53,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/typescript  (installs travsr-lsif-ts)",
+        underlying_tool_hint: "",
         provider_binary: None,
         elevated_hosts: &[],
     },
@@ -59,6 +65,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/typescript  (installs travsr-lsif-ts)",
+        underlying_tool_hint: "",
         provider_binary: None,
         elevated_hosts: &[],
     },
@@ -69,7 +76,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["lsif", "{root}"],
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/rust  (or: rustup component add rust-analyzer)",
+        install_hint: "rustup component add rust-analyzer",
+        underlying_tool_hint: "rustup component add rust-analyzer",
         provider_binary: None,
         elevated_hosts: &[],
     },
@@ -81,6 +89,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/go  (or: go install github.com/sourcegraph/scip-go/cmd/scip-go@latest)",
+        underlying_tool_hint: "go install github.com/sourcegraph/scip-go/cmd/scip-go@latest",
         provider_binary: Some("travsr-lang-go"),
         elevated_hosts: &[],
     },
@@ -92,6 +101,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/python  (or: pip install scip-python)",
+        underlying_tool_hint: "pip install scip-python",
         provider_binary: Some("travsr-lang-python"),
         elevated_hosts: &[],
     },
@@ -103,6 +113,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr-plugin/java  — PSE approval required (Maven/Gradle network access)",
+        underlying_tool_hint: "see scip-java docs — install via Maven or Gradle plugin",
         provider_binary: Some("travsr-lang-java"),
         elevated_hosts: &[
             "repo1.maven.org",
@@ -119,6 +130,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr-plugin/kotlin  — PSE approval required (scip-java covers Kotlin via Gradle)",
+        underlying_tool_hint: "see scip-java docs — covers Kotlin via Gradle plugin",
         provider_binary: Some("travsr-lang-kotlin"),
         elevated_hosts: &[
             "repo1.maven.org",
@@ -134,6 +146,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr-plugin/scala  — PSE approval required (sbt dependency resolution)",
+        underlying_tool_hint: "see scip-scala docs — install via sbt plugin",
         provider_binary: Some("travsr-lang-scala"),
         elevated_hosts: &[
             "repo1.maven.org",
@@ -150,6 +163,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/ruby  (experimental)",
+        underlying_tool_hint: "see scip-ruby docs",
         provider_binary: Some("travsr-lang-ruby"),
         elevated_hosts: &[],
     },
@@ -161,6 +175,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/php",
+        underlying_tool_hint: "see scip-php docs",
         provider_binary: Some("travsr-lang-php"),
         elevated_hosts: &[],
     },
@@ -172,6 +187,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "npm install -g @travsr-plugin/csharp  — PSE approval required (NuGet restore)",
+        underlying_tool_hint: "dotnet tool install --global scip-dotnet",
         provider_binary: Some("travsr-lang-csharp"),
         elevated_hosts: &["api.nuget.org", "www.nuget.org"],
     },
@@ -183,6 +199,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/cpp  (requires compile_commands.json)",
+        underlying_tool_hint: "see scip-clang releases (requires compile_commands.json)",
         provider_binary: Some("travsr-lang-cpp"),
         elevated_hosts: &[],
     },
@@ -194,6 +211,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "npm install -g @travsr-plugin/c  (requires compile_commands.json)",
+        underlying_tool_hint: "see scip-clang releases (requires compile_commands.json)",
         provider_binary: Some("travsr-lang-c"),
         elevated_hosts: &[],
     },

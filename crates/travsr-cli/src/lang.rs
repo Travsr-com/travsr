@@ -79,7 +79,14 @@ fn cmd_list() -> Result<()> {
         };
 
         let package_col = entry.npm_package.unwrap_or(entry.command);
-        let on_path = which(entry.command);
+        // provider_on_path: true for builtins (no external wrapper needed),
+        // or when the travsr-lang-* wrapper binary is found on PATH.
+        let provider_on_path = entry.provider_binary.map_or(true, which);
+        let tool_on_path = which(entry.command);
+        // fully_ready: underlying tool available (wrapper present for external langs).
+        let fully_ready = provider_on_path && tool_on_path;
+        // wrapper_only: npm package installed but underlying scip-* tool missing.
+        let wrapper_only = provider_on_path && !tool_on_path && entry.provider_binary.is_some();
         let registered = config
             .as_ref()
             .map(|c| c.is_registered(entry.language))
@@ -108,7 +115,14 @@ fn cmd_list() -> Result<()> {
 
         let status = if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
             "needs PSE approval (travsr lang approve)".to_string()
-        } else if registered && on_path && !sandbox_ok {
+        } else if wrapper_only {
+            format!(
+                "wrapper-only  ({} installed, {} missing — {})",
+                entry.provider_binary.unwrap_or("built-in"),
+                entry.command,
+                entry.underlying_tool_hint,
+            )
+        } else if registered && fully_ready && !sandbox_ok {
             #[cfg(target_os = "linux")]
             let hint = "install bubblewrap: sudo apt-get install bubblewrap";
             #[cfg(target_os = "macos")]
@@ -116,15 +130,19 @@ fn cmd_list() -> Result<()> {
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let hint = "sandbox not available on this platform";
             format!("disabled (sandbox unavailable — {hint})")
-        } else if registered && on_path {
-            let base = "\u{2713} active".to_string();
-            format!("{}{}", base, expiry_warning.as_deref().unwrap_or(""))
-        } else if registered && !on_path {
+        } else if registered && fully_ready {
+            format!("\u{2713} active{}", expiry_warning.as_deref().unwrap_or(""))
+        } else if registered && !fully_ready {
+            let missing = if !provider_on_path {
+                entry.provider_binary.unwrap_or(entry.command)
+            } else {
+                entry.command
+            };
             format!(
-                "registered but {} not on PATH — run: travsr lang add {}",
-                entry.command, entry.language
+                "registered but {missing} not on PATH — run: travsr lang add {}",
+                entry.language
             )
-        } else if on_path {
+        } else if fully_ready {
             format!(
                 "on PATH, not registered — run: travsr lang add {}",
                 entry.language
@@ -175,39 +193,59 @@ fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
         }
     }
 
-    // Try to install via npm if tool not on PATH
-    if !which(entry.command) {
-        if let Some(pkg) = entry.npm_package {
-            println!("Installing {pkg} via npm...");
-            match std::process::Command::new("npm")
-                .args(["install", "-g", pkg])
-                .status()
-            {
-                Ok(s) if s.success() => {
-                    println!("\u{2713} {pkg} installed successfully.");
+    // Install the travsr-lang-* wrapper via npm if not already on PATH.
+    // For builtins (provider_binary == None) no wrapper install is needed.
+    let wrapper_installed = match entry.provider_binary {
+        None => true, // builtin — no wrapper to install
+        Some(bin) if which(bin) => true,
+        Some(_) => {
+            if let Some(pkg) = entry.npm_package {
+                println!("Installing {pkg} via npm...");
+                match std::process::Command::new("npm")
+                    .args(["install", "-g", pkg])
+                    .status()
+                {
+                    Ok(s) if s.success() => {
+                        println!("\u{2713} {pkg} installed.");
+                        true
+                    }
+                    Ok(s) => {
+                        println!(
+                            "Warning: npm install exited with {s}.\n\
+                             Install manually: {}",
+                            entry.install_hint
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        println!(
+                            "Warning: could not run npm ({e}).\n\
+                             Install manually: {}",
+                            entry.install_hint
+                        );
+                        false
+                    }
                 }
-                Ok(s) => {
-                    println!(
-                        "Warning: npm install exited with {s}.\n\
-                         Install manually: {}",
-                        entry.install_hint
-                    );
-                }
-                Err(e) => {
-                    println!(
-                        "Warning: could not run npm ({e}).\n\
-                         Install manually: {}",
-                        entry.install_hint
-                    );
-                }
+            } else {
+                println!(
+                    "Warning: '{}' is not on PATH.\n\
+                     Install manually: {}",
+                    entry.provider_binary.unwrap_or(entry.command),
+                    entry.install_hint
+                );
+                false
             }
-        } else {
-            println!(
-                "Warning: '{}' is not on PATH.\n\
-                 Install manually: {}",
-                entry.command, entry.install_hint
-            );
         }
+    };
+
+    // Warn if the underlying scip-* tool is still missing after wrapper install.
+    if wrapper_installed && !which(entry.command) && !entry.underlying_tool_hint.is_empty() {
+        println!(
+            "Warning: {} not found on PATH.\n\
+             Install it: {}\n\
+             Phase B for '{}' will be inactive until {} is installed.",
+            entry.command, entry.underlying_tool_hint, entry.language, entry.command,
+        );
     }
 
     // Register in config
