@@ -353,7 +353,7 @@ fn kotlin_golden_fixture_produces_expected_nodes() {
             .collect::<Vec<_>>()
     );
     let fns: Vec<_> = out.nodes.iter().filter(|n| n.kind == "function").collect();
-    assert!(fns.len() >= 1, "expected ≥1 function, got {}", fns.len());
+    assert!(!fns.is_empty(), "expected ≥1 function, got {}", fns.len());
 
     let old = old_parse(fixture, "src/PaymentService.kt");
     assert!(

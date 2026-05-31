@@ -40,8 +40,10 @@ pub fn build_sandboxed_command(
         cmd.args(["--ro-bind-try", path, path]);
     }
     cmd.args(["--proc", "/proc", "--dev", "/dev"]);
-    // Create a tmpfs at /tmp so bind mounts of scratch dirs under /tmp work.
-    cmd.args(["--tmpfs", "/tmp"]);
+    // Bind /tmp read-only so scratch dirs under /tmp have a valid mount point,
+    // then overlay the specific scratch dir as rw. Using --ro-bind-try avoids
+    // a failure if /tmp doesn't exist on the host (unlikely but safe).
+    cmd.args(["--ro-bind-try", "/tmp", "/tmp"]);
     cmd.args(["--bind", scratch.as_ref(), scratch.as_ref()]); // scratch: rw
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
     cmd.args(["--die-with-parent", "--"]);

@@ -142,8 +142,10 @@ mod tests {
 
     #[test]
     fn which_tool_finds_existing_binary() {
-        // sh is always on PATH
-        assert!(which_tool("sh").is_ok());
+        #[cfg(unix)]
+        assert!(which_tool("sh").is_ok(), "sh should be on PATH on Unix");
+        #[cfg(windows)]
+        assert!(which_tool("cmd").is_ok(), "cmd should be on PATH on Windows");
     }
 
     #[test]
