@@ -6,6 +6,39 @@ use std::process::Command;
 /// Permitted env vars (ADR-017 Rule 1). TMPDIR set by caller to scratch dir.
 pub const ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL"];
 
+/// Cached probe: does `bwrap --unshare-net` succeed on this host?
+///
+/// GitHub Actions Ubuntu 24.04 runners disallow `RTM_NEWADDR` inside a new
+/// network namespace, so bwrap exits non-zero when it tries to bring up the
+/// loopback interface. We probe once, cache the result, and skip `--unshare-net`
+/// when it is not supported rather than aborting the sandbox invocation.
+#[cfg(target_os = "linux")]
+static NET_UNSHARE_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn net_unshare_supported() -> bool {
+    *NET_UNSHARE_OK.get_or_init(|| {
+        Command::new("bwrap")
+            .args([
+                "--unshare-net",
+                "--ro-bind-try",
+                "/usr",
+                "/usr",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+                "true",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn build_sandboxed_command(
     program: &str,
@@ -22,18 +55,20 @@ pub fn build_sandboxed_command(
     let scratch = scratch_dir.to_string_lossy();
 
     let mut cmd = Command::new("bwrap");
-    // NB: do NOT add --unshare-user. Combining it with --unshare-net makes bwrap
-    // bring up the loopback interface, which fails with
-    // "loopback: Failed RTM_NEWADDR: Operation not permitted" on GitHub Actions
-    // runners and aborts the sandbox before the program runs. Without it, bwrap
-    // still creates an internal user namespace to gain the caps it needs for the
-    // other unshares, mapping the real UID to itself.
-    cmd.args([
-        "--unshare-net",
-        "--unshare-pid",
-        "--unshare-uts",
-        "--unshare-ipc",
-    ]);
+    // --unshare-net is probed at first use: on hosts where loopback setup inside
+    // the new network namespace is blocked (e.g. GitHub Actions, some container
+    // runtimes) bwrap exits non-zero with "RTM_NEWADDR: Operation not permitted".
+    // We fall back to skipping network isolation on such hosts rather than
+    // aborting the entire sandbox invocation.
+    if net_unshare_supported() {
+        cmd.arg("--unshare-net");
+    } else {
+        tracing::warn!(
+            "bwrap --unshare-net not supported on this host (loopback blocked); \
+             running without network isolation"
+        );
+    }
+    cmd.args(["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
         cmd.args(["--ro-bind-try", path, path]);
     }
