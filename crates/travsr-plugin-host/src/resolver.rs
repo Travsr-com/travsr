@@ -477,8 +477,9 @@ mod tests {
     // ── which_binary ──────────────────────────────────────────────────────────
 
     #[test]
+    #[cfg(unix)]
     fn which_binary_finds_sh() {
-        // /bin/sh is present on every POSIX system.
+        // /bin/sh is present on every POSIX system; skip on Windows.
         let result = which_binary("sh");
         assert!(result.is_some(), "sh must be on PATH");
     }
