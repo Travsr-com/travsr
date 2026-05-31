@@ -145,7 +145,10 @@ mod tests {
         #[cfg(unix)]
         assert!(which_tool("sh").is_ok(), "sh should be on PATH on Unix");
         #[cfg(windows)]
-        assert!(which_tool("cmd").is_ok(), "cmd should be on PATH on Windows");
+        assert!(
+            which_tool("cmd.exe").is_ok(),
+            "cmd.exe should be on PATH on Windows"
+        );
     }
 
     #[test]

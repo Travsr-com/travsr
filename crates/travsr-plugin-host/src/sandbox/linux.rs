@@ -40,10 +40,11 @@ pub fn build_sandboxed_command(
         cmd.args(["--ro-bind-try", path, path]);
     }
     cmd.args(["--proc", "/proc", "--dev", "/dev"]);
-    // Bind /tmp read-only so scratch dirs under /tmp have a valid mount point,
-    // then overlay the specific scratch dir as rw. Using --ro-bind-try avoids
-    // a failure if /tmp doesn't exist on the host (unlikely but safe).
-    cmd.args(["--ro-bind-try", "/tmp", "/tmp"]);
+    // Create the scratch path (and any intermediate dirs) in the sandbox overlay,
+    // then bind-mount the host scratch dir rw over it. Using --dir avoids the
+    // ro-vs-rw mount conflict from --ro-bind-try /tmp + --bind scratch, which
+    // fails on some bwrap versions when the child path sits within a ro mount.
+    cmd.args(["--dir", scratch.as_ref()]);
     cmd.args(["--bind", scratch.as_ref(), scratch.as_ref()]); // scratch: rw
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
     cmd.args(["--die-with-parent", "--"]);
