@@ -291,6 +291,73 @@ fn elevated_policy_accepts_valid_fields() {
     );
 }
 
+#[test]
+fn elevated_policy_rejects_empty_approved_date() {
+    let policy = SandboxPolicy::Elevated {
+        permitted_hosts: vec!["repo1.maven.org".to_string()],
+        reason: "Maven dependency resolution".to_string(),
+        approved_by: "pse-handle".to_string(),
+        approved_date: String::new(), // empty — re-review date is mandatory
+    };
+    assert!(
+        policy.validate().is_err(),
+        "empty approved_date should fail validation"
+    );
+}
+
+#[test]
+fn elevated_policy_rejects_empty_permitted_hosts() {
+    let policy = SandboxPolicy::Elevated {
+        permitted_hosts: vec![], // no allowlist — cannot mean "all hosts"
+        reason: "Maven dependency resolution".to_string(),
+        approved_by: "pse-handle".to_string(),
+        approved_date: "2026-05-31".to_string(),
+    };
+    assert!(
+        policy.validate().is_err(),
+        "empty permitted_hosts should fail validation"
+    );
+}
+
+// ADR-017 Rule 1: explicit allowlist only — no wildcards, no CIDR.
+#[test]
+fn elevated_policy_rejects_wildcard_and_cidr_hosts() {
+    for bad in &[
+        "*.maven.org",                   // wildcard
+        "*",                             // full wildcard
+        "10.0.0.0/8",                    // CIDR range
+        "https://repo.maven.apache.org", // scheme
+        "repo.maven.apache.org:443",     // port
+        "repo .maven.org",               // whitespace
+    ] {
+        let policy = SandboxPolicy::Elevated {
+            permitted_hosts: vec![bad.to_string()],
+            reason: "test".to_string(),
+            approved_by: "pse-handle".to_string(),
+            approved_date: "2026-05-31".to_string(),
+        };
+        assert!(
+            policy.validate().is_err(),
+            "permitted host '{bad}' should be rejected (no wildcards/CIDR/scheme/port)"
+        );
+    }
+}
+
+#[test]
+fn validate_permitted_host_accepts_bare_hostnames() {
+    use travsr_plugin_host::sandbox::policy::validate_permitted_host;
+    for ok in &[
+        "repo1.maven.org",
+        "repo.maven.apache.org",
+        "plugins.gradle.org",
+    ] {
+        assert!(
+            validate_permitted_host(ok).is_ok(),
+            "bare hostname '{ok}' should be accepted"
+        );
+    }
+}
+
 // ── Crash isolation ───────────────────────────────────────────────────────────
 
 #[test]

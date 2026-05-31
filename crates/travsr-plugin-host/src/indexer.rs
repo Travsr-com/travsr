@@ -109,9 +109,28 @@ impl PluginIndexer {
 
         // 2. Catalog Phase B tools (scip-go, scip-java, etc.) registered in
         //    ~/.travsr/lang.toml.
+        //
+        // NOTE: this direct catalog runner is the interim path. Per RFC-011 the
+        // language Phase B logic is moving to the separate `travsr-lang` repo and
+        // will run via the sandboxed Sidecar transport. Until then we must not run
+        // a `RequiresElevated` tool here: it needs the Elevated network-allowlist
+        // sandbox (ADR-017 Rule 1) which this direct path does NOT apply. Running
+        // it would mean full unrestricted network + environment — the exact threat
+        // ADR-017 exists to contain. Fail-closed per Rule 2.
         let registered = crate::trust::registered_languages_from_disk();
         for entry in crate::phase_b::catalog::CATALOG {
             if !registered.iter().any(|r| r == entry.language) {
+                continue;
+            }
+            if entry.sandbox == crate::phase_b::catalog::SandboxRequirement::RequiresElevated {
+                tracing::warn!(
+                    lang = entry.language,
+                    "Phase B skipped (fail-closed, ADR-017 Rule 2): '{}' is RequiresElevated and \
+                     needs the Elevated network-allowlist sandbox, which the interim catalog \
+                     runner does not apply. It will run sandboxed once relocated to the \
+                     travsr-lang sidecar.",
+                    entry.language
+                );
                 continue;
             }
             match crate::phase_b::runner::run_phase_b(entry, repo_root) {

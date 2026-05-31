@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use std::path::PathBuf;
 use travsr_plugin_host::phase_b::catalog::{lookup, SandboxRequirement, CATALOG};
+use travsr_plugin_host::sandbox::policy::validate_permitted_host;
 
 const APPROVAL_EXPIRY_DAYS: i64 = 365;
 
@@ -276,6 +277,11 @@ fn cmd_approve(
         "--permitted-hosts must not be empty for RequiresElevated languages (ADR-017 Rule 1).\n\
          Example: --permitted-hosts repo1.maven.org,repo.maven.apache.org,plugins.gradle.org"
     );
+    // ADR-017 Rule 1: explicit allowlist only — no wildcards, no CIDR ranges.
+    for host in &permitted_hosts {
+        validate_permitted_host(host)
+            .map_err(|e| anyhow::anyhow!("invalid --permitted-hosts entry: {e}"))?;
+    }
 
     let mut config = load_config().unwrap_or_default();
     config.approve(language, approved_by, reason, permitted_hosts.clone());
