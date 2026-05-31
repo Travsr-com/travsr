@@ -69,14 +69,23 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      - name: Install bubblewrap (Linux sandbox breach test)
+      - name: Install bubblewrap (Linux sandbox enforcement tests)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y bubblewrap
-          # Ubuntu 24.04+ restricts unprivileged user namespaces by default.
-          # bubblewrap requires them for sandbox isolation tests.
+          # Ubuntu 24.04+ ships an AppArmor profile that blocks bwrap from creating
+          # mount/user namespaces even with sudo. Unload the profile so our sandbox
+          # enforcement tests (security.rs) can actually run bwrap.
+          for profile in /etc/apparmor.d/bwrap /etc/apparmor.d/usr.bin.bwrap; do
+            if [ -f "$profile" ]; then
+              sudo apparmor_parser -R "$profile" && echo "Unloaded AppArmor profile: $profile" || true
+            fi
+          done
+          # Also disable the global AppArmor user-namespace restriction (Ubuntu 24.04 kernel).
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
-          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+          # Verify bwrap can actually create a sandbox — fail this step loudly if not,
+          # so any remaining restriction is caught before cargo test runs.
+          bwrap --ro-bind-try /usr /usr --proc /proc --dev /dev -- true
 
       - name: Run tests
         run: cargo test --workspace
