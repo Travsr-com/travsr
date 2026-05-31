@@ -3,7 +3,9 @@
 //! Tests that require bwrap (Linux) are skipped on other platforms.
 
 use travsr_plugin_host::phase_b::catalog::{lookup, SandboxRequirement};
-use travsr_plugin_host::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
+use travsr_plugin_host::sandbox::policy::SandboxPolicy;
+#[cfg(target_os = "linux")]
+use travsr_plugin_host::sandbox::policy::SandboxUnavailable;
 use travsr_plugin_host::trust::TrustConfig;
 
 // 1. Egress blocked — Standard sandbox denies network
