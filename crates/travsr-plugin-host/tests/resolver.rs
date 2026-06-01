@@ -176,7 +176,15 @@ fn elevated_language_without_approval_skips_gracefully() {
 
     // CatalogResolver in a clean env (no lang.toml / no java approval) must
     // return None for java — not panic.
+    // Point TRAVSR_LANG_TOML at a nonexistent path so neither
+    // registered_languages_from_disk() nor load_lang_config() can see the
+    // developer's real ~/.travsr/lang.toml during testing.
+    std::env::set_var(
+        "TRAVSR_LANG_TOML",
+        "/nonexistent/__travsr_test_isolation__.toml",
+    );
     let resolver = CatalogResolver::new();
+    std::env::remove_var("TRAVSR_LANG_TOML");
     let result = resolver.resolve("java");
     assert!(
         result.is_none(),

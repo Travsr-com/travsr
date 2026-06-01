@@ -35,5 +35,33 @@ pub fn run() -> anyhow::Result<()> {
         );
     }
 
+    // Non-fatal: detection errors must not fail `travsr init`.
+    let _ = hint_lang_detect(&repo_root);
+
+    Ok(())
+}
+
+/// After indexing, scan for supported languages and suggest `travsr lang detect`
+/// if any are present but not yet registered.
+fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
+    let detected = crate::lang::detect_languages_in(repo_root);
+    if detected.is_empty() {
+        return Ok(());
+    }
+
+    let config = crate::lang::load_lang_config();
+    let unregistered: Vec<_> = detected
+        .iter()
+        .filter(|l| config.as_ref().map(|c| !c.is_registered(l)).unwrap_or(true))
+        .cloned()
+        .collect();
+
+    if !unregistered.is_empty() {
+        println!(
+            "tip: detected {} in this repo — run `travsr lang detect` to set up semantic indexing",
+            unregistered.join(", ")
+        );
+    }
+
     Ok(())
 }

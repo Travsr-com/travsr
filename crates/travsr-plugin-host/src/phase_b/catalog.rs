@@ -1,6 +1,6 @@
 //! Static catalog of every known Phase B tool.
 //! Adding a new language requires only a new entry — no code changes elsewhere.
-//! None are active by default; users enable via `travsr lang add <lang>`.
+//! None are active by default; users enable via `travsr lang install <lang>`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -13,8 +13,62 @@ pub enum SandboxRequirement {
     /// No network, no build steps that download dependencies.
     Standard,
     /// Needs network for dependency resolution (Maven/Gradle/NuGet/sbt).
-    /// Requires SandboxPolicy::Elevated with PSE sign-off (ADR-017 Rule 1).
+    // ADR-017 Rule 1: RequiresElevated languages need an explicit host allowlist
+    // recorded in ~/.travsr/lang.toml before the sandbox will permit network access.
+    // Never surface "ADR-017" in user-facing output — use plain language instead.
     RequiresElevated,
+}
+
+/// Specifies a pre-built binary that travsr can download from a GitHub release.
+#[derive(Debug, Clone, Copy)]
+pub struct ScipBinarySpec {
+    /// GitHub repo slug, e.g. `"sourcegraph/scip-java"`.
+    pub repo: &'static str,
+    /// Map a release tag and Rust target triple to the asset filename on the release page.
+    /// Return `None` when no binary exists for the given platform.
+    pub asset_fn: fn(tag: &str, target: &str) -> Option<String>,
+    /// Binary name after installation in `~/.travsr/bin/`.
+    pub install_name: &'static str,
+    /// Full release tag used as fallback when the GitHub API is unreachable.
+    pub version_fallback: &'static str,
+    /// Whether the release page includes a `.sha256` sidecar file for integrity checking.
+    pub verify_sha256: bool,
+}
+
+/// How to install the underlying SCIP tool once the travsr-lang wrapper is present.
+#[derive(Debug, Clone, Copy)]
+pub enum ScipInstall {
+    /// Run this command to install the underlying tool automatically.
+    Command(&'static [&'static str]),
+    /// Download a pre-built binary directly from the tool's GitHub Releases.
+    GithubBinary(ScipBinarySpec),
+    /// No automated install available; show `underlying_tool_hint` to the user.
+    Manual,
+}
+
+// ── asset resolution functions ────────────────────────────────────────────────
+
+/// scip-java ships a single platform-agnostic binary; the version is part of the name.
+pub fn scip_java_asset(tag: &str, _target: &str) -> Option<String> {
+    Some(format!("scip-java-{tag}"))
+}
+
+/// scip-ruby ships arm64-darwin and x86_64-linux binaries (no version in asset name).
+pub fn scip_ruby_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => Some("scip-ruby-arm64-darwin".to_string()),
+        "x86_64-unknown-linux-gnu" => Some("scip-ruby-x86_64-linux".to_string()),
+        _ => None,
+    }
+}
+
+/// scip-clang ships arm64-darwin and x86_64-linux binaries (no version in asset name).
+pub fn scip_clang_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => Some("scip-clang-arm64-darwin".to_string()),
+        "x86_64-unknown-linux-gnu" => Some("scip-clang-x86_64-linux".to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -29,13 +83,12 @@ pub struct PhaseBEntry {
     pub args: &'static [&'static str],
     pub output_format: OutputFormat,
     pub sandbox: SandboxRequirement,
-    /// Shown by `travsr lang list` and `travsr lang add` when tool is absent.
+    /// Shown by `travsr lang list` and `travsr lang install` when tool is absent.
     pub install_hint: &'static str,
     /// How to install the underlying tool (scip-*, rust-analyzer, etc.) when the
     /// travsr-lang-* wrapper is already installed but the tool itself is missing.
     /// Shown in the "wrapper-only" state by `travsr lang list`.
-    /// Empty string for builtins where no separate tool install is needed
-    /// (e.g. typescript/javascript install travsr-lsif-ts via their npm package).
+    /// Empty string for builtins where no separate tool install is needed.
     pub underlying_tool_hint: &'static str,
     /// The travsr-lang binary name for this language, e.g. "travsr-lang-go".
     /// None for in-tree builtins (rust, typescript) that spawn via __plugin.
@@ -43,6 +96,13 @@ pub struct PhaseBEntry {
     /// For RequiresElevated languages: the network hosts their build tool contacts.
     /// Empty for Standard sandbox languages.
     pub elevated_hosts: &'static [&'static str],
+    /// How to install the underlying SCIP tool automatically, if possible.
+    pub scip_install: ScipInstall,
+    /// File extensions used to detect this language in a repo (each with leading dot).
+    pub extensions: &'static [&'static str],
+    /// Fallback version string used by `travsr lang install` when the GitHub API
+    /// is unreachable. Keep in sync with the latest published release.
+    pub wrapper_version_fallback: &'static str,
 }
 
 pub static CATALOG: &[PhaseBEntry] = &[
@@ -53,10 +113,13 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["--project", "{tsconfig}"],
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/typescript  (installs travsr-lsif-ts)",
+        install_hint: "travsr lang install typescript",
         underlying_tool_hint: "",
         provider_binary: None,
         elevated_hosts: &[],
+        scip_install: ScipInstall::Command(&["npm", "install", "-g", "@travsr-plugin/typescript"]),
+        extensions: &[".ts", ".tsx"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "javascript",
@@ -65,10 +128,13 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["--project", "{tsconfig}"],
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/typescript  (installs travsr-lsif-ts)",
+        install_hint: "travsr lang install javascript",
         underlying_tool_hint: "",
         provider_binary: None,
         elevated_hosts: &[],
+        scip_install: ScipInstall::Command(&["npm", "install", "-g", "@travsr-plugin/typescript"]),
+        extensions: &[".js", ".jsx", ".mjs", ".cjs"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "rust",
@@ -77,10 +143,13 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["lsif", "{root}"],
         output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "rustup component add rust-analyzer",
+        install_hint: "travsr lang install rust",
         underlying_tool_hint: "rustup component add rust-analyzer",
         provider_binary: None,
         elevated_hosts: &[],
+        scip_install: ScipInstall::Command(&["rustup", "component", "add", "rust-analyzer"]),
+        extensions: &[".rs"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "go",
@@ -89,22 +158,41 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["--output", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/go  (or: go install github.com/sourcegraph/scip-go/cmd/scip-go@latest)",
-        underlying_tool_hint: "go install github.com/sourcegraph/scip-go/cmd/scip-go@latest",
+        install_hint: "travsr lang install go  (or: go install github.com/scip-code/scip-go/cmd/scip-go@latest)",
+        underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
         provider_binary: Some("travsr-lang-go"),
         elevated_hosts: &[],
+        scip_install: ScipInstall::Command(&[
+            "go",
+            "install",
+            "github.com/scip-code/scip-go/cmd/scip-go@latest",
+        ]),
+        extensions: &[".go"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "python",
         npm_package: Some("@travsr-plugin/python"),
         command: "scip-python",
-        args: &["index", "--project-name", "project", "--project-version", "0.0.1", "--output", "{output}", "{root}"],
+        args: &[
+            "index",
+            "--project-name",
+            "project",
+            "--project-version",
+            "0.0.1",
+            "--output",
+            "{output}",
+            "{root}",
+        ],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/python  (or: pip install scip-python)",
-        underlying_tool_hint: "pip install scip-python",
+        install_hint: "travsr lang install python",
+        underlying_tool_hint: "npm install -g @sourcegraph/scip-python",
         provider_binary: Some("travsr-lang-python"),
         elevated_hosts: &[],
+        scip_install: ScipInstall::Command(&["npm", "install", "-g", "@sourcegraph/scip-python"]),
+        extensions: &[".py"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "java",
@@ -113,8 +201,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["index", "--output", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "npm install -g @travsr-plugin/java  — PSE approval required (Maven/Gradle network access)",
-        underlying_tool_hint: "see scip-java docs — install via Maven or Gradle plugin",
+        install_hint: "travsr lang install java  (security approval required — run interactively)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases — download scip-java-<version> and place in ~/.travsr/bin/scip-java (chmod +x)",
         provider_binary: Some("travsr-lang-java"),
         elevated_hosts: &[
             "repo1.maven.org",
@@ -122,6 +210,15 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "plugins.gradle.org",
             "jcenter.bintray.com",
         ],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "sourcegraph/scip-java",
+            asset_fn: scip_java_asset,
+            install_name: "scip-java",
+            version_fallback: "v0.12.3",
+            verify_sha256: true,
+        }),
+        extensions: &[".java"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "kotlin",
@@ -130,14 +227,24 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["index", "--output", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "npm install -g @travsr-plugin/kotlin  — PSE approval required (scip-java covers Kotlin via Gradle)",
-        underlying_tool_hint: "see scip-java docs — covers Kotlin via Gradle plugin",
+        install_hint:
+            "travsr lang install kotlin  (security approval required — run interactively)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases — download scip-java-<version> and place in ~/.travsr/bin/scip-java (chmod +x)",
         provider_binary: Some("travsr-lang-kotlin"),
         elevated_hosts: &[
             "repo1.maven.org",
             "repo.maven.apache.org",
             "plugins.gradle.org",
         ],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "sourcegraph/scip-java",
+            asset_fn: scip_java_asset,
+            install_name: "scip-java",
+            version_fallback: "v0.12.3",
+            verify_sha256: true,
+        }),
+        extensions: &[".kt", ".kts"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "scala",
@@ -146,8 +253,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["{root}", "--output", "{output}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "npm install -g @travsr-plugin/scala  — PSE approval required (sbt dependency resolution)",
-        underlying_tool_hint: "see scip-scala docs — install via sbt plugin",
+        install_hint: "travsr lang install scala  (security approval required — run interactively)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-scala  — install via the sbt plugin",
         provider_binary: Some("travsr-lang-scala"),
         elevated_hosts: &[
             "repo1.maven.org",
@@ -155,6 +262,9 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "plugins.sbt.org",
             "jcenter.bintray.com",
         ],
+        scip_install: ScipInstall::Manual,
+        extensions: &[".scala", ".sbt"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "ruby",
@@ -163,10 +273,19 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["--index-file-path", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/ruby  (experimental)",
-        underlying_tool_hint: "see scip-ruby docs",
+        install_hint: "travsr lang install ruby  (experimental)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-ruby/releases — download scip-ruby-arm64-darwin or scip-ruby-x86_64-linux and place in ~/.travsr/bin/scip-ruby (chmod +x)",
         provider_binary: Some("travsr-lang-ruby"),
         elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "sourcegraph/scip-ruby",
+            asset_fn: scip_ruby_asset,
+            install_name: "scip-ruby",
+            version_fallback: "scip-ruby-v0.4.7",
+            verify_sha256: false,
+        }),
+        extensions: &[".rb"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "php",
@@ -175,10 +294,13 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["{root}", "--output", "{output}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/php",
-        underlying_tool_hint: "see scip-php docs",
+        install_hint: "travsr lang install php",
+        underlying_tool_hint: "https://github.com/davidrjenni/scip-php — community indexer: composer require --dev davidrjenni/scip-php (then use vendor/bin/scip-php)",
         provider_binary: Some("travsr-lang-php"),
         elevated_hosts: &[],
+        scip_install: ScipInstall::Manual,
+        extensions: &[".php"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "csharp",
@@ -187,34 +309,72 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["{root}", "--output", "{output}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
-        install_hint: "npm install -g @travsr-plugin/csharp  — PSE approval required (NuGet restore)",
+        install_hint:
+            "travsr lang install csharp  (security approval required — run interactively)",
         underlying_tool_hint: "dotnet tool install --global scip-dotnet",
         provider_binary: Some("travsr-lang-csharp"),
         elevated_hosts: &["api.nuget.org", "www.nuget.org"],
+        scip_install: ScipInstall::Command(&[
+            "dotnet",
+            "tool",
+            "install",
+            "--global",
+            "scip-dotnet",
+        ]),
+        extensions: &[".cs", ".csx"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "cpp",
         npm_package: Some("@travsr-plugin/cpp"),
         command: "scip-clang",
-        args: &["--compdb-path", "{root}/compile_commands.json", "--output", "{output}"],
+        args: &[
+            "--compdb-path",
+            "{root}/compile_commands.json",
+            "--output",
+            "{output}",
+        ],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/cpp  (requires compile_commands.json)",
-        underlying_tool_hint: "see scip-clang releases (requires compile_commands.json)",
+        install_hint: "travsr lang install cpp  (requires compile_commands.json)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-cpp"),
         elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "sourcegraph/scip-clang",
+            asset_fn: scip_clang_asset,
+            install_name: "scip-clang",
+            version_fallback: "v0.4.0",
+            verify_sha256: false,
+        }),
+        extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
+        wrapper_version_fallback: "v0.1.0",
     },
     PhaseBEntry {
         language: "c",
         npm_package: Some("@travsr-plugin/c"),
         command: "scip-clang",
-        args: &["--compdb-path", "{root}/compile_commands.json", "--output", "{output}"],
+        args: &[
+            "--compdb-path",
+            "{root}/compile_commands.json",
+            "--output",
+            "{output}",
+        ],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @travsr-plugin/c  (requires compile_commands.json)",
-        underlying_tool_hint: "see scip-clang releases (requires compile_commands.json)",
+        install_hint: "travsr lang install c  (requires compile_commands.json)",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-c"),
         elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "sourcegraph/scip-clang",
+            asset_fn: scip_clang_asset,
+            install_name: "scip-clang",
+            version_fallback: "v0.4.0",
+            verify_sha256: false,
+        }),
+        extensions: &[".c", ".h"],
+        wrapper_version_fallback: "v0.1.0",
     },
 ];
 

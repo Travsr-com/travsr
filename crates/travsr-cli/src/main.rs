@@ -6,6 +6,7 @@ mod ask;
 mod graph;
 mod index;
 mod init;
+mod install;
 mod lang;
 mod migrate;
 mod repo;
@@ -204,8 +205,10 @@ async fn main() {
 /// Log redaction: file contents are never logged. Spans record only paths,
 /// counts, and numeric identifiers — never raw source text.
 fn init_tracing() {
+    // Default to error-only for normal user operation — no internal tracing noise.
+    // Set RUST_LOG=info or RUST_LOG=debug to see internals during development.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
 
     #[cfg(not(feature = "otlp"))]
     {
@@ -251,7 +254,7 @@ fn init_tracing() {
                     .with_writer(std::io::stderr)
                     .with_env_filter(
                         tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
                     )
                     .init();
                 tracing::warn!(
