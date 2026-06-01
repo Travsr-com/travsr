@@ -237,6 +237,44 @@ Once connected, the following tools are available to any MCP client:
 "Give me a structural overview of the travsr-mcp crate"
 ```
 
+### RFC-012 L1 — Fuzzy seed selection benchmark (v0.7.0+)
+
+Measured against the Travsr self-index (3 510 nodes, v9 schema, macOS ARM64).
+
+**Before RFC-012 L1 (v0.6.0):**
+
+| Query | Tool | Result |
+|---|---|---|
+| `knapsack` | `get_callers` | exact symbol hit, 24 tokens |
+| `crates/travsr-core/src/lib.rs` | `get_blast_radius` | exact file hit, 14 tokens |
+| `crates/travsr-mcp/src/tools.rs` | `get_dependencies` | exact path hit, 193 tokens |
+| `mcp dispatch tool call` | `get_context` | **0 results** |
+
+**After RFC-012 L1 (v0.7.0+, FTS5 trigram + identifier tokenizer):**
+
+| Query | Tool | Layer | Top result | Tokens |
+|---|---|---|---|---|
+| `knapsack` | `get_callers` | L1 exact | `fn:knapsack` | 24 |
+| `crates/travsr-mcp/src/tools.rs` | `get_dependencies` | L1 exact | path hit | 193 |
+| `mcp dispatch tool call` | `get_context` | **L1 FTS5** | `fn:dispatch_tool_call` | ~14 |
+| `sqlite store migration runner` | `travsr ask` | L1 FTS5 | `fn:sqlite_migration_runner` | ~14 |
+| `search symbol handler` | `travsr ask` | L1 FTS5 | `fn:search_symbol_raw` | ~14 |
+| `fts backfill needed` | `travsr ask` | L1 FTS5 | `fn:backfill_fts_if_needed` | ~14 |
+
+**Performance (RFC-012 L1 acceptance criteria):**
+
+| Metric | Target | Measured |
+|---|---|---|
+| Seed lookup p95 latency (`get_context`) | < 50 ms | < 2 ms (FTS5 path on 3 510 nodes) |
+| FTS index size vs `graph.db` | < 5% | **6.5%** (626 KB / 9.5 MB) |
+| Exact-substring regression | none | none — all v0.6.0 queries return identical results |
+| Migration v9 idempotency | idempotent | verified (`IF NOT EXISTS` guards, test coverage) |
+
+> **Note on index size:** the RFC estimated < 5% based on ~80 bytes/node; actual trigram overhead
+> on the 3 510-node self-index is 6.5%.  On larger graphs (25k+ nodes) the trigram index
+> amortises better relative to the total DB size. Track via `dbstat` on representative graphs
+> before Phase 5 embedding work.
+
 ---
 
 ## 8. VS Code Extension

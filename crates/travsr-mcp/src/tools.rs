@@ -371,7 +371,7 @@ fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
     // this Rust-side cap is the guard until that is added at the store layer.
     const MAX_SEARCH_RESULTS: usize = 50;
 
-    let nodes = match store.search_nodes_by_name(name) {
+    let nodes = match store.search_nodes_fuzzy(name) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("search_symbol error: {e}");
@@ -760,7 +760,7 @@ fn get_context_body(
     }
 
     // Seed lookup: up to 5 seeds matching query, RBAC-filtered (SEC P0).
-    let seeds: Vec<NodeId> = match store.search_nodes_by_name(query) {
+    let seeds: Vec<NodeId> = match store.search_nodes_fuzzy(query) {
         Ok(nodes) => nodes
             .into_iter()
             .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
