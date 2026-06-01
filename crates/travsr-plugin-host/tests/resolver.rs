@@ -179,12 +179,16 @@ fn elevated_language_without_approval_skips_gracefully() {
     // Point TRAVSR_LANG_TOML at a nonexistent path so neither
     // registered_languages_from_disk() nor load_lang_config() can see the
     // developer's real ~/.travsr/lang.toml during testing.
+    // Mutex guards the set_var/remove_var sequence against parallel test threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var(
         "TRAVSR_LANG_TOML",
         "/nonexistent/__travsr_test_isolation__.toml",
     );
     let resolver = CatalogResolver::new();
     std::env::remove_var("TRAVSR_LANG_TOML");
+    drop(_guard);
     let result = resolver.resolve("java");
     assert!(
         result.is_none(),

@@ -132,7 +132,7 @@ fn cmd_list() -> Result<()> {
         };
 
         let package_col = entry.npm_package.unwrap_or(entry.command);
-        let provider_on_path = entry.provider_binary.map_or(true, which);
+        let provider_on_path = entry.provider_binary.map_or(true, tool_available);
         let tool_on_path = tool_available(entry.command);
         let fully_ready = provider_on_path && tool_on_path;
         let wrapper_only = provider_on_path && !tool_on_path && entry.provider_binary.is_some();
@@ -532,7 +532,7 @@ fn cmd_detect() -> Result<()> {
             .as_ref()
             .map(|c| c.is_registered(lang))
             .unwrap_or(false);
-        let provider_ready = entry.provider_binary.map_or(true, which);
+        let provider_ready = entry.provider_binary.map_or(true, tool_available);
         let fully_ready = provider_ready && tool_available(entry.command);
 
         let status = if registered && fully_ready {
@@ -1016,6 +1016,11 @@ impl LangConfig {
 }
 
 fn config_path() -> PathBuf {
+    // TRAVSR_LANG_TOML overrides the path — used in tests to avoid reading the
+    // real ~/.travsr/lang.toml (mirrors the same override in resolver.rs and trust.rs).
+    if let Ok(p) = std::env::var("TRAVSR_LANG_TOML") {
+        return PathBuf::from(p);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".travsr")

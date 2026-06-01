@@ -204,8 +204,10 @@ pub async fn download_scip_binary(
             .context("setting executable permission")?;
     }
 
-    std::fs::rename(&tmp, &dest)
-        .with_context(|| format!("moving {} to {}", tmp.display(), dest.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("moving {} to {}", tmp.display(), dest.display()));
+    }
 
     Ok(dest)
 }
@@ -281,8 +283,10 @@ pub async fn download_and_install_wrapper(
             .context("setting executable permission")?;
     }
 
-    std::fs::rename(&tmp, &dest)
-        .with_context(|| format!("moving {} to {}", tmp.display(), dest.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("moving {} to {}", tmp.display(), dest.display()));
+    }
 
     Ok(dest)
 }
@@ -361,6 +365,9 @@ mod tests {
 
     #[test]
     fn skip_download_returns_dest_path() {
+        // Mutex guards set_var/remove_var against parallel test threads.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(SKIP_DOWNLOAD_ENV, "1");
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(download_and_install_wrapper(
@@ -369,6 +376,7 @@ mod tests {
             "x86_64-unknown-linux-gnu",
         ));
         std::env::remove_var(SKIP_DOWNLOAD_ENV);
+        drop(_guard);
         // Only check it doesn't error; bin dir creation may fail in sandbox envs.
         let _ = result; // result is Ok or Err depending on home dir availability
     }
