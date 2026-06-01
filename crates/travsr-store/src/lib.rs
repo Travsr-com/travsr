@@ -814,8 +814,13 @@ impl SqliteStore {
             return Ok(());
         }
 
+        // map_count > node_count is possible when stale FTS entries exist
+        // (nodes deleted via a path that ran outside this store instance).
+        // In that case the JOIN in search_nodes_fuzzy silently skips them;
+        // the count-inequality still triggers a no-op backfill pass.
         tracing::info!(
-            missing = node_count - map_count,
+            missing = node_count.saturating_sub(map_count),
+            stale = map_count.saturating_sub(node_count),
             "RFC-012 L1: backfilling FTS index for unindexed nodes"
         );
 

@@ -315,6 +315,109 @@ fn kind_update_reindex_no_duplicate_fts_rows() {
     );
 }
 
+// ── Empty graph ───────────────────────────────────────────────────────────────
+
+#[test]
+fn empty_graph_returns_empty_not_error() {
+    let store = open();
+    // No nodes at all — every layer must return empty, never error.
+    let r = store.search_nodes_fuzzy("mcp dispatch tool call").unwrap();
+    assert!(r.is_empty(), "empty graph must return empty vec, not error");
+}
+
+#[test]
+fn empty_graph_exact_query_returns_empty() {
+    let store = open();
+    let r = store.search_nodes_fuzzy("dispatch_tool_call").unwrap();
+    assert!(r.is_empty());
+}
+
+// ── Delete retraction (always-fresh invariant) ────────────────────────────────
+
+#[test]
+fn delete_nodes_for_path_retracts_fts_entry() {
+    let mut store = open();
+    let n = node(
+        "crates/travsr-mcp/src/server.rs",
+        "fn:handle_tool_call",
+        "function",
+    );
+    put(&mut store, &n);
+
+    // Verify it is findable before deletion.
+    let before = store.search_nodes_fuzzy("handle tool call").unwrap();
+    assert!(
+        !before.is_empty(),
+        "node must be findable via FTS before deletion"
+    );
+
+    // Delete via the store's path-based deletion (same path used to index).
+    store
+        .delete_nodes_for_path("crates/travsr-mcp/src/server.rs")
+        .expect("delete_nodes_for_path failed");
+
+    // Must not surface via FTS after deletion (always-fresh invariant).
+    let after = store.search_nodes_fuzzy("handle tool call").unwrap();
+    assert!(
+        after.is_empty(),
+        "deleted node must not be findable via FTS after delete_nodes_for_path"
+    );
+
+    // Must not surface via exact match either.
+    let exact = store.search_nodes_fuzzy("handle_tool_call").unwrap();
+    assert!(
+        exact.is_empty(),
+        "deleted node must not appear via exact match"
+    );
+}
+
+#[test]
+fn delete_nodes_for_path_prefix_retracts_fts_entries() {
+    let mut store = open();
+    let n1 = node(
+        "crates/travsr-mcp/src/server.rs",
+        "fn:handle_tool_call",
+        "function",
+    );
+    let n2 = node(
+        "crates/travsr-mcp/src/tools.rs",
+        "fn:search_symbol_raw",
+        "function",
+    );
+    let n3 = node("crates/travsr-store/src/lib.rs", "fn:put_node", "function");
+    put(&mut store, &n1);
+    put(&mut store, &n2);
+    put(&mut store, &n3);
+
+    // Delete all nodes under crates/travsr-mcp/ via prefix.
+    store
+        .delete_nodes_for_path_prefix("crates/travsr-mcp/")
+        .expect("delete_nodes_for_path_prefix failed");
+
+    // MCP nodes must be gone.
+    assert!(
+        store
+            .search_nodes_fuzzy("handle tool call")
+            .unwrap()
+            .is_empty(),
+        "handle_tool_call must be retracted"
+    );
+    assert!(
+        store
+            .search_nodes_fuzzy("search symbol raw")
+            .unwrap()
+            .is_empty(),
+        "search_symbol_raw must be retracted"
+    );
+
+    // Store node must still be findable.
+    let remaining = store.search_nodes_fuzzy("put node").unwrap();
+    assert!(
+        !remaining.is_empty(),
+        "put_node (different prefix) must still be findable"
+    );
+}
+
 // ── Migration idempotency ─────────────────────────────────────────────────────
 
 #[test]
