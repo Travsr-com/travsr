@@ -30,7 +30,7 @@ pub fn run(query: &str) -> anyhow::Result<()> {
     }
 
     let store = SqliteStore::open(&db_path)?;
-    let matches = store.search_nodes_by_name(query)?;
+    let matches = store.search_nodes_fuzzy(query)?;
 
     if matches.is_empty() {
         println!("no symbols matching '{query}'");

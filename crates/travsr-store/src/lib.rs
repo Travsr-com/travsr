@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fts_tokenize;
 pub mod migration;
 pub mod migration_manifest;
 pub mod registry;
@@ -27,6 +28,8 @@ use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 use travsr_error::StoreError;
+
+use crate::fts_tokenize::{build_match_expr, tokenize_identifier};
 
 // ── SQLite migration structs (T2) ─────────────────────────────────────────────
 // Each SQL file becomes a concrete Migration so the runner can apply them
@@ -152,6 +155,18 @@ impl Migration for V8NodeLine {
     }
 }
 
+struct V9NodesFts;
+impl Migration for V9NodesFts {
+    fn version(&self) -> u32 {
+        9
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // Both statements use IF NOT EXISTS — idempotent on re-run after a
+        // crash between up() and set_schema_version (the atomicity gap).
+        store.exec_ddl(include_str!("migrations/v9_nodes_fts.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -164,6 +179,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V6EdgeConfidence);
     r.register(V7RbacColumns);
     r.register(V8NodeLine);
+    r.register(V9NodesFts);
     r
 }
 
@@ -233,6 +249,9 @@ impl SqliteStore {
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations")?;
+            store
+                .backfill_fts_if_needed()
+                .context("backfilling FTS index")?;
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -248,6 +267,9 @@ impl SqliteStore {
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations (in-memory)")?;
+            store
+                .backfill_fts_if_needed()
+                .context("backfilling FTS index (in-memory)")?;
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -374,6 +396,22 @@ impl SqliteStore {
             )
             .context("deleting edges for path")?;
 
+            // Retract FTS entries before deleting nodes (tokens stored in map).
+            tx.execute(
+                "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
+                 SELECT 'delete', m.node_id, m.tokens \
+                 FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.path = ?1",
+                params![path],
+            )
+            .context("retracting FTS rows for path")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                params![path],
+            )
+            .context("removing nodes_fts_map rows for path")?;
+
             tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
                 .context("deleting nodes for path")?;
 
@@ -416,6 +454,22 @@ impl SqliteStore {
                 params![pattern],
             )
             .context("deleting edges for path prefix")?;
+
+            // Retract FTS entries before deleting nodes (tokens stored in map).
+            tx.execute(
+                "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
+                 SELECT 'delete', m.node_id, m.tokens \
+                 FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.path LIKE ?1",
+                params![pattern],
+            )
+            .context("retracting FTS rows for path prefix")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE path LIKE ?1)",
+                params![pattern],
+            )
+            .context("removing nodes_fts_map rows for path prefix")?;
 
             tx.execute("DELETE FROM nodes WHERE path LIKE ?1", params![pattern])
                 .context("deleting nodes for path prefix")?;
@@ -642,7 +696,6 @@ impl StoreMigratable for SqliteStore {
     }
 
     fn column_exists(&self, table: &str, column: &str) -> anyhow::Result<bool> {
-        // `pragma_table_info(table)` returns one row per column; name is col 1.
         let count: i64 = self
             .conn
             .query_row(
@@ -655,13 +708,265 @@ impl StoreMigratable for SqliteStore {
     }
 }
 
+// ── FTS helpers + fuzzy search (RFC-012 L1) ───────────────────────────────────
+
+impl SqliteStore {
+    // ── FTS helpers (RFC-012 L1) ──────────────────────────────────────────────
+
+    /// Build the token string for a node: tokenized signature + path + kind + language.
+    fn node_fts_tokens(node: &Node) -> String {
+        format!(
+            "{} {} {} {}",
+            tokenize_identifier(&node.vname.signature),
+            tokenize_identifier(&node.vname.path),
+            node.kind.to_ascii_lowercase(),
+            node.vname.language.to_ascii_lowercase(),
+        )
+    }
+
+    /// Upsert a node's FTS entry.  Handles the contentless-FTS5 invariant:
+    /// a row must be explicitly deleted (with its original tokens) before
+    /// re-inserting, otherwise the index silently accumulates stale entries.
+    fn put_node_fts(conn: &Connection, node: &Node) -> AnyResult<()> {
+        let id_i64 = node_id_to_i64(node.id);
+        let new_tokens = Self::node_fts_tokens(node);
+
+        // Fetch old tokens (if any) so we can retract the stale FTS row.
+        let old_tokens: Option<String> = conn
+            .query_row(
+                "SELECT tokens FROM nodes_fts_map WHERE node_id = ?1",
+                params![id_i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading old FTS tokens")?;
+
+        if let Some(old) = old_tokens {
+            // Retract the stale contentless-FTS5 row with its original tokens.
+            conn.execute(
+                "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) VALUES('delete', ?1, ?2)",
+                params![id_i64, old],
+            )
+            .context("retracting stale FTS row")?;
+        }
+
+        // Insert new FTS row.
+        conn.execute(
+            "INSERT INTO nodes_fts(rowid, tokens) VALUES(?1, ?2)",
+            params![id_i64, new_tokens],
+        )
+        .context("inserting FTS row")?;
+
+        // Upsert the map so future retractions can supply the exact token string.
+        conn.execute(
+            "INSERT INTO nodes_fts_map(node_id, tokens) VALUES(?1, ?2)
+             ON CONFLICT(node_id) DO UPDATE SET tokens = excluded.tokens",
+            params![id_i64, new_tokens],
+        )
+        .context("upserting nodes_fts_map")?;
+
+        Ok(())
+    }
+
+    /// Retract a single node from the FTS index.  No-op if the node has no FTS entry.
+    #[allow(dead_code)]
+    fn delete_node_fts(conn: &Connection, node_id_i64: i64) -> AnyResult<()> {
+        let old_tokens: Option<String> = conn
+            .query_row(
+                "SELECT tokens FROM nodes_fts_map WHERE node_id = ?1",
+                params![node_id_i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading FTS tokens for deletion")?;
+
+        if let Some(tokens) = old_tokens {
+            conn.execute(
+                "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) VALUES('delete', ?1, ?2)",
+                params![node_id_i64, tokens],
+            )
+            .context("retracting FTS row on node delete")?;
+            conn.execute(
+                "DELETE FROM nodes_fts_map WHERE node_id = ?1",
+                params![node_id_i64],
+            )
+            .context("removing nodes_fts_map row")?;
+        }
+
+        Ok(())
+    }
+
+    /// Idempotent FTS backfill called once after migrations at `open()` /
+    /// `open_in_memory()`.  Cheap gate: if `COUNT(nodes) == COUNT(nodes_fts_map)`
+    /// the index is up to date and we return immediately.  On first open after
+    /// the v9 migration ships, indexes any nodes not yet in the map.
+    fn backfill_fts_if_needed(&mut self) -> AnyResult<()> {
+        let node_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .context("counting nodes for FTS backfill gate")?;
+        let map_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes_fts_map", [], |r| r.get(0))
+            .context("counting nodes_fts_map for FTS backfill gate")?;
+
+        if node_count == map_count {
+            return Ok(());
+        }
+
+        // map_count > node_count is possible when stale FTS entries exist
+        // (nodes deleted via a path that ran outside this store instance).
+        // In that case the JOIN in search_nodes_fuzzy silently skips them;
+        // the count-inequality still triggers a no-op backfill pass.
+        tracing::info!(
+            missing = node_count.saturating_sub(map_count),
+            stale = map_count.saturating_sub(node_count),
+            "RFC-012 L1: backfilling FTS index for unindexed nodes"
+        );
+
+        // Fetch unindexed nodes into a Vec first so the statement is dropped
+        // before we open the write transaction (borrow-checker: immutable stmt
+        // borrow must not overlap the mutable conn borrow for transaction()).
+        let nodes: Vec<Node> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line \
+                     FROM nodes WHERE id NOT IN (SELECT node_id FROM nodes_fts_map)",
+                )
+                .context("preparing FTS backfill query")?;
+            let collected = stmt
+                .query_map([], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing FTS backfill query")?
+                .collect::<Result<_, _>>()
+                .context("collecting FTS backfill rows")?;
+            collected
+        }; // stmt dropped here — conn is free for the write transaction
+
+        // Index in one transaction to minimise WAL pressure.
+        let tx = self
+            .conn
+            .transaction()
+            .context("starting FTS backfill transaction")?;
+        for node in &nodes {
+            Self::put_node_fts(&tx, node).context("put_node_fts during backfill")?;
+        }
+        tx.commit().context("committing FTS backfill transaction")?;
+
+        tracing::info!(indexed = nodes.len(), "RFC-012 L1: FTS backfill complete");
+        Ok(())
+    }
+
+    /// Layered seed selection (RFC-012 L1).
+    ///
+    /// 1. Exact substring via `search_nodes_by_name` — if ≥1 result, return it.
+    /// 2. FTS5 trigram MATCH on the tokenized query — up to 50 results by BM25.
+    /// 3. Empty.
+    ///
+    /// The exact-substring step ensures existing benchmarks never regress.
+    /// The FTS path is reached only on a substring miss, so multi-word
+    /// natural-language queries (`"mcp dispatch tool call"`) now resolve even
+    /// when no single node contains the literal string.
+    pub fn search_nodes_fuzzy(&self, query: &str) -> Result<Vec<Node>, StoreError> {
+        let _span = tracing::debug_span!("store.search_nodes_fuzzy", query).entered();
+
+        // Step 1 — exact substring (never regresses).
+        let exact = self.search_nodes_by_name(query)?;
+        if !exact.is_empty() {
+            tracing::debug!(layer = "exact", nodes_returned = exact.len());
+            return Ok(exact);
+        }
+
+        // Step 2 — FTS5 trigram MATCH.
+        (|| -> AnyResult<Vec<Node>> {
+            let match_expr = match build_match_expr(query) {
+                Some(e) => e,
+                // All tokens < 3 chars (e.g. pure punctuation) — nothing to search.
+                None => {
+                    tracing::debug!(layer = "fts5_skip_empty_tokens");
+                    return Ok(Vec::new());
+                }
+            };
+
+            let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                              n.kind, n.package, n.line \
+                       FROM nodes_fts \
+                       JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
+                       JOIN nodes n ON n.id = m.node_id \
+                       WHERE nodes_fts MATCH ?1 \
+                       ORDER BY bm25(nodes_fts) \
+                       LIMIT 50";
+
+            let mut stmt = self.conn.prepare(sql).context("preparing FTS5 query")?;
+
+            let rows = stmt
+                .query_map(params![match_expr], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing FTS5 query")?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding FTS5 row")?);
+            }
+            tracing::debug!(layer = "fts5", nodes_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+}
+
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 impl Store for SqliteStore {
     fn put_node(&mut self, node: &Node) -> Result<NodeId, StoreError> {
         let id_i64 = node_id_to_i64(node.id);
-        self.conn
-            .execute(
+        // Wrap node upsert + FTS write in one transaction so a crash between
+        // the two writes cannot leave nodes and nodes_fts_map out of sync.
+        // (The backfill gate in open() self-heals any gap, but atomicity is
+        // preferable.)  Callers use bare autocommit loops — no nesting conflict.
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting put_node transaction")?;
+            tx.execute(
                 "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, package = excluded.package, line = COALESCE(excluded.line, nodes.line)",
@@ -677,8 +982,12 @@ impl Store for SqliteStore {
                     node.line.map(|l| l as i64),
                 ],
             )
-            .context("inserting node")
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .context("inserting node")?;
+            Self::put_node_fts(&tx, node).context("put_node_fts")?;
+            tx.commit().context("committing put_node transaction")?;
+            Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(node.id)
     }
 
