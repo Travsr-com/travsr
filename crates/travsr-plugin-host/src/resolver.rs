@@ -362,8 +362,14 @@ impl LangConfigFile {
 }
 
 fn load_lang_config() -> Option<LangConfigFile> {
-    let home = dirs::home_dir()?;
-    let path = home.join(".travsr").join("lang.toml");
+    // TRAVSR_LANG_TOML overrides the path — used in tests to avoid reading the
+    // real ~/.travsr/lang.toml and making tests dependent on local machine state.
+    let path = if let Ok(p) = std::env::var("TRAVSR_LANG_TOML") {
+        std::path::PathBuf::from(p)
+    } else {
+        let home = dirs::home_dir()?;
+        home.join(".travsr").join("lang.toml")
+    };
     let content = std::fs::read_to_string(&path).ok()?;
     toml::from_str(&content).ok()
 }

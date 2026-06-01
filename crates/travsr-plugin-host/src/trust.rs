@@ -57,11 +57,16 @@ impl TrustConfig {
 }
 
 /// Read the `registered` language list from ~/.travsr/lang.toml.
+/// Override path via `TRAVSR_LANG_TOML` env var (for tests).
 pub fn registered_languages_from_disk() -> Vec<String> {
-    let Some(home) = dirs::home_dir() else {
-        return vec![];
+    let path = if let Ok(p) = std::env::var("TRAVSR_LANG_TOML") {
+        std::path::PathBuf::from(p)
+    } else {
+        let Some(home) = dirs::home_dir() else {
+            return vec![];
+        };
+        home.join(".travsr").join("lang.toml")
     };
-    let path = home.join(".travsr").join("lang.toml");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return vec![];
     };
