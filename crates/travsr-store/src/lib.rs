@@ -30,7 +30,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 use travsr_error::StoreError;
 
-use crate::fts_tokenize::{build_fuzzy_match_expr, tokenize_identifier};
+use crate::fts_tokenize::{build_fuzzy_match_expr_db, tokenize_identifier};
 
 // ── SQLite migration structs (T2) ─────────────────────────────────────────────
 // Each SQL file becomes a concrete Migration so the runner can apply them
@@ -179,6 +179,32 @@ impl Migration for V10FtsVocab {
     }
 }
 
+struct V11FtsSynonyms;
+impl Migration for V11FtsSynonyms {
+    fn version(&self) -> u32 {
+        11
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // Both CREATE statements use IF NOT EXISTS — idempotent on re-run.
+        store.exec_ddl(include_str!("migrations/v11_fts_synonyms.sql"))
+    }
+}
+
+#[cfg(feature = "embeddings")]
+struct V12Vec0Embeddings;
+#[cfg(feature = "embeddings")]
+impl Migration for V12Vec0Embeddings {
+    fn version(&self) -> u32 {
+        12
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // vec0 extension must be loaded before this migration runs.
+        // SqliteStore::load_vec0_extension() is called by `travsr embed init`
+        // before opening the store with embeddings enabled.
+        store.exec_ddl(include_str!("migrations/v12_vec0_embeddings.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -193,6 +219,9 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V8NodeLine);
     r.register(V9NodesFts);
     r.register(V10FtsVocab);
+    r.register(V11FtsSynonyms);
+    #[cfg(feature = "embeddings")]
+    r.register(V12Vec0Embeddings);
     r
 }
 
@@ -268,6 +297,9 @@ impl SqliteStore {
             store
                 .backfill_vocab_if_needed()
                 .context("backfilling fts_vocab index (L2-A)")?;
+            store
+                .seed_synonyms_if_empty()
+                .context("seeding fts_synonyms (RFC-012 A2 F1)")?;
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -289,6 +321,9 @@ impl SqliteStore {
             store
                 .backfill_vocab_if_needed()
                 .context("backfilling fts_vocab index in-memory (L2-A)")?;
+            store
+                .seed_synonyms_if_empty()
+                .context("seeding fts_synonyms in-memory (RFC-012 A2 F1)")?;
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -976,7 +1011,12 @@ impl SqliteStore {
         }
 
         // Step 2 — FTS5 trigram MATCH on the T0 heuristic-normalised token union.
-        let step2_expr = match build_fuzzy_match_expr(query) {
+        // build_fuzzy_match_expr_db uses fts_synonyms (DB-backed, RFC-012 A2 F1)
+        // instead of the compile-time static; pure build_fuzzy_match_expr is kept
+        // for unit tests that run without a live connection.
+        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
             Some(e) => e,
             // All tokens < 3 chars (e.g. pure punctuation) — nothing to search.
             None => {
@@ -1231,6 +1271,87 @@ impl SqliteStore {
             nodes = token_strings.len(),
             "RFC-012 L2-A: fts_vocab backfill complete"
         );
+        Ok(())
+    }
+
+    // ── Dynamic synonym table (RFC-012 A2 F1) ────────────────────────────────
+
+    /// Seed `fts_synonyms` from the compile-time static defaults if the table is empty.
+    /// Called once at `open()` / `open_in_memory()` after migrations.
+    /// Idempotent: if any rows exist, returns immediately without touching the table.
+    fn seed_synonyms_if_empty(&mut self) -> AnyResult<()> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_synonyms", [], |r| r.get(0))
+            .context("counting fts_synonyms")?;
+        if count > 0 {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for (term, aliases) in crate::seed_lexicon::SYNONYMS {
+            for alias in *aliases {
+                tx.execute(
+                    "INSERT OR IGNORE INTO fts_synonyms(term, alias) VALUES(?1, ?2)",
+                    params![term, alias],
+                )?;
+            }
+        }
+        tx.commit()?;
+        tracing::info!("RFC-012 A2 F1: seeded fts_synonyms from static defaults");
+        Ok(())
+    }
+
+    /// Add a synonym pair. Rejects if the table already has ≥200 rows.
+    pub fn synonym_add(&mut self, term: &str, alias: &str) -> AnyResult<()> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_synonyms", [], |r| r.get(0))
+            .context("counting fts_synonyms before add")?;
+        anyhow::ensure!(
+            count < 200,
+            "fts_synonyms is full (200 rows). Use `travsr synonym remove` to make space."
+        );
+        self.conn.execute(
+            "INSERT OR IGNORE INTO fts_synonyms(term, alias) VALUES(?1, ?2)",
+            params![term, alias],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a synonym pair. No-op if the pair does not exist.
+    pub fn synonym_remove(&mut self, term: &str, alias: &str) -> AnyResult<()> {
+        self.conn.execute(
+            "DELETE FROM fts_synonyms WHERE term = ?1 AND alias = ?2",
+            params![term, alias],
+        )?;
+        Ok(())
+    }
+
+    /// List all active synonym pairs as (term, alias) tuples.
+    pub fn synonym_list(&self) -> AnyResult<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT term, alias FROM fts_synonyms ORDER BY term, alias")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Reset `fts_synonyms` to the static defaults: delete all rows and re-seed.
+    pub fn synonym_reset(&mut self) -> AnyResult<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute_batch("DELETE FROM fts_synonyms")?;
+        for (term, aliases) in crate::seed_lexicon::SYNONYMS {
+            for alias in *aliases {
+                tx.execute(
+                    "INSERT OR IGNORE INTO fts_synonyms(term, alias) VALUES(?1, ?2)",
+                    params![term, alias],
+                )?;
+            }
+        }
+        tx.commit()?;
+        tracing::info!("RFC-012 A2 F1: fts_synonyms reset to static defaults");
         Ok(())
     }
 }

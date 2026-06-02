@@ -31,6 +31,7 @@ import {
   EVT_MCP_INVOKED,
   EVT_DAEMON_FAILED,
 } from "./telemetry";
+import { registerContextProvider } from "./contextProvider";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -79,6 +80,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   wireDisconnectHandler(rawClient, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
   void rawClient.connect();
+
+  // RFC-012 A2 F4: ambient context provider — fires before every Copilot Chat turn.
+  registerContextProvider(proxy, context);
 
   // Status bar (VSCODE-201) — reconnect-aware
   createStatusBarItem(context, proxy, (cb) => proxy.onReconnect(cb), statusBarPosition);

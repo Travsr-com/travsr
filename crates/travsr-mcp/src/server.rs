@@ -72,6 +72,19 @@ fn handle_request(store: &SqliteStore, req: RpcRequest) -> Option<String> {
             handle_tool_call(store, id, params)
         }
 
+        #[cfg(feature = "mcp-sampling")]
+        "prompts/list" => ok_response(id, prompts_list()),
+
+        #[cfg(feature = "mcp-sampling")]
+        "prompts/get" => {
+            let name = req
+                .params
+                .as_ref()
+                .and_then(|p| p["name"].as_str())
+                .unwrap_or("");
+            handle_prompts_get(id, name)
+        }
+
         other => {
             tracing::debug!("unknown method: {other}");
             error_response(id, METHOD_NOT_FOUND, format!("method not found: {other}"))
@@ -337,6 +350,20 @@ fn handle_request_global(req: RpcRequest) -> Option<String> {
             let params = req.params.unwrap_or(serde_json::Value::Null);
             handle_tool_call_global(&repos, id, params)
         }
+
+        #[cfg(feature = "mcp-sampling")]
+        "prompts/list" => ok_response(id, prompts_list()),
+
+        #[cfg(feature = "mcp-sampling")]
+        "prompts/get" => {
+            let name = req
+                .params
+                .as_ref()
+                .and_then(|p| p["name"].as_str())
+                .unwrap_or("");
+            handle_prompts_get(id, name)
+        }
+
         other => {
             tracing::debug!("unknown method: {other}");
             error_response(id, METHOD_NOT_FOUND, format!("method not found: {other}"))
@@ -531,6 +558,49 @@ fn tools_list_global() -> serde_json::Value {
             }
         ]
     })
+}
+
+// ── L2-D: MCP sampling borrow (RFC-012 A2 F3, feature = "mcp-sampling") ────────
+// The daemon is passive: it returns a prompt template string with a {{query}}
+// placeholder. The host LLM fills the placeholder and calls tools/call itself.
+// The daemon never calls the LLM. Security review required before cloud deploy.
+
+#[cfg(feature = "mcp-sampling")]
+fn prompts_list() -> serde_json::Value {
+    serde_json::json!({
+        "prompts": [{
+            "name": "search_query_rewrite",
+            "description": "Rewrite a natural-language query into a concise \
+                            symbol-oriented search term for Travsr's graph index.",
+            "arguments": [{
+                "name": "query",
+                "description": "The original user query",
+                "required": true
+            }]
+        }]
+    })
+}
+
+#[cfg(feature = "mcp-sampling")]
+fn handle_prompts_get(id: serde_json::Value, name: &str) -> String {
+    match name {
+        "search_query_rewrite" => ok_response(
+            id,
+            serde_json::json!({
+                "description": "Rewrite this query for Travsr symbol search",
+                "messages": [{
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": "Rewrite the following query into a short (1–4 word) \
+                                 code-symbol search term that would appear in function \
+                                 names, class names, or file names:\n\n{{query}}"
+                    }
+                }]
+            }),
+        ),
+        _ => error_response(id, INVALID_PARAMS, format!("unknown prompt: {name}")),
+    }
 }
 
 #[cfg(test)]

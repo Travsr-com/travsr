@@ -123,6 +123,32 @@ pub fn build_fuzzy_match_expr(query: &str) -> Option<String> {
     }
 }
 
+/// DB-backed variant of `build_fuzzy_match_expr` for the Step 2 hot path (RFC-012 A2 F1).
+///
+/// Identical contract to `build_fuzzy_match_expr` but calls `expand_tokens_db`
+/// (fts_synonyms table) instead of the compile-time static `expand_tokens`.
+/// Returns `None` when the token union is empty.
+pub fn build_fuzzy_match_expr_db(
+    query: &str,
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<Option<String>> {
+    let raw_str = tokenize_identifier(query);
+    if raw_str.is_empty() {
+        return Ok(None);
+    }
+    let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
+    let union = crate::seed_lexicon::expand_tokens_db(conn, &raw)?;
+    if union.is_empty() {
+        return Ok(None);
+    }
+    let expr = union
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Ok(if expr.is_empty() { None } else { Some(expr) })
+}
+
 /// Build the MATCH expression for `search_nodes_fuzzy`.
 ///
 /// Tokenises `query`, double-quotes each token (neutralises all FTS5 operators),

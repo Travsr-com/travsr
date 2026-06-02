@@ -97,6 +97,51 @@ pub(crate) fn expand_tokens(raw: &[String]) -> Vec<String> {
     out
 }
 
+/// DB-backed variant of `expand_tokens` for the Step 2 hot path (RFC-012 A2 F1).
+///
+/// Identical contract to `expand_tokens` (PA C1: raw content tokens always enter
+/// the union first) but looks up aliases from `fts_synonyms` instead of the
+/// compile-time static.  `expand_tokens` is kept for unit tests that run without
+/// a live connection.
+pub(crate) fn expand_tokens_db(
+    conn: &rusqlite::Connection,
+    raw: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let content: Vec<&String> = raw.iter().filter(|t| !is_stopword(t.as_str())).collect();
+
+    let mut out: Vec<String> = Vec::new();
+    let push = |v: &mut Vec<String>, s: &str| {
+        if s.len() >= 3 && !v.iter().any(|e| e == s) {
+            v.push(s.to_string());
+        }
+    };
+
+    // PA C1: raw content tokens always enter first.
+    for t in &content {
+        push(&mut out, t.as_str());
+    }
+
+    // DB-backed alias lookup.
+    for t in &content {
+        let mut stmt = conn.prepare_cached("SELECT alias FROM fts_synonyms WHERE term = ?1")?;
+        let aliases: Vec<String> = stmt
+            .query_map(rusqlite::params![t.as_str()], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for alias in aliases {
+            push(&mut out, &alias);
+        }
+    }
+
+    // PA C1 safety floor: if stopwords emptied content, fall back to raw.
+    if out.is_empty() {
+        for t in raw {
+            push(&mut out, t.as_str());
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

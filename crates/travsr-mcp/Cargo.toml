@@ -32,6 +32,14 @@ base64 = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 
+[features]
+default = []
+# Expose prompts/list + prompts/get endpoints for host-LLM query rewriting.
+# Default-off: security review required before enabling in cloud deployments.
+# The daemon is purely passive — it returns a prompt template string; the LLM
+# fills {{query}} and calls tools/call with the rewritten query itself.
+mcp-sampling = []
+
 [dev-dependencies]
 assert_cmd = { workspace = true }
 tempfile = { workspace = true }

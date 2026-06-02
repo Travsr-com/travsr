@@ -13,6 +13,7 @@ mod repo;
 mod repos;
 mod serve;
 mod status;
+mod synonym;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -115,6 +116,11 @@ enum Command {
     Lang {
         #[command(subcommand)]
         action: lang::LangCommand,
+    },
+    /// Manage per-repo dynamic synonym pairs (RFC-012 A2 F1).
+    Synonym {
+        #[command(subcommand)]
+        action: synonym::SynonymCommand,
     },
 }
 
@@ -403,6 +409,7 @@ async fn run(cli: Cli) -> Result<()> {
             serve::run(port, tenants_dir).await?;
         }
         Command::Lang { action } => lang::run(action)?,
+        Command::Synonym { action } => synonym::run(action)?,
     }
     Ok(())
 }
