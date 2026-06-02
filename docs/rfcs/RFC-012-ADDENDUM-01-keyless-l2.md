@@ -5,7 +5,7 @@
 | **Status** | Draft (ratification gate before fold-in to RFC-012) |
 | **Author** | Tech Lead |
 | **Date** | 2026-06-02 |
-| **Revision** | Rev 3 — folds in the SOTA retrieval synthesis (*Advanced Retrieval Architecture for Deterministic Code Graph Navigation*): SymSpell+FST for L2-A scale, MRL+RaBitQ+AVX-512 for L2-B footprint, Elias-Fano for hyperscale postings. Rev 2 hardened against a 5-persona review (Principal Architect · Principal Security Engineer · Tech Lead · Solution Architect · Senior SWE). See § Review Record. |
+| **Revision** | Rev 4 — co-lands with RFC-012 A1 S20 T0 (`seed_lexicon.rs` + `build_fuzzy_match_expr`); updated step block + line numbers to reflect T0 at Step 2; specified `expand_query` vs `expand_tokens` relationship; added OR-arm cap T0 gap note + AC (k); added refcount test contracts to AC (e); added vec0 migration pre-condition AC (l); added Open Q 7a (T0 one-directionality); fixed `delete_node_fts` line reference. Rev 3 — folds in the SOTA retrieval synthesis (*Advanced Retrieval Architecture for Deterministic Code Graph Navigation*): SymSpell+FST for L2-A scale, MRL+RaBitQ+AVX-512 for L2-B footprint, Elias-Fano for hyperscale postings. Rev 2 hardened against a 5-persona review (Principal Architect · Principal Security Engineer · Tech Lead · Solution Architect · Senior SWE). See § Review Record. |
 | **Supersedes** | RFC-012 § "Detailed Design — L2: LLM Query Translator" (§2.0–§2.7) |
 | **Leaves intact** | L1 (shipped, #258, migration `v9_nodes_fts.sql`), L3 sidecar mechanics (§3.x) — L3 is *re-roled*, not removed |
 | **Issue** | #258 |
@@ -60,14 +60,17 @@ L2-A is a deterministic expansion step. It changes no MCP tool schema, no transp
 
 ### Where it slots (no-regression by construction)
 
-It runs as an **additive Step 3** inside `search_nodes_fuzzy` (`crates/travsr-store/src/lib.rs:889`), reached **only when Step 1 (exact substring, `lib.rs:892`) and Step 2 (raw FTS `build_match_expr`, `lib.rs:899`) both miss.** Because every query that resolves today resolves at Step 1 or Step 2 unchanged, the merged L1 conformance tests cannot regress — L2-A only fires where the answer is currently *empty*.
+It runs as an **additive Step 3** inside `search_nodes_fuzzy` (`crates/travsr-store/src/lib.rs:890`), reached **only when Step 1 (exact substring, `lib.rs:894`) and Step 2 (T0 heuristic-normalised FTS `build_fuzzy_match_expr`, `lib.rs:906`) both miss.** Because every query that resolves today resolves at Step 1 or Step 2 unchanged, the merged L1 conformance tests cannot regress — L2-A only fires where the answer is currently *empty*.
 
 ```
-Step 1  exact substring            (unchanged, lib.rs:892)
-Step 2  raw FTS build_match_expr    (unchanged, lib.rs:899)
+Step 1  exact substring                                        (unchanged, lib.rs:894)
+Step 2  T0 heuristic-normalised FTS via build_fuzzy_match_expr (lib.rs:906)
+        (RFC-012 A1: stopwords stripped, bounded synonym union, PA C1 additive)
 Step 3  L2-A expand_query → FTS     (NEW — only on Step 1+2 miss)
 Step 4  L2-B local embeddings       (only if --features embedding, on Step 3 miss)
 ```
+
+**Relationship to T0 (`expand_tokens` / `seed_lexicon.rs`):** Step 2 already runs `build_fuzzy_match_expr`, which internally calls `expand_tokens` from `seed_lexicon.rs` (33 stopwords + 8-entry one-directional synonym map, RFC-012 A1 T0). Step 3 `expand_query` is a **separate, independent function** — it fires only when Step 2 (including T0 synonym expansion) returned empty, so there is no overlap. `expand_query` takes `&self` to read `fts_vocab`; `expand_tokens` is a pure function with no DB access. L2-A's programmer-jargon const slice is bidirectional (↔) and supersedes `seed_lexicon.rs` SYNONYMS for L2-A candidates; `seed_lexicon.rs` remains the T0 layer at Step 2.
 
 ### `expand_query`
 
@@ -97,7 +100,7 @@ fn expand_query(&self, nl: &str) -> Result<Vec<String>, StoreError> {
     //    token asc) — deterministic, no HashMap iteration order. Then cap to
     //    the FINAL OR-ARM budget (see "OR-arm budget" below), NOT to a
     //    pre-expansion fragment count. OR-join the survivors and hand them to
-    //    the existing build_match_expr / FTS path.
+    //    the existing build_fuzzy_match_expr / FTS path.
     todo!()
 }
 ```
@@ -115,14 +118,16 @@ CREATE TABLE IF NOT EXISTS fts_vocab (
 ```
 
 **Maintenance must hook the paths that actually run — not the dead one.** In the merged code:
-- `delete_node_fts` (`lib.rs:772`) is `#[allow(dead_code)]` and is **never called**.
-- The live deletions are the bulk SQL paths `delete_nodes_for_path` (`lib.rs:375`) and `delete_nodes_for_path_prefix` (`lib.rs:433`), which hand-roll FTS retraction inline.
+- `delete_node_fts` (`lib.rs:773`) is `#[allow(dead_code)]` and is **never called**.
+- The live deletions are the bulk SQL paths `delete_nodes_for_path` and `delete_nodes_for_path_prefix`, which hand-roll FTS retraction inline.
 
 Therefore the refcount deltas must be folded into **`put_node_fts` (insert + rename-retract) AND both bulk-delete sites**, inside their existing transactions, derived from the same `nodes_fts_map.tokens` strings those sites already read/write. Hooking only a `put/delete` pair (as Rev 1 implied) would leak decrements on every real delete → stale vocabulary → tokens proposed for symbols that no longer exist, breaking the "always-fresh" non-negotiable.
 
 ### OR-arm budget (the BM25-noise seam)
 
-`build_match_expr` already OR-joins *all* tokens of a single query. If L2-A feeds it 5 *expanded* fragments, each itself OR-expanding into synonyms + trigram candidates, the effective arm count is `5 × (synonyms + candidates)` — which can exceed FTS5's practical clause budget and flatten BM25 into noise (every node matches *something*). **The cap is therefore on the final OR-arm count (≤ 16), applied after the deterministic sort — not on a pre-expansion fragment count.**
+`build_fuzzy_match_expr` already OR-joins *all* tokens of a single query (T0, Step 2). If L2-A feeds a further expansion at Step 3 without a cap, the effective arm count across both steps can exceed FTS5's practical clause budget and flatten BM25 into noise (every node matches *something*). **The cap is therefore on the final OR-arm count at Step 3 (≤ 16), applied after the deterministic sort — not on a pre-expansion fragment count.**
+
+> **T0 gap:** `build_fuzzy_match_expr` (Step 2) has no OR-arm cap today — it can emit up to 64 raw tokens × synonym fan-out OR arms. This is a known quality limitation until L2-A ships the cap. The ≤ 16 cap is a net-new constraint for L2-A Step 3 and is an explicit acceptance criterion for the L2-A sprint.
 
 ### Determinism & scale
 
@@ -146,7 +151,7 @@ The Rev 2 deferral named "a trigram inverted index or BK-tree over `fts_vocab`."
 
 - Static lexicon: `&[(&str, &[&str])]` **const slice** — zero new dependencies, MSRV-1.75-safe. **Do not** add `phf`/`strsim` (not in ADR-001's allowed set) or use `LazyLock` (Rust 1.80 > MSRV). Bidirectional `auth↔authentication` via a symmetric const table.
 - **MVP adds no deps.** The only new dependency in this addendum is `fst`, and it belongs **exclusively to the scale-out tier** (SymSpell delete-map storage, §"Scale-out: SymSpell + FST"), not the MVP linear-scan path. It does **not** land until an ADR-001 amendment + Tech Lead sign-off, and only ahead of a >500k-node deployment. Until then every default build is dep-clean and key-free.
-- **Charset constraint:** every `fts_vocab` token and every lexicon entry is constrained to `^[a-z0-9_]+$` (CI-asserted). This matters because of crate layering: `validate_mcp_arg` lives in `travsr-mcp`, which sits *above* `travsr-store` (`mcp→retrieval→store`), so it **cannot** wrap a store-layer code path. Constraining the vocabulary/lexicon at the source makes derived fragments safe-by-construction — they cannot smuggle `../`, `:`, null, or control chars into `build_match_expr` (which also double-quotes every token, belt-and-suspenders).
+- **Charset constraint:** every `fts_vocab` token and every lexicon entry is constrained to `^[a-z0-9_]+$` (CI-asserted). This matters because of crate layering: `validate_mcp_arg` lives in `travsr-mcp`, which sits *above* `travsr-store` (`mcp→retrieval→store`), so it **cannot** wrap a store-layer code path. Constraining the vocabulary/lexicon at the source makes derived fragments safe-by-construction — they cannot smuggle `../`, `:`, null, or control chars into `build_fuzzy_match_expr` (which also double-quotes every token, belt-and-suspenders).
 
 ### Cost (self-index measurement, not a universal claim)
 
@@ -307,7 +312,7 @@ L2-A and L2-B are specified above against the **SQLite MVP tier** (`fts_vocab` t
 4. **Migrations** — renumber: **L1 = v9 (shipped reality)**, **L2-A `fts_vocab` = v10**, **L3 embedding `vec0` = v11** (RFC-012 §3.5 currently says v9 — a collision with the shipped L1 table; it must move to v11).
 5. **§3.x (L3)** — add a note that L3 also fulfils the L2 semantic-paraphrase role (L2-B); ladder mechanics unchanged, but the **storage representation is upgraded** from FP32 `vec0` to **MRL-truncated + RaBitQ 1-bit** (~40 B/node) with a portable Hamming compute path (AVX-512 / NEON / scalar). The `vec0` schema (v11) holds binary payloads + per-vector scalar correctors, not FP32 arrays. Recall vs FP32 is a measured ship gate (Open Q #14).
 6. **§ Sprint Shape — S20 is MVP-only; the Rev-3 scale-out tiers are their own later sprints.** **S20 (unchanged scope, ~350–550 LOC, complexity L):** `expand_query` + stop-words + static lexicon + `fts_vocab` table + **refcount maintenance in `put_node_fts` and both bulk-delete paths** (flag the vocabulary cache as its own task) + the **linear `O(V·|q|)` scan** (no scale index yet), in `travsr-store`; rich tool descriptions in **both** `tools_list()`/`tools_list_global()` (L2-C); optional `prompts`/`sampling` (L2-C/L2-D) gated by security review; add **`:` bypass to `ask.rs`** — it does not exist in the CLI today (only proposed for VS Code), so "§2.5 bypass unchanged" is false for the CLI until added. **Explicitly deferred out of S20 (each its own sprint, behind its own ADR-001 amendment + feature flag):** **(S2x-a) L2-A scale-out** = SymSpell delete-map + `fst` build/serialize/mmap + refcount-driven FST patching (~400+ LOC, dep: `fst`); **(S2x-b) L2-B storage upgrade** = MRL truncation + RaBitQ (rotation/snap/correctors) + portable `count_ones` Hamming + recall harness (~500+ LOC, dep: RaBitQ helper) — and the optional `unsafe` AVX-512/NEON acceleration is a *further* sprint gated by its own principle-7 RFC + MSRV bump. The original "~350–550 LOC/L" applies to S20 **only**; piling SymSpell/FST/RaBitQ/MRL onto it would blow that estimate ~3×.
-7. **§ Acceptance Criteria L2** — replace hosted-translator criteria with: (a) `expand_query` is deterministic (sorted output) and grounded (proposes only in-vocabulary tokens); (b) **name ≥5 NL queries and their expected top seed in `dogfooding.md`** (as L1's AC does — make it falsifiable); (c) `:` bypass added to `ask.rs` + VS Code; (d) lexicon CI charset assertion (`^[a-z0-9_]+$`) + additive-recall test (T11); (e) `fts_vocab` refcount stays correct across both bulk-delete paths (test); (f) **no regression** vs the existing FTS path (L2-A is additive Step 3); (g) **no new dependency and no key in any *shipped* artifact — including the cloud-SSE/Docker image, not just the local default build** — asserted by a `cargo tree` / feature-matrix CI check; `fst`, the named RaBitQ helper, and `ef_rs` are each gated behind an ADR-001 amendment + feature flag and excluded from every default-feature build; (h) L2-C `prompts` and L2-D `sampling` route through the security sub-gate.
+7. **§ Acceptance Criteria L2** — replace hosted-translator criteria with: (a) `expand_query` is deterministic (sorted output) and grounded (proposes only in-vocabulary tokens); (b) **name ≥5 NL queries and their expected top seed in `dogfooding.md`** (as L1's AC does — make it falsifiable); (c) `:` bypass added to `ask.rs` + VS Code; (d) lexicon CI charset assertion (`^[a-z0-9_]+$`) + additive-recall test (T11); (e) `fts_vocab` refcount stays correct across both bulk-delete paths — **test contract:** index N nodes under a path P; call `delete_nodes_for_path(P)`; assert every token unique to P has `refcount = 0`; assert tokens shared with other paths are unchanged; repeat for `delete_nodes_for_path_prefix`; (f) **no regression** vs the existing FTS path (L2-A is additive Step 3); (g) **no new dependency and no key in any *shipped* artifact — including the cloud-SSE/Docker image, not just the local default build** — asserted by a `cargo tree` / feature-matrix CI check; `fst`, the named RaBitQ helper, and `ef_rs` are each gated behind an ADR-001 amendment + feature flag and excluded from every default-feature build; (h) L2-C `prompts` and L2-D `sampling` route through the security sub-gate; (k) **OR-arm cap ≤ 16 enforced at Step 3** — test that `expand_query` output never exceeds 16 OR arms after the deterministic sort+cap; (l) **parent RFC-012 §3.5 migration number updated** — vec0 table moves from the colliding v9 to v11 (v9 = FTS shipped, v10 = `fts_vocab`); this fold-in is a merge pre-condition for this Addendum.
 
 **Belonging to the later L2-A-scaleout / L2-B sprints (NOT S20 — see fold-in §6):** (i) **L2-B determinism across architectures** — the MVP `u64::count_ones()` baseline gives byte-identical popcount on x86/aarch64/scalar, and the gate asserts **identical *ranked seed output*** across architectures (canonical corrector application), so the OCI/ARM tier is not broken; any `unsafe` AVX-512/NEON intrinsic acceleration is out of scope until its own principle-7 RFC + MSRV bump (Open Q #13); (j) **RaBitQ+MRL recall is measured, not assumed** — a recorded recall delta vs FP32 over the dogfooding set gates the embedding-storage upgrade, the chosen MRL dim is justified from that curve, and the RaBitQ rotation seed is pinned with a CI reproducibility assertion (Open Q #14, T13). These cannot pass in S20 (no MRL model artifact in-repo yet) and are gates on their own sprints.
 
@@ -316,6 +321,7 @@ L2-A and L2-B are specified above against the **SQLite MVP tier** (`fts_vocab` t
 ## Open Questions (new / updated)
 
 7. **Stop-word list scope.** Hard-coded minimal English set vs configurable in `travsr.toml`? Lean: hard-coded minimal (the grounding step already discards non-vocabulary words).
+7a. **T0 synonym map is one-directional.** `seed_lexicon.rs` SYNONYMS maps `auth→[session, token, ...]` but not `session→[auth, ...]`. Querying "session guard" does not surface auth nodes via T0. L2-A's jargon const slice will be bidirectional (↔); until then, reverse-direction synonym recall is not covered by Step 2. Track as a known T0 limitation.
 8. **`fts_vocab` maintenance choke points.** Confirmed: `put_node_fts` + `delete_nodes_for_path` + `delete_nodes_for_path_prefix` (the dead `delete_node_fts` is not a path). Decide whether to also revive/wire `delete_node_fts` for future single-node deletes.
 9. **Lexicon governance.** CODEOWNERS-gated in-tree constant; per-language tables revisited only if telemetry (RFC-012 Open Q #4) shows synonym misses after L2-A + L2-B ship.
 10. **Vocabulary-scan index at scale. — RESOLVED (Rev 3).** Linear `O(V·|q|)` ships at the self-index; the scale-out structure is **SymSpell pre-computation encoded into an mmap'd FST**, `O(1)` in vocabulary cardinality `V` (not a trigram index or BK-tree — both considered and rejected: trigram silently drops `<3`-char tokens; BK-tree is `O(log V)` not `O(1)` and heap-resident). The "`O(1)`" is in `V` only — cost is still governed by `|q|` and `d`. Dependency residue is owned by #13a (do not restate). Tunable: `d=1` (shipped) vs `d=2`. AC must not claim sub-ms beyond the self-index *for the linear MVP path*; the FST path may.
@@ -368,8 +374,9 @@ One reviewer claim was **rejected after verification**: the Solution Architect f
 - ADR-001 — coding standards / allowed dependencies (L2-A adds none)
 - ADR-003 — PPR policy (50-seed bound, unchanged)
 - ADR-004 — error taxonomy / tarball budget (unchanged; L2-A adds only KB)
-- `crates/travsr-store/src/fts_tokenize.rs` — `tokenize_identifier`, `build_match_expr` (reused by L2-A)
-- `crates/travsr-store/src/lib.rs:889` — `search_nodes_fuzzy` (L2-A is an additive Step 3); `:375`/`:433` bulk deletes (vocab refcount hooks); `:772` dead `delete_node_fts`
+- `crates/travsr-store/src/fts_tokenize.rs` — `tokenize_identifier`, `build_fuzzy_match_expr` (T0 Step 2, reused; Step 3 `expand_query` is independent), `build_match_expr` (kept for API stability)
+- `crates/travsr-store/src/lib.rs:890` — `search_nodes_fuzzy` (L2-A is an additive Step 3); bulk deletes `delete_nodes_for_path` / `delete_nodes_for_path_prefix` (vocab refcount hooks); `:773` dead `delete_node_fts`
+- `crates/travsr-store/src/seed_lexicon.rs` — T0 stopword list (33 words) + one-directional 8-entry synonym map; used by `build_fuzzy_match_expr` at Step 2; L2-A's jargon const slice is bidirectional (↔) and is a separate entity for Step 3
 - `crates/travsr-mcp/src/server.rs:150,410` — `tools_list` / `tools_list_global` (L2-C edits both); `:63,330` advertised capabilities
 - `crates/travsr-mcp/src/sanitize.rs:22` — `MAX_ARG_BYTES = 512`
 - MCP `sampling/createMessage` — https://modelcontextprotocol.io (capability behind L2-D)
