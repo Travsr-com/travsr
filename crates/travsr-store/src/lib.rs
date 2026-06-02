@@ -10,6 +10,7 @@ pub mod fts_tokenize;
 pub mod migration;
 pub mod migration_manifest;
 pub mod registry;
+mod seed_lexicon;
 
 #[cfg(feature = "kuzu")]
 pub mod kuzu_store;
@@ -29,7 +30,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 use travsr_error::StoreError;
 
-use crate::fts_tokenize::{build_match_expr, tokenize_identifier};
+use crate::fts_tokenize::{build_fuzzy_match_expr, tokenize_identifier};
 
 // ── SQLite migration structs (T2) ─────────────────────────────────────────────
 // Each SQL file becomes a concrete Migration so the runner can apply them
@@ -167,6 +168,17 @@ impl Migration for V9NodesFts {
     }
 }
 
+struct V10FtsVocab;
+impl Migration for V10FtsVocab {
+    fn version(&self) -> u32 {
+        10
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // Both CREATE statements use IF NOT EXISTS — idempotent on re-run.
+        store.exec_ddl(include_str!("migrations/v10_fts_vocab.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -180,6 +192,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V7RbacColumns);
     r.register(V8NodeLine);
     r.register(V9NodesFts);
+    r.register(V10FtsVocab);
     r
 }
 
@@ -252,6 +265,9 @@ impl SqliteStore {
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index")?;
+            store
+                .backfill_vocab_if_needed()
+                .context("backfilling fts_vocab index (L2-A)")?;
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -270,6 +286,9 @@ impl SqliteStore {
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index (in-memory)")?;
+            store
+                .backfill_vocab_if_needed()
+                .context("backfilling fts_vocab index in-memory (L2-A)")?;
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -396,6 +415,22 @@ impl SqliteStore {
             )
             .context("deleting edges for path")?;
 
+            // Load token strings for vocab decrement BEFORE removing map rows.
+            let path_token_strings: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT m.tokens FROM nodes_fts_map m \
+                         JOIN nodes n ON n.id = m.node_id WHERE n.path = ?1",
+                    )
+                    .context("preparing token load for path delete")?;
+                let collected: Vec<String> = stmt
+                    .query_map(params![path], |row| row.get(0))
+                    .context("executing token load for path delete")?
+                    .collect::<Result<_, _>>()
+                    .context("collecting token strings for vocab decrement")?;
+                collected
+            };
+
             // Retract FTS entries before deleting nodes (tokens stored in map).
             tx.execute(
                 "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
@@ -411,6 +446,11 @@ impl SqliteStore {
                 params![path],
             )
             .context("removing nodes_fts_map rows for path")?;
+
+            // Decrement fts_vocab refcounts for all retracted tokens (v10 L2-A).
+            for ts in &path_token_strings {
+                Self::vocab_decrement(&tx, ts)?;
+            }
 
             tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
                 .context("deleting nodes for path")?;
@@ -455,6 +495,22 @@ impl SqliteStore {
             )
             .context("deleting edges for path prefix")?;
 
+            // Load token strings for vocab decrement BEFORE removing map rows.
+            let prefix_token_strings: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT m.tokens FROM nodes_fts_map m \
+                         JOIN nodes n ON n.id = m.node_id WHERE n.path LIKE ?1",
+                    )
+                    .context("preparing token load for prefix delete")?;
+                let collected: Vec<String> = stmt
+                    .query_map(params![pattern], |row| row.get(0))
+                    .context("executing token load for prefix delete")?
+                    .collect::<Result<_, _>>()
+                    .context("collecting token strings for vocab decrement (prefix)")?;
+                collected
+            };
+
             // Retract FTS entries before deleting nodes (tokens stored in map).
             tx.execute(
                 "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
@@ -470,6 +526,11 @@ impl SqliteStore {
                 params![pattern],
             )
             .context("removing nodes_fts_map rows for path prefix")?;
+
+            // Decrement fts_vocab refcounts for all retracted tokens (v10 L2-A).
+            for ts in &prefix_token_strings {
+                Self::vocab_decrement(&tx, ts)?;
+            }
 
             tx.execute("DELETE FROM nodes WHERE path LIKE ?1", params![pattern])
                 .context("deleting nodes for path prefix")?;
@@ -741,13 +802,15 @@ impl SqliteStore {
             .optional()
             .context("reading old FTS tokens")?;
 
-        if let Some(old) = old_tokens {
+        if let Some(ref old) = old_tokens {
             // Retract the stale contentless-FTS5 row with its original tokens.
             conn.execute(
                 "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) VALUES('delete', ?1, ?2)",
                 params![id_i64, old],
             )
             .context("retracting stale FTS row")?;
+            // Decrement vocab refcounts for retracted tokens (v10 L2-A).
+            Self::vocab_decrement(conn, old)?;
         }
 
         // Insert new FTS row.
@@ -764,6 +827,9 @@ impl SqliteStore {
             params![id_i64, new_tokens],
         )
         .context("upserting nodes_fts_map")?;
+
+        // Increment vocab refcounts for new tokens (v10 L2-A).
+        Self::vocab_increment(conn, &new_tokens)?;
 
         Ok(())
     }
@@ -791,6 +857,8 @@ impl SqliteStore {
                 params![node_id_i64],
             )
             .context("removing nodes_fts_map row")?;
+            // Decrement vocab refcounts for retracted tokens (v10 L2-A).
+            Self::vocab_decrement(conn, &tokens)?;
         }
 
         Ok(())
@@ -876,79 +944,275 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Layered seed selection (RFC-012 L1).
+    /// Layered seed selection (RFC-012 L1 + A1).
     ///
     /// 1. Exact substring via `search_nodes_by_name` — if ≥1 result, return it.
-    /// 2. FTS5 trigram MATCH on the tokenized query — up to 50 results by BM25.
-    /// 3. Empty.
+    /// 2. FTS5 trigram MATCH on the T0 heuristic-normalised token union
+    ///    (`build_fuzzy_match_expr`: stopwords stripped, synonym aliases added,
+    ///    PA C1 fallback).  If ≥1 result, return it.
+    /// 3. L2-A vocabulary-grounded expansion (`expand_query`): Jaccard-similarity
+    ///    candidates from `fts_vocab` merged with T0 tokens, capped at 16 OR arms.
+    ///    Only fires on combined Step 1 + Step 2 miss.
     ///
-    /// The exact-substring step ensures existing benchmarks never regress.
-    /// The FTS path is reached only on a substring miss, so multi-word
-    /// natural-language queries (`"mcp dispatch tool call"`) now resolve even
-    /// when no single node contains the literal string.
+    /// The exact-substring step ensures existing benchmarks never regress (TL3).
+    /// All synonym/stem output passes through the same double-quote FTS5 escaper
+    /// as `build_match_expr` (TL4).  L2-A is vocabulary-grounded: it can only
+    /// propose tokens that exist in `fts_vocab` (populated by `put_node_fts`),
+    /// so no hallucinated token ever reaches the FTS index — enforcing PA C4.
     pub fn search_nodes_fuzzy(&self, query: &str) -> Result<Vec<Node>, StoreError> {
         let _span = tracing::debug_span!("store.search_nodes_fuzzy", query).entered();
 
-        // Step 1 — exact substring (never regresses).
+        // Step 1 — exact substring (never regresses, TL3).
         let exact = self.search_nodes_by_name(query)?;
         if !exact.is_empty() {
             tracing::debug!(layer = "exact", nodes_returned = exact.len());
             return Ok(exact);
         }
 
-        // Step 2 — FTS5 trigram MATCH.
-        (|| -> AnyResult<Vec<Node>> {
-            let match_expr = match build_match_expr(query) {
-                Some(e) => e,
-                // All tokens < 3 chars (e.g. pure punctuation) — nothing to search.
-                None => {
-                    tracing::debug!(layer = "fts5_skip_empty_tokens");
-                    return Ok(Vec::new());
-                }
-            };
-
-            let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
-                              n.kind, n.package, n.line \
-                       FROM nodes_fts \
-                       JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
-                       JOIN nodes n ON n.id = m.node_id \
-                       WHERE nodes_fts MATCH ?1 \
-                       ORDER BY bm25(nodes_fts) \
-                       LIMIT 50";
-
-            let mut stmt = self.conn.prepare(sql).context("preparing FTS5 query")?;
-
-            let rows = stmt
-                .query_map(params![match_expr], |row| {
-                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
-                    let vname = VName::new(
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    );
-                    let kind: String = row.get(6)?;
-                    let package: String = row.get(7)?;
-                    let line: Option<i64> = row.get(8)?;
-                    Ok(Node {
-                        id,
-                        vname,
-                        kind,
-                        package,
-                        line: line.and_then(|l| u32::try_from(l).ok()),
-                    })
-                })
-                .context("executing FTS5 query")?;
-
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.context("decoding FTS5 row")?);
+        // Step 2 — FTS5 trigram MATCH on the T0 heuristic-normalised token union.
+        let step2_expr = match build_fuzzy_match_expr(query) {
+            Some(e) => e,
+            // All tokens < 3 chars (e.g. pure punctuation) — nothing to search.
+            None => {
+                tracing::debug!(layer = "fts5_skip_empty_tokens");
+                return Ok(Vec::new());
             }
-            tracing::debug!(layer = "fts5", nodes_returned = out.len());
-            Ok(out)
+        };
+        let step2 = self
+            .fts_query_nodes(&step2_expr)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !step2.is_empty() {
+            tracing::debug!(layer = "fts5_t0", nodes_returned = step2.len());
+            return Ok(step2);
+        }
+
+        // Step 3 — L2-A vocabulary-grounded expansion (RFC-012 A1).
+        // Only fires on combined Step 1 + Step 2 miss.
+        (|| -> AnyResult<Vec<Node>> {
+            let raw_str = tokenize_identifier(query);
+            if raw_str.is_empty() {
+                return Ok(Vec::new());
+            }
+            let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
+            let t0_tokens = crate::seed_lexicon::expand_tokens(&raw);
+            let l2a_extra = self.expand_query(&t0_tokens)?;
+            if l2a_extra.is_empty() {
+                tracing::debug!(layer = "fts5_l2a_no_candidates");
+                return Ok(Vec::new());
+            }
+
+            // Merge T0 tokens + L2-A candidates; sort for determinism; cap at 16.
+            let mut arms: Vec<String> = t0_tokens;
+            for c in l2a_extra {
+                if arms.len() >= 16 {
+                    break;
+                }
+                if !arms.iter().any(|t| t == &c) {
+                    arms.push(c);
+                }
+            }
+            arms.sort();
+            arms.truncate(16);
+
+            let match_expr = arms
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+
+            let step3 = self.fts_query_nodes(&match_expr)?;
+            tracing::debug!(
+                layer = "fts5_l2a",
+                arms = arms.len(),
+                nodes_returned = step3.len()
+            );
+            Ok(step3)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Execute a raw FTS5 MATCH expression against the nodes index.
+    /// Shared by Step 2 (T0) and Step 3 (L2-A) to avoid duplicated query logic.
+    fn fts_query_nodes(&self, match_expr: &str) -> AnyResult<Vec<Node>> {
+        let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                          n.kind, n.package, n.line \
+                   FROM nodes_fts \
+                   JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
+                   JOIN nodes n ON n.id = m.node_id \
+                   WHERE nodes_fts MATCH ?1 \
+                   ORDER BY bm25(nodes_fts) \
+                   LIMIT 50";
+        let mut stmt = self.conn.prepare(sql).context("preparing FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                Ok(Node {
+                    id,
+                    vname,
+                    kind,
+                    package,
+                    line: line.and_then(|l| u32::try_from(l).ok()),
+                })
+            })
+            .context("executing FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding FTS5 row")?);
+        }
+        Ok(out)
+    }
+
+    /// L2-A: vocabulary-grounded token expansion (RFC-012 A1 Step 3).
+    ///
+    /// Scans `fts_vocab` for tokens with Jaccard(byte-trigrams) ≥ 0.4 similarity
+    /// to any token in `t0_tokens`.  Returns only tokens that exist in the live
+    /// vocabulary (refcount > 0), so no hallucinated token can reach the FTS index
+    /// (PA C4 bright line).  The caller caps the merged arm list at 16.
+    ///
+    /// Cost: O(V · |t0_tokens|) where V = vocabulary size.  Acceptable at MVP
+    /// scale; SymSpell/FST can replace for scale-out without changing the API.
+    fn expand_query(&self, t0_tokens: &[String]) -> AnyResult<Vec<String>> {
+        if t0_tokens.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Load vocab tokens with refcount > 0.  Cap at 100 k to remain practical
+        // on large graphs; L2-A is only called on a combined miss so frequency is low.
+        let vocab: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT token FROM fts_vocab WHERE refcount > 0 LIMIT 100000")
+                .context("preparing fts_vocab scan")?;
+            let collected: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .context("executing fts_vocab scan")?
+                .collect::<Result<_, _>>()
+                .context("collecting fts_vocab tokens")?;
+            collected
+        };
+
+        let mut candidates: Vec<String> = Vec::new();
+        for q_tok in t0_tokens {
+            for v_tok in &vocab {
+                if t0_tokens.iter().any(|t| t == v_tok) {
+                    continue; // already in T0 union
+                }
+                if candidates.contains(v_tok) {
+                    continue;
+                }
+                if v_tok.len() < 3 {
+                    continue;
+                }
+                if byte_trigram_jaccard(q_tok, v_tok) >= 0.4 {
+                    candidates.push(v_tok.clone());
+                }
+            }
+        }
+
+        candidates.sort();
+        Ok(candidates)
+    }
+
+    /// Increment `fts_vocab` refcounts for every token in `tokens_str` (space-separated).
+    /// Skips tokens shorter than 3 bytes (FTS5 trigram minimum).
+    fn vocab_increment(conn: &Connection, tokens_str: &str) -> AnyResult<()> {
+        for tok in tokens_str.split_whitespace() {
+            if tok.len() < 3 {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO fts_vocab(token, refcount) VALUES(?1, 1) \
+                 ON CONFLICT(token) DO UPDATE SET refcount = refcount + 1",
+                params![tok],
+            )
+            .context("incrementing fts_vocab refcount")?;
+        }
+        Ok(())
+    }
+
+    /// Return the `fts_vocab` refcount for `token`, or `None` if the token is absent.
+    /// Used by integration tests to verify L2-A refcount maintenance (AC e).
+    pub fn fts_vocab_refcount(&self, token: &str) -> AnyResult<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT refcount FROM fts_vocab WHERE token = ?1",
+                params![token],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("querying fts_vocab refcount")
+    }
+
+    /// Decrement `fts_vocab` refcounts for every token in `tokens_str` (space-separated).
+    /// Uses MAX(0, refcount - 1) to guard against underflow on out-of-order deletes.
+    fn vocab_decrement(conn: &Connection, tokens_str: &str) -> AnyResult<()> {
+        for tok in tokens_str.split_whitespace() {
+            conn.execute(
+                "UPDATE fts_vocab SET refcount = MAX(0, refcount - 1) WHERE token = ?1",
+                params![tok],
+            )
+            .context("decrementing fts_vocab refcount")?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent vocab backfill called once after migrations at `open()` /
+    /// `open_in_memory()`.  Gate: if `fts_vocab` is non-empty the table is
+    /// assumed up-to-date and we return immediately.  On first open after the
+    /// v10 migration ships, reconstructs refcounts from the existing
+    /// `nodes_fts_map` so pre-v10 databases get a correct vocabulary.
+    fn backfill_vocab_if_needed(&mut self) -> AnyResult<()> {
+        let vocab_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_vocab", [], |r| r.get(0))
+            .context("counting fts_vocab for backfill gate")?;
+
+        if vocab_count > 0 {
+            return Ok(()); // already populated
+        }
+
+        let token_strings: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT tokens FROM nodes_fts_map")
+                .context("preparing nodes_fts_map scan for vocab backfill")?;
+            let collected: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .context("executing nodes_fts_map scan")?
+                .collect::<Result<_, _>>()
+                .context("collecting token strings for vocab backfill")?;
+            collected
+        };
+
+        if token_strings.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction()
+            .context("starting vocab backfill transaction")?;
+        for ts in &token_strings {
+            Self::vocab_increment(&tx, ts).context("vocab_increment during backfill")?;
+        }
+        tx.commit()
+            .context("committing vocab backfill transaction")?;
+
+        tracing::info!(
+            nodes = token_strings.len(),
+            "RFC-012 L2-A: fts_vocab backfill complete"
+        );
+        Ok(())
     }
 }
 
@@ -1191,6 +1455,27 @@ fn node_id_to_i64(id: NodeId) -> i64 {
 
 fn i64_to_node_id(v: i64) -> NodeId {
     NodeId(v as u64)
+}
+
+/// Jaccard similarity on byte-level trigrams of two strings.
+/// Used by `expand_query` (L2-A) to find vocabulary-grounded candidates.
+/// Returns 0.0 for strings shorter than 3 bytes.
+fn byte_trigram_jaccard(a: &str, b: &str) -> f64 {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() < 3 || bb.len() < 3 {
+        return 0.0;
+    }
+    let ta: std::collections::HashSet<[u8; 3]> =
+        ab.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+    let tb: std::collections::HashSet<[u8; 3]> =
+        bb.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+    let intersection = ta.intersection(&tb).count();
+    let union = ta.union(&tb).count();
+    if union == 0 {
+        return 0.0;
+    }
+    intersection as f64 / union as f64
 }
 
 #[cfg(test)]
