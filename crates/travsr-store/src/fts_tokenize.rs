@@ -87,6 +87,42 @@ pub fn tokenize_identifier(s: &str) -> String {
     tokens.join(" ")
 }
 
+/// Build the MATCH expression for `search_nodes_fuzzy` Step 2 (T0 heuristic floor).
+///
+/// Applies RFC-012 A1 normalisation before building the MATCH expression:
+/// - Tokenises via `tokenize_identifier` (TL3: never touches the raw literal
+///   used by Step 1).
+/// - Strips NL intent stopwords and expands bounded synonym aliases (additive
+///   only — PA C1: raw content tokens are always in the union).
+/// - Passes every token through the same double-quote escaper as `build_match_expr`
+///   (TL4: no raw FTS5 operators reach SQLite).
+///
+/// Returns `None` when the resulting union is empty (pure-punctuation input).
+pub fn build_fuzzy_match_expr(query: &str) -> Option<String> {
+    let raw_str = tokenize_identifier(query);
+    if raw_str.is_empty() {
+        return None;
+    }
+    let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
+
+    let union = crate::seed_lexicon::expand_tokens(&raw);
+    if union.is_empty() {
+        return None;
+    }
+
+    let expr = union
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    if expr.is_empty() {
+        None
+    } else {
+        Some(expr)
+    }
+}
+
 /// Build the MATCH expression for `search_nodes_fuzzy`.
 ///
 /// Tokenises `query`, double-quotes each token (neutralises all FTS5 operators),

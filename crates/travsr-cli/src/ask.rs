@@ -29,6 +29,10 @@ pub fn run(query: &str) -> anyhow::Result<()> {
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
+    // Strip a leading `:` so VS Code graph-panel queries (which prefix with `:`
+    // to bypass the colon-delimited command syntax) pass through cleanly.
+    let query = query.strip_prefix(':').unwrap_or(query).trim();
+
     let store = SqliteStore::open(&db_path)?;
     let matches = store.search_nodes_fuzzy(query)?;
 

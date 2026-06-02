@@ -189,11 +189,11 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "search_symbol",
-                "description": "Find symbol definitions matching a name across the indexed graph.",
+                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation', 'mcp dispatch tool call'). Query normalisation is deterministic: no model or API key required.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Symbol name to search for (partial match supported)" }
+                        "name": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars). Partial and NL queries are supported." }
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -232,11 +232,11 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack.",
+                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). A three-layer heuristic normaliser (T0 stopword strip + synonym expansion + L2-A vocabulary-grounded expansion) translates NL to FTS seeds deterministically — no model or API key required.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or free-text query (1–200 chars)" },
+                        "query": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars)" },
                         "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." }
                     },
                     "required": ["query"],
@@ -452,11 +452,11 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "search_symbol",
-                "description": "Find symbol definitions matching a name across the indexed graph.",
+                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation'). No model or API key required.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Symbol name to search for (partial match supported)" },
+                        "name": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars). Partial and NL queries are supported." },
                         "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
                     },
                     "required": ["name"],
@@ -501,11 +501,11 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack.",
+                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). T0 + L2-A heuristic normaliser translates NL to FTS seeds deterministically — no model or API key required.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or free-text query (1–200 chars)" },
+                        "query": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars)" },
                         "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." },
                         "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
                     },
