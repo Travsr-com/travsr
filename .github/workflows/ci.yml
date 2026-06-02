@@ -132,7 +132,7 @@ jobs:
       # To bump MSRV: update rust-version in Cargo.toml, update the toolchain
       # version below, and add a changelog entry.
       - name: Install Rust toolchain (1.75.0)
-        uses: dtolnay/rust-toolchain@1.75.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
