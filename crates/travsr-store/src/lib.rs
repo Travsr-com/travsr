@@ -769,6 +769,12 @@ impl StoreMigratable for SqliteStore {
     }
 }
 
+/// Jaccard(byte-trigrams) threshold for L2-A vocabulary-grounded expansion.
+/// A vocab token must share at least this fraction of trigrams with a T0 seed
+/// to be included as a candidate OR-arm.  0.4 is empirically conservative:
+/// tight enough to avoid noise, loose enough to catch plurals and short variants.
+const L2A_JACCARD_THRESHOLD: f64 = 0.4;
+
 // ── FTS helpers + fuzzy search (RFC-012 L1) ───────────────────────────────────
 
 impl SqliteStore {
@@ -1074,8 +1080,8 @@ impl SqliteStore {
 
     /// L2-A: vocabulary-grounded token expansion (RFC-012 A1 Step 3).
     ///
-    /// Scans `fts_vocab` for tokens with Jaccard(byte-trigrams) ≥ 0.4 similarity
-    /// to any token in `t0_tokens`.  Returns only tokens that exist in the live
+    /// Scans `fts_vocab` for tokens with Jaccard(byte-trigrams) ≥ `L2A_JACCARD_THRESHOLD`
+    /// similarity to ANY token in `t0_tokens`.  Returns only tokens that exist in the live
     /// vocabulary (refcount > 0), so no hallucinated token can reach the FTS index
     /// (PA C4 bright line).  The caller caps the merged arm list at 16.
     ///
@@ -1101,21 +1107,28 @@ impl SqliteStore {
             collected
         };
 
+        // Pre-build a set of T0 tokens for O(1) membership check.
+        let t0_set: std::collections::HashSet<&str> =
+            t0_tokens.iter().map(String::as_str).collect();
+
+        // Single pass over vocab: a token is a candidate if any T0 token exceeds
+        // the Jaccard threshold.  This avoids re-scanning vocab once per T0 token.
         let mut candidates: Vec<String> = Vec::new();
-        for q_tok in t0_tokens {
-            for v_tok in &vocab {
-                if t0_tokens.iter().any(|t| t == v_tok) {
-                    continue; // already in T0 union
-                }
-                if candidates.contains(v_tok) {
-                    continue;
-                }
-                if v_tok.len() < 3 {
-                    continue;
-                }
-                if byte_trigram_jaccard(q_tok, v_tok) >= 0.4 {
-                    candidates.push(v_tok.clone());
-                }
+        for v_tok in &vocab {
+            if v_tok.len() < 3 {
+                continue;
+            }
+            if t0_set.contains(v_tok.as_str()) {
+                continue; // already in T0 union
+            }
+            if candidates.iter().any(|c| c == v_tok) {
+                continue;
+            }
+            if t0_tokens
+                .iter()
+                .any(|q| byte_trigram_jaccard(q, v_tok) >= L2A_JACCARD_THRESHOLD)
+            {
+                candidates.push(v_tok.clone());
             }
         }
 
@@ -1142,6 +1155,7 @@ impl SqliteStore {
 
     /// Return the `fts_vocab` refcount for `token`, or `None` if the token is absent.
     /// Used by integration tests to verify L2-A refcount maintenance (AC e).
+    #[doc(hidden)]
     pub fn fts_vocab_refcount(&self, token: &str) -> AnyResult<Option<i64>> {
         self.conn
             .query_row(
@@ -1155,8 +1169,13 @@ impl SqliteStore {
 
     /// Decrement `fts_vocab` refcounts for every token in `tokens_str` (space-separated).
     /// Uses MAX(0, refcount - 1) to guard against underflow on out-of-order deletes.
+    /// Skips tokens shorter than 3 bytes — matching the `vocab_increment` guard so
+    /// short tokens never trigger a no-op UPDATE round-trip.
     fn vocab_decrement(conn: &Connection, tokens_str: &str) -> AnyResult<()> {
         for tok in tokens_str.split_whitespace() {
+            if tok.len() < 3 {
+                continue;
+            }
             conn.execute(
                 "UPDATE fts_vocab SET refcount = MAX(0, refcount - 1) WHERE token = ?1",
                 params![tok],
