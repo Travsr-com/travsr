@@ -38,6 +38,7 @@
     "AI",
     "Other"
   ],
+  "enabledApiProposals": ["chatContextProvider"],
   "main": "./out/extension.js",
   "activationEvents": [
     "onStartupFinished"
