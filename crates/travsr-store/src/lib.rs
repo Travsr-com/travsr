@@ -399,6 +399,34 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Return per-language node counts, ordered by count descending.
+    /// Returns an empty Vec when no nodes carry language metadata.
+    pub fn language_distribution(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, u64)>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT language, COUNT(*) as cnt \
+                     FROM nodes \
+                     WHERE language IS NOT NULL AND language != '' \
+                     GROUP BY language \
+                     ORDER BY cnt DESC",
+                )
+                .context("preparing language_distribution")?;
+            let pairs = stmt
+                .query_map([], |row| {
+                    let lang: String = row.get(0)?;
+                    let cnt: i64 = row.get(1)?;
+                    Ok((lang, cnt as u64))
+                })
+                .context("querying language distribution")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("collecting language distribution")?;
+            Ok(pairs)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn get_file_hash(&self, path: &str) -> Result<Option<String>, StoreError> {
         self.conn
             .query_row(
@@ -816,6 +844,14 @@ const L2A_JACCARD_THRESHOLD: f64 = 0.4;
 // ── FTS helpers + fuzzy search (RFC-012 L1) ───────────────────────────────────
 
 impl SqliteStore {
+    /// Public accessor for the current schema/migration version recorded in the
+    /// `meta` table. Wraps the private `StoreMigratable::schema_version` so the
+    /// MCP `get_graph_stats` tool can surface migration state in the VS Code
+    /// extension's graph-stats popup (VSCODE-247). Returns 0 if absent.
+    pub fn current_schema_version(&self) -> anyhow::Result<u32> {
+        StoreMigratable::schema_version(self)
+    }
+
     // ── FTS helpers (RFC-012 L1) ──────────────────────────────────────────────
 
     /// Build the token string for a node: tokenized signature + path + kind + language.

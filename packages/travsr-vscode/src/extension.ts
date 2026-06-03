@@ -5,6 +5,7 @@
  */
 
 import * as fs from "fs";
+import * as cp from "child_process";
 import * as vscode from "vscode";
 import { StdioMcpClient } from "./mcp";
 import { MutableMcpClientProxy } from "./clientProxy";
@@ -32,6 +33,7 @@ import {
   EVT_DAEMON_FAILED,
 } from "./telemetry";
 import { registerContextProvider } from "./contextProvider";
+import { registerParityCommands } from "./commands";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -130,9 +132,23 @@ export function activate(context: vscode.ExtensionContext): void {
   // Status bar click → Quick Pick (VSCODE-205)
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.showStatus", async () => {
-      type ItemId = "restart" | "settings" | "output" | "disable" | "close";
+      type ItemId =
+        | "graphStats"
+        | "repos"
+        | "languages"
+        | "reindex"
+        | "restart"
+        | "settings"
+        | "output"
+        | "disable"
+        | "close";
       type ActionItem = vscode.QuickPickItem & { id: ItemId };
       const items: vscode.QuickPickItem[] = [
+        { label: "$(graph) Graph stats",              id: "graphStats" } as ActionItem,
+        { label: "$(repo) Registered repos",          id: "repos"      } as ActionItem,
+        { label: "$(extensions) Languages",           id: "languages"  } as ActionItem,
+        { label: "$(sync) Re-index now",              id: "reindex"    } as ActionItem,
+        { label: "", kind: vscode.QuickPickItemKind.Separator },
         { label: "$(refresh) Restart daemon",         id: "restart"  } as ActionItem,
         { label: "$(gear) Open settings",             id: "settings" } as ActionItem,
         { label: "$(output) Show output channel",     id: "output"   } as ActionItem,
@@ -146,6 +162,18 @@ export function activate(context: vscode.ExtensionContext): void {
       // Separator items cannot be selected; plain QuickPickItems have no id.
       if (!pick || !("id" in pick)) return;
       switch ((pick as ActionItem).id) {
+        case "graphStats":
+          await vscode.commands.executeCommand("travsr.showGraphStats");
+          break;
+        case "repos":
+          await vscode.commands.executeCommand("travsr.showRepos");
+          break;
+        case "languages":
+          await vscode.commands.executeCommand("travsr.showLanguages");
+          break;
+        case "reindex":
+          await vscode.commands.executeCommand("travsr.reindexNow");
+          break;
         case "restart":
           await doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed);
           break;
@@ -255,6 +283,18 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.refreshGraph", () =>
       treeProvider.refresh()
+    )
+  );
+
+  // CLI↔UI parity commands (VSCODE-247): askSymbol, manageSynonyms,
+  // showDependencies, showExecutionPath, showRepos, showGraphStats, showLanguages.
+  registerParityCommands(proxy, context, binary);
+
+  // Re-index command — also reachable from the status Quick Pick. Lives here
+  // (not commands.ts) because it needs the output channel + workspace root.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.reindexNow", () =>
+      reindexNow(workspaceRoot, channel)
     )
   );
 
@@ -414,6 +454,60 @@ function wireDisconnectHandler(
       channel.show();
     }
   });
+}
+
+// Graph stats and registered-repos UIs moved to interactive webviews in
+// commands.ts (travsr.showGraphStats / travsr.showRepos). `reindexNow` stays
+// here because it needs the output channel + workspace root.
+
+/**
+ * VSCODE-247 #8: trigger a re-index. The MCP server cannot reindex itself
+ * without inverting the `travsr-mcp → travsr-retrieval` crate dependency rule
+ * (indexing lives in travsr-daemon), so we spawn the binary's `hook-run` — the
+ * same code path the git hook uses — as a one-shot child process.
+ */
+async function reindexNow(
+  workspaceRoot: string | undefined,
+  channel: vscode.OutputChannel
+): Promise<void> {
+  if (!workspaceRoot) {
+    void vscode.window.showWarningMessage("Open a workspace folder to re-index.");
+    return;
+  }
+  const configured =
+    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
+  const binary = configured || "travsr";
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Travsr: re-indexing…",
+      cancellable: false,
+    },
+    () =>
+      new Promise<void>((resolve) => {
+        const proc = cp.spawn(binary, ["hook-run", "--from-hook"], { cwd: workspaceRoot });
+        proc.stdout?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
+        proc.stderr?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
+        const fail = (msg: string): void => {
+          void vscode.window
+            .showErrorMessage(`Travsr re-index failed: ${msg}`, "Show logs")
+            .then((a) => {
+              if (a === "Show logs") channel.show();
+            });
+          resolve();
+        };
+        proc.on("error", (e) => fail(e.message));
+        proc.on("exit", (code) => {
+          if (code === 0) {
+            void vscode.window.showInformationMessage("Travsr re-index complete.");
+          } else {
+            fail(`exit code ${code ?? "unknown"}`);
+          }
+          resolve();
+        });
+      })
+  );
 }
 
 function buildFileListHtml(title: string, items: string[]): string {

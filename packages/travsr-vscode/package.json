@@ -92,6 +92,44 @@
         "command": "travsr.showGraph",
         "title": "Travsr: Show Graph",
         "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "travsr.askSymbol",
+        "title": "Travsr: Ask Symbol",
+        "icon": "$(search)"
+      },
+      {
+        "command": "travsr.manageSynonyms",
+        "title": "Travsr: Manage Synonyms",
+        "icon": "$(symbol-keyword)"
+      },
+      {
+        "command": "travsr.showDependencies",
+        "title": "Travsr: Show Dependencies"
+      },
+      {
+        "command": "travsr.showExecutionPath",
+        "title": "Travsr: Show Execution Path"
+      },
+      {
+        "command": "travsr.showGraphStats",
+        "title": "Travsr: Graph Stats",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "travsr.showRepos",
+        "title": "Travsr: Registered Repos",
+        "icon": "$(repo)"
+      },
+      {
+        "command": "travsr.reindexNow",
+        "title": "Travsr: Re-index Now",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "travsr.showLanguages",
+        "title": "Travsr: Languages",
+        "icon": "$(extensions)"
       }
     ],
     "keybindings": [
@@ -99,6 +137,12 @@
         "command": "travsr.showGraph",
         "key": "ctrl+shift+g",
         "mac": "cmd+shift+g",
+        "when": "editorFocus"
+      },
+      {
+        "command": "travsr.askSymbol",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a",
         "when": "editorFocus"
       }
     ],
@@ -113,6 +157,46 @@
           "command": "travsr.showGraph",
           "when": "view == travsrGraph",
           "group": "navigation"
+        },
+        {
+          "command": "travsr.askSymbol",
+          "when": "view == travsrGraph",
+          "group": "navigation"
+        },
+        {
+          "command": "travsr.manageSynonyms",
+          "when": "view == travsrGraph",
+          "group": "1_travsr@1"
+        },
+        {
+          "command": "travsr.showGraphStats",
+          "when": "view == travsrGraph",
+          "group": "1_travsr@2"
+        },
+        {
+          "command": "travsr.showDependencies",
+          "when": "view == travsrGraph",
+          "group": "1_travsr@3"
+        },
+        {
+          "command": "travsr.showExecutionPath",
+          "when": "view == travsrGraph",
+          "group": "1_travsr@4"
+        },
+        {
+          "command": "travsr.showRepos",
+          "when": "view == travsrGraph",
+          "group": "2_travsr@1"
+        },
+        {
+          "command": "travsr.reindexNow",
+          "when": "view == travsrGraph",
+          "group": "2_travsr@2"
+        },
+        {
+          "command": "travsr.showLanguages",
+          "when": "view == travsrGraph",
+          "group": "2_travsr@3"
         }
       ]
     },

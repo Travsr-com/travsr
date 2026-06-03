@@ -21,6 +21,20 @@ pub fn build_sandboxed_command(
     let repo = repo_root.to_string_lossy();
     let scratch = scratch_dir.to_string_lossy();
 
+    // Allow reading the binary being exec'd. Without this, `sandbox-exec` cannot
+    // read the binary file (e.g. target/release/travsr for __plugin builtins) and
+    // exits immediately, causing "failed to fill whole buffer" on the handshake read.
+    let program_dir = std::path::Path::new(program)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let program_dir_rule = if program_dir.is_empty() {
+        String::new()
+    } else {
+        format!("(allow file-read* (subpath \"{}\"))\n", program_dir)
+    };
+
     // ADR-017 Rule 1: deny all by default; allow read only to system paths,
     // repo root (read-only), and scratch (read-write).
     // Network: Standard → deny; Elevated → allow (coarse — sandbox-exec has no
@@ -56,9 +70,10 @@ pub fn build_sandboxed_command(
     (subpath "/Library/Developer")
     (subpath "/System")
     (subpath "/private/etc")
+    (subpath "/opt/homebrew")
     (subpath "{repo}")
     (subpath "{scratch}"))
-(allow file-write* (subpath "{scratch}"))
+{program_dir_rule}(allow file-write* (subpath "{scratch}"))
 (allow mach-lookup
     (global-name "com.apple.dyld")
     (global-name "com.apple.logd")
@@ -68,6 +83,7 @@ pub fn build_sandboxed_command(
         network_rule = network_rule,
         repo = repo,
         scratch = scratch,
+        program_dir_rule = program_dir_rule,
     );
     let mut cmd = Command::new("sandbox-exec");
     cmd.args(["-p", &profile, "--"]).arg(program).args(args);

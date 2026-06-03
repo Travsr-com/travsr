@@ -51,7 +51,17 @@ enum Command {
         db: Option<std::path::PathBuf>,
     },
     /// List all globally registered repos.
-    Repos,
+    Repos {
+        /// Remove registry entries whose graph.db no longer exists.
+        #[arg(long)]
+        prune: bool,
+        /// Remove a single repo entry by name.
+        #[arg(long, value_name = "NAME")]
+        remove: Option<String>,
+        /// Emit the registry as JSON ([{name, db_path, exists}]).
+        #[arg(long)]
+        json: bool,
+    },
     /// Print index and graph status.
     Status,
     /// Look up callers and dependencies for a symbol name.
@@ -366,7 +376,11 @@ async fn run(cli: Cli) -> Result<()> {
             output,
             corpus,
         } => index::run(&dir, &output, &corpus)?,
-        Command::Repos => repos::run()?,
+        Command::Repos {
+            prune,
+            remove,
+            json,
+        } => repos::run(prune, remove.as_deref(), json)?,
         Command::Status => status::run()?,
         Command::Ask { query } => ask::run(&query)?,
         Command::Graph {

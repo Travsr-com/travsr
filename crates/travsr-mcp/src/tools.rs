@@ -15,14 +15,78 @@ use crate::sanitize::{
 /// Return the import targets (Depends edges) of the given file path.
 /// Empty string when nothing is found — callers must NOT return an RPC error
 /// for the no-results case (Tech Lead requirement).
-pub fn get_dependencies(store: &SqliteStore, file: &str) -> String {
+pub fn get_dependencies(store: &SqliteStore, file: &str, transitive: bool, depth: u32) -> String {
     // SEC-002: reject path traversal / absolute paths / oversized args.
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_dependencies rejected invalid arg: {reason}");
         return String::new();
     }
+    let raw = if transitive {
+        get_dependencies_transitive_raw(store, file, depth)
+    } else {
+        get_dependencies_raw(store, file)
+    };
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
-    sanitize_for_mcp(&get_dependencies_raw(store, file))
+    sanitize_for_mcp(&raw)
+}
+
+/// Transitive variant of `get_dependencies`: BFS over `depends` edges from the
+/// seed file node, up to `depth` hops. Results are in BFS order — direct
+/// dependencies first (no prefix), then each deeper hop indented with `  ↳ `
+/// per level so the UI can render the tree depth. Deduplicated by node id, so a
+/// diamond import graph lists each module once.
+///
+/// `depth` is caller-clamped (server dispatch clamps to 1..=10); a runaway graph
+/// still terminates because every node is visited at most once.
+fn get_dependencies_transitive_raw(store: &SqliteStore, file: &str, depth: u32) -> String {
+    use std::collections::{HashSet, VecDeque};
+
+    let nodes = match store.search_nodes_by_name(file) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_dependencies search error: {e}");
+            return String::new();
+        }
+    };
+    let seed = match nodes
+        .iter()
+        .find(|n| n.kind == "file")
+        .or_else(|| nodes.first())
+    {
+        Some(n) => n,
+        None => return String::new(),
+    };
+
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    visited.insert(seed.id);
+    let mut queue: VecDeque<(NodeId, u32)> = VecDeque::new();
+    queue.push_back((seed.id, 0));
+    let mut lines: Vec<String> = Vec::new();
+
+    while let Some((node_id, hop)) = queue.pop_front() {
+        if hop >= depth {
+            continue;
+        }
+        let edges = match store.iter_edges_from(node_id) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("get_dependencies edge query error: {e}");
+                continue;
+            }
+        };
+        for edge in edges.iter().filter(|e| e.kind.as_str() == "depends") {
+            // `insert` returns false when already visited — skip without re-listing.
+            if !visited.insert(edge.dst) {
+                continue;
+            }
+            if let Ok(Some(dst_node)) = store.get_node(edge.dst) {
+                let prefix = "  ↳ ".repeat(hop as usize); // hop 0 = direct → no prefix
+                lines.push(format!("{prefix}{}", dst_node.vname.signature));
+                queue.push_back((edge.dst, hop + 1));
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 /// Raw (unsanitized) variant used by global aggregation — sanitization happens
@@ -515,7 +579,11 @@ pub fn get_graph_stats(store: &SqliteStore) -> String {
             0
         }
     };
-    format!("nodes: {nodes}\nedges: {edges}")
+    // schema_version lets the extension surface migration state in its stats
+    // popup. Status-bar parsing reads only the `nodes:` line, so appending here
+    // is backward compatible. 0 on read error — never fails the whole call.
+    let schema_version = store.current_schema_version().unwrap_or(0);
+    format!("nodes: {nodes}\nedges: {edges}\nschema_version: {schema_version}")
 }
 
 /// Global variant of `get_graph_stats` — sums across all registered repos.
@@ -543,6 +611,179 @@ pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&st
         String::new() // accumulation done via captured mutables; return value unused
     });
     format!("nodes: {total_nodes}\nedges: {total_edges}")
+}
+
+/// Return per-language node counts for the current repo graph.
+///
+/// Output format: TSV `language\tcount`, one line per language, sorted by
+/// count descending. Empty string when no nodes have language metadata.
+/// No sanitization needed — language names are enum values from the indexer.
+pub fn repo_languages(store: &SqliteStore) -> String {
+    match store.language_distribution() {
+        Ok(pairs) if pairs.is_empty() => String::new(),
+        Ok(pairs) => pairs
+            .iter()
+            .map(|(lang, cnt)| format!("{lang}\t{cnt}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => {
+            tracing::warn!("repo_languages error: {e}");
+            String::new()
+        }
+    }
+}
+
+// ── synonyms (RFC-012 A2 F1) ────────────────────────────────────────────────────
+//
+// These tools manage the per-repo dynamic synonym table backing query expansion.
+// Unlike the retrieval tools, their return strings are NOT passed through
+// `sanitize_for_mcp`: they are control responses to the first-party VS Code
+// extension UI (success / cap-error), not repo-derived data fed to an LLM. The
+// extension matches on `"ok"` vs an error message. Arguments are still validated
+// (SEC-002) before any store write.
+
+/// Add one (term, alias) synonym pair. Returns `"ok"` on success or the store's
+/// error text (e.g. the 200-row cap message) so the UI can surface it.
+pub fn synonym_add(store: &mut SqliteStore, term: &str, alias: &str) -> String {
+    if validate_mcp_arg(term).is_err() || validate_mcp_arg(alias).is_err() {
+        tracing::warn!("synonym_add rejected invalid arg");
+        return "invalid input".to_string();
+    }
+    match store.synonym_add(term, alias) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Replace ALL aliases for `term` with the comma-separated `aliases_csv` list.
+/// Atomic in the store layer. Rejects the whole call if any alias is invalid.
+pub fn synonym_set(store: &mut SqliteStore, term: &str, aliases_csv: &str) -> String {
+    if validate_mcp_arg(term).is_err() {
+        tracing::warn!("synonym_set rejected invalid term");
+        return "invalid input".to_string();
+    }
+    let aliases: Vec<String> = aliases_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if aliases.iter().any(|a| validate_mcp_arg(a).is_err()) {
+        tracing::warn!("synonym_set rejected invalid alias");
+        return "invalid input".to_string();
+    }
+    match store.synonym_set(term, &aliases) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Remove a single (term, alias) pair. No-op if it does not exist.
+pub fn synonym_remove(store: &mut SqliteStore, term: &str, alias: &str) -> String {
+    if validate_mcp_arg(term).is_err() || validate_mcp_arg(alias).is_err() {
+        tracing::warn!("synonym_remove rejected invalid arg");
+        return "invalid input".to_string();
+    }
+    match store.synonym_remove(term, alias) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Remove ALL aliases for `term`.
+pub fn synonym_remove_term(store: &mut SqliteStore, term: &str) -> String {
+    if validate_mcp_arg(term).is_err() {
+        tracing::warn!("synonym_remove_term rejected invalid term");
+        return "invalid input".to_string();
+    }
+    match store.synonym_remove_term(term) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Reset the synonym table to the built-in static defaults.
+pub fn synonym_reset(store: &mut SqliteStore) -> String {
+    match store.synonym_reset() {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// List all active synonym pairs as `term => alias`, one per line, sorted by the
+/// store. Empty string when the table is empty.
+pub fn synonym_list(store: &SqliteStore) -> String {
+    match store.synonym_list() {
+        Ok(pairs) => pairs
+            .iter()
+            .map(|(term, alias)| format!("{term} => {alias}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => {
+            tracing::warn!("synonym_list error: {e}");
+            String::new()
+        }
+    }
+}
+
+// ── repos (registry management, VSCODE-247) ──────────────────────────────────
+//
+// Global-registry operations exposed for the VS Code "Registered repos" webview.
+// Like the synonym tools, return strings are plain control responses (not
+// `sanitize_for_mcp`'d) — they are consumed by the first-party extension UI, not
+// fed to an LLM. The registry is global (independent of the open store), so these
+// are valid on the stdio server regardless of which repo it was started for.
+
+/// List registry entries as TSV: `name\tdb_path\t{0|1}` (1 = graph.db exists).
+/// Empty string when the registry is empty.
+pub fn repos_list() -> String {
+    let repos = match travsr_store::registry::all_repos() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("repos_list error: {e}");
+            return String::new();
+        }
+    };
+    let mut rows: Vec<(String, std::path::PathBuf)> = repos.into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.iter()
+        .map(|(name, db_path)| {
+            let exists = if db_path.exists() { "1" } else { "0" };
+            format!("{name}\t{}\t{exists}", db_path.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Prune stale registry entries. Returns `pruned: N` followed by the removed
+/// names, or `pruned: 0` when nothing was stale.
+pub fn repos_prune() -> String {
+    match travsr_store::registry::prune() {
+        Ok(removed) => {
+            let mut out = format!("pruned: {}", removed.len());
+            for name in &removed {
+                out.push('\n');
+                out.push_str(name);
+            }
+            out
+        }
+        Err(e) => {
+            tracing::warn!("repos_prune error: {e}");
+            "error".to_string()
+        }
+    }
+}
+
+/// Remove a single repo by registry-key name. Returns `ok` / `not found`.
+pub fn repos_remove(name: &str) -> String {
+    match travsr_store::registry::unregister(name) {
+        Ok(true) => "ok".to_string(),
+        Ok(false) => "not found".to_string(),
+        Err(e) => {
+            tracing::warn!("repos_remove error: {e}");
+            "error".to_string()
+        }
+    }
 }
 
 // ── get_execution_path ────────────────────────────────────────────────────────
@@ -1357,7 +1598,9 @@ mod tests {
     #[test]
     fn get_graph_stats_empty_graph() {
         let store = make_store(&[], &[]);
-        assert_eq!(get_graph_stats(&store), "nodes: 0\nedges: 0");
+        let out = get_graph_stats(&store);
+        assert!(out.starts_with("nodes: 0\nedges: 0"), "got: {out}");
+        assert!(out.contains("schema_version: "), "got: {out}");
     }
 
     #[test]
@@ -1366,7 +1609,148 @@ mod tests {
         let a = make_node("a.ts", "fn:a");
         let b = make_node("b.ts", "fn:b");
         let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::Depends)]);
-        assert_eq!(get_graph_stats(&store), "nodes: 2\nedges: 1");
+        let out = get_graph_stats(&store);
+        assert!(out.starts_with("nodes: 2\nedges: 1"), "got: {out}");
+        assert!(out.contains("schema_version: "), "got: {out}");
+    }
+
+    // ── synonym tool unit tests (RFC-012 A2 F1 / VSCODE-247) ──────────────────
+
+    // Note: `open_in_memory` seeds the synonym table with static defaults, so
+    // these tests use a `zz`-prefixed namespace unlikely to collide with seeds
+    // and never assert the table is globally empty.
+
+    #[test]
+    fn synonym_add_then_list_roundtrip() {
+        let mut store = make_store(&[], &[]);
+        assert_eq!(synonym_add(&mut store, "zzpayment", "zzcharge"), "ok");
+        let list = synonym_list(&store);
+        assert!(list.contains("zzpayment => zzcharge"), "got: {list}");
+    }
+
+    #[test]
+    fn synonym_set_replaces_all_aliases() {
+        let mut store = make_store(&[], &[]);
+        synonym_add(&mut store, "zzauth", "zzlogin");
+        synonym_add(&mut store, "zzauth", "zzsignin");
+        assert_eq!(synonym_set(&mut store, "zzauth", "zzsession"), "ok");
+        let list = synonym_list(&store);
+        assert!(list.contains("zzauth => zzsession"), "got: {list}");
+        assert!(
+            !list.contains("zzauth => zzlogin"),
+            "old alias must be gone: {list}"
+        );
+    }
+
+    #[test]
+    fn synonym_remove_term_clears_all() {
+        let mut store = make_store(&[], &[]);
+        synonym_add(&mut store, "zzdb", "zzdatabase");
+        synonym_add(&mut store, "zzdb", "zzstore");
+        assert_eq!(synonym_remove_term(&mut store, "zzdb"), "ok");
+        let list = synonym_list(&store);
+        assert!(
+            !list.contains("zzdb => "),
+            "all zzdb aliases must be gone: {list}"
+        );
+    }
+
+    #[test]
+    fn synonym_set_csv_splits_and_trims() {
+        let mut store = make_store(&[], &[]);
+        assert_eq!(
+            synonym_set(&mut store, "zzk8s", " zzkube , zzkubernetes ,"),
+            "ok"
+        );
+        let list = synonym_list(&store);
+        assert!(list.contains("zzk8s => zzkube"), "got: {list}");
+        assert!(list.contains("zzk8s => zzkubernetes"), "got: {list}");
+    }
+
+    #[test]
+    fn synonym_add_rejects_path_traversal() {
+        let mut store = make_store(&[], &[]);
+        // SEC-002: term/alias go through validate_mcp_arg.
+        let result = synonym_add(&mut store, "../etc/passwd", "x");
+        assert_eq!(result, "invalid input");
+        assert!(!synonym_list(&store).contains("../etc/passwd"));
+    }
+
+    #[test]
+    fn synonym_set_rejects_invalid_alias_wholesale() {
+        let mut store = make_store(&[], &[]);
+        let result = synonym_set(&mut store, "zzterm", "zzgood,../bad");
+        assert_eq!(result, "invalid input");
+        // Rejected before the store call — neither alias written.
+        let list = synonym_list(&store);
+        assert!(!list.contains("zzterm => zzgood"), "got: {list}");
+    }
+
+    #[test]
+    fn synonym_add_over_cap_returns_error_message() {
+        let mut store = make_store(&[], &[]);
+        // Add distinct aliases until the 200-row cap rejects one. The table is
+        // pre-seeded with defaults, so the failure arrives before 200 zz-adds.
+        let mut last = String::new();
+        for i in 0..300 {
+            last = synonym_add(&mut store, "zzfill", &format!("zza{i}"));
+            if last != "ok" {
+                break;
+            }
+        }
+        assert_ne!(last, "ok", "the cap must eventually reject an add");
+        assert!(last.contains("200"), "cap message expected, got: {last}");
+    }
+
+    #[test]
+    fn synonym_reset_restores_defaults() {
+        let mut store = make_store(&[], &[]);
+        synonym_add(&mut store, "zzcustom", "zzalias");
+        assert_eq!(synonym_reset(&mut store), "ok");
+        let list = synonym_list(&store);
+        assert!(
+            !list.contains("zzcustom => zzalias"),
+            "custom pair must be cleared: {list}"
+        );
+        assert!(!list.is_empty(), "defaults must be re-seeded after reset");
+    }
+
+    // Note: repos_list/repos_prune/repos_remove operate on the *real* global
+    // registry (~/.travsr), so they are intentionally NOT unit-tested here — a
+    // test calling repos_prune() would mutate the developer's HOME. The
+    // underlying registry::{prune,unregister,all_repos} are covered by
+    // travsr-store/src/registry.rs tests under a temp-HOME lock.
+
+    // ── transitive dependencies unit test ────────────────────────────────────
+
+    #[test]
+    fn get_dependencies_transitive_reaches_depth_two() {
+        use travsr_core::{EdgeKind, Node, VName};
+        // file_a depends file_b depends file_c
+        let mk = |path: &str| Node::new(VName::new("", "", path, "typescript", path), "file");
+        let a = mk("a.ts");
+        let b = mk("b.ts");
+        let c = mk("c.ts");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (a.id, b.id, EdgeKind::Depends),
+                (b.id, c.id, EdgeKind::Depends),
+            ],
+        );
+
+        // Direct only: just b.ts.
+        let direct = get_dependencies(&store, "a.ts", false, 3);
+        assert!(direct.contains("b.ts"), "direct dep b.ts missing: {direct}");
+        assert!(
+            !direct.contains("c.ts"),
+            "c.ts is transitive, not direct: {direct}"
+        );
+
+        // Transitive: both b.ts and c.ts.
+        let trans = get_dependencies(&store, "a.ts", true, 3);
+        assert!(trans.contains("b.ts"), "b.ts missing: {trans}");
+        assert!(trans.contains("c.ts"), "transitive c.ts missing: {trans}");
     }
 
     // ── get_repo_map unit tests ───────────────────────────────────────────────

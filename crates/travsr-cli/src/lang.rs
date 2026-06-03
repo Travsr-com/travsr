@@ -16,7 +16,11 @@ const APPROVAL_EXPIRY_DAYS: i64 = 365;
 #[derive(Debug, Subcommand)]
 pub enum LangCommand {
     /// Show all known Phase B language tools and their status.
-    List,
+    List {
+        /// Output as a JSON array for programmatic / extension use.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install and register a Phase B tool for a language.
     ///
     /// Downloads the travsr-lang-* wrapper binary from GitHub Releases into
@@ -38,6 +42,10 @@ pub enum LangCommand {
         /// Skip downloading the wrapper binary; only register in config.
         #[arg(long)]
         skip_wrapper: bool,
+        /// Auto-confirm the SCIP tool install command without interactive prompt.
+        /// Useful for --no-interactive invocations from the VS Code extension.
+        #[arg(long)]
+        yes: bool,
     },
     /// Scan the current repo, detect supported languages, and install them.
     Detect,
@@ -82,13 +90,14 @@ pub enum InstallStatus {
 
 pub fn run(cmd: LangCommand) -> Result<()> {
     match cmd {
-        LangCommand::List => cmd_list(),
+        LangCommand::List { json } => cmd_list(json),
         LangCommand::Install {
             language,
             reinstall,
             no_interactive,
             corpus,
             skip_wrapper,
+            yes,
         } => {
             match cmd_install(
                 &language,
@@ -96,6 +105,7 @@ pub fn run(cmd: LangCommand) -> Result<()> {
                 no_interactive,
                 corpus.as_deref(),
                 skip_wrapper,
+                yes,
             )? {
                 InstallStatus::WrapperOnly => std::process::exit(2),
                 InstallStatus::FullyReady => Ok(()),
@@ -115,9 +125,61 @@ pub fn run(cmd: LangCommand) -> Result<()> {
 
 // ── list ──────────────────────────────────────────────────────────────────────
 
-fn cmd_list() -> Result<()> {
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn json_arr(items: &[&str]) -> String {
+    let elems: Vec<String> = items.iter().map(|s| json_str(s)).collect();
+    format!("[{}]", elems.join(","))
+}
+
+fn cmd_list(json: bool) -> Result<()> {
     let config = load_config();
     let today = chrono::Local::now().date_naive();
+
+    if json {
+        let mut entries: Vec<String> = Vec::new();
+        for entry in CATALOG {
+            let sandbox = match entry.sandbox {
+                SandboxRequirement::Standard => "Standard",
+                SandboxRequirement::RequiresElevated => "Elevated",
+            };
+            let registered = config
+                .as_ref()
+                .map(|c| c.is_registered(entry.language))
+                .unwrap_or(false);
+            let approved = config
+                .as_ref()
+                .map(|c| c.is_approved(entry.language))
+                .unwrap_or(false);
+            let provider_on_path = entry.provider_binary.map_or(true, tool_available);
+            let tool_on_path = tool_available(entry.command);
+            let installed = entry.builtin || (provider_on_path && tool_on_path);
+            let needs_approval = entry.sandbox == SandboxRequirement::RequiresElevated && !approved;
+            let package = entry.npm_package.unwrap_or(entry.command);
+            let scip_type = match entry.scip_install {
+                ScipInstall::GithubBinary(_) => "GithubBinary",
+                ScipInstall::Command(_) => "Command",
+                ScipInstall::Manual => "Manual",
+            };
+            entries.push(format!(
+                r#"{{"language":{},"package":{},"sandbox":{},"installed":{},"registered":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{}}}"#,
+                json_str(entry.language),
+                json_str(package),
+                json_str(sandbox),
+                installed,
+                registered,
+                needs_approval,
+                json_str(scip_type),
+                json_str(entry.install_hint),
+                json_str(entry.underlying_tool_hint),
+                json_arr(entry.elevated_hosts),
+            ));
+        }
+        println!("[{}]", entries.join(",\n"));
+        return Ok(());
+    }
 
     println!(
         "{:<12} {:<26} {:<10} STATUS",
@@ -134,8 +196,9 @@ fn cmd_list() -> Result<()> {
         let package_col = entry.npm_package.unwrap_or(entry.command);
         let provider_on_path = entry.provider_binary.map_or(true, tool_available);
         let tool_on_path = tool_available(entry.command);
-        let fully_ready = provider_on_path && tool_on_path;
-        let wrapper_only = provider_on_path && !tool_on_path && entry.provider_binary.is_some();
+        let fully_ready = entry.builtin || (provider_on_path && tool_on_path);
+        let wrapper_only =
+            !entry.builtin && provider_on_path && !tool_on_path && entry.provider_binary.is_some();
         let registered = config
             .as_ref()
             .map(|c| c.is_registered(entry.language))
@@ -215,6 +278,7 @@ fn cmd_install(
     no_interactive: bool,
     corpus: Option<&str>,
     skip_wrapper: bool,
+    yes: bool,
 ) -> Result<InstallStatus> {
     let entry = lookup(language).ok_or_else(|| {
         anyhow::anyhow!(
@@ -301,9 +365,12 @@ fn cmd_install(
     };
 
     // Handle the underlying SCIP tool (scip-go, scip-python, etc.).
-    let tool_ready = if wrapper_installed && !tool_available(entry.command) {
+    // Builtins are bundled in the travsr binary — no external tool needed.
+    let tool_ready = if entry.builtin {
+        true
+    } else if wrapper_installed && !tool_available(entry.command) {
         let interactive = !no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
-        install_scip_tool(entry, interactive)?
+        install_scip_tool(entry, interactive, yes)?
     } else {
         tool_available(entry.command)
     };
@@ -358,10 +425,11 @@ fn cmd_install(
 fn install_scip_tool(
     entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
     interactive: bool,
+    yes: bool,
 ) -> Result<bool> {
     match entry.scip_install {
         ScipInstall::Command(cmd_args) => {
-            if interactive {
+            let do_run = if interactive {
                 use std::io::Write as _;
                 print!(
                     "'{}' is not installed.\nInstall via: {}\nRun it now? [Y/n]: ",
@@ -371,32 +439,35 @@ fn install_scip_tool(
                 std::io::stdout().flush()?;
                 let mut answer = String::new();
                 std::io::stdin().read_line(&mut answer)?;
-                if answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y") {
-                    let mut child = std::process::Command::new(cmd_args[0])
-                        .args(&cmd_args[1..])
-                        .spawn()
-                        .with_context(|| format!("running '{}'", cmd_args.join(" ")))?;
-                    let status = child.wait()?;
-                    if status.success() {
-                        println!("\u{2713} {} installed.", entry.command);
-                        // Trust exit 0: the binary may be in $GOPATH/bin, ~/.cargo/bin,
-                        // or another tool-managed dir not yet in the process's PATH.
-                        return Ok(true);
-                    } else {
-                        println!(
-                            "Install command exited with {status}.\nRun manually: {}",
-                            cmd_args.join(" ")
-                        );
-                    }
-                } else {
-                    println!("Skipped. Run when ready:\n\n\t{}", cmd_args.join(" "));
-                }
+                answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y")
+            } else if yes {
+                println!("Auto-installing: {}", cmd_args.join(" "));
+                true
             } else {
                 println!(
                     "Note: '{}' not found. Install it:\n\n\t{}",
                     entry.command,
                     cmd_args.join(" ")
                 );
+                false
+            };
+            if do_run {
+                let mut child = std::process::Command::new(cmd_args[0])
+                    .args(&cmd_args[1..])
+                    .spawn()
+                    .with_context(|| format!("running '{}'", cmd_args.join(" ")))?;
+                let status = child.wait()?;
+                if status.success() {
+                    println!("\u{2713} {} installed.", entry.command);
+                    // Trust exit 0: the binary may be in $GOPATH/bin, ~/.cargo/bin,
+                    // or another tool-managed dir not yet in the process's PATH.
+                    return Ok(true);
+                } else {
+                    println!(
+                        "Install command exited with {status}.\nRun manually: {}",
+                        cmd_args.join(" ")
+                    );
+                }
             }
         }
         ScipInstall::GithubBinary(ref spec) => {
@@ -533,7 +604,7 @@ fn cmd_detect() -> Result<()> {
             .map(|c| c.is_registered(lang))
             .unwrap_or(false);
         let provider_ready = entry.provider_binary.map_or(true, tool_available);
-        let fully_ready = provider_ready && tool_available(entry.command);
+        let fully_ready = entry.builtin || (provider_ready && tool_available(entry.command));
 
         let status = if registered && fully_ready {
             "\u{2713} already active"
@@ -592,7 +663,7 @@ fn cmd_detect() -> Result<()> {
     println!();
     for lang in &selected {
         println!("── {} ──", lang);
-        match cmd_install(lang, false, false, None, false) {
+        match cmd_install(lang, false, false, None, false, false) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
                 println!("  \u{26A0} {lang}: wrapper installed but SCIP tool missing")

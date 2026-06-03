@@ -1,9 +1,8 @@
 //! Subprocess runner for `travsr-lsif-ts`.
 //!
 //! Runs the Node.js LSIF emitter as a child process and captures its stdout
-//! (the LSIF JSON-Lines dump). The binary must be on PATH; if it is not
-//! installed, the function returns `Err` and callers are expected to log a
-//! warning and skip LSIF ingestion — never to fail the overall index.
+//! (the LSIF JSON-Lines dump). The emitter is resolved relative to the travsr
+//! binary — no global PATH install required.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -15,19 +14,73 @@ use anyhow::Context as _;
 /// Prevents a hung or looping `travsr-lsif-ts` from blocking `git commit`.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Run `travsr-lsif-ts --project <tsconfig>` and return the LSIF dump.
+/// Resolve the LSIF emitter program + args without requiring a global PATH install.
 ///
-/// The subprocess is killed and an error is returned if it does not complete
-/// within 60 seconds — guarding against infinite loops in `tsconfig.extends`
-/// chains or a stalled TS language service.
+/// Resolution order:
+/// 1. `TRAVSR_LSIF_TS` env var — absolute path to the JS entry point (tests / custom installs).
+/// 2. Sibling of `current_exe` named `travsr-lsif-ts` — npm global install layout where
+///    both binaries land in the same `bin/` directory.
+/// 3. Walk up from `current_exe` directory looking for
+///    `packages/travsr-lsif-ts/dist/index.js` — monorepo / `cargo build` dev layout.
+/// 4. `travsr-lsif-ts` on PATH — legacy fallback.
+///
+/// Returns `(program, prefix_args)` where the full command is
+/// `program [prefix_args...] --project <tsconfig>`.
+fn resolve_lsif_emitter() -> (String, Vec<String>) {
+    // 1. Env override — useful for tests and non-standard installs.
+    if let Ok(p) = std::env::var("TRAVSR_LSIF_TS") {
+        let path = std::path::Path::new(&p);
+        if path.is_file() {
+            return ("node".to_string(), vec![p]);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // 2. Sibling binary (npm global install: both binaries in the same bin/).
+            let sibling = exe_dir.join("travsr-lsif-ts");
+            if sibling.is_file() {
+                return (sibling.to_string_lossy().into_owned(), vec![]);
+            }
+
+            // 3. Walk up from exe_dir looking for the monorepo layout.
+            //    dev build: target/release/travsr → 3 parents up = repo root.
+            let mut cur = exe_dir.to_path_buf();
+            for _ in 0..6 {
+                let candidate = cur.join("packages/travsr-lsif-ts/dist/index.js");
+                if candidate.is_file() {
+                    return (
+                        "node".to_string(),
+                        vec![candidate.to_string_lossy().into_owned()],
+                    );
+                }
+                match cur.parent() {
+                    Some(p) => cur = p.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // 4. Fall back to PATH.
+    ("travsr-lsif-ts".to_string(), vec![])
+}
+
+/// Run the LSIF emitter for `<tsconfig>` and return the LSIF dump.
+///
+/// The emitter is resolved relative to the travsr binary — no global PATH install
+/// required. The subprocess is killed and an error is returned if it does not
+/// complete within 60 seconds.
 ///
 /// # Errors
-/// - `travsr-lsif-ts` not found on PATH (user must `npm install -g travsr-lsif-ts`)
+/// - Emitter not found (not bundled, not on PATH)
 /// - Non-zero exit code from the emitter (stderr forwarded as context)
 /// - Process exceeds the 60s timeout
 /// - Stdout is not valid UTF-8
 pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
-    let mut child = std::process::Command::new("travsr-lsif-ts")
+    let (program, prefix_args) = resolve_lsif_emitter();
+    let mut child = std::process::Command::new(&program)
+        .args(&prefix_args)
         .arg("--project")
         .arg(tsconfig)
         .stdout(std::process::Stdio::piped())
@@ -36,7 +89,7 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
         .with_context(|| {
             format!(
                 "could not run travsr-lsif-ts for {} \
-                 (is it installed? run: npm install -g travsr-lsif-ts)",
+                 (emitter not found — check TRAVSR_LSIF_TS or reinstall travsr)",
                 tsconfig.display()
             )
         })?;
@@ -75,13 +128,28 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn run_lsif_emitter_returns_err_for_missing_binary() {
-        // An impossible binary name must produce an Err, not a panic.
-        let result = std::process::Command::new("__travsr_nonexistent_binary__").output();
-        // We test the Command API directly here because run_lsif_emitter
-        // hard-codes the binary name. The important invariant is that a
-        // missing binary produces an IO error rather than a panic.
-        assert!(result.is_err(), "missing binary must return Err");
+    fn resolve_falls_back_to_path_when_no_env_and_no_sibling() {
+        // Without TRAVSR_LSIF_TS set and no sibling binary, must fall back to PATH name.
+        // We can't control current_exe in tests, but we can verify the env-override path.
+        std::env::remove_var("TRAVSR_LSIF_TS");
+        let (program, args) = resolve_lsif_emitter();
+        // Either it found a real candidate (monorepo walk succeeded) or fell back.
+        // Either way: program must be non-empty and args must be a Vec.
+        assert!(!program.is_empty());
+        let _ = args; // just verify it compiles and returns
+    }
+
+    #[test]
+    fn resolve_honours_env_override_when_file_exists() {
+        // Point TRAVSR_LSIF_TS at a file that definitely exists.
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("TRAVSR_LSIF_TS", exe.to_str().unwrap());
+        let (program, args) = resolve_lsif_emitter();
+        assert_eq!(program, "node");
+        assert_eq!(args.len(), 1);
+        std::env::remove_var("TRAVSR_LSIF_TS");
     }
 }

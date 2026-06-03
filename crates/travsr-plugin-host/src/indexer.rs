@@ -80,6 +80,13 @@ impl PluginIndexer {
             return (vec![], vec![]);
         }
 
+        // Gate Phase B per language against lang.toml registration.
+        // `travsr lang remove <lang>` writes registered=[] which must be respected here.
+        let registered: std::collections::HashSet<String> =
+            crate::trust::registered_languages_from_disk()
+                .into_iter()
+                .collect();
+
         let current_exe = std::env::current_exe()
             .unwrap_or_default()
             .to_string_lossy()
@@ -103,6 +110,13 @@ impl PluginIndexer {
         let mut all_edges = Vec::new();
 
         for lang in resolver.providable_languages() {
+            if !registered.contains(lang.as_str()) {
+                tracing::debug!(
+                    "Phase B skipped for '{}' — not registered in lang.toml",
+                    lang
+                );
+                continue;
+            }
             let spec = match resolver.resolve(&lang) {
                 Some(s) => s,
                 None => continue,

@@ -35,7 +35,10 @@ export interface GraphData {
 type WebviewMessage =
   | { command: "query"; query: string; direction: string; depth: number; kind_filter?: string }
   | { command: "goToDefinition"; path: string; line?: number }
-  | { command: "showBlastRadius"; path: string };
+  | { command: "showBlastRadius"; path: string }
+  | { command: "showDependencies"; path: string }
+  | { command: "exportDot"; dot: string }
+  | { command: "exportJson"; json: string };
 
 export class GraphPanel {
   static readonly viewType = "travsrGraphPanel";
@@ -111,6 +114,17 @@ export class GraphPanel {
     void this.panel.webview.postMessage({ command: "render", data, query });
   }
 
+  /**
+   * Render a pre-built graph (e.g. an execution path) directly, bypassing the
+   * MCP `get_graph_json` traversal. Used by `travsr.showExecutionPath`, where
+   * the PCST path nodes are flagged `root` so the webview highlights them.
+   */
+  renderPath(data: GraphData, query: string): void {
+    this.panel.reveal(vscode.ViewColumn.One);
+    this.panel.title = `Travsr: ${query}`;
+    void this.panel.webview.postMessage({ command: "render", data, query });
+  }
+
   private handleMessage(msg: WebviewMessage): void {
     if (msg.command === "query" && (msg.query || msg.kind_filter === "file")) {
       void this.query(msg.query, msg.direction, msg.depth, msg.kind_filter ?? "");
@@ -132,6 +146,24 @@ export class GraphPanel {
       }
     } else if (msg.command === "showBlastRadius" && msg.path) {
       void vscode.commands.executeCommand("travsr.showBlastRadius", msg.path);
+    } else if (msg.command === "showDependencies" && msg.path) {
+      void vscode.commands.executeCommand("travsr.showDependencies", msg.path);
+    } else if (msg.command === "exportDot") {
+      void vscode.env.clipboard
+        .writeText(msg.dot)
+        .then(() =>
+          vscode.window.showInformationMessage("Graph DOT copied to clipboard")
+        );
+    } else if (msg.command === "exportJson") {
+      void (async () => {
+        const uri = await vscode.window.showSaveDialog({
+          filters: { JSON: ["json"] },
+          saveLabel: "Save graph JSON",
+        });
+        if (uri) {
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(msg.json, "utf8"));
+        }
+      })();
     }
   }
 
@@ -454,6 +486,9 @@ export function buildLoadingHtml(logoUri?: string, cspSource?: string): string {
   <div class="toolbar-right">
     <button class="btn" onclick="cy.fit(null,30)">⊡ Fit</button>
     <button class="btn" onclick="resetLayout()">↺ Layout</button>
+    <div class="sep"></div>
+    <button class="btn" onclick="exportDot()" title="Copy the visible graph as Graphviz DOT">⤓ DOT</button>
+    <button class="btn" onclick="exportJson()" title="Save the visible graph as JSON">⤓ JSON</button>
   </div>
 </div>
 
@@ -652,6 +687,35 @@ function debouncedQuery() {
   _debounceTimer = setTimeout(() => {
     if (document.getElementById('searchInput').value.trim() || filesMode) submitQuery();
   }, 400);
+}
+
+// ── Export: serialise the in-memory (visible) graph — no MCP calls ────────────
+function escDot(s) {
+  return String(s == null ? '' : s).replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"').replace(/\\n/g, ' ');
+}
+function exportDot() {
+  let out = 'digraph travsr {\\n  rankdir=LR;\\n  node [shape=box, style=rounded];\\n';
+  cy.nodes(':visible').forEach(n => {
+    out += '  "' + escDot(n.id()) + '" [label="' + escDot(n.data('label')) + '"];\\n';
+  });
+  cy.edges(':visible').forEach(e => {
+    out += '  "' + escDot(e.data('source')) + '" -> "' + escDot(e.data('target')) +
+      '" [label="' + escDot(e.data('kind')) + '"];\\n';
+  });
+  out += '}\\n';
+  vscode.postMessage({ command: 'exportDot', dot: out });
+}
+function exportJson() {
+  const payload = {
+    nodes: cy.nodes(':visible').map(n => ({
+      id: n.id(), label: n.data('label'), kind: n.data('kind'), path: n.data('path'),
+      package: n.data('pkg'), score: n.data('score'), line: n.data('line')
+    })),
+    edges: cy.edges(':visible').map(e => ({
+      source: e.data('source'), target: e.data('target'), kind: e.data('kind')
+    }))
+  };
+  vscode.postMessage({ command: 'exportJson', json: JSON.stringify(payload, null, 2) });
 }
 
 function setFilesMode(active) {
@@ -865,6 +929,7 @@ function updateDetailPanel(d, ele) {
       <div class="collapsible-body" style="max-height:200px">
         \${d.path ? '<button class="btn-action" onclick="vscode.postMessage({command:\\'goToDefinition\\',path:\\'' + d.path + '\\'' + (d.line ? ',line:' + d.line : '') + '})"><span>↗</span> Go to definition</button>' : ''}
         \${d.kind !== 'var' ? '<button class="btn-action hot" onclick="vscode.postMessage({command:\\'showBlastRadius\\',path:\\'' + (d.path||'') + '\\'})"><span>⊗</span> Show blast radius</button>' : ''}
+        \${d.kind === 'file' && d.path ? '<button class="btn-action secondary" onclick="vscode.postMessage({command:\\'showDependencies\\',path:\\'' + d.path + '\\'})"><span>⊟</span> Show dependencies</button>' : ''}
         <button class="btn-action secondary" onclick="navigator.clipboard.writeText(\\'' + d.id + '\\').then(()=>flashBanner('VName copied'))"><span>⧉</span> Copy VName</button>
       </div>
     </div>
