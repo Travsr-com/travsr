@@ -196,12 +196,13 @@ fn link_imports_skips_package_imports() {
         "package imports must not produce resolves-to edges"
     );
 
-    // 10 relative imports (./mcp, ./status, ./codelens, ./hover, ./tree, ./welcome,
-    // ./clientProxy, ./installer, ./telemetry, ./graph) × 2 candidates each (.ts + .tsx probe) = 20 edges.
+    // 11 relative imports (./mcp, ./status, ./codelens, ./hover, ./tree, ./welcome,
+    // ./clientProxy, ./installer, ./telemetry, ./graph, ./contextProvider) × 2 candidates
+    // each (.ts + .tsx probe) = 22 edges.
     assert_eq!(
         edges.len(),
-        20,
-        "10 relative imports × 2 extension candidates = 20 resolves-to edges"
+        22,
+        "11 relative imports × 2 extension candidates = 22 resolves-to edges"
     );
 }
 

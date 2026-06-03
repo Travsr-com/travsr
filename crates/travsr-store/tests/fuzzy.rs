@@ -714,6 +714,103 @@ fn l2a_or_arm_cap_at_most_16() {
     );
 }
 
+// ── F1 dynamic synonyms (RFC-012 A2 S21) ─────────────────────────────────────
+//
+// The T0 tests above exercise the compile-time SYNONYMS static. These verify the
+// DB-backed path: a synonym added at runtime via synonym_add/set/remove must
+// change search_nodes_fuzzy results through build_fuzzy_match_expr_db.
+
+#[test]
+fn dynamic_synonym_add_changes_search() {
+    let mut store = open();
+    let n = node("src/billing.rs", "fn:billing_service", "function");
+    put(&mut store, &n);
+
+    // Negative control: "payment" is not a static synonym of "billing", and
+    // "payment" is not a substring of "billing_service" — no match yet.
+    let before = store.search_nodes_fuzzy("payment").unwrap();
+    assert!(
+        before.is_empty(),
+        "precondition: 'payment' must not resolve billing_service before the synonym exists"
+    );
+
+    // Add the synonym at runtime; the DB-backed expander must now pick it up.
+    store.synonym_add("payment", "billing").unwrap();
+
+    let after = store.search_nodes_fuzzy("payment").unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|m| m.vname.signature == "fn:billing_service"),
+        "F1: runtime synonym 'payment'→'billing' must resolve billing_service"
+    );
+}
+
+#[test]
+fn dynamic_synonym_remove_reverts_search() {
+    let mut store = open();
+    let n = node("src/billing.rs", "fn:billing_service", "function");
+    put(&mut store, &n);
+    store.synonym_add("payment", "billing").unwrap();
+    assert!(!store.search_nodes_fuzzy("payment").unwrap().is_empty());
+
+    store.synonym_remove("payment", "billing").unwrap();
+    assert!(
+        store.search_nodes_fuzzy("payment").unwrap().is_empty(),
+        "F1: removing the synonym must revert search behaviour"
+    );
+}
+
+#[test]
+fn dynamic_synonym_set_is_declarative() {
+    let mut store = open();
+    let billing = node("src/billing.rs", "fn:billing_service", "function");
+    let invoice = node("src/invoice.rs", "fn:invoice_service", "function");
+    put(&mut store, &billing);
+    put(&mut store, &invoice);
+
+    store.synonym_add("payment", "billing").unwrap();
+    // set replaces the entire alias set: billing is dropped, invoice added.
+    store
+        .synonym_set("payment", &["invoice".to_string()])
+        .unwrap();
+
+    let r = store.search_nodes_fuzzy("payment").unwrap();
+    assert!(
+        r.iter().any(|m| m.vname.signature == "fn:invoice_service"),
+        "set must add the new alias 'invoice'"
+    );
+    assert!(
+        !r.iter().any(|m| m.vname.signature == "fn:billing_service"),
+        "set must drop the replaced alias 'billing'"
+    );
+}
+
+#[test]
+fn synonym_reset_drops_user_adds_but_keeps_defaults() {
+    let mut store = open();
+    let billing = node("src/billing.rs", "fn:billing_service", "function");
+    let session = node("src/rbac.rs", "fn:check_session_access", "function");
+    put(&mut store, &billing);
+    put(&mut store, &session);
+
+    store.synonym_add("payment", "billing").unwrap();
+    assert!(!store.search_nodes_fuzzy("payment").unwrap().is_empty());
+
+    store.synonym_reset().unwrap();
+
+    // User-added synonym is gone.
+    assert!(
+        store.search_nodes_fuzzy("payment").unwrap().is_empty(),
+        "reset must drop the user-added 'payment' synonym"
+    );
+    // Static default ("auth" → "session") is restored.
+    assert!(
+        !store.search_nodes_fuzzy("auth guard").unwrap().is_empty(),
+        "reset must restore the static default 'auth'→'session'"
+    );
+}
+
 // ── PA C3 — full == incremental on canonical graph ───────────────────────────
 
 #[test]

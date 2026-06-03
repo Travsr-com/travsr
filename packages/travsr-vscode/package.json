@@ -38,6 +38,7 @@
     "AI",
     "Other"
   ],
+  "enabledApiProposals": ["chatContextProvider"],
   "main": "./out/extension.js",
   "activationEvents": [
     "onStartupFinished"
@@ -171,6 +172,18 @@
           "default": false,
           "description": "Send anonymous usage events to Travsr (extension activated, MCP tool invoked, daemon connection failures). No file paths, symbol names, or graph data are ever sent.",
           "markdownDescription": "Send anonymous usage events to Travsr.\n\n**What is sent:** extension activation, MCP tool names, daemon connection failures.\n\n**What is never sent:** file paths, symbol names, code content, or graph data.\n\nDefault: `false` (opt-in)."
+        },
+        "travsr.autoContextEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Inject graph context automatically into every Copilot Chat turn. Travsr detects the symbol under your cursor and your question, queries the graph, and silently prepends relevant nodes to Copilot's context window."
+        },
+        "travsr.contextTokenBudget": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 500,
+          "maximum": 8000,
+          "description": "Token budget for automatic context injection per chat turn. At 2000 tokens, a typical context is 8–15 graph nodes."
         }
       }
     }
