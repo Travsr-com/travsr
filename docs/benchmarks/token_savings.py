@@ -48,6 +48,7 @@ SYMBOLS = [
 
 def run(cmd):
     r = subprocess.run(cmd, cwd=REPO, env=ENV, capture_output=True, text=True)
+    
     return r.stdout + r.stderr
 
 

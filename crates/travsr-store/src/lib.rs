@@ -1327,6 +1327,13 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Remove ALL aliases for `term`. No-op if the term has no aliases.
+    pub fn synonym_remove_term(&mut self, term: &str) -> AnyResult<()> {
+        self.conn
+            .execute("DELETE FROM fts_synonyms WHERE term = ?1", params![term])?;
+        Ok(())
+    }
+
     /// List all active synonym pairs as (term, alias) tuples.
     pub fn synonym_list(&self) -> AnyResult<Vec<(String, String)>> {
         let mut stmt = self
@@ -2252,5 +2259,84 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ac, Some("corp".to_string()));
+    }
+
+    #[test]
+    fn synonym_add_multi_then_list() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.synonym_add("payment", "billing").unwrap();
+        store.synonym_add("payment", "invoice").unwrap();
+        let pairs = store.synonym_list().unwrap();
+        let aliases: Vec<&str> = pairs
+            .iter()
+            .filter(|(t, _)| t == "payment")
+            .map(|(_, a)| a.as_str())
+            .collect();
+        assert!(aliases.contains(&"billing"));
+        assert!(aliases.contains(&"invoice"));
+    }
+
+    #[test]
+    fn synonym_remove_term_clears_all_aliases() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.synonym_add("payment", "billing").unwrap();
+        store.synonym_add("payment", "invoice").unwrap();
+        store.synonym_add("payment2", "wire").unwrap();
+        store.synonym_remove_term("payment").unwrap();
+        let pairs = store.synonym_list().unwrap();
+        assert!(
+            pairs.iter().all(|(t, _)| t != "payment"),
+            "all payment aliases must be removed"
+        );
+        assert!(
+            pairs.iter().any(|(t, a)| t == "payment2" && a == "wire"),
+            "payment2 alias must survive"
+        );
+    }
+
+    #[test]
+    fn synonym_remove_term_noop_on_missing_term() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.synonym_add("payment2", "wire").unwrap();
+        store.synonym_remove_term("nonexistent").unwrap();
+        let pairs = store.synonym_list().unwrap();
+        assert!(pairs.iter().any(|(t, a)| t == "payment2" && a == "wire"));
+    }
+
+    #[test]
+    fn synonym_set_replaces_existing_aliases() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.synonym_add("payment", "billing").unwrap();
+        store.synonym_add("payment", "invoice").unwrap();
+        store.synonym_remove_term("payment").unwrap();
+        store.synonym_add("payment", "charge").unwrap();
+        store.synonym_add("payment", "transaction").unwrap();
+        let pairs = store.synonym_list().unwrap();
+        let aliases: Vec<&str> = pairs
+            .iter()
+            .filter(|(t, _)| t == "payment")
+            .map(|(_, a)| a.as_str())
+            .collect();
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases.contains(&"charge"));
+        assert!(aliases.contains(&"transaction"));
+        assert!(!aliases.contains(&"billing"));
+        assert!(!aliases.contains(&"invoice"));
+    }
+
+    #[test]
+    fn synonym_remove_one_alias_leaves_others() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.synonym_add("payment", "billing").unwrap();
+        store.synonym_add("payment", "invoice").unwrap();
+        store.synonym_remove("payment", "billing").unwrap();
+        let pairs = store.synonym_list().unwrap();
+        let aliases: Vec<&str> = pairs
+            .iter()
+            .filter(|(t, _)| t == "payment")
+            .map(|(_, a)| a.as_str())
+            .collect();
+        assert!(!aliases.contains(&"billing"), "removed alias must be gone");
+        assert!(aliases.contains(&"invoice"), "sibling alias must survive");
     }
 }
