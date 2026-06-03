@@ -21,14 +21,14 @@ import type { McpClient } from "./mcp";
 // Push model: VS Code calls provideWorkspaceChatContext whenever the extension
 // fires onDidChangeWorkspaceChatContext. Without the event, the provider is inert.
 
-interface TravrsrChatContextItem {
+interface TravsrChatContextItem {
   value: string;
   description?: string;
 }
 
-interface TravrsrChatContextProvider {
+interface TravsrChatContextProvider {
   onDidChangeWorkspaceChatContext: vscode.Event<void>;
-  provideWorkspaceChatContext(): Promise<TravrsrChatContextItem[]>;
+  provideWorkspaceChatContext(): Promise<TravsrChatContextItem[]>;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ const KEYWORDS = new Set([
 
 function getSymbolAtCursor(editor: vscode.TextEditor): string {
   const pos = editor.selection.active;
-  const range = editor.document.getWordRangeAtPosition(pos, /[\w:.<>]+/);
+  const range = editor.document.getWordRangeAtPosition(pos, /[\w:.]+/);
   if (!range) return "";
   const word = editor.document.getText(range);
   return KEYWORDS.has(word) ? "" : word;
@@ -75,10 +75,10 @@ export function registerContextProvider(
   const emitter = new vscode.EventEmitter<void>();
   context.subscriptions.push(emitter);
 
-  const provider: TravrsrChatContextProvider = {
+  const provider: TravsrChatContextProvider = {
     onDidChangeWorkspaceChatContext: emitter.event,
 
-    async provideWorkspaceChatContext(): Promise<TravrsrChatContextItem[]> {
+    async provideWorkspaceChatContext(): Promise<TravsrChatContextItem[]> {
       const cfg = vscode.workspace.getConfiguration("travsr");
       if (!cfg.get<boolean>("autoContextEnabled", true)) {
         channel.appendLine(`[context] skipped — autoContextEnabled=false`);

@@ -1,9 +1,11 @@
 -- Migration v12: vec0 embedding table for RFC-012 A2 F2 (opt-in, feature-gated).
 --
--- Only runs when the `embeddings` feature flag is enabled AND the sqlite-vec
--- extension has been loaded into the connection (done by travsr embed init).
--- Without the extension this migration is a no-op (the virtual table module
--- is not registered so CREATE VIRTUAL TABLE would fail — guard is in V12Vec0Embeddings::up).
+-- STUB — DEBT(travsr-#259). Only registered when the `embeddings` feature is
+-- enabled, which is not yet wired (ort + sqlite-vec deps unpinned, no extension
+-- loader). This CREATE VIRTUAL TABLE requires the `vec0` module to be registered
+-- on the connection; without it the statement fails. There is NO runtime guard
+-- in V12Vec0Embeddings::up today — enabling `embeddings` before F2 lands will
+-- error here. Kept in-tree so the migration ordering after v11 is reserved.
 --
 -- Stores MRL-256 + RaBitQ 1-bit compressed vectors per node.
 -- The RaBitQ rotation seed is pinned in meta (key: rabitq_rotation_seed) at

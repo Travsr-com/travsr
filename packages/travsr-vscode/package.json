@@ -44,14 +44,6 @@
     "onStartupFinished"
   ],
   "contributes": {
-    "chatParticipants": [
-      {
-        "id": "travsr.context",
-        "name": "travsr",
-        "description": "Always-on code graph context for Copilot Chat",
-        "isSticky": false
-      }
-    ],
     "viewsContainers": {
       "activitybar": [
         {

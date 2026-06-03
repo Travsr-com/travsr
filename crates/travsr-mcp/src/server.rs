@@ -45,6 +45,22 @@ pub fn run(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Capabilities advertised in the `initialize` response. The `prompts`
+/// capability is only declared when `mcp-sampling` is enabled, so that a
+/// spec-compliant client can discover and call the `prompts/*` endpoints that
+/// feature exposes; without it those endpoints are unreachable from a
+/// conformant host.
+fn server_capabilities() -> serde_json::Value {
+    #[cfg(feature = "mcp-sampling")]
+    {
+        serde_json::json!({ "tools": {}, "prompts": {} })
+    }
+    #[cfg(not(feature = "mcp-sampling"))]
+    {
+        serde_json::json!({ "tools": {} })
+    }
+}
+
 fn handle_request(store: &SqliteStore, req: RpcRequest) -> Option<String> {
     // JSON-RPC notifications have no id — must never receive a response.
     let id = match req.id {
@@ -60,7 +76,7 @@ fn handle_request(store: &SqliteStore, req: RpcRequest) -> Option<String> {
             id,
             serde_json::json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
+                "capabilities": server_capabilities(),
                 "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
             }),
         ),
@@ -340,7 +356,7 @@ fn handle_request_global(req: RpcRequest) -> Option<String> {
             id,
             serde_json::json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
+                "capabilities": server_capabilities(),
                 "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
             }),
         ),
@@ -723,5 +739,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn initialize_advertises_capabilities() {
+        let caps = server_capabilities();
+        assert!(
+            caps["tools"].is_object(),
+            "initialize must always advertise the tools capability"
+        );
+        // The prompts capability is present iff mcp-sampling is compiled in.
+        assert_eq!(
+            caps["prompts"].is_object(),
+            cfg!(feature = "mcp-sampling"),
+            "prompts capability must be advertised exactly when mcp-sampling is enabled"
+        );
+    }
+
+    #[cfg(feature = "mcp-sampling")]
+    #[test]
+    fn prompts_list_exposes_search_query_rewrite() {
+        let list = prompts_list();
+        let prompts = list["prompts"].as_array().expect("prompts must be array");
+        let names: Vec<&str> = prompts
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"search_query_rewrite"),
+            "prompts/list must expose search_query_rewrite"
+        );
+    }
+
+    #[cfg(feature = "mcp-sampling")]
+    #[test]
+    fn prompts_get_returns_template_with_placeholder() {
+        let resp = handle_prompts_get(serde_json::json!(1), "search_query_rewrite");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = v["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("template text must be present");
+        assert!(
+            text.contains("{{query}}"),
+            "prompt template must contain the {{{{query}}}} placeholder"
+        );
+        // Passive contract: the daemon returns a template, never an LLM call result.
+        assert!(v["error"].is_null(), "valid prompt must not error");
+    }
+
+    #[cfg(feature = "mcp-sampling")]
+    #[test]
+    fn prompts_get_unknown_name_is_invalid_params() {
+        let resp = handle_prompts_get(serde_json::json!(2), "does_not_exist");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            v["error"]["code"].as_i64(),
+            Some(INVALID_PARAMS as i64),
+            "unknown prompt name must return INVALID_PARAMS"
+        );
+    }
+
+    #[cfg(feature = "mcp-sampling")]
+    #[test]
+    fn global_handler_routes_prompts_list() {
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(7)),
+            method: "prompts/list".into(),
+            params: None,
+        };
+        let resp = handle_request_global(req).expect("request must produce a response");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(
+            v["result"]["prompts"].is_array(),
+            "prompts/list must route through the global handler when mcp-sampling is on"
+        );
     }
 }

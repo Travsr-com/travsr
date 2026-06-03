@@ -198,9 +198,12 @@ impl Migration for V12Vec0Embeddings {
         12
     }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
-        // vec0 extension must be loaded before this migration runs.
-        // SqliteStore::load_vec0_extension() is called by `travsr embed init`
-        // before opening the store with embeddings enabled.
+        // STUB (RFC-012 A2 F2, DEBT travsr-#259): the `embeddings` feature is not
+        // wired yet — the `ort` + `sqlite-vec` deps are unpinned and no extension
+        // loader exists. This DDL requires the `vec0` module to be registered on
+        // the connection first; until the loader lands, enabling `embeddings` will
+        // fail here. There is intentionally NO guard in this stub. Do not enable
+        // the `embeddings` feature in production until F2 is implemented.
         store.exec_ddl(include_str!("migrations/v12_vec0_embeddings.sql"))
     }
 }
@@ -1334,6 +1337,34 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Declaratively replace ALL aliases for `term` with exactly `aliases`.
+    ///
+    /// Atomic: the DELETE and every INSERT run inside a single transaction, so a
+    /// crash mid-operation can never leave the term with its old aliases removed
+    /// and only a partial new set (the failure mode of a separate remove + N adds).
+    /// Rejects — and rolls back, leaving the table untouched — if the resulting
+    /// row count would exceed the 200-row cap. The cap is evaluated once against
+    /// the post-delete count, not per-insert.
+    pub fn synonym_set(&mut self, term: &str, aliases: &[String]) -> AnyResult<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM fts_synonyms WHERE term = ?1", params![term])?;
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM fts_synonyms", [], |r| r.get(0))
+            .context("counting fts_synonyms before set")?;
+        anyhow::ensure!(
+            count + aliases.len() as i64 <= 200,
+            "fts_synonyms would exceed 200 rows. Use `travsr synonym remove` to make space."
+        );
+        for alias in aliases {
+            tx.execute(
+                "INSERT OR IGNORE INTO fts_synonyms(term, alias) VALUES(?1, ?2)",
+                params![term, alias],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// List all active synonym pairs as (term, alias) tuples.
     pub fn synonym_list(&self) -> AnyResult<Vec<(String, String)>> {
         let mut stmt = self
@@ -2308,9 +2339,13 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         store.synonym_add("payment", "billing").unwrap();
         store.synonym_add("payment", "invoice").unwrap();
-        store.synonym_remove_term("payment").unwrap();
-        store.synonym_add("payment", "charge").unwrap();
-        store.synonym_add("payment", "transaction").unwrap();
+        // Exercise the real atomic synonym_set, not a hand-rolled remove+add.
+        store
+            .synonym_set(
+                "payment",
+                &["charge".to_string(), "transaction".to_string()],
+            )
+            .unwrap();
         let pairs = store.synonym_list().unwrap();
         let aliases: Vec<&str> = pairs
             .iter()
@@ -2322,6 +2357,94 @@ mod tests {
         assert!(aliases.contains(&"transaction"));
         assert!(!aliases.contains(&"billing"));
         assert!(!aliases.contains(&"invoice"));
+    }
+
+    #[test]
+    fn synonym_add_enforces_200_row_cap() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // Fill the table up to exactly 200 rows (open() pre-seeds the defaults,
+        // so this also pins that the cap counts seeded rows).
+        let mut i = 0;
+        while store.synonym_list().unwrap().len() < 200 {
+            store.synonym_add("filler", &format!("alias{i}")).unwrap();
+            i += 1;
+        }
+        assert_eq!(store.synonym_list().unwrap().len(), 200);
+        // The 201st distinct add must be rejected.
+        assert!(
+            store.synonym_add("filler", "one_too_many").is_err(),
+            "add beyond 200 rows must error"
+        );
+        // The rejected add must not have grown the table.
+        assert_eq!(
+            store.synonym_list().unwrap().len(),
+            200,
+            "rejected add must leave the table at exactly 200 rows"
+        );
+    }
+
+    #[test]
+    fn synonym_set_over_cap_rolls_back_entirely() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // Fill to 198 rows.
+        let mut i = 0;
+        while store.synonym_list().unwrap().len() < 198 {
+            store.synonym_add("filler", &format!("a{i}")).unwrap();
+            i += 1;
+        }
+        let before = store.synonym_list().unwrap();
+        // Setting 5 aliases on a brand-new term would push 198 + 5 = 203 > 200.
+        let aliases: Vec<String> = (0..5).map(|n| format!("x{n}")).collect();
+        assert!(
+            store.synonym_set("newterm", &aliases).is_err(),
+            "synonym_set that exceeds the cap must error"
+        );
+        assert_eq!(
+            store.synonym_list().unwrap(),
+            before,
+            "a failed synonym_set must roll back the DELETE and all INSERTs"
+        );
+    }
+
+    #[test]
+    fn seed_synonyms_is_idempotent() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            !store.synonym_list().unwrap().is_empty(),
+            "open must seed static defaults"
+        );
+        store.synonym_add("payment", "billing").unwrap();
+        let after_add = store.synonym_list().unwrap().len();
+        // Re-running the seeder on a non-empty table must be a no-op.
+        store.seed_synonyms_if_empty().unwrap();
+        assert_eq!(
+            store.synonym_list().unwrap().len(),
+            after_add,
+            "re-seeding a non-empty table must not re-add defaults"
+        );
+    }
+
+    #[test]
+    fn synonyms_persist_and_dont_reseed_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        {
+            let mut store = SqliteStore::open(&db_path).unwrap();
+            store.synonym_remove_term("auth").unwrap(); // drop a seeded default
+            store.synonym_add("payment", "billing").unwrap(); // add a user row
+        }
+        // Reopen: the seeder must NOT re-add the removed default (table is
+        // non-empty), and the user row must persist (v11 idempotency).
+        let store = SqliteStore::open(&db_path).unwrap();
+        let pairs = store.synonym_list().unwrap();
+        assert!(
+            pairs.iter().any(|(t, a)| t == "payment" && a == "billing"),
+            "user-added synonym must persist across reopen"
+        );
+        assert!(
+            !pairs.iter().any(|(t, _)| t == "auth"),
+            "a removed default must not be re-seeded on reopen"
+        );
     }
 
     #[test]

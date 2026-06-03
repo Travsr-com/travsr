@@ -73,13 +73,8 @@ pub fn run(action: SynonymCommand) -> Result<()> {
         }
         SynonymCommand::Set { term, aliases } => {
             store
-                .synonym_remove_term(&term)
-                .with_context(|| format!("clearing existing aliases for {term}"))?;
-            for alias in &aliases {
-                store
-                    .synonym_add(&term, alias)
-                    .with_context(|| format!("setting synonym {term} → {alias}"))?;
-            }
+                .synonym_set(&term, &aliases)
+                .with_context(|| format!("setting synonyms for {term}"))?;
             println!("set: {} → {}", term, aliases.join(", "));
         }
         SynonymCommand::Remove {
