@@ -31,7 +31,7 @@
     "call-graph"
   ],
   "engines": {
-    "vscode": "^1.99.0"
+    "vscode": "^1.85.0"
   },
   "categories": [
     "Programming Languages",
