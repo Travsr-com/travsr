@@ -52,6 +52,56 @@ pub fn all_repos() -> anyhow::Result<HashMap<String, PathBuf>> {
     Ok(read_registry(&registry_path()).unwrap_or_default())
 }
 
+/// Remove a single repo entry by name.
+///
+/// Returns `Ok(true)` if the entry existed and was removed, `Ok(false)` if it
+/// was absent or the registry file does not exist. Non-fatal.
+pub fn unregister(repo_name: &str) -> anyhow::Result<bool> {
+    let reg_path = registry_path();
+    let mut repos = match read_registry(&reg_path) {
+        Some(r) => r,
+        None => return Ok(false), // no registry → nothing to remove
+    };
+    if repos.remove(repo_name).is_none() {
+        return Ok(false);
+    }
+    write_registry_atomic(&reg_path, &repos)?;
+    Ok(true)
+}
+
+/// Prune stale entries — those whose `graph.db` no longer exists on disk.
+///
+/// This is the cleanup for registry pollution: `travsr init` runs in throwaway
+/// directories (e.g. tests in `/tmp`) leave entries behind that never get
+/// removed when the directory is deleted. Returns the names removed (sorted);
+/// empty when the registry is absent or already clean. Only rewrites the file
+/// when something was actually pruned.
+///
+/// O(n) over registry entries, one `stat` per entry.
+pub fn prune() -> anyhow::Result<Vec<String>> {
+    let reg_path = registry_path();
+    let repos = match read_registry(&reg_path) {
+        Some(r) => r,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut kept: HashMap<String, PathBuf> = HashMap::new();
+    for (name, db_path) in repos {
+        if db_path.exists() {
+            kept.insert(name, db_path);
+        } else {
+            removed.push(name);
+        }
+    }
+
+    if !removed.is_empty() {
+        write_registry_atomic(&reg_path, &kept)?;
+        removed.sort();
+    }
+    Ok(removed)
+}
+
 fn read_registry(path: &Path) -> Option<HashMap<String, PathBuf>> {
     let raw = std::fs::read_to_string(path).ok()?;
     let map: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -176,6 +226,58 @@ mod tests {
     fn all_repos_returns_empty_when_no_registry() {
         with_temp_home(|_| {
             assert!(all_repos().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn unregister_removes_existing_and_reports_absent() {
+        with_temp_home(|home| {
+            register("alpha", &home.join("a/graph.db")).unwrap();
+            register("beta", &home.join("b/graph.db")).unwrap();
+            assert!(unregister("alpha").unwrap(), "existing entry → true");
+            assert!(!unregister("alpha").unwrap(), "already gone → false");
+            assert!(!unregister("never").unwrap(), "never present → false");
+            let repos = all_repos().unwrap();
+            assert_eq!(repos.len(), 1);
+            assert!(repos.contains_key("beta"), "other entries preserved");
+        });
+    }
+
+    #[test]
+    fn unregister_returns_false_when_no_registry() {
+        with_temp_home(|_| {
+            assert!(!unregister("anything").unwrap());
+        });
+    }
+
+    #[test]
+    fn prune_drops_stale_keeps_live() {
+        with_temp_home(|home| {
+            // "live" gets a real graph.db on disk; "stale" points at a deleted dir.
+            let live_db = home.join("live/.travsr/graph.db");
+            std::fs::create_dir_all(live_db.parent().unwrap()).unwrap();
+            std::fs::write(&live_db, b"x").unwrap();
+            register("live", &live_db).unwrap();
+            register("stale", &home.join("gone/.travsr/graph.db")).unwrap();
+
+            let removed = prune().unwrap();
+            assert_eq!(removed, vec!["stale".to_string()]);
+            let repos = all_repos().unwrap();
+            assert_eq!(repos.len(), 1);
+            assert!(repos.contains_key("live"));
+        });
+    }
+
+    #[test]
+    fn prune_empty_when_no_registry_or_all_live() {
+        with_temp_home(|home| {
+            assert!(prune().unwrap().is_empty(), "no registry → empty");
+            let live_db = home.join("live/.travsr/graph.db");
+            std::fs::create_dir_all(live_db.parent().unwrap()).unwrap();
+            std::fs::write(&live_db, b"x").unwrap();
+            register("live", &live_db).unwrap();
+            assert!(prune().unwrap().is_empty(), "all live → nothing removed");
+            assert_eq!(all_repos().unwrap().len(), 1);
         });
     }
 }

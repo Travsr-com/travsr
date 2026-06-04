@@ -14,7 +14,7 @@ use crate::{protocol::RpcRequest, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION}
 use travsr_retrieval::OpenFilter;
 use travsr_store::{registry, SqliteStore};
 
-pub fn run(store: &SqliteStore) -> anyhow::Result<()> {
+pub fn run(store: &mut SqliteStore) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -26,7 +26,7 @@ pub fn run(store: &SqliteStore) -> anyhow::Result<()> {
         }
 
         let response = match serde_json::from_str::<RpcRequest>(&line) {
-            Ok(req) => handle_request(store, req),
+            Ok(req) => handle_request(&mut *store, req),
             Err(e) => {
                 tracing::debug!("JSON parse error: {e}");
                 Some(error_response(
@@ -61,7 +61,7 @@ fn server_capabilities() -> serde_json::Value {
     }
 }
 
-fn handle_request(store: &SqliteStore, req: RpcRequest) -> Option<String> {
+fn handle_request(store: &mut SqliteStore, req: RpcRequest) -> Option<String> {
     // JSON-RPC notifications have no id — must never receive a response.
     let id = match req.id {
         Some(id) => id,
@@ -111,7 +111,7 @@ fn handle_request(store: &SqliteStore, req: RpcRequest) -> Option<String> {
 }
 
 fn handle_tool_call(
-    store: &SqliteStore,
+    store: &mut SqliteStore,
     id: serde_json::Value,
     params: serde_json::Value,
 ) -> String {
@@ -125,7 +125,9 @@ fn handle_tool_call(
     let text = match tool_name {
         "get_dependencies" => {
             let file = args["file"].as_str().unwrap_or("");
-            tools::get_dependencies(store, file)
+            let transitive = args["transitive"].as_bool().unwrap_or(false);
+            let depth = args["depth"].as_u64().unwrap_or(3).clamp(1, 10) as u32;
+            tools::get_dependencies(store, file, transitive, depth)
         }
         "get_callers" => {
             let symbol = args["symbol"].as_str().unwrap_or("");
@@ -158,6 +160,33 @@ fn handle_tool_call(
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
             tools::get_graph_json(store, query, direction, depth, kind_filter)
         }
+        // RFC-012 A2 F1: dynamic synonym management. Single-repo (stdio) only —
+        // see `handle_tool_call_global` for the multi-repo rejection.
+        "synonym_add" => tools::synonym_add(
+            store,
+            args["term"].as_str().unwrap_or(""),
+            args["alias"].as_str().unwrap_or(""),
+        ),
+        "synonym_set" => tools::synonym_set(
+            store,
+            args["term"].as_str().unwrap_or(""),
+            args["aliases"].as_str().unwrap_or(""),
+        ),
+        "synonym_remove" => tools::synonym_remove(
+            store,
+            args["term"].as_str().unwrap_or(""),
+            args["alias"].as_str().unwrap_or(""),
+        ),
+        "synonym_remove_term" => {
+            tools::synonym_remove_term(store, args["term"].as_str().unwrap_or(""))
+        }
+        "synonym_list" => tools::synonym_list(store),
+        "synonym_reset" => tools::synonym_reset(store),
+        // VSCODE-247: global-registry management for the "Registered repos" webview.
+        "repos_list" => tools::repos_list(),
+        "repos_prune" => tools::repos_prune(),
+        "repos_remove" => tools::repos_remove(args["name"].as_str().unwrap_or("")),
+        "repo_languages" => tools::repo_languages(store),
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -182,11 +211,13 @@ fn tools_list() -> serde_json::Value {
         "tools": [
             {
                 "name": "get_dependencies",
-                "description": "Return the files and modules that a given file imports.",
+                "description": "Return the files and modules that a given file imports. Set transitive=true to follow `depends` edges recursively up to `depth` hops.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Repo-relative file path to look up dependencies for" }
+                        "file": { "type": "string", "description": "Repo-relative file path to look up dependencies for" },
+                        "transitive": { "type": "boolean", "description": "Follow dependency edges recursively. Default: false (direct imports only)." },
+                        "depth": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Max hops when transitive=true. Default: 3." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -284,6 +315,114 @@ fn tools_list() -> serde_json::Value {
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." }
                     },
                     "required": ["query"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "synonym_list",
+                "description": "List all active query-synonym pairs (term => alias) from the per-repo dynamic synonym table. Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "synonym_add",
+                "description": "Add one alias for a term to the dynamic synonym table (200-row cap). Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "term": { "type": "string", "description": "The query term to expand" },
+                        "alias": { "type": "string", "description": "An alias the term should also match" }
+                    },
+                    "required": ["term", "alias"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "synonym_set",
+                "description": "Replace ALL aliases for a term atomically. Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "term": { "type": "string", "description": "The query term to expand" },
+                        "aliases": { "type": "string", "description": "Comma-separated alias list. Replaces all existing aliases for the term." }
+                    },
+                    "required": ["term", "aliases"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "synonym_remove",
+                "description": "Remove a single (term, alias) synonym pair. Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "term": { "type": "string", "description": "The query term" },
+                        "alias": { "type": "string", "description": "The alias to remove from the term" }
+                    },
+                    "required": ["term", "alias"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "synonym_remove_term",
+                "description": "Remove ALL aliases for a term. Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "term": { "type": "string", "description": "The term whose aliases should all be removed" }
+                    },
+                    "required": ["term"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "synonym_reset",
+                "description": "Reset the dynamic synonym table to the built-in static defaults. Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "repos_list",
+                "description": "List globally registered repos as TSV (name, db_path, exists). Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "repos_prune",
+                "description": "Remove registry entries whose graph.db no longer exists. Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "repos_remove",
+                "description": "Remove a single repo from the registry by name. Stdio (single-repo) sessions only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Registry key (repo name) to remove" }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "repo_languages",
+                "description": "Return per-language node counts indexed in this repo as TSV (language, count), sorted by count descending.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
                     "additionalProperties": false
                 }
             }
@@ -433,6 +572,28 @@ fn handle_tool_call_global(
             let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 4) as u8;
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
             tools::get_graph_json_global(repos, query, direction, depth, repo_arg, kind_filter)
+        }
+        // Synonym tools mutate a single repo's table; ambiguous across the global
+        // registry. Reject cleanly rather than silently no-op or fall through to
+        // "unknown tool".
+        "synonym_add"
+        | "synonym_set"
+        | "synonym_remove"
+        | "synonym_remove_term"
+        | "synonym_list"
+        | "synonym_reset" => {
+            return error_response(
+                id,
+                INVALID_PARAMS,
+                "synonym tools require a single-repo (stdio) session".into(),
+            );
+        }
+        "repos_list" | "repos_prune" | "repos_remove" => {
+            return error_response(
+                id,
+                INVALID_PARAMS,
+                "repos tools require a single-repo (stdio) session".into(),
+            );
         }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
@@ -634,6 +795,71 @@ mod tests {
         "get_context",
         "get_graph_json",
     ];
+
+    /// Tools exposed only on the stdio (single-repo) server — never in the global
+    /// registry path. Synonyms (RFC-012 A2 F1) target one repo's table; repos
+    /// management (VSCODE-247) mutates the global registry and is meaningless to
+    /// duplicate across the per-repo global fan-out.
+    const STDIO_ONLY_TOOLS: &[&str] = &[
+        "synonym_list",
+        "synonym_add",
+        "synonym_set",
+        "synonym_remove",
+        "synonym_remove_term",
+        "synonym_reset",
+        "repos_list",
+        "repos_prune",
+        "repos_remove",
+    ];
+
+    #[test]
+    fn stdio_tools_list_contains_synonym_tools() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for expected in STDIO_ONLY_TOOLS {
+            assert!(names.contains(expected), "tools/list missing: {expected}");
+        }
+    }
+
+    #[test]
+    fn global_tools_list_excludes_synonym_tools() {
+        let list = tools_list_global();
+        let tools = list["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for forbidden in STDIO_ONLY_TOOLS {
+            assert!(
+                !names.contains(forbidden),
+                "tools_list_global must not expose stdio-only tool: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn synonym_tools_require_correct_fields() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().unwrap();
+        let required_map = [
+            ("synonym_add", &["term", "alias"][..]),
+            ("synonym_set", &["term", "aliases"][..]),
+            ("synonym_remove", &["term", "alias"][..]),
+            ("synonym_remove_term", &["term"][..]),
+            ("repos_remove", &["name"][..]),
+        ];
+        for (tool_name, fields) in required_map {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"].as_str() == Some(tool_name))
+                .unwrap_or_else(|| panic!("tool '{tool_name}' not found"));
+            let required = tool["inputSchema"]["required"].as_array().unwrap();
+            for field in fields {
+                assert!(
+                    required.iter().any(|r| r.as_str() == Some(field)),
+                    "tool '{tool_name}' must have '{field}' in required"
+                );
+            }
+        }
+    }
 
     #[test]
     fn tools_list_contains_all_tools() {

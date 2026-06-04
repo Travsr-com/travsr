@@ -244,3 +244,26 @@ suite("VSCODE-204: StdioMcpClient — callTool returns '' when daemon never resp
     assert.doesNotThrow(() => client.dispose());
   });
 });
+
+// ── VSCODE-247: parity commands registered ─────────────────────────────────
+
+suite("VSCODE-247: CLI↔UI parity commands are registered", () => {
+  test("askSymbol, manageSynonyms, showDependencies, showExecutionPath exist", async () => {
+    const ext = vscode.extensions.getExtension("travsr.travsr-vscode");
+    assert.ok(ext, "extension must be discoverable in the test host");
+    await ext!.activate();
+    const commands = await vscode.commands.getCommands(true);
+    for (const id of [
+      "travsr.askSymbol",
+      "travsr.manageSynonyms",
+      "travsr.showDependencies",
+      "travsr.showExecutionPath",
+      "travsr.showRepos",
+      "travsr.showGraphStats",
+      "travsr.showLanguages",
+      "travsr.reindexNow",
+    ]) {
+      assert.ok(commands.includes(id), `command ${id} must be registered`);
+    }
+  });
+});

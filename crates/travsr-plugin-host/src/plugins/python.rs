@@ -11,6 +11,9 @@ impl Plugin for PythonPlugin {
     fn extensions(&self) -> &[&str] {
         &["py", "pyi"]
     }
+    fn supports_phase_b(&self) -> bool {
+        true
+    }
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
         match travsr_indexer::python_parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(mut out) => {
@@ -29,7 +32,29 @@ impl Plugin for PythonPlugin {
             }
         }
     }
-    fn invoke_phase_b(&self, _req: &InvokeRequest) -> InvokeResponse {
-        InvokeResponse::default() // Python Phase B deferred
+    fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
+        match travsr_indexer::run_scip_python(&req.root, &req.corpus) {
+            Ok(Some(bytes)) => match travsr_indexer::ingest_scip(&bytes, &req.corpus) {
+                Ok(out) => InvokeResponse {
+                    nodes: out.nodes,
+                    edges: out.edges,
+                },
+                Err(e) => {
+                    tracing::warn!("python scip ingest: {e}");
+                    InvokeResponse::default()
+                }
+            },
+            Ok(None) => {
+                tracing::info!(
+                    "scip-python not found — Python Phase B skipped \
+                     (install: npm install -g @sourcegraph/scip-python)"
+                );
+                InvokeResponse::default()
+            }
+            Err(e) => {
+                tracing::warn!("scip-python failed: {e}");
+                InvokeResponse::default()
+            }
+        }
     }
 }

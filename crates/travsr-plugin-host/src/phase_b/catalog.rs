@@ -103,6 +103,9 @@ pub struct PhaseBEntry {
     /// Fallback version string used by `travsr lang install` when the GitHub API
     /// is unreachable. Keep in sync with the latest published release.
     pub wrapper_version_fallback: &'static str,
+    /// True for in-tree builtins (typescript, javascript) that are bundled with
+    /// the travsr binary — no external binary on PATH required.
+    pub builtin: bool,
 }
 
 pub static CATALOG: &[PhaseBEntry] = &[
@@ -120,6 +123,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         scip_install: ScipInstall::Command(&["npm", "install", "-g", "@travsr-plugin/typescript"]),
         extensions: &[".ts", ".tsx"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: true,
     },
     PhaseBEntry {
         language: "javascript",
@@ -135,6 +139,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         scip_install: ScipInstall::Command(&["npm", "install", "-g", "@travsr-plugin/typescript"]),
         extensions: &[".js", ".jsx", ".mjs", ".cjs"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: true,
     },
     PhaseBEntry {
         language: "rust",
@@ -150,6 +155,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         scip_install: ScipInstall::Command(&["rustup", "component", "add", "rust-analyzer"]),
         extensions: &[".rs"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: true,
     },
     PhaseBEntry {
         language: "go",
@@ -169,15 +175,16 @@ pub static CATALOG: &[PhaseBEntry] = &[
         ]),
         extensions: &[".go"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "python",
-        npm_package: Some("@travsr-plugin/python"),
+        npm_package: None,
         command: "scip-python",
         args: &[
             "index",
             "--project-name",
-            "project",
+            "{corpus}",
             "--project-version",
             "0.0.1",
             "--output",
@@ -186,13 +193,14 @@ pub static CATALOG: &[PhaseBEntry] = &[
         ],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "travsr lang install python",
+        install_hint: "npm install -g @sourcegraph/scip-python",
         underlying_tool_hint: "npm install -g @sourcegraph/scip-python",
-        provider_binary: Some("travsr-lang-python"),
+        provider_binary: None,
         elevated_hosts: &[],
         scip_install: ScipInstall::Command(&["npm", "install", "-g", "@sourcegraph/scip-python"]),
         extensions: &[".py"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: true,
     },
     PhaseBEntry {
         language: "java",
@@ -219,6 +227,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         }),
         extensions: &[".java"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "kotlin",
@@ -245,6 +254,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         }),
         extensions: &[".kt", ".kts"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "scala",
@@ -265,6 +275,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         scip_install: ScipInstall::Manual,
         extensions: &[".scala", ".sbt"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "ruby",
@@ -286,6 +297,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         }),
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "php",
@@ -301,6 +313,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         scip_install: ScipInstall::Manual,
         extensions: &[".php"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "csharp",
@@ -323,6 +336,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         ]),
         extensions: &[".cs", ".csx"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "cpp",
@@ -349,6 +363,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         }),
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
     PhaseBEntry {
         language: "c",
@@ -375,6 +390,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         }),
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.1.0",
+        builtin: false,
     },
 ];
 

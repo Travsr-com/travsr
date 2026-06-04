@@ -37,9 +37,11 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Reads JSON-RPC 2.0 requests from stdin, dispatches them to the graph
 /// tools, and writes responses to stdout. Runs until stdin is closed.
 pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
-    let store = SqliteStore::open(db_path)
+    // `&mut`: the synonym_* tools perform writes (some via SQLite transactions,
+    // which require `&mut Connection`). Read-only tools auto-reborrow `&mut`→`&`.
+    let mut store = SqliteStore::open(db_path)
         .with_context(|| format!("opening graph database at {}", db_path.display()))?;
-    server::run(&store)
+    server::run(&mut store)
 }
 
 /// Start the global MCP stdio server backed by all repos in `~/.travsr/registry.json`.

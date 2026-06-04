@@ -18,8 +18,50 @@ pub fn build_sandboxed_command(
         policy.validate()?;
     }
 
-    let repo = repo_root.to_string_lossy();
-    let scratch = scratch_dir.to_string_lossy();
+    // The Seatbelt sandbox matches paths by their *resolved* form (symlinks and
+    // firmlinks followed). On macOS `/tmp` → `/private/tmp` and `/var` →
+    // `/private/var`, so a subpath rule built from the unresolved path silently
+    // fails to match the real path the kernel sees — e.g. a scratch dir under
+    // `/var/folders/...` would be unwritable. Canonicalize so the rules match.
+    // Fall back to the original path if canonicalization fails (path still valid
+    // for the rule; the operation simply remains denied, fail-closed).
+    let repo_canon = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let scratch_canon =
+        std::fs::canonicalize(scratch_dir).unwrap_or_else(|_| scratch_dir.to_path_buf());
+    let repo = repo_canon.to_string_lossy();
+    let scratch = scratch_canon.to_string_lossy();
+
+    // Allow reading the directory holding the binary being exec'd. Builtins
+    // (current_exe) live under the repo, but external providers (travsr-lang-*,
+    // rust-analyzer) resolve to ~/.travsr/bin, node_modules, or /opt/homebrew/bin
+    // which are not otherwise readable. npm-installed providers are a *symlink*
+    // (e.g. ~/.nvm/.../bin/travsr-lang-go → .../node_modules/.../travsr-lang-go),
+    // so we must allow BOTH the symlink's directory (to resolve/exec it) and the
+    // canonicalized target's directory (to read the real binary). Without the
+    // symlink dir the kernel cannot even read the link to follow it.
+    let mut program_dirs: Vec<String> = Vec::new();
+    let mut push_parent = |path: &Path| {
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let s = dir.to_string_lossy().into_owned();
+            if !program_dirs.contains(&s) {
+                program_dirs.push(s);
+            }
+        }
+    };
+    push_parent(Path::new(program));
+    if let Ok(real) = std::fs::canonicalize(program) {
+        push_parent(&real);
+    }
+    let program_dir_rule = if program_dirs.is_empty() {
+        String::new()
+    } else {
+        let subpaths = program_dirs
+            .iter()
+            .map(|d| format!("(subpath \"{d}\")"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("(allow file-read* {subpaths})\n")
+    };
 
     // ADR-017 Rule 1: deny all by default; allow read only to system paths,
     // repo root (read-only), and scratch (read-write).
@@ -43,8 +85,21 @@ pub fn build_sandboxed_command(
         }
     };
 
+    // `(import "system.sb")` pulls in Apple's maintained base profile, which
+    // grants the minimal access the dynamic linker needs at process startup —
+    // most importantly reading the dyld shared cache (on Apple Silicon this lives
+    // on a separate APFS volume at /System/Volumes/Preboot/Cryptexes/..., which is
+    // NOT covered by a `(subpath "/System")` rule because the kernel resolves it
+    // to a different real path). Without this import, `(deny default)` blocks the
+    // shared-cache read and every spawned binary SIGABRTs inside dyld4::CacheFinder
+    // *before main() runs* — surfacing to the daemon as an instant EOF on the
+    // handshake read ("failed to fill whole buffer"). The import precedes our
+    // `(deny default)` / `(deny network*)` / write-confinement rules, which still
+    // take effect (last-match-wins), so network and out-of-scratch writes stay
+    // denied (verified by test).
     let profile = format!(
         r#"(version 1)
+(import "system.sb")
 (deny default)
 {network_rule}
 (allow process-fork process-exec* signal)
@@ -56,9 +111,10 @@ pub fn build_sandboxed_command(
     (subpath "/Library/Developer")
     (subpath "/System")
     (subpath "/private/etc")
+    (subpath "/opt/homebrew")
     (subpath "{repo}")
     (subpath "{scratch}"))
-(allow file-write* (subpath "{scratch}"))
+{program_dir_rule}(allow file-write* (subpath "{scratch}"))
 (allow mach-lookup
     (global-name "com.apple.dyld")
     (global-name "com.apple.logd")
@@ -68,6 +124,7 @@ pub fn build_sandboxed_command(
         network_rule = network_rule,
         repo = repo,
         scratch = scratch,
+        program_dir_rule = program_dir_rule,
     );
     let mut cmd = Command::new("sandbox-exec");
     cmd.args(["-p", &profile, "--"]).arg(program).args(args);

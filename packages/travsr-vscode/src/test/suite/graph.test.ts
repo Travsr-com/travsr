@@ -93,4 +93,15 @@ suite("GraphPanel", () => {
     assert.ok(html.includes("toggleVars"), "must include vars toggle function");
     assert.ok(html.includes("btn-vars"), "must include vars toggle button");
   });
+
+  test("VSCODE-247: buildLoadingHtml includes DOT/JSON export", () => {
+    const html = buildLoadingHtml();
+    assert.ok(html.includes("function exportDot"), "must define exportDot()");
+    assert.ok(html.includes("function exportJson"), "must define exportJson()");
+    assert.ok(html.includes("⤓ DOT"), "must include DOT toolbar button");
+    assert.ok(html.includes("⤓ JSON"), "must include JSON toolbar button");
+    assert.ok(html.includes("command: 'exportDot'"), "exportDot posts a message");
+    assert.ok(html.includes("command: 'exportJson'"), "exportJson posts a message");
+    assert.ok(html.includes("digraph travsr"), "DOT output is a Graphviz digraph");
+  });
 });

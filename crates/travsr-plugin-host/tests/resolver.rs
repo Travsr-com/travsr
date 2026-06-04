@@ -278,12 +278,9 @@ fn plugin_spec_standard_policy_is_deny_network() {
 /// Adding a new language without these fields fails CI immediately.
 #[test]
 fn catalog_all_external_entries_have_provider_binary() {
-    // Builtins: languages whose provider_binary is None (handled in-process).
-    let builtins = ["rust", "typescript", "javascript"];
-
     for entry in CATALOG {
-        if builtins.contains(&entry.language) {
-            // Builtins intentionally have no provider_binary — skip.
+        if entry.builtin {
+            // Builtins have no provider_binary — they are handled in-process.
             continue;
         }
 
@@ -315,6 +312,25 @@ fn catalog_all_external_entries_have_provider_binary() {
 }
 
 // ── Test 8 ────────────────────────────────────────────────────────────────────
+
+// ── Test 8 (regression) ───────────────────────────────────────────────────────
+
+/// Explicit guard: python must remain a builtin with no provider_binary.
+/// Prevents accidental reversion of the Phase B builtin promotion.
+#[test]
+fn python_catalog_entry_is_builtin() {
+    let python = CATALOG
+        .iter()
+        .find(|e| e.language == "python")
+        .expect("python must be in CATALOG");
+    assert!(python.builtin, "python must have builtin: true");
+    assert!(
+        python.provider_binary.is_none(),
+        "python builtin must have provider_binary: None"
+    );
+}
+
+// ── Test 9 ────────────────────────────────────────────────────────────────────
 
 /// PluginIndexer::new stores the corpus string, and InvokeRequest is constructed
 /// with corpus == self.corpus — exactly as invoke_phase_b_all does.
