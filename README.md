@@ -4,7 +4,7 @@
 
 > Source code is a deterministic graph, not unstructured text. Travsr builds
 > that graph on every commit and exposes it via MCP so AI agents traverse edges
-> instead of guessing from vector chunks — 80% fewer tokens, zero structural
+> instead of guessing from vector chunks. 80% fewer tokens, zero structural
 > hallucinations.
 
 [![CI](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml)
@@ -27,7 +27,7 @@ git init          # skip if already a git repo
 travsr init       # indexes TypeScript files → .travsr/graph.db
                   # auto-registers in ~/.travsr/registry.json
 
-# 3. Connect to Claude Desktop — set once, works for all repos
+# 3. Connect to Claude Desktop (set once, works for all repos)
 ```
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
@@ -48,7 +48,7 @@ Restart Claude Desktop. Ask: *"Who calls PaymentService.charge?"*
 
 > **No `cwd` needed.** `--global` reads `~/.travsr/registry.json` which
 > `travsr init` populates automatically. Every repo you init becomes
-> immediately available — no config changes required.
+> immediately available, no config changes required.
 
 ---
 
@@ -58,7 +58,7 @@ Travsr maintains a global registry at `~/.travsr/registry.json`. Every
 `travsr init` call registers that repo automatically.
 
 ```bash
-# Init each repo once — that's it
+# Init each repo once
 cd ~/projects/repo-a && travsr init
 cd ~/projects/repo-b && travsr init
 cd ~/projects/task-manager && travsr init
@@ -82,7 +82,7 @@ symbol, it searches all registered repos and prefixes results with
 
 ## Works with Every MCP-Compatible AI Tool
 
-Travsr speaks [MCP](https://modelcontextprotocol.io) — the open standard for
+Travsr speaks [MCP](https://modelcontextprotocol.io), the open standard for
 connecting AI agents to tools.
 
 ### Claude Desktop / global mode (recommended)
@@ -167,7 +167,7 @@ If you prefer to point at one specific repo, use `--db`:
 travsr mcp --stdio --db /path/to/repo/.travsr/graph.db
 ```
 
-Or omit both flags and run from inside the repo — travsr discovers the db
+Or omit both flags and run from inside the repo; travsr discovers the db
 from the current git root.
 
 ---
@@ -184,13 +184,13 @@ an optional `repo` parameter to target a specific registered repo. Omitting
 
 | Tool | Required | Optional | Description |
 |---|---|---|---|
-| `get_dependencies(file)` | `file` — file path | `repo` | Return all imports/dependencies of a file |
-| `get_callers(symbol)` | `symbol` — symbol name | `repo` | Return all nodes with an incoming edge to a symbol |
-| `get_blast_radius(file)` | `file` — file path | `repo` | Return the set of files transitively affected if the given file changes |
-| `search_symbol(name)` | `name` — symbol name | `repo` | Find symbol definitions matching a name across the indexed graph |
-| `get_repo_map` | — | `repo` | Return a structural overview of the indexed repository |
-| `get_execution_path(source, sink)` | `source`, `sink` — symbol names | `repo` | Return the PCST-optimal execution path between two symbols |
-| `get_context(query, token_budget)` | `query` — search term | `repo`, `token_budget` | PPR traversal ranked by relevance, budget-capped by 0-1 knapsack |
+| `get_dependencies(file)` | `file`: file path | `repo` | Return all imports/dependencies of a file |
+| `get_callers(symbol)` | `symbol`: symbol name | `repo` | Return all nodes with an incoming edge to a symbol |
+| `get_blast_radius(file)` | `file`: file path | `repo` | Return the set of files transitively affected if the given file changes |
+| `search_symbol(name)` | `name`: symbol name | `repo` | Find symbol definitions matching a name across the indexed graph |
+| `get_repo_map` | (none) | `repo` | Return a structural overview of the indexed repository |
+| `get_execution_path(source, sink)` | `source`, `sink`: symbol names | `repo` | Return the PCST-optimal execution path between two symbols |
+| `get_context(query, token_budget)` | `query`: search term | `repo`, `token_budget` | PPR traversal ranked by relevance, budget-capped by 0-1 knapsack |
 
 ---
 
@@ -207,12 +207,17 @@ travsr mcp --stdio --global      Start the MCP stdio server (all registered repo
 travsr mcp --stdio --db <path>   Start the MCP stdio server (explicit db path)
 travsr graph <query>             Show dependency graph for a symbol or file
 travsr graph --all               Show graph for the entire indexed repository
+travsr lang list                 List all known Phase B language indexers and their status
+travsr lang install <language>   Download and register a Phase B language indexer
+travsr lang detect               Scan the repo, detect supported languages, auto-install
+travsr lang remove <language>    Unregister a Phase B language indexer
+travsr lang approve <language>   Pre-approve a language that needs network access during indexing
 ```
 
 ### travsr migrate
 
 Migrate an existing SQLite graph to the Kùzu production backend. The SQLite
-database is never deleted — both backends coexist and `travsr status` continues
+database is never deleted; both backends coexist and `travsr status` continues
 to read from SQLite after migration.
 
 ```bash
@@ -234,7 +239,7 @@ migration complete.
   edges       : 94107
   sha256      : a3f2...
 
-tip: SQLite graph is unchanged — `travsr status` reads graph.db
+tip: SQLite graph is unchanged; `travsr status` reads graph.db
      and shows the same counts as before.
 ```
 
@@ -248,7 +253,7 @@ Visualise the dependency graph from any symbol or file as an ASCII tree,
 Graphviz DOT, or structured JSON.
 
 ```bash
-# ASCII tree (default) — what does extension.ts import and define?
+# ASCII tree (default): what does extension.ts import and define?
 travsr graph extension.ts
 
 # Who calls PaymentService.charge?
@@ -275,7 +280,7 @@ travsr graph --all --format json
 | `--direction` | `deps` | `deps` · `callers` · `both` |
 | `--depth` | `3` | Maximum traversal depth |
 | `--format` | `tree` | `tree` · `dot` · `json` |
-| `--all` | — | Dump the entire indexed graph (mutually exclusive with `<query>`) |
+| `--all` | (none) | Dump the entire indexed graph (mutually exclusive with `<query>`) |
 
 **JSON output schema** (`--format json`):
 
@@ -347,21 +352,21 @@ git init && travsr init
 git commit
   └─▶ post-commit hook fires
         └─▶ travsr hook-run <changed files>
-              └─▶ SHA-256 delta — only re-indexes changed files
+              └─▶ SHA-256 delta: only re-indexes changed files
                     └─▶ graph.db updated, last_commit SHA recorded
 
 travsr migrate --to kuzu   (optional, kuzu build only)
   └─▶ SHA-256 manifest of all edges computed from SQLite
         └─▶ nodes + edges bulk-copied to .travsr/graph.kuzu.new (staging)
-              └─▶ post-copy manifest compared — mismatch aborts, SQLite intact
+              └─▶ post-copy manifest compared; mismatch aborts, SQLite intact
                     └─▶ atomic rename: graph.kuzu.new → graph.kuzu
 ```
 
-**Graph stays current via the post-commit hook** — every committed change is
+**Graph stays current via the post-commit hook.** Every committed change is
 re-indexed automatically. The graph is also fully queryable immediately after
 `travsr init`, before any commit.
 
-Language support: **TypeScript / TSX, Rust, Python, Go**.
+Language support: **TypeScript / TSX, Rust, Python, Go** (builtin, zero configuration). Additional languages (Java, Kotlin, C#, Scala, PHP, Ruby, Swift) are available as Phase B indexers via `travsr lang install`.
 
 ### Retrieval algorithms
 
@@ -437,7 +442,7 @@ Pre-built binaries are available on the [Releases](https://github.com/raj-rkv/tr
 - **`not inside a git repository`**
   Run `git init` before `travsr init`.
 
-- **`not initialized — run travsr init`**
+- **`not initialized: run travsr init`**
   Run `travsr init` in the repo root before using `graph`, `ask`, `status`, or `mcp`.
 
 - **MCP server returns empty results in `--global` mode`**
@@ -445,13 +450,13 @@ Pre-built binaries are available on the [Releases](https://github.com/raj-rkv/tr
   If missing, re-run `travsr init` in that repo.
 
 - **Stale entries in `travsr repos` (Exists = no)**
-  Safe to ignore — they are skipped automatically. They appear when a repo
+  Safe to ignore; they are skipped automatically. They appear when a repo
   was deleted or moved after being indexed.
 
-- **`travsr migrate` — kuzu feature not enabled**
+- **`travsr migrate`: kuzu feature not enabled**
   Rebuild with `cargo build --features kuzu` (requires CMake and a C++ toolchain).
 
-- **`travsr migrate` — Kùzu store already exists**
+- **`travsr migrate`: Kùzu store already exists**
   Migration was already completed. Run `travsr status` to verify counts.
   Remove `.travsr/graph.kuzu` manually only if you need to re-migrate.
 
@@ -459,7 +464,7 @@ Pre-built binaries are available on the [Releases](https://github.com/raj-rkv/tr
   Set `TRAVSR_BINARY=/path/to/travsr` to use a local build instead.
 
 - **Corporate proxy blocks the postinstall download?**
-  Same — set `TRAVSR_BINARY` to skip the remote fetch.
+  Same: set `TRAVSR_BINARY` to skip the remote fetch.
 
 ---
 
