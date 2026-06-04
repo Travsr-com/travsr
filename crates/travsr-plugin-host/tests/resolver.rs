@@ -278,12 +278,9 @@ fn plugin_spec_standard_policy_is_deny_network() {
 /// Adding a new language without these fields fails CI immediately.
 #[test]
 fn catalog_all_external_entries_have_provider_binary() {
-    // Builtins: languages whose provider_binary is None (handled in-process).
-    let builtins = ["rust", "typescript", "javascript"];
-
     for entry in CATALOG {
-        if builtins.contains(&entry.language) {
-            // Builtins intentionally have no provider_binary — skip.
+        if entry.builtin {
+            // Builtins have no provider_binary — they are handled in-process.
             continue;
         }
 
