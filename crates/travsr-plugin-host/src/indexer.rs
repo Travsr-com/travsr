@@ -110,7 +110,12 @@ impl PluginIndexer {
         let mut all_edges = Vec::new();
 
         for lang in resolver.providable_languages() {
-            if !registered.contains(lang.as_str()) {
+            // Builtins (ts, js, rust, python) ship inside the travsr binary and
+            // are always ready — no user registration required. External plugins
+            // (go, java, …) still need explicit lang.toml registration.
+            let is_builtin =
+                crate::phase_b::catalog::lookup(lang.as_str()).is_some_and(|e| e.builtin);
+            if !is_builtin && !registered.contains(lang.as_str()) {
                 tracing::debug!(
                     "Phase B skipped for '{}' — not registered in lang.toml",
                     lang

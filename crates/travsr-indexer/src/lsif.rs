@@ -662,3 +662,90 @@ mod rust_lsif_tests {
         );
     }
 }
+
+// ── SCIP ingestion ────────────────────────────────────────────────────────────
+
+/// Ingest a raw SCIP protobuf index (produced by `scip-python`, `scip-go`, etc.)
+/// and return Travsr nodes + edges.
+///
+/// Pass 1: collect definition occurrences → `Node` records.
+/// Pass 2: collect reference occurrences → `RefCall` edges (file node → definition node).
+///
+/// Nodes use VName signatures taken verbatim from SCIP symbol strings so they are
+/// stable across re-runs.  Edges whose target symbol was not seen as a definition in
+/// this index are silently dropped (the symbol lives in another corpus/package).
+pub fn ingest_scip(bytes: &[u8], corpus: &str) -> anyhow::Result<ParseOutput> {
+    use protobuf::Message as _;
+    use std::collections::HashMap;
+    use travsr_core::{Edge, EdgeKind, Node, VName};
+
+    let index = scip::types::Index::parse_from_bytes(bytes).context("SCIP protobuf parse")?;
+
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    // SCIP symbol string → NodeId for fast edge construction.
+    let mut defs: HashMap<String, travsr_core::NodeId> = HashMap::new();
+
+    // Pass 1: definition occurrences → nodes.
+    for doc in &index.documents {
+        let path = &doc.relative_path;
+        for occ in &doc.occurrences {
+            // SymbolRole::Definition = 1 (bit flag per SCIP proto).
+            if occ.symbol_roles & 1 != 0 && !occ.symbol.is_empty() {
+                let vname = VName::new(corpus, "", path.as_str(), "python", occ.symbol.as_str());
+                let id = vname.id();
+                // range is [start_line, start_col, end_col] or 4-element form.
+                let line = occ
+                    .range
+                    .first()
+                    .copied()
+                    .map(|l| (l as u32).saturating_add(1));
+                let mut node = Node::new(vname, scip_symbol_kind(&occ.symbol));
+                if let Some(l) = line {
+                    node = node.with_line(l);
+                }
+                defs.insert(occ.symbol.clone(), id);
+                nodes.push(node);
+            }
+        }
+    }
+
+    // Pass 2: reference occurrences → RefCall edges.
+    for doc in &index.documents {
+        let path = &doc.relative_path;
+        // File-level source node — same VName as tree-sitter emits for Python files.
+        let file_id = VName::new(corpus, "", path.as_str(), "python", "").id();
+        for occ in &doc.occurrences {
+            if occ.symbol_roles & 1 == 0 && !occ.symbol.is_empty() {
+                if let Some(&dst) = defs.get(&occ.symbol) {
+                    edges.push(Edge::new(file_id, dst, EdgeKind::RefCall));
+                }
+            }
+        }
+    }
+
+    Ok(ParseOutput {
+        nodes,
+        edges,
+        ffi_markers: vec![],
+    })
+}
+
+/// Heuristic: derive a Travsr node-kind string from a SCIP symbol descriptor.
+///
+/// SCIP descriptor suffixes (per the spec):
+///   `().` → method / function
+///   `#`   → type / class member
+///   `.`   → term / variable / property
+///   `:`   → meta / annotation
+fn scip_symbol_kind(symbol: &str) -> &'static str {
+    if symbol.ends_with("().") || symbol.ends_with("()") {
+        "fn"
+    } else if symbol.contains('#') {
+        "method"
+    } else if symbol.ends_with('.') {
+        "var"
+    } else {
+        "symbol"
+    }
+}

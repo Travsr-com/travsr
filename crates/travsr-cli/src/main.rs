@@ -158,12 +158,26 @@ async fn main() {
     // Must be checked before Clap parses args (Clap would reject `__plugin`).
     if let Some("__plugin") = std::env::args().nth(1).as_deref() {
         let lang = std::env::args().nth(2).unwrap_or_default();
+        // Minimal stderr tracing so Phase B failures inside the sidecar (e.g. the
+        // LSIF emitter failing to spawn `node`, or an SCIP tool crashing) are
+        // observable when the daemon is run with RUST_LOG set. Defaults to error
+        // only — no noise in normal operation. We do NOT call the full
+        // init_tracing(): that may start the OTLP/Tokio exporter, which the
+        // short-lived, stdin/stdout-framed plugin loop must not depend on.
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
+            )
+            .try_init();
         use travsr_plugin_host::plugins;
         match lang.as_str() {
             "typescript" | "javascript" => {
                 travsr_plugin_sdk::run_plugin(plugins::typescript::TypeScriptPlugin)
             }
             "rust" => travsr_plugin_sdk::run_plugin(plugins::rust::RustPlugin),
+            "python" => travsr_plugin_sdk::run_plugin(plugins::python::PythonPlugin),
             other => {
                 eprintln!("unknown __plugin language: {other}");
                 std::process::exit(1);

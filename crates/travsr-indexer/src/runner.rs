@@ -1,8 +1,7 @@
-//! Subprocess runner for `travsr-lsif-ts`.
+//! Subprocess runners for language Phase B tools.
 //!
-//! Runs the Node.js LSIF emitter as a child process and captures its stdout
-//! (the LSIF JSON-Lines dump). The emitter is resolved relative to the travsr
-//! binary — no global PATH install required.
+//! `run_lsif_emitter` — Node.js LSIF emitter for TypeScript/JavaScript.
+//! `run_scip_python`  — scip-python SCIP indexer for Python.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -124,6 +123,107 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
     }
 
     Ok(stdout)
+}
+
+// ── scip-python ───────────────────────────────────────────────────────────────
+
+/// Hard ceiling for `scip-python` (large projects can be slow).
+const SCIP_PYTHON_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Locate the `scip-python` binary.
+///
+/// Resolution order:
+/// 1. `SCIP_PYTHON_PATH` env var — absolute path.
+/// 2. `scip-python` on PATH.
+fn find_scip_python() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("SCIP_PYTHON_PATH") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("scip-python");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Run `scip-python index` on `root` and return the raw SCIP protobuf bytes.
+///
+/// Returns `Ok(None)` when `scip-python` is not installed (graceful degradation).
+/// Returns `Ok(Some(bytes))` on success.
+/// Returns `Err` if `scip-python` is found but fails or times out.
+///
+/// Install: `npm install -g @sourcegraph/scip-python`
+pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    use anyhow::Context as _;
+
+    let scip_python = match find_scip_python() {
+        Some(p) => p,
+        None => {
+            tracing::debug!(
+                "scip-python not found on PATH — Python Phase B skipped \
+                 (install: npm install -g @sourcegraph/scip-python)"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Write SCIP output to a scratch tempdir so we can read it back.
+    let scratch = tempfile::Builder::new()
+        .prefix("travsr-scip-python-")
+        .tempdir()
+        .context("create scip-python scratch dir")?;
+    let output = scratch.path().join("index.scip");
+
+    let mut child = std::process::Command::new(&scip_python)
+        .args([
+            "index",
+            "--project-name",
+            corpus,
+            "--project-version",
+            "0.0.1",
+            "--output",
+            output.to_str().unwrap_or("index.scip"),
+        ])
+        .arg(root)
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn scip-python for {}", root.display()))?;
+
+    let deadline = Instant::now() + SCIP_PYTHON_TIMEOUT;
+    let status = loop {
+        match child.try_wait().context("polling scip-python")? {
+            Some(s) => break s,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                anyhow::bail!(
+                    "scip-python timed out after {}s — killed",
+                    SCIP_PYTHON_TIMEOUT.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(200)),
+        }
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+
+    if !status.success() {
+        anyhow::bail!("scip-python exited with {status}: {stderr}");
+    }
+
+    let bytes =
+        std::fs::read(&output).with_context(|| format!("read scip output {}", output.display()))?;
+    Ok(Some(bytes))
 }
 
 #[cfg(test)]
