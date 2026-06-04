@@ -56,19 +56,19 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   const available: LangInfo[] = [
     {
       language: "rust", package: "scip-rust", sandbox: "Standard",
-      installed: true, registered: true, needsApproval: false,
+      installed: true, registered: true, builtin: true, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
     },
     {
       language: "java", package: "scip-java", sandbox: "Elevated",
-      installed: false, registered: false, needsApproval: true,
+      installed: false, registered: false, builtin: false, needsApproval: true,
       scipInstallType: "GithubBinary", installHint: "travsr lang install java",
       underlyingToolHint: "", elevatedHosts: ["repo1.maven.org"],
     },
     {
       language: "scala", package: "scip-scala", sandbox: "Elevated",
-      installed: false, registered: false, needsApproval: false,
+      installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Manual", installHint: "travsr lang install scala",
       underlyingToolHint: "https://docs.scala-lang.org/scip", elevatedHosts: [],
     },
@@ -82,8 +82,9 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   });
   test("renders available tools with correct action cells", () => {
     const html = buildLanguagesHtml([], available);
-    // rust: registered+installed → Disable button (active overrides detection gate)
-    assert.ok(html.includes("removeLang") && html.includes("Disable"));
+    // rust: registered+installed+builtin → Built-in badge (no Disable button for builtins)
+    assert.ok(html.includes("Built-in"), "builtin shows Built-in badge");
+    assert.ok(!html.includes('onclick="removeLang'), "builtin has no Disable onclick");
     // java: needsApproval → consent form (inside not-here disclosure when undetected)
     assert.ok(html.includes("approveLang") && html.includes("Grant"));
     assert.ok(html.includes("repo1.maven.org"), "elevated hosts pre-filled");
@@ -100,7 +101,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
     const indexedWithRust: LangCount[] = [{ language: "rust", count: 10 }];
     const uninstalledRust: LangInfo[] = [{
       language: "rust", package: "scip-rust", sandbox: "Standard",
-      installed: false, registered: false, needsApproval: false,
+      installed: false, registered: false, builtin: false, needsApproval: false,
       scipInstallType: "Command", installHint: "travsr lang install rust",
       underlyingToolHint: "", elevatedHosts: [],
     }];

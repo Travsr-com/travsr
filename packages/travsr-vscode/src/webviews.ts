@@ -338,6 +338,7 @@ export interface LangInfo {
   sandbox: "Standard" | "Elevated";
   installed: boolean;
   registered: boolean;
+  builtin: boolean;
   needsApproval: boolean;
   scipInstallType: "GithubBinary" | "Command" | "Manual";
   installHint: string;
@@ -387,7 +388,9 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
 
       // Raw action HTML (used directly when detected or active; wrapped otherwise)
       let rawAction: string;
-      if (active) {
+      if (active && l.builtin) {
+        rawAction = `<span class="badge ok" title="Built-in to the travsr binary — always active, cannot be disabled">Built-in</span>`;
+      } else if (active) {
         rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
       } else if (l.needsApproval) {
         rawAction = `<details class="consent">

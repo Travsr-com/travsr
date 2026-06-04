@@ -164,6 +164,11 @@
           "group": "navigation"
         },
         {
+          "command": "travsr.askSymbol",
+          "when": "view == travsrGraph",
+          "group": "1_travsr@0"
+        },
+        {
           "command": "travsr.manageSynonyms",
           "when": "view == travsrGraph",
           "group": "1_travsr@1"

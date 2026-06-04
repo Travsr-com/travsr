@@ -164,12 +164,13 @@ fn cmd_list(json: bool) -> Result<()> {
                 ScipInstall::Manual => "Manual",
             };
             entries.push(format!(
-                r#"{{"language":{},"package":{},"sandbox":{},"installed":{},"registered":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{}}}"#,
+                r#"{{"language":{},"package":{},"sandbox":{},"installed":{},"registered":{},"builtin":{},"needsApproval":{},"scipInstallType":{},"installHint":{},"underlyingToolHint":{},"elevatedHosts":{}}}"#,
                 json_str(entry.language),
                 json_str(package),
                 json_str(sandbox),
                 installed,
                 registered,
+                entry.builtin,
                 needs_approval,
                 json_str(scip_type),
                 json_str(entry.install_hint),
