@@ -388,7 +388,7 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
 
       // Raw action HTML (used directly when detected or active; wrapped otherwise)
       let rawAction: string;
-      if (active && l.builtin) {
+      if (l.builtin) {
         rawAction = `<span class="badge ok" title="Built-in to the travsr binary — always active, cannot be disabled">Built-in</span>`;
       } else if (active) {
         rawAction = `<button class="btn danger" onclick="removeLang(this,'${esc(l.language)}')">Disable</button>`;
@@ -417,9 +417,10 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
         rawAction = `<button class="btn primary" onclick="installLang(this,'${esc(l.language)}')">Install</button>`;
       }
 
-      // Gate: undetected + inactive languages get a disclosure instead of a direct button.
+      // Gate: undetected + inactive non-builtins get a disclosure instead of a direct button.
+      // Builtins always show their badge directly — they're always available regardless of repo.
       const actionCell =
-        !detected && !active
+        !detected && !active && !l.builtin
           ? `<details class="not-here"><summary>Not in this repo</summary><div class="not-here-body">${rawAction}</div></details>`
           : rawAction;
 
