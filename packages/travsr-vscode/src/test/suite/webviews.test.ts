@@ -121,7 +121,8 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   test("detects empty indexed section", () => {
     const html = buildLanguagesHtml([], []);
     assert.ok(html.includes("No language metadata"));
-    assert.ok(html.includes("initRepo"), "Initialize button present in empty state");
+    assert.ok(html.includes('id="initBtn"'), "Initialize button element present in empty state");
+    assert.ok(html.includes('onclick="initRepo(this)"'), "Initialize button onclick wired");
   });
   test("detect and refresh buttons present", () => {
     const html = buildLanguagesHtml(indexed, available);

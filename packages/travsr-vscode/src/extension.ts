@@ -89,9 +89,13 @@ export function activate(context: vscode.ExtensionContext): void {
     const dbWatcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(workspaceRoot, ".travsr/graph.db")
     );
+    let restartInProgress = false;
     dbWatcher.onDidCreate(() => {
+      if (restartInProgress) return;
+      restartInProgress = true;
       channel.appendLine("graph.db created — reconnecting Travsr daemon…");
       void doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed).then(() => {
+        restartInProgress = false;
         void vscode.window.showInformationMessage("Travsr: graph initialized — daemon reconnected.");
       });
     });

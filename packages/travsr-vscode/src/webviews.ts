@@ -478,7 +478,7 @@ function detectLangs(btn) {
 }
 function doRefresh(btn) { setLoading(btn, true, 'Refresh'); vscode.postMessage({command:'refresh'}); }
 function reloadAvail(btn) { setLoading(btn, true, 'Reload available tools'); vscode.postMessage({command:'reloadAvailable'}); }
-function initRepo(btn) { setLoading(btn, true, 'Initialize this repo'); vscode.postMessage({command:'initRepo'}); }`;
+function initRepo(btn) { setLoading(btn, true, btn.innerText || 'Initialize this repo'); vscode.postMessage({command:'initRepo'}); }`;
 
   return webviewShell("Travsr Languages", body, script);
 }

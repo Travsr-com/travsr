@@ -313,6 +313,25 @@ fn catalog_all_external_entries_have_provider_binary() {
 
 // ── Test 8 ────────────────────────────────────────────────────────────────────
 
+// ── Test 8 (regression) ───────────────────────────────────────────────────────
+
+/// Explicit guard: python must remain a builtin with no provider_binary.
+/// Prevents accidental reversion of the Phase B builtin promotion.
+#[test]
+fn python_catalog_entry_is_builtin() {
+    let python = CATALOG
+        .iter()
+        .find(|e| e.language == "python")
+        .expect("python must be in CATALOG");
+    assert!(python.builtin, "python must have builtin: true");
+    assert!(
+        python.provider_binary.is_none(),
+        "python builtin must have provider_binary: None"
+    );
+}
+
+// ── Test 9 ────────────────────────────────────────────────────────────────────
+
 /// PluginIndexer::new stores the corpus string, and InvokeRequest is constructed
 /// with corpus == self.corpus — exactly as invoke_phase_b_all does.
 /// Pure unit test: no sidecar spawn, no network, no binaries required.

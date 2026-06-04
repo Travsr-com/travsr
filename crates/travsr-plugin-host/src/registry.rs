@@ -122,7 +122,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         true
     );
     register!(RustPlugin, "rust", &["rs"], true);
-    register!(PythonPlugin, "python", &["py", "pyi"], false);
+    register!(PythonPlugin, "python", &["py", "pyi"], true);
     register!(GoPlugin, "go", &["go"], false);
     register!(JavaPlugin, "java", &["java"], false);
 

@@ -709,9 +709,9 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
     const proc = cp.spawn(binary, args, { env: { ...process.env }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
-    proc.on("close", () => done(out));
-    proc.on("error", (e) => done(`error: ${e.message}`));
-    setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, timeoutMs);
+    const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, timeoutMs);
+    proc.on("close", () => { clearTimeout(timer); done(out); });
+    proc.on("error", (e) => { clearTimeout(timer); done(`error: ${e.message}`); });
   });
 }
 
