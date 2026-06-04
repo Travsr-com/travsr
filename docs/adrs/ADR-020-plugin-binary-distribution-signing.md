@@ -128,20 +128,41 @@ SDK/registry. Until then:
 - a user-supplied `--command` binary still runs (ADR-017 Rule 3 trust + sandbox) but
   carries **no authenticity guarantee** and is surfaced as such in `travsr languages`.
 
+### Rule 6 — Phase B analyzers are shared, often third-party, and hash-pinned
+
+RFC-013 D6a makes a Phase B **analyzer** (e.g. `scip-java`) a first-class shared
+entity serving several languages. Analyzers split into two authenticity classes:
+
+- **Org-republished analyzers** (a Travsr-built wrapper/redistribution) → treated
+  exactly like a `travsr-lang-*` binary: cosign-signed, identity pinned (Rules 1–2).
+- **Third-party analyzers** (`scip-java`, `rust-analyzer`, `scip-python`, … installed
+  via their own ecosystems) → Travsr does **not** publish or sign these, so their
+  authenticity rests on: a **catalog-pinned expected `sha256` (and/or upstream
+  publisher identity where available)**, the ADR-019 verification probe, and the
+  ADR-017 sandbox. Verified at AUTHORIZE against the pinned hash before spawn.
+
+In **both** classes the analyzer is **hash-pinned and re-verified at spawn** — never
+trusted by path — because RFC-013 D6a shares one analyzer across languages, so a
+single tampered analyzer is a **concentrated blast radius** (poisons every language
+it serves). A user-pointed analyzer path (the D6a manual override) is a
+`--command`-class decision: it runs sandboxed but carries no authenticity guarantee
+unless it matches a pinned hash/identity, and is surfaced as such.
+
 ---
 
 ## Threat model — rows touched / added (T-table)
 
 > Numbering continues the global table; ADR-017 occupies T11–T13, ADR-018 T14–T16,
-> ADR-019 T17–T19. This ADR is the home of **T11**'s plugin-binary supply-chain
+> ADR-019 T17–T19/T22. This ADR is the home of **T11**'s plugin-binary supply-chain
 > facet (ADR-017 framed T11 as the `--command` case; here it gains the *signed
-> distribution* mitigation for first-party plugins).
+> distribution* mitigation for first-party plugins). T20/T21/T23 are this ADR's.
 
 | Row | Asset | Threat | Likelihood | Impact | Mitigation | Δ |
 |---|---|---|---|---|---|---|
 | **T11 (extended)** | Developer machine / private source | A malicious or compromised `travsr-lang-*` binary runs in the user's authority and indexes/exfiltrates private code | Med (supply chain) | Critical | Cosign signature + SLSA provenance (Rule 1); identity pinned in catalog, verified at AUTHORIZE before spawn (Rule 2); ADR-017 sandbox contains residual blast radius | extended (signed distribution) |
 | **T20 (new)** | Plugin binary in transit | Binary tampered/substituted between CI build and the user's machine (MITM, registry compromise) | Low | Critical | Signature verified post-download before extraction (Rule 3 npm `postinstall`) and again at AUTHORIZE (Rule 2); hash-pinned distribution | new |
 | **T21 (new)** | Wire contract | A `protocol_version`-mismatched plugin is driven and mis-decodes into forged graph data | Low | High | Fail-fast registration refusal (Rule 4 / ADR-017 Rule 5); coordinated protocol-bump releases | new |
+| **T23 (new)** | Multiple languages' graphs | A tampered/substituted **shared analyzer** (`scip-java`) poisons every language it serves at once (concentrated blast radius, RFC-013 D6a) | Low | High | Analyzer hash-pinned in catalog + verdict, re-verified at spawn (Rule 6); org-republished analyzers signed; user-pointed path runs sandboxed + surfaced as unauthenticated | new |
 
 ---
 
@@ -157,6 +178,10 @@ SDK/registry. Until then:
   **not** skip signature/hash re-check at spawn.
 - **Provenance:** the SLSA attestation must name the expected source repo + builder;
   a missing/foreign provenance fails.
+- **Shared-analyzer tamper (T23):** a `scip-java` whose `sha256` differs from the
+  catalog-pinned hash is refused at AUTHORIZE for **all** languages it serves (Java,
+  Kotlin, Scala), not just one; a user-pointed path not matching the pin is surfaced
+  as unauthenticated.
 - **Protocol mismatch (T21):** a plugin advertising an unsupported `protocol_version`
   is refused at registration, not driven.
 - **ARM64 delivery:** the install path selects the `aarch64` artifact on Apple

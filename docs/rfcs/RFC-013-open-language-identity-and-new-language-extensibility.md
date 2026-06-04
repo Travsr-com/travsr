@@ -178,6 +178,7 @@ Concretely, the agreed sub-decisions:
 | D-4 | **Runtime subscription + verification** with a tiered verdict, replacing compile-time `register_builtins`. | Makes open identity safe — a broken/garbage-emitting plugin is quarantined, not admitted. |
 | D-5 | **Verdict cache** in `~/.travsr`, keyed by binary hash; environmental failures never poison a binary's reputation. | Correct binaries stay subscribable across transient system errors; reproducible binary faults stick. |
 | D-6 | **Host-prerequisite declaration + graceful degradation.** Phase B's toolchain (JDK, build tool) is declared and discovered, never bundled; missing toolchain → Phase-A-only, not failure. | Java with no JVM still yields a correct structural graph. |
+| D-7 | **Shared analyzers as a first-class entity, with auto-onboarding.** A Phase B analyzer (e.g. `scip-java`) is stored once and *referenced* by languages, not replicated per language. A language whose declared analyzer is already verified **auto-onboards silently** (Phase B verified in the background); trust to execute is keyed **per (corpus, analyzer)** and covers every language that analyzer serves. | `scip-java` indexes the whole JVM build in one run; Java/Kotlin/Scala share that one invocation. De-dups install + execution, no second trust prompt. (Resolves former Open Question #4.) |
 
 ---
 
@@ -370,6 +371,59 @@ installed — zero change to the plugin binary.** Phase B is verified at the
 **protocol level** (emits valid SCIP/LSIF, VNames valid) + prerequisite
 satisfiability — not semantic completeness (build-dependent, no oracle).
 
+### D6a — Shared analyzers & auto-onboarding (resolves former Q4)
+
+One analyzer serves several languages: `scip-java` indexes the **whole JVM build**
+in one run, covering Java, Kotlin, and Scala together. So the analyzer is **not** a
+per-language thing — it is a **first-class, shared entity** that languages
+*reference*, never replicate. (Today the catalog already duplicates
+`command: "scip-java"` across the java and kotlin rows — this de-duplicates it.)
+
+**Phase A is per-language; Phase B is per-analyzer/build, shared:**
+- Each language keeps its own grammar plugin, `LanguageId`, and structural graph.
+- One analyzer is installed once (shared store, `~/.travsr/analyzers/…` — on-disk
+  layout is an open question; the **verdict keys on `sha256(analyzer)` regardless**)
+  and invoked **once per build root**, producing semantic edges for every
+  `LanguageId` it covers.
+
+**"Verified" is two facts, only one of which is reused (the invariant guard):**
+
+| Fact | Scope | Reused across languages? |
+|---|---|---|
+| Analyzer binary is authentic + sound | per `sha256(analyzer)`, global | ✅ yes — the de-dup |
+| Analyzer emits valid SCIP **for this language** | per `(analyzer-hash, LanguageId)`, global | ❌ no — first-time pairing check per language |
+
+scip-java being verified for Java does **not** prove it handles Scala; the
+first-time-per-language pairing check (valid SCIP + VNames over the language's
+fixture) is what keeps auto-onboarding honest.
+
+**Trust to execute is keyed per `(corpus, analyzer)` (D-7).** Running scip-java
+*executes the project build* — code execution, gated per-corpus by ADR-017 Rule 3.
+But because Java/Kotlin/Scala are **one** scip-java invocation, trusting the
+analyzer for a corpus once **covers every language it serves** — no second prompt.
+
+**Auto-onboard silently, verify Phase B in the background — without admitting
+unverified output:**
+- A language whose declared analyzer is already verified + corpus-trusted
+  **auto-onboards with no prompt.** Phase A activates **immediately** (always safe).
+- The `(analyzer-hash, LanguageId)` pairing check runs in the **background**;
+  **Phase B semantic edges are held out of the graph until it passes.** "Silent"
+  means no user prompt — **not** "merge unverified nodes." On pass → Phase B
+  activates; on fail → Phase B stays off with a surfaced diagnostic; Phase A is
+  unaffected throughout (graceful degradation, D6).
+- **Manual override is the escape hatch:** the user may rebind a language's analyzer
+  (id / version / path) per-language (global default) or per-corpus. A user-pointed
+  arbitrary binary is a `--command`-class trust decision (ADR-017/020) and carries
+  **no authenticity guarantee** unless org-signed. A rebind re-verifies Phase B.
+
+**Concentrated blast radius (security note):** a shared analyzer means one tampered
+`scip-java` poisons three languages — so the analyzer is **hash-pinned in the
+verdict and re-verified at spawn**, never trusted by path alone (ADR-019/020).
+
+This is owned in detail by **ADR-019** (analyzer verdict facets, pairing check,
+auto-onboard, per-`(corpus, analyzer)` trust) and **ADR-020** (analyzer signing,
+user-pointed-analyzer caveat).
+
 ### D7 — Resource governance (DevOps; ADR-018)
 
 `supervisor.rs` today is crash-count only (`record_crash`, `is_disabled`);
@@ -497,7 +551,11 @@ plugin is quarantined; a correct binary survives a simulated transient failure.
 [ ] SWE:  promote catalog (command/sandbox/elevated_hosts/install_hint) into handshake (M)
 [ ] SWE:  tiered verdict Active(A+B) / Active(A only) + auto-upgrade on toolchain appear (L)
 [ ] SWE:  Phase B protocol-level conformance + prereq satisfiability (M)
+[ ] SWE:  shared analyzer entity + store; analyzer verdict keyed by sha256 (D6a) (L)
+[ ] SWE:  (analyzer-hash, LanguageId) pairing check; silent auto-onboard, Phase B held until pass (L)
+[ ] SWE:  trust per (corpus, analyzer); manual rebind override (per-lang/per-corpus) (M)
 [ ] QA:   missing-JDK degradation; toolchain-appears upgrade path (M)
+[ ] QA:   auto-onboard: Kotlin/Scala ride Java's verified scip-java; Phase B not merged pre-pairing (L)
 ```
 
 ### Phase 5 — Builtin re-split (4 builtin + rest plugins)  [Sprint D, incremental]
@@ -541,9 +599,11 @@ subscribed sidecar plugins; `travsr languages` shows per-language tiered verdict
 3. Trust for a non-enumerated `LanguageId`: is catalog entry + ADR-017 corpus trust
    sufficient, or do we want a separate per-language allowlist? (Lean: catalog
    entry *is* the allowlist.)
-4. Cross-language analyzer sharing: Java, Kotlin, and Scala all drive `scip-java`.
-   Does each subscribe independently, or do they share one Phase B provider
-   process? (Affects D6 prerequisite declaration + verdict granularity.)
+4. ~~Cross-language analyzer sharing~~ — **RESOLVED (D-7 / D6a):** shared
+   first-class analyzer, one invocation per build root, trust per `(corpus,
+   analyzer)`, silent auto-onboard with background Phase-B verification.
+   *Still open within this:* the on-disk analyzer store layout — content-hash dir
+   vs `name@version` dir vs hybrid (the verdict keys on `sha256` either way).
 5. Probe retry count N and backoff schedule for the reproducibility rule — tune
    against real flake rates.
 6. macOS memory enforcement fidelity — is an RSS-sampling watchdog tight enough,
@@ -558,7 +618,7 @@ _Pending sign-off._
 - **Principal Architect:** open identity + Direction A + invariant guards (VName,
   determinism) — _pending_.
 - **Principal Security Engineer:** authorize-before-execute, signing (ADR-020),
-  threat rows T11–T14 — _NEEDS_THREAT_MODEL on Phase 1 boundary diff_.
+  threat rows T11 (ext)/T14–T21 — _NEEDS_THREAT_MODEL on Phase 1 boundary diff_.
 - **Tech Lead:** phasing + boundary-stability CI guard — _pending_.
 - **DevOps:** resource governance (ADR-018) + plugin distribution matrix — _pending_.
 
@@ -579,4 +639,5 @@ Commit target: master after PR #271 merges (per project plan), as
 | 2026-06-04 | — | RFC reframed from "Option 3, defer Option 2" to "Direction A: out-of-process grammars + subscribe/verify." Root cause refined to `Plugin::language() -> Language` (`plugin.rs:7`), deeper than the dispatcher symptom. | Discussion established the shipped sidecar makes Direction A the cheapest *and* most complete path; the trait — not just the dispatcher — is the gate. |
 | 2026-06-04 | D8 | Threat rows renumbered: RFC's draft T11–T14 collided with ADR-017's existing global T11–T13. Detailed rows moved into the owning ADRs; RFC now references canonical numbers T11 (ext), T14–T16 (ADR-018), T17–T19 (ADR-019), T20–T21 (ADR-020). | The T-table is a global, project-wide sequence; ADR-017 already claimed T11–T13. |
 | 2026-06-04 | refs | ADR-018 / ADR-019 / ADR-020 drafted (`docs/adrs/`) on branch `rfc/013-language-pluggability`. | The three dependency decisions the RFC named are now written. |
+| 2026-06-04 | D-7 / D6a / Q4 | Open Question #4 resolved: shared first-class analyzer (one invocation per build root), trust per `(corpus, analyzer)`, silent auto-onboard with background Phase-B pairing verification (output held until pass). New D-7 row, D6a section, Phase-4 tasks; ADR-019/020 patched. Storage-layout sub-question remains open. | User chose shared analyzer + auto-onboard; `scip-java` indexes the whole JVM build in one run, so per-language replication is wrong. |
 | _next_ | _e.g. D4_ | _e.g. added `Quarantined{IncompatibleAbi}` verdict_ | _e.g. discovered during Phase 2 that a grammar ABI mismatch needs its own sticky reason_ |

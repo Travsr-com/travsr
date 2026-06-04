@@ -170,17 +170,64 @@ verdicts do not expire by time; a verified binary stays verified.
 probe regardless of any cached verdict — including overriding a HARD `Rejected` —
 for the residual misclassification / "I fixed my environment" case.
 
+### Rule 6 — Shared analyzers, two-facet verification, and silent auto-onboarding
+
+A Phase B analyzer (e.g. `scip-java`) serves multiple languages from **one
+invocation over the whole build** (Java/Kotlin/Scala). It is therefore a
+**first-class, shared, content-addressed entity**, stored once and *referenced* by
+languages — never replicated per language (RFC-013 D-7 / D6a).
+
+**"Verified" is two distinct facts, cached at different scopes:**
+
+| Fact | Cache key | Reused across languages? |
+|---|---|---|
+| Analyzer binary is authentic + sound (signature + probe) | `sha256(analyzer)`, global | **yes** — the de-dup |
+| Analyzer emits valid SCIP **for this language** (pairing) | `(sha256(analyzer), LanguageId)`, global | **no** — first-time per language |
+
+The pairing check is the cheap protocol-level conformance of Rule 2 (valid SCIP +
+VNames over the language's fixture) — it does **not** re-verify the binary, only the
+language↔analyzer fit. This is what keeps auto-onboarding from assuming scip-java
+handles Scala just because it handled Java.
+
+**Trust to execute is keyed per `(corpus, analyzer)`.** Running the analyzer
+executes the project build (code execution, ADR-017 Rule 3, per-corpus). Because the
+languages share **one** invocation, trusting the analyzer for a corpus once covers
+**every language it serves** — no per-language re-prompt.
+
+**Silent auto-onboard, background pairing verification, no unverified output:**
+- A language whose declared analyzer is already binary-verified **and**
+  corpus-trusted **auto-onboards with no prompt**. Phase A activates immediately.
+- The pairing check runs in the **background**; **Phase B edges are held out of the
+  graph until it passes.** "Silent" = no prompt, **not** "admit unverified nodes"
+  (preserves the VName/incremental invariants). Pass → Phase B activates; fail →
+  Phase B stays off with a diagnostic; Phase A unaffected (graceful degradation).
+- **Manual override:** the user may rebind a language's analyzer (id/version/path),
+  per-language (global default) or per-corpus. A user-pointed arbitrary binary is a
+  `--command`-class decision (ADR-017/020) with no authenticity guarantee unless
+  org-signed. A rebind is a Phase-B re-verification trigger.
+
+**Re-verification trigger matrix — Phase B addendum (extends Rule 5):** analyzer
+`sha256` change · analyzer rebind · analyzer-version change, in addition to the
+plugin-binary triggers. Phase A triggers are unchanged (grammar lives in the plugin
+binary, independent of the analyzer).
+
+**Concentrated blast radius:** a shared analyzer means one tampered binary affects
+every language it serves — so it is **hash-pinned in the verdict and re-verified at
+spawn** (Rule 4 advisory-cache posture, ADR-020 signature), never trusted by path.
+
 ---
 
 ## Threat model — rows touched / added (T-table)
 
 > Numbering continues the global table; ADR-017 occupies T11–T13, ADR-018 T14–T16.
+> (T20–T21 belong to ADR-020; T22 below is this ADR's auto-onboard row.)
 
 | Row | Asset | Threat | Likelihood | Impact | Mitigation | Δ |
 |---|---|---|---|---|---|---|
 | **T17 (new)** | Graph integrity | A tampered `subscriptions.lock` marks a malicious binary `Active` to bypass verification | Low | High | Cache is advisory only (Rule 4): hash re-checked at spawn; AUTHORIZE (trust + signature) re-runs regardless of cached `Active`; cache never committed to a repo | new |
 | **T18 (new)** | Graph integrity | A plugin emits nodes under a spoofed `LanguageId` to poison another language's graph slice | Low | Med | Conformance probe asserts `node.language == declared LanguageId` (Rule 2); per-corpus trust scopes admissible languages (ADR-005/017) | new |
 | **T19 (new)** | Availability / DoS | A flaky plugin is re-probed in a tight loop, spawning untrusted code repeatedly | Med | Med | SOFT failures re-probe only on a trigger (Rule 5), not in a loop; HARD failures never auto-retry; AUTHORIZE precedes every probe | new |
+| **T22 (new)** | Graph integrity | Silent auto-onboarding (Rule 6) admits Phase B nodes for a newly-shared language before the `(analyzer, language)` pairing check confirms valid output | Low | Med | Phase B edges **held out of the graph until the background pairing check passes** (Rule 6); `(corpus, analyzer)` trust never auto-extends to a *new* analyzer; Phase A only until then | new |
 
 ---
 
@@ -200,6 +247,12 @@ for the residual misclassification / "I fixed my environment" case.
 - **Disable/enable:** disabling then re-enabling an unchanged binary → no re-probe.
 - **Cache tamper (T17):** a hand-edited `Active` for a binary that fails the live
   trust/signature gate is **ignored**; the binary is not admitted.
+- **Shared-analyzer auto-onboard (Rule 6/T22):** with `scip-java` verified +
+  corpus-trusted for Java, Kotlin auto-onboards with no prompt; its Phase B edges
+  are **not merged** until the `(scip-java, kotlin)` pairing check passes; Phase A
+  is available throughout. The analyzer binary is **not** re-verified for Kotlin.
+- **New analyzer is not auto-trusted:** a language declaring an analyzer the corpus
+  has **not** trusted does **not** auto-enable Phase B execution (only Phase A).
 - **`--force`:** overrides a cached HARD `Rejected` and re-runs the probe.
 
 ---
