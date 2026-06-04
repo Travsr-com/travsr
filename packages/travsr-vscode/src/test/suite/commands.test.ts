@@ -145,12 +145,13 @@ suite("VSCODE-247: resolveDepSpec", () => {
     assert.strictEqual(resolveDepSpec("use:clap::Parser", "/src/a.ts", () => false), undefined);
   });
   test("resolves relative import with .ts extension candidate", () => {
-    const exists = (p: string) => p === "/src/status.ts";
+    // Normalize separators so the mock works on Windows (path.resolve uses backslashes there).
+    const exists = (p: string) => p.replace(/\\/g, "/").endsWith("/src/status.ts");
     const result = resolveDepSpec("import:./status", "/src/a.ts", exists);
     assert.ok(result?.includes("status.ts"), `expected status.ts, got ${result ?? "undefined"}`);
   });
   test("resolves relative import via index.ts fallback", () => {
-    const exists = (p: string) => p === "/src/utils/index.ts";
+    const exists = (p: string) => p.replace(/\\/g, "/").endsWith("/src/utils/index.ts");
     const result = resolveDepSpec("import:./utils", "/src/a.ts", exists);
     assert.ok(result?.includes("index.ts"), `expected index.ts, got ${result ?? "undefined"}`);
   });
