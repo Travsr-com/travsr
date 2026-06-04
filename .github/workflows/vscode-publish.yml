@@ -115,7 +115,7 @@ jobs:
 
       - name: Publish to VS Code Marketplace
         if: ${{ !inputs.dry_run }}
-        run: npx vsce publish --no-dependencies --packagePath ${{ needs.build.outputs.vsix_name }}
+        run: npx vsce publish --no-dependencies --allow-proposed-apis chatContextProvider --packagePath ${{ needs.build.outputs.vsix_name }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
