@@ -83,6 +83,21 @@ export function activate(context: vscode.ExtensionContext): void {
   wireDisconnectHandler(rawClient, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
   void rawClient.connect();
 
+  // Watch for graph.db creation so the daemon reconnects automatically after
+  // `travsr init` runs on a fresh repo, without requiring a window reload.
+  if (workspaceRoot) {
+    const dbWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(workspaceRoot, ".travsr/graph.db")
+    );
+    dbWatcher.onDidCreate(() => {
+      channel.appendLine("graph.db created — reconnecting Travsr daemon…");
+      void doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed).then(() => {
+        void vscode.window.showInformationMessage("Travsr: graph initialized — daemon reconnected.");
+      });
+    });
+    context.subscriptions.push(dbWatcher);
+  }
+
   // RFC-012 A2 F4: ambient context provider — fires before every Copilot Chat turn.
   // Wrapped in try/catch: a crash here must never block command registration below.
   try {

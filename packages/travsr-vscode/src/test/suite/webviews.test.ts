@@ -111,7 +111,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   });
   test("semantic badge reflects Phase B registration state", () => {
     const html = buildLanguagesHtml(indexed, available);
-    // rust: active → enabled badge
+    // rust: builtin + installed → active → enabled badge
     assert.ok(html.includes(">enabled<"), "enabled badge for active language");
     // java/scala: not registered → disabled badge
     assert.ok(html.includes(">disabled<"), "disabled badge for inactive language");
@@ -121,6 +121,7 @@ suite("VSCODE-247: buildLanguagesHtml", () => {
   test("detects empty indexed section", () => {
     const html = buildLanguagesHtml([], []);
     assert.ok(html.includes("No language metadata"));
+    assert.ok(html.includes("initRepo"), "Initialize button present in empty state");
   });
   test("detect and refresh buttons present", () => {
     const html = buildLanguagesHtml(indexed, available);

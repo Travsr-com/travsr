@@ -455,6 +455,7 @@ type PanelMessage =
   | { command: "removeLang"; language: string }
   | { command: "detectLangs" }
   | { command: "reloadAvailable" }
+  | { command: "initRepo" }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -700,18 +701,17 @@ export function registerShowExecutionPath(
 }
 
 /** Spawn a travsr CLI command and return its combined stdout+stderr. */
-async function spawnLangCommand(binary: string, args: string[]): Promise<string> {
+function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutMs = 4_000): Promise<string> {
   return new Promise((resolve) => {
     let out = "";
     let resolved = false;
     const done = (v: string): void => { if (!resolved) { resolved = true; resolve(v); } };
-    const proc = cp.spawn(binary, args, { env: { ...process.env } });
+    const proc = cp.spawn(binary, args, { env: { ...process.env }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.on("close", () => done(out));
     proc.on("error", (e) => done(`error: ${e.message}`));
-    // 4 s hard timeout — lang list --json must never block the UI.
-    setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, 4_000);
+    setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, timeoutMs);
   });
 }
 
@@ -805,6 +805,16 @@ export function registerShowLanguages(
           void vscode.window.showInformationMessage(`Disabled language tool for ${msg.language}.`);
         });
         return;
+      case "initRepo": {
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!wsRoot) return;
+        postStatus("Initializing repo…");
+        void spawnLangCommand(binary, ["init"], wsRoot, 60_000).then(() => {
+          postStatus("");
+          void refresh();
+        });
+        return;
+      }
       case "detectLangs":
         postStatus('Detecting languages…');
         void spawnLangCommand(binary, ["lang", "detect"]).then((out) => {

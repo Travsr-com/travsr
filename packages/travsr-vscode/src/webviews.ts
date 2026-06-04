@@ -357,7 +357,7 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
 <td style="text-align:right;color:var(--fg-muted)">${l.count.toLocaleString()}</td></tr>`
         )
         .join("\n")
-    : `<tr><td colspan="2" class="empty">No language metadata in the graph yet. Run <code>travsr init</code>.</td></tr>`;
+    : `<tr><td colspan="2" class="empty" style="font-style:normal">No language metadata yet.&nbsp; <button class="btn primary" id="initBtn" onclick="initRepo(this)">Initialize this repo</button></td></tr>`;
   const indexedNote = indexed.length
     ? `<p style="font-size:11px;color:var(--fg-subtle);margin:4px 0 0">Node counts from structural (tree-sitter) analysis — includes test &amp; fixture files.</p>`
     : "";
@@ -368,7 +368,9 @@ export function buildLanguagesHtml(indexed: LangCount[], available: LangInfo[]):
   const availRows = available
     .map((l) => {
       const detected = detectedLangs.has(l.language);
-      const active = l.registered && l.installed;
+      // Builtins bypass lang.toml registration — their semantic analysis runs whenever
+      // the underlying tool is installed, regardless of the registered field.
+      const active = l.builtin ? l.installed : (l.registered && l.installed);
 
       // Sandbox badge
       const sandboxBadge =
@@ -475,7 +477,8 @@ function detectLangs(btn) {
   vscode.postMessage({command:'detectLangs'});
 }
 function doRefresh(btn) { setLoading(btn, true, 'Refresh'); vscode.postMessage({command:'refresh'}); }
-function reloadAvail(btn) { setLoading(btn, true, 'Reload available tools'); vscode.postMessage({command:'reloadAvailable'}); }`;
+function reloadAvail(btn) { setLoading(btn, true, 'Reload available tools'); vscode.postMessage({command:'reloadAvailable'}); }
+function initRepo(btn) { setLoading(btn, true, 'Initialize this repo'); vscode.postMessage({command:'initRepo'}); }`;
 
   return webviewShell("Travsr Languages", body, script);
 }
