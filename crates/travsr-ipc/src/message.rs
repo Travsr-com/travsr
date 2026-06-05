@@ -23,10 +23,16 @@ pub struct ControlResponse {
 
 impl ControlResponse {
     pub fn ok(message: impl Into<Option<String>>) -> Self {
-        Self { ok: true, message: message.into() }
+        Self {
+            ok: true,
+            message: message.into(),
+        }
     }
 
     pub fn err(message: impl Into<String>) -> Self {
-        Self { ok: false, message: Some(message.into()) }
+        Self {
+            ok: false,
+            message: Some(message.into()),
+        }
     }
 }

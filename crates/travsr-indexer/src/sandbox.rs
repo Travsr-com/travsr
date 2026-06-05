@@ -278,12 +278,14 @@ fn fallback(program: &str, args: &[&str], reason: &str) -> (Command, SandboxStat
 
 /// Produce a POSIX-shell-safe `'program' 'arg1' 'arg2'` string.
 /// Each token is wrapped in single quotes; embedded `'` is escaped as `'\''`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn shell_command(program: &str, args: &[&str]) -> String {
     let mut parts = vec![shell_quote(program)];
     parts.extend(args.iter().map(|a| shell_quote(a)));
     parts.join(" ")
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -330,6 +332,7 @@ mod tests {
         assert_eq!(cfg.mem_limit_bytes, 4 * 1024 * 1024 * 1024);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn shell_quote_handles_special_characters() {
         assert_eq!(shell_quote("hello"), "'hello'");
@@ -338,6 +341,7 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn shell_command_produces_valid_string() {
         let s = shell_command("echo", &["hello world", "it's fine"]);

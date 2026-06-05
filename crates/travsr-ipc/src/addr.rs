@@ -28,13 +28,14 @@ impl ControlAddr {
         let hash = blake3::hash(path_str.to_lowercase().as_bytes());
         #[cfg(not(windows))]
         let hash = blake3::hash(path_str.as_bytes());
-        let hex: String = hash.as_bytes()[..8]
-            .iter()
-            .fold(String::with_capacity(16), |mut s, b| {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-                s
-            });
+        let hex: String =
+            hash.as_bytes()[..8]
+                .iter()
+                .fold(String::with_capacity(16), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
         Self { hex }
     }
 
@@ -90,7 +91,8 @@ mod tests {
         assert_eq!(addr.as_hex().len(), 16);
         assert!(
             addr.as_hex().chars().all(|c| c.is_ascii_hexdigit()),
-            "address must be lowercase hex: {}", addr.as_hex()
+            "address must be lowercase hex: {}",
+            addr.as_hex()
         );
     }
 
