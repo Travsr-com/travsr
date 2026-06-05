@@ -21,9 +21,7 @@ use travsr_indexer::{
 use travsr_plugin_host::PluginIndexer;
 use travsr_store::{SqliteStore, Store};
 
-#[cfg(unix)]
-pub use hook::try_dispatch_to_daemon;
-pub use hook::{changed_files_from_git, install_hook};
+pub use hook::{changed_files_from_git, install_hook, try_dispatch_to_daemon};
 
 /// Statistics returned by [`init_repo`] and displayed by `travsr init`.
 #[derive(Debug, Default)]
@@ -899,24 +897,7 @@ mod tests {
     }
 }
 
-/// Messages sent to the daemon's control socket (Unix only).
-#[cfg(unix)]
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "kebab-case")]
-enum ControlRequest {
-    ReindexCommit { sha: String },
-    ReindexPaths { paths: Vec<PathBuf> },
-    Status,
-    Shutdown,
-}
-
-#[cfg(unix)]
-#[derive(Debug, serde::Serialize)]
-struct ControlResponse {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-}
+// ControlMessage and ControlResponse are now in travsr_ipc — no local defs needed.
 
 /// The Travsr daemon — owns the file watcher, indexer worker, and control socket.
 #[derive(Debug, Default)]
@@ -979,16 +960,16 @@ impl Daemon {
         // scan; a leftover socket from a previous run causes open() → ENOTSUP
         // which aborts the entire watch setup and silently kills file watching.
         #[cfg(unix)]
-        let sock_path = travsr_dir.join("daemon.sock");
+        let sock_path = travsr_ipc::ControlAddr::for_repo(&repo_root).socket_path(&travsr_dir);
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
 
         let _watcher_handle =
             watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
 
-        // Control socket — Unix domain socket at .travsr/daemon.sock (Unix only).
+        // Control socket — Unix domain socket at .travsr/daemon-<hex>.sock (Unix only).
         #[cfg(unix)]
-        let listener = UnixListener::bind(&sock_path).context("binding daemon.sock")?;
+        let listener = UnixListener::bind(&sock_path).context("binding control socket")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1063,10 +1044,7 @@ impl Daemon {
                                     })
                                     .await
                                     .unwrap_or_else(|_| (
-                                        ControlResponse {
-                                            ok: false,
-                                            message: Some("internal error".to_string()),
-                                        },
+                                        travsr_ipc::ControlResponse::err("internal error"),
                                         false,
                                     ));
                                 let _ = writer
@@ -1180,77 +1158,40 @@ fn handle_watch_event(
 }
 
 /// Returns `(response, should_shutdown)`.
+///
+/// Stays `#[cfg(unix)]` — the Windows control plane (Named Pipe) is wired
+/// up in a separate PR per RFC-013. Unix behaviour is unchanged.
 #[cfg(unix)]
 fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
-) -> (ControlResponse, bool) {
-    match serde_json::from_str::<ControlRequest>(line) {
-        Ok(ControlRequest::ReindexCommit { sha }) => {
+) -> (travsr_ipc::ControlResponse, bool) {
+    use travsr_ipc::{ControlMessage, ControlResponse};
+
+    match serde_json::from_str::<ControlMessage>(line) {
+        Ok(ControlMessage::ReindexCommit { sha }) => {
             tracing::info!(sha=%sha, "control: reindex-commit");
             let paths = changed_files_from_git(repo_root).unwrap_or_default();
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
                 tracing::warn!(err=%e, "control reindex failed");
-                return (
-                    ControlResponse {
-                        ok: false,
-                        message: Some(e.to_string()),
-                    },
-                    false,
-                );
+                return (ControlResponse::err(e.to_string()), false);
             }
             (
-                ControlResponse {
-                    ok: true,
-                    message: Some(format!("reindexed {} paths", paths.len())),
-                },
+                ControlResponse::ok(Some(format!("reindexed {} paths", paths.len()))),
                 false,
             )
         }
-        Ok(ControlRequest::ReindexPaths { paths }) => {
+        Ok(ControlMessage::ReindexPaths { paths }) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
-                return (
-                    ControlResponse {
-                        ok: false,
-                        message: Some(e.to_string()),
-                    },
-                    false,
-                );
+                return (ControlResponse::err(e.to_string()), false);
             }
-            (
-                ControlResponse {
-                    ok: true,
-                    message: None,
-                },
-                false,
-            )
+            (ControlResponse::ok(None), false)
         }
-        Ok(ControlRequest::Status) => (
-            ControlResponse {
-                ok: true,
-                message: Some("running".to_string()),
-            },
-            false,
-        ),
-        Ok(ControlRequest::Shutdown) => {
-            // Signal the event loop to stop via the broadcast channel.
-            (
-                ControlResponse {
-                    ok: true,
-                    message: None,
-                },
-                true,
-            )
-        }
-        Err(e) => (
-            ControlResponse {
-                ok: false,
-                message: Some(format!("parse error: {e}")),
-            },
-            false,
-        ),
+        Ok(ControlMessage::Status) => (ControlResponse::ok(Some("running".to_string())), false),
+        Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
+        Err(e) => (ControlResponse::err(format!("parse error: {e}")), false),
     }
 }

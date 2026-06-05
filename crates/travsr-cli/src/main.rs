@@ -321,7 +321,7 @@ async fn run(cli: Cli) -> Result<()> {
                         // otherwise spawning a new background child (visible,
                         // 700 MB each) because the check happened *inside* the
                         // child after it was already running.
-                        let sock = repo_root.join(".travsr/daemon.sock");
+                        let sock = daemon_sock_path(&repo_root);
                         if daemon_is_running(&sock, 3, 300) {
                             eprintln!("travsr daemon is already running");
                             return Ok(());
@@ -339,16 +339,16 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DaemonAction::Stop => {
-                    let sock = repo_root.join(".travsr/daemon.sock");
+                    let sock = daemon_sock_path(&repo_root);
                     send_daemon_command(&sock, r#"{"op":"shutdown"}"#)?;
                 }
                 DaemonAction::Status => {
-                    let sock = repo_root.join(".travsr/daemon.sock");
+                    let sock = daemon_sock_path(&repo_root);
                     let resp = send_daemon_command(&sock, r#"{"op":"status"}"#)?;
                     println!("{resp}");
                 }
                 DaemonAction::Restart => {
-                    let sock = repo_root.join(".travsr/daemon.sock");
+                    let sock = daemon_sock_path(&repo_root);
                     // Best-effort stop — ignore errors if daemon not running.
                     let _ = send_daemon_command(&sock, r#"{"op":"shutdown"}"#);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -415,8 +415,7 @@ async fn run(cli: Cli) -> Result<()> {
 
             // Prefer dispatching to a running daemon — it reindexes async and
             // never blocks the git commit. Fall back to in-process indexing when
-            // no daemon is running.
-            #[cfg(unix)]
+            // no daemon is running (or on Windows before RFC-013 lands).
             if travsr_daemon::try_dispatch_to_daemon(&repo_root) {
                 return Ok(());
             }
@@ -442,7 +441,23 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Send a JSON command to the running daemon's Unix domain socket and return
+/// Compute the control socket path for `repo_root` using `ControlAddr`.
+///
+/// Both the daemon (server) and the CLI (client) call this function with the
+/// same `repo_root` → they always agree on the socket file name.
+fn daemon_sock_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+    let travsr_dir = repo_root.join(".travsr");
+    #[cfg(unix)]
+    {
+        travsr_ipc::ControlAddr::for_repo(repo_root).socket_path(&travsr_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        // Named pipe path — unused until RFC-013 lands.
+        travsr_dir.join("daemon-control.pipe")
+    }
+}
+
 /// the trimmed response line. Times out after 5 seconds.
 #[cfg(unix)]
 fn send_daemon_command(sock: &std::path::Path, msg: &str) -> anyhow::Result<String> {
