@@ -92,16 +92,17 @@ pub fn register(exe: &Path, repo_root: &Path) -> anyhow::Result<()> {
 }
 
 /// Remove the Task Scheduler auto-start task for this repo.
-/// Non-fatal if the task does not exist (schtasks exits non-zero in that case).
+/// Silent if the task does not exist — schtasks exits non-zero in that case and
+/// we treat it as already-gone.  Only propagates errors from failing to spawn
+/// schtasks at all (e.g. binary not on PATH).
 pub fn unregister(repo_root: &Path) -> anyhow::Result<()> {
     let name = task_name(repo_root);
-    let status = std::process::Command::new("schtasks")
+    let _ = std::process::Command::new("schtasks")
         .args(["/delete", "/tn", &name, "/f"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .context("running schtasks /delete")?;
-    anyhow::ensure!(status.success(), "schtasks /delete exited {status}");
     Ok(())
 }
 
