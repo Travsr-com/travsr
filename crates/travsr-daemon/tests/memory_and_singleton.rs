@@ -23,6 +23,8 @@
 //!   thread pool rather than a single-threaded executor.
 //! - `tokio::sync::mpsc::channel` — same channel type used by the watcher.
 
+#[cfg(unix)]
+use std::path::Path;
 use std::process::Command as StdCommand;
 use std::time::Duration;
 #[cfg(target_os = "linux")]
