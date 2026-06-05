@@ -9,6 +9,9 @@ import {
   buildDownloadUrl,
   buildSumsUrl,
   verifyChecksum,
+  checkOnPath,
+  hasCmdShimOnPath,
+  assertExecutableBinary,
 } from "../../installer";
 
 // ── resolveTargetTriple ────────────────────────────────────────────────────
@@ -32,6 +35,10 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
 
   test("win32/x64 → x86_64-pc-windows-msvc", () => {
     assert.strictEqual(resolveTargetTriple("win32", "x64"), "x86_64-pc-windows-msvc");
+  });
+
+  test("win32/arm64 → aarch64-pc-windows-msvc", () => {
+    assert.strictEqual(resolveTargetTriple("win32", "arm64"), "aarch64-pc-windows-msvc");
   });
 
   test("unknown platform throws with platform and arch in message", () => {
@@ -98,7 +105,7 @@ suite("VSCODE-205: installer — buildDownloadUrl", () => {
   test("url starts with GitHub releases base", () => {
     const url = buildDownloadUrl("0.5.0", "aarch64-apple-darwin");
     assert.ok(
-      url.startsWith("https://github.com/raj-rkv/travsr/releases/download/"),
+      url.startsWith("https://github.com/Travsr-com/travsr/releases/download/"),
       `unexpected: ${url}`
     );
   });
@@ -168,5 +175,57 @@ suite("VSCODE-205: installer — verifyChecksum", () => {
       "utf8"
     );
     assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sumsWithMultiple));
+  });
+});
+
+// ── WS1: checkOnPath — Windows .cmd discrimination ────────────────────────
+
+suite("WS1: checkOnPath — Windows .cmd discrimination", () => {
+  test("returns false for nonexistent binary on all platforms", () => {
+    assert.strictEqual(checkOnPath("__travsr_definitely_not_on_path_xyz__"), false);
+  });
+
+  test("hasCmdShimOnPath returns false on non-Windows platforms", () => {
+    if (process.platform === "win32") return;
+    assert.strictEqual(hasCmdShimOnPath("__anything__"), false);
+  });
+
+  test("hasCmdShimOnPath returns false for nonexistent binary on Windows", () => {
+    if (process.platform !== "win32") return;
+    assert.strictEqual(hasCmdShimOnPath("__travsr_definitely_not_on_path_xyz__"), false);
+  });
+});
+
+// ── WS1: assertExecutableBinary ───────────────────────────────────────────
+
+suite("WS1: assertExecutableBinary", () => {
+  test("throws for relative (non-absolute) path", () => {
+    assert.throws(
+      () => assertExecutableBinary("travsr"),
+      /must be an absolute path/
+    );
+  });
+
+  test("throws for path containing shell metacharacters", () => {
+    const malicious =
+      process.platform === "win32"
+        ? "C:\\Users\\user\\.travsr\\bin\\trav&sr.exe"
+        : "/usr/local/bin/trav&sr";
+    assert.throws(() => assertExecutableBinary(malicious), /shell metacharacters/);
+  });
+
+  test("on Windows: throws for absolute path not ending in .exe", () => {
+    if (process.platform !== "win32") return;
+    assert.throws(
+      () => assertExecutableBinary("C:\\Users\\user\\.travsr\\bin\\travsr"),
+      /must end in \.exe/
+    );
+  });
+
+  test("on Windows: does not throw for valid absolute .exe path", () => {
+    if (process.platform !== "win32") return;
+    assert.doesNotThrow(() =>
+      assertExecutableBinary("C:\\Users\\user\\.travsr\\bin\\travsr.exe")
+    );
   });
 });

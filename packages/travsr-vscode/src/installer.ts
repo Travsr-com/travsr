@@ -19,7 +19,7 @@ export const DOWNLOAD_VERSION = "0.7.0";
 const TARGET_MAP: Partial<Record<string, Partial<Record<string, string>>>> = {
   linux:  { x64: "x86_64-unknown-linux-gnu",  arm64: "aarch64-unknown-linux-gnu" },
   darwin: { x64: "x86_64-apple-darwin",        arm64: "aarch64-apple-darwin" },
-  win32:  { x64: "x86_64-pc-windows-msvc" },
+  win32:  { x64: "x86_64-pc-windows-msvc", arm64: "aarch64-pc-windows-msvc" },
 };
 
 export function resolveTargetTriple(
@@ -45,11 +45,11 @@ export function resolveInstallPath(
 
 export function buildDownloadUrl(version: string, triple: string): string {
   const tarName = `travsr-v${version}-${triple}.tar.gz`;
-  return `https://github.com/raj-rkv/travsr/releases/download/v${version}/${tarName}`;
+  return `https://github.com/Travsr-com/travsr/releases/download/v${version}/${tarName}`;
 }
 
 export function buildSumsUrl(version: string): string {
-  return `https://github.com/raj-rkv/travsr/releases/download/v${version}/SHA256SUMS`;
+  return `https://github.com/Travsr-com/travsr/releases/download/v${version}/SHA256SUMS`;
 }
 
 async function fetchBuffer(url: string, maxRedirects = 5): Promise<Buffer> {
@@ -144,10 +144,40 @@ export async function installBinary(
 
 export function checkOnPath(binaryName: string): boolean {
   try {
-    const cmd = process.platform === "win32" ? "where" : "which";
-    cp.execFileSync(cmd, [binaryName], { stdio: "ignore" });
+    if (process.platform === "win32") {
+      const out = cp.execFileSync("where", [binaryName], { encoding: "utf8" });
+      return out.split(/\r?\n/).some((l) => l.trim().toLowerCase().endsWith(".exe"));
+    }
+    cp.execFileSync("which", [binaryName], { stdio: "ignore" });
     return true;
   } catch {
     return false;
+  }
+}
+
+export function hasCmdShimOnPath(binaryName: string): boolean {
+  if (process.platform !== "win32") return false;
+  try {
+    const out = cp.execFileSync("where", [binaryName], { encoding: "utf8" });
+    return out.split(/\r?\n/).some((l) => l.trim().toLowerCase().endsWith(".cmd"));
+  } catch {
+    return false;
+  }
+}
+
+export function assertExecutableBinary(binary: string): void {
+  if (!path.isAbsolute(binary)) {
+    throw new Error(`travsr binary must be an absolute path, got: ${binary}`);
+  }
+  if (process.platform === "win32") {
+    if (!binary.toLowerCase().endsWith(".exe")) {
+      throw new Error(
+        `travsr binary on Windows must end in .exe, got: ${binary}. ` +
+        `.cmd/.bat shims are not supported — reinstall via the extension.`
+      );
+    }
+  }
+  if (/[&|;<>`$!^%(){}[\]"']/.test(binary)) {
+    throw new Error(`travsr binary path contains shell metacharacters: ${binary}`);
   }
 }

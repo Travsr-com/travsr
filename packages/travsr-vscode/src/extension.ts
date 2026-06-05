@@ -21,6 +21,8 @@ import { GraphPanel } from "./graph";
 import {
   installBinary,
   checkOnPath,
+  hasCmdShimOnPath,
+  assertExecutableBinary,
   resolveInstallDir,
   resolveInstallPath,
   DOWNLOAD_VERSION,
@@ -366,8 +368,12 @@ async function checkBinaryAndPrompt(
   if (checkOnPath("travsr")) return;
 
   // 4. Binary not found anywhere — prompt once.
+  const isCmdOnly = process.platform === "win32" && hasCmdShimOnPath("travsr");
+  const promptMsg = isCmdOnly
+    ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary — Download v${DOWNLOAD_VERSION}?`
+    : `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`;
   const choice = await vscode.window.showInformationMessage(
-    `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`,
+    promptMsg,
     "Download",
     "Dismiss"
   );
@@ -496,6 +502,15 @@ async function reindexNow(
   const configured =
     vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
   const binary = configured || "travsr";
+
+  if (configured) {
+    try {
+      assertExecutableBinary(configured);
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Travsr: invalid binaryPath — ${(e as Error).message}`);
+      return;
+    }
+  }
 
   await vscode.window.withProgress(
     {

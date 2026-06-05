@@ -8,6 +8,7 @@
  */
 
 import * as cp from "child_process";
+import { assertExecutableBinary } from "./installer";
 
 export interface McpClient {
   callTool(name: string, args?: Record<string, string>): Promise<string>;
@@ -41,9 +42,11 @@ export class StdioMcpClient implements McpClient {
   }
 
   async connect(): Promise<void> {
+    assertExecutableBinary(this.binary);
     this.proc = cp.spawn(this.binary, ["mcp", "--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: this.cwd,
+      windowsHide: true,
     });
 
     this.proc.stdout?.setEncoding("utf8");
