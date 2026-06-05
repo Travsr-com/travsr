@@ -981,12 +981,21 @@ impl Daemon {
 
         tracing::info!(repo = %repo_root.display(), "travsr daemon started");
         #[cfg(unix)]
-        tracing::info!(sock = %sock_path.display(), "control socket bound");
+        tracing::info!(transport = "unix", sock = %sock_path.display(), "control socket bound");
+
+        // Windows Named Pipe setup — resolved address for use in the accept task.
+        #[cfg(windows)]
+        let pipe_name = travsr_ipc::ControlAddr::for_repo(&repo_root).pipe_name();
+        #[cfg(windows)]
+        tracing::info!(transport = "named_pipe", pipe = %pipe_name, "control pipe bound");
 
         let repo_root_arc = Arc::new(repo_root.clone());
-        // Notify used for socket-initiated shutdown signal (Unix only).
+        // Notify used for socket-initiated shutdown signal.
         #[cfg(unix)]
         let sock_shutdown = Arc::new(tokio::sync::Notify::new());
+        // Notify used for pipe-initiated shutdown signal (Windows).
+        #[cfg(not(unix))]
+        let pipe_shutdown = Arc::new(tokio::sync::Notify::new());
 
         // ── Single dedicated indexer worker ───────────────────────────────────
         // PERF-001: Previously the event loop spawned a new blocking thread for
@@ -1012,6 +1021,71 @@ impl Daemon {
                 tracing::debug!("indexer worker exiting — channel closed");
             })
         };
+
+        // Windows: spawn named pipe accept loop. Runs until the runtime is shut
+        // down or until the accept fails (which happens when the daemon exits).
+        #[cfg(windows)]
+        {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            use tokio::net::windows::named_pipe::ServerOptions;
+
+            let store_win = Arc::clone(&store);
+            let repo_win = Arc::clone(&repo_root_arc);
+            let sd_win = Arc::clone(&pipe_shutdown);
+            let pipe_name_accept = pipe_name.clone();
+            tokio::spawn(async move {
+                let mut first_instance = true;
+                loop {
+                    let server = {
+                        let mut opts = ServerOptions::new();
+                        if first_instance {
+                            opts.first_pipe_instance(true);
+                            first_instance = false;
+                        }
+                        match opts.create(&pipe_name_accept) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("named pipe server create failed: {e}");
+                                return;
+                            }
+                        }
+                    };
+                    if server.connect().await.is_err() {
+                        // Runtime is shutting down or pipe was forcibly closed.
+                        break;
+                    }
+                    let store = Arc::clone(&store_win);
+                    let repo = Arc::clone(&repo_win);
+                    let sd = Arc::clone(&sd_win);
+                    tokio::spawn(async move {
+                        let (reader, mut writer) = tokio::io::split(server);
+                        let mut lines = BufReader::new(reader).lines();
+                        if let Ok(Some(line)) = lines.next_line().await {
+                            let (resp, shutdown_requested) =
+                                tokio::task::spawn_blocking(move || {
+                                    handle_control_message(&line, repo.as_path(), &store)
+                                })
+                                .await
+                                .unwrap_or_else(|_| {
+                                    (travsr_ipc::ControlResponse::err("internal error"), false)
+                                });
+                            let _ = writer
+                                .write_all(
+                                    format!(
+                                        "{}\n",
+                                        serde_json::to_string(&resp).unwrap_or_default()
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                            if shutdown_requested {
+                                sd.notify_one();
+                            }
+                        }
+                    });
+                }
+            });
+        }
 
         loop {
             // tokio::select! does not support #[cfg] on individual branches,
@@ -1081,6 +1155,7 @@ impl Daemon {
             }
             #[cfg(not(unix))]
             {
+                let pipe_shutdown_wait = pipe_shutdown.notified();
                 tokio::select! {
                     Some(ev) = rx.recv() => {
                         // Forward to the dedicated indexer worker — never spawn a
@@ -1097,6 +1172,10 @@ impl Daemon {
                     }
                     _ = &mut shutdown => {
                         tracing::info!("travsr daemon shutting down");
+                        break;
+                    }
+                    _ = pipe_shutdown_wait => {
+                        tracing::info!("travsr daemon shutting down (control pipe)");
                         break;
                     }
                 }
@@ -1159,9 +1238,10 @@ fn handle_watch_event(
 
 /// Returns `(response, should_shutdown)`.
 ///
-/// Stays `#[cfg(unix)]` — the Windows control plane (Named Pipe) is wired
-/// up in a separate PR per RFC-013. Unix behaviour is unchanged.
-#[cfg(unix)]
+/// Called from the Unix domain-socket accept loop and the Windows Named Pipe
+/// accept loop. Gated to the two supported control-plane platforms so the
+/// compiler does not emit dead_code on exotic targets.
+#[cfg(any(unix, windows))]
 fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,
