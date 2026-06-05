@@ -41,8 +41,8 @@ fn sandbox_standard_denies_network() {
             }
             eprintln!("SKIP: {msg}");
         }
-        Ok(mut cmd) => {
-            let output = cmd.output().expect("spawn");
+        Ok(spawner) => {
+            let output = spawner.output().expect("spawn");
             let exit_code = String::from_utf8_lossy(&output.stdout).trim().to_string();
             // curl should fail (non-zero) or be absent; either way network is blocked
             assert!(
@@ -187,8 +187,8 @@ fn sandbox_repo_root_is_read_only() {
             }
             eprintln!("SKIP: {msg}");
         }
-        Ok(mut cmd) => {
-            let _ = cmd.output();
+        Ok(spawner) => {
+            let _ = spawner.output();
             assert!(
                 !breach_path.exists(),
                 "sandbox allowed write to repo root — FS confinement broken"
@@ -219,8 +219,8 @@ fn sandbox_scratch_dir_is_writable() {
         Err(_) => {
             eprintln!("SKIP: bwrap not available");
         }
-        Ok(mut cmd) => {
-            let status = cmd.status().expect("spawn");
+        Ok(spawner) => {
+            let status = spawner.status().expect("spawn");
             assert!(
                 status.success(),
                 "sandbox blocked write to /travsr-scratch — should be writable"

@@ -90,6 +90,15 @@ cxx-build = "=1.0.138"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
 toml = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 scip      = "0.7"
 protobuf  = "3"
 

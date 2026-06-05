@@ -1,6 +1,8 @@
 //! Linux sandbox (bubblewrap + optional Landlock). Fail-closed per ADR-017 Rule 2.
 use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
+use crate::sandbox::SandboxedSpawn;
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 /// Permitted env vars (ADR-017 Rule 1). TMPDIR set by caller to scratch dir.
@@ -56,7 +58,7 @@ pub fn build_sandboxed_command(
     repo_root: &Path,
     scratch_dir: &Path,
     policy: &SandboxPolicy,
-) -> Result<Command, SandboxUnavailable> {
+) -> Result<SandboxedSpawn, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
             "bubblewrap (bwrap) is not available or cannot create sandboxes on this host \
@@ -151,7 +153,7 @@ pub fn build_sandboxed_command(
         }
     }
     cmd.env("TMPDIR", "/travsr-scratch");
-    Ok(cmd)
+    Ok(SandboxedSpawn::Wrapped(cmd))
 }
 
 /// Returns true if `bwrap` is on PATH (installed).
@@ -217,7 +219,7 @@ pub fn build_sandboxed_command(
     _r: &Path,
     _s: &Path,
     _policy: &SandboxPolicy,
-) -> Result<Command, SandboxUnavailable> {
+) -> Result<SandboxedSpawn, SandboxUnavailable> {
     Err(SandboxUnavailable(
         "Linux sandbox not available on this platform".into(),
     ))
