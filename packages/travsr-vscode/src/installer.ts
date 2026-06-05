@@ -177,7 +177,7 @@ export function assertExecutableBinary(binary: string): void {
       );
     }
   }
-  if (/[&|;<>`$!^%(){}[\\]\"']/.test(binary)) {
+  if (/[&|;<>`$!^%(){}[\]"']/.test(binary)) {
     throw new Error(`travsr binary path contains shell metacharacters: ${binary}`);
   }
 }
