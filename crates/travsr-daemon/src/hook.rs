@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 const TRAVSR_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this line";
+#[cfg(windows)]
 const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
 
 const HOOK_BODY: &str = r#"#!/bin/sh
@@ -21,10 +22,12 @@ exec travsr hook-run --from-hook
 "#;
 
 /// Windows `.cmd` hook — CRLF line endings required for cmd.exe.
+#[cfg(windows)]
 const CMD_HOOK_BODY: &str =
     "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\ntravsr hook-run --from-hook\r\n";
 
 /// Windows chain `.cmd` hook — calls any pre-existing hook before running travsr.
+#[cfg(windows)]
 const CMD_CHAIN_HOOK_BODY: &str =
     "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0post-commit.travsr-pre.bak.cmd\" call \"%~dp0post-commit.travsr-pre.bak.cmd\"\r\ntravsr hook-run --from-hook\r\n";
 
