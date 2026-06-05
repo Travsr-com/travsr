@@ -21,6 +21,7 @@ import { GraphPanel } from "./graph";
 import {
   installBinary,
   checkOnPath,
+  hasCmdShimOnPath,
   resolveInstallDir,
   resolveInstallPath,
   DOWNLOAD_VERSION,
@@ -366,8 +367,12 @@ async function checkBinaryAndPrompt(
   if (checkOnPath("travsr")) return;
 
   // 4. Binary not found anywhere — prompt once.
+  const isCmdOnly = process.platform === "win32" && hasCmdShimOnPath("travsr");
+  const promptMsg = isCmdOnly
+    ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary — Download v${DOWNLOAD_VERSION}?`
+    : `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`;
   const choice = await vscode.window.showInformationMessage(
-    `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`,
+    promptMsg,
     "Download",
     "Dismiss"
   );
