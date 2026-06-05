@@ -1238,6 +1238,11 @@ fn handle_watch_event(
 }
 
 /// Returns `(response, should_shutdown)`.
+///
+/// Called from the Unix domain-socket accept loop and the Windows Named Pipe
+/// accept loop. Gated to the two supported control-plane platforms so the
+/// compiler does not emit dead_code on exotic targets.
+#[cfg(any(unix, windows))]
 fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,

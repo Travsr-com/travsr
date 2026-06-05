@@ -113,8 +113,8 @@ pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
 /// running or the write fails. The hook never reads a response — the daemon
 /// processes the reindex asynchronously after the hook exits.
 ///
-/// Cross-platform: Unix uses a domain socket; Windows returns `false` until
-/// the Named Pipe transport is implemented (RFC-013).
+/// Cross-platform: Unix uses a domain socket; Windows uses a Named Pipe
+/// (`\\.\pipe\travsr-<hex>`). Returns `false` on unsupported platforms.
 ///
 /// # Panics
 /// Never — hook must never panic.
