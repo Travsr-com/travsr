@@ -3,7 +3,8 @@ use std::path::PathBuf;
 /// Messages sent to the daemon's control plane.
 ///
 /// Serialized as `{"op":"<variant>", ...fields}` (kebab-case tag) so the
-/// format matches the existing `.travsr/daemon.sock` wire protocol.
+/// format matches the `.travsr/daemon-<hex>.sock` wire protocol.
+// DEBT(travsr-261): add #[non_exhaustive] once all variant additions for WS2-WS6 are confirmed.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum ControlMessage {

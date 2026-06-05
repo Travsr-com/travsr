@@ -441,7 +441,6 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Send a JSON command to the running daemon's Unix domain socket and return
 /// Compute the control socket path for `repo_root` using `ControlAddr`.
 ///
 /// Both the daemon (server) and the CLI (client) call this function with the

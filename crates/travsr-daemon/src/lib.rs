@@ -967,9 +967,9 @@ impl Daemon {
         let _watcher_handle =
             watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
 
-        // Control socket — Unix domain socket at .travsr/daemon.sock (Unix only).
+        // Control socket — Unix domain socket at .travsr/daemon-<hex>.sock (Unix only).
         #[cfg(unix)]
-        let listener = UnixListener::bind(&sock_path).context("binding daemon.sock")?;
+        let listener = UnixListener::bind(&sock_path).context("binding control socket")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
