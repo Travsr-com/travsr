@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod ask;
+#[cfg(windows)]
+mod autostart;
 mod graph;
 mod index;
 mod init;
@@ -327,7 +329,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                         // Spawn background child: re-exec with --foreground.
                         let exe = std::env::current_exe().context("finding current exe")?;
-                        std::process::Command::new(exe)
+                        std::process::Command::new(&exe)
                             .args(["daemon", "start", "--foreground"])
                             .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
@@ -335,10 +337,23 @@ async fn run(cli: Cli) -> Result<()> {
                             .spawn()
                             .context("spawning background daemon")?;
                         eprintln!("travsr daemon started in background");
+                        // Windows: register a Task Scheduler ONLOGON task so the
+                        // daemon auto-starts after reboot. Non-fatal — the daemon
+                        // is already running; auto-start just won't persist.
+                        #[cfg(windows)]
+                        if let Err(e) = autostart::register(&exe, &repo_root) {
+                            eprintln!("travsr: warning: could not register auto-start task: {e}");
+                        }
                     }
                 }
                 DaemonAction::Stop => {
                     send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown)?;
+                    // Windows: remove the auto-start task so the daemon stays
+                    // stopped after the user logs out and back in.
+                    #[cfg(windows)]
+                    if let Err(e) = autostart::unregister(&repo_root) {
+                        eprintln!("travsr: warning: could not remove auto-start task: {e}");
+                    }
                 }
                 DaemonAction::Status => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Status) {

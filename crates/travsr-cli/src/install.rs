@@ -27,9 +27,7 @@ pub fn current_target() -> Result<&'static str> {
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
-        ("windows", _) => bail!(
-            "Windows is not yet supported — see https://github.com/Travsr-com/travsr/issues/261"
-        ),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         (os, arch) => bail!("Unsupported platform: {os}/{arch}"),
     }
 }

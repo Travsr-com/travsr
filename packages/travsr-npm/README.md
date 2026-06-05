@@ -7,7 +7,7 @@
 > instead of guessing from vector chunks — 80% fewer tokens, zero structural
 > hallucinations.
 
-[![CI](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml)
+[![CI](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -167,7 +167,7 @@ Language support: **TypeScript / TSX**. Python, Go, Rust arriving in Phase 2.
 ## Build from Source
 
 ```bash
-git clone https://github.com/raj-rkv/travsr
+git clone https://github.com/Travsr-com/travsr
 cd travsr
 cargo build --release   # requires Rust 1.75+
 ```

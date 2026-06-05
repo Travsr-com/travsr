@@ -75,14 +75,14 @@ VERSION=0.3.0
 TARGET=x86_64-unknown-linux-gnu
 
 # Download tarball and bundle from the GitHub release
-curl -LO "https://github.com/raj-rkv/travsr/releases/download/v${VERSION}/travsr-v${VERSION}-${TARGET}.tar.gz"
-curl -LO "https://github.com/raj-rkv/travsr/releases/download/v${VERSION}/travsr-v${VERSION}-${TARGET}.tar.gz.bundle"
+curl -LO "https://github.com/Travsr-com/travsr/releases/download/v${VERSION}/travsr-v${VERSION}-${TARGET}.tar.gz"
+curl -LO "https://github.com/Travsr-com/travsr/releases/download/v${VERSION}/travsr-v${VERSION}-${TARGET}.tar.gz.bundle"
 
 # Verify
 cosign verify-blob \
   --bundle "travsr-v${VERSION}-${TARGET}.tar.gz.bundle" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "https://github.com/raj-rkv/travsr/.github/workflows/release.yml" \
+  --certificate-identity-regexp "https://github.com/Travsr-com/travsr/.github/workflows/release.yml" \
   "travsr-v${VERSION}-${TARGET}.tar.gz"
 ```
 
@@ -93,7 +93,7 @@ to the GitHub release via `actions/attest-build-provenance`. Verify with:
 
 ```sh
 gh attestation verify "travsr-v${VERSION}-${TARGET}.tar.gz" \
-  --repo raj-rkv/travsr
+  --repo Travsr-com/travsr
 ```
 
 ### npm postinstall
