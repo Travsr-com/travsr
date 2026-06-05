@@ -33,7 +33,10 @@ impl ControlTransport for NamedPipeTransport {
         let mut buf = String::new();
         reader.read_line(&mut buf)?;
         let trimmed = buf.trim();
-        anyhow::ensure!(!trimmed.is_empty(), "daemon closed connection without a response");
+        anyhow::ensure!(
+            !trimmed.is_empty(),
+            "daemon closed connection without a response"
+        );
         Ok(serde_json::from_str::<ControlResponse>(trimmed)?)
     }
 }

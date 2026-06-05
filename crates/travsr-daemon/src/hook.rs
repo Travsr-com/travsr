@@ -157,8 +157,8 @@ pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        use travsr_ipc::{ControlAddr, ControlMessage, ControlTransport as _};
         use travsr_ipc::windows::NamedPipeTransport;
+        use travsr_ipc::{ControlAddr, ControlMessage, ControlTransport as _};
 
         let sha = std::process::Command::new("git")
             .args([

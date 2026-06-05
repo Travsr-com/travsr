@@ -1066,10 +1066,9 @@ impl Daemon {
                                     handle_control_message(&line, repo.as_path(), &store)
                                 })
                                 .await
-                                .unwrap_or_else(|_| (
-                                    travsr_ipc::ControlResponse::err("internal error"),
-                                    false,
-                                ));
+                                .unwrap_or_else(|_| {
+                                    (travsr_ipc::ControlResponse::err("internal error"), false)
+                                });
                             let _ = writer
                                 .write_all(
                                     format!(
