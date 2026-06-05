@@ -7,9 +7,9 @@
 > instead of guessing from vector chunks. 80% fewer tokens, zero structural
 > hallucinations.
 
-[![CI](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml)
-[![Bench](https://github.com/raj-rkv/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/bench.yml)
-[![Phase 2 Exit](https://github.com/raj-rkv/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/phase2-exit.yml)
+[![CI](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
+[![Bench](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml)
+[![Phase 2 Exit](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml)
 [![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -415,7 +415,7 @@ license policy, banned crates). A nightly OSV scan checks for new CVEs against
 ## Build from Source
 
 ```bash
-git clone https://github.com/raj-rkv/travsr
+git clone https://github.com/Travsr-com/travsr
 cd travsr
 
 # Default build (SQLite backend only)
@@ -431,7 +431,7 @@ export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 ```
 
 **Platform support:** macOS (x86\_64 + arm64), Linux (x86\_64 + aarch64), Windows (x86\_64).
-Pre-built binaries are available on the [Releases](https://github.com/raj-rkv/travsr/releases) page.
+Pre-built binaries are available on the [Releases](https://github.com/Travsr-com/travsr/releases) page.
 
 **MSRV:** Rust 1.75 (verified in CI on every commit).
 

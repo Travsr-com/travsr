@@ -29,7 +29,7 @@ function detect() {
   if (!target) {
     console.error(
       `\nTravsr does not yet ship a prebuilt binary for ${key}.\n` +
-      `Build from source: https://github.com/raj-rkv/travsr\n`
+      `Build from source: https://github.com/Travsr-com/travsr\n`
     );
     process.exit(1);
   }
@@ -68,7 +68,7 @@ async function install() {
     return;
   }
 
-  const base = `https://github.com/raj-rkv/travsr/releases/download/v${VERSION}`;
+  const base = `https://github.com/Travsr-com/travsr/releases/download/v${VERSION}`;
   const tarName = `travsr-v${VERSION}-${target}.tar.gz`;
   const tarUrl = `${base}/${tarName}`;
   const sumsUrl = `${base}/SHA256SUMS`;
@@ -115,7 +115,7 @@ async function install() {
         'verify-blob',
         '--bundle', tmpBundle,
         '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com',
-        '--certificate-identity-regexp', 'https://github.com/raj-rkv/travsr/.github/workflows/release.yml',
+        '--certificate-identity-regexp', 'https://github.com/Travsr-com/travsr/.github/workflows/release.yml',
         tmpTar,
       ], { stdio: 'inherit' });
       fs.unlinkSync(tmpBundle);
@@ -147,7 +147,7 @@ install().catch(err => {
   console.warn(
     `\nTravsr: binary download failed — ${err.message}\n` +
     `The binary was not installed. Once v${VERSION} release artifacts are ` +
-    `available at https://github.com/raj-rkv/travsr/releases you can re-run:\n` +
+    `available at https://github.com/Travsr-com/travsr/releases you can re-run:\n` +
     `  npm install -g travsr\n` +
     `Or set TRAVSR_BINARY=/path/to/travsr to use a local build.\n`
   );
