@@ -416,7 +416,7 @@ async fn run(cli: Cli) -> Result<()> {
 
             // Prefer dispatching to a running daemon — it reindexes async and
             // never blocks the git commit. Fall back to in-process indexing when
-            // no daemon is running (or on Windows before RFC-013 lands).
+            // no daemon is running.
             if travsr_daemon::try_dispatch_to_daemon(&repo_root) {
                 return Ok(());
             }
