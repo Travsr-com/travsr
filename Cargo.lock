@@ -3048,6 +3048,7 @@ dependencies = [
  "travsr-core",
  "travsr-daemon",
  "travsr-indexer",
+ "travsr-ipc",
  "travsr-mcp",
  "travsr-plugin-host",
  "travsr-plugin-sdk",
@@ -3084,6 +3085,7 @@ dependencies = [
  "tracing-appender",
  "travsr-core",
  "travsr-indexer",
+ "travsr-ipc",
  "travsr-mcp",
  "travsr-plugin-host",
  "travsr-store",
@@ -3117,6 +3119,17 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "travsr-ipc"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -107,41 +107,58 @@ pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
         .collect())
 }
 
-/// Attempt to dispatch the current commit reindex to a running daemon via the
-/// Unix domain control socket at `.travsr/daemon.sock`.
+/// Attempt to fire-and-forget a reindex request to the running daemon.
 ///
-/// Returns `true` if the daemon accepted the request; `false` if no daemon is
-/// running or the write fails. Write timeout is capped at 50 ms so the git
-/// hook never perceptibly blocks a commit.
+/// Returns `true` if the daemon received the message; `false` if no daemon is
+/// running or the write fails. The hook never reads a response — the daemon
+/// processes the reindex asynchronously after the hook exits.
+///
+/// Cross-platform: Unix uses a domain socket; Windows returns `false` until
+/// the Named Pipe transport is implemented (RFC-013).
 ///
 /// # Panics
 /// Never — hook must never panic.
-#[cfg(unix)]
 pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
-    use std::io::Write as _;
-    use std::time::Duration;
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::time::Duration;
+        use travsr_ipc::{ControlAddr, ControlMessage};
 
-    let sock = repo_root.join(".travsr/daemon.sock");
-    if !sock.exists() {
-        return false;
+        let sha = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo_root.to_string_lossy(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let Ok(line) = serde_json::to_string(&ControlMessage::ReindexCommit { sha }) else {
+            return false;
+        };
+
+        let addr = ControlAddr::for_repo(repo_root);
+        let travsr_dir = repo_root.join(".travsr");
+        let sock_path = addr.socket_path(&travsr_dir);
+        if !sock_path.exists() {
+            return false;
+        }
+        let Ok(mut conn) = std::os::unix::net::UnixStream::connect(&sock_path) else {
+            return false;
+        };
+        let _ = conn.set_write_timeout(Some(Duration::from_millis(50)));
+        writeln!(conn, "{line}").is_ok()
     }
-    let Ok(mut conn) = std::os::unix::net::UnixStream::connect(&sock) else {
-        return false;
-    };
-    let _ = conn.set_write_timeout(Some(Duration::from_millis(50)));
-    let sha = std::process::Command::new("git")
-        .args([
-            "-C",
-            &repo_root.to_string_lossy(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    let msg = format!(r#"{{"op":"reindex-commit","sha":"{sha}"}}"#);
-    writeln!(conn, "{msg}").is_ok()
+    #[cfg(not(unix))]
+    {
+        // Named Pipe transport pending RFC-013.
+        let _ = repo_root;
+        false
+    }
 }

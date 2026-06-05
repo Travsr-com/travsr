@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 travsr-core = { path = "../travsr-core" }
+travsr-ipc  = { workspace = true }
 travsr-mcp = { path = "../travsr-mcp" }
 travsr-indexer = { path = "../travsr-indexer" }
 travsr-store = { path = "../travsr-store" }
