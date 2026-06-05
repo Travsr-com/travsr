@@ -155,9 +155,36 @@ pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
         let _ = conn.set_write_timeout(Some(Duration::from_millis(50)));
         writeln!(conn, "{line}").is_ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Named Pipe transport pending RFC-013.
+        use travsr_ipc::{ControlAddr, ControlMessage, ControlTransport as _};
+        use travsr_ipc::windows::NamedPipeTransport;
+
+        let sha = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo_root.to_string_lossy(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let addr = ControlAddr::for_repo(repo_root);
+        let Ok(mut transport) = NamedPipeTransport::connect(&addr) else {
+            return false;
+        };
+        transport
+            .send_request(&ControlMessage::ReindexCommit { sha })
+            .is_ok()
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
         let _ = repo_root;
         false
     }

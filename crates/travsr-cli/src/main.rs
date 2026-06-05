@@ -316,13 +316,12 @@ async fn run(cli: Cli) -> Result<()> {
                     if foreground {
                         travsr_daemon::Daemon::run(repo_root).await?;
                     } else {
-                        // Guard: if a daemon is already responding on the socket,
+                        // Guard: if a daemon is already responding on the transport,
                         // don't spawn another one. Each `daemon start` call was
                         // otherwise spawning a new background child (visible,
                         // 700 MB each) because the check happened *inside* the
                         // child after it was already running.
-                        let sock = daemon_sock_path(&repo_root);
-                        if daemon_is_running(&sock, 3, 300) {
+                        if daemon_is_running(&repo_root, 3, 300) {
                             eprintln!("travsr daemon is already running");
                             return Ok(());
                         }
@@ -339,18 +338,20 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DaemonAction::Stop => {
-                    let sock = daemon_sock_path(&repo_root);
-                    send_daemon_command(&sock, r#"{"op":"shutdown"}"#)?;
+                    send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown)?;
                 }
                 DaemonAction::Status => {
-                    let sock = daemon_sock_path(&repo_root);
-                    let resp = send_daemon_command(&sock, r#"{"op":"status"}"#)?;
-                    println!("{resp}");
+                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Status) {
+                        Ok(_) => {
+                            let transport = if cfg!(windows) { "named_pipe" } else { "unix" };
+                            println!("running [transport={transport}]");
+                        }
+                        Err(_) => println!("not running"),
+                    }
                 }
                 DaemonAction::Restart => {
-                    let sock = daemon_sock_path(&repo_root);
                     // Best-effort stop — ignore errors if daemon not running.
-                    let _ = send_daemon_command(&sock, r#"{"op":"shutdown"}"#);
+                    let _ = send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let exe = std::env::current_exe().context("finding current exe")?;
                     std::process::Command::new(exe)
@@ -441,66 +442,52 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Compute the control socket path for `repo_root` using `ControlAddr`.
+/// Connect to the daemon's control transport for `repo_root`.
 ///
-/// Both the daemon (server) and the CLI (client) call this function with the
-/// same `repo_root` → they always agree on the socket file name.
-fn daemon_sock_path(repo_root: &std::path::Path) -> std::path::PathBuf {
-    let travsr_dir = repo_root.join(".travsr");
+/// Dispatches to the platform-appropriate transport:
+/// Unix → `UnixTransport` (domain socket), Windows → `NamedPipeTransport`.
+fn send_daemon_command(
+    repo_root: &std::path::Path,
+    msg: &travsr_ipc::ControlMessage,
+) -> anyhow::Result<travsr_ipc::ControlResponse> {
+    let addr = travsr_ipc::ControlAddr::for_repo(repo_root);
+
     #[cfg(unix)]
     {
-        travsr_ipc::ControlAddr::for_repo(repo_root).socket_path(&travsr_dir)
+        let travsr_dir = repo_root.join(".travsr");
+        let mut t = travsr_ipc::unix::UnixTransport::connect(&addr, &travsr_dir)?;
+        travsr_ipc::ControlTransport::send_request(&mut t, msg)
     }
-    #[cfg(not(unix))]
+
+    #[cfg(windows)]
     {
-        // Named pipe path — unused until RFC-013 lands.
-        travsr_dir.join("daemon-control.pipe")
+        let mut t = travsr_ipc::windows::NamedPipeTransport::connect(&addr)?;
+        travsr_ipc::ControlTransport::send_request(&mut t, msg)
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (addr, msg);
+        anyhow::bail!("daemon control socket not supported on this platform")
     }
 }
 
-/// the trimmed response line. Times out after 5 seconds.
-#[cfg(unix)]
-fn send_daemon_command(sock: &std::path::Path, msg: &str) -> anyhow::Result<String> {
-    use std::io::{BufRead as _, Write as _};
-    let mut conn = std::os::unix::net::UnixStream::connect(sock).with_context(|| {
-        format!(
-            "daemon not running (socket not found at {})",
-            sock.display()
-        )
-    })?;
-    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    writeln!(conn, "{msg}")?;
-    let mut resp = String::new();
-    std::io::BufReader::new(conn).read_line(&mut resp)?;
-    Ok(resp.trim().to_string())
-}
-
-#[cfg(not(unix))]
-fn send_daemon_command(_sock: &std::path::Path, _msg: &str) -> anyhow::Result<String> {
-    anyhow::bail!("daemon control socket not yet supported on Windows")
-}
-
-/// Retry pinging the daemon socket up to `attempts` times with `delay_ms` between tries.
+/// Retry pinging the daemon transport up to `attempts` times with `delay_ms` between tries.
 ///
 /// launchd `KeepAlive: true` restarts the daemon after `daemon stop`, so the
-/// socket may briefly vanish during restart. Without retries, a `daemon start`
-/// call immediately after `daemon stop` could incorrectly spawn a second daemon.
-#[cfg(unix)]
-fn daemon_is_running(sock: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
+/// transport may briefly be unavailable during restart. Without retries, a
+/// `daemon start` call immediately after `daemon stop` could incorrectly spawn
+/// a second daemon.
+fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
             // Blocking sleep is safe: no concurrent async tasks exist at daemon-start time.
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-        if send_daemon_command(sock, r#"{"op":"status"}"#).is_ok() {
+        if send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status).is_ok() {
             return true;
         }
     }
-    false
-}
-
-#[cfg(not(unix))]
-fn daemon_is_running(_sock: &std::path::Path, _attempts: u32, _delay_ms: u64) -> bool {
     false
 }
 
@@ -509,10 +496,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_is_running_returns_false_when_no_socket() {
+    fn daemon_is_running_returns_false_when_no_daemon() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("nonexistent.sock");
+        // No daemon running in tmp — transport connect should fail immediately.
         // Attempts=1, delay=0 — must not block.
-        assert!(!daemon_is_running(&sock, 1, 0));
+        assert!(!daemon_is_running(tmp.path(), 1, 0));
     }
 }
