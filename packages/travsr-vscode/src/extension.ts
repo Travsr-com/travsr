@@ -22,6 +22,7 @@ import {
   installBinary,
   checkOnPath,
   hasCmdShimOnPath,
+  assertExecutableBinary,
   resolveInstallDir,
   resolveInstallPath,
   DOWNLOAD_VERSION,
@@ -501,6 +502,15 @@ async function reindexNow(
   const configured =
     vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
   const binary = configured || "travsr";
+
+  if (configured) {
+    try {
+      assertExecutableBinary(configured);
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Travsr: invalid binaryPath — ${(e as Error).message}`);
+      return;
+    }
+  }
 
   await vscode.window.withProgress(
     {

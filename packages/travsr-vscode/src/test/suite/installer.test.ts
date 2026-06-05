@@ -105,7 +105,7 @@ suite("VSCODE-205: installer — buildDownloadUrl", () => {
   test("url starts with GitHub releases base", () => {
     const url = buildDownloadUrl("0.5.0", "aarch64-apple-darwin");
     assert.ok(
-      url.startsWith("https://github.com/raj-rkv/travsr/releases/download/"),
+      url.startsWith("https://github.com/Travsr-com/travsr/releases/download/"),
       `unexpected: ${url}`
     );
   });

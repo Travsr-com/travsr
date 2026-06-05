@@ -45,11 +45,11 @@ export function resolveInstallPath(
 
 export function buildDownloadUrl(version: string, triple: string): string {
   const tarName = `travsr-v${version}-${triple}.tar.gz`;
-  return `https://github.com/raj-rkv/travsr/releases/download/v${version}/${tarName}`;
+  return `https://github.com/Travsr-com/travsr/releases/download/v${version}/${tarName}`;
 }
 
 export function buildSumsUrl(version: string): string {
-  return `https://github.com/raj-rkv/travsr/releases/download/v${version}/SHA256SUMS`;
+  return `https://github.com/Travsr-com/travsr/releases/download/v${version}/SHA256SUMS`;
 }
 
 async function fetchBuffer(url: string, maxRedirects = 5): Promise<Buffer> {
