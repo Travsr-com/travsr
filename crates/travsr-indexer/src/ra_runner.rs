@@ -152,6 +152,8 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::*;
     use crate::sandbox::SandboxConfig;
 
     #[test]
