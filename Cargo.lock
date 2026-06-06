@@ -3187,6 +3187,7 @@ dependencies = [
  "tree-sitter-php",
  "tree-sitter-ruby",
  "tree-sitter-scala",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

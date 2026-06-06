@@ -2,7 +2,9 @@
 #[cfg(target_os = "macos")]
 use crate::sandbox::linux::ENV_ALLOWLIST;
 use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
+use crate::sandbox::SandboxedSpawn;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
@@ -12,7 +14,7 @@ pub fn build_sandboxed_command(
     repo_root: &Path,
     scratch_dir: &Path,
     policy: &SandboxPolicy,
-) -> Result<Command, SandboxUnavailable> {
+) -> Result<SandboxedSpawn, SandboxUnavailable> {
     // For Elevated policy, validate fields first (fail-closed per ADR-017 Rule 2).
     if let SandboxPolicy::Elevated { .. } = policy {
         policy.validate()?;
@@ -135,7 +137,7 @@ pub fn build_sandboxed_command(
         }
     }
     cmd.env("TMPDIR", scratch.as_ref());
-    Ok(cmd)
+    Ok(SandboxedSpawn::Wrapped(cmd))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -145,7 +147,7 @@ pub fn build_sandboxed_command(
     _r: &Path,
     _s: &Path,
     _policy: &SandboxPolicy,
-) -> Result<Command, SandboxUnavailable> {
+) -> Result<SandboxedSpawn, SandboxUnavailable> {
     Err(SandboxUnavailable(
         "macOS sandbox not available on this platform".into(),
     ))

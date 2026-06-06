@@ -234,7 +234,7 @@ fn cmd_list(json: bool) -> Result<()> {
                 entry.command,
                 entry.underlying_tool_hint,
             )
-        } else if registered && fully_ready && !sandbox_ok {
+        } else if registered && fully_ready && !sandbox_ok && !entry.builtin {
             #[cfg(target_os = "linux")]
             let hint = "install bubblewrap: sudo apt-get install bubblewrap";
             #[cfg(target_os = "macos")]

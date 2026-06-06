@@ -727,13 +727,18 @@ export function registerShowLanguages(
   const getCorpus = (): string =>
     path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "");
 
+  // Read the configured binary path at call time so we always use the value
+  // written by checkBinaryAndPrompt, which runs async after activation.
+  const getBinary = (): string =>
+    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || binary;
+
   let cachedAvailable: LangInfo[] = [];
   let availableLoaded = false;
 
   const render = async (): Promise<string> => {
     const langsRaw = await client.callTool("repo_languages");
     if (!availableLoaded) {
-      const raw = await spawnLangCommand(binary, ["lang", "list", "--json"]);
+      const raw = await spawnLangCommand(getBinary(), ["lang", "list", "--json"]);
       cachedAvailable = parseAvailableLanguages(raw);
       availableLoaded = true;
     }
@@ -749,7 +754,7 @@ export function registerShowLanguages(
     if (msg.command === "reloadAvailable") {
       availableLoaded = false;
       postStatus('Reloading available tools…');
-      void spawnLangCommand(binary, ["lang", "list", "--json"]).then((raw) => {
+      void spawnLangCommand(getBinary(), ["lang", "list", "--json"]).then((raw) => {
         cachedAvailable = parseAvailableLanguages(raw);
         availableLoaded = true;
         postStatus(""); // clear immediately — never couple clear to render()/callTool
@@ -763,7 +768,7 @@ export function registerShowLanguages(
         const args = ["lang", "install", msg.language, "--no-interactive", "--yes"];
         if (corpus) args.push("--corpus", corpus);
         postStatus(`Installing ${msg.language} tool…`);
-        void spawnLangCommand(binary, args).then(() => {
+        void spawnLangCommand(getBinary(), args).then(() => {
           availableLoaded = false;
           postStatus("");
           void refresh();
@@ -786,8 +791,8 @@ export function registerShowLanguages(
         const installArgs = ["lang", "install", m.language, "--no-interactive", "--yes"];
         if (corpus) installArgs.push("--corpus", corpus);
         postStatus(`Installing ${m.language} with elevated approval…`);
-        void spawnLangCommand(binary, approveArgs)
-          .then(() => spawnLangCommand(binary, installArgs))
+        void spawnLangCommand(getBinary(), approveArgs)
+          .then(() => spawnLangCommand(getBinary(), installArgs))
           .then(() => {
             availableLoaded = false;
             postStatus("");
@@ -798,7 +803,7 @@ export function registerShowLanguages(
       }
       case "removeLang":
         postStatus(`Disabling ${msg.language}…`);
-        void spawnLangCommand(binary, ["lang", "remove", msg.language]).then(() => {
+        void spawnLangCommand(getBinary(), ["lang", "remove", msg.language]).then(() => {
           availableLoaded = false;
           postStatus("");
           void refresh();
@@ -809,7 +814,7 @@ export function registerShowLanguages(
         const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!wsRoot) return;
         postStatus("Initializing repo…");
-        void spawnLangCommand(binary, ["init"], wsRoot, 60_000).then(() => {
+        void spawnLangCommand(getBinary(), ["init"], wsRoot, 60_000).then(() => {
           postStatus("");
           void refresh();
         });
@@ -817,7 +822,7 @@ export function registerShowLanguages(
       }
       case "detectLangs":
         postStatus('Detecting languages…');
-        void spawnLangCommand(binary, ["lang", "detect"]).then((out) => {
+        void spawnLangCommand(getBinary(), ["lang", "detect"]).then((out) => {
           void vscode.window.showInformationMessage(
             out.trim() ? `Detect: ${out.trim().slice(0, 120)}` : "Detection complete."
           );
