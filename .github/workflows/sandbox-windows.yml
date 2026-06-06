@@ -1,0 +1,35 @@
+name: sandbox-windows (elevated AppContainer tests)
+
+# T1–T5 require a Windows runner with admin privileges so the AppContainer
+# isolation calls succeed. Standard GitHub-hosted runners do not have these
+# privileges. Run this workflow manually on a self-hosted Windows runner
+# that is configured with administrator rights.
+#
+# Runner label requirements: [self-hosted, windows, X64, admin]
+# See docs/adrs/ADR-017-unified-plugin-sandbox-trust.md §Tests Security requires
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox-tests:
+    name: T1–T5 AppContainer sandbox tests
+    runs-on: [self-hosted, windows, X64, admin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run AppContainer sandbox tests (T1–T5, require admin)
+        # --ignored: run the tests marked #[ignore] (the elevated AppContainer tests)
+        # --test-threads=1: AppContainer profile creation is not safe to parallelise
+        run: cargo test --test sandbox_windows -- --ignored --test-threads=1
+        working-directory: crates/travsr-plugin-host
