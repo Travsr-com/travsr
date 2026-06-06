@@ -468,6 +468,33 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 
 ---
 
+## Changelog
+
+### v0.8.0 (2026-06-06)
+
+**travsr binary (npm: v0.8.0)**
+
+- Add `travsr-ipc` crate: platform-agnostic control plane (Unix socket on macOS/Linux, Named Pipe on Windows)
+- Add Windows Named Pipe daemon control: `travsr daemon start/stop/status` now works on Windows (WS2)
+- Add dual-write post-commit hook on Windows: installs both `post-commit` and `post-commit.cmd` so the hook fires from CMD, PowerShell, and Git Bash (WS3)
+- Add Windows Task Scheduler auto-start via `travsr autostart` and `travsr daemon start --autostart` (WS5/WS6)
+- Add AppContainer + Job Object sandbox for plugin host processes on Windows, matching the macOS sandbox posture (RFC-014, WS4)
+- Add full `CreateProcessW` spawn inside AppContainer for plugin indexers on Windows (P5-S3)
+- Add CI matrix for elevated AppContainer sandbox tests on Windows (T1-T5)
+- Fix `lang list` incorrectly showing built-in indexers as disabled on Windows
+- Fix `travsr unregister` treating task-not-found as an error instead of a no-op
+- Fix graph.db file permissions on Windows (restricted via `icacls`)
+
+**VS Code extension (vscode-v0.7.0)**
+
+- Add `.exe`-only binary spawn on Windows with `assertExecutableBinary` path validation (WS1, PSE R5)
+- Fix `showLanguages` using a stale binary path captured at activation time
+- Fix stale download URLs and `assertExecutableBinary` not being called in `reindexNow`
+- Fix `assertExecutableBinary` metacharacter regex on Windows paths
+- Update bundled binary reference to v0.8.0
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome. Licensed MIT.
