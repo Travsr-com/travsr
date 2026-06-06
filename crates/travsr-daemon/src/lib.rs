@@ -64,6 +64,43 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
             );
         }
     }
+    // SEC (Windows): mirror the Unix 0o600 restriction via icacls.
+    // /inheritance:r strips all inherited ACEs; /grant:r grants Full Control to
+    // the current user only. icacls ships with every Windows install since Vista.
+    #[cfg(windows)]
+    {
+        match std::env::var("USERNAME") {
+            Ok(username) if !username.is_empty() => {
+                let status = std::process::Command::new("icacls")
+                    .args([
+                        db_path.to_str().unwrap_or(""),
+                        "/inheritance:r",
+                        "/grant:r",
+                        &format!("{username}:(F)"),
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => tracing::warn!(
+                        path = %db_path.display(),
+                        exit_code = ?s.code(),
+                        "icacls failed to restrict graph.db permissions — file may be readable by other users on this machine"
+                    ),
+                    Err(e) => tracing::warn!(
+                        path = %db_path.display(),
+                        err = %e,
+                        "icacls not available — graph.db permissions not restricted on Windows"
+                    ),
+                }
+            }
+            _ => tracing::warn!(
+                path = %db_path.display(),
+                "USERNAME env var not set — skipping graph.db permission restriction on Windows"
+            ),
+        }
+    }
 
     install_hook(repo_root)?;
 
