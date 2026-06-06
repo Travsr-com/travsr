@@ -18,6 +18,7 @@ jobs:
   sandbox-tests:
     name: T1–T5 AppContainer sandbox tests
     runs-on: [self-hosted, windows, X64, admin]
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,5 +32,4 @@ jobs:
       - name: Run AppContainer sandbox tests (T1–T5, require admin)
         # --ignored: run the tests marked #[ignore] (the elevated AppContainer tests)
         # --test-threads=1: AppContainer profile creation is not safe to parallelise
-        run: cargo test --test sandbox_windows -- --ignored --test-threads=1
-        working-directory: crates/travsr-plugin-host
+        run: cargo test -p travsr-plugin-host --test sandbox_windows -- --ignored --test-threads=1
