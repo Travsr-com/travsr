@@ -2,7 +2,7 @@
   "name": "travsr-vscode",
   "displayName": "Travsr",
   "description": "Graph-native code intelligence for VS Code. Live call graph, blast radius, and callers — powered by the local Travsr daemon over MCP.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "travsr",
   "license": "MIT",
   "icon": "icon.png",
