@@ -1,7 +1,6 @@
 //! Unsafe Win32 FFI wrappers for AppContainer + Job Object sandbox (RFC-014).
 //! All `unsafe` blocks in travsr-plugin-host are confined to this file.
 #![allow(unsafe_code)]
-#![allow(dead_code)]
 #![allow(clippy::io_other_error)]
 
 use std::io;
@@ -24,9 +23,6 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
@@ -37,11 +33,10 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, GetProcessId,
-    InitializeProcThreadAttributeList, OpenThread, ResumeThread, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, IO_COUNTERS,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    STARTUPINFOW, THREAD_SUSPEND_RESUME,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, IO_COUNTERS, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 // ── Access masks ──────────────────────────────────────────────────────────────
@@ -149,13 +144,6 @@ impl Drop for OwnedHandle {
 unsafe impl Send for OwnedHandle {}
 unsafe impl Sync for OwnedHandle {}
 
-/// `SECURITY_CAPABILITIES` wrapper that implements `Copy + Send + Sync + 'static`.
-#[derive(Copy, Clone)]
-pub(super) struct SendSyncSecurityCapabilities(pub(super) SECURITY_CAPABILITIES);
-
-unsafe impl Send for SendSyncSecurityCapabilities {}
-unsafe impl Sync for SendSyncSecurityCapabilities {}
-
 /// RAII wrapper for an initialized `LPPROC_THREAD_ATTRIBUTE_LIST` buffer.
 /// Calls `DeleteProcThreadAttributeList` on drop; the `Vec<u8>` frees the memory.
 struct AttrList {
@@ -163,10 +151,6 @@ struct AttrList {
 }
 
 impl AttrList {
-    fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.buf.as_ptr() as _
-    }
-
     fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.buf.as_mut_ptr() as _
     }
@@ -421,68 +405,6 @@ pub(super) fn create_job_with_limits() -> io::Result<OwnedJobHandle> {
     Ok(OwnedJobHandle(job))
 }
 
-/// Assigns `process_handle` to `job`.
-pub(super) fn assign_to_job(job: HANDLE, process_handle: HANDLE) -> io::Result<()> {
-    let ok = unsafe { AssignProcessToJobObject(job, process_handle) };
-    if ok == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Finds the first thread of `pid` and calls `ResumeThread`. Used by tests.
-pub(super) fn resume_first_thread(pid: u32) -> io::Result<()> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    struct SnapGuard(HANDLE);
-    impl Drop for SnapGuard {
-        fn drop(&mut self) {
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-    let _snap = SnapGuard(snapshot);
-
-    let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
-    te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-
-    if unsafe { Thread32First(snapshot, &mut te) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    loop {
-        if te.th32OwnerProcessID == pid {
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID) };
-            if thread.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            struct ThreadGuard(HANDLE);
-            impl Drop for ThreadGuard {
-                fn drop(&mut self) {
-                    unsafe { CloseHandle(self.0) };
-                }
-            }
-            let _tg = ThreadGuard(thread);
-            let prev = unsafe { ResumeThread(thread) };
-            if prev == u32::MAX {
-                return Err(io::Error::last_os_error());
-            }
-            return Ok(());
-        }
-        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        if unsafe { Thread32Next(snapshot, &mut te) } == 0 {
-            break;
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("no thread found for pid {pid}"),
-    ))
-}
-
 // ── P5-S3: CreateProcessW + AppContainer spawn ────────────────────────────────
 
 /// Quote a single argument for a Windows command line.
@@ -632,63 +554,6 @@ fn init_attr_list(count: u32) -> io::Result<AttrList> {
         ));
     }
     Ok(AttrList { buf })
-}
-
-/// Resolve a single stdio stream into a child-side HANDLE and an optional
-/// parent-side pipe end. The returned keepalive values must stay alive until
-/// after `CreateProcessW` returns.
-///
-/// Returns `(child_handle, parent_pipe, _nul_file)` where:
-/// - `child_handle` goes into `STARTUPINFOW.hStd*`
-/// - `parent_pipe` is the parent's end of a `StdioMode::Pipe` (returned to caller)
-/// - `_nul_file` keeps a NUL device file open for `StdioMode::Null`
-fn resolve_stdio(
-    mode: StdioMode,
-    for_read: bool, // true = stdin (child reads), false = stdout/stderr (child writes)
-) -> io::Result<(HANDLE, Option<OwnedHandle>, Option<std::fs::File>)> {
-    match mode {
-        StdioMode::Pipe => {
-            let (read_h, write_h) = create_pipe_pair()?;
-            if for_read {
-                // stdin: child gets read end; parent keeps write end
-                make_inheritable(read_h.as_handle())?;
-                let child_h = read_h.as_handle();
-                Ok((child_h, Some(write_h), None)) // read_h dropped after CreateProcessW
-                                                   // NOTE: read_h is consumed by the caller match, not dropped here
-            } else {
-                // stdout/stderr: child gets write end; parent keeps read end
-                make_inheritable(write_h.as_handle())?;
-                let child_h = write_h.as_handle();
-                Ok((child_h, Some(read_h), None))
-            }
-        }
-        StdioMode::Null => {
-            let f = if for_read {
-                std::fs::File::open("NUL")
-            } else {
-                std::fs::OpenOptions::new().write(true).open("NUL")
-            }
-            .map_err(|e| io::Error::new(e.kind(), format!("failed to open NUL device: {e}")))?;
-            use std::os::windows::io::AsRawHandle;
-            let h = f.as_raw_handle() as HANDLE;
-            make_inheritable(h)?;
-            Ok((h, None, Some(f)))
-        }
-        StdioMode::Inherit => {
-            use std::os::windows::io::AsRawHandle;
-            let h = if for_read {
-                std::io::stdin().as_raw_handle() as HANDLE
-            } else {
-                // We don't know if it's stdout or stderr here; caller passes the right one.
-                // This variant is handled by spawn_in_appcontainer directly.
-                std::ptr::null_mut()
-            };
-            if !h.is_null() {
-                make_inheritable(h)?;
-            }
-            Ok((h, None, None))
-        }
-    }
 }
 
 /// Wrap an `OwnedHandle` as a writable `std::fs::File` (e.g. stdin pipe write end).
@@ -1019,7 +884,3 @@ pub(super) fn terminate_process(handle: HANDLE) -> io::Result<()> {
     }
 }
 
-/// Return the PID for a process handle.
-pub(super) fn get_pid(handle: HANDLE) -> u32 {
-    unsafe { GetProcessId(handle) }
-}
