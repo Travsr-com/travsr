@@ -64,6 +64,58 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
             );
         }
     }
+    // SEC (Windows): mirror the Unix 0o600 restriction via icacls.
+    // /inheritance:r strips all inherited ACEs; /grant:r grants Full Control to
+    // the current user only. icacls ships with every Windows install since Vista.
+    // USERDOMAIN\USERNAME is used rather than USERNAME alone to avoid ambiguity
+    // on domain-joined machines where a local and domain user share the same name.
+    #[cfg(windows)]
+    'acl: {
+        let Some(path_str) = db_path.to_str() else {
+            tracing::warn!(
+                path = %db_path.display(),
+                "graph.db path is not valid UTF-8 — skipping icacls permission restriction"
+            );
+            break 'acl;
+        };
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+        if user.is_empty() {
+            tracing::warn!(
+                path = %db_path.display(),
+                "USERNAME env var not set — skipping graph.db permission restriction on Windows"
+            );
+            break 'acl;
+        }
+        let account = if domain.is_empty() {
+            user
+        } else {
+            format!("{domain}\\{user}")
+        };
+        let status = std::process::Command::new("icacls")
+            .args([
+                path_str,
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{account}:(F)"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => tracing::warn!(
+                path = %db_path.display(),
+                exit_code = ?s.code(),
+                "icacls failed to restrict graph.db permissions — file may be readable by other users on this machine"
+            ),
+            Err(e) => tracing::warn!(
+                path = %db_path.display(),
+                err = %e,
+                "icacls not available — graph.db permissions not restricted on Windows"
+            ),
+        }
+    }
 
     install_hook(repo_root)?;
 
