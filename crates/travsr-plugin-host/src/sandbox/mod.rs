@@ -6,10 +6,89 @@ pub mod policy;
 
 pub use policy::{SandboxPolicy, SandboxUnavailable};
 
-/// Platform-specific RAII resource guard. On Windows, holds the Job Object
-/// handle with KILL_ON_JOB_CLOSE — drop when the child should be killable.
-/// On Linux and macOS, always `None`.
-pub type PlatformGuard = Option<Box<dyn std::any::Any + Send + Sync>>;
+/// How a single stdio stream is configured for a sandboxed process.
+#[derive(Clone, Copy)]
+pub enum StdioCfg {
+    /// Inherit the parent process's handle.
+    Inherit,
+    /// Redirect to the null device (discard).
+    Null,
+    /// Create an anonymous pipe; the parent end is accessible on the child.
+    Pipe,
+}
+
+impl StdioCfg {
+    fn into_stdio(self) -> std::process::Stdio {
+        match self {
+            StdioCfg::Inherit => std::process::Stdio::inherit(),
+            StdioCfg::Null => std::process::Stdio::null(),
+            StdioCfg::Pipe => std::process::Stdio::piped(),
+        }
+    }
+}
+
+/// Completed sandboxed child process.
+pub enum SandboxedChild {
+    Standard(std::process::Child),
+    #[cfg(target_os = "windows")]
+    AppContainer(windows::AppContainerChild),
+}
+
+impl SandboxedChild {
+    pub fn id(&self) -> u32 {
+        match self {
+            SandboxedChild::Standard(c) => c.id(),
+            #[cfg(target_os = "windows")]
+            SandboxedChild::AppContainer(c) => c.id(),
+        }
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            SandboxedChild::Standard(c) => c.kill(),
+            #[cfg(target_os = "windows")]
+            SandboxedChild::AppContainer(c) => c.kill(),
+        }
+    }
+
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            SandboxedChild::Standard(c) => c.wait(),
+            #[cfg(target_os = "windows")]
+            SandboxedChild::AppContainer(c) => c.wait(),
+        }
+    }
+
+    pub fn wait_with_output(self) -> std::io::Result<std::process::Output> {
+        match self {
+            SandboxedChild::Standard(c) => c.wait_with_output(),
+            #[cfg(target_os = "windows")]
+            SandboxedChild::AppContainer(c) => c.wait_with_output(),
+        }
+    }
+
+    /// Extract IPC streams (stdin write, stdout read) for protocol use.
+    /// Returns `None` if the child was not spawned with `StdioCfg::Pipe` on both.
+    pub fn take_ipc_streams(
+        &mut self,
+    ) -> Option<(
+        Box<dyn std::io::Write + Send>,
+        Box<dyn std::io::Read + Send>,
+    )> {
+        match self {
+            SandboxedChild::Standard(child) => {
+                let stdin = child.stdin.take()?;
+                let stdout = child.stdout.take()?;
+                Some((
+                    Box::new(stdin) as Box<dyn std::io::Write + Send>,
+                    Box::new(stdout) as Box<dyn std::io::Read + Send>,
+                ))
+            }
+            #[cfg(target_os = "windows")]
+            SandboxedChild::AppContainer(ac) => ac.take_ipc_streams(),
+        }
+    }
+}
 
 /// Result of `build_sandboxed_command`. Configure stdio, then call `spawn`.
 pub enum SandboxedSpawn {
@@ -21,10 +100,10 @@ pub enum SandboxedSpawn {
 }
 
 impl SandboxedSpawn {
-    pub fn stdin(&mut self, cfg: std::process::Stdio) -> &mut Self {
+    pub fn stdin(&mut self, cfg: StdioCfg) -> &mut Self {
         match self {
             SandboxedSpawn::Wrapped(cmd) => {
-                cmd.stdin(cfg);
+                cmd.stdin(cfg.into_stdio());
             }
             #[cfg(target_os = "windows")]
             SandboxedSpawn::AppContainer(ac) => ac.set_stdin(cfg),
@@ -32,10 +111,10 @@ impl SandboxedSpawn {
         self
     }
 
-    pub fn stdout(&mut self, cfg: std::process::Stdio) -> &mut Self {
+    pub fn stdout(&mut self, cfg: StdioCfg) -> &mut Self {
         match self {
             SandboxedSpawn::Wrapped(cmd) => {
-                cmd.stdout(cfg);
+                cmd.stdout(cfg.into_stdio());
             }
             #[cfg(target_os = "windows")]
             SandboxedSpawn::AppContainer(ac) => ac.set_stdout(cfg),
@@ -43,10 +122,10 @@ impl SandboxedSpawn {
         self
     }
 
-    pub fn stderr(&mut self, cfg: std::process::Stdio) -> &mut Self {
+    pub fn stderr(&mut self, cfg: StdioCfg) -> &mut Self {
         match self {
             SandboxedSpawn::Wrapped(cmd) => {
-                cmd.stderr(cfg);
+                cmd.stderr(cfg.into_stdio());
             }
             #[cfg(target_os = "windows")]
             SandboxedSpawn::AppContainer(ac) => ac.set_stderr(cfg),
@@ -54,28 +133,27 @@ impl SandboxedSpawn {
         self
     }
 
-    /// Spawns the sandboxed process. The returned `PlatformGuard` must be kept
-    /// alive for the duration of the child — dropping it triggers cleanup
-    /// (on Windows: KILL_ON_JOB_CLOSE fires, terminating the process).
-    pub fn spawn(self) -> std::io::Result<(std::process::Child, PlatformGuard)> {
+    /// Spawn the sandboxed process.
+    pub fn spawn(self) -> std::io::Result<SandboxedChild> {
         match self {
-            SandboxedSpawn::Wrapped(mut cmd) => Ok((cmd.spawn()?, None)),
+            SandboxedSpawn::Wrapped(mut cmd) => Ok(SandboxedChild::Standard(cmd.spawn()?)),
             #[cfg(target_os = "windows")]
-            SandboxedSpawn::AppContainer(ac) => ac.spawn(),
+            SandboxedSpawn::AppContainer(ac) => {
+                Ok(SandboxedChild::AppContainer(ac.spawn()?))
+            }
         }
     }
 
     /// Convenience: spawn with inherited stdio, wait, return exit status.
-    /// Used by security tests on non-Windows platforms.
     pub fn status(self) -> std::io::Result<std::process::ExitStatus> {
         match self {
             SandboxedSpawn::Wrapped(mut cmd) => cmd.status(),
             #[cfg(target_os = "windows")]
             SandboxedSpawn::AppContainer(mut ac) => {
-                ac.set_stdin(std::process::Stdio::inherit());
-                ac.set_stdout(std::process::Stdio::inherit());
-                ac.set_stderr(std::process::Stdio::inherit());
-                ac.spawn().and_then(|(mut c, _g)| c.wait()) // Child::wait needs &mut self
+                ac.set_stdin(StdioCfg::Inherit);
+                ac.set_stdout(StdioCfg::Inherit);
+                ac.set_stderr(StdioCfg::Inherit);
+                ac.spawn()?.wait()
             }
         }
     }
@@ -86,10 +164,10 @@ impl SandboxedSpawn {
             SandboxedSpawn::Wrapped(mut cmd) => cmd.output(),
             #[cfg(target_os = "windows")]
             SandboxedSpawn::AppContainer(mut ac) => {
-                ac.set_stdin(std::process::Stdio::null());
-                ac.set_stdout(std::process::Stdio::piped());
-                ac.set_stderr(std::process::Stdio::piped());
-                ac.spawn().and_then(|(c, _g)| c.wait_with_output())
+                ac.set_stdin(StdioCfg::Null);
+                ac.set_stdout(StdioCfg::Pipe);
+                ac.set_stderr(StdioCfg::Pipe);
+                ac.spawn()?.wait_with_output()
             }
         }
     }

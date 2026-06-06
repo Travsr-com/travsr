@@ -1,5 +1,5 @@
 use crate::sandbox::policy::SandboxUnavailable;
-use crate::sandbox::PlatformGuard;
+use crate::sandbox::StdioCfg;
 use std::io::{BufReader, BufWriter};
 use std::sync::{Arc, Mutex};
 use travsr_error::IndexError;
@@ -58,8 +58,8 @@ impl Transport for InProcess {
 // ── Sidecar I/O types ─────────────────────────────────────────────────────────
 
 type SidecarIo = (
-    BufWriter<std::process::ChildStdin>,
-    BufReader<std::process::ChildStdout>,
+    BufWriter<Box<dyn std::io::Write + Send>>,
+    BufReader<Box<dyn std::io::Read + Send>>,
 );
 
 /// Subprocess transport. Spawns under ADR-017 SandboxPolicy::Standard.
@@ -70,14 +70,11 @@ pub struct Sidecar {
     plugin_version: String,
     /// None for stub instances (P5-S1 compatibility).
     #[allow(dead_code)] // held for process lifetime; drop kills the subprocess
-    child: Option<Mutex<std::process::Child>>,
+    _child: Option<Mutex<crate::sandbox::SandboxedChild>>,
     io: Option<Mutex<SidecarIo>>,
     health: Mutex<PluginHealth>,
     /// Per-invocation scratch tmpdir (ADR-017 Rule 1 — read-write, cleaned up on drop).
     _scratch: Option<tempfile::TempDir>,
-    /// On Windows: Job Object handle (KILL_ON_JOB_CLOSE). Drop terminates process.
-    /// On Linux/macOS: always None.
-    _platform_guard: PlatformGuard,
 }
 
 impl Sidecar {
@@ -86,13 +83,12 @@ impl Sidecar {
         Self {
             language: language.into(),
             plugin_version: String::new(),
-            child: None,
+            _child: None,
             io: None,
             health: Mutex::new(PluginHealth::Disabled(
-                "Sidecar spawn not yet implemented (P5-S3)".into(),
+                "stub sidecar".into(),
             )),
             _scratch: None,
-            _platform_guard: None,
         }
     }
 
@@ -128,20 +124,23 @@ impl Sidecar {
         })?;
 
         spawner
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stdin(StdioCfg::Pipe)
+            .stdout(StdioCfg::Pipe)
+            .stderr(StdioCfg::Null);
 
-        let (mut child, platform_guard) =
-            spawner.spawn().map_err(|e| IndexError::Parse {
+        let mut child = spawner.spawn().map_err(|e| IndexError::Parse {
+            file: format!("plugin:{lang}"),
+            message: format!("spawn failed: {e}"),
+        })?;
+
+        let (raw_stdin, raw_stdout) =
+            child.take_ipc_streams().ok_or_else(|| IndexError::Parse {
                 file: format!("plugin:{lang}"),
-                message: format!("spawn failed: {e}"),
+                message: "piped stdio not available after spawn".into(),
             })?;
 
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let mut writer = BufWriter::new(stdin);
-        let mut reader = BufReader::new(stdout);
+        let mut writer = BufWriter::new(raw_stdin);
+        let mut reader = BufReader::new(raw_stdout);
 
         // Handshake
         write_message(
@@ -181,11 +180,10 @@ impl Sidecar {
         Ok(Self {
             language: lang.to_string(),
             plugin_version,
-            child: Some(Mutex::new(child)),
+            _child: Some(Mutex::new(child)),
             io: Some(Mutex::new((writer, reader))),
             health: Mutex::new(PluginHealth::Ok),
             _scratch: Some(scratch),
-            _platform_guard: platform_guard,
         })
     }
 

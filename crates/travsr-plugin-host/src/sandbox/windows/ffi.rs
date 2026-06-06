@@ -1,19 +1,20 @@
 //! Unsafe Win32 FFI wrappers for AppContainer + Job Object sandbox (RFC-014).
 //! All `unsafe` blocks in travsr-plugin-host are confined to this file.
 #![allow(unsafe_code)]
-#![allow(dead_code)] // full CreateProcessW integration pending P5-S3
+#![allow(dead_code)]
 #![allow(clippy::io_other_error)]
 
 use std::io;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HLOCAL,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
+    HLOCAL, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_FAILED,
 };
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, DACL_SECURITY_INFORMATION,
-    PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
@@ -28,12 +29,19 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    IO_COUNTERS, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, GetProcessId,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, IO_COUNTERS,
+    OpenThread, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, THREAD_SUSPEND_RESUME, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTF_USESTDHANDLES,
 };
 
 // ── Access masks ──────────────────────────────────────────────────────────────
@@ -55,6 +63,21 @@ const JOB_ACTIVE_PROC_LIMIT: u32 = 64;
 
 const SECURITY_MAX_SID_SIZE: usize = 68;
 
+// ── PROC_THREAD_ATTRIBUTE constants ──────────────────────────────────────────
+// Not exported as named consts in windows-sys 0.61; defined from Win32 SDK values.
+
+const PROC_THREAD_ATTR_SECURITY_CAPABILITIES: usize = 0x0002_0009; // = 131081
+const PROC_THREAD_ATTR_HANDLE_LIST: usize = 0x0002_0002; // = 131074
+
+// ── Stdio mode (mirrors sandbox::StdioCfg without the cross-module dep) ──────
+
+#[derive(Clone, Copy)]
+pub(super) enum StdioMode {
+    Pipe,
+    Null,
+    Inherit,
+}
+
 // ── RAII types ────────────────────────────────────────────────────────────────
 
 /// RAII wrapper for a `PSID` obtained from `DeriveAppContainerSidFromAppContainerName`.
@@ -75,12 +98,10 @@ impl Drop for AppContainerSid {
     }
 }
 
-// PSID (*mut c_void) is not Send/Sync by default; we uphold the invariant that
-// this type is the sole owner and is not shared across threads without join.
 unsafe impl Send for AppContainerSid {}
 unsafe impl Sync for AppContainerSid {}
 
-/// Owned HANDLE that calls `CloseHandle` on drop.
+/// Owned HANDLE that calls `CloseHandle` on drop (job-specific).
 pub(super) struct OwnedJobHandle(HANDLE);
 
 impl OwnedJobHandle {
@@ -100,19 +121,75 @@ impl Drop for OwnedJobHandle {
 unsafe impl Send for OwnedJobHandle {}
 unsafe impl Sync for OwnedJobHandle {}
 
+/// Owned generic HANDLE that calls `CloseHandle` on drop.
+pub(super) struct OwnedHandle(pub(super) HANDLE);
+
+impl OwnedHandle {
+    pub(super) fn as_handle(&self) -> HANDLE {
+        self.0
+    }
+
+    /// Transfer raw handle ownership out without calling `CloseHandle`.
+    /// Use when wrapping in `std::fs::File::from_raw_handle`.
+    pub(super) fn into_raw(self) -> HANDLE {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+unsafe impl Send for OwnedHandle {}
+unsafe impl Sync for OwnedHandle {}
+
 /// `SECURITY_CAPABILITIES` wrapper that implements `Copy + Send + Sync + 'static`.
-///
-/// # Safety
-/// The `AppContainerSid` field must point to a live SID allocation for the
-/// duration of any `CreateProcessW` call. Callers must keep the `AppContainerSid`
-/// RAII guard alive until after the process is created.
 #[derive(Copy, Clone)]
 pub(super) struct SendSyncSecurityCapabilities(pub(super) SECURITY_CAPABILITIES);
 
 unsafe impl Send for SendSyncSecurityCapabilities {}
 unsafe impl Sync for SendSyncSecurityCapabilities {}
 
-// ── Helper: convert a &str / &Path to null-terminated UTF-16 ────────────────
+/// RAII wrapper for an initialized `LPPROC_THREAD_ATTRIBUTE_LIST` buffer.
+/// Calls `DeleteProcThreadAttributeList` on drop; the `Vec<u8>` frees the memory.
+struct AttrList {
+    buf: Vec<u8>,
+}
+
+impl AttrList {
+    fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.buf.as_ptr() as _
+    }
+
+    fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.buf.as_mut_ptr() as _
+    }
+}
+
+impl Drop for AttrList {
+    fn drop(&mut self) {
+        // Deinitialize the list; buf is freed when Vec drops.
+        unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+    }
+}
+
+/// Handles returned by a successful `spawn_in_appcontainer` call.
+pub(super) struct SpawnedHandles {
+    pub process: OwnedHandle,
+    pub _job: OwnedJobHandle, // KILL_ON_JOB_CLOSE fires when this drops
+    pub pid: u32,
+    pub stdin_write: Option<OwnedHandle>,  // parent write end of stdin pipe
+    pub stdout_read: Option<OwnedHandle>,  // parent read end of stdout pipe
+    pub stderr_read: Option<OwnedHandle>,  // parent read end of stderr pipe
+}
+
+// ── Helper: convert a &str / &Path to null-terminated UTF-16 ─────────────────
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -139,7 +216,6 @@ pub(super) fn derive_appcontainer_sid(profile_name: &str) -> io::Result<AppConta
 }
 
 /// Ensures the AppContainer profile exists. Ignores `ERROR_ALREADY_EXISTS`.
-/// Fail-closed: returns `Err` on any other failure.
 pub(super) fn ensure_appcontainer_profile(profile_name: &str) -> io::Result<()> {
     let name_wide = to_wide(profile_name);
     let desc_wide = to_wide("Travsr plugin sandbox");
@@ -147,14 +223,13 @@ pub(super) fn ensure_appcontainer_profile(profile_name: &str) -> io::Result<()> 
     let hr = unsafe {
         CreateAppContainerProfile(
             name_wide.as_ptr(),
-            name_wide.as_ptr(), // display name = profile name
+            name_wide.as_ptr(),
             desc_wide.as_ptr(),
             std::ptr::null(),
             0,
             &mut out_sid,
         )
     };
-    // Free the SID returned by CreateAppContainerProfile.
     if !out_sid.is_null() {
         unsafe { FreeSid(out_sid) };
     }
@@ -171,12 +246,9 @@ pub(super) fn ensure_appcontainer_profile(profile_name: &str) -> io::Result<()> 
 }
 
 /// Adds an allow ACE for `sid` with `access_mask` to the DACL of `path`.
-/// Uses `GetNamedSecurityInfoW` → `SetEntriesInAclW` → `SetNamedSecurityInfoW`
-/// so existing DACL entries are preserved.
 pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io::Result<()> {
     let path_wide = path_to_wide(path);
 
-    // 1. Fetch the existing DACL.
     let mut old_dacl = std::ptr::null_mut();
     let mut sd = std::ptr::null_mut();
     let err = unsafe {
@@ -204,7 +276,6 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
     }
     let _sd_guard = SdGuard(sd);
 
-    // 2. Build a merged DACL with our new ACE prepended.
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access_mask,
         grfAccessMode: GRANT_ACCESS,
@@ -233,7 +304,6 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
     }
     let _acl_guard = AclGuard(new_dacl as HLOCAL);
 
-    // 3. Apply the merged DACL.
     let err = unsafe {
         SetNamedSecurityInfoW(
             path_wide.as_ptr() as *mut u16,
@@ -251,12 +321,7 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
     Ok(())
 }
 
-/// Builds `SECURITY_CAPABILITIES` for Standard (no capabilities) or Elevated
-/// (WinCapabilityInternetClientSid) policy.
-///
-/// Returns `(cap_sid_buf, cap_attr, security_caps)`. All three must be kept alive
-/// until after `CreateProcessW` — their lifetimes are tied by raw pointer references
-/// inside `security_caps`.
+/// Builds `SECURITY_CAPABILITIES` for Standard or Elevated policy.
 pub(super) fn build_security_capabilities(
     container_sid: PSID,
     elevated: bool,
@@ -282,7 +347,6 @@ pub(super) fn build_security_capabilities(
         };
         let caps = SECURITY_CAPABILITIES {
             AppContainerSid: container_sid,
-            // Pointer into cap_attr — caller must keep cap_attr alive.
             Capabilities: &cap_attr as *const SID_AND_ATTRIBUTES as *mut SID_AND_ATTRIBUTES,
             CapabilityCount: 1,
             Reserved: 0,
@@ -354,7 +418,7 @@ pub(super) fn create_job_with_limits() -> io::Result<OwnedJobHandle> {
     Ok(OwnedJobHandle(job))
 }
 
-/// Assigns the process identified by `process_handle` to `job`.
+/// Assigns `process_handle` to `job`.
 pub(super) fn assign_to_job(job: HANDLE, process_handle: HANDLE) -> io::Result<()> {
     let ok = unsafe { AssignProcessToJobObject(job, process_handle) };
     if ok == 0 {
@@ -364,8 +428,7 @@ pub(super) fn assign_to_job(job: HANDLE, process_handle: HANDLE) -> io::Result<(
     }
 }
 
-/// Finds the first thread of `pid` via `CreateToolhelp32Snapshot` and calls
-/// `ResumeThread` on it. Used after `CREATE_SUSPENDED` to start execution.
+/// Finds the first thread of `pid` and calls `ResumeThread`. Used by tests.
 pub(super) fn resume_first_thread(pid: u32) -> io::Result<()> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
@@ -415,4 +478,485 @@ pub(super) fn resume_first_thread(pid: u32) -> io::Result<()> {
         io::ErrorKind::NotFound,
         format!("no thread found for pid {pid}"),
     ))
+}
+
+// ── P5-S3: CreateProcessW + AppContainer spawn ────────────────────────────────
+
+/// Quote a single argument for a Windows command line.
+fn quote_arg(arg: &str) -> String {
+    if !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push_str("\\\"");
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// Build a Windows command line string: `"program" arg1 arg2 ...`
+fn build_command_line(program: &str, args: &[String]) -> String {
+    let mut line = quote_arg(program);
+    for arg in args {
+        line.push(' ');
+        line.push_str(&quote_arg(arg));
+    }
+    line
+}
+
+/// Build a UTF-16 double-null-terminated environment block.
+/// Contains PATH/LANG/LC_ALL from the parent (if present) and
+/// TEMP/TMP/TMPDIR forced to `scratch_dir` (PSE R2).
+pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
+    const ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL"];
+    let scratch = scratch_dir.to_string_lossy().to_string();
+    let mut block: Vec<u16> = Vec::new();
+
+    for var in ALLOWLIST {
+        if let Ok(val) = std::env::var(var) {
+            let entry = format!("{var}={val}");
+            block.extend(entry.encode_utf16());
+            block.push(0);
+        }
+    }
+    for var in &["TEMP", "TMP", "TMPDIR"] {
+        let entry = format!("{var}={scratch}");
+        block.extend(entry.encode_utf16());
+        block.push(0);
+    }
+    block.push(0); // final double-null terminator
+    block
+}
+
+/// Create an anonymous pipe. Both ends are non-inheritable by default.
+pub(super) fn create_pipe_pair() -> io::Result<(OwnedHandle, OwnedHandle)> {
+    let mut read_h: HANDLE = std::ptr::null_mut();
+    let mut write_h: HANDLE = std::ptr::null_mut();
+    let ok = unsafe {
+        CreatePipe(
+            &mut read_h,
+            &mut write_h,
+            std::ptr::null::<SECURITY_ATTRIBUTES>(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((OwnedHandle(read_h), OwnedHandle(write_h)))
+}
+
+/// Set `HANDLE_FLAG_INHERIT` on a handle so it can be listed in
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` and inherited by the child (PSE R1).
+pub(super) fn make_inheritable(h: HANDLE) -> io::Result<()> {
+    let ok = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Allocate and initialize an attribute list for `count` attributes.
+fn init_attr_list(count: u32) -> io::Result<AttrList> {
+    let mut size: usize = 0;
+    // First call: query required size (returns FALSE; size is set).
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size) };
+    let mut buf = vec![0u8; size];
+    let ok = unsafe {
+        InitializeProcThreadAttributeList(buf.as_mut_ptr() as _, count, 0, &mut size)
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(AttrList { buf })
+}
+
+/// Resolve a single stdio stream into a child-side HANDLE and an optional
+/// parent-side pipe end. The returned keepalive values must stay alive until
+/// after `CreateProcessW` returns.
+///
+/// Returns `(child_handle, parent_pipe, _nul_file)` where:
+/// - `child_handle` goes into `STARTUPINFOW.hStd*`
+/// - `parent_pipe` is the parent's end of a `StdioMode::Pipe` (returned to caller)
+/// - `_nul_file` keeps a NUL device file open for `StdioMode::Null`
+fn resolve_stdio(
+    mode: StdioMode,
+    for_read: bool, // true = stdin (child reads), false = stdout/stderr (child writes)
+) -> io::Result<(HANDLE, Option<OwnedHandle>, Option<std::fs::File>)> {
+    match mode {
+        StdioMode::Pipe => {
+            let (read_h, write_h) = create_pipe_pair()?;
+            if for_read {
+                // stdin: child gets read end; parent keeps write end
+                make_inheritable(read_h.as_handle())?;
+                let child_h = read_h.as_handle();
+                Ok((child_h, Some(write_h), None)) // read_h dropped after CreateProcessW
+                // NOTE: read_h is consumed by the caller match, not dropped here
+            } else {
+                // stdout/stderr: child gets write end; parent keeps read end
+                make_inheritable(write_h.as_handle())?;
+                let child_h = write_h.as_handle();
+                Ok((child_h, Some(read_h), None))
+            }
+        }
+        StdioMode::Null => {
+            let f = if for_read {
+                std::fs::File::open("NUL")
+            } else {
+                std::fs::OpenOptions::new().write(true).open("NUL")
+            }
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("failed to open NUL device: {e}"))
+            })?;
+            use std::os::windows::io::AsRawHandle;
+            let h = f.as_raw_handle() as HANDLE;
+            make_inheritable(h)?;
+            Ok((h, None, Some(f)))
+        }
+        StdioMode::Inherit => {
+            use std::os::windows::io::AsRawHandle;
+            let h = if for_read {
+                std::io::stdin().as_raw_handle() as HANDLE
+            } else {
+                // We don't know if it's stdout or stderr here; caller passes the right one.
+                // This variant is handled by spawn_in_appcontainer directly.
+                std::ptr::null_mut()
+            };
+            if !h.is_null() {
+                make_inheritable(h)?;
+            }
+            Ok((h, None, None))
+        }
+    }
+}
+
+/// Wrap an `OwnedHandle` as a writable `std::fs::File` (e.g. stdin pipe write end).
+/// Ownership transfers into the File; CloseHandle is called on File::drop.
+pub(super) fn handle_into_write_file(h: OwnedHandle) -> std::fs::File {
+    use std::os::windows::io::FromRawHandle;
+    unsafe { std::fs::File::from_raw_handle(h.into_raw() as _) }
+}
+
+/// Wrap an `OwnedHandle` as a readable `std::fs::File` (e.g. stdout pipe read end).
+pub(super) fn handle_into_read_file(h: OwnedHandle) -> std::fs::File {
+    use std::os::windows::io::FromRawHandle;
+    unsafe { std::fs::File::from_raw_handle(h.into_raw() as _) }
+}
+
+/// Spawn `program` with `args` inside an AppContainer + Job Object.
+///
+/// # Safety contract (PSE R5)
+/// `security_caps` must remain alive on the caller's stack until this function
+/// returns. The `_cap_sid_buf` and `_cap_attr` from `build_security_capabilities`
+/// must be bound as named locals in the calling frame.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_in_appcontainer(
+    program: &str,
+    args: &[String],
+    scratch_dir: &Path,
+    security_caps: &SECURITY_CAPABILITIES,
+    job: OwnedJobHandle,
+    stdin_mode: StdioMode,
+    stdout_mode: StdioMode,
+    stderr_mode: StdioMode,
+) -> io::Result<SpawnedHandles> {
+    // ── 1. Resolve stdio (keepalives stay alive until after CreateProcessW) ───
+    //
+    // For Pipe:   child end is an OwnedHandle we'll drop after CreateProcessW;
+    //             parent end is returned to the caller in SpawnedHandles.
+    // For Null:   NUL device File is kept open here; dropped after CreateProcessW.
+    // For Inherit: parent's stdio handle, made inheritable; no owned resource.
+
+    // stdin: child reads, parent writes
+    let (stdin_child_h, stdin_parent_pipe, _stdin_nul);
+    let stdin_child_pipe: Option<OwnedHandle>;
+    match stdin_mode {
+        StdioMode::Pipe => {
+            let (r, w) = create_pipe_pair()?;
+            make_inheritable(r.as_handle())?;
+            stdin_child_h = r.as_handle();
+            stdin_child_pipe = Some(r);
+            stdin_parent_pipe = Some(w);
+            _stdin_nul = None;
+        }
+        StdioMode::Null => {
+            let f = std::fs::File::open("NUL").map_err(|e| {
+                io::Error::new(e.kind(), format!("NUL open failed: {e}"))
+            })?;
+            use std::os::windows::io::AsRawHandle;
+            let h = f.as_raw_handle() as HANDLE;
+            make_inheritable(h)?;
+            stdin_child_h = h;
+            stdin_child_pipe = None;
+            stdin_parent_pipe = None;
+            _stdin_nul = Some(f);
+        }
+        StdioMode::Inherit => {
+            use std::os::windows::io::AsRawHandle;
+            let h = std::io::stdin().as_raw_handle() as HANDLE;
+            if !h.is_null() {
+                make_inheritable(h)?;
+            }
+            stdin_child_h = h;
+            stdin_child_pipe = None;
+            stdin_parent_pipe = None;
+            _stdin_nul = None;
+        }
+    }
+
+    // stdout: child writes, parent reads
+    let (stdout_child_h, stdout_parent_pipe, _stdout_nul);
+    let stdout_child_pipe: Option<OwnedHandle>;
+    match stdout_mode {
+        StdioMode::Pipe => {
+            let (r, w) = create_pipe_pair()?;
+            make_inheritable(w.as_handle())?;
+            stdout_child_h = w.as_handle();
+            stdout_child_pipe = Some(w);
+            stdout_parent_pipe = Some(r);
+            _stdout_nul = None;
+        }
+        StdioMode::Null => {
+            let f = std::fs::OpenOptions::new().write(true).open("NUL").map_err(|e| {
+                io::Error::new(e.kind(), format!("NUL open failed: {e}"))
+            })?;
+            use std::os::windows::io::AsRawHandle;
+            let h = f.as_raw_handle() as HANDLE;
+            make_inheritable(h)?;
+            stdout_child_h = h;
+            stdout_child_pipe = None;
+            stdout_parent_pipe = None;
+            _stdout_nul = Some(f);
+        }
+        StdioMode::Inherit => {
+            use std::os::windows::io::AsRawHandle;
+            let h = std::io::stdout().as_raw_handle() as HANDLE;
+            if !h.is_null() {
+                make_inheritable(h)?;
+            }
+            stdout_child_h = h;
+            stdout_child_pipe = None;
+            stdout_parent_pipe = None;
+            _stdout_nul = None;
+        }
+    }
+
+    // stderr: child writes, parent reads
+    let (stderr_child_h, stderr_parent_pipe, _stderr_nul);
+    let stderr_child_pipe: Option<OwnedHandle>;
+    match stderr_mode {
+        StdioMode::Pipe => {
+            let (r, w) = create_pipe_pair()?;
+            make_inheritable(w.as_handle())?;
+            stderr_child_h = w.as_handle();
+            stderr_child_pipe = Some(w);
+            stderr_parent_pipe = Some(r);
+            _stderr_nul = None;
+        }
+        StdioMode::Null => {
+            let f = std::fs::OpenOptions::new().write(true).open("NUL").map_err(|e| {
+                io::Error::new(e.kind(), format!("NUL open failed: {e}"))
+            })?;
+            use std::os::windows::io::AsRawHandle;
+            let h = f.as_raw_handle() as HANDLE;
+            make_inheritable(h)?;
+            stderr_child_h = h;
+            stderr_child_pipe = None;
+            stderr_parent_pipe = None;
+            _stderr_nul = Some(f);
+        }
+        StdioMode::Inherit => {
+            use std::os::windows::io::AsRawHandle;
+            let h = std::io::stderr().as_raw_handle() as HANDLE;
+            if !h.is_null() {
+                make_inheritable(h)?;
+            }
+            stderr_child_h = h;
+            stderr_child_pipe = None;
+            stderr_parent_pipe = None;
+            _stderr_nul = None;
+        }
+    }
+
+    // ── 2. Build PROC_THREAD_ATTRIBUTE_LIST with 2 attributes ────────────────
+    // Attribute 1: SECURITY_CAPABILITIES (AppContainer SID)
+    // Attribute 2: HANDLE_LIST (exactly the 3 child-side stdio handles, PSE R1)
+
+    let mut attr_list = init_attr_list(2)?;
+
+    // Attribute 1: AppContainer SECURITY_CAPABILITIES (PSE R5: security_caps still live)
+    let ok = unsafe {
+        UpdateProcThreadAttribute(
+            attr_list.as_mut_ptr(),
+            0,
+            PROC_THREAD_ATTR_SECURITY_CAPABILITIES,
+            security_caps as *const SECURITY_CAPABILITIES as *const _,
+            std::mem::size_of::<SECURITY_CAPABILITIES>(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Attribute 2: restrict inheritance to only the 3 child-side handles (PSE R1)
+    let mut handle_list: Vec<HANDLE> = Vec::new();
+    if !stdin_child_h.is_null() {
+        handle_list.push(stdin_child_h);
+    }
+    if !stdout_child_h.is_null() {
+        handle_list.push(stdout_child_h);
+    }
+    if !stderr_child_h.is_null() {
+        handle_list.push(stderr_child_h);
+    }
+
+    if !handle_list.is_empty() {
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                attr_list.as_mut_ptr(),
+                0,
+                PROC_THREAD_ATTR_HANDLE_LIST,
+                handle_list.as_ptr() as *const _,
+                handle_list.len() * std::mem::size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    // ── 3. STARTUPINFOEXW (PSE R3: STARTF_USESTDHANDLES + CREATE_NO_WINDOW) ──
+    let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si_ex.StartupInfo.hStdInput = stdin_child_h;
+    si_ex.StartupInfo.hStdOutput = stdout_child_h;
+    si_ex.StartupInfo.hStdError = stderr_child_h;
+    si_ex.lpAttributeList = attr_list.as_mut_ptr();
+
+    // ── 4. Command line, program path, current directory, env block ───────────
+    let cmdline = build_command_line(program, args);
+    let mut cmdline_wide = to_wide(&cmdline);
+    let program_wide = to_wide(program);
+    let scratch_wide = path_to_wide(scratch_dir);
+    let mut env_block = build_env_block(scratch_dir);
+
+    // ── 5. CreateProcessW ─────────────────────────────────────────────────────
+    // PSE R3: CREATE_NO_WINDOW | PSE R2: CREATE_UNICODE_ENVIRONMENT
+    // PSE R4: lpCurrentDirectory = scratch_dir
+    let creation_flags = CREATE_SUSPENDED
+        | EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_NO_WINDOW
+        | CREATE_UNICODE_ENVIRONMENT;
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        CreateProcessW(
+            program_wide.as_ptr(),          // lpApplicationName
+            cmdline_wide.as_mut_ptr(),      // lpCommandLine (must be mutable)
+            std::ptr::null(),               // lpProcessAttributes
+            std::ptr::null(),               // lpThreadAttributes
+            1,                              // bInheritHandles = TRUE (PSE R1)
+            creation_flags,
+            env_block.as_mut_ptr() as *const _,  // lpEnvironment
+            scratch_wide.as_ptr(),          // lpCurrentDirectory (PSE R4)
+            &si_ex.StartupInfo as *const STARTUPINFOW,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Wrap process and thread handles immediately so they're closed on any failure.
+    let process = OwnedHandle(pi.hProcess);
+    let thread_h = OwnedHandle(pi.hThread); // closed after ResumeThread
+    let pid = unsafe { GetProcessId(pi.hProcess) };
+
+    // Child-side pipe ends no longer needed — drop to close our copies.
+    drop(stdin_child_pipe);
+    drop(stdout_child_pipe);
+    drop(stderr_child_pipe);
+    // NUL device files dropped here too; child has inherited handles.
+
+    // ── 6. Assign to Job Object BEFORE resuming (PSE: job assigned first) ────
+    let ok = unsafe { AssignProcessToJobObject(job.as_handle(), process.as_handle()) };
+    if ok == 0 {
+        let e = io::Error::last_os_error();
+        unsafe { TerminateProcess(process.as_handle(), 1) };
+        return Err(e);
+    }
+
+    // ── 7. Resume the process (was created suspended) ────────────────────────
+    let prev = unsafe { ResumeThread(thread_h.as_handle()) };
+    if prev == u32::MAX {
+        let e = io::Error::last_os_error();
+        unsafe { TerminateProcess(process.as_handle(), 1) };
+        return Err(e);
+    }
+    // thread_h drops here (CloseHandle on thread is safe after ResumeThread)
+
+    Ok(SpawnedHandles {
+        process,
+        _job: job,
+        pid,
+        stdin_write: stdin_parent_pipe,
+        stdout_read: stdout_parent_pipe,
+        stderr_read: stderr_parent_pipe,
+    })
+}
+
+/// Wait for the process to exit and return the raw exit code.
+pub(super) fn wait_for_process(handle: HANDLE) -> io::Result<u32> {
+    let res = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if res == WAIT_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let mut code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(code)
+}
+
+/// Terminate the process immediately with exit code 1.
+pub(super) fn terminate_process(handle: HANDLE) -> io::Result<()> {
+    let ok = unsafe { TerminateProcess(handle, 1) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Return the PID for a process handle.
+pub(super) fn get_pid(handle: HANDLE) -> u32 {
+    unsafe { GetProcessId(handle) }
 }
