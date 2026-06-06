@@ -181,8 +181,11 @@ mod windows_sandbox {
             &[
                 "-NonInteractive",
                 "-Command",
-                // Allocate 6 GiB as a byte array — should trigger OOM kill.
-                "[void][byte[]]::new(6GB); exit 0",
+                // Try to allocate 6 GiB. The 4 GiB Job Object memory limit causes
+                // VirtualAlloc to fail, which .NET surfaces as OutOfMemoryException.
+                // PowerShell does not exit non-zero on OOM by default, so we
+                // use try-catch to map OOM → exit 1, success → exit 0.
+                "try { [void][byte[]]::new(6GB); exit 0 } catch { exit 1 }",
             ],
             repo.path(),
             scratch.path(),
@@ -191,10 +194,13 @@ mod windows_sandbox {
         .expect("build_sandboxed_command must succeed");
 
         let output = spawner.output().expect("spawn started");
-        // If the job limit killed the process, it exits abnormally (not 0).
+        // exit 1 = OOM was thrown (Job Object limit enforced — correct).
+        // exit 0 = allocation succeeded (Job Object limit not enforced — broken).
         assert!(
             !output.status.success(),
-            "process allocating 6 GiB should be killed by the 4 GiB Job Object limit"
+            "process allocating 6 GiB should have hit the 4 GiB Job Object memory limit \
+             (VirtualAlloc failed → OutOfMemoryException → exit 1); exit 0 means the limit \
+             is not being enforced"
         );
     }
 

@@ -526,10 +526,25 @@ fn build_command_line(program: &str, args: &[String]) -> String {
 }
 
 /// Build a UTF-16 double-null-terminated environment block.
-/// Contains PATH/LANG/LC_ALL from the parent (if present) and
+/// Contains an allowlist of non-sensitive parent variables plus
 /// TEMP/TMP/TMPDIR forced to `scratch_dir` (PSE R2).
+///
+/// SYSTEMROOT, SystemDrive, COMPUTERNAME, OS, PROCESSOR_ARCHITECTURE are
+/// included because the Windows AppContainer setup path expands %SYSTEMROOT%
+/// internally using the child env block; omitting them causes CreateProcessW
+/// to fail with ERROR_ENVVAR_NOT_FOUND (203).
 pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
-    const ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL"];
+    const ALLOWLIST: &[&str] = &[
+        // Shell / locale
+        "PATH", "LANG", "LC_ALL",
+        // Windows-required: AppContainer setup expands %SYSTEMROOT% from the child env
+        "SYSTEMROOT", "SystemRoot", "SystemDrive",
+        "COMPUTERNAME", "OS", "PROCESSOR_ARCHITECTURE",
+        "WINDIR",
+        // User identity (non-secret)
+        "USERNAME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+        "LOCALAPPDATA", "APPDATA", "PUBLIC",
+    ];
     let scratch = scratch_dir.to_string_lossy().to_string();
     let mut block: Vec<u16> = Vec::new();
 
@@ -540,6 +555,7 @@ pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
             block.push(0);
         }
     }
+    // TEMP/TMP/TMPDIR → scratch dir (PSE R2: child may only write to scratch)
     for var in &["TEMP", "TMP", "TMPDIR"] {
         let entry = format!("{var}={scratch}");
         block.extend(entry.encode_utf16());
@@ -581,14 +597,23 @@ pub(super) fn make_inheritable(h: HANDLE) -> io::Result<()> {
 /// Allocate and initialize an attribute list for `count` attributes.
 fn init_attr_list(count: u32) -> io::Result<AttrList> {
     let mut size: usize = 0;
-    // First call: query required size (returns FALSE; size is set).
+    // First call: query required size (expected to fail with ERROR_INSUFFICIENT_BUFFER).
     unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size) };
+    if size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("InitializeProcThreadAttributeList size query returned 0 (count={count})"),
+        ));
+    }
     let mut buf = vec![0u8; size];
     let ok = unsafe {
         InitializeProcThreadAttributeList(buf.as_mut_ptr() as _, count, 0, &mut size)
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("InitializeProcThreadAttributeList init failed: {}", io::Error::last_os_error()),
+        ));
     }
     Ok(AttrList { buf })
 }
@@ -819,7 +844,10 @@ pub(super) fn spawn_in_appcontainer(
         )
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {}", io::Error::last_os_error()),
+        ));
     }
 
     // Attribute 2: restrict inheritance to only the 3 child-side handles (PSE R1)
@@ -847,7 +875,10 @@ pub(super) fn spawn_in_appcontainer(
             )
         };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("UpdateProcThreadAttribute(HANDLE_LIST) failed: {}", io::Error::last_os_error()),
+            ));
         }
     }
 
@@ -860,16 +891,21 @@ pub(super) fn spawn_in_appcontainer(
     si_ex.StartupInfo.hStdError = stderr_child_h;
     si_ex.lpAttributeList = attr_list.as_mut_ptr();
 
-    // ── 4. Command line, program path, current directory, env block ───────────
+    // ── 4. Command line, current directory, env block ────────────────────────
     let cmdline = build_command_line(program, args);
     let mut cmdline_wide = to_wide(&cmdline);
-    let program_wide = to_wide(program);
     let scratch_wide = path_to_wide(scratch_dir);
     let mut env_block = build_env_block(scratch_dir);
 
     // ── 5. CreateProcessW ─────────────────────────────────────────────────────
     // PSE R3: CREATE_NO_WINDOW | PSE R2: CREATE_UNICODE_ENVIRONMENT
     // PSE R4: lpCurrentDirectory = scratch_dir
+    //
+    // lpApplicationName is NULL: CreateProcessW then resolves the executable
+    // from the first token of lpCommandLine using the standard search order
+    // (app dir → current dir → System32 → Windows dir → PATH), which is the
+    // only way to find bare exe names like "powershell.exe" on the PATH.
+    // When `program` is already an absolute path it resolves directly.
     let creation_flags = CREATE_SUSPENDED
         | EXTENDED_STARTUPINFO_PRESENT
         | CREATE_NO_WINDOW
@@ -878,7 +914,7 @@ pub(super) fn spawn_in_appcontainer(
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         CreateProcessW(
-            program_wide.as_ptr(),          // lpApplicationName
+            std::ptr::null(),               // lpApplicationName = NULL (resolve from cmdline)
             cmdline_wide.as_mut_ptr(),      // lpCommandLine (must be mutable)
             std::ptr::null(),               // lpProcessAttributes
             std::ptr::null(),               // lpThreadAttributes
@@ -891,7 +927,10 @@ pub(super) fn spawn_in_appcontainer(
         )
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("CreateProcessW({program:?}) failed: {}", io::Error::last_os_error()),
+        ));
     }
 
     // Wrap process and thread handles immediately so they're closed on any failure.
