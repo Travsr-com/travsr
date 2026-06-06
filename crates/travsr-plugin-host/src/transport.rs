@@ -85,9 +85,7 @@ impl Sidecar {
             plugin_version: String::new(),
             _child: None,
             io: None,
-            health: Mutex::new(PluginHealth::Disabled(
-                "stub sidecar".into(),
-            )),
+            health: Mutex::new(PluginHealth::Disabled("stub sidecar".into())),
             _scratch: None,
         }
     }

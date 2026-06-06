@@ -1,8 +1,8 @@
-#[cfg(target_os = "windows")]
-pub mod windows;
 pub mod linux;
 pub mod macos;
 pub mod policy;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub use policy::{SandboxPolicy, SandboxUnavailable};
 
@@ -138,9 +138,7 @@ impl SandboxedSpawn {
         match self {
             SandboxedSpawn::Wrapped(mut cmd) => Ok(SandboxedChild::Standard(cmd.spawn()?)),
             #[cfg(target_os = "windows")]
-            SandboxedSpawn::AppContainer(ac) => {
-                Ok(SandboxedChild::AppContainer(ac.spawn()?))
-            }
+            SandboxedSpawn::AppContainer(ac) => Ok(SandboxedChild::AppContainer(ac.spawn()?)),
         }
     }
 

@@ -93,17 +93,18 @@ impl AppContainerChild {
             .transpose()?
             .unwrap_or_default();
 
-        Ok(std::process::Output { status, stdout, stderr })
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
 
     /// Extract IPC streams (stdin write, stdout read) for protocol communication.
     /// Returns `None` if the child was not spawned with `StdioCfg::Pipe` on both.
     pub fn take_ipc_streams(
         &mut self,
-    ) -> Option<(
-        Box<dyn io::Write + Send>,
-        Box<dyn io::Read + Send>,
-    )> {
+    ) -> Option<(Box<dyn io::Write + Send>, Box<dyn io::Read + Send>)> {
         let stdin_h = self.stdin_write.take()?;
         let stdout_h = self.stdout_read.take()?;
         let stdin_file = ffi::handle_into_write_file(stdin_h);
@@ -154,7 +155,10 @@ impl AppContainerSpawn {
         let (_cap_sid_buf, _cap_attr, security_caps) =
             ffi::build_security_capabilities(sid.as_psid(), elevated)?;
 
-        if let SandboxPolicy::Elevated { permitted_hosts, .. } = &self.policy {
+        if let SandboxPolicy::Elevated {
+            permitted_hosts, ..
+        } = &self.policy
+        {
             tracing::warn!(
                 permitted_hosts = ?permitted_hosts,
                 "ADR-017 Elevated on Windows: AppContainer allows internet client; \

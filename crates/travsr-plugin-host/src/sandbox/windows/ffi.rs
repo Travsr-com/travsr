@@ -8,13 +8,8 @@ use std::io;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
-    HLOCAL, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_FAILED,
-};
-use windows_sys::Win32::Security::{
-    CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, DACL_SECURITY_INFORMATION,
-    PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+    HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_FAILED,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
@@ -23,6 +18,11 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+};
+use windows_sys::Win32::Security::{
+    CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, DACL_SECURITY_INFORMATION, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -37,11 +37,11 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, GetProcessId,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, IO_COUNTERS,
-    OpenThread, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, STARTUPINFOW,
-    TerminateProcess, THREAD_SUSPEND_RESUME, UpdateProcThreadAttribute, WaitForSingleObject,
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTF_USESTDHANDLES,
+    InitializeProcThreadAttributeList, OpenThread, ResumeThread, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, IO_COUNTERS,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, THREAD_SUSPEND_RESUME,
 };
 
 // ── Access masks ──────────────────────────────────────────────────────────────
@@ -184,9 +184,9 @@ pub(super) struct SpawnedHandles {
     pub process: OwnedHandle,
     pub _job: OwnedJobHandle, // KILL_ON_JOB_CLOSE fires when this drops
     pub pid: u32,
-    pub stdin_write: Option<OwnedHandle>,  // parent write end of stdin pipe
-    pub stdout_read: Option<OwnedHandle>,  // parent read end of stdout pipe
-    pub stderr_read: Option<OwnedHandle>,  // parent read end of stderr pipe
+    pub stdin_write: Option<OwnedHandle>, // parent write end of stdin pipe
+    pub stdout_read: Option<OwnedHandle>, // parent read end of stdout pipe
+    pub stderr_read: Option<OwnedHandle>, // parent read end of stderr pipe
 }
 
 // ── Helper: convert a &str / &Path to null-terminated UTF-16 ─────────────────
@@ -325,8 +325,11 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
 pub(super) fn build_security_capabilities(
     container_sid: PSID,
     elevated: bool,
-) -> io::Result<([u8; SECURITY_MAX_SID_SIZE], Option<SID_AND_ATTRIBUTES>, SECURITY_CAPABILITIES)>
-{
+) -> io::Result<(
+    [u8; SECURITY_MAX_SID_SIZE],
+    Option<SID_AND_ATTRIBUTES>,
+    SECURITY_CAPABILITIES,
+)> {
     if elevated {
         let mut sid_buf = [0u8; SECURITY_MAX_SID_SIZE];
         let mut sid_size = SECURITY_MAX_SID_SIZE as u32;
@@ -536,14 +539,25 @@ fn build_command_line(program: &str, args: &[String]) -> String {
 pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
     const ALLOWLIST: &[&str] = &[
         // Shell / locale
-        "PATH", "LANG", "LC_ALL",
+        "PATH",
+        "LANG",
+        "LC_ALL",
         // Windows-required: AppContainer setup expands %SYSTEMROOT% from the child env
-        "SYSTEMROOT", "SystemRoot", "SystemDrive",
-        "COMPUTERNAME", "OS", "PROCESSOR_ARCHITECTURE",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "SystemDrive",
+        "COMPUTERNAME",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
         "WINDIR",
         // User identity (non-secret)
-        "USERNAME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
-        "LOCALAPPDATA", "APPDATA", "PUBLIC",
+        "USERNAME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PUBLIC",
     ];
     let scratch = scratch_dir.to_string_lossy().to_string();
     let mut block: Vec<u16> = Vec::new();
@@ -606,13 +620,15 @@ fn init_attr_list(count: u32) -> io::Result<AttrList> {
         ));
     }
     let mut buf = vec![0u8; size];
-    let ok = unsafe {
-        InitializeProcThreadAttributeList(buf.as_mut_ptr() as _, count, 0, &mut size)
-    };
+    let ok =
+        unsafe { InitializeProcThreadAttributeList(buf.as_mut_ptr() as _, count, 0, &mut size) };
     if ok == 0 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("InitializeProcThreadAttributeList init failed: {}", io::Error::last_os_error()),
+            format!(
+                "InitializeProcThreadAttributeList init failed: {}",
+                io::Error::last_os_error()
+            ),
         ));
     }
     Ok(AttrList { buf })
@@ -638,7 +654,7 @@ fn resolve_stdio(
                 make_inheritable(read_h.as_handle())?;
                 let child_h = read_h.as_handle();
                 Ok((child_h, Some(write_h), None)) // read_h dropped after CreateProcessW
-                // NOTE: read_h is consumed by the caller match, not dropped here
+                                                   // NOTE: read_h is consumed by the caller match, not dropped here
             } else {
                 // stdout/stderr: child gets write end; parent keeps read end
                 make_inheritable(write_h.as_handle())?;
@@ -652,9 +668,7 @@ fn resolve_stdio(
             } else {
                 std::fs::OpenOptions::new().write(true).open("NUL")
             }
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("failed to open NUL device: {e}"))
-            })?;
+            .map_err(|e| io::Error::new(e.kind(), format!("failed to open NUL device: {e}")))?;
             use std::os::windows::io::AsRawHandle;
             let h = f.as_raw_handle() as HANDLE;
             make_inheritable(h)?;
@@ -727,9 +741,8 @@ pub(super) fn spawn_in_appcontainer(
             _stdin_nul = None;
         }
         StdioMode::Null => {
-            let f = std::fs::File::open("NUL").map_err(|e| {
-                io::Error::new(e.kind(), format!("NUL open failed: {e}"))
-            })?;
+            let f = std::fs::File::open("NUL")
+                .map_err(|e| io::Error::new(e.kind(), format!("NUL open failed: {e}")))?;
             use std::os::windows::io::AsRawHandle;
             let h = f.as_raw_handle() as HANDLE;
             make_inheritable(h)?;
@@ -764,9 +777,10 @@ pub(super) fn spawn_in_appcontainer(
             _stdout_nul = None;
         }
         StdioMode::Null => {
-            let f = std::fs::OpenOptions::new().write(true).open("NUL").map_err(|e| {
-                io::Error::new(e.kind(), format!("NUL open failed: {e}"))
-            })?;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open("NUL")
+                .map_err(|e| io::Error::new(e.kind(), format!("NUL open failed: {e}")))?;
             use std::os::windows::io::AsRawHandle;
             let h = f.as_raw_handle() as HANDLE;
             make_inheritable(h)?;
@@ -801,9 +815,10 @@ pub(super) fn spawn_in_appcontainer(
             _stderr_nul = None;
         }
         StdioMode::Null => {
-            let f = std::fs::OpenOptions::new().write(true).open("NUL").map_err(|e| {
-                io::Error::new(e.kind(), format!("NUL open failed: {e}"))
-            })?;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open("NUL")
+                .map_err(|e| io::Error::new(e.kind(), format!("NUL open failed: {e}")))?;
             use std::os::windows::io::AsRawHandle;
             let h = f.as_raw_handle() as HANDLE;
             make_inheritable(h)?;
@@ -846,7 +861,10 @@ pub(super) fn spawn_in_appcontainer(
     if ok == 0 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {}", io::Error::last_os_error()),
+            format!(
+                "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {}",
+                io::Error::last_os_error()
+            ),
         ));
     }
 
@@ -877,7 +895,10 @@ pub(super) fn spawn_in_appcontainer(
         if ok == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("UpdateProcThreadAttribute(HANDLE_LIST) failed: {}", io::Error::last_os_error()),
+                format!(
+                    "UpdateProcThreadAttribute(HANDLE_LIST) failed: {}",
+                    io::Error::last_os_error()
+                ),
             ));
         }
     }
@@ -914,14 +935,14 @@ pub(super) fn spawn_in_appcontainer(
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         CreateProcessW(
-            std::ptr::null(),               // lpApplicationName = NULL (resolve from cmdline)
-            cmdline_wide.as_mut_ptr(),      // lpCommandLine (must be mutable)
-            std::ptr::null(),               // lpProcessAttributes
-            std::ptr::null(),               // lpThreadAttributes
-            1,                              // bInheritHandles = TRUE (PSE R1)
+            std::ptr::null(),          // lpApplicationName = NULL (resolve from cmdline)
+            cmdline_wide.as_mut_ptr(), // lpCommandLine (must be mutable)
+            std::ptr::null(),          // lpProcessAttributes
+            std::ptr::null(),          // lpThreadAttributes
+            1,                         // bInheritHandles = TRUE (PSE R1)
             creation_flags,
-            env_block.as_mut_ptr() as *const _,  // lpEnvironment
-            scratch_wide.as_ptr(),          // lpCurrentDirectory (PSE R4)
+            env_block.as_mut_ptr() as *const _, // lpEnvironment
+            scratch_wide.as_ptr(),              // lpCurrentDirectory (PSE R4)
             &si_ex.StartupInfo as *const STARTUPINFOW,
             &mut pi,
         )
@@ -929,7 +950,10 @@ pub(super) fn spawn_in_appcontainer(
     if ok == 0 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("CreateProcessW({program:?}) failed: {}", io::Error::last_os_error()),
+            format!(
+                "CreateProcessW({program:?}) failed: {}",
+                io::Error::last_os_error()
+            ),
         ));
     }
 
