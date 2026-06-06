@@ -883,4 +883,3 @@ pub(super) fn terminate_process(handle: HANDLE) -> io::Result<()> {
         Ok(())
     }
 }
-
