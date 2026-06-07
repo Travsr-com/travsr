@@ -123,6 +123,10 @@ pub struct AppContainerSpawn {
     repo_root: PathBuf,
     scratch_dir: PathBuf,
     policy: SandboxPolicy,
+    /// Per-language toolchain cache grants (read/write paths). Env passthrough is
+    /// unnecessary on Windows: AppContainer does not clear the env, so the child
+    /// inherits GOPATH/USERPROFILE/etc. from the daemon.
+    toolchain: crate::sandbox::toolchain::ToolchainAccess,
     stdin: StdioCfg,
     stdout: StdioCfg,
     stderr: StdioCfg,
@@ -150,6 +154,13 @@ impl AppContainerSpawn {
         ffi::ensure_appcontainer_profile(&profile)?;
         ffi::grant_path_access(&self.repo_root, sid.as_psid(), ffi::ACCESS_GENERIC_READ)?;
         ffi::grant_path_access(&self.scratch_dir, sid.as_psid(), ffi::ACCESS_GENERIC_ALL)?;
+        // Per-language toolchain caches (best-effort: a missing cache dir is not fatal).
+        for path in &self.toolchain.read_paths {
+            let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_READ);
+        }
+        for path in &self.toolchain.write_paths {
+            let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_ALL);
+        }
 
         // PSE R5: all three bound on this stack frame; must outlive CreateProcessW.
         let (_cap_sid_buf, _cap_attr, security_caps) =
@@ -202,6 +213,7 @@ pub fn build_sandboxed_command(
     repo_root: &std::path::Path,
     scratch_dir: &std::path::Path,
     policy: &SandboxPolicy,
+    language: &str,
 ) -> Result<super::SandboxedSpawn, SandboxUnavailable> {
     if let SandboxPolicy::Elevated { .. } = policy {
         policy.validate()?;
@@ -212,6 +224,7 @@ pub fn build_sandboxed_command(
         repo_root: repo_root.to_path_buf(),
         scratch_dir: scratch_dir.to_path_buf(),
         policy: policy.clone(),
+        toolchain: crate::sandbox::toolchain::toolchain_access(language),
         stdin: StdioCfg::Inherit,
         stdout: StdioCfg::Inherit,
         stderr: StdioCfg::Inherit,

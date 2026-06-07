@@ -14,11 +14,29 @@ pub fn build_sandboxed_command(
     repo_root: &Path,
     scratch_dir: &Path,
     policy: &SandboxPolicy,
+    language: &str,
 ) -> Result<SandboxedSpawn, SandboxUnavailable> {
     // For Elevated policy, validate fields first (fail-closed per ADR-017 Rule 2).
     if let SandboxPolicy::Elevated { .. } = policy {
         policy.validate()?;
     }
+
+    // Per-language toolchain grants: a build-tool analyzer (scip-go, …) must read
+    // its module/build caches and see its env, or it resolves zero packages and
+    // emits an empty index. Empty for languages with no out-of-repo needs.
+    let tc = crate::sandbox::toolchain::toolchain_access(language);
+    let canon_path =
+        |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let tc_read_rule = tc
+        .read_paths
+        .iter()
+        .map(|p| format!("\n    (subpath \"{}\")", canon_path(p).to_string_lossy()))
+        .collect::<String>();
+    let tc_write_rule = tc
+        .write_paths
+        .iter()
+        .map(|p| format!(" (subpath \"{}\")", canon_path(p).to_string_lossy()))
+        .collect::<String>();
 
     // The Seatbelt sandbox matches paths by their *resolved* form (symlinks and
     // firmlinks followed). On macOS `/tmp` → `/private/tmp` and `/var` →
@@ -115,8 +133,8 @@ pub fn build_sandboxed_command(
     (subpath "/private/etc")
     (subpath "/opt/homebrew")
     (subpath "{repo}")
-    (subpath "{scratch}"))
-{program_dir_rule}(allow file-write* (subpath "{scratch}"))
+    (subpath "{scratch}"){tc_read_rule})
+{program_dir_rule}(allow file-write* (subpath "{scratch}"){tc_write_rule})
 (allow mach-lookup
     (global-name "com.apple.dyld")
     (global-name "com.apple.logd")
@@ -127,6 +145,8 @@ pub fn build_sandboxed_command(
         repo = repo,
         scratch = scratch,
         program_dir_rule = program_dir_rule,
+        tc_read_rule = tc_read_rule,
+        tc_write_rule = tc_write_rule,
     );
     let mut cmd = Command::new("sandbox-exec");
     cmd.args(["-p", &profile, "--"]).arg(program).args(args);
@@ -137,6 +157,11 @@ pub fn build_sandboxed_command(
         }
     }
     cmd.env("TMPDIR", scratch.as_ref());
+    // Per-language toolchain env (e.g. GOPATH/GOCACHE/GOMODCACHE/HOME for go) so the
+    // analyzer's build tool can locate its caches inside the otherwise-cleared env.
+    for (key, val) in &tc.env {
+        cmd.env(key, val);
+    }
     Ok(SandboxedSpawn::Wrapped(cmd))
 }
 

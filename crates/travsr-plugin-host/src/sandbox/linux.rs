@@ -58,6 +58,7 @@ pub fn build_sandboxed_command(
     repo_root: &Path,
     scratch_dir: &Path,
     policy: &SandboxPolicy,
+    language: &str,
 ) -> Result<SandboxedSpawn, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
@@ -75,6 +76,10 @@ pub fn build_sandboxed_command(
 
     let repo = repo_root.to_string_lossy();
     let scratch = scratch_dir.to_string_lossy();
+
+    // Per-language toolchain grants (e.g. go module/build caches + GO*/HOME env).
+    // Empty for languages with no out-of-repo needs.
+    let tc = crate::sandbox::toolchain::toolchain_access(language);
 
     let mut cmd = Command::new("bwrap");
 
@@ -133,6 +138,16 @@ pub fn build_sandboxed_command(
     // tmpfs automatically. A plain --tmpfs would be root-owned and unwritable.
     cmd.args(["--bind", scratch.as_ref(), "/travsr-scratch"]); // writable scratch
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
+    // Per-language toolchain caches: read-only module/toolchain dirs, writable
+    // build cache. Bound at their host paths so the GO*/HOME env (set below) resolve.
+    for path in &tc.read_paths {
+        let p = path.to_string_lossy();
+        cmd.args(["--ro-bind-try", p.as_ref(), p.as_ref()]);
+    }
+    for path in &tc.write_paths {
+        let p = path.to_string_lossy();
+        cmd.args(["--bind-try", p.as_ref(), p.as_ref()]);
+    }
     cmd.args(["--die-with-parent", "--"]);
     // Resource caps (ADR-017 Rule 1): 4 GiB virtual memory + 300s CPU via ulimit.
     let quoted_args = args
@@ -153,6 +168,11 @@ pub fn build_sandboxed_command(
         }
     }
     cmd.env("TMPDIR", "/travsr-scratch");
+    // Per-language toolchain env (e.g. GOPATH/GOCACHE/GOMODCACHE/HOME) so the
+    // analyzer's build tool locates its caches inside the cleared sandbox env.
+    for (key, val) in &tc.env {
+        cmd.env(key, val);
+    }
     Ok(SandboxedSpawn::Wrapped(cmd))
 }
 

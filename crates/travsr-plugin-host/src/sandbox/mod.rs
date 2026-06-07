@@ -1,6 +1,7 @@
 pub mod linux;
 pub mod macos;
 pub mod policy;
+pub mod toolchain;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
