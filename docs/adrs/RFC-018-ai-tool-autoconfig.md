@@ -1,127 +1,168 @@
 # RFC-018: AI Tool Auto-Configuration on `travsr init`
 
 **Date:** 2026-06-07
-**Status:** Proposed
+**Status:** Proposed (pending principal-security-engineer sign-off — see Security)
 
 ## Context
 
-Travsr's entire value proposition is that an AI agent traverses a live code graph
-via MCP instead of doing text RAG. But to get there a user must, by hand:
+Travsr only delivers value when an AI agent traverses the code graph over MCP
+instead of doing text RAG. Getting there is manual: the user must register the
+`travsr mcp --stdio` server in their tool's bespoke config, then separately tell
+that tool to prefer Travsr's graph tools over `grep`/`find`. Every tool has a
+different file, schema, and scope, so almost nobody does it, and Travsr sits
+installed-but-unused. Our own VS Code extension already proves the wiring works
+(`packages/travsr-vscode/src/mcp.ts` spawns `travsr mcp --stdio`); we just never
+bootstrap it for the third-party agents users already run.
 
-1. Register the Travsr MCP server (`travsr mcp --stdio`) in whatever AI coding
-   tool they use, in that tool's bespoke config format and location.
-2. Separately instruct that tool to prefer Travsr's graph tools over `grep`/`find`.
-
-Every AI tool has a different config file, schema, and scope (project vs global),
-so step 1 is error-prone, and almost no user does step 2. The result: Travsr is
-installed but the agent never actually uses it. The MCP wiring we already ship for
-our own VS Code extension (`packages/travsr-vscode/src/mcp.ts` spawns
-`travsr mcp --stdio`) proves the connection works — we just don't bootstrap it for
-the third-party agents users already run.
-
-`travsr init` is the natural place to fix this: the user is already in their repo,
-the graph is being built, and we know the absolute path to the running `travsr`
-binary (`std::env::current_exe()`).
+`travsr init` is the place to fix this: the user is in their repo and the binary
+is on disk.
 
 ## Decision
 
-Extend `travsr init` to detect which AI coding tools are present and, for each,
-(a) register the Travsr MCP server in that tool's config and (b) write a short
-"use Travsr effectively" instructions/rules file. The same code path is also
-exposed as a standalone `travsr connect` command.
+Extend `travsr init` to detect installed AI coding tools and, for each, register
+the Travsr MCP server and write a short "use Travsr effectively" rules file. The
+same code path is exposed as standalone `travsr connect`.
 
 ### Write behavior
 
-- **Project-scoped configs are auto-written.** They live inside the repo, are
-  git-tracked, and are trivially reverted, so writing them during `init` is safe
-  and zero-touch.
-- **Global/user-level configs are never silently mutated.** For tools that only
-  support a home-directory config (Windsurf), `init` prints the exact file path
-  and JSON snippet to add rather than editing `~`. This honors the project's
-  "confirm outward-facing / hard-to-reverse actions" rule.
-- **Idempotent.** JSON configs are merged (the `travsr` server key is
-  inserted/updated; all other servers are preserved). Markdown rules files use a
-  delimited managed block (`<!-- travsr:begin -->` / `<!-- travsr:end -->`) that
-  is replaced, never duplicated, on re-run.
-- **Non-fatal.** Detection or write failure never fails `travsr init`, mirroring
-  the existing `hint_lang_detect` pattern (`crates/travsr-cli/src/init.rs:39`).
-- **Opt out** with `travsr init --no-connect`.
+- **Local, not committed, by default.** Generated files are written into the
+  working tree but added to `.gitignore` (a managed Travsr block). Committing an
+  MCP server definition is an RCE-on-clone vector for downstream users
+  (attacker-defined server auto-loads on clone), and baking a local path into
+  shared history violates local-first. Users who *want* to share the config opt
+  in with `travsr connect --commit`.
+- **Bare command, not absolute path.** The server `command` is the bare string
+  `travsr` whenever `~/.travsr/bin` is on `PATH` (reuse
+  `install.rs::path_contains_travsr_bin`). This keeps output stable across
+  machines and avoids leaking the home dir / username. Only when `travsr` is not
+  on `PATH` do we fall back to the absolute `current_exe()` path *and* print the
+  PATH-fix guidance the install flow already emits.
+- **Global configs are never silently mutated.** For tools with only a
+  home-directory config (Windsurf), `init` prints the file path and exact snippet
+  to add rather than editing `~`.
+- **Each adapter owns its exact schema.** There is no single shared serializer:
+  Copilot uses top-level `servers` and requires `"type": "stdio"`; Cursor/Claude
+  use `mcpServers`; Zed uses `context_servers`; Cursor rules need YAML frontmatter
+  to activate. A shared helper only loads/merges/writes an opaque JSON value; the
+  per-tool entry is built by that tool's adapter.
+- **Idempotent and non-clobbering.** JSON merge upserts only the `travsr` key and
+  preserves all other servers. If the target file exists but does not parse as
+  strict JSON (hand-edited / JSONC with comments, common for `.vscode` and Zed),
+  the adapter **skips and warns** — it never rewrites and never drops the user's
+  content. Markdown rules use a single balanced
+  `<!-- travsr:begin -->` / `<!-- travsr:end -->` block; malformed, duplicate, or
+  nested markers cause a skip, never a destructive replace.
+- **Non-fatal, but visible.** Failures never fail `travsr init` (mirrors
+  `hint_lang_detect`, `init.rs:39`), but every file written or skipped is printed
+  in a one-line summary so the behavior is auditable.
+- **Opt out** with `travsr init --no-connect`. **Undo** with
+  `travsr connect --remove` (ships in v1; the managed-block design makes clean
+  removal cheap).
 
 ### Architecture
 
-A new module `crates/travsr-cli/src/connect.rs` defines one adapter per tool:
+A new module `crates/travsr-cli/src/connect.rs`. Adapters are a small enum
+dispatched by `match` (five fixed tools — no need for `fn`-pointer indirection):
 
 ```
-struct ToolAdapter {
-    name: &'static str,                          // "claude-code", "cursor", ...
-    detect: fn(repo: &Path) -> bool,             // marker dir/file present?
-    apply:  fn(repo: &Path, spec: &McpServerSpec) -> Result<Vec<PathBuf>>,
+enum Tool { ClaudeCode, Cursor, VsCodeCopilot, Windsurf, Zed }
+impl Tool {
+    fn detect(repo: &Path) -> Vec<Tool>;            // project markers first
+    fn apply(&self, repo: &Path, cmd: &McpCommand)  // builds its own schema
+        -> Result<Outcome>;                         // files written / skipped / printed
 }
 ```
 
-`McpServerSpec` carries the absolute travsr binary path plus args
-`["mcp", "--stdio"]`, serialized per tool. Shared helpers:
+`McpCommand` = the resolved command string (`travsr` or absolute fallback) +
+args `["mcp", "--stdio"]`. Shared helpers:
 
-- `merge_json_server(...)` — parse existing file (or `{}`) with `serde_json`,
-  upsert only the `travsr` server, write back. `serde_json` is already a CLI dep.
-- `write_managed_block(...)` — replace-or-append the delimited block in markdown.
-- `TRAVSR_AGENT_GUIDE` — one canonical guidance string (lifted from the "Code
-  Search: travsr MCP first" section of `.claude/CLAUDE.md`, listing
-  `search_symbol`, `get_dependencies`, `get_callers`, `get_blast_radius`,
-  `get_execution_path`, `get_repo_map`, `get_context`), reused by every adapter.
+- `merge_json_value(path, mutate)` — load existing strict-JSON (or `{}`), apply a
+  closure that upserts the `travsr` key, write back pretty-printed; **return
+  `Skipped` on parse failure** instead of overwriting.
+- `write_managed_block(path, body)` — replace the single balanced managed block or
+  append; skip on malformed markers.
+- `TRAVSR_AGENT_GUIDE` — one canonical guidance string (from the "Code Search:
+  travsr MCP first" section of `.claude/CLAUDE.md`: `search_symbol`,
+  `get_dependencies`, `get_callers`, `get_blast_radius`, `get_execution_path`,
+  `get_repo_map`, `get_context`; "use these before grep/find"). The text is
+  shared; each adapter wraps it in its own activation envelope (e.g. Cursor
+  frontmatter).
 
 Initial adapters:
 
-| Tool | Detect marker | MCP config (project) | Instructions file | Mode |
-|------|---------------|----------------------|-------------------|------|
-| Claude Code | `.claude/` or `CLAUDE.md` or `~/.claude/` | `.mcp.json` → `mcpServers.travsr` | managed block in `CLAUDE.md` | auto-write |
-| Cursor | `.cursor/` or `~/.cursor/` | `.cursor/mcp.json` → `mcpServers.travsr` | `.cursor/rules/travsr.mdc` | auto-write |
-| VS Code Copilot | `.vscode/` | `.vscode/mcp.json` → `servers.travsr` | managed block in `.github/copilot-instructions.md` | auto-write |
-| Windsurf | `~/.codeium/windsurf/` | `~/.codeium/windsurf/mcp_config.json` | `.windsurfrules` | print snippet |
-| Zed | `.zed/` or `~/.config/zed/` | `.zed/settings.json` → `context_servers.travsr` | `.rules` managed block | auto-write |
+| Tool | Detect marker (project-first) | MCP config | Server entry | Rules file |
+|------|-------------------------------|-----------|--------------|-----------|
+| Claude Code | `.claude/` or `CLAUDE.md` | `.mcp.json` → `mcpServers.travsr` | `{command, args}` | `CLAUDE.md` managed block |
+| Cursor | `.cursor/` | `.cursor/mcp.json` → `mcpServers.travsr` | `{command, args}` | `.cursor/rules/travsr.mdc` **with `---\nalwaysApply: true\n---` frontmatter** |
+| VS Code Copilot | existing `.vscode/mcp.json` (else print-snippet) | `.vscode/mcp.json` → `servers.travsr` | `{"type":"stdio", command, args}` | `.github/copilot-instructions.md` managed block |
+| Windsurf | `~/.codeium/windsurf/` | **print only** `~/.codeium/windsurf/mcp_config.json` → `mcpServers` | `{command, args}` | `.windsurf/rules/travsr.md` (preferred over legacy `.windsurfrules`) |
+| Zed | `.zed/` | `.zed/settings.json` → `context_servers.travsr` | Zed-pinned shape (verify flat `{command,args}` vs nested `{command:{path,args}}` against target version) | `.rules` managed block |
 
-The adapter table makes adding a tool a few-line change.
+Detection uses **project-local markers** to decide auto-write; a tool known only
+from a global marker (`~/.claude/`, `~/.cursor/`) is reported as print-snippet,
+not auto-written into an unrelated repo. Bare `.vscode/` is *not* a Copilot
+signal (present in most repos without Copilot) — Copilot auto-writes only when
+`.vscode/mcp.json` already exists, otherwise it prints the snippet.
 
 ### Wiring
 
-- `main.rs`: add `Command::Connect { tool: Option<String>, list: bool, print: bool }`
-  and a `--no-connect` flag on `Init`; add `mod connect;`.
+- `main.rs`: add `Command::Connect { tool: Option<String>, list: bool, print: bool, remove: bool, commit: bool }`, a `--no-connect` flag on `Init`, and `mod connect;`.
 - `init.rs`: after `hint_lang_detect`, call the connect path unless `--no-connect`,
-  wrapped non-fatally. Reuse `find_git_root` (`repo.rs`) and `dirs::home_dir()`.
+  wrapped non-fatally. Reuse `find_git_root` (`repo.rs:5`) and `dirs::home_dir()`.
+
+## Security & Privacy
+
+This RFC touches MCP registration, writes agent-instruction files, and resolves a
+local binary path, so it is a security surface and **requires
+principal-security-engineer sign-off before leaving Proposed**.
+
+- **No committed MCP configs by default** (see Write behavior) — avoids amplifying
+  the clone-and-pwn vector where a repo-defined MCP server auto-loads on clone
+  (Cursor MCPoison; VS Code skipping the trust prompt for `mcp.json`-started
+  servers; Claude Code `enableAllProjectMcpServers` consent bypass).
+- **No path/username leakage** — bare `travsr` command in generated files; absolute
+  path only in local, git-ignored fallback.
+- **No clobber, no destructive merge** — strict-JSON-or-skip, single balanced
+  managed block, never overwrite a pre-existing `travsr` key of a different shape.
+- **Instruction-poisoning containment** — the guidance text is static and minimal;
+  the managed-block writer refuses malformed/duplicate markers so a crafted host
+  file cannot trick it into deleting or preserving attacker content.
 
 ## Alternatives Considered
 
-**Auto-write global configs too (incl. `~/.codeium`).** Rejected: silently editing
-files outside the repo is hard to discover and revert, and violates the
-confirm-outward-actions principle. Printing a snippet keeps the user in control.
+**Commit MCP configs by default.** Rejected: being committable is exactly what
+makes these files dangerous to downstream cloners and conflicts with local-first.
+Opt-in `--commit` only.
 
-**Separate `travsr connect` only, leave `init` untouched.** Rejected as the
-default: it preserves the manual-wiring friction this RFC exists to remove. We
-still ship `travsr connect` for re-running and targeting one tool, but `init`
-performs the wiring automatically.
+**Absolute `current_exe()` path in generated files.** Rejected as the default:
+non-portable across machines/CI and leaks the home dir; used only as the
+not-on-PATH fallback.
 
-**Ship per-tool docs instead of code.** Rejected: documentation does not move the
-"agent actually uses Travsr" needle; the whole point is zero manual setup.
+**One shared MCP serializer for all tools.** Rejected: schemas genuinely diverge
+(`servers` + `type` for Copilot, `context_servers` for Zed, frontmatter for
+Cursor). Each adapter owns its schema; only load/merge/write is shared.
 
-**LLM-driven detection of the user's tool.** Rejected on Principle 1
-(algorithms first, LLM last) — presence of a tool's config dir is a deterministic
-filesystem check, no model needed.
+**Separate `travsr connect` only, leave `init` untouched.** Rejected as default:
+preserves the manual-wiring friction this RFC removes. `connect` still ships for
+re-running and single-tool targeting.
+
+**LLM-driven tool detection.** Rejected on Principle 1 — presence of a config dir
+is a deterministic filesystem check.
 
 ## Consequences
 
-- After `travsr init`, a user's existing agent (Claude Code, Cursor, Copilot) is
-  immediately wired to the Travsr MCP server and told to prefer it over text
-  search — no manual MCP config.
-- New committable files may appear in the repo (`.mcp.json`, `.cursor/...`,
-  `.vscode/mcp.json`). They are idempotent and `--no-connect` disables them.
-- A small, well-isolated adapter module; each adapter is pure and unit-testable
-  against a tempdir, matching the test style in `install.rs`.
-- Maintenance: each tool's config schema can drift across versions; adapters must
-  be kept current. Continue/Cline are deferred for this reason.
-- No new dependencies.
+- After `travsr init`, the user's existing agent is wired to Travsr and told to
+  prefer it over text search, with zero manual MCP config.
+- Generated files are local and git-ignored; nothing machine-specific enters
+  shared history.
+- Small, isolated module; each adapter is pure and unit-testable against a
+  tempdir (matching `install.rs` test style). No new dependencies; no crate-
+  dependency-rule change (stays in `travsr-cli`).
+- Maintenance: per-tool config schemas and rules-activation semantics drift across
+  versions and must be kept current — adapters pin and verify shapes. Continue and
+  Cline are deferred for this reason.
 
 ## Out of Scope
 
 - Continue and Cline adapters (config formats vary by version).
 - Installing the AI tools themselves; we only configure tools already present.
-- A `travsr connect --remove` uninstall path (possible follow-up).
