@@ -10,6 +10,7 @@ pub fn run(
     semantic: bool,
     force: bool,
     allow_unsandboxed_lsif: bool,
+    no_connect: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // Write command: index the worktree we are standing in, never redirect to
@@ -53,6 +54,9 @@ pub fn run(
             "ghost_prune_aborted": stats.ghost_prune_aborted,
         });
         println!("{summary}");
+        // Still wire the AI tools, but silently: this branch owns stdout and a
+        // connect report would make the summary unparseable.
+        maybe_connect(&repo_root, no_connect, true);
         return Ok(());
     }
 
@@ -103,7 +107,20 @@ pub fn run(
         hint_embed_missing();
     }
 
+    maybe_connect(&repo_root, no_connect, quiet);
+
     Ok(())
+}
+
+/// Detect AI coding tools and wire them to Travsr (RFC-026). Non-fatal: wiring
+/// is a convenience, so a failure here must never fail `travsr init`.
+fn maybe_connect(repo_root: &std::path::Path, no_connect: bool, quiet: bool) {
+    if no_connect {
+        return;
+    }
+    let mut opts = crate::connect::ConnectOpts::auto();
+    opts.quiet = quiet;
+    let _ = crate::connect::run(repo_root, &opts);
 }
 
 /// Print a tip when no embed backend is active so users know about semantic search.
