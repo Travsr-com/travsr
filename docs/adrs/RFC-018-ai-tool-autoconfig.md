@@ -19,9 +19,13 @@ is on disk.
 
 ## Decision
 
-Extend `travsr init` to detect installed AI coding tools and, for each, register
-the Travsr MCP server and write a short "use Travsr effectively" rules file. The
-same code path is exposed as standalone `travsr connect`.
+Extend `travsr init` to detect installed AI coding tools and, for each, do **two
+co-equal things**: (1) register the Travsr MCP server, and (2) write an
+always-on rules/instructions file that directs the agent to use Travsr **first**
+for every code-structure question. Wiring the server without the rules leaves the
+agent free to keep using `grep`/`find`/full-file reads — the instructions are what
+actually change behavior, so they are mandatory, not a nice-to-have. The same code
+path is exposed as standalone `travsr connect`.
 
 ### Write behavior
 
@@ -81,12 +85,32 @@ args `["mcp", "--stdio"]`. Shared helpers:
   `Skipped` on parse failure** instead of overwriting.
 - `write_managed_block(path, body)` — replace the single balanced managed block or
   append; skip on malformed markers.
-- `TRAVSR_AGENT_GUIDE` — one canonical guidance string (from the "Code Search:
-  travsr MCP first" section of `.claude/CLAUDE.md`: `search_symbol`,
-  `get_dependencies`, `get_callers`, `get_blast_radius`, `get_execution_path`,
-  `get_repo_map`, `get_context`; "use these before grep/find"). The text is
-  shared; each adapter wraps it in its own activation envelope (e.g. Cursor
-  frontmatter).
+- `TRAVSR_AGENT_GUIDE` — one canonical, imperative guidance string (derived from
+  the "Code Search: travsr MCP first" section of `.claude/CLAUDE.md`). It is not a
+  passive "Travsr is available" note — it is a directive. The text is shared; each
+  adapter wraps it in its own activation envelope (Cursor frontmatter, Copilot
+  instructions file, `CLAUDE.md`/`.rules` block) so it is **always loaded**, not
+  agent-requested. Canonical body:
+
+  ```
+  # Use Travsr first for all code questions
+  This repo has a Travsr code graph served over MCP. For ANY question about code
+  structure — definitions, callers, dependencies, impact/blast radius, call paths,
+  or repo overview — ALWAYS query Travsr's MCP tools BEFORE grep/find/ripgrep or
+  reading whole files. Travsr is the token-efficient, hallucination-free path.
+  - search_symbol(name)        — find a definition
+  - get_callers(symbol)        — who calls this
+  - get_dependencies(file)     — what this depends on
+  - get_blast_radius(file)     — what a change here affects
+  - get_execution_path(a, b)   — how a reaches b
+  - get_repo_map(repo)         — high-level structure
+  - get_context(query, budget) — full PPR + knapsack retrieval
+  Only fall back to text search when Travsr returns nothing or is unavailable.
+  ```
+
+  Adapters that support priority/always-on flags set them (Cursor
+  `alwaysApply: true`; the directive lives in the tool's auto-loaded instruction
+  file) so "always use Travsr" is enforced on every turn, not just when convenient.
 
 Initial adapters:
 
@@ -151,8 +175,10 @@ is a deterministic filesystem check.
 
 ## Consequences
 
-- After `travsr init`, the user's existing agent is wired to Travsr and told to
-  prefer it over text search, with zero manual MCP config.
+- After `travsr init`, the user's existing agent is both wired to Travsr and given
+  an always-on directive to query it first for every code-structure question —
+  zero manual MCP config and zero manual prompting. The rules file is what
+  converts "Travsr is available" into "Travsr is actually used."
 - Generated files are local and git-ignored; nothing machine-specific enters
   shared history.
 - Small, isolated module; each adapter is pure and unit-testable against a
