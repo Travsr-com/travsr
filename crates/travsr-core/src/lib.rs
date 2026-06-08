@@ -126,7 +126,8 @@ pub enum Language {
     Scala,
     Cpp,
     C,
-    // Swift: grammar crate blocked on tree-sitter version conflict; variant reserved.
+    Swift,
+    Dart,
 }
 
 impl Language {
@@ -147,6 +148,8 @@ impl Language {
             "scala" | "sc" => Some(Self::Scala),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
             "c" | "h" => Some(Self::C),
+            "swift" => Some(Self::Swift),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -166,6 +169,8 @@ impl Language {
             Self::Scala => "scala",
             Self::Cpp => "cpp",
             Self::C => "c",
+            Self::Swift => "swift",
+            Self::Dart => "dart",
         }
     }
 
@@ -185,6 +190,8 @@ impl Language {
             "scala" => Some(Self::Scala),
             "cpp" => Some(Self::Cpp),
             "c" => Some(Self::C),
+            "swift" => Some(Self::Swift),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }

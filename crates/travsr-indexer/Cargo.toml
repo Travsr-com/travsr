@@ -14,6 +14,7 @@ travsr-error = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+streaming-iterator = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 sha2 = { workspace = true }

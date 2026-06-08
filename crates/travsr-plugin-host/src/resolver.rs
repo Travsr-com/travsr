@@ -153,7 +153,10 @@ impl CatalogResolver {
 
         let mut entries = Vec::new();
 
-        tracing::debug!("CatalogResolver: registered languages from disk: {:?}", registered);
+        tracing::debug!(
+            "CatalogResolver: registered languages from disk: {:?}",
+            registered
+        );
 
         for catalog_entry in CATALOG {
             let lang = catalog_entry.language;
@@ -168,11 +171,19 @@ impl CatalogResolver {
 
             // Must be registered by the user.
             if !registered.iter().any(|r| r == lang) {
-                tracing::debug!(lang, "CatalogResolver: '{}' not in registered list — skipping", lang);
+                tracing::debug!(
+                    lang,
+                    "CatalogResolver: '{}' not in registered list — skipping",
+                    lang
+                );
                 continue;
             }
 
-            tracing::debug!(lang, binary = binary_name, "CatalogResolver: searching PATH for binary");
+            tracing::debug!(
+                lang,
+                binary = binary_name,
+                "CatalogResolver: searching PATH for binary"
+            );
 
             // The travsr-lang-<lang> binary must be on PATH.
             let Some(program) = which_binary(binary_name) else {

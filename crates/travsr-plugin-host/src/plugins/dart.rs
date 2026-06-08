@@ -12,10 +12,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (import_or_export)     @import
 "#,
     capture_kinds: &[
-        ("class.name",     "class",     "class"),
-        ("mixin.name",     "mixin",     "class"),
+        ("class.name", "class", "class"),
+        ("mixin.name", "mixin", "class"),
         ("extension.name", "extension", "class"),
-        ("fn.name",        "function",  "fn"),
-        ("import",         "import",    "import"),
+        ("fn.name", "function", "fn"),
+        ("import", "import", "import"),
     ],
 };

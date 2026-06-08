@@ -310,7 +310,11 @@ pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()
         .build()
         .context("building HTTP client")?;
 
-    let resp = client.get(&url).send().await.context("fetching share assets")?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("fetching share assets")?;
     if !resp.status().is_success() {
         bail!("share asset download failed ({}): {url}", resp.status());
     }
@@ -318,17 +322,26 @@ pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()
     let bytes = resp.bytes().await.context("reading share asset body")?;
 
     // Extract into ~/.travsr/share/<binary_name>/
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let share_dir = home.join(".travsr").join("share").join(binary_name);
     std::fs::create_dir_all(&share_dir)
         .with_context(|| format!("creating {}", share_dir.display()))?;
 
-    let tmp = share_dir.parent().unwrap().join(format!("{asset}.tmp.{}", uuid::Uuid::new_v4()));
+    let tmp = share_dir
+        .parent()
+        .unwrap()
+        .join(format!("{asset}.tmp.{}", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, &bytes)
         .with_context(|| format!("writing temp tarball {}", tmp.display()))?;
 
     let status = std::process::Command::new("tar")
-        .args(["-xzf", tmp.to_str().unwrap(), "-C", share_dir.to_str().unwrap()])
+        .args([
+            "-xzf",
+            tmp.to_str().unwrap(),
+            "-C",
+            share_dir.to_str().unwrap(),
+        ])
         .status()
         .context("running tar to extract share assets")?;
 

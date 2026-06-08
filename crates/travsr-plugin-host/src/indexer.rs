@@ -109,7 +109,14 @@ impl PluginIndexer {
         let mut all_nodes = Vec::new();
         let mut all_edges = Vec::new();
 
-        for lang in resolver.providable_languages() {
+        let providable = resolver.providable_languages();
+        tracing::debug!(
+            "Phase B: resolver surfaced {} language(s): {:?}",
+            providable.len(),
+            providable
+        );
+
+        for lang in providable {
             // Builtins (ts, js, rust, python) ship inside the travsr binary and
             // are always ready — no user registration required. External plugins
             // (go, java, …) still need explicit lang.toml registration.
@@ -124,8 +131,17 @@ impl PluginIndexer {
             }
             let spec = match resolver.resolve(&lang) {
                 Some(s) => s,
-                None => continue,
+                None => {
+                    tracing::debug!(lang = %lang, "Phase B: resolver returned None for lang");
+                    continue;
+                }
             };
+
+            tracing::debug!(
+                lang = %lang,
+                program = %spec.program,
+                "Phase B: resolved spec, spawning sidecar"
+            );
 
             let req = travsr_plugin_protocol::InvokeRequest {
                 root: repo_root.to_path_buf(),
@@ -135,10 +151,18 @@ impl PluginIndexer {
             match crate::transport::Sidecar::spawn(&spec, repo_root) {
                 Ok(sidecar) => match crate::transport::Transport::invoke_phase_b(&sidecar, req) {
                     Ok(resp) => {
+                        tracing::debug!(
+                            lang = %lang,
+                            nodes = resp.nodes.len(),
+                            edges = resp.edges.len(),
+                            "Phase B: invoke complete"
+                        );
                         all_nodes.extend(resp.nodes);
                         all_edges.extend(resp.edges);
                     }
-                    Err(travsr_error::IndexError::PhaseNotSupported) => {}
+                    Err(travsr_error::IndexError::PhaseNotSupported) => {
+                        tracing::debug!(lang = %lang, "Phase B: PhaseNotSupported (sidecar declined)");
+                    }
                     Err(e) => tracing::warn!("Phase B {lang}: {e}"),
                 },
                 Err(e) => tracing::warn!("Phase B sidecar spawn {lang}: {e}"),

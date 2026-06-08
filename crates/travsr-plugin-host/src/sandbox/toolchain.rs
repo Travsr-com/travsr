@@ -37,15 +37,15 @@ pub struct ToolchainAccess {
 /// Empty for languages with no out-of-repo toolchain needs.
 pub fn toolchain_access(language: &str) -> ToolchainAccess {
     match language {
-        "go"              => go_access(),
-        "dart"            => dart_access(),
+        "go" => go_access(),
+        "dart" => dart_access(),
         "java" | "kotlin" => java_access(),
-        "scala"           => scala_access(),
-        "php"             => php_access(),
-        "csharp"          => csharp_access(),
-        "ruby"            => ruby_access(),
-        "swift"           => swift_access(),
-        _                 => ToolchainAccess::default(),
+        "scala" => scala_access(),
+        "php" => php_access(),
+        "csharp" => csharp_access(),
+        "ruby" => ruby_access(),
+        "swift" => swift_access(),
+        _ => ToolchainAccess::default(),
     }
 }
 
@@ -95,11 +95,9 @@ fn dart_access() -> ToolchainAccess {
 
     // Emitter script directory: discover by resolving travsr-lang-dart on PATH.
     // The sidecar's emitter_path() checks the same relative locations.
-    let dart_bin = std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )
-    .map(|dir| dir.join("travsr-lang-dart"))
-    .find(|p| p.is_file());
+    let dart_bin = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("travsr-lang-dart"))
+        .find(|p| p.is_file());
 
     tracing::debug!(found = dart_bin.is_some(), path = ?dart_bin, "dart_access: travsr-lang-dart binary on PATH");
 
@@ -164,21 +162,22 @@ fn java_access() -> ToolchainAccess {
     let mut env = Vec::new();
 
     // JAVA_HOME: env var takes priority; fall back to `java -XshowSettings:properties`.
-    let java_home: Option<PathBuf> = std::env::var("JAVA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            // Output goes to stderr for this flag.
-            let output = Command::new("java")
-                .args(["-XshowSettings:properties", "-version"])
-                .output()
-                .ok()?;
-            let text = String::from_utf8_lossy(&output.stderr);
-            text.lines()
-                .find(|l| l.contains("java.home"))
-                .and_then(|l| l.split('=').nth(1))
-                .map(|v| PathBuf::from(v.trim()))
-        });
+    let java_home: Option<PathBuf> =
+        std::env::var("JAVA_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                // Output goes to stderr for this flag.
+                let output = Command::new("java")
+                    .args(["-XshowSettings:properties", "-version"])
+                    .output()
+                    .ok()?;
+                let text = String::from_utf8_lossy(&output.stderr);
+                text.lines()
+                    .find(|l| l.contains("java.home"))
+                    .and_then(|l| l.split('=').nth(1))
+                    .map(|v| PathBuf::from(v.trim()))
+            });
     if let Some(ref p) = java_home {
         tracing::debug!(path = %p.display(), "java_access: JAVA_HOME grant");
         read_paths.push(p.clone());
@@ -194,7 +193,10 @@ fn java_access() -> ToolchainAccess {
         tracing::debug!(path = %p.display(), "java_access: GRADLE_USER_HOME grant (read+write)");
         read_paths.push(p.clone());
         write_paths.push(p.clone());
-        env.push(("GRADLE_USER_HOME".to_string(), p.to_string_lossy().into_owned()));
+        env.push((
+            "GRADLE_USER_HOME".to_string(),
+            p.to_string_lossy().into_owned(),
+        ));
     }
 
     // Maven local repository (~/.m2) — read-only.
@@ -208,7 +210,11 @@ fn java_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
-    ToolchainAccess { read_paths, write_paths, env }
+    ToolchainAccess {
+        read_paths,
+        write_paths,
+        env,
+    }
 }
 
 /// `scip-scala` drives sbt to resolve dependencies. Needs:
@@ -237,7 +243,11 @@ fn scala_access() -> ToolchainAccess {
         env.push(("SBT_OPTS".to_string(), sbt_opts));
     }
 
-    ToolchainAccess { read_paths, write_paths, env }
+    ToolchainAccess {
+        read_paths,
+        write_paths,
+        env,
+    }
 }
 
 /// `scip-php` resolves Composer packages. Needs the global Composer cache:
@@ -257,10 +267,17 @@ fn php_access() -> ToolchainAccess {
     if let Some(ref p) = composer_home {
         tracing::debug!(path = %p.display(), exists = p.exists(), "php_access: COMPOSER_HOME grant (read)");
         read_paths.push(p.clone());
-        env.push(("COMPOSER_HOME".to_string(), p.to_string_lossy().into_owned()));
+        env.push((
+            "COMPOSER_HOME".to_string(),
+            p.to_string_lossy().into_owned(),
+        ));
     }
 
-    ToolchainAccess { read_paths, write_paths: vec![], env }
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env,
+    }
 }
 
 /// `scip-dotnet` resolves NuGet packages. Needs the global NuGet package cache:
@@ -282,14 +299,21 @@ fn csharp_access() -> ToolchainAccess {
     if let Some(ref p) = nuget_packages {
         tracing::debug!(path = %p.display(), exists = p.exists(), "csharp_access: NuGet packages grant (read)");
         read_paths.push(p.clone());
-        env.push(("NUGET_PACKAGES".to_string(), p.to_string_lossy().into_owned()));
+        env.push((
+            "NUGET_PACKAGES".to_string(),
+            p.to_string_lossy().into_owned(),
+        ));
     }
 
     if let Some(h) = home() {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
-    ToolchainAccess { read_paths, write_paths: vec![], env }
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env,
+    }
 }
 
 /// `scip-ruby` resolves gem dependencies. Needs the RubyGems install dirs:
@@ -300,19 +324,17 @@ fn ruby_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut env = Vec::new();
 
-    let gem_home: Option<PathBuf> =
-        run_cmd_stdout("gem", &["environment", "gemdir"])
-            .map(PathBuf::from)
-            .or_else(|| std::env::var("GEM_HOME").ok().map(PathBuf::from));
+    let gem_home: Option<PathBuf> = run_cmd_stdout("gem", &["environment", "gemdir"])
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("GEM_HOME").ok().map(PathBuf::from));
     if let Some(ref p) = gem_home {
         tracing::debug!(path = %p.display(), exists = p.exists(), "ruby_access: GEM_HOME grant (read)");
         read_paths.push(p.clone());
         env.push(("GEM_HOME".to_string(), p.to_string_lossy().into_owned()));
     }
 
-    let gem_path_str: Option<String> =
-        run_cmd_stdout("gem", &["environment", "gempath"])
-            .or_else(|| std::env::var("GEM_PATH").ok());
+    let gem_path_str: Option<String> = run_cmd_stdout("gem", &["environment", "gempath"])
+        .or_else(|| std::env::var("GEM_PATH").ok());
     if let Some(ref gp) = gem_path_str {
         for dir in gp.split(':') {
             let p = PathBuf::from(dir.trim());
@@ -328,7 +350,11 @@ fn ruby_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
-    ToolchainAccess { read_paths, write_paths: vec![], env }
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env,
+    }
 }
 
 /// `travsr-swift-index-emitter` uses SwiftSyntax for pure parse-based indexing
@@ -362,7 +388,11 @@ fn swift_access() -> ToolchainAccess {
         read_paths.push(p.clone());
     }
 
-    ToolchainAccess { read_paths, write_paths: vec![], env: vec![] }
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env: vec![],
+    }
 }
 
 /// Run `go env <keys>` and return key→value. Empty if `go` is not on PATH or fails.
@@ -393,7 +423,11 @@ fn run_cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// scip-go uses `go/packages` (i.e. the real `go` toolchain) to load packages, so

@@ -138,8 +138,8 @@ pub fn build_sandboxed_command(
     // tmpfs automatically. A plain --tmpfs would be root-owned and unwritable.
     cmd.args(["--bind", scratch.as_ref(), "/travsr-scratch"]); // writable scratch
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
-    // Per-language toolchain caches: read-only module/toolchain dirs, writable
-    // build cache. Bound at their host paths so the GO*/HOME env (set below) resolve.
+                                                           // Per-language toolchain caches: read-only module/toolchain dirs, writable
+                                                           // build cache. Bound at their host paths so the GO*/HOME env (set below) resolve.
     for path in &tc.read_paths {
         let p = path.to_string_lossy();
         cmd.args(["--ro-bind-try", p.as_ref(), p.as_ref()]);

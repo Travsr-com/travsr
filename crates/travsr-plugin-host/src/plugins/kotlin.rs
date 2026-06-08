@@ -5,10 +5,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::Kotlin,
     extensions: &["kt", "kts"],
     queries: r#"
-(class_declaration (type_identifier) @class.name)
-(object_declaration (type_identifier) @object.name)
-(function_declaration (simple_identifier) @fn.name)
-(import_header) @import
+(class_declaration name: (identifier) @class.name)
+(object_declaration name: (identifier) @object.name)
+(function_declaration name: (identifier) @fn.name)
+(import) @import
 "#,
     capture_kinds: &[
         ("class.name", "class", "class"),

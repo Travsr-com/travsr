@@ -355,9 +355,9 @@ fn cmd_install(
                 if entry.has_share_assets {
                     let sv = version.clone();
                     let sb = bin.to_string();
-                    match run_async(async move {
-                        crate::install::install_share_assets(&sv, &sb).await
-                    }) {
+                    match run_async(
+                        async move { crate::install::install_share_assets(&sv, &sb).await },
+                    ) {
                         Ok(()) => println!("\u{2713} {bin} emitter files installed"),
                         Err(e) => println!("warning: could not install {bin} share assets: {e:#}"),
                     }

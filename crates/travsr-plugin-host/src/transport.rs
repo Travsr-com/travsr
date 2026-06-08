@@ -109,6 +109,11 @@ impl Sidecar {
                 message: format!("failed to create scratch dir: {e}"),
             })?;
         let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+        tracing::debug!(
+            lang = %lang,
+            program = %spec.program,
+            "Phase B: spawning sidecar"
+        );
         let mut spawner = Self::build_cmd(
             &spec.program,
             &args,
@@ -175,6 +180,12 @@ impl Sidecar {
                 })
             }
         };
+
+        tracing::debug!(
+            lang = %lang,
+            plugin_version = %plugin_version,
+            "Phase B: sidecar handshake ok"
+        );
 
         Ok(Self {
             language: lang.to_string(),

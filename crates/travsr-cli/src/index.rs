@@ -47,7 +47,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
     for node in phase_b_nodes {
         all_nodes.insert(node.id, node);
     }
-    let mut all_phase_b_edges = phase_b_edges;
+    let all_phase_b_edges = phase_b_edges;
 
     // Emit all indexed nodes sorted by (path, signature) for deterministic output.
     let node_entries: Vec<serde_json::Value> = {
@@ -172,7 +172,7 @@ fn collect_source_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
             | "cpp" | "cc" | "cxx" | "hpp" | "hh"  // C++
             | "c" | "h"                              // C
             | "swift"                                // Swift
-            | "dart"                                 // Dart
+            | "dart" // Dart
         ) {
             files.push(entry.path().to_path_buf());
         }

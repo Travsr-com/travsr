@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
+use streaming_iterator::StreamingIterator as _;
 use tree_sitter::{Parser, Query, QueryCursor};
 
 use crate::emit;
@@ -53,9 +54,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 
     let is_tsx = abs_path.extension().and_then(|e| e.to_str()) == Some("tsx");
     let language = if is_tsx {
-        tree_sitter_typescript::language_tsx()
+        tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TSX)
     } else {
-        tree_sitter_typescript::language_typescript()
+        tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT)
     };
 
     let file_node = emit::file_node(corpus, vname_path);
@@ -71,7 +72,6 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     parser
         .set_language(&language)
         .context("loading TypeScript grammar")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     // tree-sitter returns None only on timeout/cancellation, not on bad syntax
     // (it always recovers from parse errors and returns a tree). None here means
@@ -98,57 +98,59 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .collect();
 
     let mut cursor = QueryCursor::new();
-    let captures = cursor.captures(&query, tree.root_node(), source.as_slice());
+    let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
-    for (m, cap_idx) in captures {
-        let capture = m.captures[cap_idx];
-        let Some(cap_name) = capture_names.get(capture.index as usize) else {
-            continue;
-        };
-        let text = match capture.node.utf8_text(source.as_slice()) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+    while let Some(m) = iter.next() {
+        for &capture in m.captures {
+            let Some(cap_name) = capture_names.get(capture.index as usize) else {
+                continue;
+            };
+            let text = match capture.node.utf8_text(source.as_slice()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
 
-        let line = capture.node.start_position().row as u32 + 1;
-        match cap_name.as_str() {
-            "class.name" => {
-                let node = emit::class_node(corpus, vname_path, text).with_line(line);
-                let edge = emit::defines_edge(file_id, node.id);
-                output.nodes.push(node);
-                output.edges.push(edge);
+            let line = capture.node.start_position().row as u32 + 1;
+            match cap_name.as_str() {
+                "class.name" => {
+                    let node = emit::class_node(corpus, vname_path, text).with_line(line);
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "fn.name" => {
+                    let node = emit::fn_node(corpus, vname_path, text).with_line(line);
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "method.name" => {
+                    // Edge hierarchy (Tech Lead sign-off): class→method, not file→method.
+                    let class_name = find_parent_class_name(capture.node, source.as_slice())
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    let class_id = emit::class_node(corpus, vname_path, &class_name).id;
+                    let node =
+                        emit::method_node(corpus, vname_path, &class_name, text).with_line(line);
+                    let edge = emit::defines_edge(class_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "var.name" => {
+                    let node = emit::var_node(corpus, vname_path, text).with_line(line);
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "import.source" => {
+                    // Import nodes are synthetic — no definition line.
+                    let node = emit::import_node(corpus, vname_path, text);
+                    let edge = emit::depends_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                _ => {}
             }
-            "fn.name" => {
-                let node = emit::fn_node(corpus, vname_path, text).with_line(line);
-                let edge = emit::defines_edge(file_id, node.id);
-                output.nodes.push(node);
-                output.edges.push(edge);
-            }
-            "method.name" => {
-                // Edge hierarchy (Tech Lead sign-off): class→method, not file→method.
-                let class_name = find_parent_class_name(capture.node, source.as_slice())
-                    .unwrap_or_else(|| "<anonymous>".to_string());
-                let class_id = emit::class_node(corpus, vname_path, &class_name).id;
-                let node = emit::method_node(corpus, vname_path, &class_name, text).with_line(line);
-                let edge = emit::defines_edge(class_id, node.id);
-                output.nodes.push(node);
-                output.edges.push(edge);
-            }
-            "var.name" => {
-                let node = emit::var_node(corpus, vname_path, text).with_line(line);
-                let edge = emit::defines_edge(file_id, node.id);
-                output.nodes.push(node);
-                output.edges.push(edge);
-            }
-            "import.source" => {
-                // Import nodes are synthetic — no definition line.
-                let node = emit::import_node(corpus, vname_path, text);
-                let edge = emit::depends_edge(file_id, node.id);
-                output.nodes.push(node);
-                output.edges.push(edge);
-            }
-            _ => {}
-        }
+        } // for &capture in m.captures
     }
 
     Ok(output)
@@ -241,7 +243,7 @@ fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<
     loop {
         if matches!(current.kind(), "class_declaration" | "class") {
             let name = (0..current.child_count())
-                .filter_map(|i| current.child(i))
+                .filter_map(|i| current.child(i as u32))
                 .find(|child| child.kind() == "type_identifier")
                 .and_then(|n| n.utf8_text(source).ok())
                 .map(str::to_string);

@@ -24,6 +24,8 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("scala", "fuzz_scala_parser.rs"), // TODO: create this fuzz target
     ("cpp", "fuzz_cpp_parser.rs"),   // TODO: create this fuzz target
     ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
+    ("swift", "fuzz_swift_parser.rs"),
+    ("dart", "fuzz_dart_parser.rs"),
 ];
 
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process
@@ -132,52 +134,64 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         dispatcher,
         &version,
         &crate::plugins::kotlin::CONFIG,
-        tree_sitter_kotlin::language(),
+        tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
     );
     check_fuzz_target("ruby");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::ruby::CONFIG,
-        tree_sitter_ruby::language(),
+        tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
     );
     check_fuzz_target("csharp");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::csharp::CONFIG,
-        tree_sitter_c_sharp::language(),
+        tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
     );
     check_fuzz_target("php");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::php::CONFIG,
-        tree_sitter_php::language_php(),
+        tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
     );
     check_fuzz_target("scala");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::scala::CONFIG,
-        tree_sitter_scala::language(),
+        tree_sitter::Language::new(tree_sitter_scala::LANGUAGE),
     );
     check_fuzz_target("cpp");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::cpp::CONFIG,
-        tree_sitter_cpp::language(),
+        tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
     );
     check_fuzz_target("c");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::c::CONFIG,
-        tree_sitter_c::language(),
+        tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
     );
-    // Swift: blocked — all available tree-sitter-swift crates require tree-sitter ^0.21
-    // which conflicts with workspace tree-sitter = "0.22". Re-enable when a compatible crate ships.
+    check_fuzz_target("swift");
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::swift::CONFIG,
+        tree_sitter::Language::new(tree_sitter_swift::LANGUAGE),
+    );
+    check_fuzz_target("dart");
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::dart::CONFIG,
+        tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
+    );
 }
 
 fn register_generic(

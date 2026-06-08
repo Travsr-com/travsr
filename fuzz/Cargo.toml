@@ -53,6 +53,66 @@ path = "fuzz_targets/fuzz_pcst_session.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_java_parser"
+path = "fuzz_targets/fuzz_java_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_kotlin_parser"
+path = "fuzz_targets/fuzz_kotlin_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ruby_parser"
+path = "fuzz_targets/fuzz_ruby_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_csharp_parser"
+path = "fuzz_targets/fuzz_csharp_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_php_parser"
+path = "fuzz_targets/fuzz_php_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_scala_parser"
+path = "fuzz_targets/fuzz_scala_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_cpp_parser"
+path = "fuzz_targets/fuzz_cpp_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_c_parser"
+path = "fuzz_targets/fuzz_c_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_swift_parser"
+path = "fuzz_targets/fuzz_swift_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_dart_parser"
+path = "fuzz_targets/fuzz_dart_parser.rs"
+test = false
+doc = false
+
 # Isolate from the parent workspace so cargo-fuzz can use nightly freely.
 [workspace]
 members = ["."]

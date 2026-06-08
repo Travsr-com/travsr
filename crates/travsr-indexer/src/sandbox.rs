@@ -177,7 +177,11 @@ fn build_sandboxed_command_impl(
                 .filter(|o| o.status.success())
                 .and_then(|o| {
                     let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() { None } else { Some(s) }
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
                 })
         };
         for path in [
