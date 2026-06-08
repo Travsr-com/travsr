@@ -11,6 +11,7 @@ mod init;
 mod install;
 mod lang;
 mod migrate;
+mod progress;
 mod repo;
 mod repos;
 mod serve;
@@ -34,7 +35,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Initialise a Travsr index in the current repository.
-    Init,
+    Init {
+        /// Suppress progress output and post-index tips.
+        #[arg(long, short)]
+        quiet: bool,
+        /// Emit machine-readable JSON (summary on stdout, progress on stderr).
+        #[arg(long)]
+        json: bool,
+    },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
         #[command(subcommand)]
@@ -309,7 +317,7 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init => init::run()?,
+        Command::Init { quiet, json } => init::run(quiet, json)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;

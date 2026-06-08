@@ -3,11 +3,32 @@ use anyhow::Context as _;
 
 use crate::repo::find_git_root;
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(quiet: bool, json: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
-    let stats = travsr_daemon::init_repo(&repo_root)?;
+
+    // Live progress so a long indexing run is not mistaken for a hang (#293).
+    // Renders to stderr; the summary below stays on stdout.
+    let mut progress = crate::progress::ProgressReporter::new(quiet, json);
+    let stats = travsr_daemon::init_repo_with_progress(&repo_root, &mut |ev| progress.update(ev))?;
+    progress.finish();
+
     let db_path = repo_root.join(".travsr/graph.db");
+
+    if json {
+        // Machine-readable summary on stdout for CI; progress went to stderr.
+        let summary = serde_json::json!({
+            "files_indexed": stats.files_indexed,
+            "nodes_written": stats.nodes_written,
+            "edges_written": stats.edges_written,
+            "total_nodes": stats.total_nodes,
+            "total_edges": stats.total_edges,
+            "db_path": db_path.display().to_string(),
+        });
+        println!("{summary}");
+        return Ok(());
+    }
+
     if stats.nodes_written == 0 && stats.edges_written == 0 {
         println!(
             "graph up to date: {} nodes, {} edges → {}",
@@ -25,18 +46,21 @@ pub fn run() -> anyhow::Result<()> {
         );
     }
 
-    // DEBT-013 closed: hint users whose repo has no commits yet so
-    // `travsr status` showing last_commit: (none) is not confusing.
-    let check = travsr_store::SqliteStore::open(&db_path)?;
-    if check.get_meta("last_commit")?.is_none() {
-        println!(
-            "tip: run `git commit` to record a baseline — \
-             `travsr status` will show freshness after your first commit"
-        );
-    }
+    // Tips are advisory chatter — suppress under --quiet.
+    if !quiet {
+        // DEBT-013 closed: hint users whose repo has no commits yet so
+        // `travsr status` showing last_commit: (none) is not confusing.
+        let check = travsr_store::SqliteStore::open(&db_path)?;
+        if check.get_meta("last_commit")?.is_none() {
+            println!(
+                "tip: run `git commit` to record a baseline — \
+                 `travsr status` will show freshness after your first commit"
+            );
+        }
 
-    // Non-fatal: detection errors must not fail `travsr init`.
-    let _ = hint_lang_detect(&repo_root);
+        // Non-fatal: detection errors must not fail `travsr init`.
+        let _ = hint_lang_detect(&repo_root);
+    }
 
     Ok(())
 }
