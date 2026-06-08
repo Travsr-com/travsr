@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
+use streaming_iterator::StreamingIterator as _;
 use travsr_core::{Node, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
@@ -101,7 +102,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
-    let language = tree_sitter_go::language();
+    let language = tree_sitter::Language::new(tree_sitter_go::LANGUAGE);
     let file_node = go_file_node(corpus, vname_path);
     let file_id = file_node.id;
 
@@ -115,7 +116,6 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     parser
         .set_language(&language)
         .context("loading Go grammar")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
@@ -143,7 +143,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     // matches() provides all captures for the full pattern match in one shot.
     // We process one match at a time (no collect()) so the buffer is fresh.
     let mut cursor = QueryCursor::new();
-    let iter = cursor.matches(&query, tree.root_node(), source.as_slice());
+    let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
     // Helper used inside the loop: find capture text by name within a match.
     let find_cap_text = |m: &tree_sitter::QueryMatch<'_, '_>, name: &str| -> Option<String> {
@@ -154,7 +154,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             .map(str::to_owned)
     };
 
-    for m in iter {
+    while let Some(m) = iter.next() {
         // Determine which pattern fired by inspecting the anchor capture — each
         // pattern in QUERIES has a unique first capture name.
         let Some(anchor) = m.captures.first() else {
@@ -166,7 +166,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 
         match anchor_name.as_str() {
             "fn.name" => {
-                let Some(name) = find_cap_text(&m, "fn.name") else {
+                let Some(name) = find_cap_text(m, "fn.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -177,10 +177,10 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             }
             "recv.type" => {
                 // Method: all captures (recv.type + method.name) are in m.captures.
-                let Some(recv) = find_cap_text(&m, "recv.type") else {
+                let Some(recv) = find_cap_text(m, "recv.type") else {
                     continue;
                 };
-                let Some(method_name) = find_cap_text(&m, "method.name") else {
+                let Some(method_name) = find_cap_text(m, "method.name") else {
                     continue;
                 };
                 let recv = strip_generics(&recv).to_owned();
@@ -201,7 +201,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "class.name" => {
-                let Some(name) = find_cap_text(&m, "class.name") else {
+                let Some(name) = find_cap_text(m, "class.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -211,7 +211,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "iface.name" => {
-                let Some(name) = find_cap_text(&m, "iface.name") else {
+                let Some(name) = find_cap_text(m, "iface.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -221,7 +221,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "type.name" => {
-                let Some(name) = find_cap_text(&m, "type.name") else {
+                let Some(name) = find_cap_text(m, "type.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -231,7 +231,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "var.name" => {
-                let Some(name) = find_cap_text(&m, "var.name") else {
+                let Some(name) = find_cap_text(m, "var.name") else {
                     continue;
                 };
                 let line = anchor.node.start_position().row as u32 + 1;
@@ -286,7 +286,7 @@ fn extract_import_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Str
     }
     // Fallback: walk children for the interpreted_string_literal.
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let child = node.child(i as u32)?;
         if child.kind() == "interpreted_string_literal" {
             let raw = child.utf8_text(source).ok()?;
             return Some(unquote(raw));

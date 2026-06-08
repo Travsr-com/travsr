@@ -166,6 +166,31 @@ fn build_sandboxed_command_impl(
     cmd.args(["--ro-bind-try", &rustup_dir, &rustup_dir]);
     cmd.args(["--ro-bind-try", &cargo_home, &cargo_home]);
 
+    // Python site-packages — needed by scip-python to find installed packages.
+    // `--ro-bind-try` silently skips paths that don't exist (Python not installed).
+    {
+        let mut py_path = |query: &str| {
+            std::process::Command::new("python3")
+                .args(["-c", query])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                })
+        };
+        for path in [
+            py_path("import sysconfig; print(sysconfig.get_path('purelib'))"),
+            py_path("import sysconfig; print(sysconfig.get_path('platlib'))"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            cmd.args(["--ro-bind-try", &path, &path]);
+        }
+    }
+
     // Kernel interfaces.
     cmd.args(["--proc", "/proc"]);
     cmd.args(["--dev", "/dev"]);
