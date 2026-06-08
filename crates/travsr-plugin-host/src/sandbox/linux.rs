@@ -148,6 +148,12 @@ pub fn build_sandboxed_command(
         let p = path.to_string_lossy();
         cmd.args(["--bind-try", p.as_ref(), p.as_ref()]);
     }
+    // Bind ~/.travsr/bin so tools installed by `travsr lang install` (e.g. scip-java,
+    // scip-go) are accessible inside the bwrap namespace.
+    if let Ok(home) = std::env::var("HOME") {
+        let travsr_bin = format!("{home}/.travsr/bin");
+        cmd.args(["--ro-bind-try", &travsr_bin, &travsr_bin]);
+    }
     cmd.args(["--die-with-parent", "--"]);
     // Resource caps (ADR-017 Rule 1): 4 GiB virtual memory + 300s CPU via ulimit.
     let quoted_args = args
@@ -172,6 +178,13 @@ pub fn build_sandboxed_command(
     // analyzer's build tool locates its caches inside the cleared sandbox env.
     for (key, val) in &tc.env {
         cmd.env(key, val);
+    }
+    // Prepend ~/.travsr/bin so tools installed by `travsr lang install` (e.g. scip-java,
+    // scip-go) are on PATH inside the sandbox.
+    if let Ok(home) = std::env::var("HOME") {
+        let travsr_bin = format!("{home}/.travsr/bin");
+        let base = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{travsr_bin}:{base}"));
     }
     Ok(SandboxedSpawn::Wrapped(cmd))
 }

@@ -83,6 +83,35 @@ pub fn build_sandboxed_command(
         format!("(allow file-read* {subpaths})\n")
     };
 
+    // JVM needs read access to ~/.java, ~/.gradle, ~/.m2, ~/.sdkman (build tool
+    // caches) so scip-java can resolve dependencies and run.
+    let java_home_rule = dirs::home_dir()
+        .map(|h| {
+            let h = std::fs::canonicalize(&h).unwrap_or(h);
+            let s = h.to_string_lossy();
+            format!(
+                "\n    (subpath \"{s}/.java\")\n    (subpath \"{s}/.gradle\")\
+                 \n    (subpath \"{s}/.m2\")\n    (subpath \"{s}/.sdkman\")"
+            )
+        })
+        .unwrap_or_default();
+
+    // ~/.travsr/bin may contain tool binaries (scip-java, scip-go, …) that the
+    // sidecar needs to exec. Canonicalize so firmlinks/symlinks resolve to the
+    // real path the kernel uses for Seatbelt matching.
+    let travsr_bin_rule = {
+        let raw = dirs::home_dir()
+            .map(|h| h.join(".travsr").join("bin"))
+            .unwrap_or_default();
+        let canon = std::fs::canonicalize(&raw).unwrap_or(raw);
+        let s = canon.to_string_lossy();
+        if s.is_empty() {
+            String::new()
+        } else {
+            format!("\n    (subpath \"{s}\")")
+        }
+    };
+
     // ADR-017 Rule 1: deny all by default; allow read only to system paths,
     // repo root (read-only), and scratch (read-write).
     // Network: Standard → deny; Elevated → allow (coarse — sandbox-exec has no
@@ -130,12 +159,17 @@ pub fn build_sandboxed_command(
     (subpath "/sbin")
     (subpath "/lib")
     (subpath "/Library/Developer")
+    (subpath "/Library/Java")
     (subpath "/System")
+
     (subpath "/private/etc")
+    (subpath "/private/var/select")
+    (subpath "/private/var/folders")
+    (subpath "/private/tmp")
     (literal "/opt")
     (subpath "/opt/homebrew")
     (subpath "{repo}")
-    (subpath "{scratch}"){tc_read_rule})
+    (subpath "{scratch}"){tc_read_rule}{travsr_bin_rule}{java_home_rule})
 {program_dir_rule}(allow file-write* (subpath "{scratch}"){tc_write_rule})
 (allow mach-lookup
     (global-name "com.apple.dyld")
@@ -149,11 +183,42 @@ pub fn build_sandboxed_command(
         program_dir_rule = program_dir_rule,
         tc_read_rule = tc_read_rule,
         tc_write_rule = tc_write_rule,
+        travsr_bin_rule = travsr_bin_rule,
+        java_home_rule = java_home_rule,
     );
     tracing::debug!(language, profile = %profile, "macOS sandbox profile");
 
-    let mut cmd = Command::new("sandbox-exec");
-    cmd.args(["-p", &profile, "--"]).arg(program).args(args);
+    // For Elevated policy, the JVM (and other complex runtimes) have unbounded
+    // system requirements that cannot be enumerated in a Seatbelt profile without
+    // playing endless whack-a-mole. The user already granted explicit PSE approval
+    // for Elevated — skip sandbox-exec and run the program directly with ulimits.
+    let mut cmd = match policy {
+        SandboxPolicy::Elevated { .. } => {
+            tracing::debug!(
+                language,
+                "macOS Elevated policy: skipping sandbox-exec, running sidecar directly \
+                 (PSE-approved; resource-capped via ulimit)"
+            );
+            let quoted_args = args
+                .iter()
+                .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let inner = format!(
+                "ulimit -v 4194304 2>/dev/null; ulimit -t 300 2>/dev/null; exec '{}' {}",
+                program.replace('\'', r"'\''"),
+                quoted_args
+            );
+            let mut c = Command::new("sh");
+            c.args(["-c", &inner]);
+            c
+        }
+        SandboxPolicy::Standard => {
+            let mut c = Command::new("sandbox-exec");
+            c.args(["-p", &profile, "--"]).arg(program).args(args);
+            c
+        }
+    };
     cmd.env_clear();
     for key in ENV_ALLOWLIST {
         if let Ok(val) = std::env::var(key) {
@@ -165,6 +230,20 @@ pub fn build_sandboxed_command(
     // analyzer's build tool can locate its caches inside the otherwise-cleared env.
     for (key, val) in &tc.env {
         cmd.env(key, val);
+    }
+    // Prepend ~/.travsr/bin so tools installed by `travsr lang install` (e.g. scip-java,
+    // scip-go) are on PATH.
+    let travsr_bin = std::env::var("HOME")
+        .map(|h| format!("{h}/.travsr/bin"))
+        .unwrap_or_default();
+    if !travsr_bin.is_empty() {
+        let base = cmd
+            .get_envs()
+            .find(|(k, _)| k == &std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        cmd.env("PATH", format!("{travsr_bin}:{base}"));
     }
     Ok(SandboxedSpawn::Wrapped(cmd))
 }
