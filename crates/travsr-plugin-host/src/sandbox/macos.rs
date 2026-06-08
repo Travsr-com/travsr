@@ -123,6 +123,7 @@ pub fn build_sandboxed_command(
 (deny default)
 {network_rule}
 (allow process-fork process-exec* signal)
+(allow process-info*)
 (allow file-read*
     (subpath "/usr")
     (subpath "/bin")
@@ -131,6 +132,7 @@ pub fn build_sandboxed_command(
     (subpath "/Library/Developer")
     (subpath "/System")
     (subpath "/private/etc")
+    (literal "/opt")
     (subpath "/opt/homebrew")
     (subpath "{repo}")
     (subpath "{scratch}"){tc_read_rule})
@@ -148,6 +150,8 @@ pub fn build_sandboxed_command(
         tc_read_rule = tc_read_rule,
         tc_write_rule = tc_write_rule,
     );
+    tracing::debug!(language, profile = %profile, "macOS sandbox profile");
+
     let mut cmd = Command::new("sandbox-exec");
     cmd.args(["-p", &profile, "--"]).arg(program).args(args);
     cmd.env_clear();
