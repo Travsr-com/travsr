@@ -156,7 +156,14 @@ fn handle_tool_call(
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
             let direction = args["direction"].as_str().unwrap_or("both");
-            let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 4) as u8;
+            // McpClient sends Record<string,string> so depth arrives as a JSON
+            // string ("3"), not a number. Try numeric first for direct callers,
+            // then fall back to string parsing for the VS Code extension path.
+            let depth = args["depth"]
+                .as_u64()
+                .or_else(|| args["depth"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(2)
+                .clamp(1, 4) as u8;
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
             tools::get_graph_json(store, query, direction, depth, kind_filter)
         }
@@ -569,7 +576,11 @@ fn handle_tool_call_global(
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
             let direction = args["direction"].as_str().unwrap_or("both");
-            let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 4) as u8;
+            let depth = args["depth"]
+                .as_u64()
+                .or_else(|| args["depth"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(2)
+                .clamp(1, 4) as u8;
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
             tools::get_graph_json_global(repos, query, direction, depth, repo_arg, kind_filter)
         }

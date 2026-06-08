@@ -722,7 +722,8 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
  */
 export function registerShowLanguages(
   client: McpClient,
-  binary: string
+  binary: string,
+  onAfterInit?: () => void
 ): vscode.Disposable {
   const getCorpus = (): string =>
     path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "");
@@ -816,6 +817,8 @@ export function registerShowLanguages(
         postStatus("Initializing repo…");
         void spawnLangCommand(getBinary(), ["init"], wsRoot, 60_000).then(() => {
           postStatus("");
+          // Graph rebuilt — evict stale blast-radius and caller counts.
+          onAfterInit?.();
           void refresh();
         });
         return;
@@ -846,7 +849,8 @@ export function registerShowLanguages(
 export function registerParityCommands(
   client: McpClient,
   context: vscode.ExtensionContext,
-  binary: string
+  binary: string,
+  onAfterInit?: () => void
 ): void {
   context.subscriptions.push(
     registerAskSymbol(client),
@@ -855,6 +859,6 @@ export function registerParityCommands(
     registerShowExecutionPath(client, context),
     registerShowRepos(client),
     registerShowGraphStats(client),
-    registerShowLanguages(client, binary)
+    registerShowLanguages(client, binary, onAfterInit)
   );
 }

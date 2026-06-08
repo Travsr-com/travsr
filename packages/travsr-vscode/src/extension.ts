@@ -145,6 +145,16 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  // Clear caches after daemon reconnect (binary install, restart, graph.db swap)
+  // so the code lens and hover counts reflect the new graph immediately.
+  context.subscriptions.push(
+    proxy.onReconnect(() => {
+      codeLensProvider.clearCache();
+      hoverProvider.clearCache();
+      treeProvider.refresh();
+    })
+  );
+
   // First-run welcome page (VSCODE-204)
   showWelcomeIfFirstRun(context);
 
@@ -309,14 +319,22 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // CLI↔UI parity commands (VSCODE-247): askSymbol, manageSynonyms,
   // showDependencies, showExecutionPath, showRepos, showGraphStats, showLanguages.
-  registerParityCommands(proxy, context, binary);
+  registerParityCommands(proxy, context, binary, () => {
+    codeLensProvider.clearCache();
+    hoverProvider.clearCache();
+    treeProvider.refresh();
+  });
 
   // Re-index command — also reachable from the status Quick Pick. Lives here
   // (not commands.ts) because it needs the output channel + workspace root.
   context.subscriptions.push(
-    vscode.commands.registerCommand("travsr.reindexNow", () =>
-      reindexNow(workspaceRoot, channel)
-    )
+    vscode.commands.registerCommand("travsr.reindexNow", async () => {
+      await reindexNow(workspaceRoot, channel);
+      // Graph has changed — stale blast-radius and caller counts must be evicted.
+      codeLensProvider.clearCache();
+      hoverProvider.clearCache();
+      treeProvider.refresh();
+    })
   );
 
   // Manual download command — also reachable from the command palette

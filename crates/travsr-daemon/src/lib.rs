@@ -162,6 +162,10 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
+    // Auto-trust this corpus so Phase B runs without manual lang.toml edits.
+    // `travsr init` is the explicit consent act — no separate trust command needed.
+    travsr_plugin_host::trust::auto_trust_corpus(&corpus);
+
     let mut files_indexed: u64 = 0;
 
     let walker = WalkBuilder::new(repo_root)

@@ -373,7 +373,10 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
         }
 
         for edge in incoming {
-            if !matches!(edge.kind, EdgeKind::DefinesBinding | EdgeKind::RefCall) {
+            if !matches!(
+                edge.kind,
+                EdgeKind::DefinesBinding | EdgeKind::RefCall | EdgeKind::Depends
+            ) {
                 continue;
             }
             if visited.insert(edge.src) {
@@ -1571,6 +1574,22 @@ mod tests {
         assert!(
             result.contains("b.ts"),
             "caller file must be included in blast radius"
+        );
+    }
+
+    /// B depends on A (import): blast_radius("a.ts") must include b.ts.
+    #[test]
+    fn blast_radius_follows_depends_edges() {
+        use travsr_core::EdgeKind;
+        let a = make_node("a.ts", "fn:a");
+        let b = make_node("b.ts", "fn:b");
+        // B imports A — Depends edge B→A; reverse BFS from A must reach B.
+        let store = make_store(&[a.clone(), b.clone()], &[(b.id, a.id, EdgeKind::Depends)]);
+        let result = get_blast_radius(&store, "a.ts");
+        assert!(result.contains("a.ts"), "source file must be included");
+        assert!(
+            result.contains("b.ts"),
+            "file that imports the changed file must appear in blast radius"
         );
     }
 
