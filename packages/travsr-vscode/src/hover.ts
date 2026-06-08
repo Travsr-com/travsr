@@ -17,6 +17,16 @@ export const HOVER_SELECTOR: vscode.DocumentSelector = [
   { language: "typescriptreact" },
   { language: "rust" },
   { language: "python" },
+  { language: "go" },
+  { language: "java" },
+  { language: "kotlin" },
+  { language: "ruby" },
+  { language: "php" },
+  { language: "scala" },
+  { language: "cpp" },
+  { language: "c" },
+  { language: "swift" },
+  { language: "dart" },
 ];
 
 interface HoverData {
