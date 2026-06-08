@@ -352,6 +352,17 @@ fn cmd_install(
 
                 println!("\u{2713} {bin} installed to {}", path.display());
 
+                if entry.has_share_assets {
+                    let sv = version.clone();
+                    let sb = bin.to_string();
+                    match run_async(async move {
+                        crate::install::install_share_assets(&sv, &sb).await
+                    }) {
+                        Ok(()) => println!("\u{2713} {bin} emitter files installed"),
+                        Err(e) => println!("warning: could not install {bin} share assets: {e:#}"),
+                    }
+                }
+
                 if !crate::install::path_contains_travsr_bin() {
                     println!(
                         "\nhint: add ~/.travsr/bin to your PATH:\n\n\

@@ -289,6 +289,55 @@ pub async fn download_and_install_wrapper(
     Ok(dest)
 }
 
+/// Downloads `<binary_name>-share.tar.gz` from the same travsr-lang release and
+/// extracts it into `~/.travsr/share/<binary_name>/`. Used for sidecars that
+/// spawn an external script (e.g. dart's emit.dart) rather than a compiled binary.
+/// The tarball is platform-independent (source + metadata only, no binaries).
+pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()> {
+    if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
+        return Ok(());
+    }
+
+    let base =
+        std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
+
+    let asset = format!("{binary_name}-share.tar.gz");
+    let url = format!("{base}/download/{version}/{asset}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+
+    let resp = client.get(&url).send().await.context("fetching share assets")?;
+    if !resp.status().is_success() {
+        bail!("share asset download failed ({}): {url}", resp.status());
+    }
+
+    let bytes = resp.bytes().await.context("reading share asset body")?;
+
+    // Extract into ~/.travsr/share/<binary_name>/
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let share_dir = home.join(".travsr").join("share").join(binary_name);
+    std::fs::create_dir_all(&share_dir)
+        .with_context(|| format!("creating {}", share_dir.display()))?;
+
+    let tmp = share_dir.parent().unwrap().join(format!("{asset}.tmp.{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, &bytes)
+        .with_context(|| format!("writing temp tarball {}", tmp.display()))?;
+
+    let status = std::process::Command::new("tar")
+        .args(["-xzf", tmp.to_str().unwrap(), "-C", share_dir.to_str().unwrap()])
+        .status()
+        .context("running tar to extract share assets")?;
+
+    let _ = std::fs::remove_file(&tmp);
+
+    anyhow::ensure!(status.success(), "tar extraction failed for {asset}");
+    Ok(())
+}
+
 fn hex_encode_sha256(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     use std::fmt::Write as _;

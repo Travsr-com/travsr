@@ -127,6 +127,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
         files = files.len(),
         phase_a_edges = all_phase_a_edges.len(),
         phase_b_edges = all_phase_b_edges.len(),
+        phase_b_dropped,
         ffi_edges = ffi_edges.len(),
         output = %output.display(),
         "index: complete"

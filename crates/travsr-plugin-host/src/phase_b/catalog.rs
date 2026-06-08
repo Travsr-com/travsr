@@ -106,6 +106,11 @@ pub struct PhaseBEntry {
     /// True for in-tree builtins (typescript, javascript) that are bundled with
     /// the travsr binary — no external binary on PATH required.
     pub builtin: bool,
+    /// True when `travsr lang install` must also download a platform-independent
+    /// `<provider_binary>-share.tar.gz` asset and extract it into
+    /// ~/.travsr/share/<provider_binary>/. Used by languages whose sidecar
+    /// spawns an external script rather than a compiled tool (e.g. dart).
+    pub has_share_assets: bool,
 }
 
 pub static CATALOG: &[PhaseBEntry] = &[
@@ -124,6 +129,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".ts", ".tsx"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "javascript",
@@ -140,6 +146,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".js", ".jsx", ".mjs", ".cjs"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "rust",
@@ -156,6 +163,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".rs"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "go",
@@ -176,6 +184,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".go"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "python",
@@ -201,6 +210,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".py"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "java",
@@ -228,6 +238,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".java"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "kotlin",
@@ -255,6 +266,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".kt", ".kts"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "scala",
@@ -276,6 +288,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".scala", ".sbt"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "ruby",
@@ -298,6 +311,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "php",
@@ -314,6 +328,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".php"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "csharp",
@@ -337,6 +352,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".cs", ".csx"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "cpp",
@@ -364,6 +380,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "c",
@@ -391,6 +408,41 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        has_share_assets: false,
+    },
+    PhaseBEntry {
+        language: "swift",
+        npm_package: Some("@travsr-plugin/swift"),
+        command: "travsr-swift-index-emitter",
+        args: &[],
+        output_format: OutputFormat::Scip,
+        sandbox: SandboxRequirement::RequiresElevated,
+        install_hint: "travsr lang install swift",
+        underlying_tool_hint: "cd travsr-lang/packages/swift-index-emitter && swift build -c release  (then copy .build/release/swift-index-emitter to ~/.travsr/bin/travsr-swift-index-emitter)",
+        provider_binary: Some("travsr-lang-swift"),
+        elevated_hosts: &["localhost"],
+        scip_install: ScipInstall::Manual,
+        extensions: &[".swift"],
+        wrapper_version_fallback: "v0.1.0",
+        builtin: false,
+        has_share_assets: false,
+    },
+    PhaseBEntry {
+        language: "dart",
+        npm_package: Some("@travsr-plugin/dart"),
+        command: "dart",
+        args: &[],
+        output_format: OutputFormat::Scip,
+        sandbox: SandboxRequirement::RequiresElevated,
+        install_hint: "travsr lang install dart",
+        underlying_tool_hint: "https://dart.dev/get-dart — install Dart SDK, then: cd travsr-lang/packages/dart-scip-emitter && dart pub get",
+        provider_binary: Some("travsr-lang-dart"),
+        elevated_hosts: &["localhost"],
+        scip_install: ScipInstall::Manual,
+        extensions: &[".dart"],
+        wrapper_version_fallback: "v0.1.0",
+        builtin: false,
+        has_share_assets: true,
     },
 ];
 
