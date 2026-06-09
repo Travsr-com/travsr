@@ -106,6 +106,11 @@ pub struct PhaseBEntry {
     /// True for in-tree builtins (typescript, javascript) that are bundled with
     /// the travsr binary — no external binary on PATH required.
     pub builtin: bool,
+    /// True when this language has a native (in-process, zero-install) Phase B
+    /// implementation compiled into the daemon. When true, `lang list` shows
+    /// "✓ active" even if the external enrichment tool is absent — the external
+    /// tool is an optional upgrade, not a requirement for call-edge indexing.
+    pub native_phase_b: bool,
     /// True when `travsr lang install` must also download a platform-independent
     /// `<provider_binary>-share.tar.gz` asset and extract it into
     /// ~/.travsr/share/<provider_binary>/. Used by languages whose sidecar
@@ -129,6 +134,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".ts", ".tsx"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -146,6 +152,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".js", ".jsx", ".mjs", ".cjs"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -163,6 +170,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".rs"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -184,6 +192,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".go"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -210,6 +219,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".py"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -238,6 +248,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".java"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -266,6 +277,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".kt", ".kts"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -288,6 +300,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".scala", ".sbt"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -311,6 +324,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -328,6 +342,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".php"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -352,6 +367,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".cs", ".csx"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -380,6 +396,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -408,6 +425,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -425,6 +443,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".swift"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: false,
     },
     PhaseBEntry {
@@ -442,6 +461,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".dart"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
         has_share_assets: true,
     },
 ];

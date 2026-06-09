@@ -243,7 +243,11 @@ fn cmd_list(json: bool) -> Result<()> {
             let hint = "sandbox not available on this platform";
             format!("disabled (sandbox unavailable — {hint})")
         } else if registered && fully_ready {
-            let phase_b_note = if entry.builtin && !tool_on_path && !entry.install_hint.is_empty() {
+            let phase_b_note = if entry.builtin
+                && !entry.native_phase_b
+                && !tool_on_path
+                && !entry.install_hint.is_empty()
+            {
                 format!(" (Phase A only — Phase B needs: {})", entry.install_hint)
             } else {
                 String::new()
