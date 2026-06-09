@@ -181,6 +181,7 @@ fn sandbox_repo_root_is_read_only() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
@@ -216,6 +217,7 @@ fn sandbox_scratch_dir_is_writable() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
