@@ -268,7 +268,7 @@ export function activate(context: vscode.ExtensionContext): void {
             ? Promise.resolve(files)
             : proxy
                 .callTool("get_blast_radius", { file, analysis: "tree-sitter" })
-                .then((r) => r.split("\n").map((l) => l.trim()).filter(Boolean))
+                .then((r) => parseEnvelope(r))
                 .catch(() => [] as string[]),
         ]);
 
@@ -336,7 +336,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 file,
                 analysis: currentMode,
               });
-              currentFiles = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+              currentFiles = parseEnvelope(raw);
             } catch {
               currentFiles = [];
             }
@@ -355,10 +355,7 @@ export function activate(context: vscode.ExtensionContext): void {
       "travsr.showCallers",
       async (symbol: string) => {
         const raw = await proxy.callTool("get_callers", { symbol });
-        const lines = raw
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
+        const lines = parseEnvelope(raw);
         const panel = vscode.window.createWebviewPanel(
           "travsrCallers",
           `Callers — ${symbol}`,
@@ -647,6 +644,14 @@ interface FileListOpts {
   semanticAvailable: boolean;
   installHint: string;
   loading?: boolean;
+}
+
+/** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
+export function parseEnvelope(raw: string): string[] {
+  const inner = raw
+    .replace(/^<travsr-data>\n?/, "")
+    .replace(/\n?<\/travsr-data>$/, "");
+  return inner.split("\n").map((l) => l.trim()).filter(Boolean);
 }
 
 export function buildFileListHtml(
