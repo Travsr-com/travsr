@@ -104,6 +104,24 @@ pub fn scip_clang_asset(_tag: &str, target: &str) -> Option<String> {
     }
 }
 
+/// travsr-swift-index-emitter ships arm64-darwin and x86_64-linux binaries.
+pub fn swift_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => Some("travsr-swift-index-emitter-aarch64-apple-darwin".to_string()),
+        "x86_64-unknown-linux-gnu" => Some("travsr-swift-index-emitter-x86_64-unknown-linux-gnu".to_string()),
+        _ => None,
+    }
+}
+
+/// travsr-dart-index-emitter ships arm64-darwin and x86_64-linux binaries (AOT-compiled via dart compile exe).
+pub fn dart_scip_emitter_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => Some("travsr-dart-index-emitter-aarch64-apple-darwin".to_string()),
+        "x86_64-unknown-linux-gnu" => Some("travsr-dart-index-emitter-x86_64-unknown-linux-gnu".to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub struct PhaseBEntry {
     pub language: &'static str,
@@ -474,12 +492,18 @@ pub static CATALOG: &[PhaseBEntry] = &[
         command: "travsr-swift-index-emitter",
         args: &[],
         output_format: OutputFormat::Scip,
-        sandbox: SandboxRequirement::RequiresElevated,
+        sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install swift",
-        underlying_tool_hint: "cd travsr-lang/packages/swift-index-emitter && swift build -c release  (then copy .build/release/swift-index-emitter to ~/.travsr/bin/travsr-swift-index-emitter)",
+        underlying_tool_hint: "",
         provider_binary: Some("travsr-lang-swift"),
-        elevated_hosts: &["localhost"],
-        scip_install: ScipInstall::Manual,
+        elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "Travsr-com/travsr-lang",
+            asset_fn: swift_index_emitter_asset,
+            install_name: "travsr-swift-index-emitter",
+            version_fallback: "v0.1.0",
+            verify_sha256: false,
+        }),
         extensions: &[".swift"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
@@ -489,20 +513,26 @@ pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "dart",
         npm_package: Some("@travsr-plugin/dart"),
-        command: "dart",
+        command: "travsr-dart-index-emitter",
         args: &[],
         output_format: OutputFormat::Scip,
-        sandbox: SandboxRequirement::RequiresElevated,
+        sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install dart",
-        underlying_tool_hint: "https://dart.dev/get-dart — install Dart SDK, then: cd travsr-lang/packages/dart-scip-emitter && dart pub get",
+        underlying_tool_hint: "",
         provider_binary: Some("travsr-lang-dart"),
-        elevated_hosts: &["localhost"],
-        scip_install: ScipInstall::Manual,
+        elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "Travsr-com/travsr-lang",
+            asset_fn: dart_scip_emitter_asset,
+            install_name: "travsr-dart-index-emitter",
+            version_fallback: "v0.1.0",
+            verify_sha256: false,
+        }),
         extensions: &[".dart"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
         native_phase_b: false,
-        has_share_assets: true,
+        has_share_assets: false,
     },
 ];
 
