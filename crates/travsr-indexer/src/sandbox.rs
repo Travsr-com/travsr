@@ -169,7 +169,7 @@ fn build_sandboxed_command_impl(
     // Python site-packages — needed by scip-python to find installed packages.
     // `--ro-bind-try` silently skips paths that don't exist (Python not installed).
     {
-        let mut py_path = |query: &str| {
+        let py_path = |query: &str| {
             std::process::Command::new("python3")
                 .args(["-c", query])
                 .output()

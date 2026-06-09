@@ -91,6 +91,12 @@ def main():
         fixture_root = pair_spec["fixture_root"]
         golden_edges = pair_spec["edges"]
 
+        if pair_spec.get("xfail"):
+            print(f"Pair: {pair_name}")
+            print(f"  Status:    [SKIP] (xfail — {pair_spec.get('xfail_reason', 'no reason given')})")
+            print()
+            continue
+
         # Filter emitted edges to this fixture root
         pair_emitted = [
             e for e in all_emitted

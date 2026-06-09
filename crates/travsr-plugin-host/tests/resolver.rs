@@ -236,6 +236,7 @@ fn plugin_spec_standard_policy_is_deny_network() {
             repo.path(),
             scratch.path(),
             &spec.policy,
+            "rust",
         );
 
         match result {
@@ -261,6 +262,7 @@ fn plugin_spec_standard_policy_is_deny_network() {
             repo.path(),
             scratch.path(),
             &spec.policy,
+            "rust",
         );
         assert!(
             result.is_err(),
