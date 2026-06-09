@@ -7,7 +7,12 @@
 # removed. The new schema denies all advisories by default; use ignore[] for
 # specific accepted exceptions.
 version = 2
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0173: proc-macro-error2 unmaintained. Transitive via
+    # tabled -> tabled_derive -> proc-macro-error2. No safe upgrade available
+    # upstream yet; build-time proc-macro only. Revisit when tabled drops it.
+    "RUSTSEC-2026-0173",
+]
 
 [licenses]
 # Anything not in this allow list is denied. The old `deny` and `copyleft`
