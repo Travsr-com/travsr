@@ -321,18 +321,20 @@ pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "scala",
         npm_package: Some("@travsr-plugin/scala"),
-        command: "scip-scala",
-        args: &["{root}", "--output", "{output}"],
+        // The sidecar injects semanticdbEnabled := true and runs `sbt compile`.
+        // scip-scala is not published to any accessible registry.
+        command: "sbt",
+        args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "travsr lang install scala  (security approval required — run interactively)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-scala  — install via the sbt plugin",
+        underlying_tool_hint: "https://www.scala-sbt.org/download.html — install sbt (usually already present in Scala projects)",
         provider_binary: Some("travsr-lang-scala"),
         elevated_hosts: &[
             "repo1.maven.org",
             "repo.maven.apache.org",
+            "repo.scala-sbt.org",
             "plugins.sbt.org",
-            "jcenter.bintray.com",
         ],
         scip_install: ScipInstall::Manual,
         extensions: &[".scala", ".sbt"],
