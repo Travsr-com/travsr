@@ -7,7 +7,13 @@
 # removed. The new schema denies all advisories by default; use ignore[] for
 # specific accepted exceptions.
 version = 2
-ignore = []
+ignore = [
+    # proc-macro-error2 is unmaintained (RUSTSEC-2026-0173), but it is a
+    # build-time-only proc-macro dep pulled in by tabled_derive (via tabled).
+    # Zero runtime attack surface. Revisit when tabled_derive migrates to
+    # manyhow or proc-macro2-diagnostics.
+    { id = "RUSTSEC-2026-0173", reason = "build-time proc-macro only, no runtime exposure" },
+]
 
 [licenses]
 # Anything not in this allow list is denied. The old `deny` and `copyleft`
