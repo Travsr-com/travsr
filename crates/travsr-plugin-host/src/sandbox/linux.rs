@@ -252,6 +252,7 @@ pub fn build_sandboxed_command(
     _r: &Path,
     _s: &Path,
     _policy: &SandboxPolicy,
+    _lang: &str,
 ) -> Result<SandboxedSpawn, SandboxUnavailable> {
     Err(SandboxUnavailable(
         "Linux sandbox not available on this platform".into(),

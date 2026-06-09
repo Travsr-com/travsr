@@ -27,6 +27,7 @@ fn sandbox_standard_denies_network() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
@@ -93,6 +94,7 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
             repo.path(),
             scratch.path(),
             &SandboxPolicy::Standard,
+            "",
         );
         assert!(
             result.is_err(),
@@ -112,7 +114,8 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
             &[],
             repo.path(),
             scratch.path(),
-            &SandboxPolicy::Standard
+            &SandboxPolicy::Standard,
+            "",
         )
         .is_err());
         assert!(macos_build(
