@@ -1256,6 +1256,10 @@ fn tool_available(name: &str) -> bool {
         if home.join(".travsr").join("bin").join(name).is_file() {
             return true;
         }
+        // ~/.dotnet/tools — dotnet global tool install location (`dotnet tool install --global`).
+        if home.join(".dotnet").join("tools").join(name).is_file() {
+            return true;
+        }
     }
     false
 }

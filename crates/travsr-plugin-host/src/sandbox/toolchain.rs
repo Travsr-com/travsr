@@ -289,14 +289,18 @@ fn php_access() -> ToolchainAccess {
     }
 }
 
-/// `scip-dotnet` resolves NuGet packages. Needs the global NuGet package cache:
-///   - NuGet global-packages dir (read) — `dotnet nuget locals global-packages --list`,
-///     then `NUGET_PACKAGES` env, then `~/.nuget/packages`
+/// `scip-dotnet` resolves NuGet packages. Needs:
+///   - NuGet global-packages dir (read+write) — `dotnet restore` downloads new packages here
+///   - `~/.dotnet` (read) — dotnet global tools dir; scip-dotnet binary lives here
+///   - dotnet runtime root (read) — non-standard for Homebrew installs on macOS
+///   - `DOTNET_ROOT` env — scip-dotnet needs it when dotnet is not in /usr/local
 ///   - `HOME` env var — dotnet uses it for config resolution
 fn csharp_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
+    let mut write_paths = Vec::new();
     let mut env = Vec::new();
 
+    // NuGet global-packages dir — restore reads cached packages AND writes new ones.
     // `dotnet nuget locals global-packages --list` prints:
     // "global-packages: /home/user/.nuget/packages"
     let nuget_packages: Option<PathBuf> =
@@ -306,12 +310,51 @@ fn csharp_access() -> ToolchainAccess {
             .or_else(|| home().map(|h| h.join(".nuget").join("packages")));
 
     if let Some(ref p) = nuget_packages {
-        tracing::debug!(path = %p.display(), exists = p.exists(), "csharp_access: NuGet packages grant (read)");
+        tracing::debug!(path = %p.display(), exists = p.exists(), "csharp_access: NuGet packages grant (read+write)");
         read_paths.push(p.clone());
+        write_paths.push(p.clone());
         env.push((
             "NUGET_PACKAGES".to_string(),
             p.to_string_lossy().into_owned(),
         ));
+    }
+
+    // ~/.dotnet — dotnet global tools live here (scip-dotnet binary + runtime shim).
+    if let Some(h) = home() {
+        let dotnet_dir = h.join(".dotnet");
+        if dotnet_dir.exists() {
+            tracing::debug!(path = %dotnet_dir.display(), "csharp_access: ~/.dotnet grant (read)");
+            read_paths.push(dotnet_dir);
+        }
+    }
+
+    // dotnet runtime root — required when dotnet is installed via Homebrew.
+    // Homebrew: /opt/homebrew/bin/dotnet → /opt/homebrew/opt/dotnet/libexec/dotnet
+    // Resolved from DOTNET_ROOT env, or by canonicalizing `which dotnet` → parent dir.
+    // DOTNET_ROOT must point at the directory containing host/, sdk/, shared/.
+    // Homebrew canonical path: …/Cellar/dotnet/<ver>/bin/dotnet
+    //   parent(bin) → parent(install root) → join(libexec) = correct DOTNET_ROOT.
+    let dotnet_root: Option<PathBuf> = std::env::var("DOTNET_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            let exe = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|d| d.join("dotnet"))
+                .find(|p| p.is_file())?;
+            let real = std::fs::canonicalize(&exe).ok()?;
+            let libexec = real.parent()?.parent()?.join("libexec");
+            if libexec.is_dir() {
+                Some(libexec)
+            } else {
+                real.parent()
+                    .and_then(|b| b.parent())
+                    .map(|p| p.to_path_buf())
+            }
+        });
+    if let Some(ref p) = dotnet_root {
+        tracing::debug!(path = %p.display(), "csharp_access: DOTNET_ROOT grant (read)");
+        read_paths.push(p.clone());
+        env.push(("DOTNET_ROOT".to_string(), p.to_string_lossy().into_owned()));
     }
 
     if let Some(h) = home() {
@@ -320,7 +363,7 @@ fn csharp_access() -> ToolchainAccess {
 
     ToolchainAccess {
         read_paths,
-        write_paths: vec![],
+        write_paths,
         env,
     }
 }
