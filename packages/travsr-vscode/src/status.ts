@@ -172,5 +172,31 @@ export function createStatusBarItem(
     })
   );
 
+  // On .travsr deletion: show "indexing" so the status bar reflects the
+  // daemon's re-initialization cycle instead of staying frozen on "fresh".
+  // On re-creation: re-poll immediately to pick up the rebuilt graph.
+  const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (wsRoot) {
+    let deletionDebounce: ReturnType<typeof setTimeout> | undefined;
+    const travsrWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(wsRoot, ".travsr/**")
+    );
+    context.subscriptions.push(
+      travsrWatcher,
+      travsrWatcher.onDidDelete(() => {
+        if (state === "fresh") {
+          state = "indexing";
+          render();
+          clearTimeout(deletionDebounce);
+          deletionDebounce = setTimeout(() => void poll(), 2_000);
+        }
+      }),
+      travsrWatcher.onDidCreate(() => {
+        clearTimeout(deletionDebounce);
+        void poll();
+      })
+    );
+  }
+
   return item;
 }

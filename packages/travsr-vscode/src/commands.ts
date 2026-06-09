@@ -706,7 +706,7 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
     let out = "";
     let resolved = false;
     const done = (v: string): void => { if (!resolved) { resolved = true; resolve(v); } };
-    const proc = cp.spawn(binary, args, { env: { ...process.env }, ...(cwd ? { cwd } : {}) });
+    const proc = cp.spawn(binary, args, { env: { ...process.env, TERM: "dumb", NO_COLOR: "1" }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, timeoutMs);
@@ -833,6 +833,10 @@ export function registerShowLanguages(
           postStatus("");
           void refresh();
         });
+        return;
+      case "refresh":
+        availableLoaded = false;
+        await refresh();
         return;
       default:
         break;
