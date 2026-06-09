@@ -243,7 +243,16 @@ fn cmd_list(json: bool) -> Result<()> {
             let hint = "sandbox not available on this platform";
             format!("disabled (sandbox unavailable — {hint})")
         } else if registered && fully_ready {
-            format!("\u{2713} active{}", expiry_warning.as_deref().unwrap_or(""))
+            let phase_b_note = if entry.builtin && !tool_on_path && !entry.install_hint.is_empty() {
+                format!(" (Phase A only — Phase B needs: {})", entry.install_hint)
+            } else {
+                String::new()
+            };
+            format!(
+                "\u{2713} active{}{}",
+                phase_b_note,
+                expiry_warning.as_deref().unwrap_or("")
+            )
         } else if registered && !fully_ready {
             let missing = if !provider_on_path {
                 entry.provider_binary.unwrap_or(entry.command)

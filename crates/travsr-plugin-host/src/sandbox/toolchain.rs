@@ -45,6 +45,9 @@ pub fn toolchain_access(language: &str) -> ToolchainAccess {
         "csharp" => csharp_access(),
         "ruby" => ruby_access(),
         "swift" => swift_access(),
+        "rust" => rust_access(),
+        "typescript" | "javascript" => typescript_access(),
+        "python" => python_access(),
         _ => ToolchainAccess::default(),
     }
 }
@@ -392,6 +395,124 @@ fn swift_access() -> ToolchainAccess {
         read_paths,
         write_paths: vec![],
         env: vec![],
+    }
+}
+
+/// `rust-analyzer lsif` needs read access to:
+///   - `CARGO_HOME` (~/.cargo) — rust-analyzer binary + crates registry
+///   - `RUSTUP_HOME` (~/.rustup) — active toolchain (used by rust-analyzer for stdlib analysis)
+///   - `HOME` env so rustup/cargo can locate their homes at runtime
+fn rust_access() -> ToolchainAccess {
+    let mut read_paths = Vec::new();
+    let mut env = Vec::new();
+
+    let cargo_home = std::env::var("CARGO_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".cargo")));
+    if let Some(ref p) = cargo_home {
+        tracing::debug!(path = %p.display(), exists = p.exists(), "rust_access: CARGO_HOME grant (read)");
+        read_paths.push(p.clone());
+        env.push(("CARGO_HOME".to_string(), p.to_string_lossy().into_owned()));
+    }
+
+    let rustup_home = std::env::var("RUSTUP_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".rustup")));
+    if let Some(ref p) = rustup_home {
+        tracing::debug!(path = %p.display(), exists = p.exists(), "rust_access: RUSTUP_HOME grant (read)");
+        read_paths.push(p.clone());
+        env.push(("RUSTUP_HOME".to_string(), p.to_string_lossy().into_owned()));
+    }
+
+    if let Some(h) = home() {
+        env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
+    }
+
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env,
+    }
+}
+
+/// `travsr-lsif-ts` is a Node.js binary. Node may be managed by nvm (~/.nvm) or
+/// installed to a custom npm prefix (~/.npm-global). Grant both when present so
+/// the sidecar can resolve `node` and its module tree inside the sandbox.
+/// Homebrew node (/opt/homebrew) and system node (/usr/local) are already covered
+/// by the macOS sandbox profile's base rules.
+fn typescript_access() -> ToolchainAccess {
+    let mut read_paths = Vec::new();
+    let mut env = Vec::new();
+
+    if let Some(home) = home() {
+        let nvm_dir = std::env::var("NVM_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join(".nvm"));
+        if nvm_dir.exists() {
+            tracing::debug!(path = %nvm_dir.display(), "typescript_access: NVM_DIR grant (read)");
+            read_paths.push(nvm_dir.clone());
+            env.push((
+                "NVM_DIR".to_string(),
+                nvm_dir.to_string_lossy().into_owned(),
+            ));
+        }
+
+        // Global npm prefix, e.g. ~/.npm-global — covers globally installed travsr-lsif-ts.
+        let npm_global = std::env::var("NPM_CONFIG_PREFIX")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join(".npm-global"));
+        if npm_global.exists() {
+            tracing::debug!(path = %npm_global.display(), "typescript_access: npm global prefix grant (read)");
+            read_paths.push(npm_global);
+        }
+
+        env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+    }
+
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env,
+    }
+}
+
+/// `scip-python` uses the Python runtime to resolve imports. Grant:
+///   - `PYENV_ROOT` (~/.pyenv) if pyenv is in use
+///   - `~/.local` — pip user-scheme install prefix (pip install --user)
+fn python_access() -> ToolchainAccess {
+    let mut read_paths = Vec::new();
+    let mut env = Vec::new();
+
+    if let Some(home) = home() {
+        let pyenv_root = std::env::var("PYENV_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join(".pyenv"));
+        if pyenv_root.exists() {
+            tracing::debug!(path = %pyenv_root.display(), "python_access: PYENV_ROOT grant (read)");
+            read_paths.push(pyenv_root.clone());
+            env.push((
+                "PYENV_ROOT".to_string(),
+                pyenv_root.to_string_lossy().into_owned(),
+            ));
+        }
+
+        // pip --user installs land in ~/.local/lib/pythonX.Y/site-packages and
+        // ~/.local/bin — grant the whole prefix so the analyzer can import them.
+        let local = home.join(".local");
+        if local.exists() {
+            tracing::debug!(path = %local.display(), "python_access: ~/.local grant (read)");
+            read_paths.push(local);
+        }
+
+        env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+    }
+
+    ToolchainAccess {
+        read_paths,
+        write_paths: vec![],
+        env,
     }
 }
 

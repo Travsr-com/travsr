@@ -49,45 +49,52 @@ fn check_fuzz_target(language: &str) {
     }
 }
 
+/// Cached probe: log sandbox availability once per process lifetime.
+/// `register_builtins` is called once per `PluginIndexer` creation; guard here
+/// so the log line never repeats even when the indexer is recreated per-file.
+static SANDBOX_PROBED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// Probe OS sandbox availability and log the result at startup.
 /// ADR-017 Rule 2: if the sandbox is unavailable, Sidecar Phase B is disabled.
 /// Phase A (in-process) is always unaffected.
 pub fn probe_sandbox() {
-    #[cfg(target_os = "linux")]
-    {
-        let available = std::process::Command::new("bwrap")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok();
-        if available {
-            tracing::info!("sandbox: bubblewrap available — Phase B sidecar spawn enabled");
-        } else {
-            tracing::warn!(
-                "sandbox: bubblewrap (bwrap) not found on PATH — \
-                 Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
-                 Install with: sudo apt-get install bubblewrap"
-            );
+    SANDBOX_PROBED.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            let available = std::process::Command::new("bwrap")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok();
+            if available {
+                tracing::info!("sandbox: bubblewrap available — Phase B sidecar spawn enabled");
+            } else {
+                tracing::warn!(
+                    "sandbox: bubblewrap (bwrap) not found on PATH — \
+                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
+                     Install with: sudo apt-get install bubblewrap"
+                );
+            }
         }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let available = std::path::Path::new("/usr/bin/sandbox-exec").exists();
-        if available {
-            tracing::info!("sandbox: sandbox-exec available — Phase B sidecar spawn enabled");
-        } else {
-            tracing::warn!(
-                "sandbox: sandbox-exec not found — \
-                 Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
-            );
+        #[cfg(target_os = "macos")]
+        {
+            let available = std::path::Path::new("/usr/bin/sandbox-exec").exists();
+            if available {
+                tracing::info!("sandbox: sandbox-exec available — Phase B sidecar spawn enabled");
+            } else {
+                tracing::warn!(
+                    "sandbox: sandbox-exec not found — \
+                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+                );
+            }
         }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    tracing::warn!(
-        "sandbox: no sandbox implementation for this platform — \
-         Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
-    );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        tracing::warn!(
+            "sandbox: no sandbox implementation for this platform — \
+             Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+        );
+    });
 }
 
 /// Register all first-party in-process plugins into `dispatcher`.
