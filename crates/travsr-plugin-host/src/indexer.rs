@@ -64,22 +64,12 @@ impl PluginIndexer {
         Ok(response_to_output(resp))
     }
 
-    /// Phase B: semantic indexing for all trusted, registered languages.
+    /// Phase B: semantic indexing for all registered languages.
     /// Called from `init_repo` once per full index — not per commit.
-    /// ADR-017 Rule 3: checks trust before any code-executing subprocess spawns.
     pub fn invoke_phase_b_all(
         &self,
         repo_root: &std::path::Path,
-        trust: &crate::trust::TrustConfig,
     ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
-        if !trust.is_trusted(&self.corpus) {
-            tracing::info!(
-                "Phase B skipped for corpus '{}' — add trust first",
-                self.corpus
-            );
-            return (vec![], vec![]);
-        }
-
         // Gate Phase B per language against lang.toml registration.
         // `travsr lang remove <lang>` writes registered=[] which must be respected here.
         let registered: std::collections::HashSet<String> =

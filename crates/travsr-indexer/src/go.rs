@@ -28,6 +28,12 @@ const _: () = {
 //   - Type alias (type X = Y)          → kind="type",      sig="type:<name>"
 //   - Top-level var / const declarations→ kind="var",      sig="var:<name>"
 //   - Import declarations              → kind="import",    sig="import:<path>"
+//   - Package membership               → kind="go-pkg",    sig="go-pkg:<dir>/<pkg>"
+//
+// The go-pkg node's VName path is set to the parent directory (not the file
+// path) so that every file in the same package directory hashes to the same
+// NodeId. This allows the daemon's co-package pass to group co-package files
+// by NodeId without any cross-file state.
 //
 // Known gaps (Phase 3 / DEBT-018):
 //   - Build tags (`//go:build`) are ignored — all files indexed regardless
@@ -38,6 +44,7 @@ const _: () = {
 //   - Multi-value var blocks: only first name in each spec is indexed
 //   - Named type definitions (type X Y, no `=`) not indexed — DEBT-019
 //   - Methods on generic types (*Stack[T]) silently dropped — DEBT-020
+//   - Co-package edges only refreshed on `travsr init`, not per-commit — DEBT-024
 
 // ── Tree-sitter queries ───────────────────────────────────────────────────────
 //
@@ -82,6 +89,8 @@ const QUERIES: &str = r#"
     (const_spec
       name: (identifier) @var.name)))
 (import_spec) @import
+(package_clause
+  (package_identifier) @pkg.name)
 "#;
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
@@ -249,6 +258,28 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.edges.push(emit::depends_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
+            }
+            "pkg.name" => {
+                let Some(pkg_name) = find_cap_text(m, "pkg.name") else {
+                    continue;
+                };
+                // Use the parent directory as the VName path so that every file
+                // in the same package directory produces the identical NodeId.
+                // This is the key invariant that lets the daemon's co-package pass
+                // group co-package files by a shared NodeId without cross-file state.
+                let parent_dir = std::path::Path::new(vname_path)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+                let parent_dir = if parent_dir.is_empty() {
+                    ".".to_owned()
+                } else {
+                    parent_dir.replace('\\', "/")
+                };
+                let sig = format!("go-pkg:{parent_dir}/{pkg_name}");
+                let pkg_node = Node::new(VName::new(corpus, "", &parent_dir, "go", &sig), "go-pkg");
+                output.edges.push(emit::defines_edge(file_id, pkg_node.id));
+                output.nodes.push(pkg_node);
             }
             _ => {}
         }
@@ -483,7 +514,19 @@ mod tests {
     fn vname_path_is_respected() {
         let out = parse("", &fixture_path(), "custom/path.go").unwrap();
         for node in &out.nodes {
-            assert_eq!(node.vname.path, "custom/path.go");
+            if node.kind == "go-pkg" {
+                // go-pkg nodes use the parent directory as their VName path so
+                // that all files in the same package directory share one NodeId.
+                assert_eq!(
+                    node.vname.path, "custom",
+                    "go-pkg node must use parent dir as vname.path"
+                );
+            } else {
+                assert_eq!(
+                    node.vname.path, "custom/path.go",
+                    "non-pkg node must use the file's vname_path"
+                );
+            }
         }
     }
 
@@ -723,5 +766,118 @@ mod tests {
         let orig_len = edges.len();
         edges.dedup();
         assert_eq!(edges.len(), orig_len, "duplicate edges found");
+    }
+
+    #[test]
+    fn go_pkg_node_emitted_for_package_clause() {
+        use travsr_core::EdgeKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.go");
+        std::fs::write(&path, b"package strategies\nfunc New() {}\n").unwrap();
+        let out = parse("", &path, "strategies/server.go").unwrap();
+
+        let pkg_node = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .expect("expected go-pkg node for package clause");
+        assert_eq!(
+            pkg_node.vname.signature, "go-pkg:strategies/strategies",
+            "go-pkg sig must encode parent_dir/pkg_name"
+        );
+        assert_eq!(
+            pkg_node.vname.path, "strategies",
+            "go-pkg vname.path must be parent dir, not file path"
+        );
+
+        let file_id = out.nodes.iter().find(|n| n.kind == "file").unwrap().id;
+        assert!(
+            out.edges.iter().any(|e| e.src == file_id
+                && e.dst == pkg_node.id
+                && e.kind == EdgeKind::DefinesBinding),
+            "expected file → go-pkg DefinesBinding edge"
+        );
+    }
+
+    #[test]
+    fn go_pkg_node_root_level_uses_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.go");
+        std::fs::write(&path, b"package main\nfunc main() {}\n").unwrap();
+        let out = parse("", &path, "main.go").unwrap();
+        let pkg_node = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .expect("expected go-pkg node for root-level file");
+        assert_eq!(
+            pkg_node.vname.signature, "go-pkg:./main",
+            "root-level file must use '.' as parent_dir in go-pkg sig"
+        );
+        assert_eq!(
+            pkg_node.vname.path, ".",
+            "root-level go-pkg vname.path must be '.'"
+        );
+    }
+
+    #[test]
+    fn go_pkg_node_is_exactly_one_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.go");
+        std::fs::write(&path, b"package strategies\nfunc A() {}\nfunc B() {}\n").unwrap();
+        let out = parse("", &path, "strategies/a.go").unwrap();
+        let pkg_count = out.nodes.iter().filter(|n| n.kind == "go-pkg").count();
+        assert_eq!(pkg_count, 1, "exactly one go-pkg node per file after dedup");
+    }
+
+    #[test]
+    fn co_package_files_share_same_pkg_node_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.go");
+        let path_b = dir.path().join("b.go");
+        std::fs::write(&path_a, b"package strategies\nfunc A() {}\n").unwrap();
+        std::fs::write(&path_b, b"package strategies\nfunc B() {}\n").unwrap();
+        let out_a = parse("", &path_a, "strategies/a.go").unwrap();
+        let out_b = parse("", &path_b, "strategies/b.go").unwrap();
+        let pkg_id_a = out_a
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        let pkg_id_b = out_b
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        assert_eq!(
+            pkg_id_a, pkg_id_b,
+            "files in the same package directory must produce identical go-pkg NodeIds"
+        );
+    }
+
+    #[test]
+    fn different_packages_same_dir_produce_distinct_pkg_node_ids() {
+        // External test packages (pkg_test convention) must get a distinct NodeId.
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.go");
+        let path_b = dir.path().join("a_test.go");
+        std::fs::write(&path_a, b"package mypkg\nfunc A() {}\n").unwrap();
+        std::fs::write(&path_b, b"package mypkg_test\nfunc TestA() {}\n").unwrap();
+        let out_a = parse("", &path_a, "mypkg/a.go").unwrap();
+        let out_b = parse("", &path_b, "mypkg/a_test.go").unwrap();
+        let pkg_id_a = out_a
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        let pkg_id_b = out_b
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        assert_ne!(
+            pkg_id_a, pkg_id_b,
+            "mypkg and mypkg_test must produce distinct go-pkg NodeIds"
+        );
     }
 }

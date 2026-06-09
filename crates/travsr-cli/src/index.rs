@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use travsr_core::{Edge, NodeId};
 use travsr_indexer::{FfiMarker, Node};
-use travsr_plugin_host::{trust::TrustConfig, PluginIndexer};
+use travsr_plugin_host::PluginIndexer;
 
 /// Walk `dir`, index all source files, resolve FFI edges, and write the
 /// graph JSON to `output`.  Used by the cross-lang precision gate CI workflow.
@@ -42,8 +42,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
     let ffi_edges = indexer.resolve_ffi_edges(&all_markers);
 
     // Phase B: semantic edges (resolves-to, ref/call) via external sidecars.
-    let trust = TrustConfig::from_disk();
-    let (phase_b_nodes, phase_b_edges) = indexer.invoke_phase_b_all(dir, &trust);
+    let (phase_b_nodes, phase_b_edges) = indexer.invoke_phase_b_all(dir);
     for node in phase_b_nodes {
         all_nodes.insert(node.id, node);
     }

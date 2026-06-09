@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
-use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
+use travsr_core::{
+    canonical_corpus, canonical_corpus_local, EdgeKind, Language, NodeId, SIGNATURE_FORMAT_VERSION,
+};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_python_fs, link_imports_rust,
     run_lsif_emitter, FfiMarker,
@@ -162,10 +164,6 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
-    // Auto-trust this corpus so Phase B runs without manual lang.toml edits.
-    // `travsr init` is the explicit consent act — no separate trust command needed.
-    travsr_plugin_host::trust::auto_trust_corpus(&corpus);
-
     let mut files_indexed: u64 = 0;
 
     let walker = WalkBuilder::new(repo_root)
@@ -229,11 +227,10 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     run_lsif_pass(repo_root, &corpus, &mut store);
 
     // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
-    // Runs once per full init, not per commit (PERF-002). Trust gate inside.
+    // Runs once per full init, not per commit (PERF-002).
     {
-        let trust = travsr_plugin_host::trust::TrustConfig::from_disk();
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
-        let (pb_nodes, pb_edges) = phase_b_indexer.invoke_phase_b_all(repo_root, &trust);
+        let (pb_nodes, pb_edges) = phase_b_indexer.invoke_phase_b_all(repo_root);
         for node in &pb_nodes {
             if let Err(e) = store.put_node(node) {
                 tracing::warn!("phase B node write error: {e}");
@@ -249,6 +246,75 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
                 nodes = pb_nodes.len(),
                 edges = pb_edges.len(),
                 "phase B indexing complete"
+            );
+        }
+    }
+
+    // ── Go intra-package co-file pass ─────────────────────────────────────────
+    // Go files in the same package share their namespace without import
+    // statements, so Phase A emits no Depends edges between them. Each file
+    // parsed by go::parse emits a `go-pkg` node whose VName path is the parent
+    // directory — so every file in `strategies/` produces the same go-pkg NodeId.
+    // This pass groups files by that shared NodeId and writes
+    //   file_B --Depends--> file_A
+    // for all ordered pairs (B ≠ A). Blast-radius Phase 1 then finds all
+    // co-package siblings via its generic reverse Depends BFS.
+    //
+    // DEBT-024: reindex_files (commit hook) does NOT run this pass — same
+    // limitation as FFI resolution. Adding/removing a Go file from a package
+    // requires a full `travsr init` to refresh co-package edges.
+    {
+        let all_nodes = store.all_nodes().unwrap_or_default();
+
+        // Find every go-pkg node, then collect the file nodes that define it.
+        let go_pkg_ids: Vec<NodeId> = all_nodes
+            .iter()
+            .filter(|n| n.kind == "go-pkg")
+            .map(|n| n.id)
+            .collect();
+
+        let mut pkg_to_files: std::collections::HashMap<NodeId, Vec<NodeId>> =
+            std::collections::HashMap::new();
+
+        for &pkg_id in &go_pkg_ids {
+            let Ok(incoming) = store.iter_edges_to(pkg_id) else {
+                continue;
+            };
+            for edge in &incoming {
+                if edge.kind != EdgeKind::DefinesBinding {
+                    continue;
+                }
+                if let Ok(Some(src)) = store.get_node(edge.src) {
+                    if src.kind == "file" {
+                        pkg_to_files.entry(pkg_id).or_default().push(edge.src);
+                    }
+                }
+            }
+        }
+
+        let mut copkg_count = 0usize;
+        for file_ids in pkg_to_files.values() {
+            if file_ids.len() < 2 {
+                continue;
+            }
+            for &b in file_ids {
+                for &a in file_ids {
+                    if a == b {
+                        continue;
+                    }
+                    let edge = travsr_core::Edge::new(b, a, EdgeKind::Depends);
+                    match store.put_edge(&edge) {
+                        Ok(()) => copkg_count += 1,
+                        Err(e) => tracing::warn!("co-package Depends edge write error: {e}"),
+                    }
+                }
+            }
+        }
+
+        if copkg_count > 0 {
+            tracing::info!(
+                count = copkg_count,
+                "go co-package pass: emitted intra-package Depends edges"
             );
         }
     }

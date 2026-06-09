@@ -390,6 +390,70 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
         }
     }
 
+    // Phase 2: file-level blast radius via language-aware import resolution.
+    // Many languages store deps as file --[Depends]--> import:pkg with no
+    // ResolvesTo chain back. ImportResolver bridges this for all 14 languages.
+    //
+    // Two search hints: the package directory (Go, Java packages, PHP, C#) and
+    // the file stem (Java/Kotlin/Scala class-level imports like import:com.Foo).
+    {
+        let fp_normalized = file.replace('\\', "/");
+        let p = std::path::Path::new(&fp_normalized);
+        let dir_hint = p
+            .parent()
+            .and_then(|d| d.file_name()) // last component of directory
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty());
+        let stem_hint = p.file_stem().and_then(|s| s.to_str());
+
+        let mut hints: Vec<&str> = Vec::new();
+        if let Some(d) = dir_hint {
+            hints.push(d);
+        }
+        if let Some(s) = stem_hint {
+            if Some(s) != dir_hint {
+                hints.push(s);
+            }
+        }
+
+        let mut checked_import_ids: std::collections::HashSet<travsr_core::NodeId> =
+            std::collections::HashSet::new();
+
+        for hint in hints {
+            let Ok(import_nodes) = store.search_nodes_by_name(hint) else {
+                continue;
+            };
+            for imp in import_nodes {
+                if imp.kind != "import" {
+                    continue;
+                }
+                if !checked_import_ids.insert(imp.id) {
+                    continue;
+                } // dedup across hints
+                let resolver = travsr_core::resolver_for_language(&imp.vname.language);
+                if !resolver.resolves_to(&imp.vname.signature, file) {
+                    continue;
+                }
+                let Ok(edges) = store.iter_edges_to(imp.id) else {
+                    continue;
+                };
+                for edge in edges {
+                    if !matches!(edge.kind, EdgeKind::Depends) {
+                        continue;
+                    }
+                    if visited.insert(edge.src) {
+                        queue.push_back(edge.src);
+                    }
+                    if let Ok(Some(src_node)) = store.get_node(edge.src) {
+                        if !src_node.vname.path.is_empty() {
+                            affected_files.insert(src_node.vname.path.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     affected_files.into_iter().collect::<Vec<_>>().join("\n")
 }
 
@@ -518,8 +582,8 @@ fn get_repo_map_raw(store: &SqliteStore) -> String {
         } else {
             node.vname.path.clone()
         };
-        // Only include named symbols (skip bare file nodes with empty signature).
-        if !node.vname.signature.is_empty() && node.kind != "file" {
+        // Only include named symbols (skip file nodes and internal go-pkg nodes).
+        if !node.vname.signature.is_empty() && node.kind != "file" && node.kind != "go-pkg" {
             by_file
                 .entry(path)
                 .or_default()
@@ -1180,15 +1244,47 @@ fn node_json_id(node: &CoreNode) -> String {
 }
 
 /// Short display label — basename for files, full signature for everything else.
-fn node_json_label(node: &CoreNode) -> &str {
+fn node_json_label(node: &CoreNode) -> String {
     if node.kind == "file" {
         node.vname
             .path
             .rsplit('/')
             .next()
             .unwrap_or(&node.vname.path)
+            .to_string()
+    } else if node.vname.signature.starts_with("scip:") {
+        // Extract the short name from a scip qualified signature.
+        // "scip:...HomeController#home()." → "home()"
+        // "scip:...HomeController#"        → "HomeController"
+        let sig = &node.vname.signature;
+        if let Some(hash_pos) = sig.rfind('#') {
+            let after = sig[hash_pos + 1..].trim_end_matches('.');
+            if !after.is_empty() {
+                return after.to_string();
+            }
+            let before = &sig[..hash_pos];
+            return before
+                .rsplit(['/', ' '])
+                .next()
+                .unwrap_or(before)
+                .to_string();
+        }
+        sig.to_string()
     } else {
-        &node.vname.signature
+        // Strip structural prefixes (fn:, class:, method:, interface:, import:)
+        // so "fn:home" displays as "home", "class:HomeController" as "HomeController".
+        let sig = &node.vname.signature;
+        if let Some(rest) = sig
+            .strip_prefix("fn:")
+            .or_else(|| sig.strip_prefix("class:"))
+            .or_else(|| sig.strip_prefix("method:"))
+            .or_else(|| sig.strip_prefix("interface:"))
+            .or_else(|| sig.strip_prefix("import:"))
+        {
+            rest.to_string()
+        } else {
+            sig.clone()
+        }
     }
 }
 
@@ -1217,6 +1313,9 @@ fn get_graph_json_raw(
     };
 
     // Filter seeds to the requested kind when kind_filter is set.
+    // In symbol mode: also exclude scip: nodes from seeds — Phase B semantic nodes
+    // have no edges in most projects and appear as isolated floating dots.
+    // They are still reachable via BFS traversal if edges exist.
     let seed_nodes: Vec<_> = if !kind_filter.is_empty() {
         seed_nodes_raw
             .into_iter()
@@ -1224,6 +1323,9 @@ fn get_graph_json_raw(
             .collect()
     } else {
         seed_nodes_raw
+            .into_iter()
+            .filter(|n| !n.vname.signature.starts_with("scip:"))
+            .collect()
     };
 
     if seed_nodes.is_empty() {
@@ -1236,6 +1338,10 @@ fn get_graph_json_raw(
     let mut nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut edges_out: Vec<serde_json::Value> = Vec::new();
     let mut edge_seen: HashSet<(NodeId, NodeId, &'static str)> = HashSet::new();
+    // Tracks JSON ids already in nodes_out. Two different DB rows can share the
+    // same signature (Phase B stores the same symbol once per referencing file).
+    // Deduplicate here so Cytoscape never sees two nodes with the same id.
+    let mut node_ids_out: HashSet<String> = HashSet::new();
 
     for node in &seed_nodes {
         if visited.insert(node.id) {
@@ -1254,12 +1360,27 @@ fn get_graph_json_raw(
             continue;
         }
 
+        // In symbol mode: skip import nodes (long qualified names, no navigation
+        // value in a symbol graph) and scip:local N internal tokens.
+        // Skip empty-path external stubs at hop>0.
+        let is_scip_local =
+            node.vname.signature.starts_with("scip:") && node.vname.signature.contains(":local ");
+        let is_import_in_symbol_mode = node.kind == "import" && kind_filter != "file";
+        if is_scip_local || is_import_in_symbol_mode || (node.vname.path.is_empty() && hop > 0) {
+            continue;
+        }
+
+        let json_id = node_json_id(&node);
+        if !node_ids_out.insert(json_id.clone()) {
+            continue; // duplicate signature across DB rows — skip to avoid Cytoscape crash
+        }
+
         let score = {
             let raw = 0.7_f64.powi(i32::from(hop));
             (raw * 1000.0).round() / 1000.0
         };
         let mut node_obj = serde_json::json!({
-            "id":      node_json_id(&node),
+            "id":      json_id,
             "label":   node_json_label(&node),
             "kind":    node.kind,
             "path":    node.vname.path,
@@ -1396,6 +1517,14 @@ fn get_graph_json_raw(
             }
         }
     }
+
+    // Remove edges whose source or target was filtered/deduplicated from nodes_out.
+    // Orphan edges cause Cytoscape to silently crash.
+    edges_out.retain(|e| {
+        let src = e["source"].as_str().unwrap_or("");
+        let tgt = e["target"].as_str().unwrap_or("");
+        node_ids_out.contains(src) && node_ids_out.contains(tgt)
+    });
 
     match serde_json::to_string(&serde_json::json!({
         "nodes": nodes_out,
@@ -1610,6 +1739,48 @@ mod tests {
         let result = get_blast_radius(&store, "a.ts");
         assert!(result.contains("a.ts"));
         assert!(result.contains("b.ts"));
+    }
+
+    /// Go co-package: blast_radius("a.go") must include all sibling files in
+    /// the same package, via the Depends edges written by init_repo's co-package pass.
+    #[test]
+    fn blast_radius_includes_go_copackage_siblings() {
+        use travsr_core::{EdgeKind, Node, VName};
+
+        fn go_file_node(path: &str) -> Node {
+            Node::new(VName::new("", "", path, "go", "file"), "file")
+        }
+
+        let a = go_file_node("strategies/serverConfig.go");
+        let b = go_file_node("strategies/roundRobinStrategy.go");
+        let c = go_file_node("strategies/loadBalancer.go");
+
+        // Mirrors what init_repo's co-package pass writes: all ordered pairs.
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (b.id, a.id, EdgeKind::Depends),
+                (c.id, a.id, EdgeKind::Depends),
+                (a.id, b.id, EdgeKind::Depends),
+                (c.id, b.id, EdgeKind::Depends),
+                (a.id, c.id, EdgeKind::Depends),
+                (b.id, c.id, EdgeKind::Depends),
+            ],
+        );
+
+        let result = get_blast_radius(&store, "strategies/serverConfig.go");
+        assert!(
+            result.contains("strategies/serverConfig.go"),
+            "the file itself must appear in its blast radius"
+        );
+        assert!(
+            result.contains("strategies/roundRobinStrategy.go"),
+            "co-package sibling roundRobinStrategy.go must appear in blast radius"
+        );
+        assert!(
+            result.contains("strategies/loadBalancer.go"),
+            "co-package sibling loadBalancer.go must appear in blast radius"
+        );
     }
 
     // ── get_graph_stats unit tests ───────────────────────────────────────────

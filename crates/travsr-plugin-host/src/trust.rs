@@ -56,52 +56,6 @@ impl TrustConfig {
     }
 }
 
-/// Append `corpus` to the `trusted_corpora` list in ~/.travsr/lang.toml if it
-/// is not already present. Called by `init_repo` so the user never has to
-/// manually edit lang.toml — running `travsr init` is sufficient consent for
-/// Phase B analysis of that repo (ADR-017 Rule 3 preserved: consent is still
-/// explicit, just expressed through `init` rather than a separate command).
-pub fn auto_trust_corpus(corpus: &str) {
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("auto_trust_corpus: could not determine home dir");
-        return;
-    };
-    let travsr_dir = home.join(".travsr");
-    if let Err(e) = std::fs::create_dir_all(&travsr_dir) {
-        tracing::warn!("auto_trust_corpus: could not create ~/.travsr: {e}");
-        return;
-    }
-    let path = travsr_dir.join("lang.toml");
-
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut table: toml::Value =
-        toml::from_str(&content).unwrap_or(toml::Value::Table(toml::map::Map::new()));
-
-    // Ensure trusted_corpora array exists and corpus is in it.
-    let corpora = table.as_table_mut().and_then(|t| {
-        t.entry("trusted_corpora")
-            .or_insert(toml::Value::Array(vec![]))
-            .as_array_mut()
-    });
-
-    if let Some(arr) = corpora {
-        let already = arr.iter().any(|v| v.as_str() == Some(corpus));
-        if !already {
-            arr.push(toml::Value::String(corpus.to_string()));
-            match toml::to_string_pretty(&table) {
-                Ok(serialized) => {
-                    if let Err(e) = std::fs::write(&path, serialized) {
-                        tracing::warn!("auto_trust_corpus: could not write lang.toml: {e}");
-                    } else {
-                        tracing::info!("auto_trust_corpus: trusted corpus '{corpus}' in lang.toml");
-                    }
-                }
-                Err(e) => tracing::warn!("auto_trust_corpus: could not serialize lang.toml: {e}"),
-            }
-        }
-    }
-}
-
 /// Read the `registered` language list from ~/.travsr/lang.toml.
 /// Override path via `TRAVSR_LANG_TOML` env var (for tests).
 pub fn registered_languages_from_disk() -> Vec<String> {
