@@ -10,6 +10,7 @@ mod index;
 mod init;
 mod install;
 mod lang;
+mod logo;
 mod migrate;
 mod progress;
 mod repo;
@@ -19,7 +20,7 @@ mod status;
 mod synonym;
 
 use anyhow::{Context as _, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -211,7 +212,11 @@ async fn main() {
     // Clap exits immediately for --version and --help via process::exit, so
     // init_tracing() (which may start the OTLP exporter or its background
     // tasks) must not run first — otherwise those simple queries hang.
-    let cli = Cli::parse();
+    // Brand header for `--help`: the real logo as truecolor half-block art on a
+    // color terminal, else the geometric motif. Both are pure SGR, which clap's
+    // before_help preserves.
+    let matches = Cli::command().before_help(logo::banner()).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     init_tracing();
 

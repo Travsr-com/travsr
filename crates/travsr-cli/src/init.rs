@@ -11,6 +11,7 @@ pub fn run(quiet: bool, json: bool) -> anyhow::Result<()> {
     // Renders to stderr; the summary below stays on stdout.
     let mut progress = crate::progress::ProgressReporter::new(quiet, json);
     let stats = travsr_daemon::init_repo_with_progress(&repo_root, &mut |ev| progress.update(ev))?;
+    let elapsed = progress.elapsed();
     progress.finish();
 
     let db_path = repo_root.join(".travsr/graph.db");
@@ -23,28 +24,14 @@ pub fn run(quiet: bool, json: bool) -> anyhow::Result<()> {
             "edges_written": stats.edges_written,
             "total_nodes": stats.total_nodes,
             "total_edges": stats.total_edges,
+            "elapsed_s": elapsed.as_secs(),
             "db_path": db_path.display().to_string(),
         });
         println!("{summary}");
         return Ok(());
     }
 
-    if stats.nodes_written == 0 && stats.edges_written == 0 {
-        println!(
-            "graph up to date: {} nodes, {} edges → {}",
-            stats.total_nodes,
-            stats.total_edges,
-            db_path.display()
-        );
-    } else {
-        println!(
-            "indexed {} files, +{} nodes, +{} edges → {}",
-            stats.files_indexed,
-            stats.nodes_written,
-            stats.edges_written,
-            db_path.display()
-        );
-    }
+    crate::progress::print_summary(&stats, elapsed, quiet);
 
     // Tips are advisory chatter — suppress under --quiet.
     if !quiet {
