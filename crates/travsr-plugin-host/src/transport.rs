@@ -296,7 +296,12 @@ impl Transport for Sidecar {
         }
     }
 
-    fn invoke_phase_b(&self, req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+    fn invoke_phase_b(&self, mut req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+        // Inject the sandbox-authorized scratch dir so the sidecar can write
+        // temp files (SCIP output, etc.) inside the sandbox's allowed write area.
+        if let Some(scratch) = self._scratch.as_ref() {
+            req.scratch = scratch.path().to_path_buf();
+        }
         let io_lock = match &self.io {
             Some(m) => m,
             None => return Err(IndexError::PhaseNotSupported),

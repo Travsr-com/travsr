@@ -136,7 +136,7 @@ impl Language {
     /// Returns `None` for unrecognised extensions — callers skip those files.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
-            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::TypeScript),
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
             "go" => Some(Self::Go),
@@ -1021,7 +1021,10 @@ mod tests {
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("pyi"), Some(Language::Python));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
-        assert_eq!(Language::from_extension("js"), None);
+        assert_eq!(Language::from_extension("js"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("jsx"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("mjs"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("cjs"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension(""), None);
     }
 

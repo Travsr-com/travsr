@@ -117,7 +117,14 @@ pub fn build_sandboxed_command(
             );
         }
     }
-    cmd.args(["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+    // NativeIpc policy: tool uses POSIX IPC queues/shm (e.g. scip-clang parallel
+    // workers). Skip --unshare-ipc so mq_open/shm_open work inside the namespace.
+    let ipc_unshare: &[&str] = if matches!(policy, SandboxPolicy::NativeIpc) {
+        &["--unshare-pid", "--unshare-uts"]
+    } else {
+        &["--unshare-pid", "--unshare-uts", "--unshare-ipc"]
+    };
+    cmd.args(ipc_unshare);
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
         cmd.args(["--ro-bind-try", path, path]);
     }

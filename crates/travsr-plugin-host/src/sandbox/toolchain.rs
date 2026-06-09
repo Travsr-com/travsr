@@ -48,6 +48,12 @@ pub fn toolchain_access(language: &str) -> ToolchainAccess {
         "rust" => rust_access(),
         "typescript" | "javascript" => typescript_access(),
         "python" => python_access(),
+        // scip-clang reads compile_commands.json + source tree only; no module
+        // caches, no network. System headers (/usr, /Library/Developer, /opt/homebrew)
+        // are already readable via the base macOS sandbox profile and equivalent
+        // bwrap binds on Linux. The only sandbox requirement is a writable scratch
+        // dir, which is now injected via InvokeRequest::scratch.
+        "c" | "cpp" => ToolchainAccess::default(),
         _ => ToolchainAccess::default(),
     }
 }

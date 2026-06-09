@@ -117,7 +117,7 @@ pub fn build_sandboxed_command(
     // Network: Standard → deny; Elevated → allow (coarse — sandbox-exec has no
     // per-host filtering; enforce via egress proxy / firewall at the OS level).
     let network_rule = match policy {
-        SandboxPolicy::Standard => "(deny network*)".to_string(),
+        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => "(deny network*)".to_string(),
         SandboxPolicy::Elevated {
             permitted_hosts, ..
         } => {
@@ -176,6 +176,7 @@ pub fn build_sandboxed_command(
     (global-name "com.apple.logd")
     (global-name "com.apple.system.logger"))
 (allow sysctl-read)
+(allow ipc-posix-shm*)
 "#,
         network_rule = network_rule,
         repo = repo,
@@ -198,6 +199,29 @@ pub fn build_sandboxed_command(
                 language,
                 "macOS Elevated policy: skipping sandbox-exec, running sidecar directly \
                  (PSE-approved; resource-capped via ulimit)"
+            );
+            let quoted_args = args
+                .iter()
+                .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let inner = format!(
+                "ulimit -v 4194304 2>/dev/null; ulimit -t 300 2>/dev/null; exec '{}' {}",
+                program.replace('\'', r"'\''"),
+                quoted_args
+            );
+            let mut c = Command::new("sh");
+            c.args(["-c", &inner]);
+            c
+        }
+        SandboxPolicy::NativeIpc => {
+            // macOS Seatbelt (sandbox-exec) has no valid SBPL operation to permit
+            // mq_open/POSIX message queues. Skip sandbox-exec entirely; apply ulimit
+            // resource caps instead. Network is not granted — OS firewall applies.
+            tracing::debug!(
+                language,
+                "macOS NativeIpc policy: skipping sandbox-exec (no Seatbelt op for mq_open); \
+                 resource-capped via ulimit"
             );
             let quoted_args = args
                 .iter()

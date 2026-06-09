@@ -360,6 +360,68 @@ fn hex_encode_sha256(data: &[u8]) -> String {
     })
 }
 
+/// Downloads a zip archive from a GitHub release, extracts it into
+/// `~/.travsr/<extract_dir>/`, and returns that directory path.
+///
+/// Used for tools that ship as archives rather than standalone binaries
+/// (e.g. kotlin-language-server ships `server.zip`).
+pub async fn download_zip_and_extract(
+    repo: &str,
+    tag: &str,
+    asset_name: &str,
+    extract_dir: &str,
+) -> Result<PathBuf> {
+    if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
+        let dest = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
+            .join(".travsr")
+            .join(extract_dir);
+        return Ok(dest);
+    }
+
+    let url = format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("downloading {url}"))?;
+
+    if !resp.status().is_success() {
+        bail!("download failed: {} for {url}", resp.status());
+    }
+
+    let bytes = resp.bytes().await.context("reading zip bytes")?;
+
+    let dest = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
+        .join(".travsr")
+        .join(extract_dir);
+    std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
+
+    let tmp = dest.join("_download.zip");
+    std::fs::write(&tmp, &bytes).with_context(|| format!("writing zip to {}", tmp.display()))?;
+
+    let status = std::process::Command::new("unzip")
+        .args(["-qo", &tmp.to_string_lossy(), "-d", &dest.to_string_lossy()])
+        .status()
+        .context("running unzip — ensure unzip is installed")?;
+
+    let _ = std::fs::remove_file(&tmp);
+
+    if !status.success() {
+        bail!("unzip exited with {status}");
+    }
+
+    Ok(dest)
+}
+
 fn parse_sha256_line(line: &str) -> Result<String> {
     let hex = line
         .split_whitespace()

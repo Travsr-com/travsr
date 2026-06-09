@@ -9,7 +9,7 @@ impl Plugin for TypeScriptPlugin {
         Language::TypeScript
     }
     fn extensions(&self) -> &[&str] {
-        &["ts", "tsx", "mts", "cts"]
+        &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]
     }
     fn supports_phase_b(&self) -> bool {
         true

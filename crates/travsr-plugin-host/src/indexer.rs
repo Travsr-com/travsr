@@ -136,6 +136,7 @@ impl PluginIndexer {
             let req = travsr_plugin_protocol::InvokeRequest {
                 root: repo_root.to_path_buf(),
                 corpus: self.corpus.clone(),
+                scratch: std::path::PathBuf::default(), // overwritten in Sidecar::invoke_phase_b
             };
 
             match crate::transport::Sidecar::spawn(&spec, repo_root) {

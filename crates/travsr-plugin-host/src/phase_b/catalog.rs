@@ -12,6 +12,10 @@ pub enum OutputFormat {
 pub enum SandboxRequirement {
     /// No network, no build steps that download dependencies.
     Standard,
+    /// Needs POSIX IPC queues/shm (e.g. scip-clang parallel workers) but not network.
+    /// macOS sandbox-exec has no valid Seatbelt operation for mq_open; this policy
+    /// bypasses sandbox-exec and applies ulimit caps only. No PSE approval required.
+    NativeIpc,
     /// Needs network for dependency resolution (Maven/Gradle/NuGet/sbt).
     // ADR-017 Rule 1: RequiresElevated languages need an explicit host allowlist
     // recorded in ~/.travsr/lang.toml before the sandbox will permit network access.
@@ -35,6 +39,26 @@ pub struct ScipBinarySpec {
     pub verify_sha256: bool,
 }
 
+/// Specifies a zip archive on GitHub Releases that must be extracted rather than
+/// installed directly as a binary (e.g. kotlin-language-server ships `server.zip`).
+#[derive(Debug, Clone, Copy)]
+pub struct ZipBinarySpec {
+    /// GitHub repo slug, e.g. `"fwcd/kotlin-language-server"`.
+    pub repo: &'static str,
+    /// Map a release tag to the zip asset filename. Takes only `tag` (not target)
+    /// because platform-independent zip archives don't vary by host triple.
+    pub asset_fn: fn(tag: &str) -> String,
+    /// Subdirectory under `~/.travsr/` to extract the zip into (e.g. `"kls"`).
+    pub extract_dir: &'static str,
+    /// Path to the actual binary within the extracted directory, used to write
+    /// the `~/.travsr/bin/<install_name>` wrapper script (e.g. `"server/bin/kotlin-language-server"`).
+    pub binary_subpath: &'static str,
+    /// Wrapper script name placed in `~/.travsr/bin/`.
+    pub install_name: &'static str,
+    /// Fallback version tag when the GitHub API is unreachable.
+    pub version_fallback: &'static str,
+}
+
 /// How to install the underlying SCIP tool once the travsr-lang wrapper is present.
 #[derive(Debug, Clone, Copy)]
 pub enum ScipInstall {
@@ -42,6 +66,10 @@ pub enum ScipInstall {
     Command(&'static [&'static str]),
     /// Download a pre-built binary directly from the tool's GitHub Releases.
     GithubBinary(ScipBinarySpec),
+    /// Download a zip archive from GitHub Releases, extract it, and create a
+    /// wrapper script in `~/.travsr/bin/`. Used for tools that ship as archives
+    /// rather than standalone binaries (e.g. kotlin-language-server).
+    ZipBinary(ZipBinarySpec),
     /// No automated install available; show `underlying_tool_hint` to the user.
     Manual,
 }
@@ -60,6 +88,11 @@ pub fn scip_ruby_asset(_tag: &str, target: &str) -> Option<String> {
         "x86_64-unknown-linux-gnu" => Some("scip-ruby-x86_64-linux".to_string()),
         _ => None,
     }
+}
+
+/// kotlin-language-server ships a single platform-independent `server.zip`.
+pub fn kls_asset(_tag: &str) -> String {
+    "server.zip".to_string()
 }
 
 /// scip-clang ships arm64-darwin and x86_64-linux binaries (no version in asset name).
@@ -254,25 +287,30 @@ pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "kotlin",
         npm_package: Some("@travsr-plugin/kotlin"),
-        command: "scip-java",
-        args: &["index", "--output", "{output}", "{root}"],
+        // The sidecar drives kotlin-language-server (KLS) over LSP — build-system
+        // agnostic: KLS auto-detects Maven or Gradle and resolves the classpath itself.
+        command: "kotlin-language-server",
+        args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint:
             "travsr lang install kotlin  (security approval required — run interactively)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases — download scip-java-<version> and place in ~/.travsr/bin/scip-java (chmod +x)",
+        underlying_tool_hint: "travsr lang install kotlin  (auto-installs kotlin-language-server)",
         provider_binary: Some("travsr-lang-kotlin"),
         elevated_hosts: &[
             "repo1.maven.org",
             "repo.maven.apache.org",
             "plugins.gradle.org",
         ],
-        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
-            repo: "sourcegraph/scip-java",
-            asset_fn: scip_java_asset,
-            install_name: "scip-java",
-            version_fallback: "v0.12.3",
-            verify_sha256: true,
+        // KLS ships as server.zip — extracted to ~/.travsr/kls/, wrapper created at
+        // ~/.travsr/bin/kotlin-language-server automatically by `travsr lang install kotlin`.
+        scip_install: ScipInstall::ZipBinary(ZipBinarySpec {
+            repo: "fwcd/kotlin-language-server",
+            asset_fn: kls_asset,
+            extract_dir: "kls",
+            binary_subpath: "server/bin/kotlin-language-server",
+            install_name: "kotlin-language-server",
+            version_fallback: "1.3.13",
         }),
         extensions: &[".kt", ".kts"],
         wrapper_version_fallback: "v0.1.0",
@@ -381,7 +419,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "{output}",
         ],
         output_format: OutputFormat::Scip,
-        sandbox: SandboxRequirement::Standard,
+        sandbox: SandboxRequirement::NativeIpc,
         install_hint: "travsr lang install cpp  (requires compile_commands.json)",
         underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-cpp"),
@@ -410,7 +448,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "{output}",
         ],
         output_format: OutputFormat::Scip,
-        sandbox: SandboxRequirement::Standard,
+        sandbox: SandboxRequirement::NativeIpc,
         install_hint: "travsr lang install c  (requires compile_commands.json)",
         underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-c"),

@@ -202,6 +202,13 @@ impl CatalogResolver {
             let policy = match catalog_entry.sandbox {
                 SandboxRequirement::Standard => SandboxPolicy::Standard,
 
+                // NativeIpc: tool needs POSIX IPC queues/shm (e.g. scip-clang) but
+                // not network. macOS sandbox-exec has no valid Seatbelt operation for
+                // mq_open, so we skip sandbox-exec and rely on ulimit caps only.
+                // No PSE approval required — this is a structural constraint, not a
+                // network exception.
+                SandboxRequirement::NativeIpc => SandboxPolicy::NativeIpc,
+
                 SandboxRequirement::RequiresElevated => {
                     // Must have a recorded PSE approval in lang.toml.
                     // If the user provided an explicit permitted_hosts override in
