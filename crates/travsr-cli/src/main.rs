@@ -10,7 +10,9 @@ mod index;
 mod init;
 mod install;
 mod lang;
+mod logo;
 mod migrate;
+mod progress;
 mod repo;
 mod repos;
 mod serve;
@@ -18,7 +20,7 @@ mod status;
 mod synonym;
 
 use anyhow::{Context as _, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,7 +36,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Initialise a Travsr index in the current repository.
-    Init,
+    Init {
+        /// Suppress progress output and post-index tips.
+        #[arg(long, short)]
+        quiet: bool,
+        /// Emit machine-readable JSON (summary on stdout, progress on stderr).
+        #[arg(long)]
+        json: bool,
+    },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
         #[command(subcommand)]
@@ -203,7 +212,11 @@ async fn main() {
     // Clap exits immediately for --version and --help via process::exit, so
     // init_tracing() (which may start the OTLP exporter or its background
     // tasks) must not run first — otherwise those simple queries hang.
-    let cli = Cli::parse();
+    // Brand header for `--help`: the real logo as truecolor half-block art on a
+    // color terminal, else the geometric motif. Both are pure SGR, which clap's
+    // before_help preserves.
+    let matches = Cli::command().before_help(logo::banner()).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     init_tracing();
 
@@ -309,7 +322,7 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init => init::run()?,
+        Command::Init { quiet, json } => init::run(quiet, json)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;

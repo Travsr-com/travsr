@@ -39,6 +39,20 @@ pub struct InitStats {
     pub total_edges: u64,
 }
 
+/// Progress events emitted during [`init_repo_with_progress`] so a caller (the
+/// CLI) can render a live indicator. Counts are best-effort. The callback runs
+/// on the indexing thread, so keep it cheap and non-blocking.
+#[derive(Debug, Clone, Copy)]
+pub enum InitProgress {
+    /// Walking the work tree to discover indexable files. `scanned` is the
+    /// number of directory entries seen so far (the total is not yet known).
+    Scanning { scanned: u64 },
+    /// Indexing discovered files: `done` of `total` source files processed.
+    Indexing { done: u64, total: u64 },
+    /// Post-index semantic passes (LSIF + Phase B); no granular count.
+    Finalizing,
+}
+
 /// Initialise a Travsr index in `repo_root`:
 /// 1. Create `.travsr/graph.db` with WAL-mode migrations.
 /// 2. Install the `post-commit` git hook.
@@ -46,6 +60,16 @@ pub struct InitStats {
 ///    and index them via the delta path so the `files` hash table is populated
 ///    from the start.
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
+    init_repo_with_progress(repo_root, &mut |_| {})
+}
+
+/// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
+/// show that a long indexing run is alive (issue #293). The callback is invoked
+/// on the indexing thread; keep it cheap.
+pub fn init_repo_with_progress(
+    repo_root: &Path,
+    on_progress: &mut dyn FnMut(InitProgress),
+) -> anyhow::Result<InitStats> {
     let travsr_dir = repo_root.join(".travsr");
     std::fs::create_dir_all(&travsr_dir).context("creating .travsr directory")?;
 
@@ -173,7 +197,14 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         .build();
 
     let mut indexable_paths: Vec<PathBuf> = Vec::new();
+    let mut scanned: u64 = 0;
     for entry in walker {
+        // Emit a scanning tick periodically so a large tree does not look hung
+        // during discovery; the index loop below reports exact file counts.
+        scanned += 1;
+        if scanned % 1024 == 0 {
+            on_progress(InitProgress::Scanning { scanned });
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -214,13 +245,20 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     // PERF: Two COUNT(*) per file (N files → 2N full-table scans) was causing
     // WAL page-cache bloat during large init_repo runs. Replaced with two
     // total counts: one snapshot before the loop, one after.
+    let total_to_index = indexable_paths.len() as u64;
     let edges_before = store.edge_count().unwrap_or(0);
     for abs_path in &indexable_paths {
         reindex_files(std::slice::from_ref(abs_path), repo_root, &mut store)?;
         files_indexed += 1;
+        on_progress(InitProgress::Indexing {
+            done: files_indexed,
+            total: total_to_index,
+        });
     }
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
+
+    on_progress(InitProgress::Finalizing);
 
     // LSIF semantic pass — adds RefCall edges on top of structural edges.
     // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
