@@ -14,12 +14,17 @@
 
 use std::io::IsTerminal;
 
+use crate::progress::Palette;
+
 /// Half-block ANSI art of the brand favicon (16 cols x 8 rows).
 const LOGO: &str = include_str!("../assets/logo.ansi");
 
 /// The `--help` header: the real logo on a color terminal, else the motif.
 pub fn banner() -> String {
-    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    // Reuse the canonical color gate (NO_COLOR / CLICOLOR_FORCE / TERM=dumb) so
+    // the logo degrades exactly like the rest of the UI — a `dumb` terminal must
+    // not receive raw truecolor escapes.
+    let color = Palette::for_stream(std::io::stdout().is_terminal()).enabled();
     if !color {
         // Plain terminals / pipes / NO_COLOR: motif already carries the wordmark.
         return crate::progress::banner();

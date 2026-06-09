@@ -53,6 +53,13 @@ impl Palette {
         Self { color }
     }
 
+    /// Whether color/ANSI output is enabled for this stream, per the canonical
+    /// gate (`NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb`). Lets other surfaces
+    /// (e.g. the `--help` logo) reuse the same decision instead of re-deriving it.
+    pub fn enabled(self) -> bool {
+        self.color
+    }
+
     fn paint(self, code: &str, s: &str) -> String {
         if self.color {
             format!("\x1b[{code}m{s}\x1b[0m")
