@@ -15,6 +15,8 @@ import type { McpClient } from "./mcp";
 export const HOVER_SELECTOR: vscode.DocumentSelector = [
   { language: "typescript" },
   { language: "typescriptreact" },
+  { language: "javascript" },
+  { language: "javascriptreact" },
   { language: "rust" },
   { language: "python" },
   { language: "go" },
@@ -25,6 +27,7 @@ export const HOVER_SELECTOR: vscode.DocumentSelector = [
   { language: "scala" },
   { language: "cpp" },
   { language: "c" },
+  { language: "csharp" },
   { language: "swift" },
   { language: "dart" },
 ];

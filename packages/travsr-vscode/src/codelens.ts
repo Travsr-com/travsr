@@ -19,6 +19,8 @@ import { parseEnvelope } from "./extension";
 export const BLAST_RADIUS_SELECTOR: vscode.DocumentSelector = [
   { language: "typescript" },
   { language: "typescriptreact" },
+  { language: "javascript" },
+  { language: "javascriptreact" },
   { language: "rust" },
   { language: "python" },
   { language: "go" },
@@ -29,6 +31,7 @@ export const BLAST_RADIUS_SELECTOR: vscode.DocumentSelector = [
   { language: "scala" },
   { language: "cpp" },
   { language: "c" },
+  { language: "csharp" },
   { language: "swift" },
   { language: "dart" },
 ];
