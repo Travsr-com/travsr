@@ -252,19 +252,99 @@ export function activate(context: vscode.ExtensionContext): void {
           "travsrBlastRadius",
           `Blast radius — ${file}`,
           vscode.ViewColumn.Beside,
-          { localResourceRoots: [] }
+          { localResourceRoots: [], enableScripts: true }
         );
-        panel.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:16px">Loading…</body></html>`;
-        const actualFiles =
-          files ??
-          (await proxy.callTool("get_blast_radius", { file }))
-            .split("\n")
-            .map((l) => l.trim())
-            .filter(Boolean);
-        if (!panel.visible && files === undefined) return;
+
         panel.webview.html = buildFileListHtml(
           `Blast radius for <code>${escHtml(file)}</code>`,
-          actualFiles
+          [],
+          { mode: "tree-sitter", semanticAvailable: false, installHint: "", loading: true }
+        );
+
+        // Fetch lang status and initial blast radius in parallel.
+        const [langStatusRaw, initialFiles] = await Promise.all([
+          proxy.callTool("get_lang_status", { file }).catch(() => null as string | null),
+          files
+            ? Promise.resolve(files)
+            : proxy
+                .callTool("get_blast_radius", { file, analysis: "tree-sitter" })
+                .then((r) => r.split("\n").map((l) => l.trim()).filter(Boolean))
+                .catch(() => [] as string[]),
+        ]);
+
+        if (!panel.visible && files === undefined) return;
+
+        interface LangStatus {
+          language: string;
+          builtin: boolean;
+          semantic_available: boolean;
+          install_hint: string;
+        }
+        let langStatus: LangStatus = {
+          language: "unknown",
+          builtin: false,
+          semantic_available: false,
+          install_hint: "",
+        };
+        try {
+          if (langStatusRaw) {
+            langStatus = JSON.parse(langStatusRaw) as LangStatus;
+          }
+        } catch {
+          // malformed JSON: keep safe defaults
+        }
+
+        type AnalysisMode = "tree-sitter" | "semantic";
+        let currentMode: AnalysisMode = "tree-sitter";
+        let currentFiles = initialFiles;
+
+        function render(): void {
+          panel.webview.html = buildFileListHtml(
+            `Blast radius for <code>${escHtml(file)}</code>`,
+            currentFiles,
+            {
+              mode: currentMode,
+              semanticAvailable: langStatus.semantic_available,
+              installHint: langStatus.install_hint,
+              loading: false,
+            }
+          );
+        }
+
+        render();
+
+        panel.webview.onDidReceiveMessage(
+          async (msg: { command: string; mode?: AnalysisMode }) => {
+            if (msg.command !== "setMode" || !msg.mode) return;
+            if (msg.mode === currentMode) return;
+            if (msg.mode === "semantic" && !langStatus.semantic_available) return;
+
+            currentMode = msg.mode;
+            panel.webview.html = buildFileListHtml(
+              `Blast radius for <code>${escHtml(file)}</code>`,
+              currentFiles,
+              {
+                mode: currentMode,
+                semanticAvailable: langStatus.semantic_available,
+                installHint: langStatus.install_hint,
+                loading: true,
+              }
+            );
+
+            try {
+              const raw = await proxy.callTool("get_blast_radius", {
+                file,
+                analysis: currentMode,
+              });
+              currentFiles = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+            } catch {
+              currentFiles = [];
+            }
+
+            if (panel.visible) render();
+          },
+          undefined,
+          context.subscriptions
         );
       }
     )
@@ -562,16 +642,110 @@ async function reindexNow(
   );
 }
 
-function buildFileListHtml(title: string, items: string[]): string {
-  const rows = items
-    .map(
-      (f) =>
-        `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`
-    )
-    .join("\n");
-  return `<!DOCTYPE html><html><body style="padding:16px">
+interface FileListOpts {
+  mode: "tree-sitter" | "semantic";
+  semanticAvailable: boolean;
+  installHint: string;
+  loading?: boolean;
+}
+
+export function buildFileListHtml(
+  title: string,
+  items: string[],
+  opts?: FileListOpts
+): string {
+  // When opts is absent (showCallers / legacy callers) render a plain list —
+  // no toggle bar, no scripts. This keeps every existing caller working unchanged.
+  if (!opts) {
+    const rows = items
+      .map((f) => `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`)
+      .join("\n");
+    return `<!DOCTYPE html><html><body style="padding:16px">
 <h3>${title}</h3>
 <ul style="margin:0;padding-left:20px">${rows || "<li><em>none</em></li>"}</ul>
+</body></html>`;
+  }
+
+  const { mode, semanticAvailable, installHint, loading = false } = opts;
+
+  const pillBase =
+    "display:inline-block;padding:4px 14px;border-radius:20px;font-size:12px;" +
+    "font-family:var(--vscode-font-family,'Segoe UI',system-ui,sans-serif);" +
+    "cursor:pointer;border:none;transition:background 120ms;";
+  const activeStyle   = `${pillBase}background:#0078d4;color:#fff;font-weight:600;`;
+  const inactiveStyle = `${pillBase}background:#3c3c3c;color:#ccc;`;
+  const disabledStyle = `${pillBase}background:#555;color:#888;cursor:not-allowed;opacity:0.6;`;
+
+  const tsPill = `<button id="pill-ts"
+    style="${mode === "tree-sitter" ? activeStyle : inactiveStyle}"
+    onclick="setMode('tree-sitter')"
+    title="Structural analysis — Tree-sitter import/call edges (always available)"
+    aria-pressed="${mode === "tree-sitter"}"
+  >Tree-sitter</button>`;
+
+  const semTooltip = semanticAvailable
+    ? "Semantic analysis — precise RefCall edges from SCIP/LSIF (Phase B)"
+    : installHint
+      ? `Semantic analysis not yet available. ${installHint}`
+      : "Semantic analysis not yet available for this language.";
+
+  const semPill = semanticAvailable
+    ? `<button id="pill-sem"
+        style="${mode === "semantic" ? activeStyle : inactiveStyle}"
+        onclick="setMode('semantic')"
+        title="${escHtml(semTooltip)}"
+        aria-pressed="${mode === "semantic"}"
+      >Semantic</button>`
+    : `<button id="pill-sem"
+        style="${disabledStyle}"
+        disabled
+        title="${escHtml(semTooltip)}"
+        aria-pressed="false"
+        onclick="showInstallHint()"
+      >Semantic ▾</button>`;
+
+  const installHintHtml = installHint
+    ? `<div id="install-hint" style="display:none;margin-top:8px;padding:8px 12px;` +
+      `background:#2d2d00;border:1px solid #888600;border-radius:6px;` +
+      `font-size:12px;color:#e0c060;font-family:monospace;">${escHtml(installHint)}</div>`
+    : "";
+
+  const toggleBar = `
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+  <span style="font-size:11px;color:#999;margin-right:4px;">Analysis:</span>
+  ${tsPill}
+  ${semPill}
+</div>
+${installHintHtml}`;
+
+  const bodyHtml = loading
+    ? `<p style="color:#aaa;font-style:italic;">Loading…</p>`
+    : `<ul style="margin:0;padding-left:20px">${
+        items
+          .map((f) => `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`)
+          .join("\n") || "<li><em>none</em></li>"
+      }</ul>`;
+
+  const script = `<script>
+    const vscode = acquireVsCodeApi();
+    function setMode(m) { vscode.postMessage({ command: 'setMode', mode: m }); }
+    function showInstallHint() {
+      const el = document.getElementById('install-hint');
+      if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    }
+  </script>`;
+
+  return `<!DOCTYPE html><html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+</head>
+<body style="background:#1e1e1e;color:#d4d4d4;font-family:var(--vscode-font-family,'Segoe UI',system-ui,sans-serif);padding:16px;font-size:13px">
+  <h3 style="margin:0 0 12px">${title}</h3>
+  ${toggleBar}
+  ${bodyHtml}
+  ${script}
 </body></html>`;
 }
 

@@ -302,6 +302,138 @@ fn collect_global(
 
 // ── get_blast_radius ──────────────────────────────────────────────────────────
 
+/// Controls which graph edges `get_blast_radius` follows during BFS.
+/// `TreeSitter` is the default and reproduces the pre-toggle behaviour exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnalysisMode {
+    /// Follow `DefinesBinding`, `RefCall`, and `Depends` edges (Phase A).
+    /// Always available; zero regressions from existing behaviour.
+    #[default]
+    TreeSitter,
+    /// Follow only `RefCall` edges (Phase B — SCIP/LSIF output).
+    /// Returns an empty result when no Phase B data exists for the file's language.
+    Semantic,
+}
+
+/// Minimal per-language metadata used by `get_lang_status`.
+/// Kept here to avoid a DAG-violating dependency on `travsr-plugin-host`.
+/// Must stay in sync with `travsr-plugin-host/src/phase_b/catalog.rs`.
+struct LangMeta {
+    language: &'static str,
+    builtin: bool,
+    extensions: &'static [&'static str],
+    install_hint: &'static str,
+    underlying_tool_hint: &'static str,
+}
+
+static LANG_CATALOG: &[LangMeta] = &[
+    LangMeta {
+        language: "typescript",
+        builtin: true,
+        extensions: &[".ts", ".tsx"],
+        install_hint: "travsr lang install typescript",
+        underlying_tool_hint: "",
+    },
+    LangMeta {
+        language: "javascript",
+        builtin: true,
+        extensions: &[".js", ".jsx", ".mjs", ".cjs"],
+        install_hint: "travsr lang install javascript",
+        underlying_tool_hint: "",
+    },
+    LangMeta {
+        language: "rust",
+        builtin: true,
+        extensions: &[".rs"],
+        install_hint: "travsr lang install rust",
+        underlying_tool_hint: "rustup component add rust-analyzer",
+    },
+    LangMeta {
+        language: "python",
+        builtin: true,
+        extensions: &[".py"],
+        install_hint: "travsr lang install python",
+        underlying_tool_hint: "npm install -g @sourcegraph/scip-python",
+    },
+    LangMeta {
+        language: "go",
+        builtin: false,
+        extensions: &[".go"],
+        install_hint: "travsr lang install go",
+        underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
+    },
+    LangMeta {
+        language: "java",
+        builtin: false,
+        extensions: &[".java"],
+        install_hint: "travsr lang install java",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases",
+    },
+    LangMeta {
+        language: "kotlin",
+        builtin: false,
+        extensions: &[".kt", ".kts"],
+        install_hint: "travsr lang install kotlin",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases",
+    },
+    LangMeta {
+        language: "scala",
+        builtin: false,
+        extensions: &[".scala", ".sbt"],
+        install_hint: "travsr lang install scala",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-scala",
+    },
+    LangMeta {
+        language: "ruby",
+        builtin: false,
+        extensions: &[".rb"],
+        install_hint: "travsr lang install ruby",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-ruby/releases",
+    },
+    LangMeta {
+        language: "php",
+        builtin: false,
+        extensions: &[".php"],
+        install_hint: "travsr lang install php",
+        underlying_tool_hint: "https://github.com/davidrjenni/scip-php",
+    },
+    LangMeta {
+        language: "csharp",
+        builtin: false,
+        extensions: &[".cs", ".csx"],
+        install_hint: "travsr lang install csharp",
+        underlying_tool_hint: "dotnet tool install --global scip-dotnet",
+    },
+    LangMeta {
+        language: "cpp",
+        builtin: false,
+        extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
+        install_hint: "travsr lang install cpp",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases",
+    },
+    LangMeta {
+        language: "c",
+        builtin: false,
+        extensions: &[".c", ".h"],
+        install_hint: "travsr lang install c",
+        underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases",
+    },
+    LangMeta {
+        language: "swift",
+        builtin: false,
+        extensions: &[".swift"],
+        install_hint: "travsr lang install swift",
+        underlying_tool_hint: "swift build -c release in travsr-lang/packages/swift-index-emitter",
+    },
+    LangMeta {
+        language: "dart",
+        builtin: false,
+        extensions: &[".dart"],
+        install_hint: "travsr lang install dart",
+        underlying_tool_hint: "https://dart.dev/get-dart",
+    },
+];
+
 /// Return the set of files transitively affected if the given file changes.
 ///
 /// Uses reverse BFS over `DefinesBinding` and `RefCall` edges: starting from
@@ -311,15 +443,15 @@ fn collect_global(
 /// Output format (one line per affected file, sorted):
 ///   `src/service.ts`
 ///   `src/controller.ts`
-pub fn get_blast_radius(store: &SqliteStore, file: &str) -> String {
+pub fn get_blast_radius(store: &SqliteStore, file: &str, mode: AnalysisMode) -> String {
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_blast_radius rejected invalid arg: {reason}");
         return String::new();
     }
-    sanitize_for_mcp(&get_blast_radius_raw(store, file))
+    sanitize_for_mcp(&get_blast_radius_raw(store, file, mode))
 }
 
-fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
+fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> String {
     use std::collections::{HashSet, VecDeque};
     use travsr_core::EdgeKind;
 
@@ -373,10 +505,14 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
         }
 
         for edge in incoming {
-            if !matches!(
-                edge.kind,
-                EdgeKind::DefinesBinding | EdgeKind::RefCall | EdgeKind::Depends
-            ) {
+            let follow = match mode {
+                AnalysisMode::TreeSitter => matches!(
+                    edge.kind,
+                    EdgeKind::DefinesBinding | EdgeKind::RefCall | EdgeKind::Depends
+                ),
+                AnalysisMode::Semantic => matches!(edge.kind, EdgeKind::RefCall),
+            };
+            if !follow {
                 continue;
             }
             if visited.insert(edge.src) {
@@ -393,10 +529,11 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str) -> String {
     // Phase 2: file-level blast radius via language-aware import resolution.
     // Many languages store deps as file --[Depends]--> import:pkg with no
     // ResolvesTo chain back. ImportResolver bridges this for all 14 languages.
+    // Skipped in Semantic mode — RefCall edges are already precise.
     //
     // Two search hints: the package directory (Go, Java packages, PHP, C#) and
     // the file stem (Java/Kotlin/Scala class-level imports like import:com.Foo).
-    {
+    if mode == AnalysisMode::TreeSitter {
         let fp_normalized = file.replace('\\', "/");
         let p = std::path::Path::new(&fp_normalized);
         let dir_hint = p
@@ -462,13 +599,14 @@ pub fn get_blast_radius_global(
     repos: &HashMap<String, PathBuf>,
     file: &str,
     repo: Option<&str>,
+    mode: AnalysisMode,
 ) -> String {
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_blast_radius_global rejected invalid arg: {reason}");
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_blast_radius_raw(store, file);
+        let result = get_blast_radius_raw(store, file, mode);
         if result.is_empty() || single {
             result
         } else {
@@ -480,6 +618,88 @@ pub fn get_blast_radius_global(
         }
     });
     sanitize_for_mcp(&raw)
+}
+
+// ── get_lang_status ───────────────────────────────────────────────────────────
+
+/// Detect the language of `file` from its extension, then check whether Phase B
+/// (SCIP/LSIF) data exists in the store for that language.
+///
+/// Returns JSON: `{"language":"go","builtin":false,"semantic_available":false,
+/// "install_hint":"travsr lang install go"}`
+///
+/// `install_hint` is empty when semantic is already available; for builtins
+/// (ts/js/rust/python) with missing Phase B it shows `underlying_tool_hint`.
+/// JSON is returned unsanitised — it is parsed by first-party TypeScript code,
+/// not fed to an LLM.
+pub fn get_lang_status(store: &SqliteStore, file: &str) -> String {
+    if let Err(reason) = validate_mcp_arg(file) {
+        tracing::warn!("get_lang_status rejected invalid arg: {reason}");
+        return r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":""}"#
+            .to_string();
+    }
+    get_lang_status_raw(store, file)
+}
+
+fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
+    let ext = std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+
+    let entry = LANG_CATALOG
+        .iter()
+        .find(|e| e.extensions.contains(&ext.as_str()));
+
+    let Some(meta) = entry else {
+        return r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":"unknown language"}"#
+            .to_string();
+    };
+
+    let semantic_available = store.has_refcall_edges_for_language(meta.language);
+
+    let install_hint = if semantic_available {
+        ""
+    } else if meta.builtin {
+        meta.underlying_tool_hint
+    } else {
+        meta.install_hint
+    };
+
+    // Manual JSON to avoid a serde_json dependency on a hot path.
+    // Fields are all static strings — no escaping needed.
+    format!(
+        r#"{{"language":"{lang}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}"}}"#,
+        lang = meta.language,
+        builtin = meta.builtin,
+        sem = semantic_available,
+        hint = install_hint,
+    )
+}
+
+/// Global variant of `get_lang_status` — opens the first matched repo store.
+pub fn get_lang_status_global(
+    repos: &HashMap<String, PathBuf>,
+    file: &str,
+    repo: Option<&str>,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(file) {
+        tracing::warn!("get_lang_status_global rejected invalid arg: {reason}");
+        return r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":""}"#
+            .to_string();
+    }
+    // collect_global returns newline-joined results; we only need the first repo's answer.
+    let raw = collect_global(repos, repo, |store, _repo_name, _single| {
+        get_lang_status_raw(store, file)
+    });
+    if raw.is_empty() {
+        r#"{"language":"unknown","builtin":false,"semantic_available":false,"install_hint":""}"#
+            .to_string()
+    } else {
+        // collect_global joins results with "\n"; take only the first JSON line.
+        raw.lines().next().unwrap_or("").to_string()
+    }
 }
 
 // ── search_symbol ─────────────────────────────────────────────────────────────
@@ -1683,7 +1903,7 @@ mod tests {
     fn blast_radius_includes_source_file() {
         let a = make_node("a.ts", "fn:a");
         let store = make_store(std::slice::from_ref(&a), &[]);
-        let result = get_blast_radius(&store, "a.ts");
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
         assert!(
             result.contains("a.ts"),
             "source file must appear in its own blast radius"
@@ -1698,7 +1918,7 @@ mod tests {
         let b = make_node("b.ts", "fn:b");
         // B calls A — reverse BFS from A should reach B.
         let store = make_store(&[a.clone(), b.clone()], &[(b.id, a.id, EdgeKind::RefCall)]);
-        let result = get_blast_radius(&store, "a.ts");
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
         assert!(result.contains("a.ts"), "source file must be included");
         assert!(
             result.contains("b.ts"),
@@ -1714,7 +1934,7 @@ mod tests {
         let b = make_node("b.ts", "fn:b");
         // B imports A — Depends edge B→A; reverse BFS from A must reach B.
         let store = make_store(&[a.clone(), b.clone()], &[(b.id, a.id, EdgeKind::Depends)]);
-        let result = get_blast_radius(&store, "a.ts");
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
         assert!(result.contains("a.ts"), "source file must be included");
         assert!(
             result.contains("b.ts"),
@@ -1736,7 +1956,7 @@ mod tests {
             ],
         );
         // Must not hang; both files reachable.
-        let result = get_blast_radius(&store, "a.ts");
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
         assert!(result.contains("a.ts"));
         assert!(result.contains("b.ts"));
     }
@@ -1768,7 +1988,11 @@ mod tests {
             ],
         );
 
-        let result = get_blast_radius(&store, "strategies/serverConfig.go");
+        let result = get_blast_radius(
+            &store,
+            "strategies/serverConfig.go",
+            AnalysisMode::TreeSitter,
+        );
         assert!(
             result.contains("strategies/serverConfig.go"),
             "the file itself must appear in its blast radius"
@@ -1781,6 +2005,107 @@ mod tests {
             result.contains("strategies/loadBalancer.go"),
             "co-package sibling loadBalancer.go must appear in blast radius"
         );
+    }
+
+    /// Semantic mode follows only RefCall; Depends-only files must be excluded.
+    #[test]
+    fn blast_radius_semantic_excludes_depends_only_files() {
+        use travsr_core::EdgeKind;
+        let a = make_node("a.ts", "fn:a");
+        let b = make_node("b.ts", "fn:b"); // connected via RefCall
+        let c = make_node("c.ts", "fn:c"); // connected via Depends only
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (b.id, a.id, EdgeKind::RefCall),
+                (c.id, a.id, EdgeKind::Depends),
+            ],
+        );
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::Semantic);
+        assert!(
+            result.contains("b.ts"),
+            "RefCall caller must appear in semantic blast radius"
+        );
+        assert!(
+            !result.contains("c.ts"),
+            "Depends-only file must NOT appear in semantic mode"
+        );
+    }
+
+    /// TreeSitter mode follows both RefCall and Depends — unchanged from before.
+    #[test]
+    fn blast_radius_tree_sitter_follows_both_edge_kinds() {
+        use travsr_core::EdgeKind;
+        let a = make_node("a.ts", "fn:a");
+        let b = make_node("b.ts", "fn:b");
+        let c = make_node("c.ts", "fn:c");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (b.id, a.id, EdgeKind::RefCall),
+                (c.id, a.id, EdgeKind::Depends),
+            ],
+        );
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
+        assert!(
+            result.contains("b.ts") && result.contains("c.ts"),
+            "TreeSitter mode must follow both RefCall and Depends"
+        );
+    }
+
+    /// get_lang_status returns valid JSON for a known extension with no RefCall data.
+    #[test]
+    fn get_lang_status_known_extension_semantic_unavailable() {
+        let store = make_store(&[], &[]);
+        let json = get_lang_status(&store, "src/main.ts");
+        assert!(json.contains(r#""language":"typescript""#));
+        assert!(json.contains(r#""builtin":true"#));
+        assert!(json.contains(r#""semantic_available":false"#));
+    }
+
+    /// get_lang_status returns semantic_available:true after a RefCall edge is inserted.
+    #[test]
+    fn get_lang_status_returns_semantic_available_true_after_refcall_insert() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let n1 = Node::new(VName::new("", "", "a.ts", "typescript", "fn:a"), "function");
+        let n2 = Node::new(VName::new("", "", "b.ts", "typescript", "fn:b"), "function");
+        let mut store = make_store(&[n1.clone(), n2.clone()], &[]);
+        store
+            .put_edge(&Edge::new(n1.id, n2.id, EdgeKind::RefCall))
+            .unwrap();
+        let json = get_lang_status(&store, "a.ts");
+        assert!(json.contains(r#""semantic_available":true"#));
+        assert!(json.contains(r#""install_hint":"""#));
+    }
+
+    /// get_lang_status returns a safe unknown envelope for an unrecognised extension.
+    #[test]
+    fn get_lang_status_unknown_extension_returns_unknown() {
+        let store = make_store(&[], &[]);
+        let json = get_lang_status(&store, "Makefile");
+        assert!(json.contains(r#""language":"unknown""#));
+        assert!(json.contains(r#""semantic_available":false"#));
+    }
+
+    /// Non-builtin language (Go) shows install_hint when semantic unavailable.
+    #[test]
+    fn get_lang_status_non_builtin_shows_install_hint() {
+        let store = make_store(&[], &[]);
+        let json = get_lang_status(&store, "main.go");
+        assert!(json.contains(r#""language":"go""#));
+        assert!(json.contains(r#""builtin":false"#));
+        assert!(json.contains(r#""semantic_available":false"#));
+        assert!(json.contains("travsr lang install go"));
+    }
+
+    /// Builtin language (Rust) shows underlying_tool_hint when semantic unavailable.
+    #[test]
+    fn get_lang_status_builtin_shows_underlying_tool_hint() {
+        let store = make_store(&[], &[]);
+        let json = get_lang_status(&store, "src/main.rs");
+        assert!(json.contains(r#""language":"rust""#));
+        assert!(json.contains(r#""builtin":true"#));
+        assert!(json.contains("rust-analyzer"));
     }
 
     // ── get_graph_stats unit tests ───────────────────────────────────────────
