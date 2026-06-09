@@ -3119,6 +3119,7 @@ dependencies = [
  "sha2",
  "streaming-iterator",
  "tempfile",
+ "toml",
  "tracing",
  "travsr-core",
  "travsr-error",

@@ -12,6 +12,9 @@ mod ffi_resolver;
 mod go;
 mod hash;
 pub mod lsif;
+pub mod phase_b_python;
+pub mod phase_b_rust;
+pub mod phase_b_typescript;
 mod python;
 pub mod python_lsif;
 pub mod ra_runner;
@@ -62,6 +65,33 @@ pub fn go_parse(
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
     go::parse(corpus, path, vname_path)
+}
+
+/// Native Phase B for Rust: Cargo.toml dep graph + tree-sitter call edges.
+/// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+pub fn phase_b_native_rust(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_rust::extract_native_phase_b(corpus, root)
+}
+
+/// Native Phase B for TypeScript: tree-sitter call + inheritance edges.
+/// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+pub fn phase_b_native_typescript(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_typescript::extract_native_phase_b(corpus, root)
+}
+
+/// Native Phase B for Python: tree-sitter call + inheritance edges.
+/// Zero external-tool downloads. SCIP enrichment is merged by the caller.
+pub fn phase_b_native_python(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_python::extract_native_phase_b(corpus, root)
 }
 
 /// Resolve relative imports in `nodes` to `resolves-to` edges.

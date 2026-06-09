@@ -33,28 +33,45 @@ impl Plugin for PythonPlugin {
         }
     }
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
+        // Native Phase B: always runs, zero external-tool requirements.
+        let (mut nodes, mut edges) = travsr_indexer::phase_b_native_python(&req.corpus, &req.root)
+            .unwrap_or_else(|e| {
+                tracing::warn!("python native phase_b: {e}");
+                (vec![], vec![])
+            });
+        tracing::debug!(
+            nodes = nodes.len(),
+            edges = edges.len(),
+            "python native phase_b complete"
+        );
+
+        // SCIP enrichment: merge higher-fidelity edges when scip-python is available.
         match travsr_indexer::run_scip_python(&req.root, &req.corpus) {
             Ok(Some(bytes)) => match travsr_indexer::ingest_scip(&bytes, &req.corpus) {
-                Ok(out) => InvokeResponse {
-                    nodes: out.nodes,
-                    edges: out.edges,
-                },
-                Err(e) => {
-                    tracing::warn!("python scip ingest: {e}");
-                    InvokeResponse::default()
+                Ok(scip_out) => {
+                    tracing::debug!(
+                        nodes = scip_out.nodes.len(),
+                        edges = scip_out.edges.len(),
+                        "python scip enrichment merged"
+                    );
+                    nodes.extend(scip_out.nodes);
+                    edges.extend(scip_out.edges);
                 }
+                Err(e) => tracing::warn!("python scip ingest: {e}"),
             },
-            Ok(None) => {
-                tracing::info!(
-                    "scip-python not found — Python Phase B skipped \
-                     (install: npm install -g @sourcegraph/scip-python)"
-                );
-                InvokeResponse::default()
-            }
-            Err(e) => {
-                tracing::warn!("scip-python failed: {e}");
-                InvokeResponse::default()
-            }
+            Ok(None) => tracing::debug!(
+                "scip-python not available — native phase_b only \
+                 (install: npm install -g @sourcegraph/scip-python)"
+            ),
+            Err(e) => tracing::warn!("scip-python failed: {e}"),
         }
+
+        // Dedup merged output
+        nodes.sort_unstable_by_key(|n| n.id);
+        nodes.dedup_by_key(|n| n.id);
+        edges.sort_unstable_by_key(|e| (e.src, e.dst));
+        edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+
+        InvokeResponse { nodes, edges }
     }
 }

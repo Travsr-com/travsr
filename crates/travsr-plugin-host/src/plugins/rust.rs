@@ -12,7 +12,7 @@ impl Plugin for RustPlugin {
         &["rs"]
     }
     fn supports_phase_b(&self) -> bool {
-        travsr_indexer::ra_runner::ra_available()
+        true // Native Phase B always available; LSIF enrichment is opt-in
     }
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
         match travsr_indexer::rust_parse(&req.corpus, &req.path, &req.vname_path) {
@@ -25,29 +25,47 @@ impl Plugin for RustPlugin {
     }
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
         use travsr_indexer::{ingest_rust, run_ra_lsif, sandbox::SandboxConfig};
+
+        // Native Phase B: always runs, zero external-tool requirements.
+        let (mut nodes, mut edges) = travsr_indexer::phase_b_native_rust(&req.corpus, &req.root)
+            .unwrap_or_else(|e| {
+                tracing::warn!("rust native phase_b: {e}");
+                (vec![], vec![])
+            });
+        tracing::debug!(
+            nodes = nodes.len(),
+            edges = edges.len(),
+            "rust native phase_b complete"
+        );
+
+        // LSIF enrichment: merge higher-fidelity edges when rust-analyzer is available.
         let cfg = SandboxConfig {
             repo_root: req.root.clone(),
             ..Default::default()
         };
         match run_ra_lsif(&req.root, &cfg) {
             Ok(Some(dump)) => match ingest_rust(&dump, &req.corpus) {
-                Ok(out) => InvokeResponse {
-                    nodes: out.nodes,
-                    edges: out.edges,
-                },
-                Err(e) => {
-                    tracing::warn!("rust lsif ingest: {e}");
-                    InvokeResponse::default()
+                Ok(lsif_out) => {
+                    tracing::debug!(
+                        nodes = lsif_out.nodes.len(),
+                        edges = lsif_out.edges.len(),
+                        "rust lsif enrichment merged"
+                    );
+                    nodes.extend(lsif_out.nodes);
+                    edges.extend(lsif_out.edges);
                 }
+                Err(e) => tracing::warn!("rust lsif ingest: {e}"),
             },
-            Ok(None) => {
-                tracing::info!("rust-analyzer not available");
-                InvokeResponse::default()
-            }
-            Err(e) => {
-                tracing::warn!("rust-analyzer failed: {e}");
-                InvokeResponse::default()
-            }
+            Ok(None) => tracing::debug!("rust-analyzer not available — native phase_b only"),
+            Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
         }
+
+        // Dedup merged output
+        nodes.sort_unstable_by_key(|n| n.id);
+        nodes.dedup_by_key(|n| n.id);
+        edges.sort_unstable_by_key(|e| (e.src, e.dst));
+        edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+
+        InvokeResponse { nodes, edges }
     }
 }
