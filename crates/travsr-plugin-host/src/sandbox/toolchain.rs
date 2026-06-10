@@ -191,6 +191,10 @@ fn dart_access() -> ToolchainAccess {
         }
     }
 
+    if let Some(h) = home() {
+        env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
+    }
+
     tracing::debug!(read_paths = ?read_paths, env_keys = ?env.iter().map(|(k,_)| k).collect::<Vec<_>>(), "dart_access: final grants");
 
     ToolchainAccess {

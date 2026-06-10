@@ -133,6 +133,29 @@ impl PluginIndexer {
                 outcome.skipped_unregistered.push(lang.clone());
                 continue;
             }
+            // Dart AOT emitter crashes with SIGABRT when spawned as a nested
+            // subprocess inside the sandboxed sidecar. Call it directly from
+            // the daemon process where HOME and the full env are intact.
+            if lang == "dart" {
+                match travsr_indexer::phase_b_native_dart(&self.corpus, repo_root) {
+                    Ok((nodes, edges)) => {
+                        tracing::debug!(
+                            nodes = nodes.len(),
+                            edges = edges.len(),
+                            "Phase B: native dart complete"
+                        );
+                        all_nodes.extend(nodes);
+                        all_edges.extend(edges);
+                        outcome.ran.push(lang.clone());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Phase B dart: {e:#}");
+                        outcome.skipped_absent.push(lang.clone());
+                    }
+                }
+                continue;
+            }
+
             let spec = match resolver.resolve(&lang) {
                 Some(s) => s,
                 None => {
