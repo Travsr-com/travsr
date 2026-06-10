@@ -197,7 +197,7 @@ fn extract_file_edges(
                     ts_vname(corpus, vname_path, &format!("class:{child}")),
                     "class",
                 ));
-                edges.push(Edge::new(child_id, base_id, EdgeKind::Overrides));
+                edges.push(Edge::new(child_id, base_id, EdgeKind::IsImplementation));
             }
         }
     }
