@@ -84,6 +84,7 @@ pub enum InitProgress {
 /// 3. Walk all `.ts`/`.tsx`/`.rs` files (honours `.gitignore`, skips `target/`)
 ///    and index them via the delta path so the `files` hash table is populated
 ///    from the start.
+///
 /// Outcome from one worker's parse of a single file.
 struct ParseResult {
     file_graph: FileGraph,
@@ -131,7 +132,7 @@ fn index_paths_parallel(
     let stored_hashes = store.get_all_file_hashes().unwrap_or_default();
 
     // Divide `paths` into `jobs` slices (last shard may be smaller).
-    let shard_size = (paths.len() + jobs - 1) / jobs;
+    let shard_size = paths.len().div_ceil(jobs);
 
     let (tx, rx) = mpsc::sync_channel::<anyhow::Result<ParseResult>>(jobs * 4);
 
@@ -225,13 +226,11 @@ fn index_paths_parallel(
         // ── writer thread: drain channel, batch-write ─────────────────────────
         let mut counts = BatchWriteCounts::default();
         let mut files_skipped_unchanged: u64 = 0;
-        let mut done: u64 = 0;
         let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
 
-        for result in rx {
+        for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
-            done += 1;
 
             if pr.unchanged {
                 files_skipped_unchanged += 1;

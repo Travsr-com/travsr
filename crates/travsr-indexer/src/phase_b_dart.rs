@@ -78,10 +78,7 @@ fn emitter_path() -> Option<PathBuf> {
 /// the emitter is a nested subprocess of the sandboxed sidecar. Running it as a
 /// direct child of the daemon process (which has a clean env with HOME intact)
 /// avoids the crash.
-pub fn extract_native_phase_b(
-    corpus: &str,
-    root: &Path,
-) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let emitter = emitter_path().context(
         "travsr-dart-index-emitter not found — \
          set $TRAVSR_DART_EMITTER or run `travsr lang install dart`",
@@ -150,8 +147,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<(Vec<N
         .context("missing 'documents' in emitter output")?;
 
     // Pass 1: build symbol → NodeId map from all definitions.
-    let mut def_ids: std::collections::HashMap<String, NodeId> =
-        std::collections::HashMap::new();
+    let mut def_ids: std::collections::HashMap<String, NodeId> = std::collections::HashMap::new();
     let mut nodes: Vec<Node> = Vec::new();
 
     for doc in docs {
