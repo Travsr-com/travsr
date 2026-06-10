@@ -714,7 +714,7 @@ pub fn init_repo_with_progress(
             }
         }
         for edge in &pb_edges {
-            if let Err(e) = store.put_edge(edge) {
+            if let Err(e) = store.put_edge_lsif(edge) {
                 tracing::warn!("phase B edge write error: {e}");
             }
         }
