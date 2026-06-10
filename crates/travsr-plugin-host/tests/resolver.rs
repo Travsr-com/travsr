@@ -296,6 +296,15 @@ fn catalog_all_external_entries_have_provider_binary() {
                     entry.language,
                 );
             }
+            SandboxRequirement::NativeIpc => {
+                assert!(
+                    entry.provider_binary.is_some(),
+                    "NativeIpc external language '{}' must have a provider_binary. \
+                     Add `provider_binary: Some(\"travsr-lang-{}\")` to its CATALOG entry.",
+                    entry.language,
+                    entry.language,
+                );
+            }
             SandboxRequirement::RequiresElevated => {
                 assert!(
                     entry.provider_binary.is_some(),
@@ -356,6 +365,7 @@ fn corpus_flows_into_invoke_request() {
     let req = InvokeRequest {
         root: repo_root.path().to_path_buf(),
         corpus: indexer.corpus.clone(),
+        scratch: std::path::PathBuf::default(),
     };
 
     assert_eq!(

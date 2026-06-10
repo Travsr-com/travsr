@@ -376,6 +376,7 @@ mod tests {
         let req = InvokeRequest {
             root: std::path::PathBuf::from("."),
             corpus: String::new(),
+            scratch: std::path::PathBuf::default(),
         };
         assert!(matches!(
             t.invoke_phase_b(req),

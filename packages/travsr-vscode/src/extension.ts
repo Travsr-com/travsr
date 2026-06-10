@@ -35,7 +35,7 @@ import {
   EVT_DAEMON_FAILED,
 } from "./telemetry";
 import { registerContextProvider } from "./contextProvider";
-import { registerParityCommands } from "./commands";
+import { registerParityCommands, refreshOpenPanels } from "./commands";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -99,7 +99,15 @@ export function activate(context: vscode.ExtensionContext): void {
       void doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed).then(() => {
         restartInProgress = false;
         void vscode.window.showInformationMessage("Travsr: graph initialized — daemon reconnected.");
+        refreshOpenPanels();
       });
+    });
+    // External `travsr init` updates graph.db in-place — refresh panels without restarting.
+    dbWatcher.onDidChange(() => {
+      codeLensProvider.clearCache();
+      hoverProvider.clearCache();
+      treeProvider.refresh();
+      refreshOpenPanels();
     });
     context.subscriptions.push(dbWatcher);
   }
@@ -407,10 +415,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.reindexNow", async () => {
       await reindexNow(workspaceRoot, channel);
-      // Graph has changed — stale blast-radius and caller counts must be evicted.
+      // Graph has changed — evict stale counts and refresh all open panels.
       codeLensProvider.clearCache();
       hoverProvider.clearCache();
       treeProvider.refresh();
+      refreshOpenPanels();
     })
   );
 
@@ -581,10 +590,11 @@ function wireDisconnectHandler(
 // here because it needs the output channel + workspace root.
 
 /**
- * VSCODE-247 #8: trigger a re-index. The MCP server cannot reindex itself
- * without inverting the `travsr-mcp → travsr-retrieval` crate dependency rule
- * (indexing lives in travsr-daemon), so we spawn the binary's `hook-run` — the
- * same code path the git hook uses — as a one-shot child process.
+ * VSCODE-247 #8: trigger a full re-index including Phase B semantic analysis.
+ * Runs `travsr init` which walks all files, runs LSIF, and invokes any
+ * registered Phase B language plugins — identical to what the user gets from
+ * the terminal. This is required after installing a new language plugin so the
+ * new semantic edges appear in the graph.
  */
 async function reindexNow(
   workspaceRoot: string | undefined,
@@ -610,12 +620,15 @@ async function reindexNow(
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Travsr: re-indexing…",
+      title: "Travsr: re-indexing (may take up to 2 min)…",
       cancellable: false,
     },
     () =>
       new Promise<void>((resolve) => {
-        const proc = cp.spawn(binary, ["hook-run", "--from-hook"], { cwd: workspaceRoot });
+        const proc = cp.spawn(binary, ["init"], {
+          cwd: workspaceRoot,
+          env: { ...process.env, TERM: "dumb", NO_COLOR: "1" },
+        });
         proc.stdout?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
         proc.stderr?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
         const fail = (msg: string): void => {

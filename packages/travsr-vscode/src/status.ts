@@ -121,8 +121,8 @@ export function createStatusBarItem(
     return md;
   }
 
-  async function poll(): Promise<void> {
-    if (state === "indexing") return;
+  async function poll(force = false): Promise<void> {
+    if (!force && state === "indexing") return;
     try {
       const raw = await client.callTool("get_graph_stats");
       if (raw.length > 0) {
@@ -167,7 +167,7 @@ export function createStatusBarItem(
         state = "indexing";
         render();
         clearTimeout(saveDebounce);
-        saveDebounce = setTimeout(() => void poll(), 2_000);
+        saveDebounce = setTimeout(() => void poll(true), 2_000);
       }
     })
   );
@@ -193,7 +193,7 @@ export function createStatusBarItem(
       }),
       travsrWatcher.onDidCreate(() => {
         clearTimeout(deletionDebounce);
-        void poll();
+        void poll(true);
       })
     );
   }

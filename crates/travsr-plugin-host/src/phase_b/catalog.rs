@@ -107,8 +107,12 @@ pub fn scip_clang_asset(_tag: &str, target: &str) -> Option<String> {
 /// travsr-swift-index-emitter ships arm64-darwin and x86_64-linux binaries.
 pub fn swift_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
     match target {
-        "aarch64-apple-darwin" => Some("travsr-swift-index-emitter-aarch64-apple-darwin".to_string()),
-        "x86_64-unknown-linux-gnu" => Some("travsr-swift-index-emitter-x86_64-unknown-linux-gnu".to_string()),
+        "aarch64-apple-darwin" => {
+            Some("travsr-swift-index-emitter-aarch64-apple-darwin".to_string())
+        }
+        "x86_64-unknown-linux-gnu" => {
+            Some("travsr-swift-index-emitter-x86_64-unknown-linux-gnu".to_string())
+        }
         _ => None,
     }
 }
@@ -116,8 +120,12 @@ pub fn swift_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
 /// travsr-dart-index-emitter ships arm64-darwin and x86_64-linux binaries (AOT-compiled via dart compile exe).
 pub fn dart_scip_emitter_asset(_tag: &str, target: &str) -> Option<String> {
     match target {
-        "aarch64-apple-darwin" => Some("travsr-dart-index-emitter-aarch64-apple-darwin".to_string()),
-        "x86_64-unknown-linux-gnu" => Some("travsr-dart-index-emitter-x86_64-unknown-linux-gnu".to_string()),
+        "aarch64-apple-darwin" => {
+            Some("travsr-dart-index-emitter-aarch64-apple-darwin".to_string())
+        }
+        "x86_64-unknown-linux-gnu" => {
+            Some("travsr-dart-index-emitter-x86_64-unknown-linux-gnu".to_string())
+        }
         _ => None,
     }
 }

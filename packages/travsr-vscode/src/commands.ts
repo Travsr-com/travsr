@@ -460,6 +460,13 @@ type PanelMessage =
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
 
+/** Re-render every open managed panel — call after an external `travsr init` updates graph.db. */
+export function refreshOpenPanels(): void {
+  for (const { refresh } of managedPanels.values()) {
+    void refresh();
+  }
+}
+
 /**
  * Open (or reveal) a singleton management webview. `render` produces the HTML;
  * `handle` reacts to a posted message and may call the provided `refresh`.
@@ -815,11 +822,11 @@ export function registerShowLanguages(
         const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!wsRoot) return;
         postStatus("Initializing repo…");
-        void spawnLangCommand(getBinary(), ["init"], wsRoot, 60_000).then(() => {
+        void spawnLangCommand(getBinary(), ["init"], wsRoot, 120_000).then(() => {
           postStatus("");
           // Graph rebuilt — evict stale blast-radius and caller counts.
           onAfterInit?.();
-          void refresh();
+          refreshOpenPanels();
         });
         return;
       }
