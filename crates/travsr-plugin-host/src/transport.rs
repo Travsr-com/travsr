@@ -109,12 +109,18 @@ impl Sidecar {
                 message: format!("failed to create scratch dir: {e}"),
             })?;
         let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+        tracing::debug!(
+            lang = %lang,
+            program = %spec.program,
+            "Phase B: spawning sidecar"
+        );
         let mut spawner = Self::build_cmd(
             &spec.program,
             &args,
             repo_root,
             scratch.path(),
             &spec.policy,
+            &spec.language,
         )
         .map_err(|e| IndexError::Parse {
             file: format!("plugin:{lang}"),
@@ -175,6 +181,12 @@ impl Sidecar {
             }
         };
 
+        tracing::debug!(
+            lang = %lang,
+            plugin_version = %plugin_version,
+            "Phase B: sidecar handshake ok"
+        );
+
         Ok(Self {
             language: lang.to_string(),
             plugin_version,
@@ -192,8 +204,11 @@ impl Sidecar {
         repo_root: &std::path::Path,
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
+        language: &str,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
-        crate::sandbox::linux::build_sandboxed_command(program, args, repo_root, scratch, policy)
+        crate::sandbox::linux::build_sandboxed_command(
+            program, args, repo_root, scratch, policy, language,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -203,8 +218,11 @@ impl Sidecar {
         repo_root: &std::path::Path,
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
+        language: &str,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
-        crate::sandbox::macos::build_sandboxed_command(program, args, repo_root, scratch, policy)
+        crate::sandbox::macos::build_sandboxed_command(
+            program, args, repo_root, scratch, policy, language,
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -214,8 +232,11 @@ impl Sidecar {
         repo_root: &std::path::Path,
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
+        language: &str,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
-        crate::sandbox::windows::build_sandboxed_command(program, args, repo_root, scratch, policy)
+        crate::sandbox::windows::build_sandboxed_command(
+            program, args, repo_root, scratch, policy, language,
+        )
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -225,6 +246,7 @@ impl Sidecar {
         _r: &std::path::Path,
         _s: &std::path::Path,
         _policy: &crate::sandbox::policy::SandboxPolicy,
+        _language: &str,
     ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
         Err(SandboxUnavailable("unsupported platform".into()))
     }
@@ -274,7 +296,12 @@ impl Transport for Sidecar {
         }
     }
 
-    fn invoke_phase_b(&self, req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+    fn invoke_phase_b(&self, mut req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+        // Inject the sandbox-authorized scratch dir so the sidecar can write
+        // temp files (SCIP output, etc.) inside the sandbox's allowed write area.
+        if let Some(scratch) = self._scratch.as_ref() {
+            req.scratch = scratch.path().to_path_buf();
+        }
         let io_lock = match &self.io {
             Some(m) => m,
             None => return Err(IndexError::PhaseNotSupported),
@@ -349,6 +376,7 @@ mod tests {
         let req = InvokeRequest {
             root: std::path::PathBuf::from("."),
             corpus: String::new(),
+            scratch: std::path::PathBuf::default(),
         };
         assert!(matches!(
             t.invoke_phase_b(req),

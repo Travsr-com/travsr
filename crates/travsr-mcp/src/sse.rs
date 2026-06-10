@@ -594,7 +594,19 @@ fn dispatch_tool_call(
                     args["symbol"].as_str().unwrap_or(""),
                     repo_arg,
                 ),
-                "get_blast_radius" => tools::get_blast_radius_global(
+                "get_blast_radius" => {
+                    let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
+                        "semantic" => tools::AnalysisMode::Semantic,
+                        _ => tools::AnalysisMode::TreeSitter,
+                    };
+                    tools::get_blast_radius_global(
+                        repos,
+                        args["file"].as_str().unwrap_or(""),
+                        repo_arg,
+                        mode,
+                    )
+                }
+                "get_lang_status" => tools::get_lang_status_global(
                     repos,
                     args["file"].as_str().unwrap_or(""),
                     repo_arg,

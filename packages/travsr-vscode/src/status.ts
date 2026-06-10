@@ -121,8 +121,8 @@ export function createStatusBarItem(
     return md;
   }
 
-  async function poll(): Promise<void> {
-    if (state === "indexing") return;
+  async function poll(force = false): Promise<void> {
+    if (!force && state === "indexing") return;
     try {
       const raw = await client.callTool("get_graph_stats");
       if (raw.length > 0) {
@@ -167,10 +167,36 @@ export function createStatusBarItem(
         state = "indexing";
         render();
         clearTimeout(saveDebounce);
-        saveDebounce = setTimeout(() => void poll(), 2_000);
+        saveDebounce = setTimeout(() => void poll(true), 2_000);
       }
     })
   );
+
+  // On .travsr deletion: show "indexing" so the status bar reflects the
+  // daemon's re-initialization cycle instead of staying frozen on "fresh".
+  // On re-creation: re-poll immediately to pick up the rebuilt graph.
+  const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (wsRoot) {
+    let deletionDebounce: ReturnType<typeof setTimeout> | undefined;
+    const travsrWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(wsRoot, ".travsr/**")
+    );
+    context.subscriptions.push(
+      travsrWatcher,
+      travsrWatcher.onDidDelete(() => {
+        if (state === "fresh") {
+          state = "indexing";
+          render();
+          clearTimeout(deletionDebounce);
+          deletionDebounce = setTimeout(() => void poll(), 2_000);
+        }
+      }),
+      travsrWatcher.onDidCreate(() => {
+        clearTimeout(deletionDebounce);
+        void poll(true);
+      })
+    );
+  }
 
   return item;
 }

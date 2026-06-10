@@ -8,10 +8,11 @@
 # specific accepted exceptions.
 version = 2
 ignore = [
-    # RUSTSEC-2026-0173: proc-macro-error2 unmaintained. Transitive via
-    # tabled -> tabled_derive -> proc-macro-error2. No safe upgrade available
-    # upstream yet; build-time proc-macro only. Revisit when tabled drops it.
-    "RUSTSEC-2026-0173",
+    # proc-macro-error2 is unmaintained (RUSTSEC-2026-0173), but it is a
+    # build-time-only proc-macro dep pulled in by tabled_derive (via tabled).
+    # Zero runtime attack surface. Revisit when tabled_derive migrates to
+    # manyhow or proc-macro2-diagnostics.
+    { id = "RUSTSEC-2026-0173", reason = "build-time proc-macro only, no runtime exposure" },
 ]
 
 [licenses]

@@ -8,12 +8,12 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use travsr_core::{Language, Node, VName};
+use streaming_iterator::StreamingIterator as _;
+use travsr_core::{Edge, EdgeKind, Language, Node, VName};
 use travsr_plugin_protocol::{InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
-const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
 
 /// A complete Phase A language definition expressed as data.
 /// All fields are `'static` so configs can be declared as `const`.
@@ -113,7 +113,6 @@ fn parse_generic(
 
     let mut parser = Parser::new();
     parser.set_language(grammar).context("set language")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     let tree = parser.parse(&source, None).context("parse timeout")?;
 
@@ -123,8 +122,9 @@ fn parse_generic(
 
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
+    let mut iter = cursor.matches(query, tree.root_node(), source.as_slice());
 
-    for m in cursor.matches(query, tree.root_node(), source.as_slice()) {
+    while let Some(m) = iter.next() {
         for cap in m.captures {
             let cap_name = *capture_names.get(cap.index as usize).unwrap_or(&"");
 
@@ -163,9 +163,22 @@ fn parse_generic(
         }
     }
 
+    let file_id = nodes[0].id;
+    let edges: Vec<Edge> = nodes[1..]
+        .iter()
+        .map(|n| {
+            let kind = if n.kind == "import" {
+                EdgeKind::Depends
+            } else {
+                EdgeKind::DefinesBinding
+            };
+            Edge::new(file_id, n.id, kind)
+        })
+        .collect();
+
     Ok(ParseResponse {
         nodes,
-        edges: vec![],
+        edges,
         ffi_markers: vec![],
     })
 }

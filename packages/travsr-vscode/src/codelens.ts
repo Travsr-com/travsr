@@ -14,13 +14,26 @@
 
 import * as vscode from "vscode";
 import type { McpClient } from "./mcp";
+import { parseEnvelope } from "./extension";
 
 export const BLAST_RADIUS_SELECTOR: vscode.DocumentSelector = [
   { language: "typescript" },
   { language: "typescriptreact" },
+  { language: "javascript" },
+  { language: "javascriptreact" },
   { language: "rust" },
   { language: "python" },
   { language: "go" },
+  { language: "java" },
+  { language: "kotlin" },
+  { language: "ruby" },
+  { language: "php" },
+  { language: "scala" },
+  { language: "cpp" },
+  { language: "c" },
+  { language: "csharp" },
+  { language: "swift" },
+  { language: "dart" },
 ];
 
 function formatBlastCount(n: number): string {
@@ -68,10 +81,7 @@ export class BlastRadiusCodeLensProvider implements vscode.CodeLensProvider {
       const raw = await this.mcp.callTool("get_blast_radius", { file });
       if (token.isCancellationRequested) return undefined;
 
-      const files = raw
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
+      const files = parseEnvelope(raw);
       const count = files.length;
 
       if (count === 0) {

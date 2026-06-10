@@ -43,6 +43,7 @@ mod windows_sandbox {
             repo.path(),
             scratch.path(),
             &standard_policy(),
+            "",
         )
         .expect("build_sandboxed_command must succeed");
 
@@ -75,6 +76,7 @@ mod windows_sandbox {
             repo.path(),
             scratch.path(),
             &standard_policy(),
+            "",
         )
         .expect("build_sandboxed_command must succeed");
 
@@ -114,6 +116,7 @@ mod windows_sandbox {
             repo.path(),
             scratch.path(),
             &standard_policy(),
+            "",
         )
         .expect("build_sandboxed_command must succeed");
 
@@ -147,6 +150,7 @@ mod windows_sandbox {
             repo.path(),
             scratch.path(),
             &standard_policy(),
+            "",
         )
         .expect("build_sandboxed_command must succeed");
 
@@ -190,6 +194,7 @@ mod windows_sandbox {
             repo.path(),
             scratch.path(),
             &standard_policy(),
+            "",
         )
         .expect("build_sandboxed_command must succeed");
 
@@ -223,6 +228,7 @@ mod windows_sandbox {
             repo.path(),
             scratch.path(),
             &standard_policy(),
+            "",
         );
 
         // On Windows, build_sandboxed_command must succeed and return an

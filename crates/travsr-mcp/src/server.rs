@@ -135,7 +135,15 @@ fn handle_tool_call(
         }
         "get_blast_radius" => {
             let file = args["file"].as_str().unwrap_or("");
-            tools::get_blast_radius(store, file)
+            let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
+                "semantic" => tools::AnalysisMode::Semantic,
+                _ => tools::AnalysisMode::TreeSitter,
+            };
+            tools::get_blast_radius(store, file, mode)
+        }
+        "get_lang_status" => {
+            let file = args["file"].as_str().unwrap_or("");
+            tools::get_lang_status(store, file)
         }
         "search_symbol" => {
             let name = args["name"].as_str().unwrap_or("");
@@ -156,7 +164,14 @@ fn handle_tool_call(
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
             let direction = args["direction"].as_str().unwrap_or("both");
-            let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 4) as u8;
+            // McpClient sends Record<string,string> so depth arrives as a JSON
+            // string ("3"), not a number. Try numeric first for direct callers,
+            // then fall back to string parsing for the VS Code extension path.
+            let depth = args["depth"]
+                .as_u64()
+                .or_else(|| args["depth"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(2)
+                .clamp(1, 4) as u8;
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
             tools::get_graph_json(store, query, direction, depth, kind_filter)
         }
@@ -241,7 +256,20 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" }
+                        "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
+                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (RefCall only, requires Phase B)." }
+                    },
+                    "required": ["file"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_lang_status",
+                "description": "Return whether semantic (Phase B) analysis is available for the language of the given file, and an install hint if not. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Repo-relative file path to detect language for" }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -549,7 +577,19 @@ fn handle_tool_call_global(
             tools::get_callers_global(repos, args["symbol"].as_str().unwrap_or(""), repo_arg)
         }
         "get_blast_radius" => {
-            tools::get_blast_radius_global(repos, args["file"].as_str().unwrap_or(""), repo_arg)
+            let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
+                "semantic" => tools::AnalysisMode::Semantic,
+                _ => tools::AnalysisMode::TreeSitter,
+            };
+            tools::get_blast_radius_global(
+                repos,
+                args["file"].as_str().unwrap_or(""),
+                repo_arg,
+                mode,
+            )
+        }
+        "get_lang_status" => {
+            tools::get_lang_status_global(repos, args["file"].as_str().unwrap_or(""), repo_arg)
         }
         "search_symbol" => {
             tools::search_symbol_global(repos, args["name"].as_str().unwrap_or(""), repo_arg)
@@ -569,7 +609,11 @@ fn handle_tool_call_global(
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
             let direction = args["direction"].as_str().unwrap_or("both");
-            let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 4) as u8;
+            let depth = args["depth"]
+                .as_u64()
+                .or_else(|| args["depth"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(2)
+                .clamp(1, 4) as u8;
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
             tools::get_graph_json_global(repos, query, direction, depth, repo_arg, kind_filter)
         }
@@ -648,6 +692,20 @@ fn tools_list_global() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
+                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (RefCall only, requires Phase B)." },
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                    },
+                    "required": ["file"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_lang_status",
+                "description": "Return whether semantic (Phase B) analysis is available for the language of the given file, and an install hint if not. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Repo-relative file path to detect language for" },
                         "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
                     },
                     "required": ["file"],
@@ -788,6 +846,7 @@ mod tests {
         "get_dependencies",
         "get_callers",
         "get_blast_radius",
+        "get_lang_status",
         "search_symbol",
         "get_repo_map",
         "get_execution_path",

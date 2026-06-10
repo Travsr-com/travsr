@@ -27,6 +27,7 @@ fn sandbox_standard_denies_network() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
@@ -93,6 +94,7 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
             repo.path(),
             scratch.path(),
             &SandboxPolicy::Standard,
+            "",
         );
         assert!(
             result.is_err(),
@@ -112,7 +114,8 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
             &[],
             repo.path(),
             scratch.path(),
-            &SandboxPolicy::Standard
+            &SandboxPolicy::Standard,
+            "",
         )
         .is_err());
         assert!(macos_build(
@@ -178,6 +181,7 @@ fn sandbox_repo_root_is_read_only() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
@@ -213,6 +217,7 @@ fn sandbox_scratch_dir_is_writable() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
@@ -428,6 +433,7 @@ fn sidecar_stub_disabled_health_is_isolated() {
     let invoke_req = InvokeRequest {
         corpus: String::new(),
         root: PathBuf::from("."),
+        scratch: PathBuf::default(),
     };
     let invoke_result = sidecar.invoke_phase_b(invoke_req);
     assert!(

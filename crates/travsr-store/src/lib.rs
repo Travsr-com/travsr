@@ -427,6 +427,30 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Returns `true` when at least one `ref/call` edge exists whose source node
+    /// has the given `language`. Used by `get_lang_status` to detect whether
+    /// Phase B (SCIP/LSIF) has run for a language without a separate metadata
+    /// table. Returns `false` on any query error (safe default: show Tree-sitter).
+    pub fn has_refcall_edges_for_language(&self, language: &str) -> bool {
+        let result: rusqlite::Result<bool> = self.conn.query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM edges e \
+                INNER JOIN nodes n ON e.src = n.id \
+                WHERE e.kind = 'ref/call' AND n.language = ?1 \
+                LIMIT 1 \
+             )",
+            params![language],
+            |row| row.get::<_, bool>(0),
+        );
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("has_refcall_edges_for_language error: {e}");
+                false
+            }
+        }
+    }
+
     pub fn get_file_hash(&self, path: &str) -> Result<Option<String>, StoreError> {
         self.conn
             .query_row(
@@ -2497,5 +2521,29 @@ mod tests {
             .collect();
         assert!(!aliases.contains(&"billing"), "removed alias must be gone");
         assert!(aliases.contains(&"invoice"), "sibling alias must survive");
+    }
+
+    #[test]
+    fn has_refcall_edges_for_language_returns_false_when_none() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(!store.has_refcall_edges_for_language("typescript"));
+    }
+
+    #[test]
+    fn has_refcall_edges_for_language_returns_true_after_insert() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n1 = Node::new(VName::new("", "", "a.ts", "typescript", "fn:a"), "function");
+        let n2 = Node::new(VName::new("", "", "b.ts", "typescript", "fn:b"), "function");
+        store.put_node(&n1).unwrap();
+        store.put_node(&n2).unwrap();
+        store
+            .put_edge(&Edge::new(n1.id, n2.id, EdgeKind::RefCall))
+            .unwrap();
+        assert!(store.has_refcall_edges_for_language("typescript"));
+        assert!(
+            !store.has_refcall_edges_for_language("rust"),
+            "different lang must return false"
+        );
     }
 }

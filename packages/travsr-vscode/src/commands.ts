@@ -460,6 +460,13 @@ type PanelMessage =
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
 
+/** Re-render every open managed panel — call after an external `travsr init` updates graph.db. */
+export function refreshOpenPanels(): void {
+  for (const { refresh } of managedPanels.values()) {
+    void refresh();
+  }
+}
+
 /**
  * Open (or reveal) a singleton management webview. `render` produces the HTML;
  * `handle` reacts to a posted message and may call the provided `refresh`.
@@ -706,7 +713,7 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
     let out = "";
     let resolved = false;
     const done = (v: string): void => { if (!resolved) { resolved = true; resolve(v); } };
-    const proc = cp.spawn(binary, args, { env: { ...process.env }, ...(cwd ? { cwd } : {}) });
+    const proc = cp.spawn(binary, args, { env: { ...process.env, TERM: "dumb", NO_COLOR: "1" }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, timeoutMs);
@@ -722,7 +729,8 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
  */
 export function registerShowLanguages(
   client: McpClient,
-  binary: string
+  binary: string,
+  onAfterInit?: () => void
 ): vscode.Disposable {
   const getCorpus = (): string =>
     path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "");
@@ -814,9 +822,11 @@ export function registerShowLanguages(
         const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!wsRoot) return;
         postStatus("Initializing repo…");
-        void spawnLangCommand(getBinary(), ["init"], wsRoot, 60_000).then(() => {
+        void spawnLangCommand(getBinary(), ["init"], wsRoot, 120_000).then(() => {
           postStatus("");
-          void refresh();
+          // Graph rebuilt — evict stale blast-radius and caller counts.
+          onAfterInit?.();
+          refreshOpenPanels();
         });
         return;
       }
@@ -830,6 +840,10 @@ export function registerShowLanguages(
           postStatus("");
           void refresh();
         });
+        return;
+      case "refresh":
+        availableLoaded = false;
+        await refresh();
         return;
       default:
         break;
@@ -846,7 +860,8 @@ export function registerShowLanguages(
 export function registerParityCommands(
   client: McpClient,
   context: vscode.ExtensionContext,
-  binary: string
+  binary: string,
+  onAfterInit?: () => void
 ): void {
   context.subscriptions.push(
     registerAskSymbol(client),
@@ -855,6 +870,6 @@ export function registerParityCommands(
     registerShowExecutionPath(client, context),
     registerShowRepos(client),
     registerShowGraphStats(client),
-    registerShowLanguages(client, binary)
+    registerShowLanguages(client, binary, onAfterInit)
   );
 }

@@ -153,6 +153,11 @@ impl CatalogResolver {
 
         let mut entries = Vec::new();
 
+        tracing::debug!(
+            "CatalogResolver: registered languages from disk: {:?}",
+            registered
+        );
+
         for catalog_entry in CATALOG {
             let lang = catalog_entry.language;
 
@@ -166,8 +171,19 @@ impl CatalogResolver {
 
             // Must be registered by the user.
             if !registered.iter().any(|r| r == lang) {
+                tracing::debug!(
+                    lang,
+                    "CatalogResolver: '{}' not in registered list — skipping",
+                    lang
+                );
                 continue;
             }
+
+            tracing::debug!(
+                lang,
+                binary = binary_name,
+                "CatalogResolver: searching PATH for binary"
+            );
 
             // The travsr-lang-<lang> binary must be on PATH.
             let Some(program) = which_binary(binary_name) else {
@@ -180,9 +196,18 @@ impl CatalogResolver {
                 continue;
             };
 
+            tracing::debug!(lang, program = %program, "CatalogResolver: binary found");
+
             // Determine sandbox policy.
             let policy = match catalog_entry.sandbox {
                 SandboxRequirement::Standard => SandboxPolicy::Standard,
+
+                // NativeIpc: tool needs POSIX IPC queues/shm (e.g. scip-clang) but
+                // not network. macOS sandbox-exec has no valid Seatbelt operation for
+                // mq_open, so we skip sandbox-exec and rely on ulimit caps only.
+                // No PSE approval required — this is a structural constraint, not a
+                // network exception.
+                SandboxRequirement::NativeIpc => SandboxPolicy::NativeIpc,
 
                 SandboxRequirement::RequiresElevated => {
                     // Must have a recorded PSE approval in lang.toml.
@@ -323,8 +348,23 @@ impl PluginResolver for CompositeResolver {
 /// Search PATH for a binary with the given name. Returns the absolute path as
 /// a `String` if found, or `None` if not on PATH. Mirrors the `which()` helper
 /// in `crates/travsr-cli/src/lang.rs` lines 398-401.
+///
+/// `~/.travsr/bin` is always prepended to the search path so that binaries
+/// installed by `travsr lang install` (e.g. `travsr-lang-java`) are found even
+/// when the daemon was launched with a stripped PATH (launchd, GUI launch, etc.).
 fn which_binary(name: &str) -> Option<String> {
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let travsr_bin = dirs::home_dir().map(|h| h.join(".travsr").join("bin"));
+
+    // Build the augmented search list: ~/.travsr/bin first, then host PATH.
+    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(tb) = travsr_bin {
+        search_dirs.push(tb);
+    }
+    search_dirs.extend(std::env::split_paths(&host_path));
+
+    search_dirs
+        .into_iter()
         .map(|dir| dir.join(name))
         .find(|p| p.is_file())
         .map(|p| p.to_string_lossy().into_owned())

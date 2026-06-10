@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
+use streaming_iterator::StreamingIterator as _;
 use travsr_core::{Node, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
@@ -27,6 +28,12 @@ const _: () = {
 //   - Type alias (type X = Y)          → kind="type",      sig="type:<name>"
 //   - Top-level var / const declarations→ kind="var",      sig="var:<name>"
 //   - Import declarations              → kind="import",    sig="import:<path>"
+//   - Package membership               → kind="go-pkg",    sig="go-pkg:<dir>/<pkg>"
+//
+// The go-pkg node's VName path is set to the parent directory (not the file
+// path) so that every file in the same package directory hashes to the same
+// NodeId. This allows the daemon's co-package pass to group co-package files
+// by NodeId without any cross-file state.
 //
 // Known gaps (Phase 3 / DEBT-018):
 //   - Build tags (`//go:build`) are ignored — all files indexed regardless
@@ -37,6 +44,7 @@ const _: () = {
 //   - Multi-value var blocks: only first name in each spec is indexed
 //   - Named type definitions (type X Y, no `=`) not indexed — DEBT-019
 //   - Methods on generic types (*Stack[T]) silently dropped — DEBT-020
+//   - Co-package edges only refreshed on `travsr init`, not per-commit — DEBT-024
 
 // ── Tree-sitter queries ───────────────────────────────────────────────────────
 //
@@ -81,6 +89,8 @@ const QUERIES: &str = r#"
     (const_spec
       name: (identifier) @var.name)))
 (import_spec) @import
+(package_clause
+  (package_identifier) @pkg.name)
 "#;
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
@@ -101,7 +111,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
-    let language = tree_sitter_go::language();
+    let language = tree_sitter::Language::new(tree_sitter_go::LANGUAGE);
     let file_node = go_file_node(corpus, vname_path);
     let file_id = file_node.id;
 
@@ -115,7 +125,6 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     parser
         .set_language(&language)
         .context("loading Go grammar")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
@@ -143,7 +152,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     // matches() provides all captures for the full pattern match in one shot.
     // We process one match at a time (no collect()) so the buffer is fresh.
     let mut cursor = QueryCursor::new();
-    let iter = cursor.matches(&query, tree.root_node(), source.as_slice());
+    let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
     // Helper used inside the loop: find capture text by name within a match.
     let find_cap_text = |m: &tree_sitter::QueryMatch<'_, '_>, name: &str| -> Option<String> {
@@ -154,7 +163,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             .map(str::to_owned)
     };
 
-    for m in iter {
+    while let Some(m) = iter.next() {
         // Determine which pattern fired by inspecting the anchor capture — each
         // pattern in QUERIES has a unique first capture name.
         let Some(anchor) = m.captures.first() else {
@@ -166,7 +175,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 
         match anchor_name.as_str() {
             "fn.name" => {
-                let Some(name) = find_cap_text(&m, "fn.name") else {
+                let Some(name) = find_cap_text(m, "fn.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -177,10 +186,10 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             }
             "recv.type" => {
                 // Method: all captures (recv.type + method.name) are in m.captures.
-                let Some(recv) = find_cap_text(&m, "recv.type") else {
+                let Some(recv) = find_cap_text(m, "recv.type") else {
                     continue;
                 };
-                let Some(method_name) = find_cap_text(&m, "method.name") else {
+                let Some(method_name) = find_cap_text(m, "method.name") else {
                     continue;
                 };
                 let recv = strip_generics(&recv).to_owned();
@@ -201,7 +210,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "class.name" => {
-                let Some(name) = find_cap_text(&m, "class.name") else {
+                let Some(name) = find_cap_text(m, "class.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -211,7 +220,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "iface.name" => {
-                let Some(name) = find_cap_text(&m, "iface.name") else {
+                let Some(name) = find_cap_text(m, "iface.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -221,7 +230,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "type.name" => {
-                let Some(name) = find_cap_text(&m, "type.name") else {
+                let Some(name) = find_cap_text(m, "type.name") else {
                     continue;
                 };
                 let name = strip_generics(&name).to_owned();
@@ -231,7 +240,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.nodes.push(node);
             }
             "var.name" => {
-                let Some(name) = find_cap_text(&m, "var.name") else {
+                let Some(name) = find_cap_text(m, "var.name") else {
                     continue;
                 };
                 let line = anchor.node.start_position().row as u32 + 1;
@@ -249,6 +258,28 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.edges.push(emit::depends_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
+            }
+            "pkg.name" => {
+                let Some(pkg_name) = find_cap_text(m, "pkg.name") else {
+                    continue;
+                };
+                // Use the parent directory as the VName path so that every file
+                // in the same package directory produces the identical NodeId.
+                // This is the key invariant that lets the daemon's co-package pass
+                // group co-package files by a shared NodeId without cross-file state.
+                let parent_dir = std::path::Path::new(vname_path)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+                let parent_dir = if parent_dir.is_empty() {
+                    ".".to_owned()
+                } else {
+                    parent_dir.replace('\\', "/")
+                };
+                let sig = format!("go-pkg:{parent_dir}/{pkg_name}");
+                let pkg_node = Node::new(VName::new(corpus, "", &parent_dir, "go", &sig), "go-pkg");
+                output.edges.push(emit::defines_edge(file_id, pkg_node.id));
+                output.nodes.push(pkg_node);
             }
             _ => {}
         }
@@ -286,7 +317,7 @@ fn extract_import_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Str
     }
     // Fallback: walk children for the interpreted_string_literal.
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let child = node.child(i as u32)?;
         if child.kind() == "interpreted_string_literal" {
             let raw = child.utf8_text(source).ok()?;
             return Some(unquote(raw));
@@ -483,7 +514,19 @@ mod tests {
     fn vname_path_is_respected() {
         let out = parse("", &fixture_path(), "custom/path.go").unwrap();
         for node in &out.nodes {
-            assert_eq!(node.vname.path, "custom/path.go");
+            if node.kind == "go-pkg" {
+                // go-pkg nodes use the parent directory as their VName path so
+                // that all files in the same package directory share one NodeId.
+                assert_eq!(
+                    node.vname.path, "custom",
+                    "go-pkg node must use parent dir as vname.path"
+                );
+            } else {
+                assert_eq!(
+                    node.vname.path, "custom/path.go",
+                    "non-pkg node must use the file's vname_path"
+                );
+            }
         }
     }
 
@@ -723,5 +766,118 @@ mod tests {
         let orig_len = edges.len();
         edges.dedup();
         assert_eq!(edges.len(), orig_len, "duplicate edges found");
+    }
+
+    #[test]
+    fn go_pkg_node_emitted_for_package_clause() {
+        use travsr_core::EdgeKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.go");
+        std::fs::write(&path, b"package strategies\nfunc New() {}\n").unwrap();
+        let out = parse("", &path, "strategies/server.go").unwrap();
+
+        let pkg_node = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .expect("expected go-pkg node for package clause");
+        assert_eq!(
+            pkg_node.vname.signature, "go-pkg:strategies/strategies",
+            "go-pkg sig must encode parent_dir/pkg_name"
+        );
+        assert_eq!(
+            pkg_node.vname.path, "strategies",
+            "go-pkg vname.path must be parent dir, not file path"
+        );
+
+        let file_id = out.nodes.iter().find(|n| n.kind == "file").unwrap().id;
+        assert!(
+            out.edges.iter().any(|e| e.src == file_id
+                && e.dst == pkg_node.id
+                && e.kind == EdgeKind::DefinesBinding),
+            "expected file → go-pkg DefinesBinding edge"
+        );
+    }
+
+    #[test]
+    fn go_pkg_node_root_level_uses_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.go");
+        std::fs::write(&path, b"package main\nfunc main() {}\n").unwrap();
+        let out = parse("", &path, "main.go").unwrap();
+        let pkg_node = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .expect("expected go-pkg node for root-level file");
+        assert_eq!(
+            pkg_node.vname.signature, "go-pkg:./main",
+            "root-level file must use '.' as parent_dir in go-pkg sig"
+        );
+        assert_eq!(
+            pkg_node.vname.path, ".",
+            "root-level go-pkg vname.path must be '.'"
+        );
+    }
+
+    #[test]
+    fn go_pkg_node_is_exactly_one_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.go");
+        std::fs::write(&path, b"package strategies\nfunc A() {}\nfunc B() {}\n").unwrap();
+        let out = parse("", &path, "strategies/a.go").unwrap();
+        let pkg_count = out.nodes.iter().filter(|n| n.kind == "go-pkg").count();
+        assert_eq!(pkg_count, 1, "exactly one go-pkg node per file after dedup");
+    }
+
+    #[test]
+    fn co_package_files_share_same_pkg_node_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.go");
+        let path_b = dir.path().join("b.go");
+        std::fs::write(&path_a, b"package strategies\nfunc A() {}\n").unwrap();
+        std::fs::write(&path_b, b"package strategies\nfunc B() {}\n").unwrap();
+        let out_a = parse("", &path_a, "strategies/a.go").unwrap();
+        let out_b = parse("", &path_b, "strategies/b.go").unwrap();
+        let pkg_id_a = out_a
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        let pkg_id_b = out_b
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        assert_eq!(
+            pkg_id_a, pkg_id_b,
+            "files in the same package directory must produce identical go-pkg NodeIds"
+        );
+    }
+
+    #[test]
+    fn different_packages_same_dir_produce_distinct_pkg_node_ids() {
+        // External test packages (pkg_test convention) must get a distinct NodeId.
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.go");
+        let path_b = dir.path().join("a_test.go");
+        std::fs::write(&path_a, b"package mypkg\nfunc A() {}\n").unwrap();
+        std::fs::write(&path_b, b"package mypkg_test\nfunc TestA() {}\n").unwrap();
+        let out_a = parse("", &path_a, "mypkg/a.go").unwrap();
+        let out_b = parse("", &path_b, "mypkg/a_test.go").unwrap();
+        let pkg_id_a = out_a
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        let pkg_id_b = out_b
+            .nodes
+            .iter()
+            .find(|n| n.kind == "go-pkg")
+            .map(|n| n.id);
+        assert_ne!(
+            pkg_id_a, pkg_id_b,
+            "mypkg and mypkg_test must produce distinct go-pkg NodeIds"
+        );
     }
 }

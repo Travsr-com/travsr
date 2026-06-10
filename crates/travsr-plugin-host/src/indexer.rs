@@ -64,22 +64,12 @@ impl PluginIndexer {
         Ok(response_to_output(resp))
     }
 
-    /// Phase B: semantic indexing for all trusted, registered languages.
+    /// Phase B: semantic indexing for all registered languages.
     /// Called from `init_repo` once per full index — not per commit.
-    /// ADR-017 Rule 3: checks trust before any code-executing subprocess spawns.
     pub fn invoke_phase_b_all(
         &self,
         repo_root: &std::path::Path,
-        trust: &crate::trust::TrustConfig,
     ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
-        if !trust.is_trusted(&self.corpus) {
-            tracing::info!(
-                "Phase B skipped for corpus '{}' — add trust first",
-                self.corpus
-            );
-            return (vec![], vec![]);
-        }
-
         // Gate Phase B per language against lang.toml registration.
         // `travsr lang remove <lang>` writes registered=[] which must be respected here.
         let registered: std::collections::HashSet<String> =
@@ -109,7 +99,14 @@ impl PluginIndexer {
         let mut all_nodes = Vec::new();
         let mut all_edges = Vec::new();
 
-        for lang in resolver.providable_languages() {
+        let providable = resolver.providable_languages();
+        tracing::debug!(
+            "Phase B: resolver surfaced {} language(s): {:?}",
+            providable.len(),
+            providable
+        );
+
+        for lang in providable {
             // Builtins (ts, js, rust, python) ship inside the travsr binary and
             // are always ready — no user registration required. External plugins
             // (go, java, …) still need explicit lang.toml registration.
@@ -124,21 +121,39 @@ impl PluginIndexer {
             }
             let spec = match resolver.resolve(&lang) {
                 Some(s) => s,
-                None => continue,
+                None => {
+                    tracing::debug!(lang = %lang, "Phase B: resolver returned None for lang");
+                    continue;
+                }
             };
+
+            tracing::debug!(
+                lang = %lang,
+                program = %spec.program,
+                "Phase B: resolved spec, spawning sidecar"
+            );
 
             let req = travsr_plugin_protocol::InvokeRequest {
                 root: repo_root.to_path_buf(),
                 corpus: self.corpus.clone(),
+                scratch: std::path::PathBuf::default(), // overwritten in Sidecar::invoke_phase_b
             };
 
             match crate::transport::Sidecar::spawn(&spec, repo_root) {
                 Ok(sidecar) => match crate::transport::Transport::invoke_phase_b(&sidecar, req) {
                     Ok(resp) => {
+                        tracing::debug!(
+                            lang = %lang,
+                            nodes = resp.nodes.len(),
+                            edges = resp.edges.len(),
+                            "Phase B: invoke complete"
+                        );
                         all_nodes.extend(resp.nodes);
                         all_edges.extend(resp.edges);
                     }
-                    Err(travsr_error::IndexError::PhaseNotSupported) => {}
+                    Err(travsr_error::IndexError::PhaseNotSupported) => {
+                        tracing::debug!(lang = %lang, "Phase B: PhaseNotSupported (sidecar declined)");
+                    }
                     Err(e) => tracing::warn!("Phase B {lang}: {e}"),
                 },
                 Err(e) => tracing::warn!("Phase B sidecar spawn {lang}: {e}"),

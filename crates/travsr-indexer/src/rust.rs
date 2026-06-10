@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
+use streaming_iterator::StreamingIterator as _;
 use travsr_core::{Node, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
@@ -64,7 +65,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
-    let language = tree_sitter_rust::language();
+    let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
     let file_node = rust_file_node(corpus, vname_path);
     let file_id = file_node.id;
 
@@ -78,7 +79,6 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     parser
         .set_language(&language)
         .context("loading Rust grammar")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
@@ -101,101 +101,103 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .collect();
 
     let mut cursor = QueryCursor::new();
-    let captures = cursor.captures(&query, tree.root_node(), source.as_slice());
+    let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
-    for (m, cap_idx) in captures {
-        let capture = m.captures[cap_idx];
-        let Some(cap_name) = capture_names.get(capture.index as usize) else {
-            continue;
-        };
-        let text = match capture.node.utf8_text(source.as_slice()) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+    while let Some(m) = iter.next() {
+        for &capture in m.captures {
+            let Some(cap_name) = capture_names.get(capture.index as usize) else {
+                continue;
+            };
+            let text = match capture.node.utf8_text(source.as_slice()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
 
-        let line = capture.node.start_position().row as u32 + 1;
-        match cap_name.as_str() {
-            "fn.name" => {
-                // Functions inside impl blocks become methods; the parent impl
-                // type is the namespace so signatures are `fn:TypeName.method`.
-                let parent_impl = find_parent_impl_type(capture.node, source.as_slice());
-                let (node, src_id) = if let Some(impl_type) = parent_impl {
-                    let impl_id = rust_impl_node(corpus, vname_path, &impl_type).id;
-                    let n = rust_method_node(corpus, vname_path, &impl_type, text).with_line(line);
-                    (n, impl_id)
-                } else {
-                    let n = rust_fn_node(corpus, vname_path, text).with_line(line);
-                    (n, file_id)
-                };
-                output.edges.push(emit::defines_edge(src_id, node.id));
-                output.nodes.push(node);
-            }
-            "struct.name" => {
-                let node = rust_struct_node(corpus, vname_path, text).with_line(line);
-                output.edges.push(emit::defines_edge(file_id, node.id));
-                output.nodes.push(node);
-            }
-            "enum.name" => {
-                let node = rust_enum_node(corpus, vname_path, text).with_line(line);
-                output.edges.push(emit::defines_edge(file_id, node.id));
-                output.nodes.push(node);
-            }
-            "trait.name" => {
-                let node = rust_trait_node(corpus, vname_path, text).with_line(line);
-                output.edges.push(emit::defines_edge(file_id, node.id));
-                output.nodes.push(node);
-            }
-            "impl.name" => {
-                let node = rust_impl_node(corpus, vname_path, text).with_line(line);
-                output.edges.push(emit::defines_edge(file_id, node.id));
-                output.nodes.push(node);
-            }
-            "mod.name" => {
-                // Distinguish `mod foo;` (file declaration, no body) from
-                // `mod foo { … }` (inline module, has body) at the AST level.
-                // capture.node is the `identifier` from `(mod_item name: (identifier))`,
-                // so its parent is always the enclosing `mod_item` node.
-                let has_body = capture
-                    .node
-                    .parent()
-                    .and_then(|p| p.child_by_field_name("body"))
-                    .is_some();
-                let node = if has_body {
-                    // Inline module — structural container.
-                    rust_mod_node(corpus, vname_path, text).with_line(line)
-                } else {
-                    // File-system module declaration.
-                    // link_imports_rust() resolves this to foo.rs / foo/mod.rs.
-                    rust_filemod_node(corpus, vname_path, text).with_line(line)
-                };
-                output.edges.push(emit::defines_edge(file_id, node.id));
-                output.nodes.push(node);
-            }
-            "const.name" => {
-                let node = rust_const_node(corpus, vname_path, text).with_line(line);
-                output.edges.push(emit::defines_edge(file_id, node.id));
-                output.nodes.push(node);
-            }
-            "static.name" => {
-                let node = rust_static_node(corpus, vname_path, text).with_line(line);
-                output.edges.push(emit::defines_edge(file_id, node.id));
-                output.nodes.push(node);
-            }
-            "use.decl" => {
-                // Walk the full use-tree to extract every leaf path, including
-                // grouped imports (`use std::{fmt, io}`) and renames.
-                if let Some(arg) = capture.node.child_by_field_name("argument") {
-                    let mut paths = Vec::new();
-                    extract_use_paths(arg, "", source.as_slice(), &mut paths);
-                    for path in paths {
-                        let node = rust_use_node(corpus, vname_path, &path);
-                        output.edges.push(emit::depends_edge(file_id, node.id));
-                        output.nodes.push(node);
+            let line = capture.node.start_position().row as u32 + 1;
+            match cap_name.as_str() {
+                "fn.name" => {
+                    // Functions inside impl blocks become methods; the parent impl
+                    // type is the namespace so signatures are `fn:TypeName.method`.
+                    let parent_impl = find_parent_impl_type(capture.node, source.as_slice());
+                    let (node, src_id) = if let Some(impl_type) = parent_impl {
+                        let impl_id = rust_impl_node(corpus, vname_path, &impl_type).id;
+                        let n =
+                            rust_method_node(corpus, vname_path, &impl_type, text).with_line(line);
+                        (n, impl_id)
+                    } else {
+                        let n = rust_fn_node(corpus, vname_path, text).with_line(line);
+                        (n, file_id)
+                    };
+                    output.edges.push(emit::defines_edge(src_id, node.id));
+                    output.nodes.push(node);
+                }
+                "struct.name" => {
+                    let node = rust_struct_node(corpus, vname_path, text).with_line(line);
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "enum.name" => {
+                    let node = rust_enum_node(corpus, vname_path, text).with_line(line);
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "trait.name" => {
+                    let node = rust_trait_node(corpus, vname_path, text).with_line(line);
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "impl.name" => {
+                    let node = rust_impl_node(corpus, vname_path, text).with_line(line);
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "mod.name" => {
+                    // Distinguish `mod foo;` (file declaration, no body) from
+                    // `mod foo { … }` (inline module, has body) at the AST level.
+                    // capture.node is the `identifier` from `(mod_item name: (identifier))`,
+                    // so its parent is always the enclosing `mod_item` node.
+                    let has_body = capture
+                        .node
+                        .parent()
+                        .and_then(|p| p.child_by_field_name("body"))
+                        .is_some();
+                    let node = if has_body {
+                        // Inline module — structural container.
+                        rust_mod_node(corpus, vname_path, text).with_line(line)
+                    } else {
+                        // File-system module declaration.
+                        // link_imports_rust() resolves this to foo.rs / foo/mod.rs.
+                        rust_filemod_node(corpus, vname_path, text).with_line(line)
+                    };
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "const.name" => {
+                    let node = rust_const_node(corpus, vname_path, text).with_line(line);
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "static.name" => {
+                    let node = rust_static_node(corpus, vname_path, text).with_line(line);
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "use.decl" => {
+                    // Walk the full use-tree to extract every leaf path, including
+                    // grouped imports (`use std::{fmt, io}`) and renames.
+                    if let Some(arg) = capture.node.child_by_field_name("argument") {
+                        let mut paths = Vec::new();
+                        extract_use_paths(arg, "", source.as_slice(), &mut paths);
+                        for path in paths {
+                            let node = rust_use_node(corpus, vname_path, &path);
+                            output.edges.push(emit::depends_edge(file_id, node.id));
+                            output.nodes.push(node);
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
+        } // for &capture in m.captures
     }
 
     // Dedup: a type with both `impl T` and `impl Trait for T` emits the same
@@ -233,7 +235,7 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
                     "generic_type" => {
                         // e.g. `impl<T> Container<T>` — base name is first type_identifier child
                         (0..type_node.child_count())
-                            .filter_map(|i| type_node.child(i))
+                            .filter_map(|i| type_node.child(i as u32))
                             .find(|c| c.kind() == "type_identifier")
                             .and_then(|c| c.utf8_text(source).ok().map(str::to_string))
                     }
@@ -303,7 +305,9 @@ fn extract_use_paths(
         }
         "use_list" => {
             for i in 0..node.child_count() {
-                let Some(child) = node.child(i) else { continue };
+                let Some(child) = node.child(i as u32) else {
+                    continue;
+                };
                 match child.kind() {
                     "{" | "}" | "," => {}
                     _ => extract_use_paths(child, prefix, source, out),

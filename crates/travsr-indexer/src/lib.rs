@@ -12,6 +12,9 @@ mod ffi_resolver;
 mod go;
 mod hash;
 pub mod lsif;
+pub mod phase_b_python;
+pub mod phase_b_rust;
+pub mod phase_b_typescript;
 mod python;
 pub mod python_lsif;
 pub mod ra_runner;
@@ -62,6 +65,33 @@ pub fn go_parse(
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
     go::parse(corpus, path, vname_path)
+}
+
+/// Native Phase B for Rust: Cargo.toml dep graph + tree-sitter call edges.
+/// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+pub fn phase_b_native_rust(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_rust::extract_native_phase_b(corpus, root)
+}
+
+/// Native Phase B for TypeScript: tree-sitter call + inheritance edges.
+/// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+pub fn phase_b_native_typescript(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_typescript::extract_native_phase_b(corpus, root)
+}
+
+/// Native Phase B for Python: tree-sitter call + inheritance edges.
+/// Zero external-tool downloads. SCIP enrichment is merged by the caller.
+pub fn phase_b_native_python(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_python::extract_native_phase_b(corpus, root)
 }
 
 /// Resolve relative imports in `nodes` to `resolves-to` edges.
@@ -451,6 +481,68 @@ pub fn link_imports_go(
     }
 
     edges
+}
+
+/// Emit intra-package co-file `Depends` edges for Go.
+///
+/// In Go, files within the same package share the namespace without import
+/// statements. Each file parsed by `go::parse` emits a `go-pkg` node whose
+/// VName path is the parent directory — so every file in `strategies/` produces
+/// the same `go-pkg` NodeId regardless of which file is being parsed.
+///
+/// This function groups `file` nodes that share a `go-pkg` node (via
+/// `DefinesBinding` edges) and emits `file_B --Depends--> file_A` for every
+/// ordered pair (B ≠ A). Blast-radius Phase 1 follows these `Depends` edges
+/// during reverse BFS, so all co-package siblings appear in the affected set.
+///
+/// Call this once, after ALL Go files in the repo have been parsed, so that
+/// the complete package group is visible.
+///
+/// # DEBT-024
+/// Incremental reindex (`reindex_files`) does not call this function — the same
+/// limitation as FFI resolution. A full `travsr init` is required after adding
+/// or removing a `.go` file from a package to refresh co-package edges.
+///
+/// # Complexity
+/// O(N + E) where N = nodes, E = edges in the slice.
+pub fn link_go_copackage_edges(nodes: &[Node], edges: &[Edge]) -> Vec<Edge> {
+    use std::collections::HashMap;
+
+    // Index node kind by NodeId — O(N).
+    let kind_of: HashMap<travsr_core::NodeId, &str> =
+        nodes.iter().map(|n| (n.id, n.kind.as_str())).collect();
+
+    // Build pkg_node_id → Vec<file_node_id> from DefinesBinding edges — O(E).
+    let mut pkg_to_files: HashMap<travsr_core::NodeId, Vec<travsr_core::NodeId>> = HashMap::new();
+    for edge in edges {
+        if edge.kind != EdgeKind::DefinesBinding {
+            continue;
+        }
+        if kind_of.get(&edge.src).copied() != Some("file") {
+            continue;
+        }
+        if kind_of.get(&edge.dst).copied() != Some("go-pkg") {
+            continue;
+        }
+        pkg_to_files.entry(edge.dst).or_default().push(edge.src);
+    }
+
+    // Emit all ordered pairs for groups with ≥2 files — O(F²) where F = files per pkg.
+    // F is typically small (< 30 for realistic packages), so the quadratic factor is fine.
+    let mut result: Vec<Edge> = Vec::new();
+    for file_ids in pkg_to_files.values() {
+        if file_ids.len() < 2 {
+            continue;
+        }
+        for &b in file_ids {
+            for &a in file_ids {
+                if a != b {
+                    result.push(Edge::new(b, a, EdgeKind::Depends));
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Normalize a logical path by resolving `.` and `..` components without

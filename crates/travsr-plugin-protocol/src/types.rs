@@ -34,6 +34,13 @@ pub struct InvokeRequest {
     /// with plugin binaries that predate this field.
     #[serde(default)]
     pub corpus: String,
+    /// Sandbox-authorized writable scratch directory. Sidecar tools that need to
+    /// write temp files (e.g. scip-clang SCIP output, scip-ruby index) MUST place
+    /// them under this path — the sandbox's write grant covers only this directory.
+    /// Defaults to empty (older daemons) in which case the sidecar may fall back to
+    /// `std::env::temp_dir()`, accepting that the sandbox may deny the write.
+    #[serde(default)]
+    pub scratch: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use std::path::PathBuf;
 use travsr_plugin_host::phase_b::catalog::{
-    lookup, SandboxRequirement, ScipBinarySpec, ScipInstall, CATALOG,
+    lookup, SandboxRequirement, ScipBinarySpec, ScipInstall, ZipBinarySpec, CATALOG,
 };
 use travsr_plugin_host::sandbox::policy::validate_permitted_host;
 
@@ -143,6 +143,7 @@ fn cmd_list(json: bool) -> Result<()> {
         for entry in CATALOG {
             let sandbox = match entry.sandbox {
                 SandboxRequirement::Standard => "Standard",
+                SandboxRequirement::NativeIpc => "NativeIpc",
                 SandboxRequirement::RequiresElevated => "Elevated",
             };
             let registered = config
@@ -156,10 +157,12 @@ fn cmd_list(json: bool) -> Result<()> {
             let provider_on_path = entry.provider_binary.map_or(true, tool_available);
             let tool_on_path = tool_available(entry.command);
             let installed = entry.builtin || (provider_on_path && tool_on_path);
-            let needs_approval = entry.sandbox == SandboxRequirement::RequiresElevated && !approved;
+            let needs_approval =
+                matches!(entry.sandbox, SandboxRequirement::RequiresElevated) && !approved;
             let package = entry.npm_package.unwrap_or(entry.command);
             let scip_type = match entry.scip_install {
                 ScipInstall::GithubBinary(_) => "GithubBinary",
+                ScipInstall::ZipBinary(_) => "ZipBinary",
                 ScipInstall::Command(_) => "Command",
                 ScipInstall::Manual => "Manual",
             };
@@ -191,6 +194,7 @@ fn cmd_list(json: bool) -> Result<()> {
     for entry in CATALOG {
         let sandbox_label = match entry.sandbox {
             SandboxRequirement::Standard => "Standard",
+            SandboxRequirement::NativeIpc => "NativeIpc",
             SandboxRequirement::RequiresElevated => "Elevated",
         };
 
@@ -243,7 +247,20 @@ fn cmd_list(json: bool) -> Result<()> {
             let hint = "sandbox not available on this platform";
             format!("disabled (sandbox unavailable — {hint})")
         } else if registered && fully_ready {
-            format!("\u{2713} active{}", expiry_warning.as_deref().unwrap_or(""))
+            let phase_b_note = if entry.builtin
+                && !entry.native_phase_b
+                && !tool_on_path
+                && !entry.install_hint.is_empty()
+            {
+                format!(" (Phase A only — Phase B needs: {})", entry.install_hint)
+            } else {
+                String::new()
+            };
+            format!(
+                "\u{2713} active{}{}",
+                phase_b_note,
+                expiry_warning.as_deref().unwrap_or("")
+            )
         } else if registered && !fully_ready {
             let missing = if !provider_on_path {
                 entry.provider_binary.unwrap_or(entry.command)
@@ -351,6 +368,17 @@ fn cmd_install(
                 .context("downloading wrapper binary")?;
 
                 println!("\u{2713} {bin} installed to {}", path.display());
+
+                if entry.has_share_assets {
+                    let sv = version.clone();
+                    let sb = bin.to_string();
+                    match run_async(
+                        async move { crate::install::install_share_assets(&sv, &sb).await },
+                    ) {
+                        Ok(()) => println!("\u{2713} {bin} emitter files installed"),
+                        Err(e) => println!("warning: could not install {bin} share assets: {e:#}"),
+                    }
+                }
 
                 if !crate::install::path_contains_travsr_bin() {
                     println!(
@@ -475,6 +503,10 @@ fn install_scip_tool(
             install_scip_github_binary(entry, spec)?;
             return Ok(tool_available(entry.command));
         }
+        ScipInstall::ZipBinary(ref spec) => {
+            install_zip_binary(entry, spec)?;
+            return Ok(tool_available(entry.command));
+        }
         ScipInstall::Manual => {
             if !entry.underlying_tool_hint.is_empty() {
                 println!(
@@ -577,6 +609,78 @@ fn install_scip_github_binary(
                 entry.command, entry.underlying_tool_hint
             );
         }
+    }
+
+    Ok(())
+}
+
+/// Download a GitHub zip release, extract it, and create a wrapper script in
+/// `~/.travsr/bin/<spec.install_name>` pointing at the binary inside the archive.
+fn install_zip_binary(
+    entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
+    spec: &ZipBinarySpec,
+) -> Result<()> {
+    let repo = spec.repo.to_string();
+    let tag = match run_async(
+        async move { crate::install::fetch_latest_version_for_repo(&repo).await },
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "warning: could not fetch latest {} version ({e:#}), using {}",
+                spec.install_name, spec.version_fallback
+            );
+            spec.version_fallback.to_string()
+        }
+    };
+
+    let asset_name = (spec.asset_fn)(&tag);
+    println!("Downloading {} {} ...", spec.install_name, tag);
+
+    let repo2 = spec.repo.to_string();
+    let tag2 = tag.clone();
+    let asset2 = asset_name.clone();
+    let extract_dir = spec.extract_dir.to_string();
+
+    let extract_path = match run_async(async move {
+        crate::install::download_zip_and_extract(&repo2, &tag2, &asset2, &extract_dir).await
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            println!(
+                "Download failed: {e:#}\nInstall '{}' manually:\n\t{}",
+                entry.command, entry.underlying_tool_hint
+            );
+            return Ok(());
+        }
+    };
+
+    // Write wrapper script: #!/bin/sh\nexec <binary_abs> "$@"\n
+    let bin_dir = crate::install::travsr_bin_dir()?;
+    let wrapper = bin_dir.join(spec.install_name);
+    let binary_abs = extract_path.join(spec.binary_subpath);
+    let script = format!("#!/bin/sh\nexec {} \"$@\"\n", binary_abs.display());
+    std::fs::write(&wrapper, &script)
+        .with_context(|| format!("writing wrapper to {}", wrapper.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .context("chmod +x wrapper")?;
+    }
+
+    println!(
+        "\u{2713} {} installed to {}",
+        spec.install_name,
+        wrapper.display()
+    );
+    if !crate::install::path_contains_travsr_bin() {
+        println!(
+            "\nhint: add ~/.travsr/bin to your PATH:\n\n\
+             \texport PATH=\"$HOME/.travsr/bin:$PATH\"\n\n\
+             Add this to your ~/.zshrc or ~/.bashrc to make it permanent.\n"
+        );
     }
 
     Ok(())
@@ -1150,6 +1254,10 @@ fn tool_available(name: &str) -> bool {
         }
         // ~/.travsr/bin — travsr's own managed directory for downloaded scip-* binaries.
         if home.join(".travsr").join("bin").join(name).is_file() {
+            return true;
+        }
+        // ~/.dotnet/tools — dotnet global tool install location (`dotnet tool install --global`).
+        if home.join(".dotnet").join("tools").join(name).is_file() {
             return true;
         }
     }

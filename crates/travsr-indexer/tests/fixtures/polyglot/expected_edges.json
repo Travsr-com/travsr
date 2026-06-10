@@ -4,6 +4,8 @@
     {
       "pair": "ts-rust",
       "fixture_root": "ts-rust/",
+      "xfail": true,
+      "xfail_reason": "wasm-bindgen FFI resolver not yet implemented — tracked in #306",
       "edges": [
         {
           "src": {"language": "typescript", "path_contains": "addon.d.ts", "signature": "fn:add"},
@@ -22,6 +24,8 @@
     {
       "pair": "py-rust",
       "fixture_root": "py-rust/",
+      "xfail": true,
+      "xfail_reason": "PyO3 FFI resolver not yet implemented — tracked in #306",
       "edges": [
         {
           "src": {"language": "python", "path_contains": "_native.pyi", "signature": "fn:multiply"},

@@ -1,15 +1,14 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use travsr_core::{Language, Node, VName};
+use travsr_core::{Edge, EdgeKind, Language, Node, VName};
 use travsr_plugin_protocol::{
     FfiMarker as WireFfi, FfiMarkerKind as WireKind, InvokeRequest, InvokeResponse, ParseRequest,
     ParseResponse, Plugin,
 };
 use tree_sitter::{Parser, Query, QueryCursor};
 
-const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
-const PARSE_TIMEOUT_MICROS: u64 = 5_000_000; // 5 seconds
+const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 const JAVA_QUERIES: &str = r#"
 (class_declaration name: (identifier) @class.name)
@@ -57,11 +56,10 @@ fn parse_java_file(
     let source = std::fs::read(abs_path)?;
 
     let mut parser = Parser::new();
-    let lang_obj = tree_sitter_java::language();
+    let lang_obj = tree_sitter::Language::new(tree_sitter_java::LANGUAGE);
     parser
         .set_language(&lang_obj)
         .context("loading Java grammar")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     let tree = parser.parse(&source, None).context("parse timeout")?;
     let query = Query::new(&lang_obj, JAVA_QUERIES).context("building Java query")?;
@@ -73,7 +71,8 @@ fn parse_java_file(
     let mut ffi_markers: Vec<WireFfi> = vec![];
     let names = query.capture_names();
 
-    for m in cursor.matches(&query, tree.root_node(), source.as_slice()) {
+    let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
+    while let Some(m) = streaming_iterator::StreamingIterator::next(&mut iter) {
         for cap in m.captures {
             let cap_name = &names[cap.index as usize];
             let text = cap.node.utf8_text(&source).unwrap_or("").to_string();
@@ -137,9 +136,22 @@ fn parse_java_file(
         }
     }
 
+    let file_id = nodes[0].id;
+    let edges: Vec<Edge> = nodes[1..]
+        .iter()
+        .map(|n| {
+            let kind = if n.kind == "import" {
+                EdgeKind::Depends
+            } else {
+                EdgeKind::DefinesBinding
+            };
+            Edge::new(file_id, n.id, kind)
+        })
+        .collect();
+
     Ok(ParseResponse {
         nodes,
-        edges: vec![],
+        edges,
         ffi_markers,
     })
 }

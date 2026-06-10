@@ -58,6 +58,7 @@ pub fn build_sandboxed_command(
     repo_root: &Path,
     scratch_dir: &Path,
     policy: &SandboxPolicy,
+    language: &str,
 ) -> Result<SandboxedSpawn, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
@@ -76,10 +77,17 @@ pub fn build_sandboxed_command(
     let repo = repo_root.to_string_lossy();
     let scratch = scratch_dir.to_string_lossy();
 
+    // Per-language toolchain grants (e.g. go module/build caches + GO*/HOME env).
+    // Empty for languages with no out-of-repo needs.
+    let tc = crate::sandbox::toolchain::toolchain_access(language);
+
     let mut cmd = Command::new("bwrap");
 
     match policy {
-        SandboxPolicy::Standard => {
+        // NativeIpc: tool needs POSIX IPC (shm_open/mq_open) but must NOT have
+        // network access — enforce --unshare-net exactly like Standard. The IPC
+        // namespace isolation (--unshare-ipc) is omitted below, after this match.
+        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => {
             // --unshare-net is probed at first use: on hosts where loopback setup
             // inside the new network namespace is blocked (e.g. GitHub Actions,
             // some container runtimes) bwrap exits non-zero with
@@ -112,7 +120,14 @@ pub fn build_sandboxed_command(
             );
         }
     }
-    cmd.args(["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+    // NativeIpc policy: tool uses POSIX IPC queues/shm (e.g. scip-clang parallel
+    // workers). Skip --unshare-ipc so mq_open/shm_open work inside the namespace.
+    let ipc_unshare: &[&str] = if matches!(policy, SandboxPolicy::NativeIpc) {
+        &["--unshare-pid", "--unshare-uts"]
+    } else {
+        &["--unshare-pid", "--unshare-uts", "--unshare-ipc"]
+    };
+    cmd.args(ipc_unshare);
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
         cmd.args(["--ro-bind-try", path, path]);
     }
@@ -133,6 +148,22 @@ pub fn build_sandboxed_command(
     // tmpfs automatically. A plain --tmpfs would be root-owned and unwritable.
     cmd.args(["--bind", scratch.as_ref(), "/travsr-scratch"]); // writable scratch
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
+                                                           // Per-language toolchain caches: read-only module/toolchain dirs, writable
+                                                           // build cache. Bound at their host paths so the GO*/HOME env (set below) resolve.
+    for path in &tc.read_paths {
+        let p = path.to_string_lossy();
+        cmd.args(["--ro-bind-try", p.as_ref(), p.as_ref()]);
+    }
+    for path in &tc.write_paths {
+        let p = path.to_string_lossy();
+        cmd.args(["--bind-try", p.as_ref(), p.as_ref()]);
+    }
+    // Bind ~/.travsr/bin so tools installed by `travsr lang install` (e.g. scip-java,
+    // scip-go) are accessible inside the bwrap namespace.
+    if let Ok(home) = std::env::var("HOME") {
+        let travsr_bin = format!("{home}/.travsr/bin");
+        cmd.args(["--ro-bind-try", &travsr_bin, &travsr_bin]);
+    }
     cmd.args(["--die-with-parent", "--"]);
     // Resource caps (ADR-017 Rule 1): 4 GiB virtual memory + 300s CPU via ulimit.
     let quoted_args = args
@@ -153,6 +184,18 @@ pub fn build_sandboxed_command(
         }
     }
     cmd.env("TMPDIR", "/travsr-scratch");
+    // Per-language toolchain env (e.g. GOPATH/GOCACHE/GOMODCACHE/HOME) so the
+    // analyzer's build tool locates its caches inside the cleared sandbox env.
+    for (key, val) in &tc.env {
+        cmd.env(key, val);
+    }
+    // Prepend ~/.travsr/bin so tools installed by `travsr lang install` (e.g. scip-java,
+    // scip-go) are on PATH inside the sandbox.
+    if let Ok(home) = std::env::var("HOME") {
+        let travsr_bin = format!("{home}/.travsr/bin");
+        let base = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{travsr_bin}:{base}"));
+    }
     Ok(SandboxedSpawn::Wrapped(cmd))
 }
 
@@ -219,6 +262,7 @@ pub fn build_sandboxed_command(
     _r: &Path,
     _s: &Path,
     _policy: &SandboxPolicy,
+    _lang: &str,
 ) -> Result<SandboxedSpawn, SandboxUnavailable> {
     Err(SandboxUnavailable(
         "Linux sandbox not available on this platform".into(),

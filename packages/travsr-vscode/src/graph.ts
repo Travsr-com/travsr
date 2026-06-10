@@ -624,7 +624,7 @@ const cy = cytoscape({
     { selector: 'edge.dimmed',   style: { 'opacity': 0.08 } },
     { selector: 'edge:selected', style: { 'opacity': 1, 'width': 2.5 } },
   ],
-  layout: { name:'dagre', rankDir:'TB', nodeSep:60, rankSep:80, padding:30 },
+  layout: { name:'dagre', rankDir:'LR', nodeSep:55, rankSep:80, padding:30 },
   wheelSensitivity: 0.3, minZoom: 0.2, maxZoom: 4,
 });
 
@@ -637,9 +637,12 @@ window.addEventListener('message', event => {
   const nodes = (data.nodes || []).map(n => ({
     data: { id: n.id, label: n.label, kind: n.kind, path: n.path, pkg: n.package, score: n.score, root: n.root || false, line: n.line }
   }));
-  const edges = (data.edges || []).map(e => ({
-    data: { id: e.source + '->' + e.target, source: e.source, target: e.target, kind: e.kind }
-  }));
+  const nodeIds = new Set(nodes.map(n => n.data.id));
+  const edges = (data.edges || [])
+    .filter(e => nodeIds.has(e.source) && nodeIds.has(e.target))
+    .map(e => ({
+      data: { id: e.source + '->' + e.target, source: e.source, target: e.target, kind: e.kind }
+    }));
 
   // Reset var visibility state before loading new data
   varsVisible = false;
@@ -967,6 +970,7 @@ function resetLayout() {
     ? { name:'circle', padding:40 }
     : { name:'cose', animate:!window.matchMedia('(prefers-reduced-motion: reduce)').matches, randomize:false, padding:40, nodeRepulsion:8000 };
   cy.layout(opts).run();
+  setTimeout(() => cy.fit(undefined, 30), 50);
 }
 
 // ── Minimap ───────────────────────────────────────────────────────────────────

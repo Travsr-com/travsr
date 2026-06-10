@@ -24,6 +24,8 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("scala", "fuzz_scala_parser.rs"), // TODO: create this fuzz target
     ("cpp", "fuzz_cpp_parser.rs"),   // TODO: create this fuzz target
     ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
+    ("swift", "fuzz_swift_parser.rs"),
+    ("dart", "fuzz_dart_parser.rs"),
 ];
 
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process
@@ -47,45 +49,52 @@ fn check_fuzz_target(language: &str) {
     }
 }
 
+/// Cached probe: log sandbox availability once per process lifetime.
+/// `register_builtins` is called once per `PluginIndexer` creation; guard here
+/// so the log line never repeats even when the indexer is recreated per-file.
+static SANDBOX_PROBED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// Probe OS sandbox availability and log the result at startup.
 /// ADR-017 Rule 2: if the sandbox is unavailable, Sidecar Phase B is disabled.
 /// Phase A (in-process) is always unaffected.
 pub fn probe_sandbox() {
-    #[cfg(target_os = "linux")]
-    {
-        let available = std::process::Command::new("bwrap")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok();
-        if available {
-            tracing::info!("sandbox: bubblewrap available — Phase B sidecar spawn enabled");
-        } else {
-            tracing::warn!(
-                "sandbox: bubblewrap (bwrap) not found on PATH — \
-                 Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
-                 Install with: sudo apt-get install bubblewrap"
-            );
+    SANDBOX_PROBED.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            let available = std::process::Command::new("bwrap")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok();
+            if available {
+                tracing::info!("sandbox: bubblewrap available — Phase B sidecar spawn enabled");
+            } else {
+                tracing::warn!(
+                    "sandbox: bubblewrap (bwrap) not found on PATH — \
+                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
+                     Install with: sudo apt-get install bubblewrap"
+                );
+            }
         }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let available = std::path::Path::new("/usr/bin/sandbox-exec").exists();
-        if available {
-            tracing::info!("sandbox: sandbox-exec available — Phase B sidecar spawn enabled");
-        } else {
-            tracing::warn!(
-                "sandbox: sandbox-exec not found — \
-                 Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
-            );
+        #[cfg(target_os = "macos")]
+        {
+            let available = std::path::Path::new("/usr/bin/sandbox-exec").exists();
+            if available {
+                tracing::info!("sandbox: sandbox-exec available — Phase B sidecar spawn enabled");
+            } else {
+                tracing::warn!(
+                    "sandbox: sandbox-exec not found — \
+                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+                );
+            }
         }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    tracing::warn!(
-        "sandbox: no sandbox implementation for this platform — \
-         Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
-    );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        tracing::warn!(
+            "sandbox: no sandbox implementation for this platform — \
+             Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+        );
+    });
 }
 
 /// Register all first-party in-process plugins into `dispatcher`.
@@ -132,52 +141,64 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         dispatcher,
         &version,
         &crate::plugins::kotlin::CONFIG,
-        tree_sitter_kotlin::language(),
+        tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
     );
     check_fuzz_target("ruby");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::ruby::CONFIG,
-        tree_sitter_ruby::language(),
+        tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
     );
     check_fuzz_target("csharp");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::csharp::CONFIG,
-        tree_sitter_c_sharp::language(),
+        tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
     );
     check_fuzz_target("php");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::php::CONFIG,
-        tree_sitter_php::language_php(),
+        tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
     );
     check_fuzz_target("scala");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::scala::CONFIG,
-        tree_sitter_scala::language(),
+        tree_sitter::Language::new(tree_sitter_scala::LANGUAGE),
     );
     check_fuzz_target("cpp");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::cpp::CONFIG,
-        tree_sitter_cpp::language(),
+        tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
     );
     check_fuzz_target("c");
     register_generic(
         dispatcher,
         &version,
         &crate::plugins::c::CONFIG,
-        tree_sitter_c::language(),
+        tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
     );
-    // Swift: blocked — all available tree-sitter-swift crates require tree-sitter ^0.21
-    // which conflicts with workspace tree-sitter = "0.22". Re-enable when a compatible crate ships.
+    check_fuzz_target("swift");
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::swift::CONFIG,
+        tree_sitter::Language::new(tree_sitter_swift::LANGUAGE),
+    );
+    check_fuzz_target("dart");
+    register_generic(
+        dispatcher,
+        &version,
+        &crate::plugins::dart::CONFIG,
+        tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
+    );
 }
 
 fn register_generic(
