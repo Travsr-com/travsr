@@ -17,11 +17,11 @@ use travsr_core::{
     canonical_corpus, canonical_corpus_local, EdgeKind, Language, NodeId, SIGNATURE_FORMAT_VERSION,
 };
 use travsr_indexer::{
-    hash_file, ingest_lsif, link_imports, link_imports_python_fs, link_imports_rust,
-    run_lsif_emitter, FfiMarker,
+    hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
+    link_imports_rust, run_lsif_emitter, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
-use travsr_store::{SqliteStore, Store};
+use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
 pub use hook::{changed_files_from_git, install_hook, try_dispatch_to_daemon};
 
@@ -29,6 +29,12 @@ pub use hook::{changed_files_from_git, install_hook, try_dispatch_to_daemon};
 #[derive(Debug, Default)]
 pub struct InitStats {
     pub files_indexed: u64,
+    /// Files skipped because their SHA-256 hash matched the stored value.
+    pub files_skipped_unchanged: u64,
+    /// Files skipped because they matched a `.travsrignore` / built-in rule.
+    pub files_skipped_ignored: u64,
+    /// Whether `.travsrignore` was freshly created on this run (first `travsr init`).
+    pub travsrignore_scaffolded: bool,
     /// Net change in node count. `i64` to allow negative values if nodes are
     /// removed in the future (e.g. delete-by-file support); currently always >= 0.
     pub nodes_written: i64,
@@ -37,6 +43,20 @@ pub struct InitStats {
     pub total_nodes: u64,
     /// Absolute edge count after init (for "up to date" display on re-runs).
     pub total_edges: u64,
+    /// Per-language Phase B outcome, populated by the full init path.
+    pub phase_b_report: Option<PhaseBReport>,
+}
+
+/// Per-language Phase B outcome, surfaced in [`InitStats`] so the CLI can
+/// tell the user which analyzers ran and which were absent.
+#[derive(Debug, Default, Clone)]
+pub struct PhaseBReport {
+    /// Languages for which Phase B ran successfully.
+    pub ran: Vec<String>,
+    /// Languages for which the analyzer binary was not found.
+    pub skipped_absent: Vec<String>,
+    /// Languages registered in the resolver but not in lang.toml.
+    pub skipped_unregistered: Vec<String>,
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -47,8 +67,13 @@ pub enum InitProgress {
     /// Walking the work tree to discover indexable files. `scanned` is the
     /// number of directory entries seen so far (the total is not yet known).
     Scanning { scanned: u64 },
-    /// Indexing discovered files: `done` of `total` source files processed.
-    Indexing { done: u64, total: u64 },
+    /// Phase A: parallel parse + batch write. `done`/`total` are files processed.
+    /// `workers` is the thread count used.
+    Indexing {
+        done: u64,
+        total: u64,
+        workers: usize,
+    },
     /// Post-index semantic passes (LSIF + Phase B); no granular count.
     Finalizing,
 }
@@ -59,15 +84,336 @@ pub enum InitProgress {
 /// 3. Walk all `.ts`/`.tsx`/`.rs` files (honours `.gitignore`, skips `target/`)
 ///    and index them via the delta path so the `files` hash table is populated
 ///    from the start.
+/// Outcome from one worker's parse of a single file.
+struct ParseResult {
+    file_graph: FileGraph,
+    ffi_markers: Vec<FfiMarker>,
+    /// `true` when the file was skipped (unchanged hash) — graph is empty.
+    unchanged: bool,
+}
+
+/// Parallel Phase-A parse → batched write pipeline for `init_repo`.
+///
+/// # Data flow
+/// ```text
+/// preloaded hash map ─┐
+///                     ├──► N worker threads (parse + link_imports, no store access)
+///                     │       │  bounded mpsc channel
+///                     │       ▼
+///                     └── single writer thread (owns &mut SqliteStore)
+///                              batches BATCH_SIZE results → write_file_graphs_batch
+/// ```
+///
+/// `reindex_files` (commit hook) is NOT changed — this path is init-only.
+/// That structurally preserves the full-reindex == incremental invariant.
+/// Returns `(write_counts, files_skipped_unchanged)`.
+fn index_paths_parallel(
+    paths: &[PathBuf],
+    repo_root: &Path,
+    corpus: &str,
+    jobs: usize,
+    bulk: bool,
+    store: &mut SqliteStore,
+    on_progress: &mut dyn FnMut(InitProgress),
+) -> anyhow::Result<(BatchWriteCounts, u64)> {
+    use std::sync::mpsc;
+
+    // 512 files per batch: fewer transactions than 64, WAL still stays bounded.
+    // Bulk init skips per-node FTS5 writes so memory per batch stays modest.
+    const BATCH_SIZE: usize = 512;
+
+    let total = paths.len() as u64;
+    if total == 0 {
+        return Ok((BatchWriteCounts::default(), 0));
+    }
+
+    // Pre-load all stored hashes once — workers compare in-memory.
+    let stored_hashes = store.get_all_file_hashes().unwrap_or_default();
+
+    // Divide `paths` into `jobs` slices (last shard may be smaller).
+    let shard_size = (paths.len() + jobs - 1) / jobs;
+
+    let (tx, rx) = mpsc::sync_channel::<anyhow::Result<ParseResult>>(jobs * 4);
+
+    // ── spawn worker threads ──────────────────────────────────────────────────
+    // Each thread owns a PluginIndexer (cheap to construct, not Send).
+    std::thread::scope(|scope| -> anyhow::Result<(BatchWriteCounts, u64)> {
+        for shard in paths.chunks(shard_size) {
+            let tx = tx.clone();
+            let stored = &stored_hashes;
+            let corpus = corpus.to_owned();
+            let repo = repo_root.to_path_buf();
+
+            scope.spawn(move || {
+                let mut indexer = PluginIndexer::new(&corpus);
+                for abs_path in shard {
+                    let vname_path = abs_path
+                        .strip_prefix(&repo)
+                        .unwrap_or(abs_path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+
+                    // Hash-delta skip — same as reindex_files.
+                    let new_hash = match hash_file(abs_path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!(path=%abs_path.display(), err=%e, "hash failed, skipping");
+                            continue;
+                        }
+                    };
+                    let new_hex = hex_encode(&new_hash);
+                    if stored.get(&vname_path).map(String::as_str) == Some(&new_hex) {
+                        let _ = tx.send(Ok(ParseResult {
+                            file_graph: FileGraph {
+                                vname_path,
+                                new_hash: new_hex,
+                                nodes: vec![],
+                                edges: vec![],
+                            },
+                            ffi_markers: vec![],
+                            unchanged: true,
+                        }));
+                        continue;
+                    }
+
+                    // Parse Phase A.
+                    let out = match indexer.parse_file_with_vname(abs_path, &vname_path) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::warn!(path=%abs_path.display(), err=%e, "parse error, skipping");
+                            continue;
+                        }
+                    };
+
+                    // Import resolution (read-only FS, no store access).
+                    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let import_edges = match Language::from_extension(ext) {
+                        Some(Language::TypeScript) => {
+                            link_imports(&out.nodes, &vname_path, &corpus)
+                        }
+                        Some(Language::Rust) => {
+                            link_imports_rust(&out.nodes, &vname_path, &corpus)
+                        }
+                        Some(Language::Python) => {
+                            link_imports_python_fs(&out.nodes, &vname_path, &corpus, &repo)
+                        }
+                        Some(Language::Go) => {
+                            link_imports_go(&out.nodes, &vname_path, &corpus, None)
+                        }
+                        _ => vec![],
+                    };
+
+                    let mut edges = out.edges;
+                    edges.extend(import_edges);
+
+                    let _ = tx.send(Ok(ParseResult {
+                        file_graph: FileGraph {
+                            vname_path,
+                            new_hash: new_hex,
+                            nodes: out.nodes,
+                            edges,
+                        },
+                        ffi_markers: out.ffi_markers,
+                        unchanged: false,
+                    }));
+                }
+            });
+        }
+        // Drop the sender owned by this scope so `rx` sees EOF when all workers exit.
+        drop(tx);
+
+        // ── writer thread: drain channel, batch-write ─────────────────────────
+        let mut counts = BatchWriteCounts::default();
+        let mut files_skipped_unchanged: u64 = 0;
+        let mut done: u64 = 0;
+        let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
+        let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+
+        for result in rx {
+            let pr = result?;
+            done += 1;
+
+            if pr.unchanged {
+                files_skipped_unchanged += 1;
+                // Emit progress even for unchanged files so the bar moves.
+                on_progress(InitProgress::Indexing {
+                    done,
+                    total,
+                    workers: jobs,
+                });
+                continue;
+            }
+
+            all_ffi_markers.extend(pr.ffi_markers);
+            batch.push(pr.file_graph);
+
+            if batch.len() >= BATCH_SIZE {
+                let written = store.write_file_graphs_batch(&batch, bulk)?;
+                counts.nodes_upserted += written.nodes_upserted;
+                counts.edges_upserted += written.edges_upserted;
+                counts.files_written += written.files_written;
+                batch.clear();
+            }
+
+            on_progress(InitProgress::Indexing {
+                done,
+                total,
+                workers: jobs,
+            });
+        }
+
+        // Flush remaining files.
+        if !batch.is_empty() {
+            let written = store.write_file_graphs_batch(&batch, bulk)?;
+            counts.nodes_upserted += written.nodes_upserted;
+            counts.edges_upserted += written.edges_upserted;
+            counts.files_written += written.files_written;
+        }
+
+        // Repo-level FFI resolution (same logic as reindex_files).
+        if !all_ffi_markers.is_empty() {
+            let indexer = PluginIndexer::new(corpus);
+            let ffi_edges = indexer.resolve_ffi_edges(&all_ffi_markers);
+            for edge in &ffi_edges {
+                if let Err(e) = store.put_edge(edge) {
+                    tracing::warn!(err=%e, "ffi edge write error");
+                }
+                counts.edges_upserted += 1;
+            }
+        }
+
+        Ok((counts, files_skipped_unchanged))
+    })
+}
+
+/// Built-in default ignore patterns written into the scaffolded `.travsrignore`.
+///
+/// Precedence: SKIP_DIRS (hard, non-overridable) < these defaults (soft, user can
+/// negate with `!pattern` in `.travsrignore`) < any additional user rules.
+const DEFAULT_TRAVSRIGNORE: &str = "\
+# .travsrignore — gitignore-syntax exclusions for Travsr graph indexing.
+# Patterns here are additive to .gitignore. Negate with ! to re-include.
+# Generated by `travsr init` — safe to edit.
+
+# Third-party vendored dependencies
+vendor/
+# Common build output directories
+build/
+# Generated code
+**/generated/
+**/*.pb.go
+**/testdata/
+";
+
+/// Number of default rules in [`DEFAULT_TRAVSRIGNORE`] (for the summary line).
+const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 5;
+
+/// Write `.travsrignore` with commented defaults if it does not already exist.
+///
+/// Idempotent: never overwrites an existing file.  Reports whether the file was
+/// freshly created so `init_repo` can mention it in the summary.
+fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
+    let path = repo_root.join(".travsrignore");
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::write(&path, DEFAULT_TRAVSRIGNORE)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Heuristic: a single directory holding ≥ 1 000 source-language files AND
+/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir".
+///
+/// Returns `(dir_name, file_count, total_count)` for the first such directory
+/// that is not already excluded by the walker (SKIP_DIRS or .travsrignore).
+fn detect_large_dep_dir(indexable: &[PathBuf], repo_root: &Path) -> Option<(String, u64, u64)> {
+    use std::collections::HashMap;
+
+    let total = indexable.len() as u64;
+    if total == 0 {
+        return None;
+    }
+
+    let mut top_counts: HashMap<String, u64> = HashMap::new();
+    for p in indexable {
+        if let Some(first) = p.strip_prefix(repo_root).ok().and_then(|r| {
+            r.components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        }) {
+            *top_counts.entry(first).or_insert(0) += 1;
+        }
+    }
+
+    for (dir, count) in top_counts {
+        let pct = count * 100 / total;
+        if count >= 1_000 && pct >= 15 {
+            return Some((dir, count, total));
+        }
+    }
+    None
+}
+
+/// If stderr is a TTY, prompt the user once to exclude a detected large dep dir.
+/// If non-TTY / CI, auto-exclude and log the decision without blocking.
+///
+/// Appends the rule to `.travsrignore` if the user accepts (or in CI mode).
+/// Returns `true` if a rule was appended (caller should re-build the walker).
+fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -> bool {
+    use std::io::{IsTerminal, Write};
+
+    let pct = count * 100 / total;
+    let is_tty = std::io::stderr().is_terminal();
+
+    let exclude = if is_tty {
+        let mut err = std::io::stderr().lock();
+        let _ = write!(
+            err,
+            "\nDetected {dir}/ ({count} files, ~{pct}% of repo). \
+             Exclude from index? [Y/n] "
+        );
+        let _ = err.flush();
+        drop(err);
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        let answer = line.trim().to_ascii_lowercase();
+        answer.is_empty() || answer == "y" || answer == "yes"
+    } else {
+        tracing::info!(
+            dir = %dir,
+            count,
+            pct,
+            "non-TTY: auto-excluding large dep dir from index (add !{dir}/ to .travsrignore to override)"
+        );
+        true
+    };
+
+    if exclude {
+        let path = repo_root.join(".travsrignore");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{dir}/");
+        }
+    }
+    exclude
+}
+
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
-    init_repo_with_progress(repo_root, &mut |_| {})
+    init_repo_with_progress(repo_root, None, &mut |_| {})
 }
 
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
 /// show that a long indexing run is alive (issue #293). The callback is invoked
 /// on the indexing thread; keep it cheap.
+///
+/// `jobs` sets the parse-worker count (`None` = `available_parallelism()`).
 pub fn init_repo_with_progress(
     repo_root: &Path,
+    jobs: Option<usize>,
     on_progress: &mut dyn FnMut(InitProgress),
 ) -> anyhow::Result<InitStats> {
     let travsr_dir = repo_root.join(".travsr");
@@ -188,12 +534,20 @@ pub fn init_repo_with_progress(
         .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
-    let mut files_indexed: u64 = 0;
+    // T4 (1b): scaffold .travsrignore before the walker reads it so default
+    // patterns are active on the very first `travsr init` run.
+    let scaffolded = scaffold_travsrignore(repo_root).unwrap_or(false);
+    if scaffolded {
+        tracing::info!("wrote .travsrignore ({DEFAULT_TRAVSRIGNORE_RULE_COUNT} default rules)");
+    }
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
         .git_ignore(true)
         .follow_links(false)
+        // T3 (1a): honor .travsrignore (gitignore-syntax) in addition to .gitignore.
+        // Precedence: SKIP_DIRS (hard) < .gitignore < .travsrignore (user wins).
+        .add_custom_ignore_filename(".travsrignore")
         .build();
 
     let mut indexable_paths: Vec<PathBuf> = Vec::new();
@@ -237,24 +591,109 @@ pub fn init_repo_with_progress(
         }
     }
 
-    // DEBT(travsr-73): files_indexed counts every path handed to reindex_files,
-    // including files skipped due to size or parse errors. The user-visible
-    // "indexed N files" message is therefore optimistic. Fix by returning a
-    // per-file success/skip result from reindex_files.
-    //
-    // PERF: Two COUNT(*) per file (N files → 2N full-table scans) was causing
-    // WAL page-cache bloat during large init_repo runs. Replaced with two
-    // total counts: one snapshot before the loop, one after.
-    let total_to_index = indexable_paths.len() as u64;
-    let edges_before = store.edge_count().unwrap_or(0);
-    for abs_path in &indexable_paths {
-        reindex_files(std::slice::from_ref(abs_path), repo_root, &mut store)?;
-        files_indexed += 1;
-        on_progress(InitProgress::Indexing {
-            done: files_indexed,
-            total: total_to_index,
-        });
+    // T4 (1c): detect a large un-excluded dep dir and prompt/auto-exclude it.
+    // If the user accepts, re-discover so the excluded files are dropped.
+    if let Some((dir, count, total)) = detect_large_dep_dir(&indexable_paths, repo_root) {
+        let appended = maybe_prompt_large_dep(repo_root, &dir, count, total);
+        if appended {
+            // Re-build the walker and re-discover now that .travsrignore is updated.
+            let walker2 = WalkBuilder::new(repo_root)
+                .hidden(false)
+                .git_ignore(true)
+                .follow_links(false)
+                .add_custom_ignore_filename(".travsrignore")
+                .build();
+            indexable_paths.clear();
+            for entry in walker2.flatten() {
+                if !entry.file_type().is_some_and(|t| t.is_file()) {
+                    continue;
+                }
+                let p = entry.into_path();
+                let rel = p.strip_prefix(repo_root).unwrap_or(&p);
+                if rel.components().any(|c| {
+                    crate::watcher::SKIP_DIRS
+                        .iter()
+                        .any(|skip| c.as_os_str() == *skip)
+                }) {
+                    continue;
+                }
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if Language::from_extension(ext).is_some() {
+                    indexable_paths.push(p);
+                }
+            }
+        }
     }
+
+    // Count source files the walker would have found without any ignore rules so
+    // we can surface how many were excluded by .gitignore / .travsrignore in the
+    // terminal summary. This walk does no I/O (stat only) so it is fast.
+    let source_files_without_ignore = WalkBuilder::new(repo_root)
+        .hidden(false)
+        .git_ignore(false)
+        .follow_links(false)
+        .build()
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .filter(|e| {
+            let rel = e.path().strip_prefix(repo_root).unwrap_or(e.path());
+            !rel.components().any(|c| {
+                crate::watcher::SKIP_DIRS
+                    .iter()
+                    .any(|skip| c.as_os_str() == *skip)
+            })
+        })
+        .filter(|e| {
+            Language::from_extension(e.path().extension().and_then(|x| x.to_str()).unwrap_or(""))
+                .is_some()
+        })
+        .count() as u64;
+    let files_skipped_ignored =
+        source_files_without_ignore.saturating_sub(indexable_paths.len() as u64);
+
+    let jobs = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+
+    // Bulk-init mode: skip fsync on WAL writes + expand page cache for the
+    // duration of indexing. Safe because `travsr init` is always re-runnable.
+    // Restored unconditionally after indexing (success or error path below).
+    store
+        .set_bulk_init_mode(true)
+        .context("enabling bulk init mode")?;
+    store
+        .begin_bulk_fts_tracking()
+        .context("creating bulk FTS tracking table")?;
+
+    let edges_before = store.edge_count().unwrap_or(0);
+    let index_result = index_paths_parallel(
+        &indexable_paths,
+        repo_root,
+        &corpus,
+        jobs,
+        true,
+        &mut store,
+        on_progress,
+    );
+
+    // Rebuild FTS + vocab in one pass now that all nodes are written.
+    // Do this before restoring pragmas so the rebuild benefits from the
+    // expanded cache and synchronous=OFF.
+    if index_result.is_ok() {
+        store
+            .rebuild_fts_from_map()
+            .context("rebuilding FTS after bulk init")?;
+    }
+
+    // Always restore pragmas — even on error — so the store is left in a
+    // consistent state if the caller catches the error and continues.
+    store
+        .set_bulk_init_mode(false)
+        .context("restoring sync mode after bulk init")?;
+
+    let (batch_counts, files_skipped_unchanged) = index_result?;
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
@@ -266,9 +705,9 @@ pub fn init_repo_with_progress(
 
     // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
     // Runs once per full init, not per commit (PERF-002).
-    {
+    let phase_b_report = {
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
-        let (pb_nodes, pb_edges) = phase_b_indexer.invoke_phase_b_all(repo_root);
+        let (pb_nodes, pb_edges, pb_outcome) = phase_b_indexer.invoke_phase_b_all(repo_root);
         for node in &pb_nodes {
             if let Err(e) = store.put_node(node) {
                 tracing::warn!("phase B node write error: {e}");
@@ -286,7 +725,12 @@ pub fn init_repo_with_progress(
                 "phase B indexing complete"
             );
         }
-    }
+        PhaseBReport {
+            ran: pb_outcome.ran,
+            skipped_absent: pb_outcome.skipped_absent,
+            skipped_unregistered: pb_outcome.skipped_unregistered,
+        }
+    };
 
     // ── Go intra-package co-file pass ─────────────────────────────────────────
     // Go files in the same package share their namespace without import
@@ -370,11 +814,15 @@ pub fn init_repo_with_progress(
 
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
-        files_indexed,
+        files_indexed: batch_counts.files_written,
+        files_skipped_unchanged,
+        files_skipped_ignored,
+        travsrignore_scaffolded: scaffolded,
         nodes_written: nodes_after - nodes_before,
         edges_written,
         total_nodes: nodes_after as u64,
         total_edges,
+        phase_b_report: Some(phase_b_report),
     })
 }
 

@@ -423,29 +423,14 @@ fn cmd_install(
     if !provider_ready || !tool_ready {
         println!(
             "\u{26A0} '{language}' is registered but '{}' is not installed yet.\n\
-             Deep code analysis will be inactive until it is set up.",
+             Deep code analysis will be inactive until it is set up.\n\
+             Once the tool is installed, run `travsr init` inside your repository.",
             entry.command
         );
-        if corpus.is_none() {
-            println!(
-                "Once installed, activate for a repository:\n\n\
-                 \ttravsr lang install {language} --corpus <your-corpus>"
-            );
-        }
         return Ok(InstallStatus::WrapperOnly);
     }
 
-    println!(
-        "\u{2713} '{language}' is ready for deep code analysis.{}",
-        if corpus.is_none() {
-            format!(
-                "\nTo activate for a repository:\n\n\
-                 \ttravsr lang install {language} --corpus <your-corpus>"
-            )
-        } else {
-            String::new()
-        }
-    );
+    println!("\u{2713} '{language}' is ready for deep code analysis.");
     Ok(InstallStatus::FullyReady)
 }
 

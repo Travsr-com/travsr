@@ -17,7 +17,7 @@ pub mod transport;
 pub mod trust;
 
 pub use dispatcher::Dispatcher;
-pub use indexer::PluginIndexer;
+pub use indexer::{PhaseBOutcome, PluginIndexer};
 pub use phase_b::{
     lookup as lookup_phase_b, OutputFormat, PhaseBEntry, SandboxRequirement,
     CATALOG as PHASE_B_CATALOG,

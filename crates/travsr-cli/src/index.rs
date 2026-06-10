@@ -42,7 +42,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
     let ffi_edges = indexer.resolve_ffi_edges(&all_markers);
 
     // Phase B: semantic edges (resolves-to, ref/call) via external sidecars.
-    let (phase_b_nodes, phase_b_edges) = indexer.invoke_phase_b_all(dir);
+    let (phase_b_nodes, phase_b_edges, _phase_b_outcome) = indexer.invoke_phase_b_all(dir);
     for node in phase_b_nodes {
         all_nodes.insert(node.id, node);
     }
