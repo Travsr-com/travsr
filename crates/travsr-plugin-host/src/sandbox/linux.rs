@@ -84,7 +84,10 @@ pub fn build_sandboxed_command(
     let mut cmd = Command::new("bwrap");
 
     match policy {
-        SandboxPolicy::Standard => {
+        // NativeIpc: tool needs POSIX IPC (shm_open/mq_open) but must NOT have
+        // network access — enforce --unshare-net exactly like Standard. The IPC
+        // namespace isolation (--unshare-ipc) is omitted below, after this match.
+        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => {
             // --unshare-net is probed at first use: on hosts where loopback setup
             // inside the new network namespace is blocked (e.g. GitHub Actions,
             // some container runtimes) bwrap exits non-zero with
