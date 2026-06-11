@@ -43,16 +43,20 @@ fn sandbox_standard_allows_network() {
         Ok(spawner) => {
             let output = spawner.output().expect("spawn");
             let exit_code = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // curl may be absent inside bwrap (exit non-zero is fine), but if it IS
-            // present network must not be blocked — exit_code "0" means success.
-            // We accept either: curl absent (non-zero bwrap status) OR curl succeeds.
-            // What is NOT acceptable: bwrap blocks network while curl is present.
-            let curl_absent = !output.status.success();
+            // The shell command is `sh -c "curl ...; echo $?"` — sh always exits 0
+            // when bwrap runs successfully, so output.status.success() is always true
+            // for a live sandbox. We inspect exit_code directly:
+            //   "0"   → curl ran and network succeeded (expected: network is allowed)
+            //   "127" → curl not found inside bwrap (acceptable: no curl in namespace)
+            //   "126" → curl not executable (acceptable)
+            //   other → curl found but network blocked → test FAILS
+            let bwrap_failed = !output.status.success();
             let curl_succeeded = exit_code == "0";
+            let curl_absent = exit_code == "127" || exit_code == "126";
             assert!(
-                curl_absent || curl_succeeded,
-                "Standard sandbox blocked network but ADR-017 policy intentionally allows it \
-                 for build tools; exit_code={exit_code}"
+                bwrap_failed || curl_absent || curl_succeeded,
+                "Standard sandbox blocked network but ADR-017 Amendment A1 intentionally \
+                 allows it for build tools; exit_code={exit_code}"
             );
         }
     }
