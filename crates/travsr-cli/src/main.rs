@@ -99,6 +99,12 @@ enum Command {
         /// Output format.
         #[arg(short, long, default_value = "tree")]
         format: graph::Format,
+        /// Edge-follow mode: semantic prefers call/override edges over imports (ignored with --all).
+        #[arg(long, default_value = "semantic")]
+        edges: graph::EdgeMode,
+        /// Include third-party and anonymous-local nodes in traversal output.
+        #[arg(long)]
+        include_noise: bool,
     },
     /// Index a directory of source files and emit a graph JSON (for CI / tooling).
     Index {
@@ -435,10 +441,12 @@ async fn run(cli: Cli) -> Result<()> {
             depth,
             direction,
             format,
+            edges,
+            include_noise,
         } => match (all, query.as_deref()) {
             (true, Some(_)) => anyhow::bail!("--all and a query are mutually exclusive"),
             (true, None) => graph::run_all(format)?,
-            (false, Some(q)) => graph::run(q, depth, direction, format)?,
+            (false, Some(q)) => graph::run(q, depth, direction, format, edges, include_noise)?,
             (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
         },
         Command::HookRun { from_hook, paths } => {

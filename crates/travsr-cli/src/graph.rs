@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Context as _;
-use travsr_core::{Node, NodeId};
+use travsr_core::{display_label, is_noise_node, Node, NodeId};
 use travsr_store::{SqliteStore, Store};
 
 use crate::repo::find_git_root;
@@ -31,7 +31,22 @@ pub enum Format {
     Json,
 }
 
-pub fn run(query: &str, depth: u8, direction: Direction, format: Format) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum EdgeMode {
+    /// Prefer semantic call edges; fall back to structural if none exist
+    Semantic,
+    /// Follow all edge kinds (original behaviour)
+    All,
+}
+
+pub fn run(
+    query: &str,
+    depth: u8,
+    direction: Direction,
+    format: Format,
+    edge_mode: EdgeMode,
+    include_noise: bool,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
     let db_path = repo_root.join(".travsr/graph.db");
@@ -55,16 +70,27 @@ pub fn run(query: &str, depth: u8, direction: Direction, format: Format) -> anyh
 
     match format {
         Format::Tree => {
-            println!("{} ({})", seed.vname.signature, seed.kind);
+            println!("{} ({})", display_label(seed), seed.kind);
             let mut visited = HashSet::new();
             visited.insert(seed.id);
-            print_tree(&store, seed.id, depth, 0, direction, &mut visited, "")?;
+            print_tree(
+                &store,
+                seed.id,
+                depth,
+                0,
+                direction,
+                &mut visited,
+                "",
+                edge_mode,
+                include_noise,
+            )?;
         }
         Format::Dot => {
-            print_dot(&store, seed.id, depth, direction)?;
+            print_dot(&store, seed.id, depth, direction, edge_mode, include_noise)?;
         }
         Format::Json => {
-            let (nodes_map, edges) = collect_graph(&store, seed.id, depth, direction)?;
+            let (nodes_map, edges) =
+                collect_graph(&store, seed.id, depth, direction, edge_mode, include_noise)?;
             print_json(&store, Some(seed), &nodes_map, &edges)?;
         }
     }
@@ -80,12 +106,14 @@ fn print_tree(
     direction: Direction,
     visited: &mut HashSet<NodeId>,
     prefix: &str,
+    edge_mode: EdgeMode,
+    include_noise: bool,
 ) -> anyhow::Result<()> {
     if depth >= max_depth {
         return Ok(());
     }
 
-    let edges = next_edges(store, node_id, direction)?;
+    let edges = next_edges(store, node_id, direction, edge_mode)?;
 
     let children: Vec<(String, NodeId)> = edges
         .into_iter()
@@ -103,9 +131,13 @@ fn print_tree(
         let extension = if is_last { "    " } else { "│   " };
 
         if let Some(child) = store.get_node(*child_id)? {
+            if !include_noise && is_noise_node(&child) {
+                continue;
+            }
             println!(
                 "{prefix}{connector}{edge_kind} → {} ({})",
-                child.vname.signature, child.kind
+                display_label(&child),
+                child.kind
             );
             visited.insert(*child_id);
             print_tree(
@@ -116,6 +148,8 @@ fn print_tree(
                 direction,
                 visited,
                 &format!("{prefix}{extension}"),
+                edge_mode,
+                include_noise,
             )?;
         }
     }
@@ -128,8 +162,17 @@ fn print_dot(
     seed_id: NodeId,
     max_depth: u8,
     direction: Direction,
+    edge_mode: EdgeMode,
+    include_noise: bool,
 ) -> anyhow::Result<()> {
-    let (nodes_map, raw_edges) = collect_graph(store, seed_id, max_depth, direction)?;
+    let (nodes_map, raw_edges) = collect_graph(
+        store,
+        seed_id,
+        max_depth,
+        direction,
+        edge_mode,
+        include_noise,
+    )?;
     print_dot_from_map(&nodes_map, &raw_edges)
 }
 
@@ -357,6 +400,8 @@ fn collect_graph(
     seed_id: NodeId,
     max_depth: u8,
     direction: Direction,
+    edge_mode: EdgeMode,
+    include_noise: bool,
 ) -> anyhow::Result<GraphData> {
     let mut nodes_map: HashMap<NodeId, (Node, u8)> = HashMap::new();
     let mut edge_list: Vec<(NodeId, NodeId, String, String)> = Vec::new();
@@ -375,7 +420,7 @@ fn collect_graph(
             continue;
         }
 
-        for (edge_kind, next_id) in next_edges(store, current_id, direction)? {
+        for (edge_kind, next_id) in next_edges(store, current_id, direction, edge_mode)? {
             let (src, dst) = match direction {
                 Direction::Callers => (next_id, current_id),
                 _ => (current_id, next_id),
@@ -386,6 +431,12 @@ fn collect_graph(
             edge_list.push((src, dst, edge_kind, "tree-sitter".to_string()));
 
             if !visited.contains(&next_id) {
+                if let Some(next_node) = store.get_node(next_id)? {
+                    if !include_noise && is_noise_node(&next_node) {
+                        visited.insert(next_id); // mark visited so we don't revisit
+                        continue;
+                    }
+                }
                 visited.insert(next_id);
                 queue.push_back((next_id, depth + 1));
             }
@@ -405,10 +456,13 @@ fn collect_all_graph(store: &SqliteStore) -> anyhow::Result<GraphData> {
     Ok((nodes_map, edges))
 }
 
+static FALLBACK_NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: Direction,
+    edge_mode: EdgeMode,
 ) -> anyhow::Result<Vec<(String, NodeId)>> {
     let mut out = Vec::new();
     if matches!(direction, Direction::Deps | Direction::Both) {
@@ -417,11 +471,41 @@ fn next_edges(
         }
     }
     if matches!(direction, Direction::Callers | Direction::Both) {
-        for e in store.iter_edges_to(node_id)? {
-            out.push((e.kind.as_str().to_string(), e.src));
+        let incoming = store.iter_edges_to(node_id)?;
+        if matches!(edge_mode, EdgeMode::Semantic) {
+            let has_semantic = incoming.iter().any(|e| is_semantic_edge(e.kind.as_str()));
+            if has_semantic {
+                for e in &incoming {
+                    let s = e.kind.as_str();
+                    if is_semantic_edge(s) || s == "defines/binding" {
+                        out.push((s.to_string(), e.src));
+                    }
+                }
+            } else {
+                FALLBACK_NOTE.get_or_init(|| {
+                    eprintln!(
+                        "note: no semantic caller edges found — showing file-level imports. \
+                         Run `travsr lang` to enable call-site analysis."
+                    );
+                });
+                for e in &incoming {
+                    out.push((e.kind.as_str().to_string(), e.src));
+                }
+            }
+        } else {
+            for e in &incoming {
+                out.push((e.kind.as_str().to_string(), e.src));
+            }
         }
     }
     Ok(out)
+}
+
+fn is_semantic_edge(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ref/call" | "ffi/call" | "overrides" | "is-implementation" | "ref/imports" | "resolves-to"
+    )
 }
 
 pub fn run_all(format: Format) -> anyhow::Result<()> {
