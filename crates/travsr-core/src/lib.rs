@@ -445,6 +445,37 @@ impl Node {
     }
 }
 
+/// Human-readable label: path for file nodes (whose `signature` is the
+/// literal `"file"`), signature for everything else.
+pub fn display_label(node: &Node) -> &str {
+    if node.kind == "file" && !node.vname.path.is_empty() {
+        &node.vname.path
+    } else {
+        &node.vname.signature
+    }
+}
+
+/// Returns `true` for nodes that carry no developer-facing signal:
+/// vendored paths and SCIP anonymous locals.
+pub fn is_noise_node(node: &Node) -> bool {
+    let p = &node.vname.path;
+    p.starts_with("third_party/")
+        || p.starts_with("vendor/")
+        || p.starts_with("node_modules/")
+        || p.contains("/node_modules/")
+        || is_scip_anonymous_local(&node.vname.signature)
+}
+
+fn is_scip_anonymous_local(sig: &str) -> bool {
+    // SCIP local symbols end with "local <digits>", e.g. "local 27".
+    if let Some(pos) = sig.rfind("local ") {
+        let suffix = &sig[pos + 6..];
+        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
 /// A directed, typed edge between two nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
@@ -1125,5 +1156,62 @@ mod tests {
         let json = r#"{"src":1,"dst":2,"kind":"ref/call"}"#;
         let e: Edge = serde_json::from_str(json).unwrap();
         assert_eq!(e.confidence, None);
+    }
+
+    #[test]
+    fn display_label_uses_path_for_file_nodes() {
+        let n = Node::new(VName::new("", "", "src/lib.rs", "rust", "file"), "file");
+        assert_eq!(display_label(&n), "src/lib.rs");
+    }
+
+    #[test]
+    fn display_label_uses_signature_otherwise() {
+        let n = Node::new(
+            VName::new("", "", "src/lib.rs", "rust", "fn:main"),
+            "function",
+        );
+        assert_eq!(display_label(&n), "fn:main");
+    }
+
+    #[test]
+    fn noise_detects_third_party() {
+        let n = Node::new(
+            VName::new("", "", "third_party/foo/bar.go", "go", "fn:bar"),
+            "function",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_scip_local() {
+        let n = Node::new(
+            VName::new("", "", "pkg/eviction/handler.go", "go", "local 27"),
+            "variable",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_keeps_production_node() {
+        let n = Node::new(
+            VName::new("", "", "pkg/eviction/handler.go", "go", "fn:Handle"),
+            "function",
+        );
+        assert!(!is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_root_node_modules() {
+        let n = Node::new(
+            VName::new(
+                "",
+                "",
+                "node_modules/react/index.js",
+                "typescript",
+                "fn:createElement",
+            ),
+            "function",
+        );
+        assert!(is_noise_node(&n));
     }
 }
