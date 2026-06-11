@@ -72,10 +72,25 @@ fn dart_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
 
     // Dart pub package cache — required by package:analyzer at runtime.
+    // travsr-dart-index-emitter (AOT binary) resolves the Dart SDK root as
+    // ~/.travsr/ (one level above its own ~/.travsr/bin/). Grant read on
+    // ~/.travsr/lib (symlinked to the real SDK lib dir) and ~/.travsr/version
+    // so FolderBasedDartSdk can initialise inside the sandbox.
     if let Some(home) = home() {
         let pub_cache = home.join(".pub-cache");
         tracing::debug!(path = %pub_cache.display(), exists = pub_cache.exists(), "dart_access: pub-cache grant");
         read_paths.push(pub_cache);
+
+        let travsr_lib = home.join(".travsr").join("lib");
+        if travsr_lib.exists() {
+            tracing::debug!(path = %travsr_lib.display(), "dart_access: granting read on ~/.travsr/lib (SDK lib symlink for AOT emitter)");
+            read_paths.push(travsr_lib);
+        }
+        let travsr_version = home.join(".travsr").join("version");
+        if travsr_version.exists() {
+            tracing::debug!(path = %travsr_version.display(), "dart_access: granting read on ~/.travsr/version (SDK version for AOT emitter)");
+            read_paths.push(travsr_version);
+        }
     }
 
     // The dart binary needs to read its own SDK snapshot files at startup
@@ -145,12 +160,47 @@ fn dart_access() -> ToolchainAccess {
         }
     }
 
-    tracing::debug!(read_paths = ?read_paths, "dart_access: final grants");
+    // TRAVSR_DART_EMITTER: the sidecar binary (travsr-lang-dart) finds the AOT
+    // emitter via current_exe() → sibling lookup. When the sidecar is the
+    // npm-installed binary (~/.nvm/.../bin/travsr-lang-dart), the sibling path
+    // is ~/.nvm/.../bin/travsr-dart-index-emitter which does not exist — only
+    // ~/.travsr/bin/travsr-dart-index-emitter exists (put there by `travsr lang
+    // install dart`). Injecting this env var hits emitter_path() check 1,
+    // bypassing the broken relative-path lookup regardless of which travsr-lang-dart
+    // variant is on PATH.
+    let mut env = Vec::new();
+    if let Some(home) = home() {
+        let emitter_bin = home
+            .join(".travsr")
+            .join("bin")
+            .join("travsr-dart-index-emitter");
+        if emitter_bin.exists() {
+            tracing::debug!(
+                path = %emitter_bin.display(),
+                "dart_access: setting TRAVSR_DART_EMITTER"
+            );
+            env.push((
+                "TRAVSR_DART_EMITTER".to_string(),
+                emitter_bin.to_string_lossy().into_owned(),
+            ));
+        } else {
+            tracing::debug!(
+                path = %emitter_bin.display(),
+                "dart_access: travsr-dart-index-emitter not found — TRAVSR_DART_EMITTER not set"
+            );
+        }
+    }
+
+    if let Some(h) = home() {
+        env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
+    }
+
+    tracing::debug!(read_paths = ?read_paths, env_keys = ?env.iter().map(|(k,_)| k).collect::<Vec<_>>(), "dart_access: final grants");
 
     ToolchainAccess {
         read_paths,
         write_paths: vec![],
-        env: vec![],
+        env,
     }
 }
 
@@ -644,6 +694,20 @@ fn go_access() -> ToolchainAccess {
         write_paths.push(p.clone()); // `go build` writes compiled artifacts here
         env.push(("GOCACHE".to_string(), p.to_string_lossy().into_owned()));
     }
+    // GOROOT: the Go standard library. scip-go's type checker reads stdlib
+    // source for cross-package type resolution. Missing on large repos (e.g.
+    // Kubernetes 2255 packages) causes the sandbox to block stdlib reads and
+    // scip-go to exit silently with 0 edges despite a successful handshake.
+    let goroot = std::env::var("GOROOT")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| run_cmd_stdout("go", &["env", "GOROOT"]).map(|s| PathBuf::from(s.trim())));
+    if let Some(ref p) = goroot {
+        tracing::debug!(path = %p.display(), "go_access: GOROOT grant (stdlib for type checker)");
+        read_paths.push(p.clone());
+        env.push(("GOROOT".to_string(), p.to_string_lossy().into_owned()));
+    }
+
     if let Some(h) = home() {
         // Go tooling consults $HOME for defaults; pass it through.
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));

@@ -620,7 +620,7 @@ async function reindexNow(
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Travsr: re-indexing (may take up to 2 min)…",
+      title: "Travsr: re-indexing…",
       cancellable: false,
     },
     () =>

@@ -35,7 +35,7 @@ Every Sidecar-transport spawn (RFC-011 §2) — whether a Phase B SCIP/LSIF invo
 
 ```
 SandboxPolicy::Standard
-  network:    DENY ALL          (no egress, no listen)
+  network:    ALLOW             (intentional — see Amendment A1 below)
   filesystem: repo root         → READ-ONLY
               scratch tmpdir     → READ-WRITE (per-invocation, removed after)
               everything else    → DENY
@@ -49,6 +49,28 @@ SandboxPolicy::Standard
               No HOME, no CARGO_HOME, no GIT_*, no SSH_*, no AWS_* / GCP_* / AZURE_*,
               no CI, no GITHUB_TOKEN, no NPM_TOKEN, and no other credential-carrying vars.
 ```
+
+> **Amendment A1 — Network allow for Standard/NativeIpc (2026-06-11)**
+>
+> Network egress is **intentionally allowed** in `Standard` and `NativeIpc` sandbox policies.
+>
+> **Rationale:** Every language build tool that Phase B invokes (`go mod download`, `npm install`,
+> `pip install`, `pub get`, Maven/Gradle for scip-java) requires outbound network access to
+> resolve and fetch dependencies at analysis time. Blocking network caused 0 edges on
+> multi-package repos (e.g. Kubernetes: 2255 packages, 0 LSIF edges → 426,636 after fix).
+>
+> **Compensating controls:**
+> - Filesystem confinement via bwrap/sandbox-exec still fully applies — the plugin cannot
+>   write outside its scratch dir or read outside the repo root.
+> - `Elevated` policy continues to exist for documenting host-allowlists; host-level egress
+>   controls (firewall / egress proxy) remain the network boundary.
+> - The sentence in Rule 1 below ("disable the network-deny rule entirely, it cannot be
+>   granted under Elevated — escalate to CTO") referred to ad-hoc Elevated exceptions that
+>   bypass documented allowlists. Standard's unconditional network-allow is not an Elevated
+>   exception; it is an explicit policy change recorded here and enforced uniformly.
+>
+> **Approved by:** Principal Security Engineer (PSE review 2026-06-11, branch
+> `feature/travsr-daemon-init-at-scale-295`)
 
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 
@@ -151,7 +173,7 @@ Any grammar that cannot meet all four runs under the **Sidecar** transport inste
 
 ## Tests Security requires QA to add
 
-- **Egress blocked:** a plugin that attempts a network connection under the sandbox fails; no bytes leave the host.
+- **Egress allowed (Standard/NativeIpc):** a plugin running under `Standard` or `NativeIpc` policy CAN reach the network — this is intentional per Amendment A1. The test `sandbox_standard_allows_network` verifies this. `Elevated` policy follows the same allow rule; host-level egress controls enforce the permitted-hosts list.
 - **Fail-closed:** with the sandbox mechanism forcibly unavailable, the plugin is disabled and indexes **zero** of its files — assert no fallback path runs the subprocess.
 - **Trust gate:** a `--command` plugin with no `plugins.trust.<corpus>` / `--command` opt-in is **refused**; a repo cannot opt itself into Phase B via committed config.
 - **FS confinement:** a plugin attempting to write inside the repo root (outside the scratch tmpdir) fails; repo is read-only.

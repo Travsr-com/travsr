@@ -524,7 +524,14 @@ pub static CATALOG: &[PhaseBEntry] = &[
         command: "travsr-dart-index-emitter",
         args: &[],
         output_format: OutputFormat::Scip,
-        sandbox: SandboxRequirement::Standard,
+        // travsr-dart-index-emitter is a Dart AOT binary linked against
+        // Security.framework, CoreFoundation, Foundation, and CoreServices.
+        // These macOS system frameworks need unrestricted system-file access
+        // that can't be enumerated in a Seatbelt profile — the AOT runtime
+        // reads its own binary to load the embedded snapshot and sandbox-exec
+        // blocks that, producing "is not an AOT snapshot" errors. NativeIpc
+        // bypasses sandbox-exec and applies ulimit caps only (same as scip-clang).
+        sandbox: SandboxRequirement::NativeIpc,
         install_hint: "travsr lang install dart",
         underlying_tool_hint: "",
         provider_binary: Some("travsr-lang-dart"),

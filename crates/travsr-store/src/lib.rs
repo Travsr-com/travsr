@@ -264,6 +264,29 @@ pub trait Store {
     fn get_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>, StoreError>;
 }
 
+/// One file's worth of parsed graph data, ready to write in a batch transaction.
+///
+/// Produced by the parallel parse workers in `travsr-daemon` and consumed by
+/// `SqliteStore::write_file_graphs_batch`.  Keeping parse and write decoupled
+/// lets N CPU threads produce data while a single writer thread owns the store.
+#[derive(Debug)]
+pub struct FileGraph {
+    /// Repo-relative path string, e.g. `"src/lib.rs"`.
+    pub vname_path: String,
+    /// SHA-256 hex of the file, used to update the `files` hash table.
+    pub new_hash: String,
+    pub nodes: Vec<travsr_core::Node>,
+    pub edges: Vec<travsr_core::Edge>,
+}
+
+/// Aggregate counts returned by [`SqliteStore::write_file_graphs_batch`].
+#[derive(Debug, Default)]
+pub struct BatchWriteCounts {
+    pub nodes_upserted: u64,
+    pub edges_upserted: u64,
+    pub files_written: u64,
+}
+
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
 #[derive(Debug)]
 pub struct SqliteStore {
@@ -369,6 +392,33 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Enable or disable bulk-init mode pragmas.
+    ///
+    /// `enable=true` skips WAL fsyncs (`synchronous=OFF`) and expands the page
+    /// cache to 256 MB for the duration of a full `init_repo` run.  Safe because
+    /// init is re-runnable: an OS crash may leave a partially-written WAL, but
+    /// the next `travsr init` heals it.  NEVER use on the commit-hook path.
+    ///
+    /// `enable=false` restores the values set by [`configure`].
+    pub fn set_bulk_init_mode(&mut self, enable: bool) -> anyhow::Result<()> {
+        if enable {
+            self.conn
+                .pragma_update(None, "synchronous", "OFF")
+                .context("bulk init: setting synchronous=OFF")?;
+            self.conn
+                .pragma_update(None, "cache_size", -262144i64)
+                .context("bulk init: setting cache_size=256MB")?;
+        } else {
+            self.conn
+                .pragma_update(None, "synchronous", "NORMAL")
+                .context("bulk init: restoring synchronous=NORMAL")?;
+            self.conn
+                .pragma_update(None, "cache_size", -65536i64)
+                .context("bulk init: restoring cache_size=64MB")?;
+        }
+        Ok(())
+    }
+
     /// Return the live journal mode reported by SQLite. Useful in tests.
     pub fn journal_mode(&self) -> Result<String, StoreError> {
         self.conn
@@ -451,6 +501,31 @@ impl SqliteStore {
         }
     }
 
+    /// Load every row from the `files` table into a path → sha256 map.
+    ///
+    /// Used by `init_repo`'s parallel indexing pipeline to pre-populate an
+    /// in-memory skip set so worker threads can compare hashes without hitting
+    /// SQLite on every file.
+    pub fn get_all_file_hashes(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        (|| -> AnyResult<std::collections::HashMap<String, String>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, sha256 FROM files")
+                .context("preparing get_all_file_hashes")?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("executing get_all_file_hashes")?;
+            let owned: rusqlite::Result<std::collections::HashMap<String, String>> =
+                mapped.collect();
+            owned.context("collecting file hashes")
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn get_file_hash(&self, path: &str) -> Result<Option<String>, StoreError> {
         self.conn
             .query_row(
@@ -476,6 +551,164 @@ impl SqliteStore {
             .context("writing file hash")
             .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    /// Write a batch of parsed file graphs in a single SQLite transaction.
+    ///
+    /// For each `FileGraph` in `batch`:
+    /// 1. Retract old FTS rows + decrement vocab refcounts for the path.
+    /// 2. Delete old edges and nodes for the path.
+    /// 3. Insert new nodes and edges.
+    /// 4. Upsert the file hash.
+    ///
+    /// When `bulk=true` (init path), step 3 writes only `nodes_fts_map` rows
+    /// instead of the full FTS5 + vocab update per node.  Call
+    /// [`rebuild_fts_from_map`] after all batches to build the index in one pass.
+    ///
+    /// When `bulk=false` (incremental / reindex path), each node gets the full
+    /// `put_node_fts` treatment — FTS5 insert + vocab increment — exactly as before.
+    ///
+    /// All files in the batch commit atomically — a failure rolls back the
+    /// entire batch, leaving the DB consistent.
+    pub fn write_file_graphs_batch(
+        &mut self,
+        batch: &[FileGraph],
+        bulk: bool,
+    ) -> Result<BatchWriteCounts, StoreError> {
+        (|| -> AnyResult<BatchWriteCounts> {
+            // _bulk_fts_pending is a temp table populated by put_node_fts_map_only
+            // and consumed by rebuild_fts_from_map. Create it here so the table
+            // exists for the duration of this call even when begin_bulk_fts_tracking
+            // was not called explicitly by the caller.
+            if bulk {
+                self.conn
+                    .execute_batch(
+                        "CREATE TEMP TABLE IF NOT EXISTS _bulk_fts_pending \
+                         (node_id INTEGER PRIMARY KEY);",
+                    )
+                    .context("creating _bulk_fts_pending temp table")?;
+            }
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting batch write transaction")?;
+            let mut counts = BatchWriteCounts::default();
+
+            for file in batch {
+                // ── delete pass (mirrors delete_nodes_for_path logic) ─────────
+                // Load old FTS tokens BEFORE removing map rows so vocab can
+                // be decremented correctly.
+                let old_token_strings: Vec<String> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT m.tokens FROM nodes_fts_map m \
+                             JOIN nodes n ON n.id = m.node_id WHERE n.path = ?1",
+                        )
+                        .context("preparing old-token load")?;
+                    // Collect into an owned Result before `?` so the MappedRows
+                    // borrow on `stmt` ends before the block closes (E0597).
+                    let mapped = stmt
+                        .query_map(params![file.vname_path], |row| row.get::<_, String>(0))
+                        .context("querying old tokens")?;
+                    let owned: rusqlite::Result<Vec<String>> = mapped.collect();
+                    owned.context("collecting old tokens")?
+                };
+
+                // Retract FTS entries for the path.
+                tx.execute(
+                    "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
+                     SELECT 'delete', m.node_id, m.tokens \
+                     FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
+                     WHERE n.path = ?1",
+                    params![file.vname_path],
+                )
+                .context("retracting FTS rows")?;
+                tx.execute(
+                    "DELETE FROM nodes_fts_map \
+                     WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                    params![file.vname_path],
+                )
+                .context("removing FTS map rows")?;
+
+                for ts in &old_token_strings {
+                    Self::vocab_decrement(&tx, ts)?;
+                }
+
+                // Delete edges referencing this path's nodes, then the nodes.
+                tx.execute(
+                    "DELETE FROM edges \
+                     WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
+                        OR dst IN (SELECT id FROM nodes WHERE path = ?1)",
+                    params![file.vname_path],
+                )
+                .context("deleting edges for path")?;
+                tx.execute("DELETE FROM nodes WHERE path = ?1", params![file.vname_path])
+                    .context("deleting nodes for path")?;
+
+                // ── insert pass ───────────────────────────────────────────────
+                for node in &file.nodes {
+                    let id_i64 = node_id_to_i64(node.id);
+                    tx.execute(
+                        "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
+                           package = excluded.package, \
+                           line = COALESCE(excluded.line, nodes.line)",
+                        params![
+                            id_i64,
+                            node.vname.corpus,
+                            node.vname.root,
+                            node.vname.path,
+                            node.vname.language,
+                            node.vname.signature,
+                            node.kind,
+                            node.package,
+                            node.line.map(|l| l as i64),
+                        ],
+                    )
+                    .context("inserting node in batch")?;
+                    if bulk {
+                        Self::put_node_fts_map_only(&tx, node)
+                            .context("batch put_node_fts_map_only")?;
+                    } else {
+                        Self::put_node_fts(&tx, node).context("batch put_node_fts")?;
+                    }
+                    counts.nodes_upserted += 1;
+                }
+
+                for edge in &file.edges {
+                    tx.execute(
+                        "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                         VALUES(?1, ?2, ?3, 'tree-sitter', ?4) \
+                         ON CONFLICT(src, dst, kind) DO NOTHING",
+                        params![
+                            node_id_to_i64(edge.src),
+                            node_id_to_i64(edge.dst),
+                            edge.kind.as_str(),
+                            edge.confidence.map(|c| c as i64),
+                        ],
+                    )
+                    .context("inserting edge in batch")?;
+                    counts.edges_upserted += 1;
+                }
+
+                // Upsert file hash.
+                tx.execute(
+                    "INSERT INTO files(path, sha256, last_indexed_at) \
+                     VALUES(?1, ?2, unixepoch()) \
+                     ON CONFLICT(path) DO UPDATE SET \
+                       sha256 = excluded.sha256, \
+                       last_indexed_at = excluded.last_indexed_at",
+                    params![file.vname_path, file.new_hash],
+                )
+                .context("writing file hash in batch")?;
+                counts.files_written += 1;
+            }
+
+            tx.commit().context("committing batch write transaction")?;
+            Ok(counts)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Delete all nodes (and their edges) whose VName path equals `path`.
@@ -811,6 +1044,105 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
     }
+
+    /// Write Phase B (SCIP/LSIF semantic) nodes and edges in a single transaction.
+    ///
+    /// Semantics match repeated `put_node` + `put_edge_lsif` calls but in one
+    /// round-trip instead of O(N) transactions. Call this after `invoke_phase_b_all`
+    /// returns; the caller must not hold an open transaction.
+    pub fn write_phase_b_batch(
+        &mut self,
+        nodes: &[travsr_core::Node],
+        edges: &[travsr_core::Edge],
+    ) -> anyhow::Result<()> {
+        if nodes.is_empty() && edges.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("write_phase_b_batch: begin")?;
+        for node in nodes {
+            let id_i64 = node_id_to_i64(node.id);
+            tx.execute(
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
+                 package = excluded.package, \
+                 line = COALESCE(excluded.line, nodes.line)",
+                params![
+                    id_i64,
+                    node.vname.corpus,
+                    node.vname.root,
+                    node.vname.path,
+                    node.vname.language,
+                    node.vname.signature,
+                    node.kind,
+                    node.package,
+                    node.line.map(|l| l as i64),
+                ],
+            )
+            .context("write_phase_b_batch: insert node")?;
+            Self::put_node_fts(&tx, node).context("write_phase_b_batch: put_node_fts")?;
+        }
+        for edge in edges {
+            tx.execute(
+                "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                 VALUES(?1, ?2, ?3, 'lsif', ?4) \
+                 ON CONFLICT(src, dst, kind) DO UPDATE SET \
+                 provenance = 'lsif', confidence = excluded.confidence",
+                params![
+                    node_id_to_i64(edge.src),
+                    node_id_to_i64(edge.dst),
+                    edge.kind.as_str(),
+                    edge.confidence.map(|c| c as i64),
+                ],
+            )
+            .context("write_phase_b_batch: insert edge")?;
+        }
+        tx.commit().context("write_phase_b_batch: commit")
+    }
+
+    /// Emit `Depends` edges between all ordered file-node pairs that co-define
+    /// the same package/module node, using a single SQL self-join.
+    ///
+    /// Languages whose files share a namespace without explicit imports (Go,
+    /// Swift, Kotlin, Java, Dart) emit a package node during Phase A that every
+    /// file in the package points at via `DefinesBinding`. This pass finds all
+    /// such groups and writes `file_B --Depends--> file_A` for every ordered
+    /// pair (B ≠ A), giving blast-radius BFS structural co-package coupling.
+    ///
+    /// `pkg_kinds` must contain only internal kind strings (e.g. `"go-pkg"`,
+    /// `"swift-module"`) — never values derived from user input.
+    ///
+    /// Returns the number of new edges inserted (`INSERT OR IGNORE` skips
+    /// existing rows).
+    pub fn emit_copackage_depends(&mut self, pkg_kinds: &[&str]) -> anyhow::Result<usize> {
+        if pkg_kinds.is_empty() {
+            return Ok(0);
+        }
+        // All values come from internal constants — no user input reaches here.
+        let in_clause = pkg_kinds
+            .iter()
+            .map(|s| format!("'{}'", s.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT OR IGNORE INTO edges(src, dst, kind, provenance, confidence) \
+             SELECT DISTINCT a.src, b.src, 'depends', 'tree-sitter', NULL \
+             FROM edges a \
+             JOIN edges b   ON a.dst = b.dst AND a.src != b.src \
+             JOIN nodes pkg ON pkg.id = a.dst AND pkg.kind IN ({in_clause}) \
+             JOIN nodes fa  ON fa.id = a.src  AND fa.kind = 'file' \
+             JOIN nodes fb  ON fb.id = b.src  AND fb.kind = 'file' \
+             WHERE a.kind = 'defines/binding' \
+               AND b.kind = 'defines/binding'"
+        );
+        self.conn
+            .execute(&sql, [])
+            .context("emit_copackage_depends")?;
+        Ok(self.conn.changes() as usize)
+    }
 }
 
 // ── StoreMigratable (T3) ──────────────────────────────────────────────────────
@@ -935,6 +1267,48 @@ impl SqliteStore {
         // Increment vocab refcounts for new tokens (v10 L2-A).
         Self::vocab_increment(conn, &new_tokens)?;
 
+        Ok(())
+    }
+
+    /// Bulk-init variant of [`put_node_fts`]: writes only the `nodes_fts_map` row
+    /// and records the node_id in `_bulk_fts_pending` (a temp table created by
+    /// [`begin_bulk_fts_tracking`]), skipping the FTS5 inverted-index insert and
+    /// `fts_vocab` increments.
+    ///
+    /// Called by [`write_file_graphs_batch`] when `bulk=true`.
+    /// [`rebuild_fts_from_map`] must be called after all batches to populate
+    /// `nodes_fts` and `fts_vocab` for only the written nodes.
+    fn put_node_fts_map_only(conn: &Connection, node: &Node) -> AnyResult<()> {
+        let id_i64 = node_id_to_i64(node.id);
+        let tokens = Self::node_fts_tokens(node);
+        conn.execute(
+            "INSERT INTO nodes_fts_map(node_id, tokens) VALUES(?1, ?2) \
+             ON CONFLICT(node_id) DO UPDATE SET tokens = excluded.tokens",
+            params![id_i64, tokens],
+        )
+        .context("bulk: writing nodes_fts_map")?;
+        // Track this node_id so rebuild_fts_from_map inserts FTS entries only
+        // for written nodes — not for unchanged nodes whose entries already exist.
+        conn.execute(
+            "INSERT OR IGNORE INTO _bulk_fts_pending(node_id) VALUES(?1)",
+            params![id_i64],
+        )
+        .context("bulk: recording node_id in _bulk_fts_pending")?;
+        Ok(())
+    }
+
+    /// Create the per-connection temp table used to track which node IDs had
+    /// their `nodes_fts_map` row written during a bulk init run.
+    ///
+    /// Must be called once before the first [`write_file_graphs_batch`] call
+    /// with `bulk=true`.  The table is dropped by [`rebuild_fts_from_map`].
+    pub fn begin_bulk_fts_tracking(&mut self) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _bulk_fts_pending \
+                 (node_id INTEGER PRIMARY KEY);",
+            )
+            .context("creating _bulk_fts_pending temp table")?;
         Ok(())
     }
 
@@ -1333,6 +1707,95 @@ impl SqliteStore {
         tracing::info!(
             nodes = token_strings.len(),
             "RFC-012 L2-A: fts_vocab backfill complete"
+        );
+        Ok(())
+    }
+
+    /// Rebuild `nodes_fts` and `fts_vocab` from `nodes_fts_map` in one pass.
+    ///
+    /// Called by `init_repo_with_progress` after all bulk batches are flushed.
+    /// Produces an identical end-state to per-node `put_node_fts` calls but
+    /// avoids per-node FTS5 inverted-index writes — the dominant bottleneck on
+    /// large repos (kubernetes: ~12M FTS ops → ~10 min, bulk rebuild: ~1 pass).
+    ///
+    /// Safe to call on an empty store (no-op) or a partially-written store
+    /// (idempotent: clears and repopulates both tables).
+    pub fn rebuild_fts_from_map(&mut self) -> anyhow::Result<()> {
+        // Phase 1: insert FTS entries only for nodes written in this bulk run.
+        // _bulk_fts_pending (created by begin_bulk_fts_tracking, populated by
+        // put_node_fts_map_only) holds exactly those node IDs. Unchanged files
+        // are excluded because they were hash-skipped and never reached
+        // put_node_fts_map_only, so their existing FTS entries stay untouched.
+        //
+        // Contentless FTS5 tables forbid DELETE FROM and the 'rebuild' command.
+        // Retracting non-existent entries corrupts the index, so we filter by
+        // _bulk_fts_pending rather than clear-and-rebuild.
+        {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting FTS rebuild transaction")?;
+            tx.execute_batch(
+                "INSERT INTO nodes_fts(rowid, tokens) \
+                   SELECT m.node_id, m.tokens FROM nodes_fts_map m \
+                   WHERE EXISTS ( \
+                     SELECT 1 FROM _bulk_fts_pending p WHERE p.node_id = m.node_id \
+                   ); \
+                 DROP TABLE IF EXISTS _bulk_fts_pending;",
+            )
+            .context("bulk-inserting nodes_fts from pending nodes")?;
+            tx.commit().context("committing FTS rebuild")?;
+        }
+
+        // Phase 2: rebuild fts_vocab by counting tokens in Rust, then
+        // bulk-inserting unique token counts. This replaces ~6–10M per-token
+        // SQL upserts with ~50k–200k unique-token inserts (kubernetes estimate).
+        let token_strings: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT tokens FROM nodes_fts_map")
+                .context("preparing nodes_fts_map scan for vocab rebuild")?;
+            let collected: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .context("executing nodes_fts_map scan")?
+                .collect::<rusqlite::Result<_>>()
+                .context("collecting token strings for vocab rebuild")?;
+            collected
+        };
+
+        // Count token frequencies in Rust — O(nodes × tokens_per_node).
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for ts in &token_strings {
+            for tok in ts.split_whitespace() {
+                if tok.len() >= 3 {
+                    *counts.entry(tok.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        if counts.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction()
+            .context("starting fts_vocab rebuild transaction")?;
+        tx.execute("DELETE FROM fts_vocab", [])
+            .context("clearing fts_vocab for rebuild")?;
+        for (token, refcount) in &counts {
+            tx.execute(
+                "INSERT INTO fts_vocab(token, refcount) VALUES(?1, ?2)",
+                params![token, *refcount as i64],
+            )
+            .context("inserting rebuilt fts_vocab row")?;
+        }
+        tx.commit().context("committing fts_vocab rebuild")?;
+
+        tracing::info!(
+            nodes = token_strings.len(),
+            unique_tokens = counts.len(),
+            "bulk init: FTS + vocab rebuild complete"
         );
         Ok(())
     }
@@ -2545,5 +3008,101 @@ mod tests {
             !store.has_refcall_edges_for_language("rust"),
             "different lang must return false"
         );
+    }
+
+    #[test]
+    fn bulk_init_fts_matches_row_by_row() {
+        // Index the same nodes via bulk path and row-by-row path; verify
+        // that FTS search returns identical results in both cases.
+        let nodes = vec![
+            Node::new(
+                VName::new("c", "", "src/auth.ts", "typescript", "fn:AuthService"),
+                "function",
+            ),
+            Node::new(
+                VName::new("c", "", "src/pay.ts", "typescript", "fn:PaymentHandler"),
+                "function",
+            ),
+        ];
+
+        // ── row-by-row (reference) ──────────────────────────────────────────
+        let mut ref_store = SqliteStore::open_in_memory().unwrap();
+        for n in &nodes {
+            ref_store.put_node(n).unwrap();
+        }
+        let ref_results = ref_store.search_nodes_fuzzy("auth").unwrap();
+
+        // ── bulk path ───────────────────────────────────────────────────────
+        let mut bulk_store = SqliteStore::open_in_memory().unwrap();
+        let batch: Vec<FileGraph> = nodes
+            .iter()
+            .map(|n| FileGraph {
+                vname_path: n.vname.path.clone(),
+                new_hash: "deadbeef".to_string(),
+                nodes: vec![n.clone()],
+                edges: vec![],
+            })
+            .collect();
+        bulk_store.write_file_graphs_batch(&batch, true).unwrap();
+        bulk_store.rebuild_fts_from_map().unwrap();
+        let bulk_results = bulk_store.search_nodes_fuzzy("auth").unwrap();
+
+        assert_eq!(
+            ref_results.len(),
+            bulk_results.len(),
+            "bulk FTS must return the same number of results as row-by-row"
+        );
+        assert!(
+            bulk_results
+                .iter()
+                .any(|n| n.vname.signature.contains("Auth")),
+            "bulk FTS must find AuthService"
+        );
+    }
+
+    #[test]
+    fn bulk_init_vocab_counts_match_row_by_row() {
+        let node = Node::new(
+            VName::new("c", "", "src/session.ts", "typescript", "fn:SessionStore"),
+            "function",
+        );
+
+        let mut ref_store = SqliteStore::open_in_memory().unwrap();
+        ref_store.put_node(&node).unwrap();
+
+        let mut bulk_store = SqliteStore::open_in_memory().unwrap();
+        let batch = vec![FileGraph {
+            vname_path: node.vname.path.clone(),
+            new_hash: "deadbeef".to_string(),
+            nodes: vec![node.clone()],
+            edges: vec![],
+        }];
+        bulk_store.write_file_graphs_batch(&batch, true).unwrap();
+        bulk_store.rebuild_fts_from_map().unwrap();
+
+        // "session" and "store" are the primary tokens — both must have refcount 1.
+        for tok in &["session", "store"] {
+            let ref_rc = ref_store.fts_vocab_refcount(tok).unwrap();
+            let bulk_rc = bulk_store.fts_vocab_refcount(tok).unwrap();
+            assert_eq!(
+                ref_rc, bulk_rc,
+                "fts_vocab refcount for '{tok}' must match row-by-row"
+            );
+            assert!(
+                bulk_rc.is_some(),
+                "token '{tok}' must be present in fts_vocab after bulk rebuild"
+            );
+        }
+    }
+
+    #[test]
+    fn set_bulk_init_mode_restores_synchronous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("bulk.db");
+        let mut store = SqliteStore::open(&db_path).unwrap();
+        store.set_bulk_init_mode(true).unwrap();
+        store.set_bulk_init_mode(false).unwrap();
+        // After restoring, journal_mode must still be WAL (pragma was not changed).
+        assert_eq!(store.journal_mode().unwrap().to_lowercase(), "wal");
     }
 }

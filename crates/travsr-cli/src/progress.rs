@@ -229,7 +229,7 @@ impl ProgressReporter {
                     pal.dim(&elapsed)
                 )
             }
-            InitProgress::Indexing { done, total } => {
+            InitProgress::Indexing { done, total, .. } => {
                 let pct = (done * 100).checked_div(total).unwrap_or(0);
                 let tail = match eta(self.start, done, total) {
                     Some(e) => format!("{elapsed} · eta {}", fmt_dur(e)),
@@ -259,7 +259,7 @@ impl ProgressReporter {
             InitProgress::Scanning { scanned } => {
                 format!("scanning {} files  {elapsed}", commas(scanned))
             }
-            InitProgress::Indexing { done, total } => {
+            InitProgress::Indexing { done, total, .. } => {
                 let pct = (done * 100).checked_div(total).unwrap_or(0);
                 let eta = eta(self.start, done, total)
                     .map(|e| format!("  eta {}", fmt_dur(e)))
@@ -280,7 +280,7 @@ impl ProgressReporter {
             InitProgress::Scanning { scanned } => {
                 format!(r#"{{"phase":"scanning","scanned":{scanned},"elapsed_s":{secs}}}"#)
             }
-            InitProgress::Indexing { done, total } => {
+            InitProgress::Indexing { done, total, .. } => {
                 format!(
                     r#"{{"phase":"indexing","done":{done},"total":{total},"elapsed_s":{secs}}}"#
                 )
@@ -310,12 +310,37 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
         return;
     }
 
+    let skipped = stats.files_skipped_unchanged + stats.files_skipped_ignored;
+    let skipped_note = if skipped > 0 {
+        format!(" ({} skipped)", commas(skipped))
+    } else {
+        String::new()
+    };
     println!(
-        "  {node} indexed {} files · {} nodes · {} edges · {dur}",
+        "  {node} indexed {} files{skipped_note} · {} nodes · {} edges · {dur}",
         commas(stats.files_indexed),
         commas(stats.nodes_written.max(0) as u64),
         commas(stats.edges_written),
     );
+
+    // Phase B absent notice — surfaces when an analyzer was not found.
+    if let Some(ref report) = stats.phase_b_report {
+        if !report.skipped_absent.is_empty() {
+            let langs = report.skipped_absent.join(", ");
+            println!(
+                "  {} note: Phase B skipped for {langs} (analyzer not found) — Phase-A-only",
+                pal.dim("ℹ"),
+            );
+        }
+    }
+
+    if stats.travsrignore_scaffolded {
+        println!(
+            "  {} created .travsrignore — customize to exclude generated dirs, vendored deps, etc.",
+            pal.dim("ℹ"),
+        );
+    }
+
     if !quiet {
         println!(
             "    {}",

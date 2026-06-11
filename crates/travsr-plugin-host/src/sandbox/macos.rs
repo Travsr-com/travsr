@@ -117,7 +117,7 @@ pub fn build_sandboxed_command(
     // Network: Standard → deny; Elevated → allow (coarse — sandbox-exec has no
     // per-host filtering; enforce via egress proxy / firewall at the OS level).
     let network_rule = match policy {
-        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => "(deny network*)".to_string(),
+        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => "(allow network*)".to_string(),
         SandboxPolicy::Elevated {
             permitted_hosts, ..
         } => {

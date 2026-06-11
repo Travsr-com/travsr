@@ -127,7 +127,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
     register!(
         TypeScriptPlugin,
         "typescript",
-        &["ts", "tsx", "mts", "cts"],
+        &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
         true
     );
     register!(RustPlugin, "rust", &["rs"], true);

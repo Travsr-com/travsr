@@ -7,6 +7,14 @@ use std::path::Path;
 use travsr_error::IndexError;
 use travsr_indexer::{hash_file, ParseOutput};
 
+/// Per-language Phase B outcome reported by [`PluginIndexer::invoke_phase_b_all`].
+#[derive(Debug, Default, Clone)]
+pub struct PhaseBOutcome {
+    pub ran: Vec<String>,
+    pub skipped_absent: Vec<String>,
+    pub skipped_unregistered: Vec<String>,
+}
+
 /// Drop-in replacement for travsr_indexer::Indexer.
 /// Routes files through the plugin Dispatcher, caches results by
 /// (plugin_version, sha256(file)) — both daemon-computed per ADR-017 Rule 5.
@@ -69,7 +77,11 @@ impl PluginIndexer {
     pub fn invoke_phase_b_all(
         &self,
         repo_root: &std::path::Path,
-    ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
+    ) -> (
+        Vec<travsr_core::Node>,
+        Vec<travsr_core::Edge>,
+        PhaseBOutcome,
+    ) {
         // Gate Phase B per language against lang.toml registration.
         // `travsr lang remove <lang>` writes registered=[] which must be respected here.
         let registered: std::collections::HashSet<String> =
@@ -98,6 +110,7 @@ impl PluginIndexer {
 
         let mut all_nodes = Vec::new();
         let mut all_edges = Vec::new();
+        let mut outcome = PhaseBOutcome::default();
 
         let providable = resolver.providable_languages();
         tracing::debug!(
@@ -117,12 +130,37 @@ impl PluginIndexer {
                     "Phase B skipped for '{}' — not registered in lang.toml",
                     lang
                 );
+                outcome.skipped_unregistered.push(lang.clone());
                 continue;
             }
+            // Dart AOT emitter crashes with SIGABRT when spawned as a nested
+            // subprocess inside the sandboxed sidecar. Call it directly from
+            // the daemon process where HOME and the full env are intact.
+            if lang == "dart" {
+                match travsr_indexer::phase_b_native_dart(&self.corpus, repo_root) {
+                    Ok((nodes, edges)) => {
+                        tracing::debug!(
+                            nodes = nodes.len(),
+                            edges = edges.len(),
+                            "Phase B: native dart complete"
+                        );
+                        all_nodes.extend(nodes);
+                        all_edges.extend(edges);
+                        outcome.ran.push(lang.clone());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Phase B dart: {e:#}");
+                        outcome.skipped_absent.push(lang.clone());
+                    }
+                }
+                continue;
+            }
+
             let spec = match resolver.resolve(&lang) {
                 Some(s) => s,
                 None => {
-                    tracing::debug!(lang = %lang, "Phase B: resolver returned None for lang");
+                    tracing::debug!(lang = %lang, "Phase B: resolver returned None (analyzer absent)");
+                    outcome.skipped_absent.push(lang.clone());
                     continue;
                 }
             };
@@ -150,17 +188,25 @@ impl PluginIndexer {
                         );
                         all_nodes.extend(resp.nodes);
                         all_edges.extend(resp.edges);
+                        outcome.ran.push(lang.clone());
                     }
                     Err(travsr_error::IndexError::PhaseNotSupported) => {
                         tracing::debug!(lang = %lang, "Phase B: PhaseNotSupported (sidecar declined)");
+                        outcome.skipped_absent.push(lang.clone());
                     }
-                    Err(e) => tracing::warn!("Phase B {lang}: {e}"),
+                    Err(e) => {
+                        tracing::warn!("Phase B {lang}: {e}");
+                        outcome.skipped_absent.push(lang.clone());
+                    }
                 },
-                Err(e) => tracing::warn!("Phase B sidecar spawn {lang}: {e}"),
+                Err(e) => {
+                    tracing::warn!("Phase B sidecar spawn {lang}: {e}");
+                    outcome.skipped_absent.push(lang.clone());
+                }
             }
         }
 
-        (all_nodes, all_edges)
+        (all_nodes, all_edges, outcome)
     }
 
     /// Resolve cross-language FFI edges from accumulated markers.

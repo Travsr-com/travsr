@@ -43,6 +43,9 @@ enum Command {
         /// Emit machine-readable JSON (summary on stdout, progress on stderr).
         #[arg(long)]
         json: bool,
+        /// Number of parallel parse workers (default: available CPU cores).
+        #[arg(long, value_name = "N")]
+        jobs: Option<usize>,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -322,7 +325,7 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init { quiet, json } => init::run(quiet, json)?,
+        Command::Init { quiet, json, jobs } => init::run(quiet, json, jobs)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;

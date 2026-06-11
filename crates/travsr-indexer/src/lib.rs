@@ -12,6 +12,7 @@ mod ffi_resolver;
 mod go;
 mod hash;
 pub mod lsif;
+pub mod phase_b_dart;
 pub mod phase_b_python;
 pub mod phase_b_rust;
 pub mod phase_b_typescript;
@@ -65,6 +66,16 @@ pub fn go_parse(
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
     go::parse(corpus, path, vname_path)
+}
+
+/// Native Phase B for Dart: calls travsr-dart-index-emitter directly.
+/// Bypasses the travsr-lang-dart sidecar to avoid a Dart AOT SIGABRT that
+/// occurs when the emitter is a nested subprocess of the sandboxed sidecar.
+pub fn phase_b_native_dart(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_dart::extract_native_phase_b(corpus, root)
 }
 
 /// Native Phase B for Rust: Cargo.toml dep graph + tree-sitter call edges.
