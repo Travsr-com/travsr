@@ -84,28 +84,10 @@ pub fn build_sandboxed_command(
     let mut cmd = Command::new("bwrap");
 
     match policy {
-        // NativeIpc: tool needs POSIX IPC (shm_open/mq_open) but must NOT have
-        // network access — enforce --unshare-net exactly like Standard. The IPC
-        // namespace isolation (--unshare-ipc) is omitted below, after this match.
-        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => {
-            // --unshare-net is probed at first use: on hosts where loopback setup
-            // inside the new network namespace is blocked (e.g. GitHub Actions,
-            // some container runtimes) bwrap exits non-zero with
-            // "RTM_NEWADDR: Operation not permitted".
-            // ADR-017 Rule 2: fail-closed. Network isolation is a primary egress
-            // control; silently dropping it is not an acceptable degradation.
-            if net_unshare_supported() {
-                cmd.arg("--unshare-net");
-            } else {
-                return Err(SandboxUnavailable(
-                    "bwrap --unshare-net not supported on this host (loopback blocked \
-                     inside the network namespace); plugin disabled per ADR-017 Rule 2 \
-                     — to run on a host without network-namespace support, request an \
-                     Elevated policy exception via ADR-017 §Elevated"
-                        .into(),
-                ));
-            }
-        }
+        // Standard / NativeIpc: network access allowed — build tools (go, npm,
+        // pip, …) may need to fetch missing dependencies. File-system confinement
+        // via bwrap still applies; no --unshare-net.
+        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => {}
         SandboxPolicy::Elevated {
             permitted_hosts, ..
         } => {

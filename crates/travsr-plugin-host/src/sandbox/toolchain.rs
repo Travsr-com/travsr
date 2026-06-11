@@ -694,6 +694,20 @@ fn go_access() -> ToolchainAccess {
         write_paths.push(p.clone()); // `go build` writes compiled artifacts here
         env.push(("GOCACHE".to_string(), p.to_string_lossy().into_owned()));
     }
+    // GOROOT: the Go standard library. scip-go's type checker reads stdlib
+    // source for cross-package type resolution. Missing on large repos (e.g.
+    // Kubernetes 2255 packages) causes the sandbox to block stdlib reads and
+    // scip-go to exit silently with 0 edges despite a successful handshake.
+    let goroot = std::env::var("GOROOT")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| run_cmd_stdout("go", &["env", "GOROOT"]).map(|s| PathBuf::from(s.trim())));
+    if let Some(ref p) = goroot {
+        tracing::debug!(path = %p.display(), "go_access: GOROOT grant (stdlib for type checker)");
+        read_paths.push(p.clone());
+        env.push(("GOROOT".to_string(), p.to_string_lossy().into_owned()));
+    }
+
     if let Some(h) = home() {
         // Go tooling consults $HOME for defaults; pass it through.
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
