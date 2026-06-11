@@ -865,6 +865,11 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Search nodes by name substring, ranked best-first.
+    ///
+    /// Results are ordered by match quality (exact > prefix > substring), then
+    /// production-file bias (test and vendor paths rank lower), then path length.
+    /// At most 100 results are returned.
     pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>, StoreError> {
         // Log the query name (symbol/path, not file contents — SEC log-redaction rule).
         let _span = tracing::debug_span!("store.search_nodes_by_name", query = name).entered();
@@ -872,9 +877,28 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line \
-                     FROM nodes WHERE signature LIKE '%' || ?1 || '%' \
-                        OR path LIKE '%' || ?1 || '%'",
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line,
+  (
+    CASE
+      WHEN signature = ?1 THEN 0
+      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 THEN 10
+      WHEN signature LIKE ?1 || '%' THEN 20
+      WHEN path = ?1 THEN 5
+      WHEN path LIKE '%/' || ?1 THEN 15
+      ELSE 40
+    END
+    + CASE WHEN path LIKE '%_test.go' OR path LIKE '%test/%'
+           OR path LIKE '%.test.%' OR path LIKE '%_test.%'
+           OR path LIKE 'tests/%' OR path LIKE '%/tests/%' THEN 25 ELSE 0 END
+    + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
+           OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
+    + (LENGTH(path) / 32)
+  ) AS rank
+FROM nodes
+WHERE signature LIKE '%' || ?1 || '%'
+   OR path LIKE '%' || ?1 || '%'
+ORDER BY rank ASC, id ASC
+LIMIT 100",
                 )
                 .context("preparing search query")?;
 
@@ -2419,6 +2443,84 @@ mod tests {
         let results = store.search_nodes_by_name("charge").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].vname.signature, "fn:charge");
+    }
+
+    #[test]
+    fn search_ranks_exact_signature_first() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&node_with_path("pkg/eviction/handler.go", "fn:eviction"))
+            .unwrap();
+        store
+            .put_node(&node_with_path(
+                "pkg/eviction/mock_test.go",
+                "fn:eviction_test",
+            ))
+            .unwrap();
+        let results = store.search_nodes_by_name("eviction").unwrap();
+        // exact signature match must rank first
+        assert_eq!(results[0].vname.signature, "fn:eviction");
+    }
+
+    #[test]
+    fn search_ranks_production_over_test_path() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // Both signatures are identical substrings so match-quality tier is equal;
+        // only the test-path penalty (+25) should differentiate them.
+        store
+            .put_node(&node_with_path("pkg/eviction/mock_test.go", "fn:handleX"))
+            .unwrap();
+        store
+            .put_node(&node_with_path("pkg/eviction/handler.go", "fn:handleY"))
+            .unwrap();
+        let results = store.search_nodes_by_name("handle").unwrap();
+        // production file must rank ahead of test file
+        assert_eq!(results[0].vname.path, "pkg/eviction/handler.go");
+    }
+
+    #[test]
+    fn search_ranks_vendor_last() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&node_with_path("vendor/lib/util.go", "fn:util"))
+            .unwrap();
+        store
+            .put_node(&node_with_path("src/util.go", "fn:util2"))
+            .unwrap();
+        let results = store.search_nodes_by_name("util").unwrap();
+        // vendor path must rank below production
+        assert_eq!(results[0].vname.path, "src/util.go");
+    }
+
+    #[test]
+    fn search_limit_caps_results() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for i in 0..150u32 {
+            store
+                .put_node(&node_with_path(
+                    &format!("src/file{i}.go"),
+                    &format!("fn:target_{i}"),
+                ))
+                .unwrap();
+        }
+        let results = store.search_nodes_by_name("target").unwrap();
+        assert!(results.len() <= 100);
+    }
+
+    #[test]
+    fn search_rank_deterministic_tiebreak() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // Two nodes with identical rank (same path pattern, same sig pattern)
+        store
+            .put_node(&node_with_path("src/a.go", "fn:foo"))
+            .unwrap();
+        store
+            .put_node(&node_with_path("src/b.go", "fn:foo"))
+            .unwrap();
+        let r1 = store.search_nodes_by_name("foo").unwrap();
+        let r2 = store.search_nodes_by_name("foo").unwrap();
+        // Order must be deterministic across two calls
+        assert_eq!(r1[0].vname.path, r2[0].vname.path);
     }
 
     #[test]
