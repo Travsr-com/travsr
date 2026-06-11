@@ -1044,6 +1044,105 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
     }
+
+    /// Write Phase B (SCIP/LSIF semantic) nodes and edges in a single transaction.
+    ///
+    /// Semantics match repeated `put_node` + `put_edge_lsif` calls but in one
+    /// round-trip instead of O(N) transactions. Call this after `invoke_phase_b_all`
+    /// returns; the caller must not hold an open transaction.
+    pub fn write_phase_b_batch(
+        &mut self,
+        nodes: &[travsr_core::Node],
+        edges: &[travsr_core::Edge],
+    ) -> anyhow::Result<()> {
+        if nodes.is_empty() && edges.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("write_phase_b_batch: begin")?;
+        for node in nodes {
+            let id_i64 = node_id_to_i64(node.id);
+            tx.execute(
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
+                 package = excluded.package, \
+                 line = COALESCE(excluded.line, nodes.line)",
+                params![
+                    id_i64,
+                    node.vname.corpus,
+                    node.vname.root,
+                    node.vname.path,
+                    node.vname.language,
+                    node.vname.signature,
+                    node.kind,
+                    node.package,
+                    node.line.map(|l| l as i64),
+                ],
+            )
+            .context("write_phase_b_batch: insert node")?;
+            Self::put_node_fts(&tx, node).context("write_phase_b_batch: put_node_fts")?;
+        }
+        for edge in edges {
+            tx.execute(
+                "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                 VALUES(?1, ?2, ?3, 'lsif', ?4) \
+                 ON CONFLICT(src, dst, kind) DO UPDATE SET \
+                 provenance = 'lsif', confidence = excluded.confidence",
+                params![
+                    node_id_to_i64(edge.src),
+                    node_id_to_i64(edge.dst),
+                    edge.kind.as_str(),
+                    edge.confidence.map(|c| c as i64),
+                ],
+            )
+            .context("write_phase_b_batch: insert edge")?;
+        }
+        tx.commit().context("write_phase_b_batch: commit")
+    }
+
+    /// Emit `Depends` edges between all ordered file-node pairs that co-define
+    /// the same package/module node, using a single SQL self-join.
+    ///
+    /// Languages whose files share a namespace without explicit imports (Go,
+    /// Swift, Kotlin, Java, Dart) emit a package node during Phase A that every
+    /// file in the package points at via `DefinesBinding`. This pass finds all
+    /// such groups and writes `file_B --Depends--> file_A` for every ordered
+    /// pair (B ≠ A), giving blast-radius BFS structural co-package coupling.
+    ///
+    /// `pkg_kinds` must contain only internal kind strings (e.g. `"go-pkg"`,
+    /// `"swift-module"`) — never values derived from user input.
+    ///
+    /// Returns the number of new edges inserted (`INSERT OR IGNORE` skips
+    /// existing rows).
+    pub fn emit_copackage_depends(&mut self, pkg_kinds: &[&str]) -> anyhow::Result<usize> {
+        if pkg_kinds.is_empty() {
+            return Ok(0);
+        }
+        // All values come from internal constants — no user input reaches here.
+        let in_clause = pkg_kinds
+            .iter()
+            .map(|s| format!("'{}'", s.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT OR IGNORE INTO edges(src, dst, kind, provenance, confidence) \
+             SELECT DISTINCT a.src, b.src, 'depends', 'tree-sitter', NULL \
+             FROM edges a \
+             JOIN edges b   ON a.dst = b.dst AND a.src != b.src \
+             JOIN nodes pkg ON pkg.id = a.dst AND pkg.kind IN ({in_clause}) \
+             JOIN nodes fa  ON fa.id = a.src  AND fa.kind = 'file' \
+             JOIN nodes fb  ON fb.id = b.src  AND fb.kind = 'file' \
+             WHERE a.kind = 'defines/binding' \
+               AND b.kind = 'defines/binding'"
+        );
+        self.conn
+            .execute(&sql, [])
+            .context("emit_copackage_depends")?;
+        Ok(self.conn.changes() as usize)
+    }
 }
 
 // ── StoreMigratable (T3) ──────────────────────────────────────────────────────
