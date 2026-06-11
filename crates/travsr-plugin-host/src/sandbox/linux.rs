@@ -8,49 +8,6 @@ use std::process::Command;
 /// Permitted env vars (ADR-017 Rule 1). TMPDIR set by caller to scratch dir.
 pub const ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL"];
 
-/// Cached probe: does `bwrap --unshare-net` succeed on this host?
-///
-/// GitHub Actions Ubuntu 24.04 runners disallow `RTM_NEWADDR` inside a new
-/// network namespace, so bwrap exits non-zero when it tries to bring up the
-/// loopback interface. We probe once, cache the result, and skip `--unshare-net`
-/// when it is not supported rather than aborting the sandbox invocation.
-#[cfg(target_os = "linux")]
-static NET_UNSHARE_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-#[cfg(target_os = "linux")]
-fn net_unshare_supported() -> bool {
-    *NET_UNSHARE_OK.get_or_init(|| {
-        // Mount /lib and /lib64 alongside /usr so the dynamic linker
-        // (/lib64/ld-linux-x86-64.so.2) is reachable inside the probe sandbox.
-        // On merged-usr systems these are host symlinks → /usr/lib{,64}; they
-        // don't appear automatically inside bwrap's fresh tmpfs root.
-        Command::new("bwrap")
-            .args([
-                "--unshare-net",
-                "--ro-bind-try",
-                "/usr",
-                "/usr",
-                "--ro-bind-try",
-                "/lib",
-                "/lib",
-                "--ro-bind-try",
-                "/lib64",
-                "/lib64",
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--",
-                "true",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
-}
-
 #[cfg(target_os = "linux")]
 pub fn build_sandboxed_command(
     program: &str,
