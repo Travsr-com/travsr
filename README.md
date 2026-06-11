@@ -470,6 +470,42 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 
 ## Changelog
 
+### v0.9.0 (2026-06-11)
+
+**travsr binary (npm: v0.9.0)**
+
+- Add native Phase B semantic indexing for Rust, TypeScript, and Python (no external SCIP tools required)
+- Add Phase B support for Kotlin via Kotlin Language Server with ZipBinary install
+- Add Phase B support for Swift and Dart: Phase A tree-sitter configs and GithubBinary install
+- Add Phase B support for Java: sandbox, resolver, and edge wiring end-to-end
+- Add Phase B support for C#: dotnet tools PATH check and toolchain grants
+- Add Phase B support for Scala: sbt catalog
+- Add .travsrignore support for excluding paths during `travsr init`
+- Add live progress UI during `travsr init` with parallel batched indexing
+- Add branded `--help` logo
+- Add blast radius Phase 2 and 3: ImportResolver for 14 languages and Go intra-package co-file edges
+- Add Tree-sitter vs Semantic toggle for the blast radius view
+- Add native_phase_b flag for per-language configuration
+- Allow network access in Phase B sandboxes; display live schema version in `travsr status`
+- Fix Dart Phase B: bypass sidecar, call emitter directly
+- Fix bwrap network isolation enforcement on Linux NativeIpc sandbox
+- Fix bulk_init: create _bulk_fts_pending table before write_file_graphs_batch
+- Fix generalized co-package pass and Phase B batch writes
+- Fix JS/TS file extension handling, Dart sandbox, and Phase B edge writes
+
+**VS Code extension (vscode-v0.8.0)**
+
+- Add JavaScript and C# to codelens and hover selectors
+- Add Tree-sitter vs Semantic toggle in blast radius webview
+- Extend hover and codelens selectors to all 13 indexed languages
+- Fix re-index triggering, panel refresh, and test regressions
+- Fix stale language list refresh and status bar .travsr watcher
+- Fix MCP envelope leaking into file lists
+- Fix blast radius depth slider and corpus auto-trust
+- Update bundled binary reference to v0.9.0
+
+---
+
 ### v0.8.0 (2026-06-06)
 
 **travsr binary (npm: v0.8.0)**
