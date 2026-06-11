@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.1] — 2026-06-11
+
+### Changed
+
+- Update bundled binary reference to v0.9.1.
+
 ## [0.8.0] — 2026-06-11
 
 ### Added

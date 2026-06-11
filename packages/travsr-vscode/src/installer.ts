@@ -14,7 +14,7 @@ import * as https from "https";
 import * as os from "os";
 import * as path from "path";
 
-export const DOWNLOAD_VERSION = "0.9.0";
+export const DOWNLOAD_VERSION = "0.9.1";
 
 const TARGET_MAP: Partial<Record<string, Partial<Record<string, string>>>> = {
   linux:  { x64: "x86_64-unknown-linux-gnu",  arm64: "aarch64-unknown-linux-gnu" },

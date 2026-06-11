@@ -470,6 +470,18 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 
 ## Changelog
 
+### v0.9.1 (2026-06-11)
+
+**travsr binary (npm: v0.9.1)**
+
+- Fix `travsr --version` reporting stale version number: Cargo.toml workspace version was not bumped in v0.9.0, causing the compiled binary to report `0.7.0` instead of `0.9.0`. No functional changes.
+
+**VS Code extension (vscode-v0.8.1)**
+
+- Update bundled binary reference to v0.9.1.
+
+---
+
 ### v0.9.0 (2026-06-11)
 
 **travsr binary (npm: v0.9.0)**
