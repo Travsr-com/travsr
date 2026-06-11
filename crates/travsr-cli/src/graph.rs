@@ -39,6 +39,13 @@ pub enum EdgeMode {
     All,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TraversalOpts {
+    direction: Direction,
+    edge_mode: EdgeMode,
+    include_noise: bool,
+}
+
 pub fn run(
     query: &str,
     depth: u8,
@@ -68,29 +75,24 @@ pub fn run(
         .find(|n| n.kind == "file")
         .unwrap_or(&matches[0]);
 
+    let opts = TraversalOpts {
+        direction,
+        edge_mode,
+        include_noise,
+    };
+
     match format {
         Format::Tree => {
             println!("{} ({})", display_label(seed), seed.kind);
             let mut visited = HashSet::new();
             visited.insert(seed.id);
-            print_tree(
-                &store,
-                seed.id,
-                depth,
-                0,
-                direction,
-                &mut visited,
-                "",
-                edge_mode,
-                include_noise,
-            )?;
+            print_tree(&store, seed.id, depth, 0, &mut visited, "", opts)?;
         }
         Format::Dot => {
-            print_dot(&store, seed.id, depth, direction, edge_mode, include_noise)?;
+            print_dot(&store, seed.id, depth, opts)?;
         }
         Format::Json => {
-            let (nodes_map, edges) =
-                collect_graph(&store, seed.id, depth, direction, edge_mode, include_noise)?;
+            let (nodes_map, edges) = collect_graph(&store, seed.id, depth, opts)?;
             print_json(&store, Some(seed), &nodes_map, &edges)?;
         }
     }
@@ -103,17 +105,15 @@ fn print_tree(
     node_id: NodeId,
     max_depth: u8,
     depth: u8,
-    direction: Direction,
     visited: &mut HashSet<NodeId>,
     prefix: &str,
-    edge_mode: EdgeMode,
-    include_noise: bool,
+    opts: TraversalOpts,
 ) -> anyhow::Result<()> {
     if depth >= max_depth {
         return Ok(());
     }
 
-    let edges = next_edges(store, node_id, direction, edge_mode)?;
+    let edges = next_edges(store, node_id, opts.direction, opts.edge_mode)?;
 
     let children: Vec<(String, NodeId)> = edges
         .into_iter()
@@ -131,7 +131,7 @@ fn print_tree(
         let extension = if is_last { "    " } else { "│   " };
 
         if let Some(child) = store.get_node(*child_id)? {
-            if !include_noise && is_noise_node(&child) {
+            if !opts.include_noise && is_noise_node(&child) {
                 continue;
             }
             println!(
@@ -145,11 +145,9 @@ fn print_tree(
                 *child_id,
                 max_depth,
                 depth + 1,
-                direction,
                 visited,
                 &format!("{prefix}{extension}"),
-                edge_mode,
-                include_noise,
+                opts,
             )?;
         }
     }
@@ -161,18 +159,9 @@ fn print_dot(
     store: &SqliteStore,
     seed_id: NodeId,
     max_depth: u8,
-    direction: Direction,
-    edge_mode: EdgeMode,
-    include_noise: bool,
+    opts: TraversalOpts,
 ) -> anyhow::Result<()> {
-    let (nodes_map, raw_edges) = collect_graph(
-        store,
-        seed_id,
-        max_depth,
-        direction,
-        edge_mode,
-        include_noise,
-    )?;
+    let (nodes_map, raw_edges) = collect_graph(store, seed_id, max_depth, opts)?;
     print_dot_from_map(&nodes_map, &raw_edges)
 }
 
@@ -399,9 +388,7 @@ fn collect_graph(
     store: &SqliteStore,
     seed_id: NodeId,
     max_depth: u8,
-    direction: Direction,
-    edge_mode: EdgeMode,
-    include_noise: bool,
+    opts: TraversalOpts,
 ) -> anyhow::Result<GraphData> {
     let mut nodes_map: HashMap<NodeId, (Node, u8)> = HashMap::new();
     let mut edge_list: Vec<(NodeId, NodeId, String, String)> = Vec::new();
@@ -420,8 +407,8 @@ fn collect_graph(
             continue;
         }
 
-        for (edge_kind, next_id) in next_edges(store, current_id, direction, edge_mode)? {
-            let (src, dst) = match direction {
+        for (edge_kind, next_id) in next_edges(store, current_id, opts.direction, opts.edge_mode)? {
+            let (src, dst) = match opts.direction {
                 Direction::Callers => (next_id, current_id),
                 _ => (current_id, next_id),
             };
@@ -432,8 +419,8 @@ fn collect_graph(
 
             if !visited.contains(&next_id) {
                 if let Some(next_node) = store.get_node(next_id)? {
-                    if !include_noise && is_noise_node(&next_node) {
-                        visited.insert(next_id); // mark visited so we don't revisit
+                    if !opts.include_noise && is_noise_node(&next_node) {
+                        visited.insert(next_id);
                         continue;
                     }
                 }
