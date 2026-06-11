@@ -576,6 +576,18 @@ impl SqliteStore {
         bulk: bool,
     ) -> Result<BatchWriteCounts, StoreError> {
         (|| -> AnyResult<BatchWriteCounts> {
+            // _bulk_fts_pending is a temp table populated by put_node_fts_map_only
+            // and consumed by rebuild_fts_from_map. Create it here so the table
+            // exists for the duration of this call even when begin_bulk_fts_tracking
+            // was not called explicitly by the caller.
+            if bulk {
+                self.conn
+                    .execute_batch(
+                        "CREATE TEMP TABLE IF NOT EXISTS _bulk_fts_pending \
+                         (node_id INTEGER PRIMARY KEY);",
+                    )
+                    .context("creating _bulk_fts_pending temp table")?;
+            }
             let tx = self
                 .conn
                 .transaction()
