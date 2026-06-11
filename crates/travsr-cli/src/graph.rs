@@ -132,6 +132,7 @@ fn print_tree(
 
         if let Some(child) = store.get_node(*child_id)? {
             if !opts.include_noise && is_noise_node(&child) {
+                visited.insert(*child_id);
                 continue;
             }
             println!(

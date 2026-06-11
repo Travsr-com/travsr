@@ -461,6 +461,7 @@ pub fn is_noise_node(node: &Node) -> bool {
     let p = &node.vname.path;
     p.starts_with("third_party/")
         || p.starts_with("vendor/")
+        || p.starts_with("node_modules/")
         || p.contains("/node_modules/")
         || is_scip_anonymous_local(&node.vname.signature)
 }
@@ -1197,5 +1198,20 @@ mod tests {
             "function",
         );
         assert!(!is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_root_node_modules() {
+        let n = Node::new(
+            VName::new(
+                "",
+                "",
+                "node_modules/react/index.js",
+                "typescript",
+                "fn:createElement",
+            ),
+            "function",
+        );
+        assert!(is_noise_node(&n));
     }
 }
