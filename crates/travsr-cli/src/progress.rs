@@ -332,6 +332,13 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
                 pal.dim("ℹ"),
             );
         }
+        if !report.crashed.is_empty() {
+            let langs = report.crashed.join(", ");
+            println!(
+                "  {} note: Phase B crashed for {langs} — Phase-A-only (rerun with RUST_LOG=travsr_plugin_host=debug for details)",
+                pal.dim("⚠"),
+            );
+        }
     }
 
     if stats.travsrignore_scaffolded {

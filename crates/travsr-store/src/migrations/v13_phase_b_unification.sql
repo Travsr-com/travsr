@@ -28,3 +28,9 @@ CREATE TABLE IF NOT EXISTS edge_sites (
 
 CREATE INDEX IF NOT EXISTS idx_edge_sites_src_dst
     ON edge_sites(src, dst, kind);
+
+-- G1/G2 lookups probe nodes by (corpus, path) per SCIP ref — on a monorepo
+-- that is millions of probes, and without this index each one is a full
+-- table scan over every node (hours on kubernetes; minutes with it).
+CREATE INDEX IF NOT EXISTS idx_nodes_corpus_path
+    ON nodes(corpus, path);

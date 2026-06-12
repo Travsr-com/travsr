@@ -56,6 +56,8 @@ pub struct PhaseBReport {
     pub skipped_absent: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
+    /// Languages whose analyzer spawned but died or errored mid-invoke.
+    pub crashed: Vec<String>,
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -742,6 +744,7 @@ pub fn init_repo_with_progress(
             ran: pb_outcome.ran,
             skipped_absent: pb_outcome.skipped_absent,
             skipped_unregistered: pb_outcome.skipped_unregistered,
+            crashed: pb_outcome.crashed,
         }
     };
 

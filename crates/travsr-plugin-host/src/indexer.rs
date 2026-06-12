@@ -13,6 +13,10 @@ pub struct PhaseBOutcome {
     pub ran: Vec<String>,
     pub skipped_absent: Vec<String>,
     pub skipped_unregistered: Vec<String>,
+    /// Languages whose analyzer was found and spawned but died or errored
+    /// mid-invoke. Distinct from `skipped_absent` so the CLI doesn't report
+    /// a crash as "analyzer not found".
+    pub crashed: Vec<String>,
 }
 
 /// Drop-in replacement for travsr_indexer::Indexer.
@@ -206,12 +210,14 @@ impl PluginIndexer {
                     }
                     Err(e) => {
                         tracing::warn!("Phase B {lang}: {e}");
-                        outcome.skipped_absent.push(lang.clone());
+                        outcome.crashed.push(lang.clone());
                     }
                 },
                 Err(e) => {
+                    // The analyzer binary WAS found (resolver confirmed it) —
+                    // failing to spawn it is a crash-class failure, not absence.
                     tracing::warn!("Phase B sidecar spawn {lang}: {e}");
-                    outcome.skipped_absent.push(lang.clone());
+                    outcome.crashed.push(lang.clone());
                 }
             }
         }

@@ -222,22 +222,19 @@ impl Migration for V13PhaseBUnification {
         // symbol_aliases + edge_sites: CREATE TABLE IF NOT EXISTS is idempotent.
         store.exec_ddl(include_str!("migrations/v13_phase_b_unification.sql"))?;
         // G3: delete SCIP anonymous-local nodes and their incident edges.
-        // Matches signatures containing "local " followed only by digits at the end.
-        // Uses two LIKE patterns joined by INTERSECT to approximate the regex
-        // `^.*local [0-9]+$` without requiring a REGEXP extension.
+        // SCIP ingest stores these with signature `scip:<path>:local <N>`, so
+        // the pattern must match "local " mid-string after a colon — GLOB
+        // `*local [0-9]*` covers that without a REGEXP extension. (The ingest
+        // path in scip-reader also drops locals; this cleans up DBs written
+        // before that filter existed.)
         store.exec_ddl(
             "DELETE FROM edges WHERE src IN (\
-               SELECT id FROM nodes WHERE signature LIKE '% local %' \
-                 OR signature LIKE 'local %'\
+               SELECT id FROM nodes WHERE signature GLOB '*local [0-9]*'\
              ) OR dst IN (\
-               SELECT id FROM nodes WHERE signature LIKE '% local %' \
-                 OR signature LIKE 'local %'\
+               SELECT id FROM nodes WHERE signature GLOB '*local [0-9]*'\
              )",
         )?;
-        store.exec_ddl(
-            "DELETE FROM nodes WHERE signature LIKE '% local %' \
-               OR signature LIKE 'local %'",
-        )?;
+        store.exec_ddl("DELETE FROM nodes WHERE signature GLOB '*local [0-9]*'")?;
         // O7: reclaim freed pages from G3 deletions.  WAL checkpoint first so the
         // VACUUM can compact the database file (VACUUM is a no-op while WAL frames
         // are not yet flushed to the main file).
@@ -1243,12 +1240,10 @@ LIMIT 100",
                 .optional()
                 .context("write_scip_attributed_batch: enclosing fn lookup")?;
 
-            let caller_id = src_id.unwrap_or_else(|| {
-                // Fall back to file node — same VName as tree-sitter emits.
-                let file_id =
-                    travsr_core::VName::new(corpus, "", &scip_ref.caller_path, "", "file").id();
-                node_id_to_i64(file_id)
-            });
+            let caller_id = match src_id {
+                Some(id) => id,
+                None => file_node_for_attribution(&tx, corpus, &scip_ref.caller_path)?,
+            };
 
             let callee_id = node_id_to_i64(scip_ref.callee_id);
             tx.execute(
@@ -2409,6 +2404,52 @@ impl Store for SqliteStore {
         }
         Ok(out)
     }
+}
+
+/// G2 fallback: resolve the file node id for a SCIP ref whose enclosing
+/// function could not be found.
+///
+/// Looks up the real Phase A file node by `(corpus, path, kind='file')` —
+/// never reconstructs the VName hash, which silently diverges when fields
+/// like `language` differ (the cause of 385K dangling edges on kubernetes).
+/// If the path was never Phase-A-indexed (`.travsrignore` etc.), synthesizes
+/// a file node matching the Phase A VName convention so the edge has a real
+/// src; the language is taken from any sibling node at the same path (SCIP
+/// definition nodes for the path are inserted earlier in this transaction).
+fn file_node_for_attribution(
+    tx: &rusqlite::Transaction<'_>,
+    corpus: &str,
+    path: &str,
+) -> anyhow::Result<i64> {
+    if let Some(id) = tx
+        .query_row(
+            "SELECT id FROM nodes WHERE corpus = ?1 AND path = ?2 AND kind = 'file' LIMIT 1",
+            params![corpus, path],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("file_node_for_attribution: lookup")?
+    {
+        return Ok(id);
+    }
+    let language: String = tx
+        .query_row(
+            "SELECT language FROM nodes WHERE corpus = ?1 AND path = ?2 LIMIT 1",
+            params![corpus, path],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("file_node_for_attribution: sibling language")?
+        .unwrap_or_default();
+    let vname = travsr_core::VName::new(corpus, "", path, &language, "file");
+    let id = node_id_to_i64(vname.id());
+    tx.execute(
+        "INSERT OR IGNORE INTO nodes(id, corpus, root, path, language, signature, kind, package) \
+         VALUES(?1, ?2, '', ?3, ?4, 'file', 'file', '')",
+        params![id, corpus, path, language],
+    )
+    .context("file_node_for_attribution: insert file node")?;
+    Ok(id)
 }
 
 fn node_id_to_i64(id: NodeId) -> i64 {
