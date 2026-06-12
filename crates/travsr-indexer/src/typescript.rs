@@ -282,7 +282,10 @@ fn has_napi_package_json(abs_path: &std::path::Path) -> bool {
 fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let mut current = node.parent()?;
     loop {
-        if matches!(current.kind(), "class_declaration" | "class") {
+        if matches!(
+            current.kind(),
+            "class_declaration" | "class" | "abstract_class_declaration"
+        ) {
             let name = (0..current.child_count())
                 .filter_map(|i| current.child(i as u32))
                 .find(|child| child.kind() == "type_identifier")
@@ -348,6 +351,35 @@ mod tests {
         assert!(
             err.contains("giant.ts"),
             "error message must include the file path: {err}"
+        );
+    }
+
+    // Methods of abstract classes must be qualified by the class name, not
+    // `<anonymous>` — find_parent_class_name must recognise
+    // `abstract_class_declaration` (verified in tree-sitter-typescript
+    // node-types.json for both typescript/ and tsx/ dialects).
+    #[test]
+    fn abstract_class_method_is_qualified_by_class_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.ts");
+        std::fs::write(&path, "export abstract class Base { foo(): void {} }").unwrap();
+
+        let out = parse("", &path, "base.ts").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "class:Base" && n.kind == "class"),
+            "expected class:Base node for abstract class"
+        );
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "method:Base.foo" && n.kind == "method"),
+            "expected method:Base.foo, got: {:?}",
+            out.nodes
+                .iter()
+                .map(|n| n.vname.signature.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

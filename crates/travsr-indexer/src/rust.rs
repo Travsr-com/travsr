@@ -234,6 +234,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.nodes.push(node);
                 }
                 "type.name" => {
+                    // Associated types (`type Item = X;` inside an impl or trait
+                    // body) are projections, not standalone type definitions —
+                    // two impls in one file would emit colliding file-level
+                    // `type:Item` VNames, and SCIP namespaces them differently
+                    // so G1 unification could never match them. Skip entirely.
+                    if has_impl_or_trait_ancestor(capture.node) {
+                        continue;
+                    }
                     let node = rust_type_node(corpus, vname_path, text)
                         .with_line(line)
                         .with_end_line(decl_end_line(capture.node));
@@ -280,6 +288,23 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     output.ffi_markers = ffi_markers;
 
     Ok(output)
+}
+
+/// Returns true if any ancestor of `node` is an `impl_item` or `trait_item`
+/// body. Used to skip associated types (`type Item = X;` inside impl/trait
+/// blocks) which are projections, not standalone type definitions.
+/// Note: `type Item;` without a value parses as `associated_type` (not
+/// `type_item`) per tree-sitter-rust node-types.json, so it never reaches
+/// the `type.name` capture in the first place.
+fn has_impl_or_trait_ancestor(node: tree_sitter::Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if matches!(n.kind(), "impl_item" | "trait_item") {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
 }
 
 /// Walk up the AST from `node` to find the nearest enclosing `impl_item`.
@@ -659,6 +684,48 @@ mod tests {
                 .iter()
                 .any(|n| n.vname.signature == "struct:Bits" && n.kind == "union"),
             "expected struct:Bits union node"
+        );
+    }
+
+    #[test]
+    fn associated_types_in_impl_blocks_are_not_emitted() {
+        // Two impls with `type Item = ...` must not emit colliding file-level
+        // `type:Item` nodes; only the standalone `type Alias = u32;` counts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("assoc.rs");
+        std::fs::write(
+            &path,
+            b"struct A;\nstruct B;\n\
+              impl Iterator for A { type Item = u8; fn next(&mut self) -> Option<u8> { None } }\n\
+              impl Iterator for B { type Item = u16; fn next(&mut self) -> Option<u16> { None } }\n\
+              type Alias = u32;\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "assoc.rs").unwrap();
+        let type_nodes: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "type")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert_eq!(
+            type_nodes,
+            vec!["type:Alias"],
+            "expected exactly one type node (type:Alias), no type:Item"
+        );
+    }
+
+    #[test]
+    fn associated_type_with_default_in_trait_is_not_emitted() {
+        // `type Item = u32;` (with default) inside a trait body parses as
+        // `type_item`, not `associated_type` — must also be skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trait_assoc.rs");
+        std::fs::write(&path, b"trait T { type Item = u32; }\n").unwrap();
+        let out = parse("", &path, "trait_assoc.rs").unwrap();
+        assert!(
+            !out.nodes.iter().any(|n| n.kind == "type"),
+            "trait associated type default must not emit a type node"
         );
     }
 

@@ -19,15 +19,19 @@ CREATE TABLE IF NOT EXISTS symbol_aliases (
 CREATE INDEX IF NOT EXISTS idx_symbol_aliases_node
     ON symbol_aliases(node_id);
 
+-- The composite PK makes the INSERT OR IGNORE in write_scip_attributed_batch
+-- an actual dedup: re-indexing re-derives identical (src, dst, kind, line)
+-- rows, and without a uniqueness constraint the table would grow unboundedly.
+-- WITHOUT ROWID (SQLite >= 3.8.2; bundled libsqlite3 is far newer) stores the
+-- rows clustered on the PK, and the PK prefix (src, dst, kind) covers the
+-- lookup index this table needs — no separate index required.
 CREATE TABLE IF NOT EXISTS edge_sites (
     src  INTEGER NOT NULL,
     dst  INTEGER NOT NULL,
     kind TEXT NOT NULL,
-    line INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_edge_sites_src_dst
-    ON edge_sites(src, dst, kind);
+    line INTEGER NOT NULL,
+    PRIMARY KEY (src, dst, kind, line)
+) WITHOUT ROWID;
 
 -- G1/G2 lookups probe nodes by (corpus, path) per SCIP ref — on a monorepo
 -- that is millions of probes, and without this index each one is a full

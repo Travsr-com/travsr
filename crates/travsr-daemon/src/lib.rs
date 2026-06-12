@@ -709,6 +709,8 @@ pub fn init_repo_with_progress(
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
         let (pb_nodes, pb_edges, pb_refs, pb_outcome) =
             phase_b_indexer.invoke_phase_b_all(repo_root);
+        let pb_node_count = pb_nodes.len();
+        let pb_edge_count = pb_edges.len();
         if pb_refs.is_empty() {
             // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
             if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
@@ -717,10 +719,37 @@ pub fn init_repo_with_progress(
         } else {
             // G1: unify SCIP nodes (all languages) onto tree-sitter nodes before
             // writing. Mutates pb_refs in-place to redirect callee_id to unified
-            // TS nodes.
+            // TS nodes, and returns the alias map (SCIP id → TS id).
             let mut pb_refs_mut = pb_refs;
-            crate::scip_unifier::unify_all(&mut store, &corpus, &pb_nodes, &mut pb_refs_mut);
+            let alias_map =
+                crate::scip_unifier::unify_all(&mut store, &corpus, &pb_nodes, &mut pb_refs_mut);
             let pb_refs = pb_refs_mut;
+
+            // Drop unified SCIP definition nodes: the tree-sitter node already
+            // represents them (symbol_aliases preserves scip_symbol → TS node
+            // resolution), and writing them would re-create the duplicate node
+            // + FTS rows that unification exists to eliminate.
+            let pb_nodes: Vec<travsr_core::Node> = pb_nodes
+                .into_iter()
+                .filter(|n| !alias_map.contains_key(&n.id))
+                .collect();
+
+            // Rewrite SCIP structural edges through the alias map so they land
+            // on the unified TS nodes instead of the dropped duplicates; an
+            // edge that collapses to a self-loop after rewriting carried no
+            // information beyond the node itself — drop it.
+            let pb_edges: Vec<travsr_core::Edge> = pb_edges
+                .into_iter()
+                .filter_map(|mut e| {
+                    if let Some(&ts_id) = alias_map.get(&e.src) {
+                        e.src = ts_id;
+                    }
+                    if let Some(&ts_id) = alias_map.get(&e.dst) {
+                        e.dst = ts_id;
+                    }
+                    (e.src != e.dst).then_some(e)
+                })
+                .collect();
 
             // G2 path: span-attributed ref/call edges.
             if let Err(e) = store.write_scip_attributed_batch(&corpus, &pb_nodes, &pb_refs) {
@@ -734,10 +763,10 @@ pub fn init_repo_with_progress(
                 }
             }
         }
-        if !pb_nodes.is_empty() || !pb_edges.is_empty() {
+        if pb_node_count > 0 || pb_edge_count > 0 {
             tracing::info!(
-                nodes = pb_nodes.len(),
-                structural_edges = pb_edges.len(),
+                nodes = pb_node_count,
+                structural_edges = pb_edge_count,
                 "phase B indexing complete"
             );
         }

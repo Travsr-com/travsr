@@ -32,7 +32,7 @@ pub fn run() -> anyhow::Result<()> {
     // knows the graph was built with an older format and a re-index is due.
     let sig_v = store.get_signature_format_version()?;
     if sig_v != travsr_core::SIGNATURE_FORMAT_VERSION {
-        println!(
+        eprintln!(
             "⚠ signature format v{sig_v} ≠ current v{} — graph built with an older format; run `travsr init` to re-index",
             travsr_core::SIGNATURE_FORMAT_VERSION
         );

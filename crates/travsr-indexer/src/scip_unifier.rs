@@ -80,13 +80,32 @@ pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
 /// Split `Type#name` into `(Some("Type"), "name")`; bare names pass through.
 /// Nested types (`Outer#Inner#name`) keep only the innermost container, which
 /// matches the single-level `Container.name` qualification Phase A emits.
+///
+/// SCIP descriptors may be backtick-escaped (e.g. scip-go wraps identifiers
+/// containing special characters: `` `Kubelet`#`syncPod`(). ``).  One pair of
+/// surrounding backticks is stripped from both container and name so they
+/// match Phase A signatures.  Backticks containing `/` or `(` (package
+/// descriptors) are not tokenized here — those never parse as name/kind.
 fn split_container(s: &str) -> (Option<&str>, &str) {
     match s.rsplit_once('#') {
         Some((pre, name)) => {
-            let container = pre.rsplit('#').next().unwrap_or(pre);
-            ((!container.is_empty()).then_some(container), name)
+            let container = strip_backticks(pre.rsplit('#').next().unwrap_or(pre));
+            (
+                (!container.is_empty()).then_some(container),
+                strip_backticks(name),
+            )
         }
-        None => (None, s),
+        None => (None, strip_backticks(s)),
+    }
+}
+
+/// Strip ONE pair of surrounding backticks from a SCIP escaped identifier.
+/// `` `name` `` → `name`; anything else passes through unchanged.
+fn strip_backticks(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
+        &s[1..s.len() - 1]
+    } else {
+        s
     }
 }
 
@@ -282,5 +301,23 @@ mod tests {
     fn scip_symbol_from_raw_sig() {
         let sig = "scip-go go example.com v1.0.0 pkg/Bar().";
         assert_eq!(scip_symbol_from_sig(sig), sig);
+    }
+
+    #[test]
+    fn backtick_escaped_descriptors_are_stripped() {
+        // scip-go wraps identifiers that contain special characters in backticks.
+        // Both container and name must have surrounding backticks stripped so
+        // they can match Phase A signatures like `method:Kubelet.syncPod`.
+        assert_eq!(
+            scip_name_kind(
+                "scip-go go k8s.io/kubernetes v0.0.0 pkg/kubelet/`Kubelet`#`syncPod`()."
+            ),
+            Some(parsed(Some("Kubelet"), "syncPod", "function"))
+        );
+        // Bare name without backticks still works.
+        assert_eq!(
+            scip_name_kind("scip-go go k8s.io/kubernetes v0.0.0 pkg/kubelet/Kubelet#syncPod()."),
+            Some(parsed(Some("Kubelet"), "syncPod", "function"))
+        );
     }
 }

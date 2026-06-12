@@ -701,13 +701,16 @@ pub fn ingest_scip(bytes: &[u8], corpus: &str) -> anyhow::Result<ParseOutput> {
                 let id = vname.id();
                 // range: [start_line, start_col, end_col] (3-elem) or
                 //        [start_line, start_col, end_line, end_col] (4-elem).
+                // Clamp negatives before the i32→u32 cast so corrupt SCIP
+                // input can neither overflow-panic (debug) nor become a huge
+                // line number (release); then saturate the +1.
                 let line = occ
                     .range
                     .first()
                     .copied()
-                    .map(|l| (l as u32).saturating_add(1));
+                    .map(|l| (l.max(0) as u32).saturating_add(1));
                 let end_line = if occ.range.len() >= 4 {
-                    Some(occ.range[2] as u32 + 1)
+                    Some((occ.range[2].max(0) as u32).saturating_add(1))
                 } else {
                     None
                 };
@@ -792,10 +795,16 @@ pub fn ingest_scip_g2(
             let vname =
                 travsr_core::VName::new(corpus, "", path.as_str(), language, occ.symbol.as_str());
             let id = vname.id();
-            let line = occ.range.first().copied().map(|l| l as u32 + 1);
+            // Clamp negatives before the i32→u32 cast (corrupt SCIP input),
+            // then saturate the +1 — see ingest_scip for rationale.
+            let line = occ
+                .range
+                .first()
+                .copied()
+                .map(|l| (l.max(0) as u32).saturating_add(1));
             // 4-element range encodes a multi-line span; 3-element is single-line.
             let end_line = if occ.range.len() >= 4 {
-                Some(occ.range[2] as u32 + 1)
+                Some((occ.range[2].max(0) as u32).saturating_add(1))
             } else {
                 None
             };
@@ -826,7 +835,7 @@ pub fn ingest_scip_g2(
                     .range
                     .first()
                     .copied()
-                    .map(|l| l as u32 + 1)
+                    .map(|l| (l.max(0) as u32).saturating_add(1))
                     .unwrap_or(1);
                 out.refs.push(travsr_core::ScipRef {
                     caller_path: path.clone(),

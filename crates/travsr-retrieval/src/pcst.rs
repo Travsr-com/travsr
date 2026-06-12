@@ -95,7 +95,12 @@ pub fn pcst_path(
     };
 
     // Dijkstra from source: cost = 1.0 - ppr_weight (lower = more traversable).
-    let costs = dijkstra(&graph, src_idx, Some(dst_idx), |e| *e.weight());
+    // Determinism: pass `None` as the goal so the FULL local component settles.
+    // With an early-exit goal, zero-cost ref/call edges leave many nodes tied
+    // at cost 0 and WHICH of them settle before the sink varies with HashMap
+    // iteration order run-to-run. The component is capped at MAX_LOCAL_NODES
+    // (2000), so the extra work is negligible vs PCST_TIMEOUT_MS.
+    let costs = dijkstra(&graph, src_idx, None, |e| *e.weight());
 
     // Reconstruct the actual source→sink route. The route must LEAD the result:
     // downstream consumers truncate (token budget here, 4 KiB sanitizer at the
@@ -328,7 +333,13 @@ fn build_graph(
     let mut node_to_idx: HashMap<NodeId, NodeIndex> = HashMap::new();
     let mut idx_to_node: HashMap<NodeIndex, NodeId> = HashMap::new();
 
-    for &id in nodes.keys() {
+    // Determinism: insert nodes in sorted NodeId order. HashMap key order
+    // varies run-to-run, and NodeIndex assignment order is astar's implicit
+    // tie-breaker among equal-cost routes — unsorted insertion makes the
+    // chosen route nondeterministic on tied-cost topologies.
+    let mut ids: Vec<NodeId> = nodes.keys().copied().collect();
+    ids.sort_by_key(|id| id.0);
+    for id in ids {
         let idx = graph.add_node(id);
         node_to_idx.insert(id, idx);
         idx_to_node.insert(idx, id);
@@ -557,5 +568,45 @@ mod tests {
         // but they would produce non-simple graphs that violate the PCST model).
         let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), unique_ids.len(), "no duplicate nodes in result");
+    }
+
+    #[test]
+    fn pcst_is_deterministic_on_tied_cost_topology() {
+        // Diamond with zero-cost ref/call edges: A→B→D and A→C→D both cost 0,
+        // so route selection ties and the λ threshold admits the whole
+        // component. Before sorting node insertion in build_graph and settling
+        // the full component in Dijkstra (no early-exit goal), the output
+        // order varied run-to-run with HashMap iteration order.
+        let a = node("a.rs", "fn:a");
+        let b = node("b.rs", "fn:b");
+        let c = node("c.rs", "fn:c");
+        let d = node("d.rs", "fn:d");
+        let nodes = [a.clone(), b.clone(), c.clone(), d.clone()];
+        let edges = [
+            (a.id, b.id, EdgeKind::RefCall),
+            (a.id, c.id, EdgeKind::RefCall),
+            (b.id, d.id, EdgeKind::RefCall),
+            (c.id, d.id, EdgeKind::RefCall),
+        ];
+
+        // Fresh store per run: rebuilds all in-memory state so any
+        // HashMap-iteration-order nondeterminism gets a chance to surface.
+        let run = || {
+            let store = store_with(&nodes, &edges);
+            pcst_path(&store, a.id, d.id, &OpenFilter, 4096)
+                .unwrap()
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>()
+        };
+
+        let first = run();
+        let second = run();
+        assert_eq!(
+            first, second,
+            "pcst_path must return identical node order across runs"
+        );
+        assert_eq!(first[0], a.id, "route must start at source");
+        assert!(first.contains(&d.id), "sink must be in result");
     }
 }

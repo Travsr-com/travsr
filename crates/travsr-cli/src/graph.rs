@@ -466,8 +466,14 @@ fn next_edges(
         // (defines/binding) are skipped to avoid self-loops.
         if let Some(node) = store.get_node(node_id)? {
             if node.kind == "file" {
-                for def_id in
-                    store.definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
+                // Cap the splice at 200 definitions: pathological generated
+                // files can hold thousands, each costing an iter_edges_to
+                // round-trip. Full fidelity remains available via per-symbol
+                // queries.
+                for def_id in store
+                    .definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
+                    .into_iter()
+                    .take(200)
                 {
                     incoming.extend(
                         store

@@ -20,8 +20,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// Version history:
 ///   0 — legacy (no version byte; all pre-RFC-002 databases)
-///   1 — current: Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
-pub const SIGNATURE_FORMAT_VERSION: u8 = 1;
+///   1 — Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
+///   2 — current: RFC-014 Phase B graph unification. Phase A now captures
+///       type-definition nodes and `end_line` spans that the G1/G2 unification
+///       passes depend on, so v1 databases lack the tree-sitter nodes that
+///       SCIP symbols unify onto. Bumping intentionally invalidates every
+///       existing `.travsr/graph.db` so the daemon skew check and the
+///       `travsr status` warning force a full re-index (RFC-014 "Re-index
+///       Policy").
+pub const SIGNATURE_FORMAT_VERSION: u8 = 2;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 
@@ -922,9 +929,10 @@ mod tests {
     #[test]
     fn version_byte_produces_different_id_than_unversioned() {
         // Regression guard: confirms the RFC-002 domain separator is actually
-        // prepended and that length-prefix encoding is used. The v1 format starts
-        // with [0x01][len][corpus...]; the v0 format starts with raw corpus bytes.
-        // These byte streams can never be equal regardless of field contents.
+        // prepended and that length-prefix encoding is used. The versioned format
+        // starts with [SIGNATURE_FORMAT_VERSION][len][corpus...]; the v0 format
+        // starts with raw corpus bytes. These byte streams can never be equal
+        // regardless of field contents.
         let v = sample_vname();
         let versioned_id = v.id(); // uses SIGNATURE_FORMAT_VERSION byte + length-prefix
 

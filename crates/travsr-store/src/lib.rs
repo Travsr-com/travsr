@@ -222,19 +222,25 @@ impl Migration for V13PhaseBUnification {
         // symbol_aliases + edge_sites: CREATE TABLE IF NOT EXISTS is idempotent.
         store.exec_ddl(include_str!("migrations/v13_phase_b_unification.sql"))?;
         // G3: delete SCIP anonymous-local nodes and their incident edges.
-        // SCIP ingest stores these with signature `scip:<path>:local <N>`, so
-        // the pattern must match "local " mid-string after a colon — GLOB
-        // `*local [0-9]*` covers that without a REGEXP extension. (The ingest
-        // path in scip-reader also drops locals; this cleans up DBs written
-        // before that filter existed.)
-        store.exec_ddl(
+        // SCIP ingest stores these with signature `scip:<path>:local <N>`
+        // (see `travsr_core::is_scip_anonymous_local`, whose semantics this
+        // mirrors: a `:local ` separator followed by digits only, to end of
+        // string). The pattern is anchored to the `:local [0-9]` suffix and
+        // rejects any non-digit after it, so a *path* containing "local N"
+        // (e.g. `src/local 9/util.go`) can never false-positive — its
+        // signature has `/local`, not `:local`, before the digits. (The
+        // ingest path in scip-reader also drops locals; this cleans up DBs
+        // written before that filter existed.)
+        const G3_LOCAL_FILTER: &str = "signature GLOB 'scip:*:local [0-9]*' \
+             AND signature NOT GLOB 'scip:*:local [0-9]*[^0-9]*'";
+        store.exec_ddl(&format!(
             "DELETE FROM edges WHERE src IN (\
-               SELECT id FROM nodes WHERE signature GLOB '*local [0-9]*'\
+               SELECT id FROM nodes WHERE {G3_LOCAL_FILTER}\
              ) OR dst IN (\
-               SELECT id FROM nodes WHERE signature GLOB '*local [0-9]*'\
-             )",
-        )?;
-        store.exec_ddl("DELETE FROM nodes WHERE signature GLOB '*local [0-9]*'")?;
+               SELECT id FROM nodes WHERE {G3_LOCAL_FILTER}\
+             )"
+        ))?;
+        store.exec_ddl(&format!("DELETE FROM nodes WHERE {G3_LOCAL_FILTER}"))?;
         // O7: reclaim freed pages from G3 deletions.  WAL checkpoint first so the
         // VACUUM can compact the database file (VACUUM is a no-op while WAL frames
         // are not yet flushed to the main file).
@@ -1283,7 +1289,35 @@ LIMIT 100",
         Ok(())
     }
 
-    /// G1: Find the closest tree-sitter node at `(corpus, path)` whose signature
+    /// G1: Batch variant of [`Self::register_symbol_alias`].
+    ///
+    /// Wraps all inserts in a single transaction with a cached statement so
+    /// the unification pass pays one fsync for the whole alias set instead of
+    /// one autocommit transaction per alias.
+    pub fn register_symbol_aliases(&mut self, aliases: &[(String, NodeId)]) -> anyhow::Result<()> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("register_symbol_aliases: begin")?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO symbol_aliases(scip_symbol, node_id) VALUES(?1, ?2) \
+                     ON CONFLICT(scip_symbol) DO UPDATE SET node_id = excluded.node_id",
+                )
+                .context("register_symbol_aliases: prepare")?;
+            for (scip_symbol, node_id) in aliases {
+                stmt.execute(params![scip_symbol, node_id_to_i64(*node_id)])
+                    .context("register_symbol_aliases: insert")?;
+            }
+        }
+        tx.commit().context("register_symbol_aliases: commit")
+    }
+
+    /// G1: Find the tree-sitter node at `(corpus, path)` whose signature
     /// matches one of `signatures`, within `max_delta` lines of `scip_line`.
     ///
     /// Candidate signatures come from
@@ -1292,6 +1326,15 @@ LIMIT 100",
     /// kind filter is needed.  The `(corpus, path)` index keeps the candidate
     /// row set per-file small.  Returns `None` when no candidate is within the
     /// proximity threshold.
+    ///
+    /// `signatures` is ordered most → least specific by the caller (e.g.
+    /// `method:Server.Serve`, `fn:Server.Serve`, `fn:Serve`); ties are broken
+    /// by candidate priority **first**, then line distance, so a less-specific
+    /// same-named node one line closer cannot shadow a more specific match.
+    ///
+    /// The SQL string varies only by candidate count, so `prepare_cached`
+    /// hits its statement cache across the millions of calls a monorepo
+    /// unification pass makes.
     pub fn find_ts_node_for_unification(
         &self,
         corpus: &str,
@@ -1303,18 +1346,32 @@ LIMIT 100",
         if signatures.is_empty() {
             return Ok(None);
         }
-        let placeholders = vec!["?"; signatures.len()].join(",");
+        // Numbered params: ?1=corpus ?2=path ?3..?(n+2)=signatures
+        // ?(n+3)=scip_line ?(n+4)=max_delta. The CASE re-uses the signature
+        // params to rank rows by candidate priority (0 = most specific).
+        let n = signatures.len();
+        let placeholders = (3..n + 3)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let priority_case = (3..n + 3)
+            .map(|i| format!("WHEN ?{i} THEN {}", i - 3))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line_p = n + 3;
+        let delta_p = n + 4;
         let sql = format!(
             "SELECT id FROM nodes \
-             WHERE corpus = ? AND path = ? \
+             WHERE corpus = ?1 AND path = ?2 \
                AND signature IN ({placeholders}) \
                AND line IS NOT NULL \
-               AND ABS(line - ?) <= ? \
-             ORDER BY ABS(line - ?) ASC \
+               AND ABS(line - ?{line_p}) <= ?{delta_p} \
+             ORDER BY CASE signature {priority_case} END ASC, \
+                      ABS(line - ?{line_p}) ASC \
              LIMIT 1"
         );
 
-        let mut bind: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(signatures.len() + 5);
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(n + 4);
         bind.push(&corpus);
         bind.push(&path);
         for sig in signatures {
@@ -1322,11 +1379,13 @@ LIMIT 100",
         }
         bind.push(&scip_line);
         bind.push(&max_delta);
-        bind.push(&scip_line);
 
-        let id: Option<i64> = self
+        let mut stmt = self
             .conn
-            .query_row(&sql, bind.as_slice(), |row| row.get(0))
+            .prepare_cached(&sql)
+            .context("find_ts_node_for_unification: prepare")?;
+        let id: Option<i64> = stmt
+            .query_row(bind.as_slice(), |row| row.get(0))
             .optional()
             .context("find_ts_node_for_unification")?;
         Ok(id.map(i64_to_node_id))
@@ -2599,6 +2658,110 @@ mod tests {
         };
         let store = SqliteStore::open(&db_path).unwrap();
         assert_eq!(store.get_node(id).unwrap().as_ref(), Some(&n));
+    }
+
+    #[test]
+    fn unification_prefers_higher_priority_candidate_over_closer_line() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // SCIP definition at line 10. Candidates ordered most → least
+        // specific: method:Server.Serve (priority 0), fn:Serve (priority 1).
+        // The lower-priority node is CLOSER (line 11, delta 1) than the
+        // higher-priority node (line 13, delta 3) — priority must still win.
+        let hi = Node::new(
+            VName::new("c", "main", "src/s.go", "go", "method:Server.Serve"),
+            "method",
+        )
+        .with_line(13);
+        let lo = Node::new(
+            VName::new("c", "main", "src/s.go", "go", "fn:Serve"),
+            "function",
+        )
+        .with_line(11);
+        store.put_node(&hi).unwrap();
+        store.put_node(&lo).unwrap();
+
+        let candidates = vec!["method:Server.Serve".to_string(), "fn:Serve".to_string()];
+        let found = store
+            .find_ts_node_for_unification("c", "src/s.go", &candidates, 10, 5)
+            .unwrap();
+        assert_eq!(found, Some(hi.id), "higher-priority candidate must win");
+
+        // When the higher-priority signature matches nothing, the closer
+        // lower-priority node wins on line distance as before.
+        let candidates = vec!["method:Other.Serve".to_string(), "fn:Serve".to_string()];
+        let found = store
+            .find_ts_node_for_unification("c", "src/s.go", &candidates, 10, 5)
+            .unwrap();
+        assert_eq!(found, Some(lo.id), "falls back to line proximity");
+    }
+
+    #[test]
+    fn edge_sites_dedup_on_reinsert() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // The composite PK makes INSERT OR IGNORE an actual dedup: the same
+        // (src, dst, kind, line) row inserted twice must yield one row.
+        store
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(1, 2, 'ref/call', 7)",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(1, 2, 'ref/call', 7)",
+                [],
+            )
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn register_symbol_aliases_batch_roundtrip() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // symbol_aliases.node_id is a FK → nodes(id); nodes must exist first.
+        let n1 = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a/b.go", "go", "method:X.m"),
+            "method",
+        );
+        let n2 = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a/b.go", "go", "method:Y.n"),
+            "method",
+        );
+        store.put_node(&n1).unwrap();
+        store.put_node(&n2).unwrap();
+        let aliases = vec![
+            ("scip . a/b 1.0 X#m().".to_string(), n1.id),
+            ("scip . a/b 1.0 Y#n().".to_string(), n2.id),
+        ];
+        store.register_symbol_aliases(&aliases).unwrap();
+        assert_eq!(
+            store.resolve_scip_symbol("scip . a/b 1.0 X#m().").unwrap(),
+            Some(n1.id)
+        );
+        assert_eq!(
+            store.resolve_scip_symbol("scip . a/b 1.0 Y#n().").unwrap(),
+            Some(n2.id)
+        );
+        // Upsert: re-registering the same scip_symbol with a different node id
+        // overwrites; use a distinct node so the FK is satisfied.
+        let n3 = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a/b.go", "go", "method:Z.p"),
+            "method",
+        );
+        store.put_node(&n3).unwrap();
+        store
+            .register_symbol_aliases(&[("scip . a/b 1.0 X#m().".to_string(), n3.id)])
+            .unwrap();
+        assert_eq!(
+            store.resolve_scip_symbol("scip . a/b 1.0 X#m().").unwrap(),
+            Some(n3.id)
+        );
     }
 
     fn node_with_path(path: &str, sig: &str) -> Node {

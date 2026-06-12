@@ -185,6 +185,16 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         for _ in 0..5 {
             match cur.parent() {
                 Some(parent) => match parent.kind() {
+                    // Grouped declarations (`type ( A ...  B ... )`, grouped
+                    // var/const blocks): stop at the per-member spec node so
+                    // each member's end_line covers its own spec, not the
+                    // whole group. Spec kinds verified in tree-sitter-go
+                    // node-types.json: type_spec, type_alias, var_spec,
+                    // const_spec. For ungrouped declarations the spec's end
+                    // equals the declaration's end, so this is a no-op there.
+                    "type_spec" | "type_alias" | "var_spec" | "const_spec" => {
+                        return parent.end_position().row as u32 + 1
+                    }
                     "function_declaration"
                     | "method_declaration"
                     | "type_declaration"
@@ -587,6 +597,43 @@ mod tests {
         assert!(kinds.contains("file"), "missing file node");
         assert!(kinds.contains("function"), "missing function node");
         assert!(kinds.contains("import"), "missing import node");
+    }
+
+    #[test]
+    fn grouped_type_block_members_end_at_own_spec() {
+        // In a grouped `type ( ... )` block each member's end_line must be
+        // its own type_spec's end line, not the end of the whole group.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grouped.go");
+        std::fs::write(
+            &path,
+            b"package main\n\ntype (\n\tA struct {\n\t\tx int\n\t}\n\tB struct {\n\t\ty int\n\t}\n)\n",
+        )
+        .unwrap();
+        // Layout: A spans lines 4-6, B spans lines 7-9, group closes line 10.
+        let out = parse("", &path, "grouped.go").unwrap();
+        let a = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "class:A")
+            .expect("expected class:A node");
+        let b = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "class:B")
+            .expect("expected class:B node");
+        assert_eq!(a.line, Some(4));
+        assert_eq!(
+            a.end_line,
+            Some(6),
+            "A must end at its own spec, not the group's `)`"
+        );
+        assert_eq!(b.line, Some(7));
+        assert_eq!(
+            b.end_line,
+            Some(9),
+            "B must end at its own spec, not the group's `)`"
+        );
     }
 
     #[test]
