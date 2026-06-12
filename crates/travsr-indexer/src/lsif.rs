@@ -692,17 +692,31 @@ pub fn ingest_scip(bytes: &[u8], corpus: &str) -> anyhow::Result<ParseOutput> {
         for occ in &doc.occurrences {
             // SymbolRole::Definition = 1 (bit flag per SCIP proto).
             if occ.symbol_roles & 1 != 0 && !occ.symbol.is_empty() {
+                // G3: skip SCIP anonymous locals at ingest — they are intra-function
+                // SSA temporaries with zero developer-facing signal (RFC-014 G3).
+                if travsr_core::is_scip_anonymous_local(&occ.symbol) {
+                    continue;
+                }
                 let vname = VName::new(corpus, "", path.as_str(), "python", occ.symbol.as_str());
                 let id = vname.id();
-                // range is [start_line, start_col, end_col] or 4-element form.
+                // range: [start_line, start_col, end_col] (3-elem) or
+                //        [start_line, start_col, end_line, end_col] (4-elem).
                 let line = occ
                     .range
                     .first()
                     .copied()
                     .map(|l| (l as u32).saturating_add(1));
+                let end_line = if occ.range.len() >= 4 {
+                    Some(occ.range[2] as u32 + 1)
+                } else {
+                    None
+                };
                 let mut node = Node::new(vname, scip_symbol_kind(&occ.symbol));
                 if let Some(l) = line {
                     node = node.with_line(l);
+                }
+                if let Some(el) = end_line {
+                    node = node.with_end_line(el);
                 }
                 defs.insert(occ.symbol.clone(), id);
                 nodes.push(node);
@@ -717,6 +731,10 @@ pub fn ingest_scip(bytes: &[u8], corpus: &str) -> anyhow::Result<ParseOutput> {
         let file_id = VName::new(corpus, "", path.as_str(), "python", "").id();
         for occ in &doc.occurrences {
             if occ.symbol_roles & 1 == 0 && !occ.symbol.is_empty() {
+                // G3: also skip references to anonymous locals.
+                if travsr_core::is_scip_anonymous_local(&occ.symbol) {
+                    continue;
+                }
                 if let Some(&dst) = defs.get(&occ.symbol) {
                     edges.push(Edge::new(file_id, dst, EdgeKind::RefCall));
                 }
@@ -729,6 +747,97 @@ pub fn ingest_scip(bytes: &[u8], corpus: &str) -> anyhow::Result<ParseOutput> {
         edges,
         ffi_markers: vec![],
     })
+}
+
+/// Output from [`ingest_scip_g2`] — nodes plus attribution-ready reference data.
+#[derive(Debug, Default)]
+pub struct ScipIngestOutput {
+    /// SCIP definition nodes (G3-filtered, with end_line where available).
+    pub nodes: Vec<travsr_core::Node>,
+    /// Reference occurrences for G2 call-site attribution.
+    pub refs: Vec<travsr_core::ScipRef>,
+    /// SCIP symbol string → NodeId (for G1 alias registration).
+    pub symbol_map: HashMap<String, travsr_core::NodeId>,
+}
+
+/// G2-aware SCIP ingestion: returns nodes + [`ScipRef`] records instead of
+/// pre-built edges.  The caller passes these to
+/// [`SqliteStore::write_scip_attributed_batch`] which performs span lookup
+/// and emits function-level `ref/call` edges.
+///
+/// Language string is caller-supplied (e.g. `"go"`, `"python"`) so the same
+/// function handles all SCIP-emitting languages.
+pub fn ingest_scip_g2(
+    bytes: &[u8],
+    corpus: &str,
+    language: &str,
+) -> anyhow::Result<ScipIngestOutput> {
+    use protobuf::Message as _;
+
+    let index = scip::types::Index::parse_from_bytes(bytes).context("SCIP protobuf parse")?;
+
+    let mut out = ScipIngestOutput::default();
+
+    // Pass 1: definition occurrences → nodes + symbol_map.
+    for doc in &index.documents {
+        let path = &doc.relative_path;
+        for occ in &doc.occurrences {
+            if occ.symbol_roles & 1 == 0 || occ.symbol.is_empty() {
+                continue;
+            }
+            // G3: skip anonymous locals.
+            if travsr_core::is_scip_anonymous_local(&occ.symbol) {
+                continue;
+            }
+            let vname =
+                travsr_core::VName::new(corpus, "", path.as_str(), language, occ.symbol.as_str());
+            let id = vname.id();
+            let line = occ.range.first().copied().map(|l| l as u32 + 1);
+            // 4-element range encodes a multi-line span; 3-element is single-line.
+            let end_line = if occ.range.len() >= 4 {
+                Some(occ.range[2] as u32 + 1)
+            } else {
+                None
+            };
+            let mut node = travsr_core::Node::new(vname, scip_symbol_kind(&occ.symbol));
+            if let Some(l) = line {
+                node = node.with_line(l);
+            }
+            if let Some(el) = end_line {
+                node = node.with_end_line(el);
+            }
+            out.symbol_map.insert(occ.symbol.clone(), id);
+            out.nodes.push(node);
+        }
+    }
+
+    // Pass 2: reference occurrences → ScipRef records for G2 attribution.
+    for doc in &index.documents {
+        let path = &doc.relative_path;
+        for occ in &doc.occurrences {
+            if occ.symbol_roles & 1 != 0 || occ.symbol.is_empty() {
+                continue;
+            }
+            if travsr_core::is_scip_anonymous_local(&occ.symbol) {
+                continue;
+            }
+            if let Some(&callee_id) = out.symbol_map.get(&occ.symbol) {
+                let caller_line = occ
+                    .range
+                    .first()
+                    .copied()
+                    .map(|l| l as u32 + 1)
+                    .unwrap_or(1);
+                out.refs.push(travsr_core::ScipRef {
+                    caller_path: path.clone(),
+                    caller_line,
+                    callee_id,
+                });
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Heuristic: derive a Travsr node-kind string from a SCIP symbol descriptor.

@@ -109,6 +109,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // G2: capture.node is the name identifier; its parent is the definition node
+    // (function_definition or class_definition), which has the full declaration span.
+    let decl_end_line = |node: tree_sitter::Node<'_>| -> u32 {
+        node.parent()
+            .map(|p| p.end_position().row as u32 + 1)
+            .unwrap_or_else(|| node.start_position().row as u32 + 1)
+    };
+
     while let Some(m) = iter.next() {
         for &capture in m.captures {
             let Some(cap_name) = capture_names.get(capture.index as usize) else {
@@ -122,6 +130,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         Err(_) => continue,
                     };
                     let line = capture.node.start_position().row as u32 + 1;
+                    let end_line = decl_end_line(capture.node);
                     // capture.node is the identifier; its parent is function_definition.
                     // Pass function_definition so find_parent_class looks at the outer context.
                     let parent_class = capture
@@ -130,11 +139,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .and_then(|fd| find_parent_class(fd, source.as_slice()));
                     let (node, src_id) = if let Some(class_name) = parent_class {
                         let class_id = py_class_node(corpus, vname_path, &class_name).id;
-                        let n =
-                            py_method_node(corpus, vname_path, &class_name, text).with_line(line);
+                        let n = py_method_node(corpus, vname_path, &class_name, text)
+                            .with_line(line)
+                            .with_end_line(end_line);
                         (n, class_id)
                     } else {
-                        let n = py_fn_node(corpus, vname_path, text).with_line(line);
+                        let n = py_fn_node(corpus, vname_path, text)
+                            .with_line(line)
+                            .with_end_line(end_line);
                         (n, file_id)
                     };
                     output.edges.push(emit::defines_edge(src_id, node.id));
@@ -146,7 +158,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         Err(_) => continue,
                     };
                     let line = capture.node.start_position().row as u32 + 1;
-                    let node = py_class_node(corpus, vname_path, text).with_line(line);
+                    let node = py_class_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }

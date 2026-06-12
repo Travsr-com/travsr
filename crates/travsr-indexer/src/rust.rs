@@ -103,6 +103,35 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // G2: walk up from the name identifier to the enclosing declaration item.
+    // `impl.name` may need two hops (identifier → generic_type → impl_item),
+    // so we walk up to 3 levels before falling back to the capture's own line.
+    let decl_end_line = |node: tree_sitter::Node<'_>| -> u32 {
+        let mut cur = node;
+        for _ in 0..3 {
+            match cur.parent() {
+                Some(p) => {
+                    if matches!(
+                        p.kind(),
+                        "function_item"
+                            | "struct_item"
+                            | "enum_item"
+                            | "trait_item"
+                            | "impl_item"
+                            | "mod_item"
+                            | "const_item"
+                            | "static_item"
+                    ) {
+                        return p.end_position().row as u32 + 1;
+                    }
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        node.start_position().row as u32 + 1
+    };
+
     while let Some(m) = iter.next() {
         for &capture in m.captures {
             let Some(cap_name) = capture_names.get(capture.index as usize) else {
@@ -118,36 +147,48 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 "fn.name" => {
                     // Functions inside impl blocks become methods; the parent impl
                     // type is the namespace so signatures are `fn:TypeName.method`.
+                    let end_line = decl_end_line(capture.node);
                     let parent_impl = find_parent_impl_type(capture.node, source.as_slice());
                     let (node, src_id) = if let Some(impl_type) = parent_impl {
                         let impl_id = rust_impl_node(corpus, vname_path, &impl_type).id;
-                        let n =
-                            rust_method_node(corpus, vname_path, &impl_type, text).with_line(line);
+                        let n = rust_method_node(corpus, vname_path, &impl_type, text)
+                            .with_line(line)
+                            .with_end_line(end_line);
                         (n, impl_id)
                     } else {
-                        let n = rust_fn_node(corpus, vname_path, text).with_line(line);
+                        let n = rust_fn_node(corpus, vname_path, text)
+                            .with_line(line)
+                            .with_end_line(end_line);
                         (n, file_id)
                     };
                     output.edges.push(emit::defines_edge(src_id, node.id));
                     output.nodes.push(node);
                 }
                 "struct.name" => {
-                    let node = rust_struct_node(corpus, vname_path, text).with_line(line);
+                    let node = rust_struct_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
                 "enum.name" => {
-                    let node = rust_enum_node(corpus, vname_path, text).with_line(line);
+                    let node = rust_enum_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
                 "trait.name" => {
-                    let node = rust_trait_node(corpus, vname_path, text).with_line(line);
+                    let node = rust_trait_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
                 "impl.name" => {
-                    let node = rust_impl_node(corpus, vname_path, text).with_line(line);
+                    let node = rust_impl_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
@@ -163,7 +204,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .is_some();
                     let node = if has_body {
                         // Inline module — structural container.
-                        rust_mod_node(corpus, vname_path, text).with_line(line)
+                        rust_mod_node(corpus, vname_path, text)
+                            .with_line(line)
+                            .with_end_line(decl_end_line(capture.node))
                     } else {
                         // File-system module declaration.
                         // link_imports_rust() resolves this to foo.rs / foo/mod.rs.
@@ -173,12 +216,16 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.nodes.push(node);
                 }
                 "const.name" => {
-                    let node = rust_const_node(corpus, vname_path, text).with_line(line);
+                    let node = rust_const_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
                 "static.name" => {
-                    let node = rust_static_node(corpus, vname_path, text).with_line(line);
+                    let node = rust_static_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }

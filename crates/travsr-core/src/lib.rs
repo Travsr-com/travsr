@@ -406,6 +406,10 @@ pub struct Node {
     /// 1-based source line of the symbol's definition site.
     /// `None` for file-kind nodes and synthetic import nodes.
     pub line: Option<u32>,
+    /// 1-based last source line of the symbol's body (inclusive).
+    /// Used by G2 span attribution to find the enclosing function for a SCIP
+    /// reference occurrence. `None` until migration v13 backfills the column.
+    pub end_line: Option<u32>,
 }
 
 impl Node {
@@ -413,7 +417,7 @@ impl Node {
     ///
     /// The `id` is derived deterministically from the VName. `package`
     /// defaults to an empty string; use [`Node::with_package`] to set it.
-    /// `line` defaults to `None`; use [`Node::with_line`] to set it.
+    /// `line` / `end_line` default to `None`; use the builder methods to set them.
     pub fn new(vname: VName, kind: impl Into<String>) -> Self {
         let id = vname.id();
         Self {
@@ -422,6 +426,7 @@ impl Node {
             kind: kind.into(),
             package: String::new(),
             line: None,
+            end_line: None,
         }
     }
 
@@ -443,6 +448,27 @@ impl Node {
         self.line = Some(line);
         self
     }
+
+    /// Set the `end_line` field (1-based, inclusive) and return `self` (builder pattern).
+    pub fn with_end_line(mut self, end_line: u32) -> Self {
+        self.end_line = Some(end_line);
+        self
+    }
+}
+
+/// A raw SCIP reference occurrence used for G2 call-site attribution.
+///
+/// The store's `write_scip_attributed_batch` takes a slice of these and emits
+/// `ref/call` edges from the enclosing function node (or the file node as fallback)
+/// to `callee_id`.
+#[derive(Debug, Clone)]
+pub struct ScipRef {
+    /// Repo-relative path of the file containing the reference (e.g. `pkg/foo/bar.go`).
+    pub caller_path: String,
+    /// 1-based source line of the reference occurrence.
+    pub caller_line: u32,
+    /// `NodeId` of the called symbol (from `symbol_map` or `symbol_aliases`).
+    pub callee_id: NodeId,
 }
 
 /// Human-readable label: path for file nodes (whose `signature` is the
@@ -466,7 +492,9 @@ pub fn is_noise_node(node: &Node) -> bool {
         || is_scip_anonymous_local(&node.vname.signature)
 }
 
-fn is_scip_anonymous_local(sig: &str) -> bool {
+/// Returns `true` if `sig` is a SCIP anonymous-local symbol (`local N` suffix).
+/// Used by G3 ingest filter in `travsr-indexer` and by `is_noise_node`.
+pub fn is_scip_anonymous_local(sig: &str) -> bool {
     // SCIP local symbols end with "local <digits>", e.g. "local 27".
     if let Some(pos) = sig.rfind("local ") {
         let suffix = &sig[pos + 6..];

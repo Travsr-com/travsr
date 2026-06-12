@@ -208,6 +208,40 @@ impl Migration for V12Vec0Embeddings {
     }
 }
 
+/// RFC-014 WS2: end_line column, symbol_aliases table, edge_sites table, G3 cleanup.
+struct V13PhaseBUnification;
+impl Migration for V13PhaseBUnification {
+    fn version(&self) -> u32 {
+        13
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite — guard manually.
+        if !store.column_exists("nodes", "end_line")? {
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN end_line INTEGER")?;
+        }
+        // symbol_aliases + edge_sites: CREATE TABLE IF NOT EXISTS is idempotent.
+        store.exec_ddl(include_str!("migrations/v13_phase_b_unification.sql"))?;
+        // G3: delete SCIP anonymous-local nodes and their incident edges.
+        // Matches signatures containing "local " followed only by digits at the end.
+        // Uses two LIKE patterns joined by INTERSECT to approximate the regex
+        // `^.*local [0-9]+$` without requiring a REGEXP extension.
+        store.exec_ddl(
+            "DELETE FROM edges WHERE src IN (\
+               SELECT id FROM nodes WHERE signature LIKE '% local %' \
+                 OR signature LIKE 'local %'\
+             ) OR dst IN (\
+               SELECT id FROM nodes WHERE signature LIKE '% local %' \
+                 OR signature LIKE 'local %'\
+             )",
+        )?;
+        store.exec_ddl(
+            "DELETE FROM nodes WHERE signature LIKE '% local %' \
+               OR signature LIKE 'local %'",
+        )?;
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -225,6 +259,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V11FtsSynonyms);
     #[cfg(feature = "embeddings")]
     r.register(V12Vec0Embeddings);
+    r.register(V13PhaseBUnification);
     r
 }
 
@@ -649,11 +684,12 @@ impl SqliteStore {
                 for node in &file.nodes {
                     let id_i64 = node_id_to_i64(node.id);
                     tx.execute(
-                        "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                        "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                          ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                            package = excluded.package, \
-                           line = COALESCE(excluded.line, nodes.line)",
+                           line = COALESCE(excluded.line, nodes.line), \
+                           end_line = COALESCE(excluded.end_line, nodes.end_line)",
                         params![
                             id_i64,
                             node.vname.corpus,
@@ -664,6 +700,7 @@ impl SqliteStore {
                             node.kind,
                             node.package,
                             node.line.map(|l| l as i64),
+                            node.end_line.map(|l| l as i64),
                         ],
                     )
                     .context("inserting node in batch")?;
@@ -877,7 +914,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line,
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line,
   (
     CASE
       WHEN signature = ?1 THEN 0
@@ -915,12 +952,14 @@ LIMIT 100",
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
                     Ok(Node {
                         id,
                         vname,
                         kind,
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
                     })
                 })
                 .context("executing search query")?;
@@ -940,7 +979,7 @@ LIMIT 100",
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line FROM nodes",
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line FROM nodes",
                 )
                 .context("preparing all_nodes query")?;
             let rows = stmt
@@ -956,12 +995,14 @@ LIMIT 100",
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
                     Ok(Node {
                         id,
                         vname,
                         kind,
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
                     })
                 })
                 .context("executing all_nodes query")?;
@@ -1089,11 +1130,12 @@ LIMIT 100",
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
             tx.execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
-                 line = COALESCE(excluded.line, nodes.line)",
+                 line = COALESCE(excluded.line, nodes.line), \
+                 end_line = COALESCE(excluded.end_line, nodes.end_line)",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -1104,6 +1146,7 @@ LIMIT 100",
                     node.kind,
                     node.package,
                     node.line.map(|l| l as i64),
+                    node.end_line.map(|l| l as i64),
                 ],
             )
             .context("write_phase_b_batch: insert node")?;
@@ -1125,6 +1168,136 @@ LIMIT 100",
             .context("write_phase_b_batch: insert edge")?;
         }
         tx.commit().context("write_phase_b_batch: commit")
+    }
+
+    /// G2 attribution-aware Phase B write.
+    ///
+    /// Writes SCIP definition nodes, then for each [`travsr_core::ScipRef`]
+    /// finds the innermost function/method node whose span contains
+    /// `caller_line` and emits a `ref/call` edge from it (falls back to the
+    /// file node if no enclosing function is found).  Also records a row in
+    /// `edge_sites` for every attribution (O4 evidence).
+    ///
+    /// Must be called **after** the Phase A tree-sitter pass so that
+    /// `end_line` spans are already in the DB.
+    pub fn write_scip_attributed_batch(
+        &mut self,
+        corpus: &str,
+        nodes: &[travsr_core::Node],
+        refs: &[travsr_core::ScipRef],
+    ) -> anyhow::Result<()> {
+        if nodes.is_empty() && refs.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("write_scip_attributed_batch: begin")?;
+
+        for node in nodes {
+            let id_i64 = node_id_to_i64(node.id);
+            tx.execute(
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
+                 package = excluded.package, \
+                 line = COALESCE(excluded.line, nodes.line), \
+                 end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                params![
+                    id_i64,
+                    node.vname.corpus,
+                    node.vname.root,
+                    node.vname.path,
+                    node.vname.language,
+                    node.vname.signature,
+                    node.kind,
+                    node.package,
+                    node.line.map(|l| l as i64),
+                    node.end_line.map(|l| l as i64),
+                ],
+            )
+            .context("write_scip_attributed_batch: insert node")?;
+            Self::put_node_fts(&tx, node).context("write_scip_attributed_batch: put_node_fts")?;
+        }
+
+        for scip_ref in refs {
+            // G2: find the innermost enclosing function/method span.
+            // Prefer narrowest span (end_line - line ASC).
+            let occ_line = scip_ref.caller_line as i64;
+            let src_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 \
+                       AND kind IN ('function','method','fn') \
+                       AND line <= ?3 AND end_line >= ?3 \
+                     ORDER BY (end_line - line) ASC \
+                     LIMIT 1",
+                    params![corpus, scip_ref.caller_path, occ_line],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("write_scip_attributed_batch: enclosing fn lookup")?;
+
+            let caller_id = src_id.unwrap_or_else(|| {
+                // Fall back to file node — same VName as tree-sitter emits.
+                let file_id =
+                    travsr_core::VName::new(corpus, "", &scip_ref.caller_path, "", "file").id();
+                node_id_to_i64(file_id)
+            });
+
+            let callee_id = node_id_to_i64(scip_ref.callee_id);
+            tx.execute(
+                "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                 VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
+                 ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'scip'",
+                params![caller_id, callee_id],
+            )
+            .context("write_scip_attributed_batch: insert edge")?;
+
+            // O4: record call-site line evidence.
+            tx.execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
+                params![caller_id, callee_id, occ_line],
+            )
+            .context("write_scip_attributed_batch: insert edge_site")?;
+        }
+
+        tx.commit().context("write_scip_attributed_batch: commit")
+    }
+
+    /// G1: Register a mapping from a raw SCIP symbol string to a unified tree-sitter `NodeId`.
+    ///
+    /// Idempotent: if the alias already exists with the same `node_id`, this is a no-op.
+    pub fn register_symbol_alias(
+        &mut self,
+        scip_symbol: &str,
+        node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO symbol_aliases(scip_symbol, node_id) VALUES(?1, ?2) \
+                 ON CONFLICT(scip_symbol) DO UPDATE SET node_id = excluded.node_id",
+                params![scip_symbol, node_id_to_i64(node_id)],
+            )
+            .context("register_symbol_alias")?;
+        Ok(())
+    }
+
+    /// G1: Look up the unified `NodeId` for a raw SCIP symbol string.
+    ///
+    /// Returns `None` if the symbol has not been aliased (i.e. no tree-sitter
+    /// node matched it during the unification pass).
+    pub fn resolve_scip_symbol(&self, scip_symbol: &str) -> anyhow::Result<Option<NodeId>> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT node_id FROM symbol_aliases WHERE scip_symbol = ?1",
+                params![scip_symbol],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("resolve_scip_symbol")?;
+        Ok(id.map(i64_to_node_id))
     }
 
     /// Emit `Depends` edges between all ordered file-node pairs that co-define
@@ -1401,7 +1574,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line \
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line \
                      FROM nodes WHERE id NOT IN (SELECT node_id FROM nodes_fts_map)",
                 )
                 .context("preparing FTS backfill query")?;
@@ -1418,12 +1591,14 @@ impl SqliteStore {
                     let kind: String = row.get(6)?;
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
                     Ok(Node {
                         id,
                         vname,
                         kind,
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
                     })
                 })
                 .context("executing FTS backfill query")?
@@ -1542,7 +1717,7 @@ impl SqliteStore {
     /// Shared by Step 2 (T0) and Step 3 (L2-A) to avoid duplicated query logic.
     fn fts_query_nodes(&self, match_expr: &str) -> AnyResult<Vec<Node>> {
         let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
-                          n.kind, n.package, n.line \
+                          n.kind, n.package, n.line, n.end_line \
                    FROM nodes_fts \
                    JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
                    JOIN nodes n ON n.id = m.node_id \
@@ -1563,12 +1738,14 @@ impl SqliteStore {
                 let kind: String = row.get(6)?;
                 let package: String = row.get(7)?;
                 let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
                 Ok(Node {
                     id,
                     vname,
                     kind,
                     package,
                     line: line.and_then(|l| u32::try_from(l).ok()),
+                    end_line: end_line.and_then(|l| u32::try_from(l).ok()),
                 })
             })
             .context("executing FTS5 query")?;
@@ -1956,9 +2133,12 @@ impl Store for SqliteStore {
                 .transaction()
                 .context("starting put_node transaction")?;
             tx.execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, package = excluded.package, line = COALESCE(excluded.line, nodes.line)",
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
+                 package = excluded.package, \
+                 line = COALESCE(excluded.line, nodes.line), \
+                 end_line = COALESCE(excluded.end_line, nodes.end_line)",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -1969,6 +2149,7 @@ impl Store for SqliteStore {
                     node.kind,
                     node.package,
                     node.line.map(|l| l as i64),
+                    node.end_line.map(|l| l as i64),
                 ],
             )
             .context("inserting node")?;
@@ -2005,7 +2186,7 @@ impl Store for SqliteStore {
             let row = self
                 .conn
                 .query_row(
-                    "SELECT corpus, root, path, language, signature, kind, package, line \
+                    "SELECT corpus, root, path, language, signature, kind, package, line, end_line \
                      FROM nodes WHERE id = ?1",
                     params![node_id_to_i64(id)],
                     |row| {
@@ -2019,12 +2200,14 @@ impl Store for SqliteStore {
                         let kind: String = row.get(5)?;
                         let package: String = row.get(6)?;
                         let line: Option<i64> = row.get(7)?;
+                        let end_line: Option<i64> = row.get(8)?;
                         Ok(Node {
                             id,
                             vname,
                             kind,
                             package,
                             line: line.and_then(|l| u32::try_from(l).ok()),
+                            end_line: end_line.and_then(|l| u32::try_from(l).ok()),
                         })
                     },
                 )
@@ -2132,7 +2315,7 @@ impl Store for SqliteStore {
         for chunk in ids.chunks(CHUNK) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT id, corpus, root, path, language, signature, kind, package, line \
+                "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line \
                  FROM nodes WHERE id IN ({placeholders})"
             );
             (|| -> AnyResult<()> {
@@ -2154,12 +2337,14 @@ impl Store for SqliteStore {
                         let kind: String = row.get(6)?;
                         let package: String = row.get(7)?;
                         let line: Option<i64> = row.get(8)?;
+                        let end_line: Option<i64> = row.get(9)?;
                         Ok(Node {
                             id,
                             vname,
                             kind,
                             package,
                             line: line.and_then(|l| u32::try_from(l).ok()),
+                            end_line: end_line.and_then(|l| u32::try_from(l).ok()),
                         })
                     })
                     .context("executing get_nodes query")?;

@@ -100,6 +100,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // G2: one hop from the name identifier to its declaration node gives the full span.
+    // Works for class_declaration, function_declaration, function_signature, method_definition.
+    let decl_end_line = |node: tree_sitter::Node<'_>| -> u32 {
+        node.parent()
+            .map(|p| p.end_position().row as u32 + 1)
+            .unwrap_or_else(|| node.start_position().row as u32 + 1)
+    };
+
     while let Some(m) = iter.next() {
         for &capture in m.captures {
             let Some(cap_name) = capture_names.get(capture.index as usize) else {
@@ -113,13 +121,17 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             let line = capture.node.start_position().row as u32 + 1;
             match cap_name.as_str() {
                 "class.name" => {
-                    let node = emit::class_node(corpus, vname_path, text).with_line(line);
+                    let node = emit::class_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     let edge = emit::defines_edge(file_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
                 }
                 "fn.name" => {
-                    let node = emit::fn_node(corpus, vname_path, text).with_line(line);
+                    let node = emit::fn_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     let edge = emit::defines_edge(file_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
@@ -129,8 +141,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     let class_name = find_parent_class_name(capture.node, source.as_slice())
                         .unwrap_or_else(|| "<anonymous>".to_string());
                     let class_id = emit::class_node(corpus, vname_path, &class_name).id;
-                    let node =
-                        emit::method_node(corpus, vname_path, &class_name, text).with_line(line);
+                    let node = emit::method_node(corpus, vname_path, &class_name, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     let edge = emit::defines_edge(class_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);

@@ -163,6 +163,28 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             .map(str::to_owned)
     };
 
+    // G2: walk up from a capture node to the nearest body-containing declaration
+    // and return its 1-based end line.  Handles function_declaration (1 level),
+    // method_declaration (3 levels from recv.type), and type_declaration (2 levels).
+    // Falls back to the capture's own start line when no declaration is found.
+    let decl_end_line = |node: tree_sitter::Node<'_>| -> u32 {
+        let mut cur = node;
+        for _ in 0..5 {
+            match cur.parent() {
+                Some(parent) => match parent.kind() {
+                    "function_declaration"
+                    | "method_declaration"
+                    | "type_declaration"
+                    | "const_declaration"
+                    | "var_declaration" => return parent.end_position().row as u32 + 1,
+                    _ => cur = parent,
+                },
+                None => break,
+            }
+        }
+        node.start_position().row as u32 + 1
+    };
+
     while let Some(m) = iter.next() {
         // Determine which pattern fired by inspecting the anchor capture — each
         // pattern in QUERIES has a unique first capture name.
@@ -180,7 +202,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 };
                 let name = strip_generics(&name).to_owned();
                 let line = anchor.node.start_position().row as u32 + 1;
-                let node = go_fn_node(corpus, vname_path, &name).with_line(line);
+                let node = go_fn_node(corpus, vname_path, &name)
+                    .with_line(line)
+                    .with_end_line(decl_end_line(anchor.node));
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -205,7 +229,11 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     })
                     .map(|c| c.node.start_position().row as u32 + 1)
                     .unwrap_or_else(|| anchor.node.start_position().row as u32 + 1);
-                let node = go_method_node(corpus, vname_path, &recv, &method_name).with_line(line);
+                // decl_end_line walks up from recv.type → parameter_declaration →
+                // parameter_list → method_declaration in at most 3 hops.
+                let node = go_method_node(corpus, vname_path, &recv, &method_name)
+                    .with_line(line)
+                    .with_end_line(decl_end_line(anchor.node));
                 output.edges.push(emit::defines_edge(class_id, node.id));
                 output.nodes.push(node);
             }
@@ -215,7 +243,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 };
                 let name = strip_generics(&name).to_owned();
                 let line = anchor.node.start_position().row as u32 + 1;
-                let node = go_class_node(corpus, vname_path, &name).with_line(line);
+                let node = go_class_node(corpus, vname_path, &name)
+                    .with_line(line)
+                    .with_end_line(decl_end_line(anchor.node));
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -225,7 +255,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 };
                 let name = strip_generics(&name).to_owned();
                 let line = anchor.node.start_position().row as u32 + 1;
-                let node = go_iface_node(corpus, vname_path, &name).with_line(line);
+                let node = go_iface_node(corpus, vname_path, &name)
+                    .with_line(line)
+                    .with_end_line(decl_end_line(anchor.node));
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -235,7 +267,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 };
                 let name = strip_generics(&name).to_owned();
                 let line = anchor.node.start_position().row as u32 + 1;
-                let node = go_type_node(corpus, vname_path, &name).with_line(line);
+                let node = go_type_node(corpus, vname_path, &name)
+                    .with_line(line)
+                    .with_end_line(decl_end_line(anchor.node));
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }
@@ -244,7 +278,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     continue;
                 };
                 let line = anchor.node.start_position().row as u32 + 1;
-                let node = go_var_node(corpus, vname_path, &name).with_line(line);
+                let node = go_var_node(corpus, vname_path, &name)
+                    .with_line(line)
+                    .with_end_line(decl_end_line(anchor.node));
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
             }

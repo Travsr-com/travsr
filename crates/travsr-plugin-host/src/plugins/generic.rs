@@ -142,6 +142,12 @@ fn parse_generic(
                 continue;
             }
             let line = cap.node.start_position().row as u32 + 1;
+            // G2: one hop from the name capture to the declaration node gives the full span.
+            let end_line = cap
+                .node
+                .parent()
+                .map(|p| p.end_position().row as u32 + 1)
+                .unwrap_or(line);
 
             let sig = if sig_prefix == "import" {
                 // Use the full node text, strip leading keyword + trailing semicolons
@@ -159,7 +165,11 @@ fn parse_generic(
             };
 
             let vname = VName::new(corpus, "", vname_path, lang_str, &sig);
-            nodes.push(Node::new(vname, node_kind).with_line(line));
+            let mut node = Node::new(vname, node_kind).with_line(line);
+            if sig_prefix != "import" {
+                node = node.with_end_line(end_line);
+            }
+            nodes.push(node);
         }
     }
 
