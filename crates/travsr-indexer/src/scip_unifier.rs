@@ -235,7 +235,10 @@ mod tests {
     #[test]
     fn candidates_function_with_container() {
         let sigs = candidate_signatures(&parsed(Some("Server"), "Serve", "function"));
-        assert_eq!(sigs, vec!["method:Server.Serve", "fn:Server.Serve", "fn:Serve"]);
+        assert_eq!(
+            sigs,
+            vec!["method:Server.Serve", "fn:Server.Serve", "fn:Serve"]
+        );
     }
 
     #[test]

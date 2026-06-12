@@ -26,6 +26,10 @@ const _: () = {
 // Sprint 2 will extend this with LSIF-derived call/ref edges.
 const QUERIES: &str = r"
 (class_declaration name: (type_identifier) @class.name)
+(abstract_class_declaration name: (type_identifier) @class.name)
+(interface_declaration name: (type_identifier) @iface.name)
+(type_alias_declaration name: (type_identifier) @type.name)
+(enum_declaration name: (identifier) @enum.name)
 (function_declaration name: (identifier) @fn.name)
 (function_signature name: (identifier) @fn.name)
 (method_definition name: (property_identifier) @method.name)
@@ -122,6 +126,30 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             match cap_name.as_str() {
                 "class.name" => {
                     let node = emit::class_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "iface.name" => {
+                    let node = emit::interface_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "type.name" => {
+                    let node = emit::type_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "enum.name" => {
+                    let node = emit::enum_node(corpus, vname_path, text)
                         .with_line(line)
                         .with_end_line(decl_end_line(capture.node));
                     let edge = emit::defines_edge(file_id, node.id);

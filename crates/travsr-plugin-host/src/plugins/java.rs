@@ -14,6 +14,8 @@ const JAVA_QUERIES: &str = r#"
 (class_declaration name: (identifier) @class.name)
 (interface_declaration name: (identifier) @interface.name)
 (enum_declaration name: (identifier) @enum.name)
+(record_declaration name: (identifier) @record.name)
+(annotation_type_declaration name: (identifier) @annotation.name)
 (method_declaration name: (identifier) @method.name)
 (constructor_declaration name: (identifier) @constructor.name)
 (import_declaration) @import
@@ -106,6 +108,26 @@ fn parse_java_file(
                     let vn = VName::new(corpus, "", vname_path, "java", format!("enum:{text}"));
                     nodes.push(
                         Node::new(vn, "enum")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
+                }
+                "record.name" => {
+                    // Java 14+ records are class-like — `class:` keeps the G1
+                    // matcher's class-candidate list closed.
+                    let vn = VName::new(corpus, "", vname_path, "java", format!("class:{text}"));
+                    nodes.push(
+                        Node::new(vn, "class")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
+                }
+                "annotation.name" => {
+                    // `@interface` annotation types are interface-like.
+                    let vn =
+                        VName::new(corpus, "", vname_path, "java", format!("interface:{text}"));
+                    nodes.push(
+                        Node::new(vn, "interface")
                             .with_line(line)
                             .with_end_line(end_line),
                     );

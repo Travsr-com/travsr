@@ -42,7 +42,6 @@ const _: () = {
 //   - `import "C"` (cgo pseudo-package) emitted and then filtered in link_imports_go
 //   - Call/ref edges deferred to Phase 4 (Go LSIF / pyright-equivalent)
 //   - Multi-value var blocks: only first name in each spec is indexed
-//   - Named type definitions (type X Y, no `=`) not indexed — DEBT-019
 //   - Methods on generic types (*Stack[T]) silently dropped — DEBT-020
 //   - Co-package edges only refreshed on `travsr init`, not per-commit — DEBT-024
 
@@ -80,6 +79,20 @@ const QUERIES: &str = r#"
 (type_declaration
   (type_alias
     name: (type_identifier) @type.name))
+(type_declaration
+  (type_spec
+    name: (type_identifier) @type.name
+    type: [
+      (type_identifier)
+      (qualified_type)
+      (map_type)
+      (slice_type)
+      (array_type)
+      (function_type)
+      (channel_type)
+      (pointer_type)
+      (generic_type)
+    ]))
 (source_file
   (var_declaration
     (var_spec
@@ -770,6 +783,29 @@ mod tests {
                 .any(|n| n.vname.signature == "type:ID" && n.kind == "type"),
             "expected type:ID"
         );
+    }
+
+    #[test]
+    fn named_type_definitions_emitted() {
+        // DEBT-019 / #317: `type X Y` (no `=`) over non-struct underlying types
+        // must produce nodes — SCIP marks them as types and G1 needs a
+        // tree-sitter counterpart to unify onto.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("named.go");
+        std::fs::write(
+            &path,
+            b"package main\ntype Disposition string\ntype DocumentMap map[string]int\ntype EnsureRBACFunc func(int) error\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "named.go").unwrap();
+        for name in ["Disposition", "DocumentMap", "EnsureRBACFunc"] {
+            assert!(
+                out.nodes
+                    .iter()
+                    .any(|n| n.vname.signature == format!("type:{name}") && n.kind == "type"),
+                "expected type:{name}"
+            );
+        }
     }
 
     #[test]

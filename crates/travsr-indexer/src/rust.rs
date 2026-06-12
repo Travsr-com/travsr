@@ -44,6 +44,8 @@ const QUERIES: &str = "
 (mod_item name: (identifier) @mod.name)
 (const_item name: (identifier) @const.name)
 (static_item name: (identifier) @static.name)
+(type_item name: (type_identifier) @type.name)
+(union_item name: (type_identifier) @union.name)
 (use_declaration) @use.decl
 ";
 
@@ -121,6 +123,8 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                             | "mod_item"
                             | "const_item"
                             | "static_item"
+                            | "type_item"
+                            | "union_item"
                     ) {
                         return p.end_position().row as u32 + 1;
                     }
@@ -224,6 +228,20 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 }
                 "static.name" => {
                     let node = rust_static_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "type.name" => {
+                    let node = rust_type_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "union.name" => {
+                    let node = rust_union_node(corpus, vname_path, text)
                         .with_line(line)
                         .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
@@ -455,6 +473,16 @@ fn rust_static_node(corpus: &str, path: &str, name: &str) -> Node {
     )
 }
 
+fn rust_type_node(corpus: &str, path: &str, name: &str) -> Node {
+    Node::new(rust_vname(corpus, path, &format!("type:{name}")), "type")
+}
+
+fn rust_union_node(corpus: &str, path: &str, name: &str) -> Node {
+    // Unions are struct-like aggregates — `struct:` keeps the G1 matcher's
+    // class-candidate list closed (SCIP marks them `#`).
+    Node::new(rust_vname(corpus, path, &format!("struct:{name}")), "union")
+}
+
 fn rust_use_node(corpus: &str, path: &str, use_path: &str) -> Node {
     Node::new(
         rust_vname(corpus, path, &format!("use:{use_path}")),
@@ -606,6 +634,32 @@ mod tests {
         let out = parse("", &path, "bad.rs").unwrap();
         assert!(!out.nodes.is_empty());
         assert_eq!(out.nodes[0].kind, "file");
+    }
+
+    #[test]
+    fn type_alias_and_union_emitted() {
+        // RFC-014 #317: SCIP marks `type X = Y` and `union U` as `#` type
+        // symbols — Phase A must emit G1-matchable nodes for them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("types.rs");
+        std::fs::write(
+            &path,
+            b"pub type Result2 = std::result::Result<(), String>;\npub union Bits { i: i32, f: f32 }\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "types.rs").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "type:Result2" && n.kind == "type"),
+            "expected type:Result2"
+        );
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "struct:Bits" && n.kind == "union"),
+            "expected struct:Bits union node"
+        );
     }
 
     #[test]

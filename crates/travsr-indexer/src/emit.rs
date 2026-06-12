@@ -22,6 +22,21 @@ pub fn method_node(corpus: &str, path: &str, class_name: &str, method_name: &str
     )
 }
 
+pub fn interface_node(corpus: &str, path: &str, iface_name: &str) -> Node {
+    Node::new(
+        ts_vname(corpus, path, &format!("interface:{iface_name}")),
+        "interface",
+    )
+}
+
+pub fn type_node(corpus: &str, path: &str, type_name: &str) -> Node {
+    Node::new(ts_vname(corpus, path, &format!("type:{type_name}")), "type")
+}
+
+pub fn enum_node(corpus: &str, path: &str, enum_name: &str) -> Node {
+    Node::new(ts_vname(corpus, path, &format!("enum:{enum_name}")), "enum")
+}
+
 pub fn var_node(corpus: &str, path: &str, var_name: &str) -> Node {
     Node::new(
         ts_vname(corpus, path, &format!("var:{var_name}")),

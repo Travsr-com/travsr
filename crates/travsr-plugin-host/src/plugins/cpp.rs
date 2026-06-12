@@ -10,6 +10,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (union_specifier name: (type_identifier) @union.name)
 (enum_specifier name: (type_identifier) @enum.name)
 (namespace_definition name: (namespace_identifier) @namespace.name)
+(alias_declaration name: (type_identifier) @using.name)
 (function_declarator declarator: (identifier) @fn.name)
 (function_declarator declarator: (field_identifier) @fn.name)
 (preproc_include path: (_) @import)
@@ -20,6 +21,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("union.name", "union", "struct"),
         ("enum.name", "enum", "enum"),
         ("namespace.name", "namespace", "namespace"),
+        ("using.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],
