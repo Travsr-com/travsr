@@ -459,7 +459,25 @@ fn next_edges(
         }
     }
     if matches!(direction, Direction::Callers | Direction::Both) {
-        let incoming = store.iter_edges_to(node_id)?;
+        let mut incoming = store.iter_edges_to(node_id)?;
+        // RFC-014 #317: a file's callers are the callers of the definitions it
+        // contains — splice them in so function-level callers surface when a
+        // query resolves to a file node. Edges sourced from the file itself
+        // (defines/binding) are skipped to avoid self-loops.
+        if let Some(node) = store.get_node(node_id)? {
+            if node.kind == "file" {
+                for def_id in
+                    store.definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
+                {
+                    incoming.extend(
+                        store
+                            .iter_edges_to(def_id)?
+                            .into_iter()
+                            .filter(|e| e.src != node_id),
+                    );
+                }
+            }
+        }
         if matches!(edge_mode, EdgeMode::Semantic) {
             let has_semantic = incoming.iter().any(|e| is_semantic_edge(e.kind.as_str()));
             if has_semantic {
@@ -486,6 +504,10 @@ fn next_edges(
             }
         }
     }
+    // Multiple call sites (and the file-node definition splice) can yield the
+    // same (kind, src) pair — collapse them for display.
+    let mut seen = HashSet::new();
+    out.retain(|(kind, id)| seen.insert((kind.clone(), *id)));
     Ok(out)
 }
 

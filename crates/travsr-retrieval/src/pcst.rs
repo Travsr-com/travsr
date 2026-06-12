@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use petgraph::algo::dijkstra;
+use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{DiGraph, NodeIndex};
 use travsr_core::{Node, NodeId};
 use travsr_store::{SqliteStore, Store};
@@ -97,7 +97,18 @@ pub fn pcst_path(
     // Dijkstra from source: cost = 1.0 - ppr_weight (lower = more traversable).
     let costs = dijkstra(&graph, src_idx, Some(dst_idx), |e| *e.weight());
 
-    let Some(&total_cost) = costs.get(&dst_idx) else {
+    // Reconstruct the actual source→sink route. The route must LEAD the result:
+    // downstream consumers truncate (token budget here, 4 KiB sanitizer at the
+    // MCP boundary), and ref/call edges cost 0 (ppr_weight 1.0) so the λ
+    // threshold can admit the source's whole zero-cost component — a sink
+    // appended after that blob would be cut off every time.
+    let Some((total_cost, route)) = astar(
+        &graph,
+        src_idx,
+        |idx| idx == dst_idx,
+        |e| *e.weight(),
+        |_| 0.0,
+    ) else {
         tracing::debug!(
             src = source.0,
             sink = sink.0,
@@ -115,18 +126,24 @@ pub fn pcst_path(
         return bfs_fallback(store, source, filter, token_budget);
     }
 
-    // Include nodes whose cheapest-path cost is within λ × total_cost of optimal.
+    // Route nodes first, in traversal order (source → … → sink).
+    let mut result_ids: Vec<NodeId> = route
+        .iter()
+        .filter_map(|idx| idx_to_node.get(idx).copied())
+        .collect();
+    let on_route: HashSet<NodeId> = result_ids.iter().copied().collect();
+
+    // Then context: nodes whose cheapest-path cost is within λ × total_cost of
+    // optimal, cheapest first (deterministic — `costs` is a HashMap).
     let threshold = total_cost * (1.0 + PCST_LAMBDA);
-    let mut result_ids: Vec<NodeId> = costs
+    let mut context: Vec<(f32, NodeId)> = costs
         .iter()
         .filter(|(_, &c)| c <= threshold)
-        .filter_map(|(idx, _)| idx_to_node.get(idx).copied())
+        .filter_map(|(idx, &c)| idx_to_node.get(idx).map(|&id| (c, id)))
+        .filter(|(_, id)| !on_route.contains(id))
         .collect();
-
-    // Always include sink if reachable.
-    if !result_ids.contains(&sink) {
-        result_ids.push(sink);
-    }
+    context.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
+    result_ids.extend(context.into_iter().map(|(_, id)| id));
 
     // Retrieve nodes, apply token budget.
     let mut result = Vec::new();
@@ -193,9 +210,25 @@ fn expand_local_subgraph(
     rev_queue.push_back((sink, 0));
     rev_visited.insert(sink);
 
+    // Seed both endpoints upfront: on high-fanout graphs the forward pass can
+    // exhaust the node budget before the reverse pass runs, and the sink must
+    // never be starved out of the local graph (it would force a BFS fallback
+    // even when a direct edge exists).
+    for endpoint in [source, sink] {
+        if let Ok(Some(node)) = store.get_node(endpoint) {
+            if filter.allow(endpoint, endpoint, Some(node.vname.corpus.as_str())) {
+                nodes.entry(endpoint).or_insert(node);
+            }
+        }
+    }
+
+    // The forward pass may consume at most half the node budget so the
+    // reverse pass always has room to connect the sink side.
+    let fwd_cap = MAX_LOCAL_NODES / 2;
+
     // Forward BFS from source: follow outgoing edges.
     while let Some((current, depth)) = fwd_queue.pop_front() {
-        if nodes.len() >= MAX_LOCAL_NODES {
+        if nodes.len() >= fwd_cap {
             break;
         }
         if let Ok(Some(node)) = store.get_node(current) {
@@ -435,6 +468,41 @@ mod tests {
         let result = pcst_path(&store, a.id, b.id, &OpenFilter, 4096).unwrap();
         // BFS from a will find only a (no outgoing edges).
         assert!(result.iter().any(|n| n.id == a.id));
+    }
+
+    #[test]
+    fn pcst_high_fanout_source_does_not_starve_sink() {
+        // Regression (#317): source with fanout larger than the local-node
+        // budget plus a direct edge to the sink. The forward pass used to
+        // consume the whole budget, the sink never entered the local graph,
+        // and PCST silently fell back to BFS instead of returning the
+        // one-hop path.
+        let src = node("src.rs", "fn:src");
+        let sink = node("sink.rs", "fn:sink");
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&src).unwrap();
+        store.put_node(&sink).unwrap();
+        for i in 0..(MAX_LOCAL_NODES + 10) {
+            let filler = node(&format!("filler{i}.rs"), &format!("fn:filler{i}"));
+            store.put_node(&filler).unwrap();
+            store
+                .put_edge(&Edge::new(src.id, filler.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        store
+            .put_edge(&Edge::new(src.id, sink.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = pcst_path(&store, src.id, sink.id, &OpenFilter, 1 << 20).unwrap();
+        let ids: Vec<_> = result.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&src.id), "source must be in path");
+        assert!(ids.contains(&sink.id), "sink must be in path");
+        // Regression (#317): ref/call edges cost 0, so the λ threshold admits
+        // the entire zero-cost component. The route must lead the result —
+        // consumers truncate output, and a sink buried after thousands of
+        // context nodes is as bad as no sink at all.
+        assert_eq!(ids[0], src.id, "route must start at source");
+        assert_eq!(ids[1], sink.id, "direct route must place sink second");
     }
 
     #[test]

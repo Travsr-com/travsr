@@ -1332,6 +1332,33 @@ LIMIT 100",
         Ok(id.map(i64_to_node_id))
     }
 
+    /// All definition node ids at `(corpus, path)` — tree-sitter and SCIP —
+    /// ordered by line.  Used by the CLI to surface function-level callers
+    /// when a query resolves to a file node (RFC-014 #317: a file's callers
+    /// are the callers of the definitions it contains).  Container nodes
+    /// (file, import, packages, modules) are excluded: their incoming edges
+    /// are structural, not call sites.
+    pub fn definition_node_ids_in_file(
+        &self,
+        corpus: &str,
+        path: &str,
+    ) -> anyhow::Result<Vec<NodeId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM nodes \
+             WHERE corpus = ?1 AND path = ?2 \
+               AND kind IN ('function','method','fn','class','interface','struct', \
+                            'trait','enum','type','typedef','union','object', \
+                            'protocol','mixin','extension','namespace','init', \
+                            'var','variable','const','constant','static') \
+             ORDER BY line ASC",
+        )?;
+        let ids = stmt
+            .query_map(params![corpus, path], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<i64>, _>>()
+            .context("definition_node_ids_in_file")?;
+        Ok(ids.into_iter().map(i64_to_node_id).collect())
+    }
+
     /// G1: Look up the unified `NodeId` for a raw SCIP symbol string.
     ///
     /// Returns `None` if the symbol has not been aliased (i.e. no tree-sitter

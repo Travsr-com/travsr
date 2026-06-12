@@ -28,5 +28,15 @@ pub fn run() -> anyhow::Result<()> {
         "nodes: {nodes} | edges: {edges} | schema: v{schema} | journal: {journal} | last_commit: {last_commit}"
     );
 
+    // RFC-014 #317 re-index policy: surface signature-format skew so the user
+    // knows the graph was built with an older format and a re-index is due.
+    let sig_v = store.get_signature_format_version()?;
+    if sig_v != travsr_core::SIGNATURE_FORMAT_VERSION {
+        println!(
+            "⚠ signature format v{sig_v} ≠ current v{} — graph built with an older format; run `travsr init` to re-index",
+            travsr_core::SIGNATURE_FORMAT_VERSION
+        );
+    }
+
     Ok(())
 }
