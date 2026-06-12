@@ -20,8 +20,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// Version history:
 ///   0 — legacy (no version byte; all pre-RFC-002 databases)
-///   1 — current: Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
-pub const SIGNATURE_FORMAT_VERSION: u8 = 1;
+///   1 — Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
+///   2 — current: RFC-014 Phase B graph unification. Phase A now captures
+///       type-definition nodes and `end_line` spans that the G1/G2 unification
+///       passes depend on, so v1 databases lack the tree-sitter nodes that
+///       SCIP symbols unify onto. Bumping intentionally invalidates every
+///       existing `.travsr/graph.db` so the daemon skew check and the
+///       `travsr status` warning force a full re-index (RFC-014 "Re-index
+///       Policy").
+pub const SIGNATURE_FORMAT_VERSION: u8 = 2;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 
@@ -406,6 +413,10 @@ pub struct Node {
     /// 1-based source line of the symbol's definition site.
     /// `None` for file-kind nodes and synthetic import nodes.
     pub line: Option<u32>,
+    /// 1-based last source line of the symbol's body (inclusive).
+    /// Used by G2 span attribution to find the enclosing function for a SCIP
+    /// reference occurrence. `None` until migration v13 backfills the column.
+    pub end_line: Option<u32>,
 }
 
 impl Node {
@@ -413,7 +424,7 @@ impl Node {
     ///
     /// The `id` is derived deterministically from the VName. `package`
     /// defaults to an empty string; use [`Node::with_package`] to set it.
-    /// `line` defaults to `None`; use [`Node::with_line`] to set it.
+    /// `line` / `end_line` default to `None`; use the builder methods to set them.
     pub fn new(vname: VName, kind: impl Into<String>) -> Self {
         let id = vname.id();
         Self {
@@ -422,6 +433,7 @@ impl Node {
             kind: kind.into(),
             package: String::new(),
             line: None,
+            end_line: None,
         }
     }
 
@@ -443,6 +455,27 @@ impl Node {
         self.line = Some(line);
         self
     }
+
+    /// Set the `end_line` field (1-based, inclusive) and return `self` (builder pattern).
+    pub fn with_end_line(mut self, end_line: u32) -> Self {
+        self.end_line = Some(end_line);
+        self
+    }
+}
+
+/// A raw SCIP reference occurrence used for G2 call-site attribution.
+///
+/// The store's `write_scip_attributed_batch` takes a slice of these and emits
+/// `ref/call` edges from the enclosing function node (or the file node as fallback)
+/// to `callee_id`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScipRef {
+    /// Repo-relative path of the file containing the reference (e.g. `pkg/foo/bar.go`).
+    pub caller_path: String,
+    /// 1-based source line of the reference occurrence.
+    pub caller_line: u32,
+    /// `NodeId` of the called symbol (from `symbol_map` or `symbol_aliases`).
+    pub callee_id: NodeId,
 }
 
 /// Human-readable label: path for file nodes (whose `signature` is the
@@ -466,7 +499,9 @@ pub fn is_noise_node(node: &Node) -> bool {
         || is_scip_anonymous_local(&node.vname.signature)
 }
 
-fn is_scip_anonymous_local(sig: &str) -> bool {
+/// Returns `true` if `sig` is a SCIP anonymous-local symbol (`local N` suffix).
+/// Used by G3 ingest filter in `travsr-indexer` and by `is_noise_node`.
+pub fn is_scip_anonymous_local(sig: &str) -> bool {
     // SCIP local symbols end with "local <digits>", e.g. "local 27".
     if let Some(pos) = sig.rfind("local ") {
         let suffix = &sig[pos + 6..];
@@ -894,9 +929,10 @@ mod tests {
     #[test]
     fn version_byte_produces_different_id_than_unversioned() {
         // Regression guard: confirms the RFC-002 domain separator is actually
-        // prepended and that length-prefix encoding is used. The v1 format starts
-        // with [0x01][len][corpus...]; the v0 format starts with raw corpus bytes.
-        // These byte streams can never be equal regardless of field contents.
+        // prepended and that length-prefix encoding is used. The versioned format
+        // starts with [SIGNATURE_FORMAT_VERSION][len][corpus...]; the v0 format
+        // starts with raw corpus bytes. These byte streams can never be equal
+        // regardless of field contents.
         let v = sample_vname();
         let versioned_id = v.id(); // uses SIGNATURE_FORMAT_VERSION byte + length-prefix
 

@@ -14,6 +14,36 @@ fn indexer() -> Indexer {
 }
 
 #[test]
+fn interface_type_alias_enum_emitted() {
+    // RFC-014 #317: SCIP marks interfaces, type aliases, enums and abstract
+    // classes as `#` type symbols — Phase A must emit G1-matchable nodes.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("types.ts");
+    std::fs::write(
+        &path,
+        b"export interface Shape { area(): number }\nexport type Velocity = number;\nexport enum Color { Red, Green }\nexport abstract class Base { }\n",
+    )
+    .unwrap();
+    let out = indexer().parse_file(&path).unwrap();
+    let sigs: Vec<&str> = out
+        .nodes
+        .iter()
+        .map(|n| n.vname.signature.as_str())
+        .collect();
+    for expected in [
+        "interface:Shape",
+        "type:Velocity",
+        "enum:Color",
+        "class:Base",
+    ] {
+        assert!(
+            sigs.contains(&expected),
+            "missing {expected} — got {sigs:?}"
+        );
+    }
+}
+
+#[test]
 fn parse_empty_file_emits_only_file_node() {
     let out = indexer().parse_file(&fixture("empty.ts")).unwrap();
     assert_eq!(out.nodes.len(), 1, "expected exactly one file node");

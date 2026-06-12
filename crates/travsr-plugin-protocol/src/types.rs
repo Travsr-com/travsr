@@ -1,7 +1,7 @@
 use crate::ffi_marker::FfiMarker;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use travsr_core::{Edge, Node};
+use travsr_core::{Edge, Node, ScipRef};
 
 /// Current protocol version. Bump on any breaking wire change.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -47,6 +47,10 @@ pub struct InvokeRequest {
 pub struct InvokeResponse {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    /// G2 attribution records — reference occurrences with call-site line numbers.
+    /// Old sidecar binaries omit this field; `#[serde(default)]` provides `[]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<ScipRef>,
 }
 
 impl InvokeResponse {

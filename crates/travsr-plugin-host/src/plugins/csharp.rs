@@ -10,6 +10,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (struct_declaration name: (identifier) @struct.name)
 (enum_declaration name: (identifier) @enum.name)
 (record_declaration name: (identifier) @class.name)
+(delegate_declaration name: (identifier) @delegate.name)
 (method_declaration name: (identifier) @fn.name)
 (constructor_declaration name: (identifier) @fn.name)
 (using_directive) @import
@@ -19,6 +20,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("interface.name", "interface", "interface"),
         ("struct.name", "class", "class"),
         ("enum.name", "enum", "enum"),
+        ("delegate.name", "delegate", "type"),
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],

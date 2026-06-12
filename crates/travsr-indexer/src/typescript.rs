@@ -26,6 +26,10 @@ const _: () = {
 // Sprint 2 will extend this with LSIF-derived call/ref edges.
 const QUERIES: &str = r"
 (class_declaration name: (type_identifier) @class.name)
+(abstract_class_declaration name: (type_identifier) @class.name)
+(interface_declaration name: (type_identifier) @iface.name)
+(type_alias_declaration name: (type_identifier) @type.name)
+(enum_declaration name: (identifier) @enum.name)
 (function_declaration name: (identifier) @fn.name)
 (function_signature name: (identifier) @fn.name)
 (method_definition name: (property_identifier) @method.name)
@@ -100,6 +104,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // G2: one hop from the name identifier to its declaration node gives the full span.
+    // Works for class_declaration, function_declaration, function_signature, method_definition.
+    let decl_end_line = |node: tree_sitter::Node<'_>| -> u32 {
+        node.parent()
+            .map(|p| p.end_position().row as u32 + 1)
+            .unwrap_or_else(|| node.start_position().row as u32 + 1)
+    };
+
     while let Some(m) = iter.next() {
         for &capture in m.captures {
             let Some(cap_name) = capture_names.get(capture.index as usize) else {
@@ -113,13 +125,41 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             let line = capture.node.start_position().row as u32 + 1;
             match cap_name.as_str() {
                 "class.name" => {
-                    let node = emit::class_node(corpus, vname_path, text).with_line(line);
+                    let node = emit::class_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "iface.name" => {
+                    let node = emit::interface_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "type.name" => {
+                    let node = emit::type_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    let edge = emit::defines_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                "enum.name" => {
+                    let node = emit::enum_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     let edge = emit::defines_edge(file_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
                 }
                 "fn.name" => {
-                    let node = emit::fn_node(corpus, vname_path, text).with_line(line);
+                    let node = emit::fn_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     let edge = emit::defines_edge(file_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
@@ -129,8 +169,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     let class_name = find_parent_class_name(capture.node, source.as_slice())
                         .unwrap_or_else(|| "<anonymous>".to_string());
                     let class_id = emit::class_node(corpus, vname_path, &class_name).id;
-                    let node =
-                        emit::method_node(corpus, vname_path, &class_name, text).with_line(line);
+                    let node = emit::method_node(corpus, vname_path, &class_name, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     let edge = emit::defines_edge(class_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
@@ -241,7 +282,10 @@ fn has_napi_package_json(abs_path: &std::path::Path) -> bool {
 fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let mut current = node.parent()?;
     loop {
-        if matches!(current.kind(), "class_declaration" | "class") {
+        if matches!(
+            current.kind(),
+            "class_declaration" | "class" | "abstract_class_declaration"
+        ) {
             let name = (0..current.child_count())
                 .filter_map(|i| current.child(i as u32))
                 .find(|child| child.kind() == "type_identifier")
@@ -307,6 +351,35 @@ mod tests {
         assert!(
             err.contains("giant.ts"),
             "error message must include the file path: {err}"
+        );
+    }
+
+    // Methods of abstract classes must be qualified by the class name, not
+    // `<anonymous>` — find_parent_class_name must recognise
+    // `abstract_class_declaration` (verified in tree-sitter-typescript
+    // node-types.json for both typescript/ and tsx/ dialects).
+    #[test]
+    fn abstract_class_method_is_qualified_by_class_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.ts");
+        std::fs::write(&path, "export abstract class Base { foo(): void {} }").unwrap();
+
+        let out = parse("", &path, "base.ts").unwrap();
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "class:Base" && n.kind == "class"),
+            "expected class:Base node for abstract class"
+        );
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "method:Base.foo" && n.kind == "method"),
+            "expected method:Base.foo, got: {:?}",
+            out.nodes
+                .iter()
+                .map(|n| n.vname.signature.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

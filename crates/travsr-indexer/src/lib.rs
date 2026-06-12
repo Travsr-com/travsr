@@ -22,6 +22,7 @@ pub mod ra_runner;
 pub mod runner;
 mod rust;
 pub mod sandbox;
+pub mod scip_unifier;
 mod typescript;
 
 use std::path::Path;

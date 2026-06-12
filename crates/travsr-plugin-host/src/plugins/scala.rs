@@ -9,6 +9,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (object_definition name: (_) @object.name)
 (trait_definition name: (_) @trait.name)
 (function_definition name: (_) @fn.name)
+(type_definition name: (type_identifier) @typedef.name)
 (import_declaration) @import
 "#,
     capture_kinds: &[
@@ -16,6 +17,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("object.name", "object", "class"),
         ("trait.name", "trait", "class"),
         ("fn.name", "function", "fn"),
+        ("typedef.name", "type", "type"),
         ("import", "import", "import"),
     ],
 };

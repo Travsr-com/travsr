@@ -49,6 +49,7 @@ const _: () = {
 const QUERIES: &str = "
 (function_definition name: (identifier) @fn.name)
 (class_definition name: (identifier) @class.name)
+(type_alias_statement left: (type) @type.name)
 (import_statement) @import
 (import_from_statement) @from_import
 ";
@@ -109,6 +110,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // G2: capture.node is the name identifier; its parent is the definition node
+    // (function_definition or class_definition), which has the full declaration span.
+    let decl_end_line = |node: tree_sitter::Node<'_>| -> u32 {
+        node.parent()
+            .map(|p| p.end_position().row as u32 + 1)
+            .unwrap_or_else(|| node.start_position().row as u32 + 1)
+    };
+
     while let Some(m) = iter.next() {
         for &capture in m.captures {
             let Some(cap_name) = capture_names.get(capture.index as usize) else {
@@ -122,6 +131,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         Err(_) => continue,
                     };
                     let line = capture.node.start_position().row as u32 + 1;
+                    let end_line = decl_end_line(capture.node);
                     // capture.node is the identifier; its parent is function_definition.
                     // Pass function_definition so find_parent_class looks at the outer context.
                     let parent_class = capture
@@ -130,11 +140,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .and_then(|fd| find_parent_class(fd, source.as_slice()));
                     let (node, src_id) = if let Some(class_name) = parent_class {
                         let class_id = py_class_node(corpus, vname_path, &class_name).id;
-                        let n =
-                            py_method_node(corpus, vname_path, &class_name, text).with_line(line);
+                        let n = py_method_node(corpus, vname_path, &class_name, text)
+                            .with_line(line)
+                            .with_end_line(end_line);
                         (n, class_id)
                     } else {
-                        let n = py_fn_node(corpus, vname_path, text).with_line(line);
+                        let n = py_fn_node(corpus, vname_path, text)
+                            .with_line(line)
+                            .with_end_line(end_line);
                         (n, file_id)
                     };
                     output.edges.push(emit::defines_edge(src_id, node.id));
@@ -146,7 +159,28 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         Err(_) => continue,
                     };
                     let line = capture.node.start_position().row as u32 + 1;
-                    let node = py_class_node(corpus, vname_path, text).with_line(line);
+                    let node = py_class_node(corpus, vname_path, text)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
+                    output.edges.push(emit::defines_edge(file_id, node.id));
+                    output.nodes.push(node);
+                }
+                "type.name" => {
+                    // PEP 695 `type X = Y` — the left field is a `type` node whose
+                    // text is the alias name (strip `[T]` params like Go strips
+                    // generics).
+                    let text = match capture.node.utf8_text(source.as_slice()) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let name = text.split('[').next().unwrap_or(text).trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let line = capture.node.start_position().row as u32 + 1;
+                    let node = py_type_node(corpus, vname_path, name)
+                        .with_line(line)
+                        .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
                 }
@@ -379,6 +413,10 @@ fn py_class_node(corpus: &str, path: &str, name: &str) -> Node {
     Node::new(py_vname(corpus, path, &format!("class:{name}")), "class")
 }
 
+fn py_type_node(corpus: &str, path: &str, name: &str) -> Node {
+    Node::new(py_vname(corpus, path, &format!("type:{name}")), "type")
+}
+
 fn py_import_node(corpus: &str, path: &str, module: &str) -> Node {
     Node::new(
         py_vname(corpus, path, &format!("import:{module}")),
@@ -422,6 +460,28 @@ mod tests {
             out.nodes.iter().any(|n| n.kind == "file"),
             "expected file node even for malformed input"
         );
+    }
+
+    #[test]
+    fn pep695_type_alias_emitted() {
+        // RFC-014 #317: PEP 695 `type X = Y` is a `#` type symbol in SCIP —
+        // Phase A must emit a G1-matchable node (type params stripped).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aliases.py");
+        std::fs::write(
+            &path,
+            b"type Point = tuple[int, int]\ntype Pair[T] = tuple[T, T]\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "aliases.py").unwrap();
+        for name in ["Point", "Pair"] {
+            assert!(
+                out.nodes
+                    .iter()
+                    .any(|n| n.vname.signature == format!("type:{name}") && n.kind == "type"),
+                "expected type:{name}"
+            );
+        }
     }
 
     #[test]

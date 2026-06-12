@@ -14,6 +14,8 @@ const JAVA_QUERIES: &str = r#"
 (class_declaration name: (identifier) @class.name)
 (interface_declaration name: (identifier) @interface.name)
 (enum_declaration name: (identifier) @enum.name)
+(record_declaration name: (identifier) @record.name)
+(annotation_type_declaration name: (identifier) @annotation.name)
 (method_declaration name: (identifier) @method.name)
 (constructor_declaration name: (identifier) @constructor.name)
 (import_declaration) @import
@@ -77,31 +79,70 @@ fn parse_java_file(
             let cap_name = &names[cap.index as usize];
             let text = cap.node.utf8_text(&source).unwrap_or("").to_string();
             let line = cap.node.start_position().row as u32 + 1;
+            // G2: one hop from name identifier to declaration node gives the full span.
+            let end_line = cap
+                .node
+                .parent()
+                .map(|p| p.end_position().row as u32 + 1)
+                .unwrap_or(line);
 
             match *cap_name {
                 "class.name" => {
                     let vn = VName::new(corpus, "", vname_path, "java", format!("class:{text}"));
-                    nodes.push(Node::new(vn, "class").with_line(line));
+                    nodes.push(
+                        Node::new(vn, "class")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
                 }
                 "interface.name" => {
                     let vn =
                         VName::new(corpus, "", vname_path, "java", format!("interface:{text}"));
-                    nodes.push(Node::new(vn, "interface").with_line(line));
+                    nodes.push(
+                        Node::new(vn, "interface")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
                 }
                 "enum.name" => {
                     let vn = VName::new(corpus, "", vname_path, "java", format!("enum:{text}"));
-                    nodes.push(Node::new(vn, "enum").with_line(line));
+                    nodes.push(
+                        Node::new(vn, "enum")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
+                }
+                "record.name" => {
+                    // Java 14+ records are class-like — `class:` keeps the G1
+                    // matcher's class-candidate list closed.
+                    let vn = VName::new(corpus, "", vname_path, "java", format!("class:{text}"));
+                    nodes.push(
+                        Node::new(vn, "class")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
+                }
+                "annotation.name" => {
+                    // `@interface` annotation types are interface-like.
+                    let vn =
+                        VName::new(corpus, "", vname_path, "java", format!("interface:{text}"));
+                    nodes.push(
+                        Node::new(vn, "interface")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
                 }
                 "method.name" => {
                     let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
                     // Check for native modifier on the parent method_declaration node.
-                    let is_native = cap
-                        .node
-                        .parent()
+                    let parent = cap.node.parent();
+                    let is_native = parent
                         .and_then(|p| p.utf8_text(&source).ok())
                         .map(|s| s.contains("native "))
                         .unwrap_or(false);
-                    let node = Node::new(vn, "method").with_line(line);
+                    let node = Node::new(vn, "method")
+                        .with_line(line)
+                        .with_end_line(end_line);
                     let node_id = node.id;
                     nodes.push(node);
                     if is_native {
@@ -118,7 +159,11 @@ fn parse_java_file(
                 }
                 "constructor.name" => {
                     let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
-                    nodes.push(Node::new(vn, "constructor").with_line(line));
+                    nodes.push(
+                        Node::new(vn, "constructor")
+                            .with_line(line)
+                            .with_end_line(end_line),
+                    );
                 }
                 "import" => {
                     let raw = cap.node.utf8_text(&source).unwrap_or("").trim().to_string();

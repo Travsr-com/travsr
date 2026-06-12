@@ -87,3 +87,125 @@ int compute(int x) { return x * 2; }
         );
     }
 }
+
+/// Like `kinds`, but returns VName signatures — proves the sig_prefix mapping
+/// the RFC-014 G1 unifier matches against, not just the node kind.
+fn sigs(source: &str, ext: &str) -> HashSet<String> {
+    let mut f = tempfile::Builder::new()
+        .suffix(&format!(".{ext}"))
+        .tempfile()
+        .expect("tempfile");
+    f.write_all(source.as_bytes()).expect("write fixture");
+    f.flush().expect("flush fixture");
+
+    let nodes = PluginIndexer::new(CORPUS)
+        .parse_file_with_vname(f.path(), &format!("fixture.{ext}"))
+        .expect("parse")
+        .nodes;
+
+    nodes.into_iter().map(|n| n.vname.signature).collect()
+}
+
+// RFC-014 #317: type-defining constructs SCIP emits as `#` symbols must have
+// Phase A nodes with G1-matchable signature prefixes.
+
+#[test]
+fn kotlin_typealias_emitted() {
+    let s = sigs("typealias Name = String\nclass Foo\n", "kt");
+    assert!(
+        s.contains("type:Name"),
+        "kotlin: missing type:Name — got {s:?}"
+    );
+    assert!(
+        s.contains("class:Foo"),
+        "kotlin: missing class:Foo — got {s:?}"
+    );
+}
+
+#[test]
+fn scala_type_definition_emitted() {
+    let s = sigs("object O { }\ntype Handler = String => Unit\n", "scala");
+    assert!(
+        s.contains("type:Handler"),
+        "scala: missing type:Handler — got {s:?}"
+    );
+}
+
+#[test]
+fn csharp_delegate_emitted() {
+    let s = sigs(
+        "public delegate int Transformer(int x);\npublic class Worker { }\n",
+        "cs",
+    );
+    assert!(
+        s.contains("type:Transformer"),
+        "csharp: missing type:Transformer — got {s:?}"
+    );
+    assert!(
+        s.contains("class:Worker"),
+        "csharp: missing class:Worker — got {s:?}"
+    );
+}
+
+#[test]
+fn cpp_using_alias_emitted() {
+    let s = sigs("using IntVec = int;\nclass Widget { };\n", "cpp");
+    assert!(
+        s.contains("type:IntVec"),
+        "cpp: missing type:IntVec — got {s:?}"
+    );
+}
+
+#[test]
+fn dart_enum_and_typedef_emitted() {
+    let s = sigs(
+        "enum Color { red, green }\ntypedef StringMap = Map<String, String>;\nclass Box { }\n",
+        "dart",
+    );
+    assert!(
+        s.contains("enum:Color"),
+        "dart: missing enum:Color — got {s:?}"
+    );
+    assert!(
+        s.contains("type:StringMap"),
+        "dart: missing type:StringMap — got {s:?}"
+    );
+}
+
+#[test]
+fn swift_typealias_and_struct_emitted() {
+    // tree-sitter-swift parses struct/enum/actor as class_declaration — the
+    // existing class capture must cover them (sig prefix `class:`).
+    let s = sigs(
+        "typealias Velocity = Double\nstruct Point { var x: Double }\nenum Direction { case north }\n",
+        "swift",
+    );
+    assert!(
+        s.contains("type:Velocity"),
+        "swift: missing type:Velocity — got {s:?}"
+    );
+    assert!(
+        s.contains("class:Point"),
+        "swift: struct must emit class:Point — got {s:?}"
+    );
+    assert!(
+        s.contains("class:Direction"),
+        "swift: enum must emit class:Direction — got {s:?}"
+    );
+}
+
+#[test]
+fn java_record_and_annotation_emitted() {
+    let s = sigs(
+        "public record Point(int x, int y) { }\n@interface Marker { }\nclass Plain { }\n",
+        "java",
+    );
+    assert!(
+        s.contains("class:Point"),
+        "java: record must emit class:Point — got {s:?}"
+    );
+    assert!(
+        s.contains("interface:Marker"),
+        "java: annotation type must emit interface:Marker — got {s:?}"
+    );
+}
