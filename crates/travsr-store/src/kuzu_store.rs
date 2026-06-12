@@ -164,8 +164,10 @@ impl KuzuStore {
                     // queries in KuzuStore. Sprint 9 prerequisite before LSIF reads Kùzu.
                     // See: docs/adrs/ADR-005-per-lang-corpus-naming.md Rule 2.
                     package: String::new(),
-                    // DEBT(travsr-251): Kùzu schema does not yet carry `line INTEGER`.
+                    // DEBT(travsr-251): Kùzu schema does not yet carry `line INTEGER`
+                    // or `end_line INTEGER`.
                     line: None,
+                    end_line: None,
                 });
             }
             Ok(out)
@@ -238,8 +240,10 @@ impl KuzuStore {
                     // queries in KuzuStore. Sprint 9 prerequisite before LSIF reads Kùzu.
                     // See: docs/adrs/ADR-005-per-lang-corpus-naming.md Rule 2.
                     package: String::new(),
-                    // DEBT(travsr-251): Kùzu schema does not yet carry `line INTEGER`.
+                    // DEBT(travsr-251): Kùzu schema does not yet carry `line INTEGER`
+                    // or `end_line INTEGER`.
                     line: None,
+                    end_line: None,
                 });
             }
             Ok(out)
@@ -346,8 +350,10 @@ impl Store for KuzuStore {
                 // TODO(travsr): update Kùzu schema to include `package STRING`
                 // once the Kùzu DDL migration path is defined (Sprint 9 / LSIF path).
                 package: String::new(),
-                // DEBT(travsr-251): update Kùzu schema to include `line INTEGER`.
+                // DEBT(travsr-251): update Kùzu schema to include `line INTEGER`
+                // and `end_line INTEGER`.
                 line: None,
+                end_line: None,
             }))
         })()
         .map_err(|e| StoreError::Database(format!("{:#}", e)))
