@@ -1283,48 +1283,50 @@ LIMIT 100",
         Ok(())
     }
 
-    /// G1: Find the closest tree-sitter node at `(corpus, path, kind, name)` within
-    /// `max_delta` lines of `scip_line`.
+    /// G1: Find the closest tree-sitter node at `(corpus, path)` whose signature
+    /// matches one of `signatures`, within `max_delta` lines of `scip_line`.
     ///
-    /// The query targets `fn:NAME` and `class:NAME`-style tree-sitter signatures
-    /// (as produced by Go, TS, Python, Rust parsers).  Returns `None` when no
-    /// candidate is within the proximity threshold.
+    /// Candidate signatures come from
+    /// `travsr_indexer::scip_unifier::candidate_signatures` and already encode
+    /// the node kind via their prefix (`fn:` / `class:` / `var:` / ...), so no
+    /// kind filter is needed.  The `(corpus, path)` index keeps the candidate
+    /// row set per-file small.  Returns `None` when no candidate is within the
+    /// proximity threshold.
     pub fn find_ts_node_for_unification(
         &self,
         corpus: &str,
         path: &str,
-        kind: &str,
-        name: &str,
+        signatures: &[String],
         scip_line: i64,
         max_delta: i64,
     ) -> anyhow::Result<Option<NodeId>> {
-        // Match the TS signature patterns produced by per-language parsers:
-        //   Go:     fn:Name / class:Name / interface:Name / var:Name
-        //   TS:     fn:Name / class:Name
-        //   Python: fn:Name / class:Name
-        //   Rust:   fn:Name / struct:Name / trait:Name / impl:Name
-        // We pass `kind` as the prefix (e.g. "function" → "fn", "class" → "class").
-        // Map from RFC-014 kind strings to TS signature prefixes.
-        let sig_prefix = match kind {
-            "function" => "fn",
-            k => k,
-        };
-        let sig_pattern = format!("{sig_prefix}:{name}");
+        if signatures.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = vec!["?"; signatures.len()].join(",");
+        let sql = format!(
+            "SELECT id FROM nodes \
+             WHERE corpus = ? AND path = ? \
+               AND signature IN ({placeholders}) \
+               AND line IS NOT NULL \
+               AND ABS(line - ?) <= ? \
+             ORDER BY ABS(line - ?) ASC \
+             LIMIT 1"
+        );
+
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(signatures.len() + 5);
+        bind.push(&corpus);
+        bind.push(&path);
+        for sig in signatures {
+            bind.push(sig);
+        }
+        bind.push(&scip_line);
+        bind.push(&max_delta);
+        bind.push(&scip_line);
 
         let id: Option<i64> = self
             .conn
-            .query_row(
-                "SELECT id FROM nodes \
-                 WHERE corpus = ?1 AND path = ?2 \
-                   AND kind IN ('function','method','fn','class','interface','struct','trait') \
-                   AND signature = ?3 \
-                   AND line IS NOT NULL \
-                   AND ABS(line - ?4) <= ?5 \
-                 ORDER BY ABS(line - ?4) ASC \
-                 LIMIT 1",
-                params![corpus, path, sig_pattern, scip_line, max_delta],
-                |row| row.get(0),
-            )
+            .query_row(&sql, bind.as_slice(), |row| row.get(0))
             .optional()
             .context("find_ts_node_for_unification")?;
         Ok(id.map(i64_to_node_id))

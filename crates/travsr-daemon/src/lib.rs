@@ -715,10 +715,11 @@ pub fn init_repo_with_progress(
                 tracing::warn!("phase B batch write error: {e:#}");
             }
         } else {
-            // G1: unify SCIP Go nodes onto tree-sitter nodes before writing.
-            // Mutates pb_refs in-place to redirect callee_id to unified TS nodes.
+            // G1: unify SCIP nodes (all languages) onto tree-sitter nodes before
+            // writing. Mutates pb_refs in-place to redirect callee_id to unified
+            // TS nodes.
             let mut pb_refs_mut = pb_refs;
-            crate::scip_unifier::unify_go(&mut store, &corpus, &pb_nodes, &mut pb_refs_mut);
+            crate::scip_unifier::unify_all(&mut store, &corpus, &pb_nodes, &mut pb_refs_mut);
             let pb_refs = pb_refs_mut;
 
             // G2 path: span-attributed ref/call edges.
