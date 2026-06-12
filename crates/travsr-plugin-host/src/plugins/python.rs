@@ -72,6 +72,10 @@ impl Plugin for PythonPlugin {
         edges.sort_unstable_by_key(|e| (e.src, e.dst));
         edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
-        InvokeResponse { nodes, edges }
+        InvokeResponse {
+            nodes,
+            edges,
+            ..Default::default()
+        }
     }
 }

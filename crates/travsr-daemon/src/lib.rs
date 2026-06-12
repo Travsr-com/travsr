@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+mod scip_unifier;
 pub mod watcher;
 
 use std::path::{Path, PathBuf};
@@ -704,14 +705,36 @@ pub fn init_repo_with_progress(
     // Runs once per full init, not per commit (PERF-002).
     let phase_b_report = {
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
-        let (pb_nodes, pb_edges, pb_outcome) = phase_b_indexer.invoke_phase_b_all(repo_root);
-        if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
-            tracing::warn!("phase B batch write error: {e:#}");
+        let (pb_nodes, pb_edges, pb_refs, pb_outcome) =
+            phase_b_indexer.invoke_phase_b_all(repo_root);
+        if pb_refs.is_empty() {
+            // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
+            if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
+                tracing::warn!("phase B batch write error: {e:#}");
+            }
+        } else {
+            // G1: unify SCIP Go nodes onto tree-sitter nodes before writing.
+            // Mutates pb_refs in-place to redirect callee_id to unified TS nodes.
+            let mut pb_refs_mut = pb_refs;
+            crate::scip_unifier::unify_go(&mut store, &corpus, &pb_nodes, &mut pb_refs_mut);
+            let pb_refs = pb_refs_mut;
+
+            // G2 path: span-attributed ref/call edges.
+            if let Err(e) = store.write_scip_attributed_batch(&corpus, &pb_nodes, &pb_refs) {
+                tracing::warn!("phase B attributed write error: {e:#}");
+            }
+            // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
+            // need to be written — they are not represented in ScipRef records.
+            if !pb_edges.is_empty() {
+                if let Err(e) = store.write_phase_b_batch(&[], &pb_edges) {
+                    tracing::warn!("phase B structural edges write error: {e:#}");
+                }
+            }
         }
         if !pb_nodes.is_empty() || !pb_edges.is_empty() {
             tracing::info!(
                 nodes = pb_nodes.len(),
-                edges = pb_edges.len(),
+                structural_edges = pb_edges.len(),
                 "phase B indexing complete"
             );
         }

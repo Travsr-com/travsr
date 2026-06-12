@@ -74,12 +74,19 @@ impl PluginIndexer {
 
     /// Phase B: semantic indexing for all registered languages.
     /// Called from `init_repo` once per full index — not per commit.
+    ///
+    /// Returns `(nodes, structural_edges, scip_refs, outcome)`.
+    /// `scip_refs` is non-empty when at least one language sidecar supports G2
+    /// attribution (i.e. returns `InvokeResponse.refs`). The daemon uses
+    /// `write_scip_attributed_batch` when refs are present, falling back to
+    /// `write_phase_b_batch` for older sidecars.
     pub fn invoke_phase_b_all(
         &self,
         repo_root: &std::path::Path,
     ) -> (
         Vec<travsr_core::Node>,
         Vec<travsr_core::Edge>,
+        Vec<travsr_core::ScipRef>,
         PhaseBOutcome,
     ) {
         // Gate Phase B per language against lang.toml registration.
@@ -110,6 +117,7 @@ impl PluginIndexer {
 
         let mut all_nodes = Vec::new();
         let mut all_edges = Vec::new();
+        let mut all_refs: Vec<travsr_core::ScipRef> = Vec::new();
         let mut outcome = PhaseBOutcome::default();
 
         let providable = resolver.providable_languages();
@@ -184,10 +192,12 @@ impl PluginIndexer {
                             lang = %lang,
                             nodes = resp.nodes.len(),
                             edges = resp.edges.len(),
+                            refs = resp.refs.len(),
                             "Phase B: invoke complete"
                         );
                         all_nodes.extend(resp.nodes);
                         all_edges.extend(resp.edges);
+                        all_refs.extend(resp.refs);
                         outcome.ran.push(lang.clone());
                     }
                     Err(travsr_error::IndexError::PhaseNotSupported) => {
@@ -206,7 +216,7 @@ impl PluginIndexer {
             }
         }
 
-        (all_nodes, all_edges, outcome)
+        (all_nodes, all_edges, all_refs, outcome)
     }
 
     /// Resolve cross-language FFI edges from accumulated markers.

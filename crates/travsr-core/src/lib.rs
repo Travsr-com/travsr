@@ -461,7 +461,7 @@ impl Node {
 /// The store's `write_scip_attributed_batch` takes a slice of these and emits
 /// `ref/call` edges from the enclosing function node (or the file node as fallback)
 /// to `callee_id`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScipRef {
     /// Repo-relative path of the file containing the reference (e.g. `pkg/foo/bar.go`).
     pub caller_path: String,
