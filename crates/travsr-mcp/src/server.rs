@@ -173,7 +173,17 @@ fn handle_tool_call(
                 .unwrap_or(2)
                 .clamp(1, 4) as u8;
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
-            tools::get_graph_json(store, query, direction, depth, kind_filter)
+            // #318 O6: optional token budget (additive arg). 0 = unlimited,
+            // preserving pre-#318 behaviour when the arg is absent.
+            let token_budget = args["token_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["token_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .unwrap_or(0) as usize;
+            tools::get_graph_json(store, query, direction, depth, kind_filter, token_budget)
         }
         // RFC-012 A2 F1: dynamic synonym management. Single-repo (stdio) only —
         // see `handle_tool_call_global` for the multi-repo rejection.
@@ -340,7 +350,8 @@ fn tools_list() -> serde_json::Value {
                         "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
-                        "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." }
+                        "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
+                        "token_budget": { "type": "integer", "description": "Cap the payload to roughly this many tokens (0 or omitted = unlimited). Truncation is reported via truncated_by_budget." }
                     },
                     "required": ["query"],
                     "additionalProperties": false

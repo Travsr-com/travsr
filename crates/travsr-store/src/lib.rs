@@ -374,6 +374,51 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Open an existing store read-only for query commands (#318 O1).
+    ///
+    /// Skips everything [`SqliteStore::open`] does that is a write-path
+    /// concern — the migration runner, FTS backfill, vocab backfill, and
+    /// synonym seeding — which makes the cold CLI path substantially cheaper.
+    /// The schema version is still verified: a store pending migrations
+    /// returns an error so the caller can fall back to a full `open()`.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        (|| -> AnyResult<Self> {
+            anyhow::ensure!(
+                path.exists(),
+                "no graph database at {} — run `travsr init`",
+                path.display()
+            );
+            let conn = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .with_context(|| format!("opening sqlite database read-only at {}", path.display()))?;
+            // Read-path pragmas only. journal_mode=WAL is a persisted property
+            // of the database file; setting pragmas that write (WAL switch,
+            // autocheckpoint) is neither possible nor needed here.
+            conn.pragma_update(None, "cache_size", -65536i64)
+                .context("setting cache_size (read-only)")?;
+            conn.pragma_update(None, "temp_store", "MEMORY")
+                .context("setting temp_store=MEMORY (read-only)")?;
+            conn.pragma_update(None, "mmap_size", 0i64)
+                .context("disabling mmap_size (read-only)")?;
+            conn.pragma_update(None, "query_only", "ON")
+                .context("setting query_only=ON")?;
+            let store = Self { conn };
+            let current = store
+                .schema_version()
+                .context("reading schema version (read-only)")?;
+            let latest = sqlite_migration_runner().latest_version();
+            anyhow::ensure!(
+                current == latest,
+                "schema v{current} ≠ expected v{latest} — pending migrations; reopen writable"
+            );
+            Ok(store)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Open an in-memory SQLite store. Used in tests; WAL is not available
     /// on `:memory:` connections, so journal mode falls back to MEMORY.
     pub fn open_in_memory() -> Result<Self, StoreError> {

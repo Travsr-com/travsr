@@ -22,5 +22,5 @@ pub mod unix;
 pub mod windows;
 
 pub use addr::ControlAddr;
-pub use message::{ControlMessage, ControlResponse};
+pub use message::{ControlMessage, ControlResponse, QUERY_PROTOCOL_VERSION};
 pub use transport::ControlTransport;
