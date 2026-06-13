@@ -3797,4 +3797,63 @@ mod tests {
         // After restoring, journal_mode must still be WAL (pragma was not changed).
         assert_eq!(store.journal_mode().unwrap().to_lowercase(), "wal");
     }
+
+    // ── file_import_pairs ─────────────────────────────────────────────────────
+
+    #[test]
+    fn file_import_pairs_empty_store_returns_empty() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.file_import_pairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_import_pairs_depends_without_resolves_to_excluded() {
+        // A Depends edge exists but no ResolvesTo follows it — must return empty.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let src = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "fn:a"),
+            "function",
+        );
+        let imp = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "import:x"),
+            "import",
+        );
+        store.put_node(&src).unwrap();
+        store.put_node(&imp).unwrap();
+        store
+            .put_edge(&Edge::new(src.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        assert!(store.file_import_pairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_import_pairs_two_hop_chain_returned() {
+        // full chain: file --Depends--> import_node --ResolvesTo--> file
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let src = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "pkg/a/mod.ts"),
+            "file",
+        );
+        let imp = Node::new(
+            VName::new("", "", "test/b/util.ts", "typescript", "import:b"),
+            "import",
+        );
+        let dst = Node::new(
+            VName::new("", "", "test/b/util.ts", "typescript", "test/b/util.ts"),
+            "file",
+        );
+        store.put_node(&src).unwrap();
+        store.put_node(&imp).unwrap();
+        store.put_node(&dst).unwrap();
+        store
+            .put_edge(&Edge::new(src.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(imp.id, dst.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        let pairs = store.file_import_pairs().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "pkg/a/mod.ts");
+        assert_eq!(pairs[0].1, "test/b/util.ts");
+    }
 }

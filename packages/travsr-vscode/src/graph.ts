@@ -66,6 +66,32 @@ type WebviewMessage =
   | { command: "exportPng"; dataUrl: string }
   | { command: "requestPeek"; path: string; line: number };
 
+// ── Security helpers ──────────────────────────────────────────────────────
+
+/**
+ * Resolve a graph node path to a VS Code URI, rejecting anything that falls
+ * outside the open workspace folders (prevents the peek/goto panel from
+ * being used to read arbitrary files off the developer's filesystem).
+ */
+function resolveWorkspacePath(path: string): vscode.Uri | null {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const root = folders[0]?.uri;
+  const uri = path.startsWith("/")
+    ? vscode.Uri.file(path)
+    : root
+    ? vscode.Uri.joinPath(root, path)
+    : null;
+  if (!uri) return null;
+  const fsPath = uri.fsPath;
+  const inWorkspace = folders.some((wf) => fsPath.startsWith(wf.uri.fsPath));
+  if (!inWorkspace) {
+    // eslint-disable-next-line no-console
+    console.warn(`Travsr: blocked path outside workspace: ${fsPath}`);
+    return null;
+  }
+  return uri;
+}
+
 // ── Nonce helper ──────────────────────────────────────────────────────────
 
 function getNonce(): string {
@@ -212,12 +238,8 @@ export class GraphPanel {
 
       case "goToDefinition":
         if (msg.path) {
-          const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-          const uri = msg.path.startsWith("/")
-            ? vscode.Uri.file(msg.path)
-            : root
-            ? vscode.Uri.joinPath(root, msg.path)
-            : vscode.Uri.file(msg.path);
+          const uri = resolveWorkspacePath(msg.path);
+          if (!uri) break;
           if (msg.line != null) {
             void (async () => {
               const doc = await vscode.workspace.openTextDocument(uri);
@@ -275,6 +297,10 @@ export class GraphPanel {
 
       case "exportPng":
         void (async () => {
+          if (msg.dataUrl.length > 50 * 1024 * 1024) {
+            vscode.window.showErrorMessage("Travsr: PNG too large to export.");
+            return;
+          }
           const uri = await vscode.window.showSaveDialog({
             filters: { PNG: ["png"] },
             saveLabel: "Save graph PNG",
@@ -294,12 +320,7 @@ export class GraphPanel {
       case "requestPeek":
         void (async () => {
           const { path, line } = msg;
-          const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-          const uri = path.startsWith("/")
-            ? vscode.Uri.file(path)
-            : root
-            ? vscode.Uri.joinPath(root, path)
-            : null;
+          const uri = resolveWorkspacePath(path);
           if (!uri) return;
           try {
             const doc = await vscode.workspace.openTextDocument(uri);

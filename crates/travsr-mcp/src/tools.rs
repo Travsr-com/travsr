@@ -1417,26 +1417,37 @@ const MAX_GRAPH_JSON_NODES: usize = 200;
 
 /// Return a subgraph around `query` as structured JSON for graph renderers.
 ///
+/// Query parameters shared by `get_graph_json` and `get_graph_json_global`.
+/// Keeps both function signatures under clippy's 7-argument limit.
+pub struct GraphJsonParams<'a> {
+    pub query: &'a str,
+    pub direction: &'a str,
+    pub depth: u8,
+    pub kind_filter: &'a str,
+    pub token_budget: usize,
+    pub mode: &'a str,
+    pub path_prefix: &'a str,
+}
+
 /// BFS from seed node(s) matching `query`, respecting `direction` and `depth`.
 /// Returns `{"nodes":[...],"edges":[...]}`.
 /// Unlike prose tools, output is NOT sanitized — it is structured JSON consumed
 /// by the VS Code graph panel, not forwarded to an LLM as freetext.
-#[allow(clippy::too_many_arguments)]
-pub fn get_graph_json(
-    store: &SqliteStore,
-    query: &str,
-    direction: &str,
-    depth: u8,
-    kind_filter: &str,
-    token_budget: usize,
-    mode: &str,
-    path_prefix: &str,
-) -> String {
-    if !matches!(mode, "" | "overview") {
+pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> String {
+    let GraphJsonParams {
+        query,
+        direction,
+        depth,
+        kind_filter,
+        token_budget,
+        mode,
+        path_prefix,
+    } = params;
+    if !matches!(*mode, "" | "overview") {
         tracing::warn!("get_graph_json rejected unknown mode: {mode}");
         return "{}".to_string();
     }
-    if mode == "overview" {
+    if *mode == "overview" {
         if !path_prefix.is_empty() {
             if let Err(reason) = validate_mcp_arg(path_prefix) {
                 tracing::warn!("get_graph_json rejected invalid path_prefix: {reason}");
@@ -1446,33 +1457,29 @@ pub fn get_graph_json(
         return overview_graph(store, path_prefix);
     }
     // Only "" (all kinds) and "file" are valid kind_filter values.
-    if !matches!(kind_filter, "" | "file") {
+    if !matches!(*kind_filter, "" | "file") {
         tracing::warn!("get_graph_json rejected unknown kind_filter: {kind_filter}");
         return "{}".to_string();
     }
     // Empty query is valid when kind_filter=="file" (returns full import graph).
-    if !(query.is_empty() && kind_filter == "file") {
+    if !(query.is_empty() && *kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
             tracing::warn!("get_graph_json rejected invalid arg: {reason}");
             return "{}".to_string();
         }
     }
-    let depth = depth.clamp(1, 4);
-    get_graph_json_raw(store, query, direction, depth, kind_filter, token_budget)
+    let depth = (*depth).clamp(1, 4);
+    get_graph_json_raw(store, query, direction, depth, kind_filter, *token_budget)
 }
 
 // ── Repo-map LOD overview (P3 #319) ──────────────────────────────────────────
 
-/// Package key: up to 2 directory segments above the filename.
-/// "crates/travsr-mcp/src/tools.rs" → "crates/travsr-mcp"
-/// "src/components/Button.tsx"      → "src/components"
-/// "src/index.ts"                   → "src"
-/// "index.ts"                       → "(root)"
-/// Maps a file path to its top-level directory segment (the first part before any `/`).
+/// Maps a file path to its top-level directory segment (the first `/`-delimited part).
 /// Returns an empty string for external/build-cache paths that should be excluded.
 ///
 /// "pkg/api/types.go"             → "pkg"
 /// "cmd/kubeadm/main.go"          → "cmd"
+/// "src/index.ts"                 → "src"
 /// "main.go"                      → "(root)"
 /// "../../../Library/Caches/..."  → ""  (excluded)
 /// "/abs/path/file.go"            → ""  (excluded)
@@ -2053,18 +2060,21 @@ fn get_graph_json_raw(
 }
 
 /// Global variant of `get_graph_json` — merges subgraphs across repos, deduping by node id.
-#[allow(clippy::too_many_arguments)]
 pub fn get_graph_json_global(
     repos: &HashMap<String, PathBuf>,
-    query: &str,
-    direction: &str,
-    depth: u8,
     repo: Option<&str>,
-    kind_filter: &str,
-    mode: &str,
-    path_prefix: &str,
+    params: &GraphJsonParams<'_>,
 ) -> String {
-    if mode == "overview" {
+    let GraphJsonParams {
+        query,
+        direction,
+        depth,
+        kind_filter,
+        token_budget: _,
+        mode,
+        path_prefix,
+    } = params;
+    if *mode == "overview" {
         if !path_prefix.is_empty() {
             if let Err(reason) = validate_mcp_arg(path_prefix) {
                 tracing::warn!("get_graph_json_global rejected invalid path_prefix: {reason}");
@@ -2074,13 +2084,13 @@ pub fn get_graph_json_global(
         // Overview mode: run per-repo and merge package tiles
         return get_graph_json_global_overview(repos, repo, path_prefix);
     }
-    if !(query.is_empty() && kind_filter == "file") {
+    if !(query.is_empty() && *kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
             tracing::warn!("get_graph_json_global rejected invalid arg: {reason}");
             return "{}".to_string();
         }
     }
-    let depth = depth.clamp(1, 4);
+    let depth = (*depth).clamp(1, 4);
 
     let candidates: Vec<(&str, &PathBuf)> = match repo {
         Some(name) => {
@@ -2679,7 +2689,18 @@ mod tests {
         store.put_node(&sym).unwrap();
         store.put_node(&file).unwrap();
 
-        let json = get_graph_json(&store, "fn:bar", "both", 1, "", 0, "", "");
+        let json = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "fn:bar",
+                direction: "both",
+                depth: 1,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
         assert!(
             json.contains("\"line\":42"),
             "symbol node must carry line in JSON: {json}"
@@ -2690,7 +2711,18 @@ mod tests {
             "coverage envelope missing: {json}"
         );
 
-        let file_json = get_graph_json(&store, "src/foo.ts", "both", 1, "file", 0, "", "");
+        let file_json = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "src/foo.ts",
+                direction: "both",
+                depth: 1,
+                kind_filter: "file",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
         assert!(
             file_json.contains("\"line\":null"),
             "file node must have null line in JSON: {file_json}"
@@ -2725,10 +2757,32 @@ mod tests {
                 .unwrap();
         }
 
-        let unbounded = get_graph_json(&store, "fn:seed", "deps", 2, "", 0, "", "");
+        let unbounded = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "fn:seed",
+                direction: "deps",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
         assert!(!unbounded.contains("truncated_by_budget"));
 
-        let capped = get_graph_json(&store, "fn:seed", "deps", 2, "", 30, "", "");
+        let capped = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "fn:seed",
+                direction: "deps",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 30,
+                mode: "",
+                path_prefix: "",
+            },
+        );
         assert!(
             capped.contains("\"truncated_by_budget\":true"),
             "tiny budget must truncate: {capped}"
@@ -2781,7 +2835,18 @@ mod tests {
     #[test]
     fn overview_graph_repo_level_groups_by_pkg() {
         let store = make_file_graph_store();
-        let raw = get_graph_json(&store, "", "both", 2, "", 0, "overview", "");
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "overview",
+                path_prefix: "",
+            },
+        );
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(v["mode"], "overview", "mode field must be 'overview'");
@@ -2813,7 +2878,18 @@ mod tests {
     #[test]
     fn overview_graph_package_drill_emits_files_and_ghost() {
         let store = make_file_graph_store();
-        let raw = get_graph_json(&store, "", "both", 2, "", 0, "overview", "pkg/a/");
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "overview",
+                path_prefix: "pkg/a/",
+            },
+        );
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(v["mode"], "prefix");
@@ -2848,16 +2924,87 @@ mod tests {
     }
 
     #[test]
+    fn package_drill_graph_intra_prefix_edge_emitted() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let fa = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "pkg/a/mod.ts"),
+            "file",
+        );
+        let fb = Node::new(
+            VName::new("", "", "pkg/a/util.ts", "typescript", "pkg/a/util.ts"),
+            "file",
+        );
+        let imp = Node::new(
+            VName::new("", "", "pkg/a/util.ts", "typescript", "import:u"),
+            "import",
+        );
+        store.put_node(&fa).unwrap();
+        store.put_node(&fb).unwrap();
+        store.put_node(&imp).unwrap();
+        store
+            .put_edge(&Edge::new(fa.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(imp.id, fb.id, EdgeKind::ResolvesTo))
+            .unwrap();
+
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "overview",
+                path_prefix: "pkg/a/",
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let edges = v["edges"].as_array().unwrap();
+        let intra = edges
+            .iter()
+            .find(|e| e["source"] == "file:pkg/a/mod.ts" && e["target"] == "file:pkg/a/util.ts");
+        assert!(
+            intra.is_some(),
+            "intra-prefix edge must be emitted: {edges:?}"
+        );
+    }
+
+    #[test]
     fn overview_graph_rejects_unknown_mode() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let raw = get_graph_json(&store, "", "both", 2, "", 0, "badmode", "");
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "badmode",
+                path_prefix: "",
+            },
+        );
         assert_eq!(raw, "{}", "unknown mode must return empty object");
     }
 
     #[test]
     fn overview_graph_rejects_path_traversal_prefix() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let raw = get_graph_json(&store, "", "both", 2, "", 0, "overview", "../etc/passwd");
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "overview",
+                path_prefix: "../etc/passwd",
+            },
+        );
         assert_eq!(raw, "{}", "path traversal prefix must be rejected");
     }
 

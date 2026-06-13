@@ -880,9 +880,9 @@ function showDetail(n) {
     const otherLabel = otherNode.length
       ? (otherNode.data('label') || shortLabel('', otherId))
       : shortLabel('', otherId.replace(/^(f::|grp::)/, ''));
-    const wgt = e.data('wgt') ? ' <span style="color:#686868">×' + e.data('wgt') + '</span>' : '';
+    const wgt = e.data('wgt') ? ' <span style="color:#686868">×' + Number(e.data('wgt') || 0) + '</span>' : '';
     return '<li class="edge-li" title="' + escHtml(otherId) + '"><span class="edge-arrow">' + (isOut ? '→' : '←') + '</span> ' +
-      escHtml(otherLabel) + ' <span class="edge-type">' + e.data('kind') + '</span>' + wgt + '</li>';
+      escHtml(otherLabel) + ' <span class="edge-type">' + escHtml(e.data('kind') || '') + '</span>' + wgt + '</li>';
   }).join('');
 
   const detailEl = document.getElementById('detail');

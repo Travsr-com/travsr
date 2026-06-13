@@ -188,13 +188,15 @@ fn handle_tool_call(
             let path_prefix = args["path_prefix"].as_str().unwrap_or("");
             tools::get_graph_json(
                 store,
-                query,
-                direction,
-                depth,
-                kind_filter,
-                token_budget,
-                mode,
-                path_prefix,
+                &tools::GraphJsonParams {
+                    query,
+                    direction,
+                    depth,
+                    kind_filter,
+                    token_budget,
+                    mode,
+                    path_prefix,
+                },
             )
         }
         // RFC-012 A2 F1: dynamic synonym management. Single-repo (stdio) only —
@@ -644,13 +646,16 @@ fn handle_tool_call_global(
             let path_prefix = args["path_prefix"].as_str().unwrap_or("");
             tools::get_graph_json_global(
                 repos,
-                query,
-                direction,
-                depth,
                 repo_arg,
-                kind_filter,
-                mode,
-                path_prefix,
+                &tools::GraphJsonParams {
+                    query,
+                    direction,
+                    depth,
+                    kind_filter,
+                    token_budget: 0,
+                    mode,
+                    path_prefix,
+                },
             )
         }
         // Synonym tools mutate a single repo's table; ambiguous across the global

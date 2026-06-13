@@ -31,6 +31,11 @@ function fileName(relPath: string): string {
   return i === -1 ? relPath : relPath.slice(i + 1);
 }
 
+/** Guard against path traversal in MCP-returned node paths. */
+function isSafePath(p: string): boolean {
+  return !!p && !p.includes("..") && !p.startsWith("/") && !p.startsWith("\\");
+}
+
 // ── Tree node types ────────────────────────────────────────────────────────
 
 export class DirNode extends vscode.TreeItem {
@@ -165,6 +170,9 @@ export class TravsrRepoFileTreeProvider
       qp.onDidHide(() => qp.dispose());
     } catch {
       qp.dispose();
+      void vscode.window.showWarningMessage(
+        "Travsr: file search unavailable — daemon not connected"
+      );
     }
   }
 
@@ -246,7 +254,7 @@ export class TravsrRepoFileTreeProvider
     }
 
     const files: FileInfo[] = (data.nodes ?? [])
-      .filter((n) => n.kind === "file" && !n.ghost && n.path)
+      .filter((n) => n.kind === "file" && !n.ghost && n.path && isSafePath(n.path))
       .map((n) => ({ relPath: n.path!, label: fileName(n.path!) }))
       .sort((a, b) => a.relPath.localeCompare(b.relPath));
 
