@@ -1068,6 +1068,81 @@ LIMIT 100",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Fetch all nodes of a given `kind` (full-table scan — use for cheap kinds like "file").
+    pub fn nodes_by_kind(&self, kind: &str) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line
+                     FROM nodes WHERE kind = ?1",
+                )
+                .context("preparing nodes_by_kind query")?;
+            let rows = stmt
+                .query_map(params![kind], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing nodes_by_kind query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding nodes_by_kind row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Return all (src_path, dst_path) pairs via the two-hop import chain:
+    /// any_node --[depends]--> import_node --[resolves-to]--> file.
+    /// src_path is the path of the node making the import (any kind: file, function, etc.).
+    /// dst_path is the path of the resolved target file.
+    /// Used by the graph-overview aggregation to compute cross-package edges.
+    pub fn file_import_pairs(&self) -> Result<Vec<(String, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, String)>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT n1.path, n2.path
+                     FROM edges e1
+                     JOIN nodes n1 ON n1.id = e1.src
+                     JOIN edges e2 ON e2.src = e1.dst AND e2.kind = 'resolves-to'
+                     JOIN nodes n2 ON n2.id = e2.dst AND n2.kind = 'file'
+                     WHERE e1.kind = 'depends'",
+                )
+                .context("preparing file_import_pairs query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("executing file_import_pairs query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding file_import_pairs row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String, String)>, StoreError> {
         (|| -> AnyResult<Vec<(NodeId, NodeId, String, String)>> {
             let mut stmt = self
@@ -3721,5 +3796,64 @@ mod tests {
         store.set_bulk_init_mode(false).unwrap();
         // After restoring, journal_mode must still be WAL (pragma was not changed).
         assert_eq!(store.journal_mode().unwrap().to_lowercase(), "wal");
+    }
+
+    // ── file_import_pairs ─────────────────────────────────────────────────────
+
+    #[test]
+    fn file_import_pairs_empty_store_returns_empty() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.file_import_pairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_import_pairs_depends_without_resolves_to_excluded() {
+        // A Depends edge exists but no ResolvesTo follows it — must return empty.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let src = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "fn:a"),
+            "function",
+        );
+        let imp = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "import:x"),
+            "import",
+        );
+        store.put_node(&src).unwrap();
+        store.put_node(&imp).unwrap();
+        store
+            .put_edge(&Edge::new(src.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        assert!(store.file_import_pairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_import_pairs_two_hop_chain_returned() {
+        // full chain: file --Depends--> import_node --ResolvesTo--> file
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let src = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "pkg/a/mod.ts"),
+            "file",
+        );
+        let imp = Node::new(
+            VName::new("", "", "test/b/util.ts", "typescript", "import:b"),
+            "import",
+        );
+        let dst = Node::new(
+            VName::new("", "", "test/b/util.ts", "typescript", "test/b/util.ts"),
+            "file",
+        );
+        store.put_node(&src).unwrap();
+        store.put_node(&imp).unwrap();
+        store.put_node(&dst).unwrap();
+        store
+            .put_edge(&Edge::new(src.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(imp.id, dst.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        let pairs = store.file_import_pairs().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "pkg/a/mod.ts");
+        assert_eq!(pairs[0].1, "test/b/util.ts");
     }
 }

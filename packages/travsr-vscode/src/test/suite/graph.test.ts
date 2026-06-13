@@ -1,5 +1,20 @@
 import * as assert from "assert";
-import { GraphPanel, buildLoadingHtml } from "../../graph";
+import * as fs from "fs";
+import * as path from "path";
+import { GraphPanel, buildHtmlContent } from "../../graph";
+
+// Combines HTML template + graph.js so tests can check both DOM and JS content.
+function getFullHtml(): string {
+  const graphJs = fs.readFileSync(
+    path.join(__dirname, "..", "..", "..", "media", "graph.js"),
+    "utf8"
+  );
+  const htmlTemplate = buildHtmlContent(
+    "test-nonce", "test-csp",
+    "graph.css", "cytoscape.min.js", "graph.js", "icon.png"
+  );
+  return htmlTemplate + "\n" + graphJs;
+}
 
 // Minimal McpClient stub
 function makeClient(response: string = "{}") {
@@ -26,7 +41,7 @@ suite("GraphPanel", () => {
   });
 
   test("buildLoadingHtml returns non-empty HTML string", () => {
-    const html = buildLoadingHtml();
+    const html = getFullHtml();
     assert.ok(html.length > 0, "HTML must be non-empty");
     assert.ok(html.includes("cytoscape"), "HTML must load Cytoscape");
     assert.ok(html.includes("acquireVsCodeApi"), "HTML must acquire VS Code API");
@@ -34,7 +49,7 @@ suite("GraphPanel", () => {
   });
 
   test("buildLoadingHtml includes the vscode postMessage bridge", () => {
-    const html = buildLoadingHtml();
+    const html = getFullHtml();
     assert.ok(
       html.includes("vscode.postMessage"),
       "webview must send messages back to extension"
@@ -74,7 +89,7 @@ suite("GraphPanel", () => {
   });
 
   test("buildLoadingHtml status bar uses visible-element counts", () => {
-    const html = buildLoadingHtml();
+    const html = getFullHtml();
     // updateStatusBar must use ':visible' selector, not plain .nodes()
     assert.ok(
       html.includes("':visible'") || html.includes("nodes(':visible')"),
@@ -83,19 +98,19 @@ suite("GraphPanel", () => {
   });
 
   test("buildLoadingHtml includes depth slider", () => {
-    const html = buildLoadingHtml();
+    const html = getFullHtml();
     assert.ok(html.includes("depthSlider"), "must include depth slider");
     assert.ok(html.includes("depthVal"), "must display depth value");
   });
 
   test("buildLoadingHtml includes vars toggle", () => {
-    const html = buildLoadingHtml();
+    const html = getFullHtml();
     assert.ok(html.includes("toggleVars"), "must include vars toggle function");
     assert.ok(html.includes("btn-vars"), "must include vars toggle button");
   });
 
   test("VSCODE-247: buildLoadingHtml includes DOT/JSON export", () => {
-    const html = buildLoadingHtml();
+    const html = getFullHtml();
     assert.ok(html.includes("function exportDot"), "must define exportDot()");
     assert.ok(html.includes("function exportJson"), "must define exportJson()");
     assert.ok(html.includes("⤓ DOT"), "must include DOT toolbar button");
