@@ -103,7 +103,7 @@ pub fn run(
         return Ok(());
     }
 
-    render(payload, format, budget, Some(&repo_root))
+    render(payload, format, budget)
 }
 
 pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
@@ -119,19 +119,10 @@ pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
     // than shipped through the daemon socket.
     let store = daemon_client::open_read_store(&db_path)?;
     let payload = query::graph_all_payload(&store)?;
-    render(payload, format, budget, None)
+    render(payload, format, budget)
 }
 
-fn render(
-    mut payload: GraphPayload,
-    format: Format,
-    budget: usize,
-    repo_root: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    if payload.no_semantic_fallback {
-        print_semantic_fallback_note(&payload, repo_root);
-    }
-
+fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::Result<()> {
     // #318 O6: token budget — prefix of BFS order, seed always kept.
     let truncated = query::apply_token_budget(&mut payload, budget);
 
@@ -163,57 +154,6 @@ fn render(
     }
 
     Ok(())
-}
-
-/// O5 staleness note: the structural-fallback hint, extended with how far the
-/// semantic (Phase B / LSIF) data lags behind the indexed commit.
-fn print_semantic_fallback_note(payload: &GraphPayload, repo_root: Option<&std::path::Path>) {
-    eprintln!(
-        "note: no semantic caller edges found — showing file-level imports. \
-         Run `travsr lang` to enable call-site analysis."
-    );
-    let (Some(cov), Some(last)) = (&payload.coverage, &payload.last_commit) else {
-        return;
-    };
-    let Some(pbc) = &cov.phase_b_commit else {
-        return;
-    };
-    if pbc == last {
-        return;
-    }
-    let short: String = pbc.chars().take(8).collect();
-    match repo_root.and_then(|root| commits_between(root, pbc, last)) {
-        Some(n) if n > 0 => eprintln!(
-            "note: semantic data is {n} commit{} old (indexed at {short}) — run `travsr init` to refresh.",
-            if n == 1 { "" } else { "s" }
-        ),
-        _ => eprintln!(
-            "note: semantic data was indexed at {short} — run `travsr init` to refresh."
-        ),
-    }
-}
-
-/// Count commits between two SHAs via `git rev-list --count`. Best-effort:
-/// any git failure (shallow clone, gc'd commit) yields `None`.
-fn commits_between(repo_root: &std::path::Path, from: &str, to: &str) -> Option<u64> {
-    // Both arguments are commit SHAs read from our own meta table; reject
-    // anything that is not plain hex before handing them to git.
-    if ![from, to]
-        .iter()
-        .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()))
-    {
-        return None;
-    }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-list", "--count", &format!("{from}..{to}")])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 fn print_tree(payload: &GraphPayload) {

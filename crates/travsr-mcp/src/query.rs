@@ -103,9 +103,6 @@ pub struct GraphPayload {
     pub nodes: Vec<NodeEntry>,
     pub edges: Vec<EdgeEntry>,
     pub tree: Vec<TreeStep>,
-    /// True when caller traversal found no semantic edges and fell back to
-    /// structural ones (the CLI prints the `travsr lang` hint for this).
-    pub no_semantic_fallback: bool,
     pub coverage: Option<Coverage>,
     pub last_commit: Option<String>,
 }
@@ -238,13 +235,14 @@ fn is_semantic_edge(kind: &str) -> bool {
 
 /// Outgoing/incoming expansion for one node, mirroring `travsr graph`'s edge
 /// semantics (RFC-014 file-node caller splice, semantic-preferred mode with
-/// structural fallback). Sets `*no_semantic_fallback` when the fallback fires.
+/// per-node structural fallback for display). Whether to surface the
+/// language-level "semantic unavailable" note is decided once in `graph_query`
+/// from coverage — NOT here — so a single caller-less leaf cannot trip it.
 fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
-    no_semantic_fallback: &mut bool,
 ) -> anyhow::Result<Vec<(String, NodeId)>> {
     let mut out = Vec::new();
     if matches!(direction, QueryDirection::Deps | QueryDirection::Both) {
@@ -288,7 +286,10 @@ fn next_edges(
                     }
                 }
             } else {
-                *no_semantic_fallback = true;
+                // This node has no semantic callers — show its structural
+                // incoming edges so the caller view is never empty. Whether the
+                // *language* lacks semantic data (and thus warrants the note) is
+                // judged from coverage in graph_query, not from this one node.
                 for e in &incoming {
                     out.push((e.kind.as_str().to_string(), e.src));
                 }
@@ -330,7 +331,6 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             nodes: Vec::new(),
             edges: Vec::new(),
             tree: Vec::new(),
-            no_semantic_fallback: false,
             coverage: None,
             last_commit: None,
         });
@@ -342,7 +342,6 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let mut tree: Vec<TreeStep> = Vec::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
-    let mut no_semantic_fallback = false;
 
     visited.insert(seed.id);
     queue.push_back((seed.id, 0));
@@ -358,13 +357,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             continue;
         }
 
-        for (edge_kind, next_id) in next_edges(
-            store,
-            current_id,
-            args.direction,
-            args.edge_mode,
-            &mut no_semantic_fallback,
-        )? {
+        for (edge_kind, next_id) in next_edges(store, current_id, args.direction, args.edge_mode)? {
             let (src, dst) = match args.direction {
                 QueryDirection::Callers => (next_id, current_id),
                 _ => (current_id, next_id),
@@ -401,7 +394,6 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
         nodes,
         edges,
         tree,
-        no_semantic_fallback,
         coverage: Some(coverage),
         last_commit: store.get_meta("last_commit")?,
     })
@@ -419,7 +411,6 @@ pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
         nodes,
         edges,
         tree: Vec::new(),
-        no_semantic_fallback: false,
         coverage: None,
         last_commit: store.get_meta("last_commit")?,
     })
