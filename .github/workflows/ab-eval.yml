@@ -1,0 +1,53 @@
+name: A/B eval
+
+# Published agent A/B eval (#318 O9): the receipt for "fewer tokens, zero
+# structural hallucination". For each task in benchmarks/ab-eval/tasks.json it
+# answers the same structural question with one Travsr graph query (GRAPH arm)
+# and with the grep+read context an agent without Travsr must feed its LLM
+# (FILES-ONLY arm), then compares answer recall/precision and context-token
+# cost. The graph arm is gated to be exact and never more expensive than reading
+# files; the mean token-reduction figure is published as an artifact.
+#
+# Also triggerable manually via the GitHub Actions UI (workflow_dispatch).
+
+on:
+  schedule:
+    - cron: '45 2 * * *'   # 02:45 UTC every day (after the accuracy nightly)
+  workflow_dispatch:        # manual trigger from GitHub Actions UI
+
+permissions:
+  contents: read
+
+jobs:
+  ab-eval:
+    name: A/B eval (graph vs file-tools)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build release binary
+        run: cargo build --release -p travsr-cli
+
+      - name: Run A/B eval
+        run: node benchmarks/ab-eval/run.js --out ab-report.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab-eval-report
+          path: ab-report.json
+          retention-days: 90
