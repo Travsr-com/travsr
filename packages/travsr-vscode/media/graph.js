@@ -36,6 +36,7 @@ const cy = cytoscape({
         'font-family': 'Segoe UI, -apple-system, sans-serif',
         'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 6,
         'text-outline-width': 2, 'text-outline-color': '#121212',
+        'text-max-width': '120px', 'text-overflow-wrap': 'whitespace',
         shape: e => nodeShape(e.data('kind')),
         'background-color': e => nodeColor(e.data('kind')),
         'background-opacity': 0.16,
@@ -62,9 +63,13 @@ const cy = cytoscape({
         'background-color': '#172017', 'background-opacity': 0.5,
         'border-width': 1, 'border-color': '#2d3a2d', 'border-style': 'solid',
         'text-valign': 'top', 'font-size': '9px', color: '#9ab89a',
-        shape: 'round-rectangle', padding: '14px',
+        shape: 'round-rectangle', padding: '22px',
         'text-background-color': '#121212', 'text-background-opacity': 0.78,
         'text-background-padding': '3px', 'text-outline-width': 0,
+    }},
+    { selector: 'node.node-search-hit', style: {
+        'border-width': 4, 'border-color': '#ffffff', 'border-opacity': 1,
+        'background-opacity': 0.6, 'z-index': 999,
     }},
     { selector: 'node.dimmed', style: { opacity: 0.10 }},
     { selector: 'node.softdim', style: { opacity: 0.22 }},
@@ -75,7 +80,12 @@ const cy = cytoscape({
     { selector: 'node.wave-1', style: { 'background-opacity': 0.44 }},
     { selector: 'node.wave-2', style: { 'background-opacity': 0.28 }},
     { selector: 'edge', style: {
-        'curve-style': 'bezier',
+        // unbundled-bezier: every edge always shows a visible arc even when
+        // source/target are in the same column.  45px perpendicular offset at
+        // the midpoint gives a clean S-bend without looking too exaggerated.
+        'curve-style': 'unbundled-bezier',
+        'control-point-distances': [45],
+        'control-point-weights': [0.5],
         width: e => e.data('wgt') ? Math.min(5, 1 + Math.log2(e.data('wgt')) * 0.7) : 1.3,
         'line-color': e => edgeColor(e.data('kind')),
         'line-fill': 'linear-gradient',
@@ -119,7 +129,11 @@ const cy = cytoscape({
         'border-color': '#ffffff', 'border-width': 3, 'background-opacity': 0.58,
     }},
   ],
-  wheelSensitivity: 0.3, minZoom: 0.15, maxZoom: 5,
+  wheelSensitivity: 0.3, minZoom: 0.08, maxZoom: 8,
+  userPanningEnabled: true,
+  userZoomingEnabled: true,
+  autoungrabify: false,
+  boxSelectionEnabled: false,
 });
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -145,6 +159,61 @@ let peekDefPath  = '';
 let _prog = 0; // programmatic zoom guard (prevents drill logic reacting to cy.fit)
 function progZoom(fn) { _prog++; fn(); setTimeout(() => _prog--, 500); }
 
+// _spreadMul is kept at 1 (no zoom-based spreading — that caused nodes to jump
+// out of the viewport). Hover-spread is used instead; see mouseover handler.
+let _spreadMul = 1;
+let _blastRingState = null; // { byRing, ringR } — set by enterBlast, used by spread slider
+
+function applyBlastPositions(mul) {
+  if (!_blastRingState) return;
+  const { byRing, ringR } = _blastRingState;
+  const m = mul || 1;
+  Object.entries(byRing).forEach(([r, ids]) => {
+    const R = Number(r) * ringR * m;
+    ids.forEach((id, i) => {
+      const n = cy.getElementById(id);
+      if (!n.length) return;
+      if (Number(r) === 0) return n.position({ x: 0, y: 0 });
+      const a = -Math.PI / 2 + 2 * Math.PI * i / ids.length;
+      n.position({ x: Math.cos(a) * R, y: Math.sin(a) * R * 0.78 });
+    });
+  });
+}
+
+// ── Hover-spread state ────────────────────────────────────────────────────────
+// When hovering over a crowded node, nearby nodes temporarily push apart so the
+// user can tell them apart and click the right one.
+let _hoverSpread = null; // { nodeId: string, orig: Map<id, {x,y}> }
+
+// ── Label normalization ───────────────────────────────────────────────────────
+// The daemon sometimes returns full VName/SCIP identifiers as the label field,
+// e.g. "scip:path:lang root corpus . `pkg`/newNamedVertex()". Extract the
+// terminal symbol name for display.
+function shortLabel(raw, fallbackId) {
+  const s = String(raw == null ? '' : raw);
+  // Treat 'unknown' as absent — fall through to fallback logic below.
+  const meaningful = s && s !== 'unknown';
+  if (meaningful && s.length <= 48) return s;
+  if (meaningful) {
+    // VName/SCIP: take everything after the last '/' as the symbol name.
+    const slash = s.lastIndexOf('/');
+    if (slash >= 0 && slash < s.length - 1) {
+      const after = s.slice(slash + 1).trim();
+      if (after.length > 0 && after.length <= 80) return after;
+    }
+    return '…' + s.slice(-40);
+  }
+  // Label missing/unknown — extract the terminal segment from the node ID.
+  if (fallbackId) {
+    const id = String(fallbackId);
+    const slash = id.lastIndexOf('/');
+    const seg = slash >= 0 ? id.slice(slash + 1) : id;
+    if (seg && seg.length <= 80) return seg;
+    return '…' + id.slice(-32);
+  }
+  return '';
+}
+
 // ── Noise heuristic (client-side, #316 F3 follow-up for server flag) ─────────
 function isNoise(path) {
   if (!path) return false;
@@ -157,39 +226,74 @@ function isNoise(path) {
 // The daemon gives score=0.7^|hop| but not the sign. We recover it by BFS:
 // outgoing structural edge (root is source) → +hop (dependency, right);
 // incoming structural edge → −hop (caller, left).
-const STRUCTURAL = new Set(['calls', 'imports', 'defines', 'is-implementation', 'overrides', 'ffi/call']);
+// Structural edge kinds: traversed by BFS to assign signed hops.
+// 'contains' handles file→symbol edges from tree-sitter indexing.
+const STRUCTURAL = new Set([
+  'calls', 'imports', 'defines', 'contains', 'ref',
+  'is-implementation', 'overrides', 'ffi/call',
+]);
 
 function assignSignedHops(nodes, edges) {
   const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
   nodes.forEach(n => { n.hop = undefined; });
 
   const root = nodes.find(n => n.root);
+
+  // BFS to assign SIGN only: outgoing structural edge = dep (+), incoming = caller (−).
+  // We deliberately do NOT use BFS hop-counts as magnitude: in dense subgraphs
+  // (k8s depth=4 returns 300 nodes with many cross-edges) the shortest subgraph
+  // path is often 1 hop, collapsing all nodes into hop=±1.
+  // Magnitude comes from score (score ≈ 0.7^|hop|, calculated on the global graph).
   if (root) {
     root.hop = 0;
+    const sign = { [root.id]: 0 }; // 0=root, 1=dep, -1=caller
     const queue = [root.id];
     while (queue.length) {
       const curId = queue.shift();
-      const cur = byId[curId];
-      if (!cur) continue;
+      const curSign = sign[curId];
       for (const e of edges) {
         if (!STRUCTURAL.has(e.kind)) continue;
-        if (e.source === curId) {
-          const tgt = byId[e.target];
-          if (tgt && tgt.hop === undefined) { tgt.hop = cur.hop + 1; queue.push(tgt.id); }
+        if (e.source === curId && sign[e.target] === undefined) {
+          // Outgoing from cur → target is a dependency
+          sign[e.target] = curSign >= 0 ? 1 : -1; // dep of dep = dep; dep of caller = caller
+          queue.push(e.target);
         }
-        if (e.target === curId) {
-          const src = byId[e.source];
-          if (src && src.hop === undefined) { src.hop = cur.hop - 1; queue.push(src.id); }
+        if (e.target === curId && sign[e.source] === undefined) {
+          // Incoming to cur → source is a caller
+          sign[e.source] = curSign <= 0 ? -1 : 1;
+          queue.push(e.source);
         }
       }
     }
+
+    // Assign hops: sign from BFS, magnitude from score (global graph distance).
+    nodes.forEach(n => {
+      if (n === root) return;
+      const s = Math.min(0.99, Math.max(0.001, n.score || 0.3));
+      const absHop = Math.max(1, Math.round(Math.log(s) / Math.log(0.7)));
+      const sg = sign[n.id];
+      if (sg !== undefined) {
+        n.hop = sg >= 0 ? absHop : -absHop;
+      }
+      // else: handled in fallback below
+    });
   }
 
-  // Fallback for unreachable nodes: derive unsigned abs from score
+  // Precompute edge degrees for fallback (nodes BFS didn't reach)
+  const outDeg = {}, inDeg = {};
+  for (const e of edges) {
+    if (!STRUCTURAL.has(e.kind)) continue;
+    outDeg[e.source] = (outDeg[e.source] || 0) + 1;
+    inDeg[e.target]  = (inDeg[e.target]  || 0) + 1;
+  }
+
   nodes.forEach(n => {
-    if (n.hop === undefined) {
-      n.hop = Math.round(-Math.log(Math.max(0.001, n.score || 0.3)) / Math.log(1 / 0.7));
-    }
+    if (n.hop !== undefined) return;
+    const s = Math.min(0.99, Math.max(0.001, n.score || 0.3));
+    const absHop = Math.max(1, Math.round(Math.log(s) / Math.log(0.7)));
+    const out = outDeg[n.id] || 0;
+    const inc = inDeg[n.id]  || 0;
+    n.hop = out > inc ? -absHop : absHop;
   });
 }
 
@@ -228,11 +332,11 @@ function buildElements() {
   // Nodes
   visNodes.forEach(n => {
     const d = deg[n.id] || 0;
-    const sz = n.root ? 48 : Math.min(44, 20 + d * 4);
+    const sz = n.root ? 52 : Math.min(52, 26 + d * 5);
     const isHidden = n.kind === 'var' && !varsOn;
     els.push({
       data: {
-        id: n.id, label: n.label, kind: n.kind, path: n.path || '',
+        id: n.id, label: shortLabel(n.label, n.id), kind: n.kind, path: n.path || '',
         pkg: n.package || '', score: n.score || 0, line: n.line || 0,
         hop: n.hop || 0, root: !!n.root, degree: d,
         w: n.kind === 'var' ? 42 : sz, h: n.kind === 'var' ? 18 : sz,
@@ -283,36 +387,85 @@ function buildElements() {
   return { els, noiseCount: allNodes.filter(n => noiseOn && isNoise(n.path) && Math.abs(n.hop || 0) <= depth).length };
 }
 
-// ── Flow layout: callers left, root center, deps right (O(n), no solver) ──────
+// ── Flow layout: callers left, root center, deps right ────────────────────────
+// Dense hop-columns are split into sub-columns so a single col never has > MAX_COL
+// nodes stacked vertically.  _spreadMul doubles all spacings when the user zooms in.
 function flowPositions() {
+  const mul = _spreadMul || 1;
+  const ROOT_X = 420, ROOT_Y = 320;
+  const MAX_COL = 14;               // max nodes in one sub-column
+  const VSTEP   = Math.round(130 * mul);
+  const HOP_X   = Math.round(380 * mul); // x-distance per hop level
+  const SUB_X   = Math.round(260 * mul); // x-gap between sub-cols of the same hop
+
   const cols = {};
   cy.nodes().not(':parent').forEach(n => {
     const h = n.data('hop') || 0;
     (cols[h] = cols[h] || []).push(n);
   });
+
   Object.entries(cols).forEach(([h, nodes]) => {
-    nodes.sort((a, b) => (a.data('path') || '').localeCompare(b.data('path') || ''));
-    const span = (nodes.length - 1) * 95;
-    nodes.forEach((n, i) => n.position({ x: 380 + Number(h) * 275, y: 290 - span / 2 + i * 95 }));
+    const hop = Number(h);
+    nodes.sort((a, b) =>
+      (b.data('root') ? 1 : 0) - (a.data('root') ? 1 : 0) ||
+      (b.data('score') || 0) - (a.data('score') || 0) ||
+      (a.data('path') || '').localeCompare(b.data('path') || '')
+    );
+
+    if (hop === 0) {
+      const span = (nodes.length - 1) * VSTEP;
+      nodes.forEach((n, i) => n.position({ x: ROOT_X, y: ROOT_Y - span / 2 + i * VSTEP }));
+      return;
+    }
+
+    const sign = hop > 0 ? 1 : -1;
+    const abshop = Math.abs(hop);
+    const numSubs = Math.ceil(nodes.length / MAX_COL);
+    for (let s = 0; s < numSubs; s++) {
+      const chunk = nodes.slice(s * MAX_COL, (s + 1) * MAX_COL);
+      const x = ROOT_X + sign * (abshop * HOP_X + s * SUB_X);
+      const span = (chunk.length - 1) * VSTEP;
+      chunk.forEach((n, i) => n.position({ x, y: ROOT_Y - span / 2 + i * VSTEP }));
+    }
   });
 }
 
 // ── Rings layout: concentric by |hop|, callers left hemisphere, deps right ────
 function ringPositions() {
+  const mul = _spreadMul || 1;
   const g = {};
   cy.nodes().not(':parent').forEach(n => {
     const h = n.data('hop') || 0;
     (g[h] = g[h] || []).push(n);
   });
+
+  const maxInRing = Math.max(1, ...Object.values(g).map(ns => ns.length));
+  // Ensure each node in the densest ring has at least ~70px of arc-spacing.
+  // arc-spacing ≈ 2 * 0.86π * r / N → r = N * 70 / (2 * 0.86π) ≈ N * 13.
+  const ringStep = Math.max(180, Math.min(360, Math.round(maxInRing * 14 + 120))) * mul;
+
   Object.entries(g).forEach(([h, nodes]) => {
     const hop = Number(h);
-    if (hop === 0) { nodes.forEach(n => n.position({ x: 400, y: 300 })); return; }
-    const r = Math.abs(hop) * 200;
-    const base = hop < 0 ? Math.PI : 0;
-    const arc = Math.PI * 0.82;
+    if (hop === 0) {
+      // Spread hop-0 nodes in a small cluster, not a single point.
+      const s0 = Math.min(44, nodes.length * 18);
+      nodes.forEach((n, i) => n.position({
+        x: 420 + (nodes.length === 1 ? 0 : (i - (nodes.length - 1) / 2) * s0),
+        y: 320,
+      }));
+      return;
+    }
+    // Cap |hop| at 4 so extreme-outlier nodes never blow up the fit box.
+    // A single node at hop -6 would otherwise appear 1080px to the left,
+    // making everything else microscopic after cy.fit().
+    const clampedHop = Math.sign(hop) * Math.min(Math.abs(hop), 4);
+    const r = Math.abs(clampedHop) * ringStep;
+    const base = clampedHop < 0 ? Math.PI : 0;
+    // Widen arc for thin rings so lone nodes aren't pinned at a single point.
+    const arc = nodes.length <= 2 ? Math.PI * 0.5 : Math.PI * 0.86;
     nodes.forEach((n, i) => {
       const a = base - arc / 2 + (nodes.length === 1 ? arc / 2 : arc * i / (nodes.length - 1));
-      n.position({ x: 400 + Math.cos(a) * r, y: 300 + Math.sin(a) * r * 0.78 });
+      n.position({ x: 420 + Math.cos(a) * r, y: 320 + Math.sin(a) * r * 0.72 });
     });
   });
 }
@@ -330,6 +483,12 @@ function renderGraph(bloomOriginId) {
     cy.edges('[kind="reads"]').style('display', varsOn ? 'element' : 'none');
   });
 
+  // Explicitly re-enable pan/grab after every render — guard against anything
+  // that might reset these (layout plugins, external state, re-used instances).
+  cy.userPanningEnabled(true);
+  cy.userZoomingEnabled(true);
+  cy.autoungrabify(false);
+
   (layoutName === 'flow' ? flowPositions : ringPositions)();
 
   // Column header visibility
@@ -337,13 +496,25 @@ function renderGraph(bloomOriginId) {
   document.querySelectorAll('.col-head').forEach(el => el.style.opacity = showCols ? '1' : '0');
 
   progZoom(() => {
-    if (FX.on && cy.nodes().length > 0) {
+    if (cy.nodes().length === 0) return;
+    const n = cy.nodes().length;
+    // Use a zoom level that keeps nodes legible regardless of graph size.
+    // For small graphs (≤25 nodes) fit is fine; for larger ones lock to a
+    // readable zoom and centre on the root node so the user can pan to explore.
+    const rootId = (allNodes.find(nd => nd.root) || {}).id;
+    const rootEl = rootId ? cy.getElementById(rootId) : null;
+    if (n <= 25) {
       cy.fit(cy.elements(), 55);
-      bloom(bloomOriginId || (allNodes.find(n => n.root) || {}).id || null);
     } else {
-      if (cy.nodes().length > 0) cy.layout({ name: 'preset', fit: true, padding: 55,
-        animate: false }).run();
+      const targetZoom = Math.max(0.18, Math.min(0.55, 12 / Math.sqrt(n)));
+      cy.zoom(targetZoom);
+      if (rootEl && rootEl.length) {
+        cy.center(rootEl);
+      } else {
+        cy.center();
+      }
     }
+    if (FX.on) bloom(bloomOriginId || rootId || null);
   });
 
   // Noise badge
@@ -450,7 +621,6 @@ function submitQuery(forceFetch) {
   }
 
   const reqId = ++currentReqId;
-  document.getElementById('statusDepth').textContent = 'depth ' + depth;
   vscode.postMessage({ command: 'query', query, direction, depth, kind_filter: '', reqId });
 }
 
@@ -561,6 +731,44 @@ cy.on('mouseover', 'node', evt => {
     tip._wt1 = setTimeout(() => h1.addClass('wave-1'), 60);
     tip._wt2 = setTimeout(() => h2.addClass('wave-2'), 175);
   }
+
+  // Hover-spread: push nodes that crowd the hovered node out of the way so the
+  // user can distinguish and click individual nodes in dense columns.
+  if (!blastOn) {
+    const pos = evt.target.position();
+    const THRESH = 110; // graph-pixel proximity threshold
+    const nearby = cy.nodes(':visible').not(':parent').filter(o => {
+      if (o.id() === evt.target.id()) return false;
+      const p = o.position();
+      return Math.hypot(p.x - pos.x, p.y - pos.y) < THRESH;
+    });
+    if (nearby.length) {
+      // Restore any prior spread first (instant — avoids double-animation)
+      if (_hoverSpread) {
+        _hoverSpread.orig.forEach((op, id) => { const o = cy.getElementById(id); if (o.length) o.position(op); });
+        _hoverSpread = null;
+      }
+      const orig = new Map();
+      nearby.forEach((o, i) => {
+        orig.set(o.id(), { ...o.position() });
+        const p = o.position();
+        const dx = p.x - pos.x, dy = p.y - pos.y;
+        const dist = Math.hypot(dx, dy);
+        let nx, ny;
+        if (dist < 4) {
+          const a = (i / nearby.length) * Math.PI * 2;
+          nx = pos.x + Math.cos(a) * (THRESH + 18);
+          ny = pos.y + Math.sin(a) * (THRESH + 18);
+        } else {
+          const push = THRESH - dist + 22;
+          nx = p.x + (dx / dist) * push;
+          ny = p.y + (dy / dist) * push;
+        }
+        o.animate({ position: { x: nx, y: ny } }, { duration: 170, easing: 'ease-out-cubic' });
+      });
+      _hoverSpread = { nodeId: evt.target.id(), orig };
+    }
+  }
 });
 cy.on('mousemove', evt => {
   if (!evt.originalEvent) return;
@@ -571,14 +779,24 @@ cy.on('mouseout', 'node', () => {
   tip.style.display = 'none';
   clearTimeout(tip._wt1); clearTimeout(tip._wt2);
   cy.elements().removeClass('wave-1 wave-2 softdim');
+  // Restore hover-spread
+  if (_hoverSpread) {
+    const s = _hoverSpread; _hoverSpread = null;
+    s.orig.forEach((op, id) => {
+      cy.getElementById(id).animate({ position: op }, { duration: 150, easing: 'ease-in-cubic' });
+    });
+  }
 });
 
 cy.on('tap', 'node', evt => {
   if (evt.target.isParent()) return;
   const n = evt.target;
   cy.batch(() => {
-    cy.elements().addClass('dimmed');
-    n.closedNeighborhood().removeClass('dimmed');
+    // Only dim non-parent nodes/edges — compound parents must stay visible so
+    // their children's opacity isn't inherited-multiplied to near-zero.
+    cy.elements().not(':parent').addClass('dimmed');
+    const nbhd = n.closedNeighborhood();
+    nbhd.removeClass('dimmed');
   });
   showDetail(n);
   if (FX.on && evt.renderedPosition) shock(evt.renderedPosition.x, evt.renderedPosition.y);
@@ -589,6 +807,11 @@ cy.on('tap', evt => {
     document.getElementById('detail').classList.remove('open');
   }
   if (FX.on && evt.renderedPosition) shock(evt.renderedPosition.x, evt.renderedPosition.y);
+});
+
+// Snap any in-flight bloom opacity fade to 1 the moment the user grabs a node.
+cy.on('grab', 'node', evt => {
+  evt.target.stop(true, true);
 });
 
 // ── Detail panel ────────────────────────────────────────────────────────────────
@@ -603,10 +826,14 @@ function showDetail(n) {
 
   const edgeItems = n.connectedEdges().map(e => {
     const isOut = e.data('source') === d.id;
-    const other = isOut ? e.data('target') : e.data('source');
-    const wgt   = e.data('wgt') ? ' <span style="color:#686868">×' + e.data('wgt') + '</span>' : '';
-    return '<li class="edge-li"><span class="edge-arrow">' + (isOut ? '→' : '←') + '</span> ' +
-      escHtml(other.replace(/^(f::|grp::)/, '')) + ' <span class="edge-type">' + e.data('kind') + '</span>' + wgt + '</li>';
+    const otherId = isOut ? e.data('target') : e.data('source');
+    const otherNode = cy.getElementById(otherId);
+    const otherLabel = otherNode.length
+      ? (otherNode.data('label') || shortLabel('', otherId))
+      : shortLabel('', otherId.replace(/^(f::|grp::)/, ''));
+    const wgt = e.data('wgt') ? ' <span style="color:#686868">×' + e.data('wgt') + '</span>' : '';
+    return '<li class="edge-li" title="' + escHtml(otherId) + '"><span class="edge-arrow">' + (isOut ? '→' : '←') + '</span> ' +
+      escHtml(otherLabel) + ' <span class="edge-type">' + e.data('kind') + '</span>' + wgt + '</li>';
   }).join('');
 
   const detailEl = document.getElementById('detail');
@@ -634,12 +861,24 @@ function showDetail(n) {
     '</div>' +
     (edgeItems ? '<div class="d-section"><div class="d-title">Edges (' + n.connectedEdges().length + ')</div><ul>' + edgeItems + '</ul></div>' : '') +
     '<div class="d-section"><div class="d-title">Actions</div>' +
-      (d.path && d.line ? '<button class="btn-action" onclick="peekNode(' + JSON.stringify(d.path) + ',' + (d.line || 0) + ')">↗ Definition peek</button>' : '') +
-      (d.path ? '<button class="btn-action" onclick="vscode.postMessage({command:\'goToDefinition\',path:' + JSON.stringify(d.path) + ',line:' + (d.line || 0) + '})">↗ Go to definition</button>' : '') +
-      '<button class="btn-action hot" onclick="enterBlast(\'' + escAttr(d.id) + '\')">⊗ Show blast radius</button>' +
-      (d.kind === 'file' && d.path ? '<button class="btn-action" onclick="vscode.postMessage({command:\'showDependencies\',path:' + JSON.stringify(d.path) + '})">⊟ Show dependencies</button>' : '') +
-      '<button class="btn-action" onclick="copyVName(\'' + escAttr(d.id) + '\')">⧉ Copy VName</button>' +
+      (d.path && d.line ? '<button class="btn-action" data-act="peek">↗ Definition peek</button>' : '') +
+      (d.path ? '<button class="btn-action" data-act="goto">↗ Go to definition</button>' : '') +
+      '<button class="btn-action hot" data-act="blast">⊗ Show blast radius</button>' +
+      (d.kind === 'file' && d.path ? '<button class="btn-action" data-act="deps">⊟ Show dependencies</button>' : '') +
+      '<button class="btn-action" data-act="copy">⧉ Copy VName</button>' +
     '</div>';
+
+  // Wire actions — CSP blocks onclick= in innerHTML; must use addEventListener.
+  const _peek = detailEl.querySelector('[data-act="peek"]');
+  if (_peek) _peek.addEventListener('click', () => peekNode(d.path, d.line || 0));
+  const _goto = detailEl.querySelector('[data-act="goto"]');
+  if (_goto) _goto.addEventListener('click', () => vscode.postMessage({ command: 'goToDefinition', path: d.path, line: d.line || 0 }));
+  const _blastBtn = detailEl.querySelector('[data-act="blast"]');
+  if (_blastBtn) _blastBtn.addEventListener('click', () => enterBlast(d.id));
+  const _deps = detailEl.querySelector('[data-act="deps"]');
+  if (_deps) _deps.addEventListener('click', () => vscode.postMessage({ command: 'showDependencies', path: d.path }));
+  const _copy = detailEl.querySelector('[data-act="copy"]');
+  if (_copy) _copy.addEventListener('click', () => copyVName(d.id));
 }
 
 function copyVName(id) {
@@ -740,7 +979,7 @@ function enterBlast(rootId) {
   // Reverse BFS: ring[id] = hop-distance upstream (callers/importers) from root
   const ring = { [rootId]: 0 };
   let frontier = [rootId], k = 0;
-  while (frontier.length && k < 6) {
+  while (frontier.length && k < 4) {
     k++;
     const cur = new Set(frontier); frontier = [];
     cy.edges().forEach(e => {
@@ -772,23 +1011,20 @@ function enterBlast(rootId) {
     });
   });
 
-  // Concentric ring positions
+  // Concentric ring positions — stored on _blastRingState so the spread slider can re-apply.
   const byRing = {};
   Object.entries(ring).forEach(([id, r]) => (byRing[r] = byRing[r] || []).push(id));
-  Object.entries(byRing).forEach(([r, ids]) => {
-    const R = Number(r) * 210;
-    ids.forEach((id, i) => {
-      const n = cy.getElementById(id);
-      if (!n.length) return;
-      if (Number(r) === 0) return n.position({ x: 0, y: 0 });
-      const a = -Math.PI / 2 + 2 * Math.PI * i / ids.length;
-      n.position({ x: Math.cos(a) * R, y: Math.sin(a) * R * 0.78 });
-    });
-  });
+  const maxRingNodes = Math.max(1, ...Object.values(byRing).map(ids => ids.length));
+  const ringR = Math.min(150, Math.max(80, Math.round(maxRingNodes * 11.5)));
+  _blastRingState = { byRing, ringR };
+  applyBlastPositions(_spreadMul);
 
-  progZoom(() => cy.layout({ name: 'preset', fit: true, padding: 80,
-    animate: !window.matchMedia('(prefers-reduced-motion: reduce)').matches,
-    animationDuration: 350 }).run());
+  progZoom(() => {
+    const n = cy.nodes().length;
+    const targetZoom = Math.max(0.18, Math.min(0.55, 12 / Math.sqrt(n)));
+    cy.zoom(targetZoom);
+    cy.center(cy.getElementById(rootId).length ? cy.getElementById(rootId) : cy.elements());
+  });
 
   document.getElementById('main').classList.add('blastmode');
   document.querySelectorAll('.col-head').forEach(el => el.style.opacity = '0');
@@ -834,13 +1070,19 @@ function showBlastReport(root, byRing) {
     '</div>' +
     (sections || '<div class="d-section"><div class="d-title">No upstream impact found in loaded subgraph</div></div>') +
     '<div class="d-section"><div class="d-title">Actions</div>' +
-      '<button class="btn-action" onclick="exportPng()">⬇ Export blast report (PNG)</button>' +
-      '<button class="btn-action hot" onclick="exitBlast()">✕ Exit blast view</button>' +
+      '<button class="btn-action" data-act="blast-export">⬇ Export blast report (PNG)</button>' +
+      '<button class="btn-action hot" data-act="blast-exit">✕ Exit blast view</button>' +
     '</div>';
+
+  const _bexp = detail.querySelector('[data-act="blast-export"]');
+  if (_bexp) _bexp.addEventListener('click', exportPng);
+  const _bexit = detail.querySelector('[data-act="blast-exit"]');
+  if (_bexit) _bexit.addEventListener('click', exitBlast);
 }
 
 function exitBlast() {
   blastOn = false;
+  _blastRingState = null;
   document.getElementById('blastbar').style.display = 'none';
   document.getElementById('main').classList.remove('blastmode');
   // Restore graph display
@@ -1013,20 +1255,23 @@ function bloom(originId) {
     const bb = nodes.boundingBox();
     o = { x: (bb.x1 + bb.x2) / 2, y: (bb.y1 + bb.y2) / 2 };
   }
+  // Opacity-only ripple — nodes stay at full size throughout so drag/tap
+  // is immediately available on the first frame after render.
   nodes.forEach(n => {
-    const tgt = { ...n.position() }, d = Math.hypot(tgt.x - o.x, tgt.y - o.y);
-    n.position(o); n.style('opacity', 0.12);
-    n.delay(Math.min(480, d * 0.5))
-      .animate({ position: tgt, style: { opacity: 1 } }, {
-        duration: 430, easing: 'ease-out-cubic',
+    const pos = n.position();
+    const d = Math.hypot(pos.x - o.x, pos.y - o.y);
+    n.style({ opacity: 0 });
+    n.delay(Math.min(280, d * 0.22))
+      .animate({ style: { opacity: 1 } }, {
+        duration: 320, easing: 'ease-out-cubic',
         complete: () => n.removeStyle('opacity'),
       });
   });
   cy.edges().style('opacity', 0);
   setTimeout(() => cy.edges().animate(
     { style: { opacity: 0.8 } },
-    { duration: 300, complete: () => cy.edges().removeStyle('opacity') }
-  ), 420);
+    { duration: 270, complete: () => cy.edges().removeStyle('opacity') }
+  ), 300);
 }
 
 function shock(x, y, cls) {
@@ -1078,8 +1323,14 @@ document.getElementById('main').addEventListener('pointermove', e => {
     'translate(' + (e.clientX - r.left) + 'px,' + (e.clientY - r.top) + 'px) translate(-50%,-50%)';
 });
 
-// Resize observer
-new ResizeObserver(sizeBgfx).observe(document.getElementById('main'));
+// Resize observer — must call cy.resize() so Cytoscape's canvas matches the container.
+// VS Code creates webviews at 0×0 initially; without cy.resize() on first expand,
+// Cytoscape's event canvas stays zero-size and drag/pan never registers.
+new ResizeObserver(() => {
+  sizeBgfx();
+  cy.resize();
+  if (cy.nodes().length) progZoom(() => cy.fit(cy.elements(), 55));
+}).observe(document.getElementById('main'));
 
 // ── Utility ───────────────────────────────────────────────────────────────────
 function escHtml(s) {
@@ -1093,8 +1344,250 @@ function escAttr(s) {
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 sizeBgfx();
+// Double-rAF: VS Code webview panels often start at zero height because the flex
+// layout hasn't resolved at script-load time.  A single rAF lands before style
+// recalculation; the nested one lands after the first paint when #cy has its
+// real dimensions, so cy.resize() correctly primes Cytoscape's bounding-rect cache.
+requestAnimationFrame(() => requestAnimationFrame(() => {
+  cy.resize();
+  sizeBgfx();
+}));
 applyFx();
 requestAnimationFrame(fxLoop);
+
+// ── Custom pan / drag / tap ───────────────────────────────────────────────────
+// Cytoscape's E(t) bounding-rect check fails in VS Code webviews (the panel can
+// start at zero-height; various focus/role mechanics suppress mousedown before it
+// reaches Cytoscape). We bypass it entirely: preventDefault on pointerdown stops
+// the browser generating a synthetic mousedown, so our handler has sole ownership
+// of pan, node-drag, and tap. Cytoscape's mousemove-based hover/tooltip still fires.
+;(function () {
+  const el = document.getElementById('cy');
+  let drag = null;
+
+  function graphXY(cx, cy_c) {
+    const bb = el.getBoundingClientRect();
+    const p = cy.pan(), z = cy.zoom();
+    return { x: (cx - bb.left - p.x) / z, y: (cy_c - bb.top - p.y) / z };
+  }
+
+  function nodeAt(gx, gy) {
+    let hit = null, bestArea = Infinity;
+    cy.nodes(':visible').not(':parent').forEach(n => {
+      const pos = n.position();
+      const hw = (n.data('w') || 26) / 2, hh = (n.data('h') || 26) / 2;
+      if (Math.abs(gx - pos.x) <= hw && Math.abs(gy - pos.y) <= hh) {
+        const a = hw * hh;
+        if (a < bestArea) { bestArea = a; hit = n; }
+      }
+    });
+    return hit;
+  }
+
+  el.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    e.preventDefault(); // suppresses synthetic mousedown → Cytoscape E(t) never runs
+    el.setPointerCapture(e.pointerId);
+    const g = graphXY(e.clientX, e.clientY);
+    const node = nodeAt(g.x, g.y);
+    drag = node
+      ? { kind: 'node', node, gx0: g.x, gy0: g.y, px0: node.position().x, py0: node.position().y, moved: false }
+      : { kind: 'pan',  cx0: e.clientX, cy0: e.clientY, pan0: { ...cy.pan() }, moved: false };
+  }, { passive: false });
+
+  el.addEventListener('pointermove', e => {
+    if (!drag) return;
+    if (drag.kind === 'pan') {
+      const dx = e.clientX - drag.cx0, dy = e.clientY - drag.cy0;
+      if (!drag.moved && Math.hypot(dx, dy) > 3) drag.moved = true;
+      if (drag.moved) cy.pan({ x: drag.pan0.x + dx, y: drag.pan0.y + dy });
+    } else {
+      const g = graphXY(e.clientX, e.clientY);
+      if (!drag.moved && Math.hypot(g.x - drag.gx0, g.y - drag.gy0) > 4) drag.moved = true;
+      if (drag.moved) {
+        drag.node.position({ x: drag.px0 + (g.x - drag.gx0), y: drag.py0 + (g.y - drag.gy0) });
+        scheduleMinimapRedraw();
+      }
+    }
+  });
+
+  el.addEventListener('pointerup', e => {
+    if (!drag) return;
+    const d = drag; drag = null;
+    try { el.releasePointerCapture(e.pointerId); } catch (_) { /* noop */ }
+    if (d.moved) return;
+
+    // Tap / click — replicate cy.on('tap', ...) since mousedown was suppressed.
+    if (d.kind === 'node' && !d.node.isParent()) {
+      const n = d.node;
+      cy.batch(() => {
+        cy.elements().not(':parent').addClass('dimmed');
+        n.closedNeighborhood().removeClass('dimmed');
+      });
+      showDetail(n);
+      if (FX.on) {
+        const bb = el.getBoundingClientRect();
+        shock(e.clientX - bb.left, e.clientY - bb.top);
+      }
+    } else {
+      cy.elements().removeClass('dimmed');
+      document.getElementById('detail').classList.remove('open');
+      if (FX.on) {
+        const bb = el.getBoundingClientRect();
+        shock(e.clientX - bb.left, e.clientY - bb.top);
+      }
+    }
+  });
+
+  el.addEventListener('pointercancel', () => { drag = null; });
+})();
+
+// ── Node search ───────────────────────────────────────────────────────────
+(function () {
+  const overlay  = document.getElementById('node-search');
+  const input    = document.getElementById('node-search-input');
+  const results  = document.getElementById('node-search-results');
+  let activeIdx  = -1;
+  let _highlighted = null;
+
+  function openSearch() {
+    overlay.style.display = 'block';
+    input.value = '';
+    results.innerHTML = '';
+    activeIdx = -1;
+    input.focus();
+  }
+
+  function closeSearch() {
+    overlay.style.display = 'none';
+    if (_highlighted) { _highlighted.removeClass('node-search-hit'); _highlighted = null; }
+  }
+
+  window.toggleNodeSearch = function() {
+    overlay.style.display === 'none' ? openSearch() : closeSearch();
+  };
+
+  function renderResults(query) {
+    results.innerHTML = '';
+    activeIdx = -1;
+    if (!query) return;
+    const q = query.toLowerCase();
+    const matches = [];
+    cy.nodes(':visible').not(':parent').forEach(n => {
+      const label = n.data('label') || '';
+      const id    = n.id() || '';
+      if (label.toLowerCase().includes(q) || id.toLowerCase().includes(q)) {
+        matches.push(n);
+      }
+    });
+    matches.slice(0, 40).forEach((n, i) => {
+      const li = document.createElement('li');
+      const kind = n.data('kind') || '';
+      li.innerHTML = escHtml(n.data('label') || n.id()) +
+        (kind ? '<span class="match-kind">' + escHtml(kind) + '</span>' : '');
+      li.setAttribute('role', 'option');
+      li.addEventListener('mousedown', e => { e.preventDefault(); selectResult(n); });
+      results.appendChild(li);
+    });
+    if (matches.length > 40) {
+      const li = document.createElement('li');
+      li.style.color = 'var(--ch-400)';
+      li.textContent = '+ ' + (matches.length - 40) + ' more…';
+      results.appendChild(li);
+    }
+  }
+
+  function selectResult(n) {
+    closeSearch();
+    // Highlight node
+    if (_highlighted) _highlighted.removeClass('node-search-hit');
+    _highlighted = n;
+    n.addClass('node-search-hit');
+    // Pan + zoom to node
+    cy.animate({ zoom: Math.max(cy.zoom(), 0.8), center: { eles: n } }, { duration: 300 });
+    // Show detail
+    cy.batch(() => {
+      cy.elements().not(':parent').addClass('dimmed');
+      n.closedNeighborhood().removeClass('dimmed');
+    });
+    showDetail(n);
+    setTimeout(() => { if (_highlighted === n) { n.removeClass('node-search-hit'); _highlighted = null; } }, 2000);
+  }
+
+  function setActive(idx) {
+    const items = results.querySelectorAll('li');
+    items.forEach(li => li.classList.remove('active'));
+    activeIdx = Math.max(0, Math.min(idx, items.length - 1));
+    if (items[activeIdx]) items[activeIdx].classList.add('active');
+  }
+
+  input.addEventListener('input', () => renderResults(input.value.trim()));
+
+  input.addEventListener('keydown', e => {
+    const items = results.querySelectorAll('li');
+    if (e.key === 'ArrowDown') { e.preventDefault(); setActive(activeIdx + 1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(activeIdx - 1); }
+    else if (e.key === 'Enter') {
+      const active = results.querySelector('li.active');
+      if (active) active.dispatchEvent(new MouseEvent('mousedown'));
+    }
+    else if (e.key === 'Escape') closeSearch();
+  });
+
+  // Cmd+F / Ctrl+F to open search
+  document.addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); openSearch(); }
+  });
+
+  // Click outside to close
+  document.addEventListener('mousedown', e => {
+    if (overlay.style.display !== 'none' && !overlay.contains(e.target)) closeSearch();
+  });
+})();
+
+// Wire all toolbar controls — CSP ('nonce-only') blocks onclick= HTML attributes;
+// every event handler must be attached via addEventListener from within this script.
+document.getElementById('btn-callers').addEventListener('click', () => setDirection('callers'));
+document.getElementById('btn-both').addEventListener('click', () => setDirection('both'));
+document.getElementById('btn-deps').addEventListener('click', () => setDirection('deps'));
+document.getElementById('depthSlider').addEventListener('input', function() { onDepthSlider(this.value); });
+document.getElementById('spreadSlider').addEventListener('input', function() {
+  const prev = _spreadMul;
+  _spreadMul = parseFloat(this.value);
+  document.getElementById('spreadVal').textContent = _spreadMul.toFixed(1) + '×';
+  if (blastOn) {
+    applyBlastPositions(_spreadMul);
+  } else {
+    (layoutName === 'flow' ? flowPositions : ringPositions)();
+  }
+  // Zoom out proportionally so the graph stays visible as nodes spread
+  const newZoom = Math.max(cy.minZoom(), cy.zoom() * (prev / _spreadMul));
+  const rootEl = blastOn
+    ? cy.nodes().filter(n => n.data('ring') === 0).first()
+    : cy.nodes('[?root]').first();
+  cy.zoom(newZoom);
+  if (rootEl.length) cy.center(rootEl); else cy.center();
+  scheduleMinimapRedraw();
+});
+document.getElementById('btn-flow').addEventListener('click', () => setLayout('flow'));
+document.getElementById('btn-rings').addEventListener('click', () => setLayout('rings'));
+document.getElementById('btn-group').addEventListener('click', toggleGrouping);
+document.getElementById('btn-vars').addEventListener('click', toggleVars);
+document.getElementById('btn-noise').addEventListener('click', toggleNoise);
+document.getElementById('chip-calls').addEventListener('click', () => toggleEdgeKind('calls'));
+document.getElementById('chip-imports').addEventListener('click', () => toggleEdgeKind('imports'));
+document.getElementById('btn-blast').addEventListener('click', blastSelected);
+document.getElementById('btn-fx').addEventListener('click', toggleFx);
+document.getElementById('btn-pulse').addEventListener('click', pulseGraph);
+document.getElementById('btn-dot').addEventListener('click', exportDot);
+document.getElementById('btn-json').addEventListener('click', exportJson);
+document.getElementById('btn-png').addEventListener('click', exportPng);
+document.getElementById('btn-fit').addEventListener('click', fitView);
+document.getElementById('btn-search').addEventListener('click', toggleNodeSearch);
+document.getElementById('blastExit').addEventListener('click', exitBlast);
+document.getElementById('btn-zoom-in').addEventListener('click', () => zoomBy(1.35));
+document.getElementById('btn-zoom-out').addEventListener('click', () => zoomBy(1 / 1.35));
+document.getElementById('btn-peek-close').addEventListener('click', closePeek);
 
 // Show initial hint
 document.getElementById('hint').innerHTML =

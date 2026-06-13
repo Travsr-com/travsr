@@ -290,8 +290,8 @@ export class GraphPanel {
           try {
             const doc = await vscode.workspace.openTextDocument(uri);
             const defLine = line - 1; // 0-indexed
-            const start = Math.max(0, defLine - 5);
-            const end = Math.min(doc.lineCount - 1, defLine + 6);
+            const start = Math.max(0, defLine - 8);
+            const end = Math.min(doc.lineCount - 1, defLine + 25);
             const lines: Array<{ no: number; text: string }> = [];
             for (let i = start; i <= end; i++) {
               lines.push({ no: i + 1, text: doc.lineAt(i).text });
@@ -372,48 +372,62 @@ export class GraphPanel {
 
   <div class="grp" id="grp-direction" aria-label="Direction">
     <span class="grp-label">show</span>
-    <button class="btn" id="btn-callers" onclick="setDirection('callers')" title="Callers only">← callers</button>
-    <button class="btn active" id="btn-both" onclick="setDirection('both')" title="Callers and dependencies">both</button>
-    <button class="btn" id="btn-deps" onclick="setDirection('deps')" title="Dependencies only">deps →</button>
+    <button class="btn" id="btn-callers" title="Callers only">← callers</button>
+    <button class="btn active" id="btn-both" title="Callers and dependencies">both</button>
+    <button class="btn" id="btn-deps" title="Dependencies only">deps →</button>
   </div>
 
   <div class="grp" id="grp-depth" aria-label="Depth">
     <span class="grp-label">depth</span>
     <input type="range" id="depthSlider" min="1" max="4" value="2"
-           oninput="onDepthSlider(this.value)" aria-label="Traversal depth">
+           aria-label="Traversal depth">
     <span id="depthVal">2</span>
+  </div>
+
+  <div class="grp" id="grp-spread" aria-label="Spread">
+    <span class="grp-label">spread</span>
+    <input type="range" id="spreadSlider" min="1" max="5" step="0.1" value="1"
+           aria-label="Node spread multiplier" style="width:72px">
+    <span id="spreadVal">1×</span>
   </div>
 
   <div class="grp" id="grp-layout" aria-label="Layout">
     <span class="grp-label">layout</span>
-    <button class="btn active" id="btn-flow" onclick="setLayout('flow')" title="Semantic flow layout">⇄ flow</button>
-    <button class="btn" id="btn-rings" onclick="setLayout('rings')" title="Concentric ring layout">◎ rings</button>
+    <button class="btn active" id="btn-flow" title="Semantic flow layout">⇄ flow</button>
+    <button class="btn" id="btn-rings" title="Concentric ring layout">◎ rings</button>
   </div>
 
   <div class="grp" id="grp-toggles" aria-label="Toggles">
-    <button class="btn active" id="btn-group" onclick="toggleGrouping()" title="Group symbols by file">▣ files</button>
-    <button class="btn" id="btn-vars" onclick="toggleVars()" title="Show exported variable nodes">x vars</button>
-    <button class="btn active-orange" id="btn-noise" onclick="toggleNoise()" title="Hide test and vendor nodes">⊘ noise</button>
+    <button class="btn active" id="btn-group" title="Group symbols by file">▣ files</button>
+    <button class="btn" id="btn-vars" title="Show exported variable nodes">x vars</button>
+    <button class="btn active-orange" id="btn-noise" title="Hide test and vendor nodes">⊘ noise</button>
   </div>
 
   <div class="grp" id="grp-edges" aria-label="Edge kinds">
     <span class="grp-label">edges</span>
-    <span class="chip on" id="chip-calls" onclick="toggleEdgeKind('calls')" role="button" tabindex="0">calls</span>
-    <span class="chip on" id="chip-imports" onclick="toggleEdgeKind('imports')" role="button" tabindex="0">imports</span>
+    <span class="chip on" id="chip-calls" role="button" tabindex="0">calls</span>
+    <span class="chip on" id="chip-imports" role="button" tabindex="0">imports</span>
   </div>
 
   <div class="grp" id="grp-fx" aria-label="Effects">
-    <button class="btn active-orange" id="btn-blast" onclick="blastSelected()" title="Show blast radius of selected node">⊗ blast</button>
-    <button class="btn active" id="btn-fx" onclick="toggleFx()" title="Toggle visual effects">⚡ fx</button>
-    <button class="btn" id="btn-pulse" onclick="pulseGraph()" title="Replay bloom animation">⟳</button>
+    <button class="btn active-orange" id="btn-blast" title="Show blast radius of selected node">⊗ blast</button>
+    <button class="btn active" id="btn-fx" title="Toggle visual effects">⚡ fx</button>
+    <button class="btn" id="btn-pulse" title="Replay bloom animation">⟳</button>
   </div>
 
   <div class="grp" aria-label="Exports">
-    <button class="btn" onclick="exportDot()" title="Copy graph as Graphviz DOT">DOT</button>
-    <button class="btn" onclick="exportJson()" title="Save graph as JSON">JSON</button>
-    <button class="btn" onclick="exportPng()" title="Save graph as PNG">PNG</button>
-    <button class="btn" onclick="fitView()" title="Fit graph to window" aria-label="Fit to window">⛶</button>
+    <button class="btn" id="btn-dot" title="Copy graph as Graphviz DOT">DOT</button>
+    <button class="btn" id="btn-json" title="Save graph as JSON">JSON</button>
+    <button class="btn" id="btn-png" title="Save graph as PNG">PNG</button>
+    <button class="btn" id="btn-fit" title="Fit graph to window" aria-label="Fit to window">⛶</button>
+    <button class="btn" id="btn-search" title="Search nodes (⌘F)">⌕</button>
   </div>
+</div>
+
+<!-- ── Node search overlay ──────────────────────────────────────────────── -->
+<div id="node-search" style="display:none" role="search" aria-label="Search nodes">
+  <input id="node-search-input" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
+  <ul id="node-search-results" role="listbox"></ul>
 </div>
 
 <!-- ── Blast bar ────────────────────────────────────────────────────────── -->
@@ -421,7 +435,7 @@ export class GraphPanel {
   <div class="blast-icon" aria-hidden="true">⊗</div>
   <span>Blast radius of <strong id="blastName"></strong></span>
   <span class="meta" id="blastMeta"></span>
-  <button class="btn" id="blastExit" onclick="exitBlast()">✕ exit blast view</button>
+  <button class="btn" id="blastExit">✕ exit blast view</button>
 </div>
 
 <!-- ── Main canvas area ─────────────────────────────────────────────────── -->
@@ -432,7 +446,7 @@ export class GraphPanel {
     <div class="blob b3"></div>
   </div>
   <canvas id="bgfx" aria-hidden="true"></canvas>
-  <div id="cy" role="img" aria-label="Code dependency graph"></div>
+  <div id="cy" role="application" aria-label="Code dependency graph"></div>
   <div id="spotlight" aria-hidden="true"></div>
   <div id="halo" aria-hidden="true"></div>
 
@@ -444,8 +458,8 @@ export class GraphPanel {
   <div id="hint" aria-live="polite"></div>
 
   <div id="zoomCtl" aria-label="Zoom controls">
-    <button class="btn" onclick="zoomBy(1.35)" aria-label="Zoom in">＋</button>
-    <button class="btn" onclick="zoomBy(1/1.35)" aria-label="Zoom out">－</button>
+    <button class="btn" id="btn-zoom-in" aria-label="Zoom in">＋</button>
+    <button class="btn" id="btn-zoom-out" aria-label="Zoom out">－</button>
   </div>
 
   <div id="minimapBox" aria-hidden="true">
@@ -458,7 +472,7 @@ export class GraphPanel {
       <span style="color:#86df86" aria-hidden="true">↗</span>
       <span class="pk-path" id="peekPath"></span>
       <span class="pk-note">peek · <kbd>Enter</kbd> opens editor</span>
-      <button class="pk-close" onclick="closePeek()" aria-label="Close peek panel">✕</button>
+      <button class="pk-close" id="btn-peek-close" aria-label="Close peek panel">✕</button>
     </div>
     <div id="peekBody" role="region" aria-label="Source code preview"></div>
     <div id="peekActions">

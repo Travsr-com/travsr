@@ -202,7 +202,13 @@ input[type=range] { width: 72px; accent-color: var(--green-300); cursor: pointer
   background-size: 100% 100%, 100% 100%, 26px 26px;
   overflow: hidden;
 }
-#cy { flex: 1; position: relative; z-index: 1; background: transparent; }
+#cy {
+  flex: 1; min-width: 0; min-height: 0; position: relative; z-index: 1;
+  background: transparent; overflow: hidden;
+  /* Required for Cytoscape drag: prevents browser from treating mousedown as
+     text-selection drag, which steals the event before Cytoscape can pan/drag. */
+  user-select: none; -webkit-user-select: none; touch-action: none;
+}
 
 /* ── FX layers ───────────────────────────────────────────────────────────── */
 #fxAurora { position: absolute; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
@@ -314,7 +320,7 @@ kbd {
   border-top: 1px solid var(--line-green);
   box-shadow: 0 -12px 36px rgba(0,0,0,.65), 0 -1px 18px rgba(134,223,134,.05);
   transform: translateY(100%); transition: transform var(--dur-slow) var(--ease);
-  max-height: 260px; display: flex; flex-direction: column;
+  max-height: 480px; display: flex; flex-direction: column;
 }
 #peek.open { transform: translateY(0); }
 #peekHead {
@@ -379,7 +385,7 @@ kbd {
 .d-val.green { color: var(--green-300); }
 .d-val.gold  { color: var(--gold-300); }
 .d-val.orange { color: var(--orange-400); }
-.edge-li { padding: 3px 0; color: var(--ch-300); font-family: var(--font-mono); font-size: 10.5px; list-style: none; }
+.edge-li { padding: 3px 0; color: var(--ch-300); font-family: var(--font-mono); font-size: 10.5px; list-style: none; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .edge-arrow { color: var(--green-300); font-weight: 700; }
 .edge-type { color: #686868; font-size: 9px; }
 .btn-action {
@@ -428,3 +434,32 @@ kbd {
 .lg { display: flex; gap: 4px; align-items: center; color: #787878; }
 .dot { width: 7px; height: 7px; border-radius: 50%; }
 .dot.ring { background: transparent !important; border: 2px solid; }
+
+/* ── Node search overlay ────────────────────────────────────────────────── */
+#node-search {
+  position: absolute; top: 48px; left: 50%; transform: translateX(-50%);
+  z-index: 120; width: 320px;
+  background: var(--ch-800); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 8px 32px rgba(0,0,0,.6);
+  overflow: hidden;
+}
+#node-search-input {
+  width: 100%; box-sizing: border-box;
+  padding: 10px 14px; background: transparent; border: none; outline: none;
+  color: var(--ch-50); font-size: 13px; font-family: var(--font-mono);
+  border-bottom: 1px solid var(--border);
+}
+#node-search-results {
+  list-style: none; margin: 0; padding: 4px 0;
+  max-height: 260px; overflow-y: auto;
+}
+#node-search-results li {
+  padding: 7px 14px; cursor: pointer; font-size: 12px;
+  font-family: var(--font-mono); color: var(--ch-200);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: background .1s;
+}
+#node-search-results li:hover,
+#node-search-results li.active { background: rgba(134,223,134,.12); color: var(--green-300); }
+#node-search-results li .match-kind { color: var(--ch-400); font-size: 10px; margin-left: 6px; }
+/* node-search-hit pulse is applied via Cytoscape style in graph.js */
