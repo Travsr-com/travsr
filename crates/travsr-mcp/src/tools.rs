@@ -1421,6 +1421,7 @@ const MAX_GRAPH_JSON_NODES: usize = 200;
 /// Returns `{"nodes":[...],"edges":[...]}`.
 /// Unlike prose tools, output is NOT sanitized — it is structured JSON consumed
 /// by the VS Code graph panel, not forwarded to an LLM as freetext.
+#[allow(clippy::too_many_arguments)]
 pub fn get_graph_json(
     store: &SqliteStore,
     query: &str,
@@ -2052,6 +2053,7 @@ fn get_graph_json_raw(
 }
 
 /// Global variant of `get_graph_json` — merges subgraphs across repos, deduping by node id.
+#[allow(clippy::too_many_arguments)]
 pub fn get_graph_json_global(
     repos: &HashMap<String, PathBuf>,
     query: &str,
