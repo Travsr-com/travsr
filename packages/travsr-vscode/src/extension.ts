@@ -16,6 +16,7 @@ import {
 } from "./codelens";
 import { CallersHoverProvider, HOVER_SELECTOR } from "./hover";
 import { TravsrTreeDataProvider } from "./tree";
+import { TravsrRepoFileTreeProvider } from "./repoFileTree";
 import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
 import { GraphPanel } from "./graph";
 import {
@@ -144,12 +145,42 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  // Repo Files tree view — sidebar file browser; click → open Travsr Graph
+  const repoFileTreeProvider = new TravsrRepoFileTreeProvider(proxy);
+  context.subscriptions.push(
+    vscode.window.createTreeView("travsrRepoFiles", {
+      treeDataProvider: repoFileTreeProvider,
+      showCollapseAll: true,
+    })
+  );
+
+  const openFileGraph = (relPath: string) => {
+    const panel = GraphPanel.show(proxy, context);
+    void panel.query(relPath);
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.refreshRepoFiles", () => {
+      repoFileTreeProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand(
+      "travsr.openFileGraph",
+      (relPath: string) => openFileGraph(relPath)
+    ),
+
+    vscode.commands.registerCommand("travsr.searchRepoFile", () => {
+      void repoFileTreeProvider.search(openFileGraph);
+    })
+  );
+
   // Clear caches on save so providers re-query fresh data
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(() => {
       codeLensProvider.clearCache();
       hoverProvider.clearCache();
       treeProvider.refresh();
+      repoFileTreeProvider.refresh();
     })
   );
 
@@ -160,6 +191,7 @@ export function activate(context: vscode.ExtensionContext): void {
       codeLensProvider.clearCache();
       hoverProvider.clearCache();
       treeProvider.refresh();
+      repoFileTreeProvider.refresh();
     })
   );
 

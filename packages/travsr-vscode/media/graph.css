@@ -261,6 +261,27 @@ body.fx-off #halo { display: none; }
 }
 @keyframes blastIn { from { opacity: 0; } }
 
+/* Dim irrelevant toolbar groups while in blast mode */
+#main.blastmode #grp-direction,
+#main.blastmode #grp-depth,
+#main.blastmode #grp-layout,
+#main.blastmode #grp-toggles,
+#main.blastmode #grp-edges {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
+/* Go-to-definition arrow in blast report list */
+.blast-goto {
+  background: none; border: none;
+  color: var(--accent, #7cf2c5); cursor: pointer;
+  font-size: 11px; padding: 0 4px; line-height: 1;
+  opacity: 0.7; transition: opacity 0.15s;
+  vertical-align: middle;
+}
+.blast-goto:hover { opacity: 1; }
+.blast-report-item:hover { background: rgba(255,255,255,0.03); border-radius: 4px; }
+
 /* ── Column headers (flow layout) ────────────────────────────────────────── */
 .col-head {
   position: absolute; top: 14px; font-size: 9px; font-weight: 700;
@@ -434,6 +455,71 @@ kbd {
 .lg { display: flex; gap: 4px; align-items: center; color: #787878; }
 .dot { width: 7px; height: 7px; border-radius: 50%; }
 .dot.ring { background: transparent !important; border: 2px solid; }
+
+/* ── Breadcrumb nav (P3 repo-map LOD) ───────────────────────────────────── */
+#breadcrumb {
+  display: none; align-items: center; gap: 0; padding: 5px 14px;
+  background: rgba(14,14,14,.97); border-bottom: 1px solid var(--border);
+  color: var(--fg-muted); font-size: 11.5px; flex-shrink: 0;
+  animation: riseIn .25s var(--ease) both;
+}
+#breadcrumb.open { display: flex; }
+.bc-crumb {
+  color: var(--fg-muted); cursor: pointer; padding: 2px 7px; border-radius: var(--r-sm);
+  transition: all var(--dur-fast) var(--ease); white-space: nowrap; font-weight: 500;
+}
+.bc-crumb:hover { color: var(--fg); background: rgba(255,255,255,.07); }
+.bc-crumb.active { color: var(--fg); cursor: default; }
+.bc-crumb.active:hover { background: none; }
+.bc-sep { color: var(--ch-500); padding: 0 2px; font-size: 13px; user-select: none; }
+
+/* ── Tile map (P3 repo-map LOD) ──────────────────────────────────────────── */
+#tilemap {
+  position: absolute; inset: 0; z-index: 1;
+  overflow: auto; display: none;
+}
+#tilemap.open { display: block; }
+#tilemap-edges {
+  position: absolute; top: 0; left: 0; pointer-events: none; z-index: 0;
+}
+#tilemap-tiles {
+  position: relative; min-height: 100%; padding-bottom: 24px; z-index: 1;
+}
+.tile {
+  position: absolute; cursor: pointer;
+  background: rgba(255,255,255,.028); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: 10px 12px; overflow: hidden;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease),
+              transform var(--dur-fast) var(--ease);
+  display: flex; flex-direction: column; justify-content: flex-end;
+  user-select: none;
+}
+.tile:hover {
+  background: rgba(134,223,134,.06); border-color: rgba(134,223,134,.38);
+  transform: translateY(-2px);
+}
+.tile:focus-visible { outline: 2px solid var(--green-300); outline-offset: 1px; }
+.tile.ghost {
+  opacity: 0.45; border-style: dashed; border-color: var(--border-mid);
+  cursor: default; pointer-events: none;
+}
+.tile.ghost:hover { transform: none; background: rgba(255,255,255,.028); }
+.tile .tile-label {
+  font: 600 11.5px var(--font-mono); color: var(--fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tile .tile-meta {
+  font-size: 10px; color: var(--fg-subtle); margin-top: 3px;
+}
+.tile .tile-kind-badge {
+  position: absolute; top: 8px; right: 9px;
+  font-size: 9px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase;
+  color: var(--green-300); opacity: 0.6;
+}
+.tile-empty-msg {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  color: var(--fg-subtle); font-size: 12px; text-align: center;
+}
 
 /* ── Node search overlay ────────────────────────────────────────────────── */
 #node-search {

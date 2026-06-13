@@ -15,12 +15,13 @@ const C = {
   iface: '#e2d4ca',   // linen-300
   vr:    '#fcd053',   // gold-300
   noise: '#4d4d4d',   // ch-500
+  pkg:   '#ffb970',   // orange-300  — directory / package tiles
 };
 function nodeColor(kind) {
-  return ({ function: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr })[kind] || '#8f7a6c';
+  return ({ function: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr, pkg: C.pkg, ghost: '#5a5a5a' })[kind] || '#8f7a6c';
 }
 function nodeShape(kind) {
-  return ({ function: 'ellipse', class: 'diamond', file: 'round-rectangle', interface: 'triangle', var: 'round-tag' })[kind] || 'ellipse';
+  return ({ function: 'ellipse', class: 'diamond', file: 'round-rectangle', interface: 'triangle', var: 'round-tag', pkg: 'round-rectangle', ghost: 'round-rectangle' })[kind] || 'ellipse';
 }
 function edgeColor(kind) {
   return ({ calls: 'rgba(134,223,134,0.28)', imports: 'rgba(72,72,72,0.42)', reads: 'rgba(252,208,83,0.35)' })[kind] || 'rgba(72,72,72,0.42)';
@@ -55,6 +56,24 @@ const cy = cytoscape({
     }},
     { selector: 'node[kind="file"]', style: {
         width: 54, height: 30, 'font-size': '9.5px', 'border-radius': '4px',
+    }},
+    // ── Repo-map LOD tile styles (P3) ────────────────────────────────────────
+    { selector: 'node[kind="pkg"]', style: {
+        'font-size': '12px', 'font-weight': '600',
+        'text-valign': 'center', 'text-halign': 'center', 'text-margin-y': 0,
+        'text-outline-width': 0,
+        'background-opacity': 0.11, 'border-width': 1.5,
+        'border-color': C.pkg, color: C.pkg,
+        shape: 'round-rectangle',
+        'text-wrap': 'wrap',
+        'text-max-width': e => Math.max(40, (e.data('w') || 80) - 16) + 'px',
+    }},
+    { selector: 'node[kind="ghost"]', style: {
+        'background-opacity': 0.04, 'border-width': 1, 'border-style': 'dashed',
+        'border-color': '#5a5a5a', color: '#8f7a6c', 'font-size': '10px',
+        'text-valign': 'center', 'text-margin-y': 0, 'text-wrap': 'wrap',
+        shape: 'round-rectangle',
+        'text-max-width': e => Math.max(30, (e.data('w') || 90) - 12) + 'px',
     }},
     { selector: 'node.noise', style: {
         'border-color': '#4d4d4d', color: '#6a6a6a', 'border-style': 'dotted', 'background-opacity': 0.06,
@@ -585,6 +604,19 @@ window.addEventListener('message', event => {
     if (msg.reqId !== undefined && msg.reqId < currentReqId) return;
 
     const data = msg.data || { nodes: [], edges: [] };
+    // Server's data.mode takes priority — it knows whether it returned overview vs prefix.
+    // msg.mode is just the query mode the client requested; fall back to it only if server
+    // didn't set one (e.g. for symbol graph responses).
+    const serverMode = data.mode || msg.mode || '';
+    const pathPrefix = msg.pathPrefix || '';
+
+    if (serverMode === 'overview' || serverMode === 'prefix') {
+      renderOverview(data, serverMode, pathPrefix);
+      return;
+    }
+
+    // Symbol graph (mode == '' or unknown)
+    setViewMode(false);
     allNodes = (data.nodes || []);
     allEdges = (data.edges || []);
     loadedDepth = depth;
@@ -592,6 +624,7 @@ window.addEventListener('message', event => {
 
     assignSignedHops(allNodes, allEdges);
     renderGraph(allNodes.find(n => n.root)?.id);
+    renderBreadcrumb();
 
     if (msg.query) {
       document.getElementById('searchInput').value = msg.query;
@@ -610,15 +643,24 @@ window.addEventListener('message', event => {
 // ── Search ─────────────────────────────────────────────────────────────────────
 function submitQuery(forceFetch) {
   const query = document.getElementById('searchInput').value.trim();
-  if (!query) return;
+  if (!query) {
+    // Empty query → back to repo overview
+    _navStack = [];
+    const reqId = ++currentReqId;
+    vscode.postMessage({ command: 'query', query: '', direction: 'both', depth: 2, kind_filter: '', mode: 'overview', path_prefix: '', reqId });
+    return;
+  }
 
-  // Client-side re-filter when within loaded depth/direction
+  // Client-side re-filter when within loaded depth/direction (symbol graph only)
   const depthOk = depth <= loadedDepth;
   const dirOk = direction === loadedDirection || loadedDirection === 'both';
-  if (!forceFetch && allNodes.length > 0 && depthOk && dirOk) {
+  if (!forceFetch && !_overviewActive && allNodes.length > 0 && depthOk && dirOk) {
     renderGraph();
     return;
   }
+
+  // Switching from overview to symbol query: clear nav stack
+  if (_overviewActive) _navStack = [];
 
   const reqId = ++currentReqId;
   vscode.postMessage({ command: 'query', query, direction, depth, kind_filter: '', reqId });
@@ -651,6 +693,7 @@ function setDirection(d) {
   ['callers', 'both', 'deps'].forEach(x => {
     document.getElementById('btn-' + x).classList.toggle('active', x === d);
   });
+  if (blastOn) return; // direction doesn't apply to blast view
   renderGraph();
 }
 
@@ -659,12 +702,14 @@ function setLayout(l) {
   ['flow', 'rings'].forEach(x => {
     document.getElementById('btn-' + x).classList.toggle('active', x === l);
   });
+  if (blastOn) return; // layout preference saved; applied when blast exits
   renderGraph();
 }
 
 function onDepthSlider(v) {
   depth = Number(v);
   document.getElementById('depthVal').textContent = v;
+  if (blastOn) return; // depth doesn't apply while in blast view
   if (depth <= loadedDepth) {
     renderGraph();
   } else {
@@ -676,6 +721,7 @@ function toggleGrouping() {
   grouping = !grouping;
   document.getElementById('btn-group').classList.toggle('active', grouping);
   flashBanner(grouping ? 'symbols grouped by file' : 'flat view');
+  if (blastOn) return;
   renderGraph();
 }
 
@@ -683,6 +729,7 @@ function toggleVars() {
   varsOn = !varsOn;
   document.getElementById('btn-vars').classList.toggle('active-gold', varsOn);
   flashBanner(varsOn ? 'showing exported variable nodes' : 'variable nodes hidden');
+  if (blastOn) return;
   renderGraph();
 }
 
@@ -690,12 +737,14 @@ function toggleNoise() {
   noiseOn = !noiseOn;
   document.getElementById('btn-noise').classList.toggle('active-orange', noiseOn);
   flashBanner(noiseOn ? 'noise filter ON — tests & vendor hidden' : 'noise filter OFF');
+  if (blastOn) return;
   renderGraph();
 }
 
 function toggleEdgeKind(k) {
   edgeKinds[k] = !edgeKinds[k];
   document.getElementById('chip-' + k).classList.toggle('on', edgeKinds[k]);
+  if (blastOn) return;
   renderGraph();
 }
 
@@ -1052,14 +1101,20 @@ function showBlastReport(root, byRing) {
   Object.keys(byRing).map(Number).sort().filter(r => r > 0).forEach(r => {
     const items = byRing[r].map(id => {
       const n = cy.getElementById(id), d = n.data();
-      return '<li class="edge-li"><span style="color:' + ringColor[Math.min(r, 3)] + '">●</span> ' +
-        escHtml((d.label || id)) + '<br><span style="color:#5a5a5a;padding-left:12px">' + escHtml(d.path || '') + '</span></li>';
+      const hasPath = !!d.path;
+      return '<li class="edge-li blast-report-item" data-nid="' + escHtml(id) + '" style="cursor:pointer">' +
+        '<span style="color:' + ringColor[Math.min(r, 3)] + '">●</span> ' +
+        escHtml(d.label || id) +
+        (hasPath
+          ? ' <button class="blast-goto" data-path="' + escHtml(d.path) + '" data-line="' + (d.line || 1) + '" title="Go to definition">→</button>'
+          : '') +
+        '<br><span style="color:#5a5a5a;padding-left:12px">' + escHtml(d.path || '') + '</span>' +
+        '</li>';
     }).join('');
     sections += '<div class="d-section"><div class="d-title" style="color:' + ringColor[Math.min(r, 3)] + '">' +
       (ringLabel[Math.min(r, 3)] || 'ring ' + r) + ' (' + byRing[r].length + ')</div><ul>' + items + '</ul></div>';
   });
 
-  const color = '#fb923c';
   const detail = document.getElementById('detail');
   detail.classList.add('open');
   detail.innerHTML =
@@ -1078,6 +1133,27 @@ function showBlastReport(root, byRing) {
   if (_bexp) _bexp.addEventListener('click', exportPng);
   const _bexit = detail.querySelector('[data-act="blast-exit"]');
   if (_bexit) _bexit.addEventListener('click', exitBlast);
+
+  // → Go-to-definition: each button jumps to the node's source file
+  detail.querySelectorAll('.blast-goto').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      vscode.postMessage({ command: 'goToDefinition', path: btn.dataset.path, line: Number(btn.dataset.line) || 1 });
+    });
+  });
+
+  // Clicking a list item centres + selects that node in the blast graph
+  detail.querySelectorAll('.blast-report-item').forEach(li => {
+    li.addEventListener('click', () => {
+      const nid = li.dataset.nid;
+      if (!nid) return;
+      const n = cy.getElementById(nid);
+      if (!n.length) return;
+      cy.elements().unselect();
+      n.select();
+      cy.animate({ center: { eles: n } }, { duration: 200 });
+    });
+  });
 }
 
 function exitBlast() {
@@ -1576,7 +1652,6 @@ document.getElementById('btn-vars').addEventListener('click', toggleVars);
 document.getElementById('btn-noise').addEventListener('click', toggleNoise);
 document.getElementById('chip-calls').addEventListener('click', () => toggleEdgeKind('calls'));
 document.getElementById('chip-imports').addEventListener('click', () => toggleEdgeKind('imports'));
-document.getElementById('btn-blast').addEventListener('click', blastSelected);
 document.getElementById('btn-fx').addEventListener('click', toggleFx);
 document.getElementById('btn-pulse').addEventListener('click', pulseGraph);
 document.getElementById('btn-dot').addEventListener('click', exportDot);
@@ -1589,6 +1664,239 @@ document.getElementById('btn-zoom-in').addEventListener('click', () => zoomBy(1.
 document.getElementById('btn-zoom-out').addEventListener('click', () => zoomBy(1 / 1.35));
 document.getElementById('btn-peek-close').addEventListener('click', closePeek);
 
+// ── P3: Repo-map LOD — overview tile map ──────────────────────────────────
+
+// Navigation stack: [{label, mode, pathPrefix}] — top of stack = current drill level.
+// Empty = at repo root overview.
+let _navStack = [];
+let _overviewActive = false; // true when tilemap is showing instead of Cytoscape
+
+// Switch between Cytoscape canvas (symbol graph) and HTML tile map (overview).
+function setViewMode(isOverview) {
+  _overviewActive = isOverview;
+  // Cytoscape handles both symbol graph and tile map — keep #cy always visible.
+  // Col-heads are absolutely positioned inside #main and overlay the tile map; hide them.
+  ['colCallers', 'colRoot', 'colDeps'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = isOverview ? 'none' : '';
+  });
+  // Graph-specific toolbar groups hidden in overview.
+  const graphOnlyGroups = ['grp-direction', 'grp-depth', 'grp-spread', 'grp-layout', 'grp-edges', 'grp-fx'];
+  graphOnlyGroups.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.visibility = isOverview ? 'hidden' : '';
+  });
+}
+
+// Shelf-pack tiles into centred rows (ported from the mockup).
+// Sizes tiles proportionally to sqrt(file_count), normalised so the largest = maxW.
+function packTiles(nodes) {
+  const maxFc = Math.max(1, ...nodes.map(n => n.file_count || 1));
+  const MAX_W = 220, MIN_W = 76;
+  const scale = fc => Math.max(MIN_W, Math.round(MAX_W * Math.sqrt(fc / maxFc)));
+  const sized = nodes.map(n => {
+    const w = scale(n.file_count || 1);
+    return { ...n, w, h: Math.round(w * 0.62) };
+  });
+  sized.sort((a, b) => b.w - a.w); // largest first → better row utilisation
+  const MAXW = 640, GAP = 50;
+  const rows = [[]], rws = [0];
+  sized.forEach(t => {
+    const last = rows.length - 1;
+    if (rws[last] + t.w + GAP > MAXW && rows[last].length) {
+      rows.push([]); rws.push(0);
+    }
+    rows[rows.length - 1].push(t);
+    rws[rws.length - 1] += t.w + GAP;
+  });
+  let y = 0; const out = [];
+  rows.forEach(row => {
+    const rowW = row.reduce((s, t) => s + t.w, 0) + GAP * (row.length - 1);
+    const rowH = Math.max(...row.map(t => t.h));
+    let x = -rowW / 2;
+    row.forEach(t => { out.push({ ...t, x: x + t.w / 2, y: y + rowH / 2 }); x += t.w + GAP; });
+    y += rowH + GAP + 14;
+  });
+  const totalH = y;
+  out.forEach(t => t.y -= totalH / 2);
+  return out;
+}
+
+// Render the repo-map or package-drill tile map using Cytoscape nodes (matches mockup design).
+function renderOverview(data, serverMode, pathPrefix) {
+  setViewMode(true);
+  const nodes = data.nodes || [];
+  const edges = data.edges || [];
+  const realNodes = nodes.filter(n => !n.ghost);
+  const ghostNodes = nodes.filter(n => n.ghost);
+
+  cy.elements().remove();
+  cy.off('dbltap', 'node');
+  cy.off('zoom.overview');
+
+  if (!realNodes.length) {
+    cy.add([{ data: { id: '__empty', label: 'No packages found.\nRun travsr init to index this repo.', kind: 'pkg', w: 240, h: 80 }, position: { x: 0, y: 0 } }]);
+    cy.layout({ name: 'preset' }).run(); cy.fit();
+    renderBreadcrumb();
+    return;
+  }
+
+  // Pack real tiles and add as Cytoscape nodes
+  const packed = packTiles(realNodes);
+  packed.forEach(t => {
+    cy.add({ data: {
+      id: t.id,
+      label: (t.label || t.id) + (t.file_count ? '\n' + t.file_count + ' files' : ''),
+      kind: t.kind || 'pkg',
+      w: t.w, h: t.h, tile: 1, file_count: t.file_count || 0,
+      _raw: JSON.stringify({ id: t.id, label: t.label, file_count: t.file_count }),
+    }, position: { x: t.x, y: t.y } });
+  });
+
+  // Ghost port nodes positioned to the right
+  const span = packed.length ? Math.max(...packed.map(t => t.x + t.w / 2)) : 300;
+  ghostNodes.forEach((g, i) => {
+    cy.add({ data: { id: g.id, label: g.label || g.id, kind: 'ghost', w: 110, h: 46 },
+             position: { x: span + 200, y: -60 + i * 96 } });
+  });
+
+  // Edges between tiles — width scales with import count
+  const edgeSeen = new Set();
+  edges.forEach(e => {
+    if (!e.source || !e.target) return;
+    const key = e.source + '->' + e.target;
+    if (edgeSeen.has(key)) return;
+    edgeSeen.add(key);
+    cy.add({ data: { id: key, source: e.source, target: e.target, kind: 'imports', wgt: e.count || 1 } });
+  });
+
+  cy.layout({ name: 'preset' }).run();
+  cy.fit(cy.elements(), 60);
+
+  // Double-tap (Cytoscape event) → drill into a tile; ghost nodes are read-only ports
+  cy.off('dbltap', 'node');
+  cy.on('dbltap', 'node', evt => {
+    const n = evt.target;
+    if (n.data('kind') === 'ghost') return; // ghost ports don't drill
+    try { tilemapDrillIn(JSON.parse(n.data('_raw') || '{}'), serverMode, pathPrefix); }
+    catch { /* ignore */ }
+  });
+
+  // Zoom-to-drill: zoom in past threshold → drill into closest tile;
+  // zoom out past threshold → go up one level (matches mockup lines 1002–1020)
+  cy.off('zoom.overview');
+  let _zoomTimer = null;
+  cy.on('zoom.overview', () => {
+    if (!_overviewActive) return;
+    clearTimeout(_zoomTimer);
+    _zoomTimer = setTimeout(() => {
+      const z = cy.zoom();
+      if (z > 1.9) {
+        // Find node closest to viewport centre and drill into it
+        const ext = cy.extent();
+        const cx = (ext.x1 + ext.x2) / 2, cy2 = (ext.y1 + ext.y2) / 2;
+        let closest = null, bestDist = Infinity;
+        cy.nodes().filter(n => n.data('kind') !== 'ghost').forEach(n => {
+          const p = n.position();
+          const d = Math.hypot(p.x - cx, p.y - cy2);
+          if (d < bestDist) { bestDist = d; closest = n; }
+        });
+        if (closest) {
+          try { tilemapDrillIn(JSON.parse(closest.data('_raw') || '{}'), serverMode, pathPrefix); }
+          catch { /* ignore */ }
+        }
+      } else if (z < 0.42 && _navStack.length > 0) {
+        // Go up one level in the breadcrumb stack
+        navigateTo(_navStack.length - 2); // -1 = root when stack has 1 entry
+      }
+    }, 200);
+  });
+
+  renderBreadcrumb();
+  updateStatusBar();
+  document.getElementById('hint').style.display = 'none';
+  // Trigger bloom on the largest tile for visual FX parity with the mockup
+  if (FX.on && packed.length) {
+    setTimeout(() => bloom(packed[0].id), 120);
+  }
+}
+
+// Drill into a tile (from overview → package drill, or from package drill → file graph).
+function tilemapDrillIn(tile, currentServerMode, currentPathPrefix) {
+  if (currentServerMode === 'overview') {
+    // Repo overview → package drill: show files inside this package
+    const prefix = (tile.label || tile.id.replace(/^pkg:/, '')) + '/';
+    _navStack.push({ label: tile.label || tile.id, mode: 'overview', pathPrefix: currentPathPrefix });
+    const reqId = ++currentReqId;
+    vscode.postMessage({ command: 'query', query: '', direction, depth, kind_filter: '', mode: 'overview', path_prefix: prefix, reqId });
+  } else if (currentServerMode === 'prefix') {
+    // Package drill → file: open file-level import graph for this file
+    const filePath = tile.id.replace(/^file:/, '');
+    _navStack.push({ label: tile.label || filePath.split('/').pop() || filePath, mode: 'overview', pathPrefix: currentPathPrefix });
+    const reqId = ++currentReqId;
+    // Show file-level import graph
+    vscode.postMessage({ command: 'query', query: filePath, direction: 'both', depth: 2, kind_filter: 'file', reqId });
+  }
+  renderBreadcrumb();
+}
+
+// Render the breadcrumb nav from _navStack + the current view's label.
+function renderBreadcrumb() {
+  const bc = document.getElementById('breadcrumb');
+  if (!_navStack.length && !_overviewActive) {
+    bc.classList.remove('open');
+    return;
+  }
+  bc.classList.add('open');
+
+  const items = [
+    { label: '⌂ repo', idx: -1 },
+    ..._navStack.map((s, i) => ({ label: s.label, idx: i })),
+  ];
+
+  bc.innerHTML = items.map((item, i) => {
+    const isLast = i === items.length - 1 && !_overviewActive;
+    return (
+      (i > 0 ? '<span class="bc-sep" aria-hidden="true">›</span>' : '') +
+      '<span class="bc-crumb' + (isLast ? ' active' : '') + '"' +
+      ' role="link" tabindex="0" data-bc-idx="' + item.idx + '"' +
+      ' aria-current="' + (isLast ? 'page' : 'false') + '">' +
+      escHtml(item.label) + '</span>'
+    );
+  }).join('');
+
+  // Wire breadcrumb clicks
+  bc.querySelectorAll('.bc-crumb:not(.active)').forEach(el => {
+    el.addEventListener('click', () => {
+      const idx = Number(el.getAttribute('data-bc-idx'));
+      navigateTo(idx);
+    });
+    el.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const idx = Number(el.getAttribute('data-bc-idx'));
+        navigateTo(idx);
+      }
+    });
+  });
+}
+
+// Navigate to breadcrumb entry at idx (-1 = repo root, >=0 = navStack entry).
+function navigateTo(idx) {
+  if (idx === -1) {
+    // Back to repo overview
+    _navStack = [];
+    const reqId = ++currentReqId;
+    vscode.postMessage({ command: 'query', query: '', direction, depth, kind_filter: '', mode: 'overview', path_prefix: '', reqId });
+  } else if (idx < _navStack.length) {
+    const target = _navStack[idx];
+    _navStack = _navStack.slice(0, idx);
+    const reqId = ++currentReqId;
+    vscode.postMessage({ command: 'query', query: '', direction, depth, kind_filter: '', mode: target.mode, path_prefix: target.pathPrefix, reqId });
+  }
+}
+
 // Show initial hint
 document.getElementById('hint').innerHTML =
   'Type a symbol name and press <kbd>Enter</kbd> to explore the graph';
+
+// Graph panel starts empty — the sidebar Repo Files tree is the entry point now.

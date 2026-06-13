@@ -57,7 +57,7 @@ export interface GraphData {
 // ── Message protocol ──────────────────────────────────────────────────────
 
 type WebviewMessage =
-  | { command: "query"; query: string; direction: string; depth: number; kind_filter?: string; reqId?: number }
+  | { command: "query"; query: string; direction: string; depth: number; kind_filter?: string; mode?: string; path_prefix?: string; reqId?: number }
   | { command: "goToDefinition"; path: string; line?: number }
   | { command: "showBlastRadius"; path: string }
   | { command: "showDependencies"; path: string }
@@ -133,10 +133,18 @@ export class GraphPanel {
     direction = "both",
     depth = 2,
     kindFilter = "",
-    reqId?: number
+    reqId?: number,
+    mode = "",
+    pathPrefix = ""
   ): Promise<void> {
-    this.panel.title =
-      kindFilter === "file" ? "Travsr: File Graph" : `Travsr: ${query}`;
+    if (mode === "overview") {
+      this.panel.title = pathPrefix
+        ? `Travsr: ${pathPrefix}`
+        : "Travsr: Repo Map";
+    } else {
+      this.panel.title =
+        kindFilter === "file" ? "Travsr: File Graph" : `Travsr: ${query}`;
+    }
 
     // Fire stats concurrently — don't block render on it.
     void this.client.callTool("get_graph_stats").then((raw) => {
@@ -153,6 +161,8 @@ export class GraphPanel {
       direction,
       depth: String(depth),
       kind_filter: kindFilter,
+      mode,
+      path_prefix: pathPrefix,
     });
 
     let data: GraphData = { nodes: [], edges: [] };
@@ -168,6 +178,8 @@ export class GraphPanel {
       command: "render",
       data,
       query,
+      mode,
+      pathPrefix,
       ...(reqId !== undefined ? { reqId } : {}),
     });
   }
@@ -185,13 +197,15 @@ export class GraphPanel {
   private handleMessage(msg: WebviewMessage): void {
     switch (msg.command) {
       case "query":
-        if (msg.query || msg.kind_filter === "file") {
+        if (msg.query || msg.kind_filter === "file" || msg.mode === "overview") {
           void this.query(
             msg.query,
             msg.direction,
             msg.depth,
             msg.kind_filter ?? "",
-            msg.reqId
+            msg.reqId,
+            msg.mode ?? "",
+            msg.path_prefix ?? ""
           );
         }
         break;
@@ -347,7 +361,21 @@ export class GraphPanel {
       .asWebviewUri(vscode.Uri.joinPath(extUri, "icon.png"))
       .toString();
 
-    return `<!DOCTYPE html>
+    return buildHtmlContent(nonce, csp, cssUri, cyUri, jsUri, logoUri);
+  }
+}
+
+// ── Exported HTML template (also used by tests without VS Code context) ───────
+
+export function buildHtmlContent(
+  nonce: string,
+  csp: string,
+  cssUri: string,
+  cyUri: string,
+  jsUri: string,
+  logoUri: string,
+): string {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -410,14 +438,13 @@ export class GraphPanel {
   </div>
 
   <div class="grp" id="grp-fx" aria-label="Effects">
-    <button class="btn active-orange" id="btn-blast" title="Show blast radius of selected node">⊗ blast</button>
     <button class="btn active" id="btn-fx" title="Toggle visual effects">⚡ fx</button>
     <button class="btn" id="btn-pulse" title="Replay bloom animation">⟳</button>
   </div>
 
   <div class="grp" aria-label="Exports">
-    <button class="btn" id="btn-dot" title="Copy graph as Graphviz DOT">DOT</button>
-    <button class="btn" id="btn-json" title="Save graph as JSON">JSON</button>
+    <button class="btn" id="btn-dot" title="Copy graph as Graphviz DOT">⤓ DOT</button>
+    <button class="btn" id="btn-json" title="Save graph as JSON">⤓ JSON</button>
     <button class="btn" id="btn-png" title="Save graph as PNG">PNG</button>
     <button class="btn" id="btn-fit" title="Fit graph to window" aria-label="Fit to window">⛶</button>
     <button class="btn" id="btn-search" title="Search nodes (⌘F)">⌕</button>
@@ -429,6 +456,11 @@ export class GraphPanel {
   <input id="node-search-input" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
   <ul id="node-search-results" role="listbox"></ul>
 </div>
+
+<!-- ── Breadcrumb nav (P3 repo-map LOD) ─────────────────────────────────── -->
+<nav id="breadcrumb" aria-label="Graph navigation level">
+  <!-- Populated by graph.js renderBreadcrumb() -->
+</nav>
 
 <!-- ── Blast bar ────────────────────────────────────────────────────────── -->
 <div id="blastbar" style="display:none" role="status" aria-live="polite">
@@ -447,6 +479,12 @@ export class GraphPanel {
   </div>
   <canvas id="bgfx" aria-hidden="true"></canvas>
   <div id="cy" role="application" aria-label="Code dependency graph"></div>
+
+  <!-- Tile-map for repo-map LOD overview (P3) — hidden until mode='overview' -->
+  <div id="tilemap" role="grid" aria-label="Repository package overview">
+    <canvas id="tilemap-edges" aria-hidden="true"></canvas>
+    <div id="tilemap-tiles"></div>
+  </div>
   <div id="spotlight" aria-hidden="true"></div>
   <div id="halo" aria-hidden="true"></div>
 
@@ -507,7 +545,6 @@ window.TRAVSR_INIT = {
 <script src="${jsUri}"></script>
 </body>
 </html>`;
-  }
 }
 
 // ── Standalone loading HTML (used by other webview panels) ────────────────
