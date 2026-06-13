@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+mod phase_b_sched;
+mod query_cache;
 mod scip_unifier;
 pub mod watcher;
 
@@ -709,73 +711,7 @@ pub fn init_repo_with_progress(
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
         let (pb_nodes, pb_edges, pb_refs, pb_outcome) =
             phase_b_indexer.invoke_phase_b_all(repo_root);
-        let pb_node_count = pb_nodes.len();
-        let pb_edge_count = pb_edges.len();
-        if pb_refs.is_empty() {
-            // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
-            if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
-                tracing::warn!("phase B batch write error: {e:#}");
-            }
-        } else {
-            // G1: unify SCIP nodes (all languages) onto tree-sitter nodes before
-            // writing. Mutates pb_refs in-place to redirect callee_id to unified
-            // TS nodes, and returns the alias map (SCIP id → TS id).
-            let mut pb_refs_mut = pb_refs;
-            let alias_map =
-                crate::scip_unifier::unify_all(&mut store, &corpus, &pb_nodes, &mut pb_refs_mut);
-            let pb_refs = pb_refs_mut;
-
-            // Drop unified SCIP definition nodes: the tree-sitter node already
-            // represents them (symbol_aliases preserves scip_symbol → TS node
-            // resolution), and writing them would re-create the duplicate node
-            // + FTS rows that unification exists to eliminate.
-            let pb_nodes: Vec<travsr_core::Node> = pb_nodes
-                .into_iter()
-                .filter(|n| !alias_map.contains_key(&n.id))
-                .collect();
-
-            // Rewrite SCIP structural edges through the alias map so they land
-            // on the unified TS nodes instead of the dropped duplicates; an
-            // edge that collapses to a self-loop after rewriting carried no
-            // information beyond the node itself — drop it.
-            let pb_edges: Vec<travsr_core::Edge> = pb_edges
-                .into_iter()
-                .filter_map(|mut e| {
-                    if let Some(&ts_id) = alias_map.get(&e.src) {
-                        e.src = ts_id;
-                    }
-                    if let Some(&ts_id) = alias_map.get(&e.dst) {
-                        e.dst = ts_id;
-                    }
-                    (e.src != e.dst).then_some(e)
-                })
-                .collect();
-
-            // G2 path: span-attributed ref/call edges.
-            if let Err(e) = store.write_scip_attributed_batch(&corpus, &pb_nodes, &pb_refs) {
-                tracing::warn!("phase B attributed write error: {e:#}");
-            }
-            // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
-            // need to be written — they are not represented in ScipRef records.
-            if !pb_edges.is_empty() {
-                if let Err(e) = store.write_phase_b_batch(&[], &pb_edges) {
-                    tracing::warn!("phase B structural edges write error: {e:#}");
-                }
-            }
-        }
-        if pb_node_count > 0 || pb_edge_count > 0 {
-            tracing::info!(
-                nodes = pb_node_count,
-                structural_edges = pb_edge_count,
-                "phase B indexing complete"
-            );
-        }
-        PhaseBReport {
-            ran: pb_outcome.ran,
-            skipped_absent: pb_outcome.skipped_absent,
-            skipped_unregistered: pb_outcome.skipped_unregistered,
-            crashed: pb_outcome.crashed,
-        }
+        write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
     };
 
     // ── Co-package Depends pass ────────────────────────────────────────────────
@@ -832,6 +768,152 @@ pub fn init_repo_with_progress(
         total_edges,
         phase_b_report: Some(phase_b_report),
     })
+}
+
+/// Write the result of one Phase B (SCIP) pass into `store`, returning a
+/// [`PhaseBReport`].
+///
+/// Factored out of `init_repo_with_progress` so the background refresh
+/// (#318 O3, [`run_background_phase_b`]) writes results through the exact same
+/// unification + attribution path as a full init — there is one and only one
+/// place that decides how Phase B nodes/edges/refs land in the store.
+fn write_phase_b_results(
+    store: &mut SqliteStore,
+    corpus: &str,
+    pb_nodes: Vec<travsr_core::Node>,
+    pb_edges: Vec<travsr_core::Edge>,
+    pb_refs: Vec<travsr_core::ScipRef>,
+    pb_outcome: travsr_plugin_host::PhaseBOutcome,
+) -> PhaseBReport {
+    let pb_node_count = pb_nodes.len();
+    let pb_edge_count = pb_edges.len();
+    if pb_refs.is_empty() {
+        // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
+        if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
+            tracing::warn!("phase B batch write error: {e:#}");
+        }
+    } else {
+        // G1: unify SCIP nodes (all languages) onto tree-sitter nodes before
+        // writing. Mutates pb_refs in-place to redirect callee_id to unified
+        // TS nodes, and returns the alias map (SCIP id → TS id).
+        let mut pb_refs_mut = pb_refs;
+        let alias_map = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
+        let pb_refs = pb_refs_mut;
+
+        // Drop unified SCIP definition nodes: the tree-sitter node already
+        // represents them (symbol_aliases preserves scip_symbol → TS node
+        // resolution), and writing them would re-create the duplicate node
+        // + FTS rows that unification exists to eliminate.
+        let pb_nodes: Vec<travsr_core::Node> = pb_nodes
+            .into_iter()
+            .filter(|n| !alias_map.contains_key(&n.id))
+            .collect();
+
+        // Rewrite SCIP structural edges through the alias map so they land
+        // on the unified TS nodes instead of the dropped duplicates; an
+        // edge that collapses to a self-loop after rewriting carried no
+        // information beyond the node itself — drop it.
+        let pb_edges: Vec<travsr_core::Edge> = pb_edges
+            .into_iter()
+            .filter_map(|mut e| {
+                if let Some(&ts_id) = alias_map.get(&e.src) {
+                    e.src = ts_id;
+                }
+                if let Some(&ts_id) = alias_map.get(&e.dst) {
+                    e.dst = ts_id;
+                }
+                (e.src != e.dst).then_some(e)
+            })
+            .collect();
+
+        // G2 path: span-attributed ref/call edges.
+        if let Err(e) = store.write_scip_attributed_batch(corpus, &pb_nodes, &pb_refs) {
+            tracing::warn!("phase B attributed write error: {e:#}");
+        }
+        // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
+        // need to be written — they are not represented in ScipRef records.
+        if !pb_edges.is_empty() {
+            if let Err(e) = store.write_phase_b_batch(&[], &pb_edges) {
+                tracing::warn!("phase B structural edges write error: {e:#}");
+            }
+        }
+    }
+    if pb_node_count > 0 || pb_edge_count > 0 {
+        tracing::info!(
+            nodes = pb_node_count,
+            structural_edges = pb_edge_count,
+            "phase B indexing complete"
+        );
+    }
+    PhaseBReport {
+        ran: pb_outcome.ran,
+        skipped_absent: pb_outcome.skipped_absent,
+        skipped_unregistered: pb_outcome.skipped_unregistered,
+        crashed: pb_outcome.crashed,
+    }
+}
+
+/// Background, single-flight Phase B refresh (#318 O3).
+///
+/// Runs the full semantic (SCIP/Phase B) pass off the commit hot path, then
+/// advances the `phase_b_commit` marker to the commit it indexed so O5 staleness
+/// reporting catches up once the debounce window settles. The expensive sidecar
+/// invocation runs WITHOUT the store lock; only the final write batch takes the
+/// lock, so concurrent O1 queries are not blocked for the minutes a large repo's
+/// SCIP run can take.
+///
+/// Package-scoped incremental re-runs (the ideal, RFC #318 O3) are gated on SCIP
+/// tools gaining sub-path invocation support; until then every refresh is a full
+/// re-run — which is exactly why it is debounced and single-flighted by
+/// [`phase_b_sched::PhaseBScheduler`] rather than run inline on every commit.
+fn run_background_phase_b(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    sched: &phase_b_sched::PhaseBScheduler,
+) {
+    // Release the single-flight slot no matter how this function returns.
+    struct FinishGuard<'a>(&'a phase_b_sched::PhaseBScheduler);
+    impl Drop for FinishGuard<'_> {
+        fn drop(&mut self) {
+            self.0.finish();
+        }
+    }
+    let _guard = FinishGuard(sched);
+
+    // Brief lock: read the corpus and the two freshness markers. Bail early if
+    // the semantic data already matches HEAD (e.g. a commit touched no indexed
+    // files, or another run already caught up).
+    let (corpus, target_sha) = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+        let last = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+        let phase_b = s
+            .get_meta("phase_b_commit")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if last.is_empty() || last == phase_b {
+            return;
+        }
+        (corpus, last)
+    };
+
+    tracing::info!(commit=%target_sha, "background phase B refresh starting (#318 O3)");
+
+    // Expensive part: spawn SCIP sidecars / read the filesystem. No store lock
+    // is held here so O1 queries stay warm throughout.
+    let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
+    let (pb_nodes, pb_edges, pb_refs, pb_outcome) = indexer.invoke_phase_b_all(repo_root);
+
+    // Write under the lock, then advance the marker to the commit we indexed.
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    let report = write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    let _ = s.set_meta("phase_b_commit", &target_sha);
+    tracing::info!(
+        commit = %target_sha,
+        ran = report.ran.len(),
+        "background phase B refresh complete (#318 O3)"
+    );
 }
 
 /// Re-index a set of changed files into `store`.
@@ -1565,6 +1647,18 @@ impl Daemon {
             SqliteStore::open(&db_path).context("opening graph.db")?,
         ));
 
+        // #318 O2: LRU result cache for read-only queries served off the warm
+        // store. Keyed on (tool, args, last_commit, phase_b_commit), so commits
+        // and background Phase B refreshes invalidate it structurally.
+        let query_cache = Arc::new(Mutex::new(query_cache::QueryCache::new(256)));
+
+        // #318 O3: debounced, single-flight background Phase B refresh. A commit
+        // arms it; the event loop's phase_b_tick claims a run once the debounce
+        // window settles.
+        let phase_b_scheduler = Arc::new(phase_b_sched::PhaseBScheduler::new(
+            std::time::Duration::from_secs(30),
+        ));
+
         // Bounded channel: 256 events max. The single indexer worker below drains
         // this channel one event at a time, so back-pressure naturally throttles
         // the watcher rather than letting thousands of events queue up in memory.
@@ -1593,6 +1687,10 @@ impl Daemon {
         }
 
         let mut gc_tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        // #318 O3: poll the Phase B scheduler often enough to honour the debounce
+        // window without busy-waiting. The tick is cheap (a single mutex peek);
+        // it only spawns work when a re-run is actually due.
+        let mut phase_b_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
         tracing::info!(repo = %repo_root.display(), "travsr daemon started");
@@ -1648,6 +1746,8 @@ impl Daemon {
             let store_win = Arc::clone(&store);
             let repo_win = Arc::clone(&repo_root_arc);
             let sd_win = Arc::clone(&pipe_shutdown);
+            let cache_win = Arc::clone(&query_cache);
+            let sched_win = Arc::clone(&phase_b_scheduler);
             let pipe_name_accept = pipe_name.clone();
             tokio::spawn(async move {
                 let mut first_instance = true;
@@ -1673,13 +1773,21 @@ impl Daemon {
                     let store = Arc::clone(&store_win);
                     let repo = Arc::clone(&repo_win);
                     let sd = Arc::clone(&sd_win);
+                    let cache = Arc::clone(&cache_win);
+                    let sched = Arc::clone(&sched_win);
                     tokio::spawn(async move {
                         let (reader, mut writer) = tokio::io::split(server);
                         let mut lines = BufReader::new(reader).lines();
                         if let Ok(Some(line)) = lines.next_line().await {
                             let (resp, shutdown_requested) =
                                 tokio::task::spawn_blocking(move || {
-                                    handle_control_message(&line, repo.as_path(), &store)
+                                    handle_control_message(
+                                        &line,
+                                        repo.as_path(),
+                                        &store,
+                                        &cache,
+                                        &sched,
+                                    )
                                 })
                                 .await
                                 .unwrap_or_else(|_| {
@@ -1721,6 +1829,8 @@ impl Daemon {
                         let store = Arc::clone(&store);
                         let repo = Arc::clone(&repo_root_arc);
                         let sd_notify = Arc::clone(&sock_shutdown);
+                        let cache = Arc::clone(&query_cache);
+                        let sched = Arc::clone(&phase_b_scheduler);
                         tokio::spawn(async move {
                             let (reader, mut writer) = conn.into_split();
                             let mut lines = BufReader::new(reader).lines();
@@ -1730,7 +1840,13 @@ impl Daemon {
                                 // the Tokio executor.
                                 let (resp, shutdown_requested) =
                                     tokio::task::spawn_blocking(move || {
-                                        handle_control_message(&line, repo.as_path(), &store)
+                                        handle_control_message(
+                                            &line,
+                                            repo.as_path(),
+                                            &store,
+                                            &cache,
+                                            &sched,
+                                        )
                                     })
                                     .await
                                     .unwrap_or_else(|_| (
@@ -1759,6 +1875,18 @@ impl Daemon {
                             start_time.elapsed().as_secs()
                         );
                     }
+                    _ = phase_b_tick.tick() => {
+                        // #318 O3: start a background Phase B refresh iff one is
+                        // due (armed + past debounce) and none is already running.
+                        if phase_b_scheduler.try_claim() {
+                            let store_bg = Arc::clone(&store);
+                            let repo_bg = Arc::clone(&repo_root_arc);
+                            let sched_bg = Arc::clone(&phase_b_scheduler);
+                            tokio::task::spawn_blocking(move || {
+                                run_background_phase_b(repo_bg.as_path(), &store_bg, &sched_bg);
+                            });
+                        }
+                    }
                     _ = &mut shutdown => {
                         tracing::info!("travsr daemon shutting down (SIGINT)");
                         break;
@@ -1785,6 +1913,18 @@ impl Daemon {
                             "daemon heartbeat — uptime {}s",
                             start_time.elapsed().as_secs()
                         );
+                    }
+                    _ = phase_b_tick.tick() => {
+                        // #318 O3: start a background Phase B refresh iff one is
+                        // due (armed + past debounce) and none is already running.
+                        if phase_b_scheduler.try_claim() {
+                            let store_bg = Arc::clone(&store);
+                            let repo_bg = Arc::clone(&repo_root_arc);
+                            let sched_bg = Arc::clone(&phase_b_scheduler);
+                            tokio::task::spawn_blocking(move || {
+                                run_background_phase_b(repo_bg.as_path(), &store_bg, &sched_bg);
+                            });
+                        }
                     }
                     _ = &mut shutdown => {
                         tracing::info!("travsr daemon shutting down");
@@ -1862,6 +2002,8 @@ fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
+    cache: &std::sync::Mutex<query_cache::QueryCache>,
+    phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
 ) -> (travsr_ipc::ControlResponse, bool) {
     use travsr_ipc::{ControlMessage, ControlResponse};
 
@@ -1874,6 +2016,10 @@ fn handle_control_message(
                 tracing::warn!(err=%e, "control reindex failed");
                 return (ControlResponse::err(e.to_string()), false);
             }
+            drop(s);
+            // #318 O3: Phase A is now fresh for this commit; arm a debounced
+            // background Phase B refresh so the semantic layer catches up too.
+            phase_b_scheduler.mark_dirty();
             (
                 ControlResponse::ok(Some(format!("reindexed {} paths", paths.len()))),
                 false,
@@ -1907,9 +2053,28 @@ fn handle_control_message(
                 );
             }
             let s = store.lock().unwrap_or_else(|e| e.into_inner());
-            let result = run_query(&s, &tool, args);
-            match result {
-                Ok(value) => (ControlResponse::query_result(value), false),
+            // #318 O2: serve from the warm result cache when the graph has not
+            // moved. The commit markers are part of the key, so a stale entry can
+            // never be returned — a Phase A reindex or background Phase B refresh
+            // shifts the key and the next query recomputes.
+            let last_commit = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+            let phase_b_commit = s
+                .get_meta("phase_b_commit")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            {
+                let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit) {
+                    return (ControlResponse::query_result(cached), false);
+                }
+            }
+            match run_query(&s, &tool, args.clone()) {
+                Ok(value) => {
+                    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    c.put(&tool, &args, &last_commit, &phase_b_commit, value.clone());
+                    (ControlResponse::query_result(value), false)
+                }
                 Err(e) => (ControlResponse::err(format!("query failed: {e:#}")), false),
             }
         }
