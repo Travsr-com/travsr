@@ -183,7 +183,19 @@ fn handle_tool_call(
                         .and_then(|s| s.parse::<u64>().ok())
                 })
                 .unwrap_or(0) as usize;
-            tools::get_graph_json(store, query, direction, depth, kind_filter, token_budget)
+            // #319 P3: LOD repo-map overview mode + package drill path_prefix.
+            let mode = args["mode"].as_str().unwrap_or("");
+            let path_prefix = args["path_prefix"].as_str().unwrap_or("");
+            tools::get_graph_json(
+                store,
+                query,
+                direction,
+                depth,
+                kind_filter,
+                token_budget,
+                mode,
+                path_prefix,
+            )
         }
         // RFC-012 A2 F1: dynamic synonym management. Single-repo (stdio) only —
         // see `handle_tool_call_global` for the multi-repo rejection.
@@ -343,17 +355,19 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_graph_json",
-                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers.",
+                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers. Pass mode='overview' with no query for the repo-map LOD tile layout.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file'." },
+                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file' or mode is 'overview'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
-                        "token_budget": { "type": "integer", "description": "Cap the payload to roughly this many tokens (0 or omitted = unlimited). Truncation is reported via truncated_by_budget." }
+                        "token_budget": { "type": "integer", "description": "Cap the payload to roughly this many tokens (0 or omitted = unlimited). Truncation is reported via truncated_by_budget." },
+                        "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns synthetic package-level tile nodes sized by file count plus cross-package import edges. Combine with path_prefix to drill into a package." },
+                        "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix (e.g. 'src/components/'). Returns file nodes inside the prefix plus ghost-port package nodes for cross-boundary deps." }
                     },
-                    "required": ["query"],
+                    "required": [],
                     "additionalProperties": false
                 }
             },
@@ -626,7 +640,18 @@ fn handle_tool_call_global(
                 .unwrap_or(2)
                 .clamp(1, 4) as u8;
             let kind_filter = args["kind_filter"].as_str().unwrap_or("");
-            tools::get_graph_json_global(repos, query, direction, depth, repo_arg, kind_filter)
+            let mode = args["mode"].as_str().unwrap_or("");
+            let path_prefix = args["path_prefix"].as_str().unwrap_or("");
+            tools::get_graph_json_global(
+                repos,
+                query,
+                direction,
+                depth,
+                repo_arg,
+                kind_filter,
+                mode,
+                path_prefix,
+            )
         }
         // Synonym tools mutate a single repo's table; ambiguous across the global
         // registry. Reject cleanly rather than silently no-op or fall through to
@@ -788,17 +813,19 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_graph_json",
-                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers.",
+                "description": "Return a subgraph around a symbol as structured JSON nodes and edges for graph renderers. Pass mode='overview' with no query for the repo-map LOD tile layout.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file'." },
+                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file' or mode is 'overview'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." },
+                        "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns synthetic package-level tile nodes sized by file count plus cross-package import edges." },
+                        "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix. Returns file nodes inside the prefix plus ghost-port package nodes for cross-boundary deps." }
                     },
-                    "required": ["query"],
+                    "required": [],
                     "additionalProperties": false
                 }
             }
@@ -976,6 +1003,7 @@ mod tests {
 
     #[test]
     fn required_tools_have_correct_required_fields() {
+        // get_graph_json is intentionally excluded: query is optional when mode="overview".
         let required_map = [
             ("get_dependencies", "file"),
             ("get_callers", "symbol"),
@@ -983,7 +1011,6 @@ mod tests {
             ("search_symbol", "name"),
             ("get_execution_path", "source"),
             ("get_context", "query"),
-            ("get_graph_json", "query"),
         ];
         for list in [tools_list(), tools_list_global()] {
             let tools = list["tools"].as_array().unwrap();

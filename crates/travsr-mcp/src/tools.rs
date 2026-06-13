@@ -1428,7 +1428,22 @@ pub fn get_graph_json(
     depth: u8,
     kind_filter: &str,
     token_budget: usize,
+    mode: &str,
+    path_prefix: &str,
 ) -> String {
+    if !matches!(mode, "" | "overview") {
+        tracing::warn!("get_graph_json rejected unknown mode: {mode}");
+        return "{}".to_string();
+    }
+    if mode == "overview" {
+        if !path_prefix.is_empty() {
+            if let Err(reason) = validate_mcp_arg(path_prefix) {
+                tracing::warn!("get_graph_json rejected invalid path_prefix: {reason}");
+                return "{}".to_string();
+            }
+        }
+        return overview_graph(store, path_prefix);
+    }
     // Only "" (all kinds) and "file" are valid kind_filter values.
     if !matches!(kind_filter, "" | "file") {
         tracing::warn!("get_graph_json rejected unknown kind_filter: {kind_filter}");
@@ -1443,6 +1458,241 @@ pub fn get_graph_json(
     }
     let depth = depth.clamp(1, 4);
     get_graph_json_raw(store, query, direction, depth, kind_filter, token_budget)
+}
+
+// ── Repo-map LOD overview (P3 #319) ──────────────────────────────────────────
+
+/// Package key: up to 2 directory segments above the filename.
+/// "crates/travsr-mcp/src/tools.rs" → "crates/travsr-mcp"
+/// "src/components/Button.tsx"      → "src/components"
+/// "src/index.ts"                   → "src"
+/// "index.ts"                       → "(root)"
+/// Maps a file path to its top-level directory segment (the first part before any `/`).
+/// Returns an empty string for external/build-cache paths that should be excluded.
+///
+/// "pkg/api/types.go"             → "pkg"
+/// "cmd/kubeadm/main.go"          → "cmd"
+/// "main.go"                      → "(root)"
+/// "../../../Library/Caches/..."  → ""  (excluded)
+/// "/abs/path/file.go"            → ""  (excluded)
+/// "scip://corpus/file"           → ""  (excluded)
+fn pkg_key_from_path(path: &str) -> String {
+    // Skip build-cache, absolute, or protocol-prefixed paths (SCIP, etc.)
+    if path.is_empty() || path.starts_with("..") || path.starts_with('/') || path.contains("://") {
+        return String::new();
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    match segs.len().saturating_sub(1) {
+        0 => "(root)".to_string(),
+        _ => segs[0].to_string(),
+    }
+}
+
+fn file_label(path: &str) -> &str {
+    path.rfind('/').map_or(path, |i| &path[i + 1..])
+}
+
+/// Entry point for `mode="overview"`. Routes by whether path_prefix is set.
+fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
+    let file_nodes = match store.nodes_by_kind("file") {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("overview_graph: nodes_by_kind error: {e}");
+            return r#"{"nodes":[],"edges":[]}"#.to_string();
+        }
+    };
+    let pairs = match store.file_import_pairs() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("overview_graph: file_import_pairs error: {e}");
+            vec![]
+        }
+    };
+    if path_prefix.is_empty() {
+        repo_overview_graph(&file_nodes, &pairs)
+    } else {
+        package_drill_graph(&file_nodes, &pairs, path_prefix)
+    }
+}
+
+/// Aggregate all file nodes into synthetic package tiles + cross-package import edges.
+// O(F + P) where F = file nodes, P = import pairs
+fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, String)]) -> String {
+    use std::collections::{BTreeMap, HashMap};
+
+    let mut pkg_files: BTreeMap<String, u32> = BTreeMap::new();
+
+    for node in file_nodes {
+        let key = pkg_key_from_path(&node.vname.path);
+        if key.is_empty() {
+            continue; // skip build-cache, absolute, or protocol paths
+        }
+        *pkg_files.entry(key).or_default() += 1;
+    }
+
+    if pkg_files.is_empty() {
+        return r#"{"nodes":[],"edges":[],"mode":"overview"}"#.to_string();
+    }
+
+    let nodes_out: Vec<serde_json::Value> = pkg_files
+        .iter()
+        .map(|(pkg, file_count)| {
+            serde_json::json!({
+                "id":         format!("pkg:{pkg}"),
+                "label":      pkg,
+                "kind":       "pkg",
+                "file_count": file_count,
+                "ghost":      false,
+            })
+        })
+        .collect();
+
+    let mut cross_pkg: HashMap<(String, String), u32> = HashMap::new();
+    for (src_path, dst_path) in pairs {
+        let src_pkg = pkg_key_from_path(src_path);
+        let dst_pkg = pkg_key_from_path(dst_path);
+        if src_pkg.is_empty() || dst_pkg.is_empty() || src_pkg == dst_pkg {
+            continue;
+        }
+        // Only emit edges where both packages are known (present in file_nodes)
+        if !pkg_files.contains_key(&src_pkg) || !pkg_files.contains_key(&dst_pkg) {
+            continue;
+        }
+        *cross_pkg.entry((src_pkg, dst_pkg)).or_default() += 1;
+    }
+
+    let edges_out: Vec<serde_json::Value> = cross_pkg
+        .iter()
+        .map(|((src, dst), count)| {
+            serde_json::json!({
+                "source": format!("pkg:{src}"),
+                "target": format!("pkg:{dst}"),
+                "kind":   "imports",
+                "count":  count,
+            })
+        })
+        .collect();
+
+    match serde_json::to_string(&serde_json::json!({
+        "nodes": nodes_out,
+        "edges": edges_out,
+        "mode":  "overview",
+    })) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("repo_overview_graph serialization error: {e}");
+            "{}".to_string()
+        }
+    }
+}
+
+/// File-level drill into a package: emit file nodes inside `path_prefix` plus ghost-port
+/// package nodes for any cross-boundary import targets.
+// O(F + P) where F = file nodes, P = import pairs
+fn package_drill_graph(
+    file_nodes: &[travsr_core::Node],
+    pairs: &[(String, String)],
+    path_prefix: &str,
+) -> String {
+    use std::collections::{HashMap, HashSet};
+
+    let prefix_paths: HashSet<&str> = file_nodes
+        .iter()
+        .filter(|n| n.vname.path.starts_with(path_prefix))
+        .map(|n| n.vname.path.as_str())
+        .collect();
+
+    if prefix_paths.is_empty() {
+        return r#"{"nodes":[],"edges":[],"mode":"prefix"}"#.to_string();
+    }
+
+    let mut nodes_out: Vec<serde_json::Value> = Vec::new();
+    let mut node_ids_out: HashSet<String> = HashSet::new();
+
+    for path in &prefix_paths {
+        let json_id = format!("file:{path}");
+        node_ids_out.insert(json_id.clone());
+        nodes_out.push(serde_json::json!({
+            "id":    json_id,
+            "label": file_label(path),
+            "kind":  "file",
+            "path":  path,
+            "ghost": false,
+        }));
+    }
+
+    let mut ghost_pkg_counts: HashMap<String, u32> = HashMap::new();
+    let mut edges_out: Vec<serde_json::Value> = Vec::new();
+    let mut edge_seen: HashSet<(String, String)> = HashSet::new();
+
+    for (src_path, dst_path) in pairs {
+        // src must be inside the prefix (src_path may be a function path — check prefix match)
+        if !src_path.starts_with(path_prefix) {
+            continue;
+        }
+        // Resolve src to the nearest file in prefix_paths (take the path directly if present,
+        // otherwise derive the file path from the src path's directory)
+        let src_file = if prefix_paths.contains(src_path.as_str()) {
+            src_path.as_str()
+        } else {
+            // src is a symbol node whose path happens to start with prefix — use it as-is
+            // (it won't match any file node, so skip intra edges but allow cross-boundary)
+            src_path.as_str()
+        };
+
+        if prefix_paths.contains(dst_path.as_str()) {
+            // Intra-prefix: file → file edge
+            let key = (src_file.to_string(), dst_path.clone());
+            if edge_seen.insert(key) {
+                edges_out.push(serde_json::json!({
+                    "source": format!("file:{src_file}"),
+                    "target": format!("file:{dst_path}"),
+                    "kind":   "imports",
+                }));
+            }
+        } else {
+            // Cross-boundary: collapse dst into a ghost package node
+            let ghost_pkg = pkg_key_from_path(dst_path);
+            if ghost_pkg.is_empty() {
+                continue;
+            }
+            let ghost_id = format!("pkg:{ghost_pkg}");
+
+            let count = ghost_pkg_counts.entry(ghost_pkg.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                node_ids_out.insert(ghost_id.clone());
+                nodes_out.push(serde_json::json!({
+                    "id":    ghost_id.clone(),
+                    "label": ghost_pkg,
+                    "kind":  "ghost",
+                    "ghost": true,
+                }));
+            }
+
+            let key = (src_file.to_string(), ghost_id.clone());
+            if edge_seen.insert(key) {
+                edges_out.push(serde_json::json!({
+                    "source": format!("file:{src_file}"),
+                    "target": ghost_id,
+                    "kind":   "imports",
+                }));
+            }
+        }
+    }
+
+    match serde_json::to_string(&serde_json::json!({
+        "nodes":       nodes_out,
+        "edges":       edges_out,
+        "mode":        "prefix",
+        "path_prefix": path_prefix,
+    })) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("package_drill_graph serialization error: {e}");
+            "{}".to_string()
+        }
+    }
 }
 
 fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
@@ -1809,7 +2059,19 @@ pub fn get_graph_json_global(
     depth: u8,
     repo: Option<&str>,
     kind_filter: &str,
+    mode: &str,
+    path_prefix: &str,
 ) -> String {
+    if mode == "overview" {
+        if !path_prefix.is_empty() {
+            if let Err(reason) = validate_mcp_arg(path_prefix) {
+                tracing::warn!("get_graph_json_global rejected invalid path_prefix: {reason}");
+                return "{}".to_string();
+            }
+        }
+        // Overview mode: run per-repo and merge package tiles
+        return get_graph_json_global_overview(repos, repo, path_prefix);
+    }
     if !(query.is_empty() && kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
             tracing::warn!("get_graph_json_global rejected invalid arg: {reason}");
@@ -1877,6 +2139,80 @@ pub fn get_graph_json_global(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("get_graph_json_global serialization error: {e}");
+            "{}".to_string()
+        }
+    }
+}
+
+/// Merge overview graphs across repos for the global (SSE) session.
+fn get_graph_json_global_overview(
+    repos: &HashMap<String, PathBuf>,
+    repo: Option<&str>,
+    path_prefix: &str,
+) -> String {
+    use std::collections::HashMap as HMap;
+
+    let candidates: Vec<(&str, &PathBuf)> = match repo {
+        Some(name) => match repos.get_key_value(name) {
+            Some((k, v)) => vec![(k.as_str(), v)],
+            None => {
+                tracing::warn!("get_graph_json_global_overview: repo '{name}' not found");
+                return r#"{"nodes":[],"edges":[],"mode":"overview"}"#.to_string();
+            }
+        },
+        None => repos.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+    };
+
+    let mut merged_nodes: HMap<String, serde_json::Value> = HMap::new();
+    let mut merged_edges: HMap<(String, String), u32> = HMap::new();
+
+    for (_repo_name, db_path) in candidates {
+        if !db_path.exists() {
+            continue;
+        }
+        match SqliteStore::open(db_path) {
+            Ok(store) => {
+                let raw = overview_graph(&store, path_prefix);
+                let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                for node in parsed["nodes"].as_array().into_iter().flatten() {
+                    let id = node["id"].as_str().unwrap_or("").to_string();
+                    merged_nodes.entry(id).or_insert_with(|| node.clone());
+                }
+                for edge in parsed["edges"].as_array().into_iter().flatten() {
+                    let src = edge["source"].as_str().unwrap_or("").to_string();
+                    let tgt = edge["target"].as_str().unwrap_or("").to_string();
+                    let count = edge["count"].as_u64().unwrap_or(1) as u32;
+                    *merged_edges.entry((src, tgt)).or_default() += count;
+                }
+            }
+            Err(e) => tracing::warn!("get_graph_json_global_overview: open error: {e}"),
+        }
+    }
+
+    let nodes_out: Vec<&serde_json::Value> = merged_nodes.values().collect();
+    let edges_out: Vec<serde_json::Value> = merged_edges
+        .iter()
+        .map(|((src, tgt), count)| {
+            serde_json::json!({
+                "source": src,
+                "target": tgt,
+                "kind":   "imports",
+                "count":  count,
+            })
+        })
+        .collect();
+
+    match serde_json::to_string(&serde_json::json!({
+        "nodes": nodes_out,
+        "edges": edges_out,
+        "mode":  "overview",
+    })) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("get_graph_json_global_overview serialization error: {e}");
             "{}".to_string()
         }
     }
@@ -2341,7 +2677,7 @@ mod tests {
         store.put_node(&sym).unwrap();
         store.put_node(&file).unwrap();
 
-        let json = get_graph_json(&store, "fn:bar", "both", 1, "", 0);
+        let json = get_graph_json(&store, "fn:bar", "both", 1, "", 0, "", "");
         assert!(
             json.contains("\"line\":42"),
             "symbol node must carry line in JSON: {json}"
@@ -2352,7 +2688,7 @@ mod tests {
             "coverage envelope missing: {json}"
         );
 
-        let file_json = get_graph_json(&store, "src/foo.ts", "both", 1, "file", 0);
+        let file_json = get_graph_json(&store, "src/foo.ts", "both", 1, "file", 0, "", "");
         assert!(
             file_json.contains("\"line\":null"),
             "file node must have null line in JSON: {file_json}"
@@ -2387,10 +2723,10 @@ mod tests {
                 .unwrap();
         }
 
-        let unbounded = get_graph_json(&store, "fn:seed", "deps", 2, "", 0);
+        let unbounded = get_graph_json(&store, "fn:seed", "deps", 2, "", 0, "", "");
         assert!(!unbounded.contains("truncated_by_budget"));
 
-        let capped = get_graph_json(&store, "fn:seed", "deps", 2, "", 30);
+        let capped = get_graph_json(&store, "fn:seed", "deps", 2, "", 30, "", "");
         assert!(
             capped.contains("\"truncated_by_budget\":true"),
             "tiny budget must truncate: {capped}"
@@ -2400,6 +2736,144 @@ mod tests {
             "seed must survive any budget: {capped}"
         );
         assert!(capped.len() < unbounded.len());
+    }
+
+    // ── P3 overview / LOD tests ────────────────────────────────────────────────
+
+    fn make_file_graph_store() -> travsr_store::SqliteStore {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // Two top-level packages: "pkg" (2 files) and "test" (1 file)
+        let fa = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "pkg/a/mod.ts"),
+            "file",
+        );
+        let fb = Node::new(
+            VName::new("", "", "test/b/util.ts", "typescript", "test/b/util.ts"),
+            "file",
+        );
+        let fc = Node::new(
+            VName::new("", "", "pkg/a/helper.ts", "typescript", "pkg/a/helper.ts"),
+            "file",
+        );
+        // Import node: fa depends on fb via an import node
+        let imp = Node::new(
+            VName::new("", "", "test/b/util.ts", "typescript", "import:b"),
+            "import",
+        );
+        store.put_node(&fa).unwrap();
+        store.put_node(&fb).unwrap();
+        store.put_node(&fc).unwrap();
+        store.put_node(&imp).unwrap();
+        // fa --[Depends]--> imp --[ResolvesTo]--> fb  (cross-package: pkg → test)
+        store
+            .put_edge(&Edge::new(fa.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(imp.id, fb.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn overview_graph_repo_level_groups_by_pkg() {
+        let store = make_file_graph_store();
+        let raw = get_graph_json(&store, "", "both", 2, "", 0, "overview", "");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(v["mode"], "overview", "mode field must be 'overview'");
+
+        let nodes = v["nodes"].as_array().unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"pkg:pkg"), "must have 'pkg' package: {ids:?}");
+        assert!(
+            ids.contains(&"pkg:test"),
+            "must have 'test' package: {ids:?}"
+        );
+
+        // file_count for "pkg" should be 2 (mod.ts + helper.ts)
+        let pkg_pkg = nodes.iter().find(|n| n["id"] == "pkg:pkg").unwrap();
+        assert_eq!(pkg_pkg["file_count"], 2, "'pkg' should have 2 files");
+
+        // Cross-package edge pkg → test
+        let edges = v["edges"].as_array().unwrap();
+        let cross = edges
+            .iter()
+            .find(|e| e["source"] == "pkg:pkg" && e["target"] == "pkg:test");
+        assert!(
+            cross.is_some(),
+            "must have cross-package edge pkg → test: {edges:?}"
+        );
+        assert!(cross.unwrap()["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn overview_graph_package_drill_emits_files_and_ghost() {
+        let store = make_file_graph_store();
+        let raw = get_graph_json(&store, "", "both", 2, "", 0, "overview", "pkg/a/");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(v["mode"], "prefix");
+
+        let nodes = v["nodes"].as_array().unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+
+        // File nodes inside prefix
+        assert!(
+            ids.contains(&"file:pkg/a/mod.ts"),
+            "missing mod.ts: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"file:pkg/a/helper.ts"),
+            "missing helper.ts: {ids:?}"
+        );
+
+        // Ghost port for external dep (1-segment key: "test")
+        assert!(
+            ids.contains(&"pkg:test"),
+            "missing ghost port pkg:test: {ids:?}"
+        );
+        let ghost = nodes.iter().find(|n| n["id"] == "pkg:test").unwrap();
+        assert_eq!(ghost["ghost"], true, "external package must be ghost");
+
+        // Cross-boundary edge: file:pkg/a/mod.ts → pkg:test
+        let edges = v["edges"].as_array().unwrap();
+        let cross = edges
+            .iter()
+            .find(|e| e["source"] == "file:pkg/a/mod.ts" && e["target"] == "pkg:test");
+        assert!(cross.is_some(), "must have cross-boundary edge: {edges:?}");
+    }
+
+    #[test]
+    fn overview_graph_rejects_unknown_mode() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let raw = get_graph_json(&store, "", "both", 2, "", 0, "badmode", "");
+        assert_eq!(raw, "{}", "unknown mode must return empty object");
+    }
+
+    #[test]
+    fn overview_graph_rejects_path_traversal_prefix() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let raw = get_graph_json(&store, "", "both", 2, "", 0, "overview", "../etc/passwd");
+        assert_eq!(raw, "{}", "path traversal prefix must be rejected");
+    }
+
+    #[test]
+    fn pkg_key_from_path_one_segment() {
+        // Any path with subdirs → first segment only
+        assert_eq!(
+            pkg_key_from_path("crates/travsr-mcp/src/tools.rs"),
+            "crates"
+        );
+        assert_eq!(pkg_key_from_path("src/components/Button.tsx"), "src");
+        assert_eq!(pkg_key_from_path("src/index.ts"), "src");
+        assert_eq!(pkg_key_from_path("index.ts"), "(root)");
+        // External / build-cache paths → empty (excluded)
+        assert_eq!(pkg_key_from_path("../../../Library/Caches/go-build/xx"), "");
+        assert_eq!(pkg_key_from_path("/abs/path/file.go"), "");
+        assert_eq!(pkg_key_from_path("scip://corpus/path/file.go"), "");
+        assert_eq!(pkg_key_from_path(""), "");
     }
 
     #[test]
