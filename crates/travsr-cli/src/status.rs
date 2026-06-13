@@ -1,6 +1,13 @@
-use anyhow::Context as _;
-use travsr_store::{SqliteStore, StoreMigratable};
+//! `travsr status` — index and graph health summary.
+//!
+//! Data acquisition is shared with the daemon via `travsr_mcp::query`
+//! (#318 O1): a running daemon answers from its warm store; otherwise the
+//! store is opened directly (read-only fast path).
 
+use anyhow::Context as _;
+use travsr_mcp::query::{self, StatusPayload};
+
+use crate::daemon_client;
 use crate::repo::find_git_root;
 
 pub fn run() -> anyhow::Result<()> {
@@ -13,24 +20,25 @@ pub fn run() -> anyhow::Result<()> {
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
-    let store = SqliteStore::open(&db_path)
-        .with_context(|| format!("opening graph database at {}", db_path.display()))?;
+    let payload: StatusPayload =
+        match daemon_client::try_query(&repo_root, "status", serde_json::json!({})) {
+            Some(p) => p,
+            None => {
+                let store = daemon_client::open_read_store(&db_path)
+                    .with_context(|| format!("opening graph database at {}", db_path.display()))?;
+                query::status_query(&store)?
+            }
+        };
 
-    let nodes = store.node_count()?;
-    let edges = store.edge_count()?;
-    let schema = store.schema_version()?;
-    let journal = store.journal_mode()?;
-    let last_commit = store
-        .get_meta("last_commit")?
-        .unwrap_or_else(|| "(none)".to_string());
-
+    let last_commit = payload.last_commit.unwrap_or_else(|| "(none)".to_string());
     println!(
-        "nodes: {nodes} | edges: {edges} | schema: v{schema} | journal: {journal} | last_commit: {last_commit}"
+        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {last_commit}",
+        payload.nodes, payload.edges, payload.schema, payload.journal
     );
 
     // RFC-014 #317 re-index policy: surface signature-format skew so the user
     // knows the graph was built with an older format and a re-index is due.
-    let sig_v = store.get_signature_format_version()?;
+    let sig_v = payload.signature_format_version;
     if sig_v != travsr_core::SIGNATURE_FORMAT_VERSION {
         eprintln!(
             "⚠ signature format v{sig_v} ≠ current v{} — graph built with an older format; run `travsr init` to re-index",

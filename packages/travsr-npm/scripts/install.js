@@ -64,6 +64,7 @@ async function install() {
   if (override) {
     fs.copyFileSync(override, destBin);
     if (process.platform !== 'win32') fs.chmodSync(destBin, 0o755);
+    optimizeWrapper(destBin);
     console.log(`travsr: using binary from TRAVSR_BINARY=${override}`);
     return;
   }
@@ -137,7 +138,26 @@ async function install() {
   fs.unlinkSync(tmpTar);
 
   if (process.platform !== 'win32') fs.chmodSync(destBin, 0o755);
+  optimizeWrapper(destBin);
   console.log(`travsr: installed to ${destBin}`);
+}
+
+// #318 O1: on POSIX, replace the JS wrapper with the native binary itself.
+// npm's .bin shim symlinks to bin/travsr.js — the kernel ignores the file
+// extension, so overwriting it with the Mach-O/ELF binary makes `travsr`
+// exec natively with zero Node startup overhead (same trick as esbuild).
+// Windows keeps the JS wrapper: npm's .cmd shims always invoke node there.
+// Best-effort: on any failure the JS wrapper still works via spawnSync.
+function optimizeWrapper(binaryPath) {
+  if (process.platform === 'win32') return;
+  try {
+    const wrapperPath = path.join(BIN_DIR, 'travsr.js');
+    fs.copyFileSync(binaryPath, wrapperPath);
+    fs.chmodSync(wrapperPath, 0o755);
+    console.log('travsr: wrapper replaced with native binary (no Node startup overhead)');
+  } catch (err) {
+    console.warn(`travsr: could not optimize wrapper (${err.message}) — JS fallback in use`);
+  }
 }
 
 install().catch(err => {

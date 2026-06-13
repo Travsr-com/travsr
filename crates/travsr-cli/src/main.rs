@@ -5,6 +5,7 @@
 mod ask;
 #[cfg(windows)]
 mod autostart;
+mod daemon_client;
 mod graph;
 mod index;
 mod init;
@@ -105,6 +106,10 @@ enum Command {
         /// Include third-party and anonymous-local nodes in traversal output.
         #[arg(long)]
         include_noise: bool,
+        /// Cap output to roughly this many tokens (0 = unlimited). Truncation
+        /// keeps the closest nodes first and reports how many were cut.
+        #[arg(long, default_value = "4096")]
+        budget: usize,
     },
     /// Index a directory of source files and emit a graph JSON (for CI / tooling).
     Index {
@@ -443,10 +448,13 @@ async fn run(cli: Cli) -> Result<()> {
             format,
             edges,
             include_noise,
+            budget,
         } => match (all, query.as_deref()) {
             (true, Some(_)) => anyhow::bail!("--all and a query are mutually exclusive"),
-            (true, None) => graph::run_all(format)?,
-            (false, Some(q)) => graph::run(q, depth, direction, format, edges, include_noise)?,
+            (true, None) => graph::run_all(format, budget)?,
+            (false, Some(q)) => {
+                graph::run(q, depth, direction, format, edges, include_noise, budget)?
+            }
             (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
         },
         Command::HookRun { from_hook, paths } => {
@@ -482,33 +490,12 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// Connect to the daemon's control transport for `repo_root`.
-///
-/// Dispatches to the platform-appropriate transport:
-/// Unix → `UnixTransport` (domain socket), Windows → `NamedPipeTransport`.
+/// Moved to `daemon_client` (#318 O1) — kept as a local alias for callers here.
 fn send_daemon_command(
     repo_root: &std::path::Path,
     msg: &travsr_ipc::ControlMessage,
 ) -> anyhow::Result<travsr_ipc::ControlResponse> {
-    let addr = travsr_ipc::ControlAddr::for_repo(repo_root);
-
-    #[cfg(unix)]
-    {
-        let travsr_dir = repo_root.join(".travsr");
-        let mut t = travsr_ipc::unix::UnixTransport::connect(&addr, &travsr_dir)?;
-        travsr_ipc::ControlTransport::send_request(&mut t, msg)
-    }
-
-    #[cfg(windows)]
-    {
-        let mut t = travsr_ipc::windows::NamedPipeTransport::connect(&addr)?;
-        travsr_ipc::ControlTransport::send_request(&mut t, msg)
-    }
-
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = (addr, msg);
-        anyhow::bail!("daemon control socket not supported on this platform")
-    }
+    daemon_client::send_daemon_command(repo_root, msg)
 }
 
 /// Retry pinging the daemon transport up to `attempts` times with `delay_ms` between tries.

@@ -667,14 +667,25 @@ fn get_lang_status_raw(store: &SqliteStore, file: &str) -> String {
         meta.install_hint
     };
 
+    // #318 O5: staleness marker — the commit Phase B data was last built at.
+    // A hex SHA needs no JSON escaping; anything else is rejected here.
+    let phase_b_commit = store
+        .get_meta("phase_b_commit")
+        .ok()
+        .flatten()
+        .filter(|s| s.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|s| format!("\"{s}\""))
+        .unwrap_or_else(|| "null".to_string());
+
     // Manual JSON to avoid a serde_json dependency on a hot path.
     // Fields are all static strings — no escaping needed.
     format!(
-        r#"{{"language":"{lang}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}"}}"#,
+        r#"{{"language":"{lang}","builtin":{builtin},"semantic_available":{sem},"install_hint":"{hint}","phase_b_commit":{pbc}}}"#,
         lang = meta.language,
         builtin = meta.builtin,
         sem = semantic_available,
         hint = install_hint,
+        pbc = phase_b_commit,
     )
 }
 
@@ -1416,6 +1427,7 @@ pub fn get_graph_json(
     direction: &str,
     depth: u8,
     kind_filter: &str,
+    token_budget: usize,
 ) -> String {
     // Only "" (all kinds) and "file" are valid kind_filter values.
     if !matches!(kind_filter, "" | "file") {
@@ -1430,7 +1442,7 @@ pub fn get_graph_json(
         }
     }
     let depth = depth.clamp(1, 4);
-    get_graph_json_raw(store, query, direction, depth, kind_filter)
+    get_graph_json_raw(store, query, direction, depth, kind_filter, token_budget)
 }
 
 fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
@@ -1514,6 +1526,7 @@ fn get_graph_json_raw(
     direction: &str,
     depth: u8,
     kind_filter: &str,
+    token_budget: usize,
 ) -> String {
     use std::collections::{HashSet, VecDeque};
 
@@ -1552,12 +1565,25 @@ fn get_graph_json_raw(
         return r#"{"nodes":[],"edges":[]}"#.to_string();
     }
 
+    // Coverage metadata (#318 O5): sourced from the first seed's language so
+    // "no callers" is distinguishable from "cannot see callers".
+    let seed_language = seed_nodes[0].vname.language.clone();
+    let coverage = serde_json::json!({
+        "language": seed_language,
+        "semantic": store.has_refcall_edges_for_language(&seed_language),
+        "phase_b_commit": store.get_meta("phase_b_commit").ok().flatten(),
+    });
+
     // (NodeId, hop_distance)
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
     let mut nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut edges_out: Vec<serde_json::Value> = Vec::new();
     let mut edge_seen: HashSet<(NodeId, NodeId, &'static str)> = HashSet::new();
+    // Token budget (#318 O6): cumulative cost of emitted nodes; once the next
+    // node would exceed the budget, stop adding nodes (mirrors the node cap).
+    let mut tokens_used = 0usize;
+    let mut truncated_by_budget = false;
     // Tracks JSON ids already in nodes_out. Two different DB rows can share the
     // same signature (Phase B stores the same symbol once per referencing file).
     // Deduplicate here so Cytoscape never sees two nodes with the same id.
@@ -1590,10 +1616,19 @@ fn get_graph_json_raw(
             continue;
         }
 
+        // Budget check before emission: the seed (first node) always survives
+        // so a tiny budget still yields a non-empty, honest payload.
+        let node_tokens = token_cost(&node);
+        if token_budget > 0 && !nodes_out.is_empty() && tokens_used + node_tokens > token_budget {
+            truncated_by_budget = true;
+            continue;
+        }
+
         let json_id = node_json_id(&node);
         if !node_ids_out.insert(json_id.clone()) {
             continue; // duplicate signature across DB rows — skip to avoid Cytoscape crash
         }
+        tokens_used += node_tokens;
 
         let score = {
             let raw = 0.7_f64.powi(i32::from(hop));
@@ -1746,10 +1781,18 @@ fn get_graph_json_raw(
         node_ids_out.contains(src) && node_ids_out.contains(tgt)
     });
 
-    match serde_json::to_string(&serde_json::json!({
+    // Additive envelope fields (#318 O5/O6) — first-party consumers read only
+    // `nodes`/`edges`; the global merge likewise ignores extra keys.
+    let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
-    })) {
+        "coverage": coverage,
+    });
+    if token_budget > 0 {
+        out["token_budget"] = serde_json::json!(token_budget);
+        out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("get_graph_json serialization error: {e}");
@@ -1804,7 +1847,7 @@ pub fn get_graph_json_global(
         }
         match SqliteStore::open(db_path) {
             Ok(store) => {
-                let raw = get_graph_json_raw(&store, query, direction, depth, kind_filter);
+                let raw = get_graph_json_raw(&store, query, direction, depth, kind_filter, 0);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -2298,17 +2341,65 @@ mod tests {
         store.put_node(&sym).unwrap();
         store.put_node(&file).unwrap();
 
-        let json = get_graph_json(&store, "fn:bar", "both", 1, "");
+        let json = get_graph_json(&store, "fn:bar", "both", 1, "", 0);
         assert!(
             json.contains("\"line\":42"),
             "symbol node must carry line in JSON: {json}"
         );
+        // #318 O5: coverage envelope must always be present on the JSON tool.
+        assert!(
+            json.contains("\"coverage\""),
+            "coverage envelope missing: {json}"
+        );
 
-        let file_json = get_graph_json(&store, "src/foo.ts", "both", 1, "file");
+        let file_json = get_graph_json(&store, "src/foo.ts", "both", 1, "file", 0);
         assert!(
             file_json.contains("\"line\":null"),
             "file node must have null line in JSON: {file_json}"
         );
+    }
+
+    /// #318 O6: a token budget caps the payload but always keeps the seed,
+    /// and the truncation is reported in-band.
+    #[test]
+    fn get_graph_json_token_budget_truncates() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed = Node::new(
+            VName::new("test", "", "src/seed.ts", "typescript", "fn:seed"),
+            "function",
+        );
+        store.put_node(&seed).unwrap();
+        for i in 0..20 {
+            let n = Node::new(
+                VName::new(
+                    "test",
+                    "",
+                    format!("src/dep{i}.ts"),
+                    "typescript",
+                    format!("fn:dep{i}"),
+                ),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+            store
+                .put_edge(&Edge::new(seed.id, n.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+
+        let unbounded = get_graph_json(&store, "fn:seed", "deps", 2, "", 0);
+        assert!(!unbounded.contains("truncated_by_budget"));
+
+        let capped = get_graph_json(&store, "fn:seed", "deps", 2, "", 30);
+        assert!(
+            capped.contains("\"truncated_by_budget\":true"),
+            "tiny budget must truncate: {capped}"
+        );
+        assert!(
+            capped.contains("fn:seed"),
+            "seed must survive any budget: {capped}"
+        );
+        assert!(capped.len() < unbounded.len());
     }
 
     #[test]

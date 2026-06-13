@@ -1,0 +1,97 @@
+{
+  "$comment": "Nightly accuracy benchmark manifest (#318 O8). Corpora are pinned in-repo fixtures so ground truth is exact and the gate is deterministic. Thresholds are hard gates: the workflow fails when any metric regresses below them. The kubernetes-pkg corpus (external, needs scip-go + pinned clone) is staged behind enabled:false until the Phase B toolchain is provisioned in CI.",
+  "iterations": 5,
+  "thresholds": {
+    "method_recall": 1.0,
+    "caller_recall": 1.0,
+    "caller_precision": 1.0,
+    "import_recall": 1.0,
+    "import_precision": 1.0,
+    "seed_resolution": 1.0,
+    "latency_p95_ms": 5000,
+    "init_seconds": 180
+  },
+  "corpora": [
+    {
+      "name": "ts-callers",
+      "enabled": true,
+      "path": "fixtures/ts-callers",
+      "expected_definitions": [
+        "class:PaymentService",
+        "method:PaymentService.charge",
+        "fn:processPayment"
+      ],
+      "cases": [
+        {
+          "class": "seed-resolution",
+          "name": "PaymentService resolves to its class node",
+          "args": ["graph", "PaymentService", "--format", "json", "--budget", "0"],
+          "expect_root": "class:PaymentService"
+        },
+        {
+          "class": "caller-set",
+          "name": "callers of PaymentService",
+          "args": ["graph", "PaymentService", "--direction", "callers", "--format", "json", "--budget", "0"],
+          "self_path": "service.ts",
+          "expect_files": ["controller.ts"]
+        },
+        {
+          "class": "import-set",
+          "name": "imports of controller.ts",
+          "args": ["graph", "controller.ts", "--direction", "deps", "--format", "json", "--budget", "0"],
+          "self_path": "controller.ts",
+          "expect_files": ["service.ts"]
+        },
+        {
+          "class": "token-budget",
+          "name": "tiny budget truncates and reports it",
+          "args": ["graph", "PaymentService", "--direction", "both", "--format", "json", "--budget", "24"],
+          "expect_budget_respected": 24
+        }
+      ]
+    },
+    {
+      "name": "ts-small",
+      "enabled": true,
+      "path": "fixtures/ts-small",
+      "expected_definitions": [
+        "class:Greeter",
+        "method:Greeter.hello",
+        "fn:go"
+      ],
+      "cases": [
+        {
+          "class": "seed-resolution",
+          "name": "Greeter resolves to its class node",
+          "args": ["graph", "Greeter", "--format", "json", "--budget", "0"],
+          "expect_root": "class:Greeter"
+        },
+        {
+          "class": "caller-set",
+          "name": "callers of Greeter",
+          "args": ["graph", "Greeter", "--direction", "callers", "--format", "json", "--budget", "0"],
+          "self_path": "a.ts",
+          "expect_files": ["b.ts"]
+        },
+        {
+          "class": "import-set",
+          "name": "imports of b.ts",
+          "args": ["graph", "b.ts", "--direction", "deps", "--format", "json", "--budget", "0"],
+          "self_path": "b.ts",
+          "expect_files": ["a.ts"]
+        }
+      ]
+    },
+    {
+      "name": "kubernetes-pkg",
+      "enabled": false,
+      "$comment": "Pinned kubernetes subset (pkg/kubelet) at a fixed SHA with scip-go Phase B — the corpus that motivated WS2/WS3. Enable once scip-go is provisioned in the nightly runner; ground-truth cases live in the same shape as above.",
+      "clone": {
+        "url": "https://github.com/kubernetes/kubernetes",
+        "sha": "pinned-on-enable",
+        "sparse": ["pkg/kubelet"]
+      },
+      "cases": []
+    }
+  ]
+}

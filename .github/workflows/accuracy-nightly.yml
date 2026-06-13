@@ -1,0 +1,54 @@
+name: Accuracy nightly
+
+# Nightly accuracy + performance regression gate (#318 O8).
+#
+# Runs the ground-truth benchmark suite in benchmarks/accuracy/ against the
+# release binary: method recall, caller-set / import-set equality, seed
+# resolution, token-budget invariants, plus the #295-T6 init-at-scale perf
+# section (cold init wall time, node/edge counts) and query latency p50/p95.
+# Thresholds live in benchmarks/accuracy/manifest.json — any regression fails
+# the job. The JSON report is uploaded as an artifact for trend inspection.
+#
+# Also triggerable manually via the GitHub Actions UI (workflow_dispatch).
+
+on:
+  schedule:
+    - cron: '30 2 * * *'   # 02:30 UTC every day
+  workflow_dispatch:        # manual trigger from GitHub Actions UI
+
+permissions:
+  contents: read
+
+jobs:
+  accuracy:
+    name: accuracy benchmark (fixtures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build release binary
+        run: cargo build --release -p travsr-cli
+
+      - name: Run accuracy benchmark
+        run: node benchmarks/accuracy/run.js --out accuracy-report.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accuracy-report
+          path: accuracy-report.json
+          retention-days: 90

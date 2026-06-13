@@ -813,6 +813,11 @@ pub fn init_repo_with_progress(
     // suppressed the stamp on clean re-runs (PR #207).
     if let Ok(sha) = read_head_commit_sha(repo_root) {
         let _ = store.set_meta("last_commit", &sha);
+        // #318 O5: semantic (LSIF/Phase B) data is as fresh as this init.
+        // Until O3 (incremental Phase B) lands, the staleness marker mirrors
+        // the index-time commit; commit-hook reindexes advance last_commit
+        // only, so consumers can compute "semantic data is N commits old".
+        let _ = store.set_meta("phase_b_commit", &sha);
     }
 
     let total_edges = edges_before + edges_written;
@@ -1883,6 +1888,57 @@ fn handle_control_message(
         }
         Ok(ControlMessage::Status) => (ControlResponse::ok(Some("running".to_string())), false),
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
+        // #318 O1: read-only CLI queries served from the daemon's warm store —
+        // skips the per-command store open that dominates CLI latency.
+        Ok(ControlMessage::Query {
+            protocol,
+            tool,
+            args,
+        }) => {
+            if protocol != travsr_ipc::QUERY_PROTOCOL_VERSION {
+                // Version skew: answer with an error so the CLI falls back to
+                // its direct-open path instead of mis-rendering a payload.
+                return (
+                    ControlResponse::err(format!(
+                        "query protocol v{protocol} != daemon v{} — falling back",
+                        travsr_ipc::QUERY_PROTOCOL_VERSION
+                    )),
+                    false,
+                );
+            }
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let result = run_query(&s, &tool, args);
+            match result {
+                Ok(value) => (ControlResponse::query_result(value), false),
+                Err(e) => (ControlResponse::err(format!("query failed: {e:#}")), false),
+            }
+        }
         Err(e) => (ControlResponse::err(format!("parse error: {e}")), false),
+    }
+}
+
+/// Dispatch one CLI query against the warm store (#318 O1).
+#[cfg(any(unix, windows))]
+fn run_query(
+    store: &SqliteStore,
+    tool: &str,
+    args: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    use travsr_mcp::query;
+    match tool {
+        "graph" => {
+            let args: query::GraphQueryArgs =
+                serde_json::from_value(args).context("invalid graph query args")?;
+            Ok(serde_json::to_value(query::graph_query(store, &args)?)?)
+        }
+        "ask" => {
+            let q = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("ask query missing 'query' arg"))?;
+            Ok(serde_json::to_value(query::ask_query(store, q)?)?)
+        }
+        "status" => Ok(serde_json::to_value(query::status_query(store)?)?),
+        other => anyhow::bail!("unknown query tool '{other}'"),
     }
 }

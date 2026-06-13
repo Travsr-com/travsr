@@ -31,9 +31,6 @@ use crate::rbac::EdgeFilter;
 /// PCST penalty parameter λ (ADR-007). Controls node-exclusion penalty weight.
 const PCST_LAMBDA: f32 = 0.5;
 
-/// Hard wall-clock timeout for the PCST pass. On expiry, falls back to BFS.
-const PCST_TIMEOUT_MS: u128 = 80;
-
 /// Maximum nodes in the local subgraph built by the bidirectional BFS expansion.
 const MAX_LOCAL_NODES: usize = 2_000;
 
@@ -72,17 +69,17 @@ pub fn pcst_path(
         return Ok(vec![source_node]);
     }
 
-    // Build local subgraph via bidirectional BFS expansion.
+    // Build local subgraph via bidirectional BFS expansion. Expansion is
+    // self-bounded: `expand_local_subgraph` stops at `MAX_LOCAL_NODES` node
+    // pops, so the cost of everything below is bounded regardless of fan-out.
+    // We deliberately do NOT gate the rest of the function on a wall-clock
+    // budget here: such a check can only fire *after* expansion has already
+    // completed (it cannot interrupt the work it nominally guards), so its sole
+    // effect would be to discard a complete, bounded subgraph and fall back to
+    // a strictly-less-informative BFS whenever the machine is briefly loaded —
+    // making the result nondeterministic. dijkstra/astar over a ≤2000-node
+    // subgraph is microsecond-scale and needs no separate time budget.
     let local = expand_local_subgraph(store, source, sink, filter, EXPAND_DEPTH);
-
-    if start.elapsed().as_millis() > PCST_TIMEOUT_MS {
-        tracing::warn!(
-            src = source.0,
-            sink = sink.0,
-            "pcst: local expansion timed out — falling back to BFS"
-        );
-        return bfs_fallback(store, source, filter, token_budget);
-    }
 
     // Build petgraph from local subgraph.
     let (graph, node_to_idx, idx_to_node) = build_graph(&local.nodes, &local.edges);
@@ -99,7 +96,7 @@ pub fn pcst_path(
     // With an early-exit goal, zero-cost ref/call edges leave many nodes tied
     // at cost 0 and WHICH of them settle before the sink varies with HashMap
     // iteration order run-to-run. The component is capped at MAX_LOCAL_NODES
-    // (2000), so the extra work is negligible vs PCST_TIMEOUT_MS.
+    // (2000), so settling the full component is cheap.
     let costs = dijkstra(&graph, src_idx, None, |e| *e.weight());
 
     // Reconstruct the actual source→sink route. The route must LEAD the result:
@@ -121,15 +118,6 @@ pub fn pcst_path(
         );
         return bfs_fallback(store, source, filter, token_budget);
     };
-
-    if start.elapsed().as_millis() > PCST_TIMEOUT_MS {
-        tracing::warn!(
-            src = source.0,
-            sink = sink.0,
-            "pcst: Dijkstra timed out — falling back to BFS"
-        );
-        return bfs_fallback(store, source, filter, token_budget);
-    }
 
     // Route nodes first, in traversal order (source → … → sink).
     let mut result_ids: Vec<NodeId> = route

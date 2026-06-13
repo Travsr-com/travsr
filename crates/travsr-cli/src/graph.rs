@@ -1,15 +1,19 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+//! `travsr graph` — subgraph rendering around a symbol or file.
+//!
+//! Data acquisition is shared with the daemon via `travsr_mcp::query`
+//! (#318 O1): a running daemon answers from its warm store; otherwise the
+//! store is opened directly (read-only fast path). Rendering happens here,
+//! from the payload, so both routes produce identical output.
+
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Context as _;
-use travsr_core::{display_label, is_noise_node, Node, NodeId};
-use travsr_store::{SqliteStore, Store};
+use travsr_mcp::query::{
+    self, EdgeEntry, GraphPayload, GraphQueryArgs, NodeEntry, QueryDirection, QueryEdgeMode,
+};
 
+use crate::daemon_client;
 use crate::repo::find_git_root;
-
-type GraphData = (
-    HashMap<NodeId, (Node, u8)>,
-    Vec<(NodeId, NodeId, String, String)>,
-);
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Direction {
@@ -19,6 +23,16 @@ pub enum Direction {
     Callers,
     /// Follow both directions
     Both,
+}
+
+impl From<Direction> for QueryDirection {
+    fn from(d: Direction) -> Self {
+        match d {
+            Direction::Deps => QueryDirection::Deps,
+            Direction::Callers => QueryDirection::Callers,
+            Direction::Both => QueryDirection::Both,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -39,20 +53,24 @@ pub enum EdgeMode {
     All,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TraversalOpts {
-    direction: Direction,
-    edge_mode: EdgeMode,
-    include_noise: bool,
+impl From<EdgeMode> for QueryEdgeMode {
+    fn from(m: EdgeMode) -> Self {
+        match m {
+            EdgeMode::Semantic => QueryEdgeMode::Semantic,
+            EdgeMode::All => QueryEdgeMode::All,
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
-    query: &str,
+    query_str: &str,
     depth: u8,
     direction: Direction,
     format: Format,
     edge_mode: EdgeMode,
     include_noise: bool,
+    budget: usize,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
@@ -62,138 +80,152 @@ pub fn run(
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
-    let store = SqliteStore::open(&db_path)?;
-    let matches = store.search_nodes_by_name(query)?;
-
-    if matches.is_empty() {
-        println!("no symbols matching '{query}'");
-        return Ok(());
-    }
-
-    let seed = matches
-        .iter()
-        .find(|n| n.kind == "file")
-        .unwrap_or(&matches[0]);
-
-    let opts = TraversalOpts {
-        direction,
-        edge_mode,
+    let args = GraphQueryArgs {
+        query: query_str.to_string(),
+        depth,
+        direction: direction.into(),
+        edge_mode: edge_mode.into(),
         include_noise,
     };
 
-    match format {
-        Format::Tree => {
-            println!("{} ({})", display_label(seed), seed.kind);
-            let mut visited = HashSet::new();
-            visited.insert(seed.id);
-            print_tree(&store, seed.id, depth, 0, &mut visited, "", opts)?;
-        }
-        Format::Dot => {
-            print_dot(&store, seed.id, depth, opts)?;
-        }
-        Format::Json => {
-            let (nodes_map, edges) = collect_graph(&store, seed.id, depth, opts)?;
-            print_json(&store, Some(seed), &nodes_map, &edges)?;
-        }
-    }
+    // Daemon route first (#318 O1), direct read-only open as fallback.
+    let payload: GraphPayload =
+        match daemon_client::try_query(&repo_root, "graph", serde_json::to_value(&args)?) {
+            Some(p) => p,
+            None => {
+                let store = daemon_client::open_read_store(&db_path)?;
+                query::graph_query(&store, &args)?
+            }
+        };
 
-    Ok(())
-}
-
-fn print_tree(
-    store: &SqliteStore,
-    node_id: NodeId,
-    max_depth: u8,
-    depth: u8,
-    visited: &mut HashSet<NodeId>,
-    prefix: &str,
-    opts: TraversalOpts,
-) -> anyhow::Result<()> {
-    if depth >= max_depth {
+    if payload.seed.is_none() {
+        println!("no symbols matching '{query_str}'");
         return Ok(());
     }
 
-    let edges = next_edges(store, node_id, opts.direction, opts.edge_mode)?;
+    render(payload, format, budget)
+}
 
-    let children: Vec<(String, NodeId)> = edges
-        .into_iter()
-        .filter_map(|(edge_kind, next_id)| {
-            if visited.contains(&next_id) {
-                return None;
+pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let repo_root = find_git_root(&cwd)?;
+    let db_path = repo_root.join(".travsr/graph.db");
+
+    if !db_path.exists() {
+        anyhow::bail!("not initialized — run `travsr init`");
+    }
+
+    // --all dumps are large by construction — always computed locally rather
+    // than shipped through the daemon socket.
+    let store = daemon_client::open_read_store(&db_path)?;
+    let payload = query::graph_all_payload(&store)?;
+    render(payload, format, budget)
+}
+
+fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::Result<()> {
+    // #318 O6: token budget — prefix of BFS order, seed always kept.
+    let truncated = query::apply_token_budget(&mut payload, budget);
+
+    match format {
+        Format::Tree => {
+            if let Some(seed) = &payload.seed {
+                println!("{} ({})", seed.label, seed.kind);
+                print_tree(&payload);
+            } else {
+                // --all tree mode: file listing (historic behaviour).
+                let mut files: Vec<&NodeEntry> =
+                    payload.nodes.iter().filter(|n| n.kind == "file").collect();
+                files.sort_by(|a, b| a.path.cmp(&b.path));
+                for node in files {
+                    println!("{}", node.path);
+                }
             }
-            Some((edge_kind, next_id))
-        })
-        .collect();
-
-    for (i, (edge_kind, child_id)) in children.iter().enumerate() {
-        let is_last = i == children.len() - 1;
-        let connector = if is_last { "└── " } else { "├── " };
-        let extension = if is_last { "    " } else { "│   " };
-
-        if let Some(child) = store.get_node(*child_id)? {
-            if !opts.include_noise && is_noise_node(&child) {
-                visited.insert(*child_id);
-                continue;
+            if truncated > 0 {
+                println!("… {truncated} more nodes beyond budget (raise with --budget)");
             }
-            println!(
-                "{prefix}{connector}{edge_kind} → {} ({})",
-                display_label(&child),
-                child.kind
-            );
-            visited.insert(*child_id);
-            print_tree(
-                store,
-                *child_id,
-                max_depth,
-                depth + 1,
-                visited,
-                &format!("{prefix}{extension}"),
-                opts,
-            )?;
         }
+        Format::Dot => {
+            print_dot(&payload)?;
+            if truncated > 0 {
+                println!("// … {truncated} more nodes beyond budget (raise with --budget)");
+            }
+        }
+        Format::Json => print_json(&payload, budget, truncated)?,
     }
 
     Ok(())
 }
 
-fn print_dot(
-    store: &SqliteStore,
-    seed_id: NodeId,
-    max_depth: u8,
-    opts: TraversalOpts,
-) -> anyhow::Result<()> {
-    let (nodes_map, raw_edges) = collect_graph(store, seed_id, max_depth, opts)?;
-    print_dot_from_map(&nodes_map, &raw_edges)
+fn print_tree(payload: &GraphPayload) {
+    let nodes_by_id: HashMap<u64, &NodeEntry> = payload.nodes.iter().map(|n| (n.id, n)).collect();
+    // Children per parent, in BFS discovery order.
+    let mut children: HashMap<u64, Vec<(&str, u64)>> = HashMap::new();
+    for step in &payload.tree {
+        children
+            .entry(step.parent)
+            .or_default()
+            .push((step.edge_kind.as_str(), step.child));
+    }
+    if let Some(seed) = &payload.seed {
+        print_tree_level(seed.id, &nodes_by_id, &children, "");
+    }
 }
 
-fn print_dot_from_map(
-    nodes_map: &HashMap<NodeId, (Node, u8)>,
-    raw_edges: &[(NodeId, NodeId, String, String)],
-) -> anyhow::Result<()> {
+fn print_tree_level(
+    node_id: u64,
+    nodes_by_id: &HashMap<u64, &NodeEntry>,
+    children: &HashMap<u64, Vec<(&str, u64)>>,
+    prefix: &str,
+) {
+    let Some(kids) = children.get(&node_id) else {
+        return;
+    };
+    for (i, (edge_kind, child_id)) in kids.iter().enumerate() {
+        let is_last = i == kids.len() - 1;
+        let connector = if is_last { "└── " } else { "├── " };
+        let extension = if is_last { "    " } else { "│   " };
+
+        if let Some(child) = nodes_by_id.get(child_id) {
+            println!(
+                "{prefix}{connector}{edge_kind} → {} ({})",
+                child.label, child.kind
+            );
+            print_tree_level(
+                *child_id,
+                nodes_by_id,
+                children,
+                &format!("{prefix}{extension}"),
+            );
+        }
+    }
+}
+
+fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
+    let nodes_map: HashMap<u64, &NodeEntry> = payload.nodes.iter().map(|n| (n.id, n)).collect();
+
     // Resolve import nodes to the file node they reference.
-    let mut import_redirect: HashMap<NodeId, NodeId> = HashMap::new();
-    for (node_id, (node, _)) in nodes_map {
+    let mut import_redirect: HashMap<u64, u64> = HashMap::new();
+    for node in &payload.nodes {
         if node.kind == "import" {
             // Best-effort local resolution without store lookup in --all mode
-            for (cand_id, (cand, _)) in nodes_map {
+            for cand in &payload.nodes {
                 if cand.kind != "file" {
                     continue;
                 }
                 let specifier = node
-                    .vname
                     .signature
                     .strip_prefix("import:")
-                    .unwrap_or(&node.vname.signature);
+                    .unwrap_or(&node.signature);
                 if specifier.starts_with('.') {
                     let basename = std::path::Path::new(specifier)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or(specifier);
-                    let stem = std::path::Path::new(&cand.vname.path)
+                    let stem = std::path::Path::new(&cand.path)
                         .file_stem()
                         .and_then(|s| s.to_str());
                     if stem == Some(basename) {
-                        import_redirect.insert(*node_id, *cand_id);
+                        import_redirect.insert(node.id, cand.id);
                         break;
                     }
                 }
@@ -202,9 +234,9 @@ fn print_dot_from_map(
     }
 
     // Rewrite edges through the redirect table; drop self-loops and duplicates.
-    let mut seen: HashSet<(NodeId, NodeId, String)> = HashSet::new();
-    let mut edges: Vec<(NodeId, NodeId, String)> = Vec::new();
-    for (src, dst, kind, _provenance) in raw_edges {
+    let mut seen: HashSet<(u64, u64, String)> = HashSet::new();
+    let mut edges: Vec<(u64, u64, String)> = Vec::new();
+    for EdgeEntry { src, dst, kind, .. } in &payload.edges {
         let s = import_redirect.get(src).copied().unwrap_or(*src);
         let d = import_redirect.get(dst).copied().unwrap_or(*dst);
         if s == d {
@@ -217,15 +249,12 @@ fn print_dot_from_map(
     }
 
     // Group visible nodes by kind (skip resolved import stubs).
-    let mut by_kind: HashMap<&str, Vec<NodeId>> = HashMap::new();
-    for (node_id, (node, _)) in nodes_map {
-        if node.kind == "import" && import_redirect.contains_key(node_id) {
+    let mut by_kind: HashMap<&str, Vec<u64>> = HashMap::new();
+    for node in &payload.nodes {
+        if node.kind == "import" && import_redirect.contains_key(&node.id) {
             continue;
         }
-        by_kind
-            .entry(node.kind.as_str())
-            .or_default()
-            .push(*node_id);
+        by_kind.entry(node.kind.as_str()).or_default().push(node.id);
     }
 
     // Cluster definitions: (kind, label, shape, fill, border)
@@ -260,12 +289,11 @@ fn print_dot_from_map(
         println!("    fillcolor=\"{fill}\";");
         println!();
         for &nid in ids {
-            if let Some((node, _)) = nodes_map.get(&nid) {
-                let label = escape_dot(&format!("{}\n{}", node.vname.signature, node.vname.path));
+            if let Some(node) = nodes_map.get(&nid) {
+                let label = escape_dot(&format!("{}\n{}", node.signature, node.path));
                 println!(
-                    "    n{} [label=\"{label}\" shape={shape} style=filled \
+                    "    n{nid} [label=\"{label}\" shape={shape} style=filled \
                      fillcolor=\"{fill}\" color=\"{border}\"];",
-                    nid.0,
                 );
             }
         }
@@ -275,23 +303,17 @@ fn print_dot_from_map(
 
     // Emit edges; suppress defines/binding labels from containers to members.
     for (src_id, dst_id, kind) in &edges {
-        let src_kind = nodes_map
-            .get(src_id)
-            .map(|(n, _)| n.kind.as_str())
-            .unwrap_or("");
-        let dst_kind = nodes_map
-            .get(dst_id)
-            .map(|(n, _)| n.kind.as_str())
-            .unwrap_or("");
+        let src_kind = nodes_map.get(src_id).map(|n| n.kind.as_str()).unwrap_or("");
+        let dst_kind = nodes_map.get(dst_id).map(|n| n.kind.as_str()).unwrap_or("");
 
         let suppress = kind == "defines/binding"
             && matches!(src_kind, "file" | "class")
             && matches!(dst_kind, "function" | "method" | "variable" | "class");
 
         if suppress {
-            println!("  n{} -> n{};", src_id.0, dst_id.0);
+            println!("  n{src_id} -> n{dst_id};");
         } else {
-            println!("  n{} -> n{} [label=\"{kind}\"];", src_id.0, dst_id.0);
+            println!("  n{src_id} -> n{dst_id} [label=\"{kind}\"];");
         }
     }
 
@@ -299,41 +321,23 @@ fn print_dot_from_map(
     Ok(())
 }
 
-fn print_json(
-    store: &SqliteStore,
-    seed: Option<&Node>,
-    nodes_map: &HashMap<NodeId, (Node, u8)>,
-    edges: &[(NodeId, NodeId, String, String)],
-) -> anyhow::Result<()> {
-    let mut sig_lookup: HashMap<NodeId, String> = nodes_map
-        .iter()
-        .map(|(id, (node, _))| (*id, node.vname.signature.clone()))
-        .collect();
-    for (src_id, dst_id, _, _) in edges {
-        for &nid in &[*src_id, *dst_id] {
-            if let std::collections::hash_map::Entry::Vacant(e) = sig_lookup.entry(nid) {
-                if let Some(node) = store.get_node(nid)? {
-                    e.insert(node.vname.signature.clone());
-                }
-            }
-        }
-    }
-
+fn print_json(payload: &GraphPayload, budget: usize, truncated: usize) -> anyhow::Result<()> {
     let mut kinds: HashMap<String, usize> = HashMap::new();
-    for (node, _) in nodes_map.values() {
+    for node in &payload.nodes {
         *kinds.entry(node.kind.clone()).or_default() += 1;
     }
 
-    let mut node_entries: Vec<serde_json::Value> = nodes_map
-        .values()
-        .map(|(node, depth)| {
+    let mut node_entries: Vec<serde_json::Value> = payload
+        .nodes
+        .iter()
+        .map(|node| {
             serde_json::json!({
-                "id": node.id.0.to_string(),
-                "signature": node.vname.signature,
+                "id": node.id.to_string(),
+                "signature": node.signature,
                 "kind": node.kind,
-                "path": node.vname.path,
-                "language": node.vname.language,
-                "depth_from_seed": depth,
+                "path": node.path,
+                "language": node.language,
+                "depth_from_seed": node.depth,
             })
         })
         .collect();
@@ -348,210 +352,52 @@ fn print_json(
         )
     });
 
-    let edge_entries: Vec<serde_json::Value> = edges
+    let edge_entries: Vec<serde_json::Value> = payload
+        .edges
         .iter()
-        .filter_map(|(src_id, dst_id, kind, provenance)| {
-            let from = sig_lookup.get(src_id)?;
-            let to = sig_lookup.get(dst_id)?;
-            Some(serde_json::json!({ "from": from, "to": to, "kind": kind, "provenance": provenance }))
+        .filter(|e| !e.src_sig.is_empty() && !e.dst_sig.is_empty())
+        .map(|e| {
+            serde_json::json!({
+                "from": e.src_sig,
+                "to": e.dst_sig,
+                "kind": e.kind,
+                "provenance": e.provenance,
+            })
         })
         .collect();
 
-    let summary = if let Some(s) = seed {
+    let mut summary = if let Some(s) = &payload.seed {
         serde_json::json!({
             "mode": "query",
-            "root": s.vname.signature,
-            "root_path": s.vname.path,
-            "total_nodes": nodes_map.len(),
-            "total_edges": edges.len(),
+            "root": s.signature,
+            "root_path": s.path,
+            "total_nodes": payload.nodes.len(),
+            "total_edges": edge_entries.len(),
             "kinds": kinds,
         })
     } else {
         serde_json::json!({
             "mode": "all",
-            "total_nodes": nodes_map.len(),
-            "total_edges": edges.len(),
+            "total_nodes": payload.nodes.len(),
+            "total_edges": edge_entries.len(),
             "kinds": kinds,
         })
     };
-    let out = serde_json::json!({
+    if truncated > 0 {
+        summary["token_budget"] = serde_json::json!(budget);
+        summary["truncated_nodes"] = serde_json::json!(truncated);
+    }
+    let mut out = serde_json::json!({
         "schema_version": 1,
         "summary": summary,
         "nodes": node_entries,
         "edges": edge_entries,
     });
+    if let Some(cov) = &payload.coverage {
+        out["coverage"] = serde_json::to_value(cov)?;
+    }
 
     println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(())
-}
-
-fn collect_graph(
-    store: &SqliteStore,
-    seed_id: NodeId,
-    max_depth: u8,
-    opts: TraversalOpts,
-) -> anyhow::Result<GraphData> {
-    let mut nodes_map: HashMap<NodeId, (Node, u8)> = HashMap::new();
-    let mut edge_list: Vec<(NodeId, NodeId, String, String)> = Vec::new();
-    let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
-
-    visited.insert(seed_id);
-    queue.push_back((seed_id, 0));
-
-    while let Some((current_id, depth)) = queue.pop_front() {
-        if let Some(node) = store.get_node(current_id)? {
-            nodes_map.entry(current_id).or_insert((node, depth));
-        }
-
-        if depth >= max_depth {
-            continue;
-        }
-
-        for (edge_kind, next_id) in next_edges(store, current_id, opts.direction, opts.edge_mode)? {
-            let (src, dst) = match opts.direction {
-                Direction::Callers => (next_id, current_id),
-                _ => (current_id, next_id),
-            };
-            // DEBT(travsr-75): iter_edges_from/to do not return provenance, so
-            // BFS-traversed edges always show "tree-sitter" in JSON output even
-            // when the DB row is "lsif". Only --all mode (all_edges) is correct.
-            edge_list.push((src, dst, edge_kind, "tree-sitter".to_string()));
-
-            if !visited.contains(&next_id) {
-                if let Some(next_node) = store.get_node(next_id)? {
-                    if !opts.include_noise && is_noise_node(&next_node) {
-                        visited.insert(next_id);
-                        continue;
-                    }
-                }
-                visited.insert(next_id);
-                queue.push_back((next_id, depth + 1));
-            }
-        }
-    }
-
-    Ok((nodes_map, edge_list))
-}
-
-fn collect_all_graph(store: &SqliteStore) -> anyhow::Result<GraphData> {
-    let nodes_map: HashMap<NodeId, (Node, u8)> = store
-        .all_nodes()?
-        .into_iter()
-        .map(|n| (n.id, (n, 0u8)))
-        .collect();
-    let edges = store.all_edges()?;
-    Ok((nodes_map, edges))
-}
-
-static FALLBACK_NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
-fn next_edges(
-    store: &SqliteStore,
-    node_id: NodeId,
-    direction: Direction,
-    edge_mode: EdgeMode,
-) -> anyhow::Result<Vec<(String, NodeId)>> {
-    let mut out = Vec::new();
-    if matches!(direction, Direction::Deps | Direction::Both) {
-        for e in store.iter_edges_from(node_id)? {
-            out.push((e.kind.as_str().to_string(), e.dst));
-        }
-    }
-    if matches!(direction, Direction::Callers | Direction::Both) {
-        let mut incoming = store.iter_edges_to(node_id)?;
-        // RFC-014 #317: a file's callers are the callers of the definitions it
-        // contains — splice them in so function-level callers surface when a
-        // query resolves to a file node. Edges sourced from the file itself
-        // (defines/binding) are skipped to avoid self-loops.
-        if let Some(node) = store.get_node(node_id)? {
-            if node.kind == "file" {
-                // Cap the splice at 200 definitions: pathological generated
-                // files can hold thousands, each costing an iter_edges_to
-                // round-trip. Full fidelity remains available via per-symbol
-                // queries.
-                for def_id in store
-                    .definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
-                    .into_iter()
-                    .take(200)
-                {
-                    incoming.extend(
-                        store
-                            .iter_edges_to(def_id)?
-                            .into_iter()
-                            .filter(|e| e.src != node_id),
-                    );
-                }
-            }
-        }
-        if matches!(edge_mode, EdgeMode::Semantic) {
-            let has_semantic = incoming.iter().any(|e| is_semantic_edge(e.kind.as_str()));
-            if has_semantic {
-                for e in &incoming {
-                    let s = e.kind.as_str();
-                    if is_semantic_edge(s) || s == "defines/binding" {
-                        out.push((s.to_string(), e.src));
-                    }
-                }
-            } else {
-                FALLBACK_NOTE.get_or_init(|| {
-                    eprintln!(
-                        "note: no semantic caller edges found — showing file-level imports. \
-                         Run `travsr lang` to enable call-site analysis."
-                    );
-                });
-                for e in &incoming {
-                    out.push((e.kind.as_str().to_string(), e.src));
-                }
-            }
-        } else {
-            for e in &incoming {
-                out.push((e.kind.as_str().to_string(), e.src));
-            }
-        }
-    }
-    // Multiple call sites (and the file-node definition splice) can yield the
-    // same (kind, src) pair — collapse them for display.
-    let mut seen = HashSet::new();
-    out.retain(|(kind, id)| seen.insert((kind.clone(), *id)));
-    Ok(out)
-}
-
-fn is_semantic_edge(kind: &str) -> bool {
-    matches!(
-        kind,
-        "ref/call" | "ffi/call" | "overrides" | "is-implementation" | "ref/imports" | "resolves-to"
-    )
-}
-
-pub fn run_all(format: Format) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir().context("getting current directory")?;
-    let repo_root = find_git_root(&cwd)?;
-    let db_path = repo_root.join(".travsr/graph.db");
-
-    if !db_path.exists() {
-        anyhow::bail!("not initialized — run `travsr init`");
-    }
-
-    let store = SqliteStore::open(&db_path)?;
-    let (nodes_map, edges) = collect_all_graph(&store)?;
-
-    match format {
-        Format::Tree => {
-            let mut files: Vec<&Node> = nodes_map
-                .values()
-                .filter(|(n, _)| n.kind == "file")
-                .map(|(n, _)| n)
-                .collect();
-            files.sort_by(|a, b| a.vname.path.cmp(&b.vname.path));
-            for node in files {
-                println!("{}", node.vname.path);
-            }
-        }
-        Format::Dot => print_dot_from_map(&nodes_map, &edges)?,
-        Format::Json => print_json(&store, None, &nodes_map, &edges)?,
-    }
-
     Ok(())
 }
 

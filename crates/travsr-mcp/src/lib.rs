@@ -11,6 +11,7 @@
 
 pub mod auth;
 mod protocol;
+pub mod query;
 mod sanitize;
 mod server;
 pub mod session;
