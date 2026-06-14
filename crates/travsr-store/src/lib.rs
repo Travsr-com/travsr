@@ -1348,23 +1348,22 @@ LIMIT 100",
             Self::put_node_fts(&tx, node).context("write_scip_attributed_batch: put_node_fts")?;
         }
 
+        // P4: build span cache — one SELECT per unique caller_path instead of one per ref.
+        // 10k refs / 200 files: 10,000 queries → 200 queries.
+        let unique_paths: std::collections::HashSet<&str> =
+            refs.iter().map(|r| r.caller_path.as_str()).collect();
+        let mut span_cache: std::collections::HashMap<&str, Vec<FnSpan>> =
+            std::collections::HashMap::with_capacity(unique_paths.len());
+        for path in unique_paths {
+            span_cache.insert(path, fetch_all_fn_spans(&tx, corpus, path)?);
+        }
+
         for scip_ref in refs {
-            // G2: find the innermost enclosing function/method span.
-            // Prefer narrowest span (end_line - line ASC).
+            // G2: find the innermost enclosing function/method span in memory.
             let occ_line = scip_ref.caller_line as i64;
-            let src_id: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM nodes \
-                     WHERE corpus = ?1 AND path = ?2 \
-                       AND kind IN ('function','method','fn') \
-                       AND line <= ?3 AND end_line >= ?3 \
-                     ORDER BY (end_line - line) ASC \
-                     LIMIT 1",
-                    params![corpus, scip_ref.caller_path, occ_line],
-                    |row| row.get(0),
-                )
-                .optional()
-                .context("write_scip_attributed_batch: enclosing fn lookup")?;
+            let src_id: Option<i64> = span_cache
+                .get(scip_ref.caller_path.as_str())
+                .and_then(|spans| find_narrowest_enclosing(spans, occ_line));
 
             let caller_id = match src_id {
                 Some(id) => id,
@@ -2645,6 +2644,58 @@ impl Store for SqliteStore {
 /// like `language` differ (the cause of 385K dangling edges on kubernetes).
 /// If the path was never Phase-A-indexed (`.travsrignore` etc.), synthesizes
 /// a file node matching the Phase A VName convention so the edge has a real
+/// Minimal span descriptor fetched once per unique path for G2 attribution.
+struct FnSpan {
+    id: i64,
+    line: i64,
+    end_line: i64,
+}
+
+/// Fetch all function/method spans for a single `path` in one query.
+///
+/// Results are ordered by `(end_line - line) ASC, id ASC` so that
+/// [`find_narrowest_enclosing`] can short-circuit on the first match — exactly
+/// replicating the `ORDER BY … LIMIT 1` the per-ref SELECT used to do.
+fn fetch_all_fn_spans(
+    tx: &rusqlite::Transaction<'_>,
+    corpus: &str,
+    path: &str,
+) -> anyhow::Result<Vec<FnSpan>> {
+    let mut stmt = tx
+        .prepare_cached(
+            "SELECT id, line, end_line FROM nodes \
+             WHERE corpus = ?1 AND path = ?2 \
+               AND kind IN ('function', 'method', 'fn') \
+               AND line IS NOT NULL AND end_line IS NOT NULL \
+             ORDER BY (end_line - line) ASC, id ASC",
+        )
+        .context("fetch_all_fn_spans: prepare")?;
+    let spans = stmt
+        .query_map(params![corpus, path], |row| {
+            Ok(FnSpan {
+                id: row.get(0)?,
+                line: row.get(1)?,
+                end_line: row.get(2)?,
+            })
+        })
+        .context("fetch_all_fn_spans: query")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("fetch_all_fn_spans: collect")?;
+    Ok(spans)
+}
+
+/// Return the `id` of the narrowest function span containing `occ_line`.
+///
+/// `spans` must be pre-sorted `(end_line - line) ASC, id ASC` (i.e. the order
+/// returned by [`fetch_all_fn_spans`]).  The first match is therefore the
+/// narrowest enclosing span — identical to `ORDER BY … LIMIT 1`.
+fn find_narrowest_enclosing(spans: &[FnSpan], occ_line: i64) -> Option<i64> {
+    spans
+        .iter()
+        .find(|s| s.line <= occ_line && s.end_line >= occ_line)
+        .map(|s| s.id)
+}
+
 /// src; the language is taken from any sibling node at the same path (SCIP
 /// definition nodes for the path are inserted earlier in this transaction).
 fn file_node_for_attribution(
@@ -3878,5 +3929,98 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "pkg/a/mod.ts");
         assert_eq!(pairs[0].1, "test/b/util.ts");
+    }
+
+    // P4 golden test: grouped span fetch produces identical (ref → enclosing_id) mapping
+    // as the old per-ref SELECT, including nested/overlapping functions and the fallback
+    // to file node when no function encloses the reference line.
+    #[test]
+    fn scip_attributed_batch_p4_attribution_golden() {
+        let corpus = "test-corpus";
+        let path = "src/foo.rs";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // Outer function: lines 1–20.
+        let outer = Node::new(VName::new(corpus, "", path, "rust", "fn:outer"), "function")
+            .with_line(1)
+            .with_end_line(20);
+
+        // Inner (narrower) function: lines 5–10, nested inside outer.
+        let inner = Node::new(VName::new(corpus, "", path, "rust", "fn:inner"), "function")
+            .with_line(5)
+            .with_end_line(10);
+
+        // A callee symbol (definition node).
+        let callee = Node::new(
+            VName::new(corpus, "", "src/bar.rs", "rust", "fn:callee"),
+            "function",
+        );
+
+        // Phase A: write the Phase A tree-sitter nodes so spans are in the DB.
+        store
+            .write_scip_attributed_batch(
+                corpus,
+                &[outer.clone(), inner.clone(), callee.clone()],
+                &[],
+            )
+            .unwrap();
+
+        // Three refs on the same file, exercising three cases:
+        //   line 7  → inside inner (5–10): narrowest = inner
+        //   line 15 → inside outer but NOT inner (11–20): narrowest = outer
+        //   line 25 → outside every function: falls back to file node
+        let refs = vec![
+            travsr_core::ScipRef {
+                caller_path: path.to_string(),
+                caller_line: 7,
+                callee_id: callee.id,
+            },
+            travsr_core::ScipRef {
+                caller_path: path.to_string(),
+                caller_line: 15,
+                callee_id: callee.id,
+            },
+            travsr_core::ScipRef {
+                caller_path: path.to_string(),
+                caller_line: 25,
+                callee_id: callee.id,
+            },
+        ];
+
+        store
+            .write_scip_attributed_batch(corpus, &[], &refs)
+            .unwrap();
+
+        // Read back the edges and verify attribution.
+        // all_edges returns (src: NodeId, dst: NodeId, kind: String, provenance: String).
+        let all_edges = store.all_edges().unwrap();
+        let ref_call_edges: Vec<_> = all_edges
+            .iter()
+            .filter(|(_, _, kind, _)| kind == "ref/call")
+            .collect();
+
+        // line 7 → inner
+        assert!(
+            ref_call_edges
+                .iter()
+                .any(|(src, dst, _, _)| *src == inner.id && *dst == callee.id),
+            "line 7 ref must be attributed to inner function"
+        );
+        // line 15 → outer (not inner)
+        assert!(
+            ref_call_edges
+                .iter()
+                .any(|(src, dst, _, _)| *src == outer.id && *dst == callee.id),
+            "line 15 ref must be attributed to outer function"
+        );
+        // line 25 → file node (attribution falls back; language = "rust" from sibling node)
+        let file_vname = VName::new(corpus, "", path, "rust", "file");
+        let file_id = file_vname.id();
+        assert!(
+            ref_call_edges
+                .iter()
+                .any(|(src, dst, _, _)| *src == file_id && *dst == callee.id),
+            "line 25 ref must fall back to file node attribution"
+        );
     }
 }
