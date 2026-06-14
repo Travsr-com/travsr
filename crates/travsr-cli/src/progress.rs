@@ -249,6 +249,13 @@ impl ProgressReporter {
                     pal.dim(&elapsed)
                 )
             }
+            InitProgress::PhaseBDeferred => {
+                format!(
+                    "  {} structural index ready — semantic edges indexing in background   {}",
+                    pal.green("●"),
+                    pal.dim(&elapsed)
+                )
+            }
         }
     }
 
@@ -271,6 +278,9 @@ impl ProgressReporter {
                 )
             }
             InitProgress::Finalizing => format!("finalizing (semantic pass)  {elapsed}"),
+            InitProgress::PhaseBDeferred => {
+                format!("structural index ready  {elapsed}")
+            }
         }
     }
 
@@ -287,6 +297,9 @@ impl ProgressReporter {
             }
             InitProgress::Finalizing => {
                 format!(r#"{{"phase":"finalizing","elapsed_s":{secs}}}"#)
+            }
+            InitProgress::PhaseBDeferred => {
+                format!(r#"{{"phase":"phase_b_deferred","elapsed_s":{secs}}}"#)
             }
         }
     }
@@ -323,24 +336,33 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
         commas(stats.edges_written),
     );
 
-    if let Some(ref report) = stats.phase_b_report {
-        if !report.ran.is_empty() {
-            let langs = report.ran.join(", ");
-            println!("  {} semantic analysis enabled for: {langs}", pal.dim("ℹ"),);
-        }
-        if !report.skipped_no_analyzer.is_empty() {
-            let langs = report.skipped_no_analyzer.join(", ");
+    match &stats.phase_b_report {
+        None => {
+            // Phase B deferred to daemon background scheduler.
             println!(
-                "  {} no semantic analyzer for: {langs} — run `travsr lang add <lang>` to enable",
+                "  {} call edges indexing in background — run `travsr status` to check progress",
                 pal.dim("ℹ"),
             );
         }
-        if !report.crashed.is_empty() {
-            let langs = report.crashed.join(", ");
-            println!(
-                "  {} semantic analysis failed for: {langs} — rerun with RUST_LOG=travsr_plugin_host=debug",
-                pal.dim("⚠"),
-            );
+        Some(report) => {
+            if !report.ran.is_empty() {
+                let langs = report.ran.join(", ");
+                println!("  {} semantic analysis enabled for: {langs}", pal.dim("ℹ"),);
+            }
+            if !report.skipped_no_analyzer.is_empty() {
+                let langs = report.skipped_no_analyzer.join(", ");
+                println!(
+                    "  {} no semantic analyzer for: {langs} — run `travsr lang add <lang>` to enable",
+                    pal.dim("ℹ"),
+                );
+            }
+            if !report.crashed.is_empty() {
+                let langs = report.crashed.join(", ");
+                println!(
+                    "  {} semantic analysis failed for: {langs} — rerun with RUST_LOG=travsr_plugin_host=debug",
+                    pal.dim("⚠"),
+                );
+            }
         }
     }
 

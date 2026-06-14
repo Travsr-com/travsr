@@ -82,7 +82,11 @@ pub enum InitProgress {
         workers: usize,
     },
     /// Post-index semantic passes (LSIF + Phase B); no granular count.
+    /// Only emitted when `--semantic` is passed or there is no HEAD commit.
     Finalizing,
+    /// Phase B deferred to the daemon background scheduler. Emitted on the
+    /// normal (non-`--semantic`) path once Phase A completes successfully.
+    PhaseBDeferred,
 }
 
 /// Initialise a Travsr index in `repo_root`:
@@ -409,7 +413,7 @@ fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -
 }
 
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
-    init_repo_with_progress(repo_root, None, &mut |_| {})
+    init_repo_with_progress(repo_root, None, false, &mut |_| {})
 }
 
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
@@ -417,9 +421,15 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
 /// on the indexing thread; keep it cheap.
 ///
 /// `jobs` sets the parse-worker count (`None` = `available_parallelism()`).
+///
+/// `semantic` forces Phase B to run synchronously before returning, matching
+/// the pre-deferred-Phase-B behaviour. Use this for CI / scripts that query
+/// call edges immediately after init. When `false` (the default), Phase B is
+/// deferred to the daemon background scheduler.
 pub fn init_repo_with_progress(
     repo_root: &Path,
     jobs: Option<usize>,
+    semantic: bool,
     on_progress: &mut dyn FnMut(InitProgress),
 ) -> anyhow::Result<InitStats> {
     let travsr_dir = repo_root.join(".travsr");
@@ -724,36 +734,82 @@ pub fn init_repo_with_progress(
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
-    on_progress(InitProgress::Finalizing);
-
-    // LSIF semantic pass — adds RefCall edges on top of structural edges.
-    // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
-    let t_lsif = std::time::Instant::now();
-    run_lsif_pass(repo_root, &corpus, &mut store);
-    tracing::info!(
-        elapsed_ms = t_lsif.elapsed().as_millis(),
-        "TIMING: run_lsif_pass done"
-    );
-
-    // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
-    // Runs once per full init, not per commit (PERF-002).
-    let t_phase_b = std::time::Instant::now();
-    let phase_b_report = {
-        let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
-        let inputs = travsr_plugin_host::PhaseBInputs {
-            repo_root,
-            present_languages: present_languages.clone(),
-            // P6 (#329): reuse the already-walked file list so Phase B runners
-            // skip their own directory walks.
-            indexable_paths: &indexable_paths,
-        };
-        let (pb_nodes, pb_edges, pb_refs, pb_outcome) = phase_b_indexer.invoke_phase_b_all(&inputs);
-        write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
+    // Decide whether to run Phase B inline now, defer it, or skip it entirely.
+    //
+    // Already-done path: `phase_b_commit == HEAD` means Phase B is current for
+    // this commit (e.g. a previous `--semantic` run or a completed background
+    // refresh). No message, no daemon spawn — silently return a dummy report so
+    // the caller knows Phase B is not pending.
+    //
+    // Deferred path (default): Phase B runs in the background via the daemon's
+    // `run_background_phase_b` once the user's IDE / agent starts it. The
+    // `phase_b_commit` meta key is intentionally left unset so the daemon's
+    // `phase_b_tick` auto-arms the scheduler on startup.
+    //
+    // Inline path (`--semantic` flag, or repo has no HEAD commit):
+    //   • `--semantic`: callers (CI, scripts) need call edges before querying.
+    //   • No commit: `run_background_phase_b` bails when `last_commit` is empty,
+    //     so there is no deferred path available for fresh repos.
+    let has_commit = read_head_commit_sha(repo_root).is_ok();
+    let current_sha = if has_commit {
+        read_head_commit_sha(repo_root).unwrap_or_default()
+    } else {
+        String::new()
     };
-    tracing::info!(
-        elapsed_ms = t_phase_b.elapsed().as_millis(),
-        "TIMING: invoke_phase_b_all done"
-    );
+    let phase_b_commit_stored = store
+        .get_meta("phase_b_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let phase_b_already_done = !current_sha.is_empty() && phase_b_commit_stored == current_sha;
+    let run_phase_b_inline = semantic || !has_commit;
+
+    let phase_b_report = if run_phase_b_inline {
+        on_progress(InitProgress::Finalizing);
+
+        // LSIF semantic pass — adds RefCall edges on top of structural edges.
+        // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
+        let t_lsif = std::time::Instant::now();
+        run_lsif_pass(repo_root, &corpus, &mut store);
+        tracing::info!(
+            elapsed_ms = t_lsif.elapsed().as_millis(),
+            "TIMING: run_lsif_pass done"
+        );
+
+        // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
+        let t_phase_b = std::time::Instant::now();
+        let report = {
+            let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
+            let inputs = travsr_plugin_host::PhaseBInputs {
+                repo_root,
+                present_languages: present_languages.clone(),
+                // P6 (#329): reuse the already-walked file list so Phase B runners
+                // skip their own directory walks.
+                indexable_paths: &indexable_paths,
+            };
+            let (pb_nodes, pb_edges, pb_refs, pb_outcome) =
+                phase_b_indexer.invoke_phase_b_all(&inputs);
+            write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
+        };
+        tracing::info!(
+            elapsed_ms = t_phase_b.elapsed().as_millis(),
+            "TIMING: invoke_phase_b_all done"
+        );
+        Some(report)
+    } else if phase_b_already_done {
+        // Phase B is current for this commit — nothing to do, no message.
+        // Return Some(empty) so init.rs skips the daemon spawn.
+        Some(PhaseBReport {
+            ran: vec![],
+            crashed: vec![],
+            skipped_not_in_repo: vec![],
+            skipped_no_analyzer: vec![],
+            skipped_unregistered: vec![],
+        })
+    } else {
+        on_progress(InitProgress::PhaseBDeferred);
+        None
+    };
 
     // ── Co-package Depends pass ────────────────────────────────────────────────
     // Languages where files share a namespace without explicit imports (Go,
@@ -790,11 +846,12 @@ pub fn init_repo_with_progress(
     // suppressed the stamp on clean re-runs (PR #207).
     if let Ok(sha) = read_head_commit_sha(repo_root) {
         let _ = store.set_meta("last_commit", &sha);
-        // #318 O5: semantic (LSIF/Phase B) data is as fresh as this init.
-        // Until O3 (incremental Phase B) lands, the staleness marker mirrors
-        // the index-time commit; commit-hook reindexes advance last_commit
-        // only, so consumers can compute "semantic data is N commits old".
-        let _ = store.set_meta("phase_b_commit", &sha);
+        // phase_b_commit is stamped only when Phase B ran inline. On the
+        // deferred path we leave it absent so the daemon's phase_b_tick
+        // auto-arms the scheduler when it opens the store.
+        if run_phase_b_inline {
+            let _ = store.set_meta("phase_b_commit", &sha);
+        }
     }
 
     let total_edges = edges_before + edges_written;
@@ -807,7 +864,7 @@ pub fn init_repo_with_progress(
         edges_written,
         total_nodes: nodes_after as u64,
         total_edges,
-        phase_b_report: Some(phase_b_report),
+        phase_b_report,
     })
 }
 
@@ -952,15 +1009,18 @@ fn run_background_phase_b(
     store: &std::sync::Mutex<SqliteStore>,
     sched: &phase_b_sched::PhaseBScheduler,
 ) {
-    // Release the single-flight slot no matter how this function returns.
-    struct FinishGuard<'a>(&'a phase_b_sched::PhaseBScheduler);
-    impl Drop for FinishGuard<'_> {
-        fn drop(&mut self) {
-            self.0.finish();
-        }
-    }
-    let _guard = FinishGuard(sched);
+    // Delegate to an inner fn so we can capture its bool result and always call
+    // finish_with_result, even on early returns — without unsafe raw pointers.
+    let succeeded = run_background_phase_b_inner(repo_root, store);
+    sched.finish_with_result(succeeded);
+}
 
+/// Inner worker for [`run_background_phase_b`].
+///
+/// Returns `true` when at least some semantic work succeeded (LSIF edges
+/// produced, or ≥1 sidecar ran without crashing). `false` means every sidecar
+/// crashed, which increments the retry-cap counter in `PhaseBScheduler`.
+fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<SqliteStore>) -> bool {
     // Brief lock: read the corpus and the two freshness markers. Bail early if
     // the semantic data already matches HEAD (e.g. a commit touched no indexed
     // files, or another run already caught up).
@@ -974,17 +1034,23 @@ fn run_background_phase_b(
             .flatten()
             .unwrap_or_default();
         if last.is_empty() || last == phase_b {
-            return;
+            // Already up to date — not a failure, treat as success so the
+            // retry counter is not incremented.
+            return true;
         }
         (corpus, last)
     };
 
-    tracing::info!(commit=%target_sha, "background phase B refresh starting (#318 O3)");
+    tracing::info!(commit=%target_sha, "background phase B refresh starting");
 
-    // Expensive part: spawn SCIP sidecars / read the filesystem. No store lock
-    // is held here so O1 queries stay warm throughout.
-    // P6 (#329): single walk yields both present_languages and indexable_paths so
-    // Phase B runners receive the file list and skip their own directory walks.
+    // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
+    // Collect edges into a Vec first; write them under the store lock below.
+    // This mirrors the SCIP sidecar pattern and keeps queries warm throughout.
+    let lsif_edges = run_lsif_pass_collect(repo_root, &corpus);
+
+    // ── SCIP sidecar pass (all languages in parallel, lock-free) ─────────────
+    // P6 (#329): single walk yields both present_languages and indexable_paths
+    // so Phase B runners skip their own directory walks.
     let (present_languages, indexable_paths) = collect_present_languages_and_paths(repo_root);
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
     let inputs = travsr_plugin_host::PhaseBInputs {
@@ -994,15 +1060,30 @@ fn run_background_phase_b(
     };
     let (pb_nodes, pb_edges, pb_refs, pb_outcome) = indexer.invoke_phase_b_all(&inputs);
 
-    // Write under the lock, then advance the marker to the commit we indexed.
+    // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Write LSIF edges first (pre-collected lock-free above).
+    for edge in &lsif_edges {
+        if let Err(e) = s.put_edge_lsif(edge) {
+            tracing::warn!("lsif edge write error: {e}");
+        }
+    }
+
     let report = write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
     let _ = s.set_meta("phase_b_commit", &target_sha);
+
+    let succeeded = !report.ran.is_empty() || !lsif_edges.is_empty() || report.crashed.is_empty();
+
     tracing::info!(
         commit = %target_sha,
         ran = report.ran.len(),
-        "background phase B refresh complete (#318 O3)"
+        lsif_edges = lsif_edges.len(),
+        crashed = report.crashed.len(),
+        "background phase B refresh complete"
     );
+
+    succeeded
 }
 
 /// Re-index a set of changed files into `store`.
@@ -1165,42 +1246,54 @@ pub fn reindex_files(
     Ok(())
 }
 
-/// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root.
+/// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root,
+/// writing edges directly into `store`.
+///
+/// Used by the inline path (`--semantic` or no-commit repos). For the deferred
+/// path use [`run_lsif_pass_collect`] + write under the store lock.
 ///
 /// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
 /// warnings and silently skipped — they must never fail the overall index.
 fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) {
+    let edges = run_lsif_pass_collect(repo_root, corpus);
+    for edge in &edges {
+        if let Err(e) = store.put_edge_lsif(edge) {
+            tracing::warn!("lsif edge write error: {e}");
+        }
+    }
+    tracing::debug!("lsif pass: {} RefCall edges persisted", edges.len());
+}
+
+/// Collect LSIF RefCall edges without holding the store lock.
+///
+/// Returns an empty `Vec` when `tsconfig.json` is absent or the emitter fails.
+/// The caller writes the edges under the store lock. This split lets
+/// `run_background_phase_b` hold the lock only for the final write batch while
+/// the expensive TS compiler runs lock-free.
+fn run_lsif_pass_collect(repo_root: &Path, corpus: &str) -> Vec<travsr_core::Edge> {
     let tsconfig = repo_root.join("tsconfig.json");
     if !tsconfig.exists() {
-        return;
+        return Vec::new();
     }
 
     let dump = match run_lsif_emitter(&tsconfig) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!("lsif emitter skipped: {e}");
-            return;
+            return Vec::new();
         }
     };
 
-    let lsif_out = match ingest_lsif(&dump, corpus) {
-        Ok(o) => o,
+    match ingest_lsif(&dump, corpus) {
+        Ok(out) => {
+            tracing::debug!("lsif pass: collected {} RefCall edges", out.edges.len());
+            out.edges
+        }
         Err(e) => {
             tracing::warn!("lsif ingest error: {e}");
-            return;
-        }
-    };
-
-    for edge in &lsif_out.edges {
-        if let Err(e) = store.put_edge_lsif(edge) {
-            tracing::warn!("lsif edge write error: {e}");
+            Vec::new()
         }
     }
-
-    tracing::debug!(
-        "lsif pass: {} RefCall edges persisted",
-        lsif_out.edges.len()
-    );
 }
 
 /// Derive the canonical corpus for `repo_root` by reading `git remote get-url origin`.
@@ -1965,6 +2058,24 @@ impl Daemon {
                         );
                     }
                     _ = phase_b_tick.tick() => {
+                        // Auto-arm when Phase B is pending (deferred init, or daemon
+                        // restarted after a crash mid-Phase-B). Idempotent: calling
+                        // mark_dirty on an already-armed scheduler just pushes the
+                        // deadline forward by the debounce window.
+                        {
+                            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                            let last = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+                            let pb   = s.get_meta("phase_b_commit").ok().flatten().unwrap_or_default();
+                            if !last.is_empty() && last != pb {
+                                // Use arm_immediate (not mark_dirty) so the
+                                // deadline is set to now instead of now+debounce.
+                                // mark_dirty called every 5 s would push the
+                                // 30 s deadline forward forever — Phase B would
+                                // never fire. arm_immediate is a no-op when a
+                                // commit-triggered debounce is already counting.
+                                phase_b_scheduler.arm_immediate();
+                            }
+                        }
                         // #318 O3: start a background Phase B refresh iff one is
                         // due (armed + past debounce) and none is already running.
                         if phase_b_scheduler.try_claim() {
@@ -2004,6 +2115,22 @@ impl Daemon {
                         );
                     }
                     _ = phase_b_tick.tick() => {
+                        // Auto-arm when Phase B is pending (deferred init, or daemon
+                        // restarted after a crash mid-Phase-B).
+                        {
+                            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                            let last = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+                            let pb   = s.get_meta("phase_b_commit").ok().flatten().unwrap_or_default();
+                            if !last.is_empty() && last != pb {
+                                // Use arm_immediate (not mark_dirty) so the
+                                // deadline is set to now instead of now+debounce.
+                                // mark_dirty called every 5 s would push the
+                                // 30 s deadline forward forever — Phase B would
+                                // never fire. arm_immediate is a no-op when a
+                                // commit-triggered debounce is already counting.
+                                phase_b_scheduler.arm_immediate();
+                            }
+                        }
                         // #318 O3: start a background Phase B refresh iff one is
                         // due (armed + past debounce) and none is already running.
                         if phase_b_scheduler.try_claim() {

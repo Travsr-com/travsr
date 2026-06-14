@@ -128,6 +128,18 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
     lines.join("\n")
 }
 
+/// Returns `true` when Phase B was deferred to the daemon background scheduler
+/// and has not yet completed for this repository.
+///
+/// The signal is: `last_commit` is set (a real init ran) but `phase_b_commit`
+/// is absent (Phase B hasn't finished). This avoids false positives on no-commit
+/// repos where both keys are absent and Phase B ran inline during init.
+fn phase_b_pending(store: &SqliteStore) -> bool {
+    let phase_b = store.get_meta("phase_b_commit").ok().flatten();
+    let last = store.get_meta("last_commit").ok().flatten();
+    phase_b.is_none() && last.is_some()
+}
+
 /// Return all nodes that have an incoming edge to the given symbol, tagged
 /// by provenance so both semantic and structural callers are visible.
 ///
@@ -146,6 +158,15 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
     if let Err(reason) = validate_mcp_arg(symbol) {
         tracing::warn!("get_callers rejected invalid arg: {reason}");
         return String::new();
+    }
+    // Phase B deferred: a HEAD commit exists but phase_b_commit hasn't been
+    // stamped yet, meaning Phase B was deferred to the daemon background
+    // scheduler. Return a structured message so the LLM/agent retries rather
+    // than treating an absent result as "no callers exist".
+    // No-commit repos (both keys absent) and fully-indexed repos (both keys
+    // present) fall through to the normal path.
+    if phase_b_pending(store) {
+        return r#"{"status":"pending","message":"Semantic call-edge index is building in the background. Call edges will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
     sanitize_for_mcp(&get_callers_raw(store, symbol))
@@ -1099,6 +1120,10 @@ pub fn repos_remove(name: &str) -> String {
 /// Returns empty string for both "symbol not found" and "symbol access denied".
 /// These cases are indistinguishable to the caller (prevents existence oracle).
 pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> String {
+    // Phase B deferred: execution paths require call edges which are not yet indexed.
+    if phase_b_pending(store) {
+        return r#"{"status":"pending","message":"Semantic call-edge index is building in the background. Execution paths will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
+    }
     get_execution_path_with_filter(store, source, sink, &OpenFilter)
 }
 
