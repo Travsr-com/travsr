@@ -323,19 +323,22 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
         commas(stats.edges_written),
     );
 
-    // Phase B absent notice — surfaces when an analyzer was not found.
     if let Some(ref report) = stats.phase_b_report {
-        if !report.skipped_absent.is_empty() {
-            let langs = report.skipped_absent.join(", ");
+        if !report.ran.is_empty() {
+            let langs = report.ran.join(", ");
+            println!("  {} semantic analysis enabled for: {langs}", pal.dim("ℹ"),);
+        }
+        if !report.skipped_no_analyzer.is_empty() {
+            let langs = report.skipped_no_analyzer.join(", ");
             println!(
-                "  {} note: Phase B skipped for {langs} (analyzer not found) — Phase-A-only",
+                "  {} no semantic analyzer for: {langs} — run `travsr lang add <lang>` to enable",
                 pal.dim("ℹ"),
             );
         }
         if !report.crashed.is_empty() {
             let langs = report.crashed.join(", ");
             println!(
-                "  {} note: Phase B crashed for {langs} — Phase-A-only (rerun with RUST_LOG=travsr_plugin_host=debug for details)",
+                "  {} semantic analysis failed for: {langs} — rerun with RUST_LOG=travsr_plugin_host=debug",
                 pal.dim("⚠"),
             );
         }

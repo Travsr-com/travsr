@@ -52,10 +52,14 @@ pub struct InitStats {
 /// tell the user which analyzers ran and which were absent.
 #[derive(Debug, Default, Clone)]
 pub struct PhaseBReport {
-    /// Languages for which Phase B ran successfully.
+    /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
-    /// Languages for which the analyzer binary was not found.
-    pub skipped_absent: Vec<String>,
+    /// Languages P1-gated because no source files of that type exist in the
+    /// repo. Not shown to the user — irrelevant when the language is absent.
+    pub skipped_not_in_repo: Vec<String>,
+    /// Languages present in the repo but with no semantic analyzer available.
+    /// Shown to the user with a `travsr lang add` call-to-action.
+    pub skipped_no_analyzer: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
     /// Languages whose analyzer spawned but died or errored mid-invoke.
@@ -553,6 +557,9 @@ pub fn init_repo_with_progress(
         .build();
 
     let mut indexable_paths: Vec<PathBuf> = Vec::new();
+    // P1 (#322): collected during the walk so Phase B skips sidecars for absent
+    // languages without spawning a single subprocess for them.
+    let mut present_languages: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut scanned: u64 = 0;
     for entry in walker {
         // Emit a scanning tick periodically so a large tree does not look hung
@@ -588,7 +595,8 @@ pub fn init_repo_with_progress(
             continue;
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if Language::from_extension(ext).is_some() {
+        if let Some(lang) = Language::from_extension(ext) {
+            present_languages.insert(lang.as_str().to_string());
             indexable_paths.push(p);
         }
     }
@@ -606,6 +614,7 @@ pub fn init_repo_with_progress(
                 .add_custom_ignore_filename(".travsrignore")
                 .build();
             indexable_paths.clear();
+            present_languages.clear();
             for entry in walker2.flatten() {
                 if !entry.file_type().is_some_and(|t| t.is_file()) {
                     continue;
@@ -620,7 +629,8 @@ pub fn init_repo_with_progress(
                     continue;
                 }
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if Language::from_extension(ext).is_some() {
+                if let Some(lang) = Language::from_extension(ext) {
+                    present_languages.insert(lang.as_str().to_string());
                     indexable_paths.push(p);
                 }
             }
@@ -709,8 +719,11 @@ pub fn init_repo_with_progress(
     // Runs once per full init, not per commit (PERF-002).
     let phase_b_report = {
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
-        let (pb_nodes, pb_edges, pb_refs, pb_outcome) =
-            phase_b_indexer.invoke_phase_b_all(repo_root);
+        let inputs = travsr_plugin_host::PhaseBInputs {
+            repo_root,
+            present_languages: present_languages.clone(),
+        };
+        let (pb_nodes, pb_edges, pb_refs, pb_outcome) = phase_b_indexer.invoke_phase_b_all(&inputs);
         write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
     };
 
@@ -847,10 +860,45 @@ fn write_phase_b_results(
     }
     PhaseBReport {
         ran: pb_outcome.ran,
-        skipped_absent: pb_outcome.skipped_absent,
+        skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
+        skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
         skipped_unregistered: pb_outcome.skipped_unregistered,
         crashed: pb_outcome.crashed,
     }
+}
+
+/// Walk `repo_root` and return the set of language names (Language::as_str)
+/// that are present in source files. Used to gate Phase B sidecars so a
+/// TypeScript-only repo never spawns Rust/Go/Java/etc. processes (#322 P1).
+fn collect_present_languages(repo_root: &Path) -> std::collections::HashSet<String> {
+    use ignore::WalkBuilder;
+    let mut langs = std::collections::HashSet::new();
+    for entry in WalkBuilder::new(repo_root)
+        .hidden(false)
+        .git_ignore(true)
+        .follow_links(false)
+        .add_custom_ignore_filename(".travsrignore")
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let p = entry.into_path();
+        let rel = p.strip_prefix(repo_root).unwrap_or(&p);
+        if rel.components().any(|c| {
+            crate::watcher::SKIP_DIRS
+                .iter()
+                .any(|skip| c.as_os_str() == *skip)
+        }) {
+            continue;
+        }
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if let Some(lang) = Language::from_extension(ext) {
+            langs.insert(lang.as_str().to_string());
+        }
+    }
+    langs
 }
 
 /// Background, single-flight Phase B refresh (#318 O3).
@@ -902,8 +950,14 @@ fn run_background_phase_b(
 
     // Expensive part: spawn SCIP sidecars / read the filesystem. No store lock
     // is held here so O1 queries stay warm throughout.
+    // P1 (#322): collect present languages so Phase B skips absent-language sidecars.
+    let present_languages = collect_present_languages(repo_root);
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
-    let (pb_nodes, pb_edges, pb_refs, pb_outcome) = indexer.invoke_phase_b_all(repo_root);
+    let inputs = travsr_plugin_host::PhaseBInputs {
+        repo_root,
+        present_languages,
+    };
+    let (pb_nodes, pb_edges, pb_refs, pb_outcome) = indexer.invoke_phase_b_all(&inputs);
 
     // Write under the lock, then advance the marker to the commit we indexed.
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());

@@ -42,8 +42,19 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
     let ffi_edges = indexer.resolve_ffi_edges(&all_markers);
 
     // Phase B: semantic edges (resolves-to, ref/call) via external sidecars.
+    // P1 (#322): derive present_languages from the already-collected file list.
+    let present_languages: std::collections::HashSet<String> = files
+        .iter()
+        .filter_map(|p| p.extension().and_then(|e| e.to_str()))
+        .filter_map(travsr_core::Language::from_extension)
+        .map(|l| l.as_str().to_string())
+        .collect();
+    let phase_b_inputs = travsr_plugin_host::PhaseBInputs {
+        repo_root: dir,
+        present_languages,
+    };
     let (phase_b_nodes, phase_b_edges, _phase_b_refs, _phase_b_outcome) =
-        indexer.invoke_phase_b_all(dir);
+        indexer.invoke_phase_b_all(&phase_b_inputs);
     for node in phase_b_nodes {
         all_nodes.insert(node.id, node);
     }
