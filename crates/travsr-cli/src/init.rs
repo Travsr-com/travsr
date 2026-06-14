@@ -18,24 +18,6 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
 
     let db_path = repo_root.join(".travsr/graph.db");
 
-    // On the deferred path (phase_b_report == None), spawn the daemon so Phase B
-    // runs in the background immediately without requiring the user to remember
-    // `travsr daemon start`. If the daemon is already running, the spawn is a
-    // no-op — the running daemon will auto-arm via phase_b_tick within 5 s.
-    if stats.phase_b_report.is_none() {
-        if let Err(e) = spawn_background_daemon(&repo_root) {
-            // Non-fatal: daemon spawn failure must not fail `travsr init`.
-            // The user can run `travsr daemon start` manually.
-            tracing::warn!("could not auto-start daemon for background Phase B: {e:#}");
-            if !quiet {
-                eprintln!(
-                    "warning: could not start background daemon — \
-                     run `travsr daemon start` to complete semantic indexing"
-                );
-            }
-        }
-    }
-
     if json {
         // Machine-readable summary on stdout for CI; progress went to stderr.
         let phase_b = if stats.phase_b_report.is_some() {
@@ -75,36 +57,6 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
         let _ = hint_lang_detect(&repo_root);
     }
 
-    Ok(())
-}
-
-/// Spawn the travsr daemon as a detached background process so Phase B runs
-/// without the user having to run `travsr daemon start` manually.
-///
-/// If the daemon is already running (control socket responds) the spawn is
-/// skipped — the running daemon will auto-arm its Phase B scheduler within one
-/// `phase_b_tick` interval (≤ 5 s).
-fn spawn_background_daemon(repo_root: &std::path::Path) -> anyhow::Result<()> {
-    // Guard: skip spawn when a daemon is already responding on the socket.
-    // The running daemon will auto-arm its Phase B scheduler within 5 s via
-    // the phase_b_tick handler.
-    if super::daemon_client::send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status)
-        .is_ok()
-    {
-        tracing::debug!("daemon already running — skipping auto-spawn for Phase B");
-        return Ok(());
-    }
-
-    let exe = std::env::current_exe().context("finding current exe path")?;
-    std::process::Command::new(&exe)
-        .args(["daemon", "start", "--foreground"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawning background daemon")?;
-
-    tracing::info!("background daemon spawned for Phase B indexing");
     Ok(())
 }
 

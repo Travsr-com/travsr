@@ -338,9 +338,10 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
 
     match &stats.phase_b_report {
         None => {
-            // Phase B deferred to daemon background scheduler.
+            // Phase B deferred — daemon picks it up if running, otherwise
+            // the user starts it with `travsr daemon start`.
             println!(
-                "  {} call edges indexing in background — run `travsr status` to check progress",
+                "  {} semantic call-edge indexing deferred — run `travsr daemon start` to index in background",
                 pal.dim("ℹ"),
             );
         }
