@@ -377,6 +377,7 @@ mod tests {
             root: std::path::PathBuf::from("."),
             corpus: String::new(),
             scratch: std::path::PathBuf::default(),
+            files: None,
         };
         assert!(matches!(
             t.invoke_phase_b(req),

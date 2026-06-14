@@ -81,29 +81,41 @@ pub fn phase_b_native_dart(
 
 /// Native Phase B for Rust: Cargo.toml dep graph + tree-sitter call edges.
 /// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+///
+/// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
+/// Pass `None` to fall back to a local directory walk.
 pub fn phase_b_native_rust(
     corpus: &str,
     root: &std::path::Path,
+    files: Option<&[(std::path::PathBuf, String)]>,
 ) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
-    phase_b_rust::extract_native_phase_b(corpus, root)
+    phase_b_rust::extract_native_phase_b(corpus, root, files)
 }
 
 /// Native Phase B for TypeScript: tree-sitter call + inheritance edges.
 /// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+///
+/// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
+/// Pass `None` to fall back to a local directory walk.
 pub fn phase_b_native_typescript(
     corpus: &str,
     root: &std::path::Path,
+    files: Option<&[(std::path::PathBuf, String)]>,
 ) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
-    phase_b_typescript::extract_native_phase_b(corpus, root)
+    phase_b_typescript::extract_native_phase_b(corpus, root, files)
 }
 
 /// Native Phase B for Python: tree-sitter call + inheritance edges.
 /// Zero external-tool downloads. SCIP enrichment is merged by the caller.
+///
+/// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
+/// Pass `None` to fall back to a local directory walk.
 pub fn phase_b_native_python(
     corpus: &str,
     root: &std::path::Path,
+    files: Option<&[(std::path::PathBuf, String)]>,
 ) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
-    phase_b_python::extract_native_phase_b(corpus, root)
+    phase_b_python::extract_native_phase_b(corpus, root, files)
 }
 
 /// Resolve relative imports in `nodes` to `resolves-to` edges.

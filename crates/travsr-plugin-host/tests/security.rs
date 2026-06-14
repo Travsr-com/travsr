@@ -442,6 +442,7 @@ fn sidecar_stub_disabled_health_is_isolated() {
         corpus: String::new(),
         root: PathBuf::from("."),
         scratch: PathBuf::default(),
+        files: None,
     };
     let invoke_result = sidecar.invoke_phase_b(invoke_req);
     assert!(

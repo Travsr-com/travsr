@@ -45,7 +45,16 @@ const IMPLEMENTS_QUERY: &str = "
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Extract native Phase B edges for a TypeScript/JavaScript corpus at `root`.
-pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+///
+/// When `files` is `Some`, the caller supplies pre-walked `(abs_path, vname_path)`
+/// pairs from the daemon's Phase A walk (P6 — #329); the extractor uses them
+/// directly and skips its own directory walk. Pass `None` to fall back to
+/// `collect_source_files`.
+pub fn extract_native_phase_b(
+    corpus: &str,
+    root: &Path,
+    files: Option<&[(PathBuf, String)]>,
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -54,11 +63,22 @@ pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<
     let extends_q = Query::new(&language, EXTENDS_QUERY).context("ts extends query")?;
     let implements_q = Query::new(&language, IMPLEMENTS_QUERY).context("ts implements query")?;
 
-    for (abs_path, vname_path) in collect_source_files(root, &["ts", "tsx", "mts", "cts"]) {
+    // Use the daemon's pre-walked file list when available (P6 — #329); fall back
+    // to a local walk for old daemons and the `travsr index` CLI path.
+    let walked;
+    let file_pairs: &[(PathBuf, String)] = match files {
+        Some(f) => f,
+        None => {
+            walked = collect_source_files(root, &["ts", "tsx", "mts", "cts"]);
+            &walked
+        }
+    };
+
+    for (abs_path, vname_path) in file_pairs {
         match extract_file_edges(
             corpus,
-            &abs_path,
-            &vname_path,
+            abs_path,
+            vname_path,
             &language,
             &call_q,
             &extends_q,

@@ -35,7 +35,16 @@ const INHERIT_QUERY: &str = "
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Extract native Phase B edges for a Python corpus at `root`.
-pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+///
+/// When `files` is `Some`, the caller supplies pre-walked `(abs_path, vname_path)`
+/// pairs from the daemon's Phase A walk (P6 — #329); the extractor uses them
+/// directly and skips its own directory walk. Pass `None` to fall back to
+/// `collect_source_files`.
+pub fn extract_native_phase_b(
+    corpus: &str,
+    root: &Path,
+    files: Option<&[(PathBuf, String)]>,
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -43,15 +52,19 @@ pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<
     let call_q = Query::new(&language, CALL_QUERY).context("python call query")?;
     let inherit_q = Query::new(&language, INHERIT_QUERY).context("python inherit query")?;
 
-    for (abs_path, vname_path) in collect_source_files(root, &["py", "pyi"]) {
-        match extract_file_edges(
-            corpus,
-            &abs_path,
-            &vname_path,
-            &language,
-            &call_q,
-            &inherit_q,
-        ) {
+    // Use the daemon's pre-walked file list when available (P6 — #329); fall back
+    // to a local walk for old daemons and the `travsr index` CLI path.
+    let walked;
+    let file_pairs: &[(PathBuf, String)] = match files {
+        Some(f) => f,
+        None => {
+            walked = collect_source_files(root, &["py", "pyi"]);
+            &walked
+        }
+    };
+
+    for (abs_path, vname_path) in file_pairs {
+        match extract_file_edges(corpus, abs_path, vname_path, &language, &call_q, &inherit_q) {
             Ok((file_nodes, file_edges)) => {
                 nodes.extend(file_nodes);
                 edges.extend(file_edges);

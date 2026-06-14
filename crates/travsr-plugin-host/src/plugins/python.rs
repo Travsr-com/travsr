@@ -33,12 +33,19 @@ impl Plugin for PythonPlugin {
         }
     }
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
+        // Convert pre-walked relative paths (P6 — #329) to (abs, vname) pairs for the extractor.
+        let files_owned: Option<Vec<(std::path::PathBuf, String)>> = req
+            .files
+            .as_ref()
+            .map(|rel| rel.iter().map(|r| (req.root.join(r), r.clone())).collect());
+
         // Native Phase B: always runs, zero external-tool requirements.
-        let (mut nodes, mut edges) = travsr_indexer::phase_b_native_python(&req.corpus, &req.root)
-            .unwrap_or_else(|e| {
-                tracing::warn!("python native phase_b: {e}");
-                (vec![], vec![])
-            });
+        let (mut nodes, mut edges) =
+            travsr_indexer::phase_b_native_python(&req.corpus, &req.root, files_owned.as_deref())
+                .unwrap_or_else(|e| {
+                    tracing::warn!("python native phase_b: {e}");
+                    (vec![], vec![])
+                });
         tracing::debug!(
             nodes = nodes.len(),
             edges = edges.len(),

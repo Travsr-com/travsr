@@ -41,6 +41,14 @@ pub struct InvokeRequest {
     /// `std::env::temp_dir()`, accepting that the sandbox may deny the write.
     #[serde(default)]
     pub scratch: PathBuf,
+    /// Pre-walked list of source files for this language (repo-root-relative paths),
+    /// forwarded from the daemon's Phase A walk (P6 — #329).
+    /// `None` = old daemon that doesn't support P6 → sidecar MUST walk itself.
+    /// `Some(paths)` = daemon pre-walked; sidecar SHOULD use this list.
+    /// (P1 ensures this is never `Some([])` for a lang without source files —
+    /// sidecars for absent languages are never spawned.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
