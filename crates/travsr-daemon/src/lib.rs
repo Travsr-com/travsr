@@ -951,6 +951,7 @@ fn run_background_phase_b(
     // Expensive part: spawn SCIP sidecars / read the filesystem. No store lock
     // is held here so O1 queries stay warm throughout.
     // P1 (#322): collect present languages so Phase B skips absent-language sidecars.
+    // DEBT(travsr-329): second walk — #329 will pass indexable_paths via InvokeRequest instead.
     let present_languages = collect_present_languages(repo_root);
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
     let inputs = travsr_plugin_host::PhaseBInputs {

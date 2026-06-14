@@ -269,6 +269,8 @@ impl PluginIndexer {
                                         }
                                     }
                                     Err(e) => {
+                                        // Dart is builtin — failure means the Dart SDK/pub-cache
+                                        // is unavailable, not that no analyzer exists.
                                         tracing::warn!("Phase B dart: {e:#}");
                                         LangResult {
                                             lang,
@@ -276,8 +278,8 @@ impl PluginIndexer {
                                             edges: Vec::new(),
                                             refs: Vec::new(),
                                             ran: false,
-                                            skipped_no_analyzer: true,
-                                            crashed: false,
+                                            skipped_no_analyzer: false,
+                                            crashed: true,
                                         }
                                     }
                                 }
