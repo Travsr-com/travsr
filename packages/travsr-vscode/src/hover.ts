@@ -11,6 +11,7 @@
 
 import * as vscode from "vscode";
 import type { McpClient } from "./mcp";
+import { parseEnvelope } from "./extension";
 
 export const HOVER_SELECTOR: vscode.DocumentSelector = [
   { language: "typescript" },
@@ -35,13 +36,6 @@ export const HOVER_SELECTOR: vscode.DocumentSelector = [
 interface HoverData {
   callers: string[];
   blastCount: number;
-}
-
-function parseCallers(raw: string): string[] {
-  return raw
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
 }
 
 function formatCallerLine(line: string): string {
@@ -92,12 +86,12 @@ export class CallersHoverProvider implements vscode.HoverProvider {
 
       const callers = hasCallers
         ? (this.callerCache.get(callerKey) ?? [])
-        : parseCallers(callersRaw);
+        : parseEnvelope(callersRaw);
       if (!hasCallers) this.callerCache.set(callerKey, callers.length > 0 ? callers : null);
 
       const blastCount = hasBlast
         ? (this.blastCache.get(file) ?? 0)
-        : blastRaw.split("\n").map((l) => l.trim()).filter(Boolean).length;
+        : parseEnvelope(blastRaw).length;
       if (!hasBlast) this.blastCache.set(file, blastCount);
 
       if (callers.length === 0 && blastCount === 0) return undefined;
