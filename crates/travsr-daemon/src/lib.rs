@@ -680,6 +680,7 @@ pub fn init_repo_with_progress(
         .context("creating bulk FTS tracking table")?;
 
     let edges_before = store.edge_count().unwrap_or(0);
+    let t_parse = std::time::Instant::now();
     let index_result = index_paths_parallel(
         &indexable_paths,
         repo_root,
@@ -689,21 +690,35 @@ pub fn init_repo_with_progress(
         &mut store,
         on_progress,
     );
+    tracing::info!(
+        elapsed_ms = t_parse.elapsed().as_millis(),
+        "TIMING: index_paths_parallel done"
+    );
 
     // Rebuild FTS + vocab in one pass now that all nodes are written.
     // Do this before restoring pragmas so the rebuild benefits from the
     // expanded cache and synchronous=OFF.
+    let t_fts = std::time::Instant::now();
     if index_result.is_ok() {
         store
             .rebuild_fts_from_map()
             .context("rebuilding FTS after bulk init")?;
     }
+    tracing::info!(
+        elapsed_ms = t_fts.elapsed().as_millis(),
+        "TIMING: rebuild_fts_from_map done"
+    );
 
     // Always restore pragmas — even on error — so the store is left in a
     // consistent state if the caller catches the error and continues.
+    let t_pragma = std::time::Instant::now();
     store
         .set_bulk_init_mode(false)
         .context("restoring sync mode after bulk init")?;
+    tracing::info!(
+        elapsed_ms = t_pragma.elapsed().as_millis(),
+        "TIMING: set_bulk_init_mode(false) done"
+    );
 
     let (batch_counts, files_skipped_unchanged) = index_result?;
 
@@ -713,19 +728,32 @@ pub fn init_repo_with_progress(
 
     // LSIF semantic pass — adds RefCall edges on top of structural edges.
     // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
+    let t_lsif = std::time::Instant::now();
     run_lsif_pass(repo_root, &corpus, &mut store);
+    tracing::info!(
+        elapsed_ms = t_lsif.elapsed().as_millis(),
+        "TIMING: run_lsif_pass done"
+    );
 
     // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
     // Runs once per full init, not per commit (PERF-002).
+    let t_phase_b = std::time::Instant::now();
     let phase_b_report = {
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
         let inputs = travsr_plugin_host::PhaseBInputs {
             repo_root,
             present_languages: present_languages.clone(),
+            // P6 (#329): reuse the already-walked file list so Phase B runners
+            // skip their own directory walks.
+            indexable_paths: &indexable_paths,
         };
         let (pb_nodes, pb_edges, pb_refs, pb_outcome) = phase_b_indexer.invoke_phase_b_all(&inputs);
         write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
     };
+    tracing::info!(
+        elapsed_ms = t_phase_b.elapsed().as_millis(),
+        "TIMING: invoke_phase_b_all done"
+    );
 
     // ── Co-package Depends pass ────────────────────────────────────────────────
     // Languages where files share a namespace without explicit imports (Go,
@@ -868,11 +896,15 @@ fn write_phase_b_results(
 }
 
 /// Walk `repo_root` and return the set of language names (Language::as_str)
-/// that are present in source files. Used to gate Phase B sidecars so a
-/// TypeScript-only repo never spawns Rust/Go/Java/etc. processes (#322 P1).
-fn collect_present_languages(repo_root: &Path) -> std::collections::HashSet<String> {
+/// and the list of indexable absolute file paths. Used by the background Phase B
+/// refresh (#318 O3) so P1 gating (#322) and P6 file-list forwarding (#329)
+/// both come from a single directory walk.
+fn collect_present_languages_and_paths(
+    repo_root: &Path,
+) -> (std::collections::HashSet<String>, Vec<PathBuf>) {
     use ignore::WalkBuilder;
     let mut langs = std::collections::HashSet::new();
+    let mut paths = Vec::new();
     for entry in WalkBuilder::new(repo_root)
         .hidden(false)
         .git_ignore(true)
@@ -896,9 +928,10 @@ fn collect_present_languages(repo_root: &Path) -> std::collections::HashSet<Stri
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         if let Some(lang) = Language::from_extension(ext) {
             langs.insert(lang.as_str().to_string());
+            paths.push(p);
         }
     }
-    langs
+    (langs, paths)
 }
 
 /// Background, single-flight Phase B refresh (#318 O3).
@@ -950,13 +983,14 @@ fn run_background_phase_b(
 
     // Expensive part: spawn SCIP sidecars / read the filesystem. No store lock
     // is held here so O1 queries stay warm throughout.
-    // P1 (#322): collect present languages so Phase B skips absent-language sidecars.
-    // DEBT(travsr-329): second walk — #329 will pass indexable_paths via InvokeRequest instead.
-    let present_languages = collect_present_languages(repo_root);
+    // P6 (#329): single walk yields both present_languages and indexable_paths so
+    // Phase B runners receive the file list and skip their own directory walks.
+    let (present_languages, indexable_paths) = collect_present_languages_and_paths(repo_root);
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
     let inputs = travsr_plugin_host::PhaseBInputs {
         repo_root,
         present_languages,
+        indexable_paths: &indexable_paths,
     };
     let (pb_nodes, pb_edges, pb_refs, pb_outcome) = indexer.invoke_phase_b_all(&inputs);
 

@@ -52,6 +52,9 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
     let phase_b_inputs = travsr_plugin_host::PhaseBInputs {
         repo_root: dir,
         present_languages,
+        // P6 (#329): forward the already-collected file list so Phase B runners
+        // skip their own directory walks.
+        indexable_paths: &files,
     };
     let (phase_b_nodes, phase_b_edges, _phase_b_refs, _phase_b_outcome) =
         indexer.invoke_phase_b_all(&phase_b_inputs);

@@ -366,6 +366,7 @@ fn corpus_flows_into_invoke_request() {
         root: repo_root.path().to_path_buf(),
         corpus: indexer.corpus.clone(),
         scratch: std::path::PathBuf::default(),
+        files: None,
     };
 
     assert_eq!(

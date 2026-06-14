@@ -2186,6 +2186,7 @@ impl SqliteStore {
         // Contentless FTS5 tables forbid DELETE FROM and the 'rebuild' command.
         // Retracting non-existent entries corrupts the index, so we filter by
         // _bulk_fts_pending rather than clear-and-rebuild.
+        let t_fts5 = std::time::Instant::now();
         {
             let tx = self
                 .conn
@@ -2202,10 +2203,15 @@ impl SqliteStore {
             .context("bulk-inserting nodes_fts from pending nodes")?;
             tx.commit().context("committing FTS rebuild")?;
         }
+        tracing::info!(
+            elapsed_ms = t_fts5.elapsed().as_millis(),
+            "TIMING: FTS5 bulk INSERT done"
+        );
 
         // Phase 2: rebuild fts_vocab by counting tokens in Rust, then
         // bulk-inserting unique token counts. This replaces ~6–10M per-token
         // SQL upserts with ~50k–200k unique-token inserts (kubernetes estimate).
+        let t_vocab_scan = std::time::Instant::now();
         let token_strings: Vec<String> = {
             let mut stmt = self
                 .conn
@@ -2218,8 +2224,14 @@ impl SqliteStore {
                 .context("collecting token strings for vocab rebuild")?;
             collected
         };
+        tracing::info!(
+            elapsed_ms = t_vocab_scan.elapsed().as_millis(),
+            rows = token_strings.len(),
+            "TIMING: nodes_fts_map scan done"
+        );
 
         // Count token frequencies in Rust — O(nodes × tokens_per_node).
+        let t_count = std::time::Instant::now();
         let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         for ts in &token_strings {
             for tok in ts.split_whitespace() {
@@ -2228,11 +2240,17 @@ impl SqliteStore {
                 }
             }
         }
+        tracing::info!(
+            elapsed_ms = t_count.elapsed().as_millis(),
+            unique_tokens = counts.len(),
+            "TIMING: token count done"
+        );
 
         if counts.is_empty() {
             return Ok(());
         }
 
+        let t_vocab_write = std::time::Instant::now();
         let tx = self
             .conn
             .transaction()
@@ -2247,6 +2265,11 @@ impl SqliteStore {
             .context("inserting rebuilt fts_vocab row")?;
         }
         tx.commit().context("committing fts_vocab rebuild")?;
+        tracing::info!(
+            elapsed_ms = t_vocab_write.elapsed().as_millis(),
+            rows = counts.len(),
+            "TIMING: fts_vocab write done"
+        );
 
         tracing::info!(
             nodes = token_strings.len(),

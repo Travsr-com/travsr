@@ -4,7 +4,8 @@ use crate::plugins::response_to_output;
 use crate::registry::register_builtins;
 use crate::resolver::PluginResolver;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use travsr_core::Language;
 use travsr_error::IndexError;
 use travsr_indexer::{hash_file, ParseOutput};
 
@@ -33,11 +34,19 @@ pub struct PhaseBOutcome {
 /// run every language the resolver provides" (used by call sites that do not
 /// have a prior walk, e.g. `run_background_phase_b` before it gains its own
 /// walk result).
+///
+/// `indexable_paths` carries the daemon's pre-walked absolute file paths so
+/// Phase B runners don't need to re-walk the directory tree (P6 — #329).
+/// An **empty** slice means "not available" — runners fall back to their own walk.
 pub struct PhaseBInputs<'a> {
     pub repo_root: &'a Path,
     /// Canonical resolver name strings (`Language::as_str()`) of languages
     /// detected during the Phase A file walk.
     pub present_languages: HashSet<String>,
+    /// All indexable absolute paths from the daemon's Phase A walk.
+    /// Partitioned by language extension inside `invoke_phase_b_all` and
+    /// forwarded via `InvokeRequest.files` (P6 — #329).
+    pub indexable_paths: &'a [PathBuf],
 }
 
 /// Drop-in replacement for travsr_indexer::Indexer.
@@ -174,7 +183,36 @@ impl PluginIndexer {
         struct WorkItem {
             lang: String,
             work: LangWork,
+            /// Pre-filtered repo-root-relative paths for this language (P6 — #329).
+            /// `None` when `inputs.indexable_paths` is empty (caller has no pre-walk).
+            files: Option<Vec<String>>,
         }
+
+        // P6 (#329): filter the daemon's pre-walked paths by language extension so
+        // each sidecar/runner receives only its language's files and skips its own walk.
+        // Returns `None` when `inputs.indexable_paths` is empty (no pre-walk available).
+        let lang_files = |lang_name: &str| -> Option<Vec<String>> {
+            if inputs.indexable_paths.is_empty() {
+                return None;
+            }
+            let paths: Vec<String> = inputs
+                .indexable_paths
+                .iter()
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(Language::from_extension)
+                        .map(|l| l.as_str() == lang_name)
+                        .unwrap_or(false)
+                })
+                .filter_map(|p| {
+                    p.strip_prefix(repo_root)
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                })
+                .collect();
+            Some(paths)
+        };
 
         let mut work_items: Vec<WorkItem> = Vec::new();
 
@@ -205,9 +243,12 @@ impl PluginIndexer {
                 // the daemon process where HOME and the full env are intact.
                 // Running in a thread (below) is safe: threads share the process
                 // environment and do not trigger the nested-sidecar SIGABRT.
+                // Dart uses an external emitter binary that doesn't accept a file
+                // list, so P6 does not apply here.
                 work_items.push(WorkItem {
                     lang,
                     work: LangWork::Dart,
+                    files: None,
                 });
                 continue;
             }
@@ -215,9 +256,11 @@ impl PluginIndexer {
             match resolver.resolve(&lang) {
                 Some(spec) => {
                     tracing::debug!(lang = %lang, program = %spec.program, "Phase B: resolved spec");
+                    let files = lang_files(&lang);
                     work_items.push(WorkItem {
                         lang,
                         work: LangWork::Sidecar(spec),
+                        files,
                     });
                 }
                 None => {
@@ -289,6 +332,9 @@ impl PluginIndexer {
                                     root: repo_root.to_path_buf(),
                                     corpus: corpus.to_string(),
                                     scratch: std::path::PathBuf::default(),
+                                    // P6 (#329): forward pre-walked file list so the
+                                    // sidecar skips its own directory walk.
+                                    files: item.files,
                                 };
                                 match crate::transport::Sidecar::spawn(&spec, repo_root) {
                                     Ok(sidecar) => {
@@ -480,6 +526,7 @@ mod tests {
             repo_root: std::path::Path::new("/nonexistent"),
             // Single dummy language that no file extension maps to — gates out everything.
             present_languages: ["__no_such_lang__".to_string()].into_iter().collect(),
+            indexable_paths: &[],
         };
         let (nodes, edges, refs, outcome) = indexer.invoke_phase_b_all(&inputs);
         assert!(nodes.is_empty(), "expected no nodes when all langs absent");
@@ -503,6 +550,7 @@ mod tests {
         let inputs = PhaseBInputs {
             repo_root: std::path::Path::new("/nonexistent"),
             present_languages: HashSet::new(), // no gating
+            indexable_paths: &[],
         };
         let (_, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
         let (_, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);

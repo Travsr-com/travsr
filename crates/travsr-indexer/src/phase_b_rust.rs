@@ -35,7 +35,16 @@ const CALL_QUERY: &str = "
 /// Returns `(nodes, edges)`:
 ///   - crate nodes + `Depends` edges from Cargo.toml dependency graph
 ///   - `RefCall` edges from tree-sitter call-site analysis
-pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+///
+/// When `files` is `Some`, the caller supplies pre-walked `(abs_path, vname_path)`
+/// pairs from the daemon's Phase A walk (P6 — #329); the extractor uses them
+/// directly and skips its own directory walk. Pass `None` to fall back to
+/// `collect_source_files`.
+pub fn extract_native_phase_b(
+    corpus: &str,
+    root: &Path,
+    files: Option<&[(PathBuf, String)]>,
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -58,8 +67,19 @@ pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<
         }
     };
 
-    for (abs_path, vname_path) in collect_source_files(root, &["rs"]) {
-        match extract_file_call_edges(corpus, &abs_path, &vname_path, &language, &query) {
+    // Use the daemon's pre-walked file list when available (P6 — #329); fall back
+    // to a local walk for old daemons and the `travsr index` CLI path.
+    let walked;
+    let file_pairs: &[(PathBuf, String)] = match files {
+        Some(f) => f,
+        None => {
+            walked = collect_source_files(root, &["rs"]);
+            &walked
+        }
+    };
+
+    for (abs_path, vname_path) in file_pairs {
+        match extract_file_call_edges(corpus, abs_path, vname_path, &language, &query) {
             Ok(file_edges) => edges.extend(file_edges),
             Err(e) => {
                 tracing::debug!(err = %e, path = %abs_path.display(), "rust call extraction skipped")
