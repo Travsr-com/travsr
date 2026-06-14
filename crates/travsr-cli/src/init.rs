@@ -3,15 +3,16 @@ use anyhow::Context as _;
 
 use crate::repo::find_git_root;
 
-pub fn run(quiet: bool, json: bool, jobs: Option<usize>) -> anyhow::Result<()> {
+pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
 
     // Live progress so a long indexing run is not mistaken for a hang (#293).
     // Renders to stderr; the summary below stays on stdout.
     let mut progress = crate::progress::ProgressReporter::new(quiet, json);
-    let stats =
-        travsr_daemon::init_repo_with_progress(&repo_root, jobs, &mut |ev| progress.update(ev))?;
+    let stats = travsr_daemon::init_repo_with_progress(&repo_root, jobs, semantic, &mut |ev| {
+        progress.update(ev)
+    })?;
     let elapsed = progress.elapsed();
     progress.finish();
 
@@ -19,6 +20,11 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>) -> anyhow::Result<()> {
 
     if json {
         // Machine-readable summary on stdout for CI; progress went to stderr.
+        let phase_b = if stats.phase_b_report.is_some() {
+            "complete"
+        } else {
+            "pending"
+        };
         let summary = serde_json::json!({
             "files_indexed": stats.files_indexed,
             "nodes_written": stats.nodes_written,
@@ -26,6 +32,7 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>) -> anyhow::Result<()> {
             "total_nodes": stats.total_nodes,
             "total_edges": stats.total_edges,
             "elapsed_s": elapsed.as_secs(),
+            "phase_b": phase_b,
             "db_path": db_path.display().to_string(),
         });
         println!("{summary}");

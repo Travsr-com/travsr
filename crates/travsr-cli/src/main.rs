@@ -47,6 +47,11 @@ enum Command {
         /// Number of parallel parse workers (default: available CPU cores).
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
+        /// Run semantic Phase B (call edges) synchronously before returning.
+        /// By default Phase B runs in the background via the daemon.
+        /// Use this in CI or scripts that query call edges immediately after init.
+        #[arg(long)]
+        semantic: bool,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -336,7 +341,12 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init { quiet, json, jobs } => init::run(quiet, json, jobs)?,
+        Command::Init {
+            quiet,
+            json,
+            jobs,
+            semantic,
+        } => init::run(quiet, json, jobs, semantic)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;
