@@ -750,12 +750,8 @@ pub fn init_repo_with_progress(
     //   • `--semantic`: callers (CI, scripts) need call edges before querying.
     //   • No commit: `run_background_phase_b` bails when `last_commit` is empty,
     //     so there is no deferred path available for fresh repos.
-    let has_commit = read_head_commit_sha(repo_root).is_ok();
-    let current_sha = if has_commit {
-        read_head_commit_sha(repo_root).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let current_sha = read_head_commit_sha(repo_root).unwrap_or_default();
+    let has_commit = !current_sha.is_empty();
     let phase_b_commit_stored = store
         .get_meta("phase_b_commit")
         .ok()
@@ -1004,6 +1000,28 @@ fn collect_present_languages_and_paths(
 /// tools gaining sub-path invocation support; until then every refresh is a full
 /// re-run — which is exactly why it is debounced and single-flighted by
 /// [`phase_b_sched::PhaseBScheduler`] rather than run inline on every commit.
+/// Check the store's freshness markers and arm the Phase B scheduler if Phase B
+/// is behind the latest commit. Uses `arm_immediate` (not `mark_dirty`) so the
+/// deadline is set to `now` rather than `now + debounce`. `mark_dirty` called
+/// on every 5 s tick would push the 30 s deadline forward forever — Phase B
+/// would never fire. `arm_immediate` is a no-op when a commit-triggered
+/// debounce is already counting down.
+fn arm_phase_b_if_pending(
+    store: &std::sync::Mutex<SqliteStore>,
+    sched: &phase_b_sched::PhaseBScheduler,
+) {
+    let s = store.lock().unwrap_or_else(|e| e.into_inner());
+    let last = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+    let pb = s
+        .get_meta("phase_b_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !last.is_empty() && last != pb {
+        sched.arm_immediate();
+    }
+}
+
 fn run_background_phase_b(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -2059,23 +2077,8 @@ impl Daemon {
                     }
                     _ = phase_b_tick.tick() => {
                         // Auto-arm when Phase B is pending (deferred init, or daemon
-                        // restarted after a crash mid-Phase-B). Idempotent: calling
-                        // mark_dirty on an already-armed scheduler just pushes the
-                        // deadline forward by the debounce window.
-                        {
-                            let s = store.lock().unwrap_or_else(|e| e.into_inner());
-                            let last = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
-                            let pb   = s.get_meta("phase_b_commit").ok().flatten().unwrap_or_default();
-                            if !last.is_empty() && last != pb {
-                                // Use arm_immediate (not mark_dirty) so the
-                                // deadline is set to now instead of now+debounce.
-                                // mark_dirty called every 5 s would push the
-                                // 30 s deadline forward forever — Phase B would
-                                // never fire. arm_immediate is a no-op when a
-                                // commit-triggered debounce is already counting.
-                                phase_b_scheduler.arm_immediate();
-                            }
-                        }
+                        // restarted after a crash mid-Phase-B).
+                        arm_phase_b_if_pending(&store, &phase_b_scheduler);
                         // #318 O3: start a background Phase B refresh iff one is
                         // due (armed + past debounce) and none is already running.
                         if phase_b_scheduler.try_claim() {
@@ -2117,20 +2120,7 @@ impl Daemon {
                     _ = phase_b_tick.tick() => {
                         // Auto-arm when Phase B is pending (deferred init, or daemon
                         // restarted after a crash mid-Phase-B).
-                        {
-                            let s = store.lock().unwrap_or_else(|e| e.into_inner());
-                            let last = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
-                            let pb   = s.get_meta("phase_b_commit").ok().flatten().unwrap_or_default();
-                            if !last.is_empty() && last != pb {
-                                // Use arm_immediate (not mark_dirty) so the
-                                // deadline is set to now instead of now+debounce.
-                                // mark_dirty called every 5 s would push the
-                                // 30 s deadline forward forever — Phase B would
-                                // never fire. arm_immediate is a no-op when a
-                                // commit-triggered debounce is already counting.
-                                phase_b_scheduler.arm_immediate();
-                            }
-                        }
+                        arm_phase_b_if_pending(&store, &phase_b_scheduler);
                         // #318 O3: start a background Phase B refresh iff one is
                         // due (armed + past debounce) and none is already running.
                         if phase_b_scheduler.try_claim() {
