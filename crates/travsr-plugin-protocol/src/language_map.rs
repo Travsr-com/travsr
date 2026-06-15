@@ -18,6 +18,7 @@ pub fn language_from_proto_str(s: &str) -> Option<Language> {
         "c" => Some(Language::C),
         "swift" => Some(Language::Swift),
         "dart" => Some(Language::Dart),
+        "objectivec" | "objc" => Some(Language::ObjectiveC),
         _ => None,
     }
 }
@@ -44,6 +45,8 @@ mod tests {
             ("c", Language::C),
             ("swift", Language::Swift),
             ("dart", Language::Dart),
+            ("objectivec", Language::ObjectiveC),
+            ("objc", Language::ObjectiveC),
         ] {
             assert_eq!(language_from_proto_str(s), Some(expected), "failed for {s}");
         }

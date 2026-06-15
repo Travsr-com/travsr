@@ -135,6 +135,7 @@ pub enum Language {
     C,
     Swift,
     Dart,
+    ObjectiveC,
 }
 
 impl Language {
@@ -157,6 +158,7 @@ impl Language {
             "c" | "h" => Some(Self::C),
             "swift" => Some(Self::Swift),
             "dart" => Some(Self::Dart),
+            "m" | "mm" => Some(Self::ObjectiveC),
             _ => None,
         }
     }
@@ -178,6 +180,7 @@ impl Language {
             Self::C => "c",
             Self::Swift => "swift",
             Self::Dart => "dart",
+            Self::ObjectiveC => "objectivec",
         }
     }
 
@@ -199,6 +202,7 @@ impl Language {
             "c" => Some(Self::C),
             "swift" => Some(Self::Swift),
             "dart" => Some(Self::Dart),
+            "objectivec" => Some(Self::ObjectiveC),
             _ => None,
         }
     }
@@ -1092,6 +1096,8 @@ mod tests {
         assert_eq!(Language::from_extension("jsx"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("mjs"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("cjs"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("m"), Some(Language::ObjectiveC));
+        assert_eq!(Language::from_extension("mm"), Some(Language::ObjectiveC));
         assert_eq!(Language::from_extension(""), None);
     }
 
@@ -1102,6 +1108,7 @@ mod tests {
             Language::Rust,
             Language::Python,
             Language::Go,
+            Language::ObjectiveC,
         ] {
             let s = lang.as_str();
             assert_eq!(

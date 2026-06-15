@@ -505,6 +505,7 @@ mod tests {
             Language::C,
             Language::Swift,
             Language::Dart,
+            Language::ObjectiveC,
         ];
         for v in variants {
             assert!(

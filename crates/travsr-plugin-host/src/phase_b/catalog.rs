@@ -519,6 +519,27 @@ pub static CATALOG: &[PhaseBEntry] = &[
         has_share_assets: false,
     },
     PhaseBEntry {
+        // Phase B not yet available: no SCIP/LSIF indexer exists for ObjC.
+        // scip-clang covers C/C++/CUDA only. Candidate: libclang-based
+        // travsr-objc-index-emitter (see RFC pending).
+        language: "objectivec",
+        npm_package: Some("@travsr-plugin/objectivec"),
+        command: "",
+        args: &[],
+        output_format: OutputFormat::Scip,
+        sandbox: SandboxRequirement::Standard,
+        install_hint: "No Phase B tool available for Objective-C yet — Phase A (tree-sitter) only",
+        underlying_tool_hint: "Phase B pending: travsr-objc-index-emitter (libclang-based, RFC in progress)",
+        provider_binary: Some("travsr-lang-objectivec"),
+        elevated_hosts: &[],
+        scip_install: ScipInstall::Manual,
+        extensions: &[".m", ".mm"],
+        wrapper_version_fallback: "v0.1.0",
+        builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
+    },
+    PhaseBEntry {
         language: "dart",
         npm_package: Some("@travsr-plugin/dart"),
         command: "travsr-dart-index-emitter",
