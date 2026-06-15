@@ -74,15 +74,24 @@ fn get_dependencies_transitive_raw(store: &SqliteStore, file: &str, depth: u32) 
                 continue;
             }
         };
-        for edge in edges.iter().filter(|e| e.kind.as_str() == "depends") {
-            // `insert` returns false when already visited — skip without re-listing.
-            if !visited.insert(edge.dst) {
-                continue;
-            }
-            if let Ok(Some(dst_node)) = store.get_node(edge.dst) {
-                let prefix = "  ↳ ".repeat(hop as usize); // hop 0 = direct → no prefix
+        // Batch: collect new dep dsts for this hop (marking visited), fetch once.
+        let new_dsts: Vec<NodeId> = edges
+            .iter()
+            .filter(|e| e.kind.as_str() == "depends")
+            .filter(|e| visited.insert(e.dst))
+            .map(|e| e.dst)
+            .collect();
+        let node_map: HashMap<NodeId, CoreNode> = store
+            .get_nodes(&new_dsts)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| (n.id, n))
+            .collect();
+        let prefix = "  ↳ ".repeat(hop as usize); // hop 0 = direct → no prefix
+        for dst_id in new_dsts {
+            if let Some(dst_node) = node_map.get(&dst_id) {
                 lines.push(format!("{prefix}{}", dst_node.vname.signature));
-                queue.push_back((edge.dst, hop + 1));
+                queue.push_back((dst_id, hop + 1));
             }
         }
     }
@@ -119,12 +128,21 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
         }
     };
 
-    let mut lines: Vec<String> = Vec::new();
-    for edge in edges.iter().filter(|e| e.kind.as_str() == "depends") {
-        if let Ok(Some(dst_node)) = store.get_node(edge.dst) {
-            lines.push(dst_node.vname.signature.clone());
-        }
-    }
+    let ids: Vec<NodeId> = edges
+        .iter()
+        .filter(|e| e.kind.as_str() == "depends")
+        .map(|e| e.dst)
+        .collect();
+    let node_map: HashMap<NodeId, CoreNode> = store
+        .get_nodes(&ids)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| (n.id, n))
+        .collect();
+    let lines: Vec<String> = ids
+        .iter()
+        .filter_map(|id| node_map.get(id).map(|n| n.vname.signature.clone()))
+        .collect();
     lines.join("\n")
 }
 
@@ -197,22 +215,32 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         }
     };
 
-    let mut lines: Vec<String> = Vec::new();
-
-    for edge in &edges {
-        let tag = match edge.kind {
-            EdgeKind::RefCall => "[call]",
-            EdgeKind::DefinesBinding => "[structural]",
-            _ => continue,
-        };
-        if let Ok(Some(src_node)) = store.get_node(edge.src) {
-            lines.push(format!(
-                "{tag} {} ({}) — {}",
-                src_node.vname.signature, src_node.kind, src_node.vname.path
-            ));
-        }
-    }
-
+    let relevant: Vec<_> = edges
+        .iter()
+        .filter_map(|e| match e.kind {
+            EdgeKind::RefCall => Some((e, "[call]")),
+            EdgeKind::DefinesBinding => Some((e, "[structural]")),
+            _ => None,
+        })
+        .collect();
+    let ids: Vec<NodeId> = relevant.iter().map(|(e, _)| e.src).collect();
+    let node_map: HashMap<NodeId, CoreNode> = store
+        .get_nodes(&ids)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| (n.id, n))
+        .collect();
+    let lines: Vec<String> = relevant
+        .iter()
+        .filter_map(|(edge, tag)| {
+            node_map.get(&edge.src).map(|src_node| {
+                format!(
+                    "{tag} {} ({}) — {}",
+                    src_node.vname.signature, src_node.kind, src_node.vname.path
+                )
+            })
+        })
+        .collect();
     lines.join("\n")
 }
 
@@ -525,23 +553,32 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
             break;
         }
 
-        for edge in incoming {
-            let follow = match mode {
+        // Batch: collect followable new-src ids, enqueue, then fetch paths once.
+        let new_srcs: Vec<NodeId> = incoming
+            .into_iter()
+            .filter(|edge| match mode {
                 AnalysisMode::TreeSitter => matches!(
                     edge.kind,
                     EdgeKind::DefinesBinding | EdgeKind::RefCall | EdgeKind::Depends
                 ),
                 AnalysisMode::Semantic => matches!(edge.kind, EdgeKind::RefCall),
-            };
-            if !follow {
-                continue;
-            }
-            if visited.insert(edge.src) {
-                queue.push_back(edge.src);
-                if let Ok(Some(src_node)) = store.get_node(edge.src) {
-                    if !src_node.vname.path.is_empty() {
-                        affected_files.insert(src_node.vname.path.clone());
-                    }
+            })
+            .filter(|edge| visited.insert(edge.src))
+            .map(|edge| edge.src)
+            .collect();
+        for &id in &new_srcs {
+            queue.push_back(id);
+        }
+        let node_map: HashMap<NodeId, CoreNode> = store
+            .get_nodes(&new_srcs)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| (n.id, n))
+            .collect();
+        for id in &new_srcs {
+            if let Some(src_node) = node_map.get(id) {
+                if !src_node.vname.path.is_empty() {
+                    affected_files.insert(src_node.vname.path.clone());
                 }
             }
         }
@@ -595,14 +632,25 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
                 let Ok(edges) = store.iter_edges_to(imp.id) else {
                     continue;
                 };
-                for edge in edges {
-                    if !matches!(edge.kind, EdgeKind::Depends) {
-                        continue;
+                // Batch: all Depends src ids (visited+queue separately; path fetch once).
+                let dep_srcs: Vec<NodeId> = edges
+                    .iter()
+                    .filter(|e| matches!(e.kind, EdgeKind::Depends))
+                    .map(|e| e.src)
+                    .collect();
+                for &id in &dep_srcs {
+                    if visited.insert(id) {
+                        queue.push_back(id);
                     }
-                    if visited.insert(edge.src) {
-                        queue.push_back(edge.src);
-                    }
-                    if let Ok(Some(src_node)) = store.get_node(edge.src) {
+                }
+                let node_map: HashMap<NodeId, CoreNode> = store
+                    .get_nodes(&dep_srcs)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| (n.id, n))
+                    .collect();
+                for id in &dep_srcs {
+                    if let Some(src_node) = node_map.get(id) {
                         if !src_node.vname.path.is_empty() {
                             affected_files.insert(src_node.vname.path.clone());
                         }
@@ -1949,30 +1997,41 @@ fn get_graph_json_raw(
             use travsr_core::EdgeKind;
             if direction == "deps" || direction == "both" {
                 if let Ok(dep_edges) = store.iter_edges_from(current_id) {
+                    // Batch: collect all ResolvesTo target ids across all Depends hops,
+                    // then fetch once instead of one get_node per res.dst.
+                    let mut res_targets: Vec<NodeId> = Vec::new();
                     for dep in &dep_edges {
                         if !matches!(dep.kind, EdgeKind::Depends) {
                             continue;
                         }
                         if let Ok(res_edges) = store.iter_edges_from(dep.dst) {
                             for res in &res_edges {
-                                if !matches!(res.kind, EdgeKind::ResolvesTo) {
-                                    continue;
+                                if matches!(res.kind, EdgeKind::ResolvesTo) {
+                                    res_targets.push(res.dst);
                                 }
-                                if let Ok(Some(target)) = store.get_node(res.dst) {
-                                    if target.kind != "file" {
-                                        continue;
-                                    }
-                                    if edge_seen.insert((current_id, target.id, "imports")) {
-                                        edges_out.push(serde_json::json!({
-                                            "source": node_json_id(&node),
-                                            "target": node_json_id(&target),
-                                            "kind":   "imports",
-                                        }));
-                                    }
-                                    if visited.insert(target.id) {
-                                        queue.push_back((target.id, hop + 1));
-                                    }
-                                }
+                            }
+                        }
+                    }
+                    let node_map: HashMap<NodeId, CoreNode> = store
+                        .get_nodes(&res_targets)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|n| (n.id, n))
+                        .collect();
+                    for target_id in res_targets {
+                        if let Some(target) = node_map.get(&target_id) {
+                            if target.kind != "file" {
+                                continue;
+                            }
+                            if edge_seen.insert((current_id, target.id, "imports")) {
+                                edges_out.push(serde_json::json!({
+                                    "source": node_json_id(&node),
+                                    "target": node_json_id(target),
+                                    "kind":   "imports",
+                                }));
+                            }
+                            if visited.insert(target.id) {
+                                queue.push_back((target.id, hop + 1));
                             }
                         }
                     }
@@ -1982,30 +2041,41 @@ fn get_graph_json_raw(
                 // Reverse: who imports this file?
                 //   importer_file --[Depends]--> import_node --[ResolvesTo]--> current_file
                 if let Ok(rev_res_edges) = store.iter_edges_to(current_id) {
+                    // Batch: collect all Depends src ids across all ResolvesTo hops,
+                    // then fetch once.
+                    let mut source_ids: Vec<NodeId> = Vec::new();
                     for rev_res in &rev_res_edges {
                         if !matches!(rev_res.kind, EdgeKind::ResolvesTo) {
                             continue;
                         }
                         if let Ok(rev_dep_edges) = store.iter_edges_to(rev_res.src) {
                             for rev_dep in &rev_dep_edges {
-                                if !matches!(rev_dep.kind, EdgeKind::Depends) {
-                                    continue;
+                                if matches!(rev_dep.kind, EdgeKind::Depends) {
+                                    source_ids.push(rev_dep.src);
                                 }
-                                if let Ok(Some(source)) = store.get_node(rev_dep.src) {
-                                    if source.kind != "file" {
-                                        continue;
-                                    }
-                                    if edge_seen.insert((source.id, current_id, "imports")) {
-                                        edges_out.push(serde_json::json!({
-                                            "source": node_json_id(&source),
-                                            "target": node_json_id(&node),
-                                            "kind":   "imports",
-                                        }));
-                                    }
-                                    if visited.insert(source.id) {
-                                        queue.push_back((source.id, hop + 1));
-                                    }
-                                }
+                            }
+                        }
+                    }
+                    let node_map: HashMap<NodeId, CoreNode> = store
+                        .get_nodes(&source_ids)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|n| (n.id, n))
+                        .collect();
+                    for source_id in source_ids {
+                        if let Some(source) = node_map.get(&source_id) {
+                            if source.kind != "file" {
+                                continue;
+                            }
+                            if edge_seen.insert((source.id, current_id, "imports")) {
+                                edges_out.push(serde_json::json!({
+                                    "source": node_json_id(source),
+                                    "target": node_json_id(&node),
+                                    "kind":   "imports",
+                                }));
+                            }
+                            if visited.insert(source.id) {
+                                queue.push_back((source.id, hop + 1));
                             }
                         }
                     }
@@ -2017,19 +2087,33 @@ fn get_graph_json_raw(
         // Normal traversal (symbol mode)
         if direction == "deps" || direction == "both" {
             if let Ok(edges) = store.iter_edges_from(current_id) {
+                // First pass: dedup via edge_seen, enqueue new visits.
+                // Collect (dst_id, kind_s) only for edges that produce JSON output.
+                let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
                 for edge in &edges {
                     let kind_s = edge_kind_str(&edge.kind);
                     if edge_seen.insert((edge.src, edge.dst, kind_s)) {
-                        if let Ok(Some(dst)) = store.get_node(edge.dst) {
-                            edges_out.push(serde_json::json!({
-                                "source": node_json_id(&node),
-                                "target": node_json_id(&dst),
-                                "kind":   kind_s,
-                            }));
-                        }
+                        new_edges.push((edge.dst, kind_s));
                     }
                     if visited.insert(edge.dst) {
                         queue.push_back((edge.dst, hop + 1));
+                    }
+                }
+                // Batch-fetch dst nodes, then emit JSON edges in original order.
+                let dst_ids: Vec<NodeId> = new_edges.iter().map(|(id, _)| *id).collect();
+                let node_map: HashMap<NodeId, CoreNode> = store
+                    .get_nodes(&dst_ids)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| (n.id, n))
+                    .collect();
+                for (dst_id, kind_s) in &new_edges {
+                    if let Some(dst) = node_map.get(dst_id) {
+                        edges_out.push(serde_json::json!({
+                            "source": node_json_id(&node),
+                            "target": node_json_id(dst),
+                            "kind":   kind_s,
+                        }));
                     }
                 }
             }
@@ -2037,19 +2121,32 @@ fn get_graph_json_raw(
 
         if direction == "callers" || direction == "both" {
             if let Ok(edges) = store.iter_edges_to(current_id) {
+                // First pass: dedup via edge_seen, enqueue new visits.
+                let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
                 for edge in &edges {
                     let kind_s = edge_kind_str(&edge.kind);
                     if edge_seen.insert((edge.src, edge.dst, kind_s)) {
-                        if let Ok(Some(src)) = store.get_node(edge.src) {
-                            edges_out.push(serde_json::json!({
-                                "source": node_json_id(&src),
-                                "target": node_json_id(&node),
-                                "kind":   kind_s,
-                            }));
-                        }
+                        new_edges.push((edge.src, kind_s));
                     }
                     if visited.insert(edge.src) {
                         queue.push_back((edge.src, hop + 1));
+                    }
+                }
+                // Batch-fetch src nodes, then emit JSON edges in original order.
+                let src_ids: Vec<NodeId> = new_edges.iter().map(|(id, _)| *id).collect();
+                let node_map: HashMap<NodeId, CoreNode> = store
+                    .get_nodes(&src_ids)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| (n.id, n))
+                    .collect();
+                for (src_id, kind_s) in &new_edges {
+                    if let Some(src) = node_map.get(src_id) {
+                        edges_out.push(serde_json::json!({
+                            "source": node_json_id(src),
+                            "target": node_json_id(&node),
+                            "kind":   kind_s,
+                        }));
                     }
                 }
             }
