@@ -335,7 +335,7 @@ fn collect_global(
             tracing::debug!("skipping stale registry entry: {}", db_path.display());
             continue;
         }
-        match SqliteStore::open(db_path) {
+        match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
                 let result = f(&store, repo_name, single);
                 if !result.is_empty() {
@@ -2241,7 +2241,7 @@ pub fn get_graph_json_global(
         if !db_path.exists() {
             continue;
         }
-        match SqliteStore::open(db_path) {
+        match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
                 let raw = get_graph_json_raw(&store, query, direction, depth, kind_filter, 0);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
@@ -2304,7 +2304,7 @@ fn get_graph_json_global_overview(
         if !db_path.exists() {
             continue;
         }
-        match SqliteStore::open(db_path) {
+        match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
                 let raw = overview_graph(&store, path_prefix);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {

@@ -1849,6 +1849,11 @@ impl Daemon {
         let store = Arc::new(Mutex::new(
             SqliteStore::open(&db_path).context("opening graph.db")?,
         ));
+        // R5 (#342): separate read-only connection so Query messages do not
+        // hold the write mutex while the indexer worker needs it.
+        let read_store = Arc::new(Mutex::new(
+            SqliteStore::open_read_only(&db_path).context("opening graph.db read-only")?,
+        ));
 
         // #318 O2: LRU result cache for read-only queries served off the warm
         // store. Keyed on (tool, args, last_commit, phase_b_commit), so commits
@@ -1947,6 +1952,7 @@ impl Daemon {
             use tokio::net::windows::named_pipe::ServerOptions;
 
             let store_win = Arc::clone(&store);
+            let read_store_win = Arc::clone(&read_store);
             let repo_win = Arc::clone(&repo_root_arc);
             let sd_win = Arc::clone(&pipe_shutdown);
             let cache_win = Arc::clone(&query_cache);
@@ -1974,6 +1980,7 @@ impl Daemon {
                         break;
                     }
                     let store = Arc::clone(&store_win);
+                    let read_store = Arc::clone(&read_store_win);
                     let repo = Arc::clone(&repo_win);
                     let sd = Arc::clone(&sd_win);
                     let cache = Arc::clone(&cache_win);
@@ -1988,6 +1995,7 @@ impl Daemon {
                                         &line,
                                         repo.as_path(),
                                         &store,
+                                        &read_store,
                                         &cache,
                                         &sched,
                                     )
@@ -2030,6 +2038,7 @@ impl Daemon {
                     }
                     Ok((conn, _)) = listener.accept() => {
                         let store = Arc::clone(&store);
+                        let read_store = Arc::clone(&read_store);
                         let repo = Arc::clone(&repo_root_arc);
                         let sd_notify = Arc::clone(&sock_shutdown);
                         let cache = Arc::clone(&query_cache);
@@ -2047,6 +2056,7 @@ impl Daemon {
                                             &line,
                                             repo.as_path(),
                                             &store,
+                                            &read_store,
                                             &cache,
                                             &sched,
                                         )
@@ -2211,6 +2221,7 @@ fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
+    read_store: &std::sync::Mutex<SqliteStore>,
     cache: &std::sync::Mutex<query_cache::QueryCache>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
 ) -> (travsr_ipc::ControlResponse, bool) {
@@ -2261,7 +2272,9 @@ fn handle_control_message(
                     false,
                 );
             }
-            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            // R5 (#342): use the dedicated read-only connection so this lock
+            // does not block the indexer worker from acquiring the write store.
+            let s = read_store.lock().unwrap_or_else(|e| e.into_inner());
             // #318 O2: serve from the warm result cache when the graph has not
             // moved. The commit markers are part of the key, so a stale entry can
             // never be returned — a Phase A reindex or background Phase B refresh
