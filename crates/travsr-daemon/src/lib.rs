@@ -725,9 +725,12 @@ pub fn init_repo_with_progress(
     store
         .set_bulk_init_mode(false)
         .context("restoring sync mode after bulk init")?;
+    store
+        .run_pragma_optimize()
+        .context("PRAGMA optimize after bulk init")?;
     tracing::info!(
         elapsed_ms = t_pragma.elapsed().as_millis(),
-        "TIMING: set_bulk_init_mode(false) done"
+        "TIMING: set_bulk_init_mode(false) + optimize done"
     );
 
     let (batch_counts, files_skipped_unchanged) = index_result?;

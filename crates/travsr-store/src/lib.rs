@@ -385,6 +385,9 @@ impl SqliteStore {
             store
                 .seed_synonyms_if_empty()
                 .context("seeding fts_synonyms (RFC-012 A2 F1)")?;
+            store
+                .run_pragma_optimize()
+                .context("PRAGMA optimize after open")?;
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -413,12 +416,12 @@ impl SqliteStore {
             // Read-path pragmas only. journal_mode=WAL is a persisted property
             // of the database file; setting pragmas that write (WAL switch,
             // autocheckpoint) is neither possible nor needed here.
-            conn.pragma_update(None, "cache_size", -65536i64)
+            conn.pragma_update(None, "cache_size", -Self::cache_size_kib())
                 .context("setting cache_size (read-only)")?;
             conn.pragma_update(None, "temp_store", "MEMORY")
                 .context("setting temp_store=MEMORY (read-only)")?;
-            conn.pragma_update(None, "mmap_size", 0i64)
-                .context("disabling mmap_size (read-only)")?;
+            conn.pragma_update(None, "mmap_size", Self::mmap_size_bytes())
+                .context("setting mmap_size (read-only)")?;
             conn.pragma_update(None, "query_only", "ON")
                 .context("setting query_only=ON")?;
             let store = Self { conn };
@@ -468,6 +471,29 @@ impl SqliteStore {
         .context("bootstrapping meta table")
     }
 
+    /// Page-cache size in kibibytes, read from `TRAVSR_STORE_CACHE_MB` (default 128).
+    /// Negative value as required by SQLite's cache_size pragma convention.
+    fn cache_size_kib() -> i64 {
+        std::env::var("TRAVSR_STORE_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(128)
+            * 1024
+    }
+
+    /// Memory-mapped I/O size in bytes, read from `TRAVSR_STORE_MMAP_GB` (default 0 — disabled).
+    /// Off by default to avoid per-process RSS bloat in multi-process local deployments.
+    /// Enable only on a dedicated single-instance OCI A1 deployment.
+    fn mmap_size_bytes() -> i64 {
+        std::env::var("TRAVSR_STORE_MMAP_GB")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&gb| gb > 0)
+            .map(|gb| gb * 1024 * 1024 * 1024)
+            .unwrap_or(0)
+    }
+
     fn configure(conn: &Connection) -> AnyResult<()> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("enabling WAL journal mode")?;
@@ -475,10 +501,10 @@ impl SqliteStore {
             .context("setting synchronous=NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign_keys pragma")?;
-        // Cap page cache to 64 MB (negative value = kibibytes).
-        // Without this the default grows proportionally with graph size and
-        // was the primary cause of ~700 MB RSS per daemon process.
-        conn.pragma_update(None, "cache_size", -65536i64)
+        // Cap page cache (negative value = kibibytes). Default 128 MB; override
+        // via TRAVSR_STORE_CACHE_MB. Without a cap the default grows with graph
+        // size and was the primary cause of ~700 MB RSS per daemon process.
+        conn.pragma_update(None, "cache_size", -Self::cache_size_kib())
             .context("setting cache_size")?;
         // Checkpoint the WAL every 500 pages (~2 MB) instead of the SQLite
         // default of 1000 pages, so the WAL file stays small at rest.
@@ -487,12 +513,10 @@ impl SqliteStore {
         // Keep temp tables in memory instead of writing to /tmp files.
         conn.pragma_update(None, "temp_store", "MEMORY")
             .context("setting temp_store=MEMORY")?;
-        // Disable memory-mapped I/O. Without this, SQLite maps the entire DB
-        // file into the process virtual address space. On a large graph.db
-        // (hundreds of MB) every daemon process shows that many MB of RSS —
-        // and multiple processes each get their own mapping of the same file.
-        conn.pragma_update(None, "mmap_size", 0i64)
-            .context("disabling mmap_size")?;
+        // Memory-mapped I/O. Off by default (TRAVSR_STORE_MMAP_GB=0) to avoid
+        // per-process RSS bloat; enable only on a dedicated OCI A1 instance.
+        conn.pragma_update(None, "mmap_size", Self::mmap_size_bytes())
+            .context("setting mmap_size")?;
         Ok(())
     }
 
@@ -517,10 +541,26 @@ impl SqliteStore {
                 .pragma_update(None, "synchronous", "NORMAL")
                 .context("bulk init: restoring synchronous=NORMAL")?;
             self.conn
-                .pragma_update(None, "cache_size", -65536i64)
-                .context("bulk init: restoring cache_size=64MB")?;
+                .pragma_update(None, "cache_size", -Self::cache_size_kib())
+                .context("bulk init: restoring cache_size")?;
         }
         Ok(())
+    }
+
+    /// Run a bounded `PRAGMA optimize` so the query planner has real cardinality
+    /// estimates for `nodes` and `edges`.
+    ///
+    /// Without `ANALYZE`, SQLite uses hardcoded defaults and may pick a full table
+    /// scan over an index seek on a fresh database. `analysis_limit = 1000` bounds
+    /// the scan cost; `PRAGMA optimize` skips tables whose stats are already fresh.
+    /// Safe to call from `&self` — the pragma writes to `sqlite_stat1` internally
+    /// but does not require a write transaction from the caller.
+    ///
+    /// Call sites: end of [`SqliteStore::open`] and end of a full `travsr init`.
+    pub fn run_pragma_optimize(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute_batch("PRAGMA analysis_limit = 1000; PRAGMA optimize;")
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Return the live journal mode reported by SQLite. Useful in tests.
