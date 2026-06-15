@@ -250,6 +250,21 @@ impl Migration for V13PhaseBUnification {
     }
 }
 
+/// #323 R2: covering reverse index on edges(dst, kind, src).
+///
+/// Symmetric counterpart to v4 `idx_edges_src_kind_cov`. Eliminates the
+/// main-table random I/O on every `get_callers` / `get_blast_radius` reverse
+/// traversal (SELECT src FROM edges WHERE dst=? AND kind=?).
+struct V14CoveringReverseIdx;
+impl Migration for V14CoveringReverseIdx {
+    fn version(&self) -> u32 {
+        14
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl(include_str!("migrations/v14_covering_reverse_idx.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -268,6 +283,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     #[cfg(feature = "embeddings")]
     r.register(V12Vec0Embeddings);
     r.register(V13PhaseBUnification);
+    r.register(V14CoveringReverseIdx);
     r
 }
 
@@ -2784,6 +2800,50 @@ mod tests {
         runner.run(&mut store).unwrap();
         let n = sample_node("fn:roundtrip");
         store.put_node(&n).unwrap();
+    }
+
+    #[test]
+    fn v14_migration_creates_covering_reverse_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let cov_exists: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_edges_dst_kind_cov'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cov_exists, 1, "idx_edges_dst_kind_cov must exist after v14");
+
+        let old_exists: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_edges_dst_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_exists, 0, "idx_edges_dst_kind must be dropped by v14");
+    }
+
+    #[test]
+    fn v14_reverse_edge_query_uses_covering_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // EXPLAIN QUERY PLAN — column 3 is the "detail" text in SQLite 3.36+.
+        let plan: String = store
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT src FROM edges WHERE dst=? AND kind=?",
+                rusqlite::params![0i64, "ref/call"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_edges_dst_kind_cov"),
+            "iter_edges_to query must use covering index; EXPLAIN detail: {plan}",
+        );
     }
 
     #[test]
