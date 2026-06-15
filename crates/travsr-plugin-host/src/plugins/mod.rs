@@ -7,6 +7,7 @@ pub mod generic;
 pub mod go;
 pub mod java;
 pub mod kotlin;
+pub mod objc;
 pub mod php;
 pub mod python;
 pub mod ruby;
