@@ -209,3 +209,70 @@ fn java_record_and_annotation_emitted() {
         "java: annotation type must emit interface:Marker — got {s:?}"
     );
 }
+
+#[test]
+fn objc_phase_a_extracts_structure() {
+    // Covers @interface, @implementation, @protocol, instance method (-),
+    // class method (+), C-style function, and #import.
+    let src = r#"
+#import <Foundation/Foundation.h>
+
+@protocol Printable
+- (void)print;
+@end
+
+@interface MyClass : NSObject <Printable>
+- (void)printName;
++ (MyClass *)sharedInstance;
+@end
+
+@implementation MyClass
+- (void)printName { }
++ (MyClass *)sharedInstance { return nil; }
+- (void)print { }
+@end
+
+void freeFunction(void) { }
+"#;
+    let k = kinds(src, "m");
+    for expected in ["file", "class", "impl", "protocol", "function"] {
+        assert!(
+            k.contains(expected),
+            "objc: missing node kind '{expected}' — got {k:?}"
+        );
+    }
+}
+
+#[test]
+fn objc_class_impl_and_protocol_sigs_emitted() {
+    let src = r#"
+@protocol Drawable
+- (void)draw;
+@end
+
+@interface Shape : NSObject
+- (void)render;
++ (Shape *)unit;
+@end
+
+@implementation Shape
+- (void)render { }
++ (Shape *)unit { return nil; }
+- (void)draw { }
+@end
+"#;
+    let s = sigs(src, "m");
+    for expected in [
+        "class:Shape",
+        "impl:Shape",
+        "protocol:Drawable",
+        "fn:render",
+        "fn:unit",
+        "fn:draw",
+    ] {
+        assert!(
+            s.contains(expected),
+            "objc: missing signature '{expected}' — got {s:?}"
+        );
+    }
+}

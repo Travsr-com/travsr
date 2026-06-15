@@ -5,18 +5,20 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::ObjectiveC,
     extensions: &["m", "mm"],
     // Class name: "@interface" immediately followed by the first identifier.
-    // The positional anchor prevents capturing the superclass identifier,
-    // which appears later under the named `superclass:` field.
+    // The positional anchor prevents capturing the superclass identifier.
     //
-    // method_identifier . (identifier) anchors to the selector's leading
-    // keyword (e.g. "initWithName" in "initWithName:age:"), which is the
-    // stable, human-readable part of the ObjC method name.
+    // Method name: in tree-sitter-objc's CST, `method_selector_no_list` and
+    // `keyword_selector` are NOT named nodes — the method name collapses into
+    // a direct `(identifier)` child of `method_definition`/`method_declaration`.
+    // We anchor immediately after `(method_type)` to get the selector's leading
+    // keyword only (e.g. "setWidth" in "setWidth:(int)w height:(int)h"), skipping
+    // the trailing keyword identifiers that also appear as direct children.
     queries: r#"
 (class_interface "@interface" . (identifier) @class.name)
 (class_implementation "@implementation" . (identifier) @impl.name)
 (protocol_declaration "@protocol" . (identifier) @protocol.name)
-(method_definition (method_identifier . (identifier) @fn.name))
-(method_declaration (method_identifier . (identifier) @fn.name))
+(method_definition (method_type) . (identifier) @fn.name)
+(method_declaration (method_type) . (identifier) @fn.name)
 (function_definition declarator: (function_declarator declarator: (identifier) @fn.name))
 (preproc_include path: (_) @import)
 (module_import (identifier) @import)
