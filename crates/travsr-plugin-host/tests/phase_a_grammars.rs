@@ -235,7 +235,7 @@ fn objc_phase_a_extracts_structure() {
 void freeFunction(void) { }
 "#;
     let k = kinds(src, "m");
-    for expected in ["file", "class", "impl", "protocol", "function"] {
+    for expected in ["file", "class", "impl", "protocol", "function", "import"] {
         assert!(
             k.contains(expected),
             "objc: missing node kind '{expected}' — got {k:?}"

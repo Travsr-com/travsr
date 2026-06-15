@@ -26,7 +26,7 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
     ("swift", "fuzz_swift_parser.rs"),
     ("dart", "fuzz_dart_parser.rs"),
-    ("objectivec", "fuzz_objc_parser.rs"), // TODO: create this fuzz target
+    ("objectivec", "fuzz_objc_parser.rs"), // TODO(#345): create this fuzz target
 ];
 
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process

@@ -202,6 +202,9 @@ impl Language {
             "c" => Some(Self::C),
             "swift" => Some(Self::Swift),
             "dart" => Some(Self::Dart),
+            // "objc" alias is accepted at the protocol layer (language_map.rs in
+            // travsr-plugin-protocol) for external API callers; core uses the
+            // canonical form only.
             "objectivec" => Some(Self::ObjectiveC),
             _ => None,
         }

@@ -3,6 +3,10 @@ use travsr_core::Language;
 
 pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::ObjectiveC,
+    // `.mm` files are ObjC++ (C++ mixed with ObjC). tree-sitter-objc parses ObjC
+    // constructs correctly but silently skips C++-only syntax (templates, lambdas,
+    // `std::` usage). Phase A nodes will be incomplete for `.mm` files that lean
+    // heavily on C++ — this is acceptable for structural indexing purposes.
     extensions: &["m", "mm"],
     // Class name: "@interface" immediately followed by the first identifier.
     // The positional anchor prevents capturing the superclass identifier.
