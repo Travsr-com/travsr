@@ -373,7 +373,10 @@ impl SqliteStore {
             Self::configure(&conn)?;
             // Bootstrap the meta table before the runner reads the schema version.
             Self::bootstrap_meta(&conn)?;
-            let mut store = Self { conn, staging_active: false };
+            let mut store = Self {
+                conn,
+                staging_active: false,
+            };
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations")?;
@@ -425,7 +428,10 @@ impl SqliteStore {
                 .context("setting mmap_size (read-only)")?;
             conn.pragma_update(None, "query_only", "ON")
                 .context("setting query_only=ON")?;
-            let store = Self { conn, staging_active: false };
+            let store = Self {
+                conn,
+                staging_active: false,
+            };
             let current = store
                 .schema_version()
                 .context("reading schema version (read-only)")?;
@@ -445,7 +451,10 @@ impl SqliteStore {
         (|| -> AnyResult<Self> {
             let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
             Self::bootstrap_meta(&conn)?;
-            let mut store = Self { conn, staging_active: false };
+            let mut store = Self {
+                conn,
+                staging_active: false,
+            };
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations (in-memory)")?;
@@ -4049,8 +4058,14 @@ mod tests {
         store.begin_bulk_fts_tracking().unwrap();
         store.begin_staging_tables().unwrap();
 
-        let node_a = Node::new(VName::new(corpus, "", "src/a.rs", "rust", "fn:foo"), "function");
-        let node_b = Node::new(VName::new(corpus, "", "src/b.rs", "rust", "fn:bar"), "function");
+        let node_a = Node::new(
+            VName::new(corpus, "", "src/a.rs", "rust", "fn:foo"),
+            "function",
+        );
+        let node_b = Node::new(
+            VName::new(corpus, "", "src/b.rs", "rust", "fn:bar"),
+            "function",
+        );
         let edge = travsr_core::Edge {
             src: node_a.id,
             dst: node_b.id,
@@ -4075,14 +4090,25 @@ mod tests {
         store.write_file_graphs_batch(&batch, true).unwrap();
 
         // Before flush: production tables must be empty.
-        assert_eq!(store.node_count().unwrap(), 0, "nodes must be in staging, not production yet");
-        assert_eq!(store.edge_count().unwrap(), 0, "edges must be in staging, not production yet");
+        assert_eq!(
+            store.node_count().unwrap(),
+            0,
+            "nodes must be in staging, not production yet"
+        );
+        assert_eq!(
+            store.edge_count().unwrap(),
+            0,
+            "edges must be in staging, not production yet"
+        );
 
         let (nodes_written, edges_written) = store.flush_staging_to_production().unwrap();
 
         assert_eq!(nodes_written, 2, "both nodes must reach production");
         assert_eq!(edges_written, 1, "the ref/call edge must reach production");
-        assert!(!store.staging_active, "staging_active must be cleared after flush");
+        assert!(
+            !store.staging_active,
+            "staging_active must be cleared after flush"
+        );
 
         // Verify graph connectivity.
         let callers = store.iter_edges_to(node_b.id).unwrap();
@@ -4097,9 +4123,12 @@ mod tests {
         store.begin_bulk_fts_tracking().unwrap();
         store.begin_staging_tables().unwrap();
 
-        let node = Node::new(VName::new(corpus, "", "src/lib.rs", "rust", "fn:init"), "function")
-            .with_line(1)
-            .with_end_line(10);
+        let node = Node::new(
+            VName::new(corpus, "", "src/lib.rs", "rust", "fn:init"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
         // Same node emitted twice (e.g. two overlapping indexing passes).
         let node_dup = node.clone();
         let edge = travsr_core::Edge {
@@ -4134,8 +4163,14 @@ mod tests {
     #[test]
     fn staging_fts_matches_bulk_path_after_flush() {
         let nodes = vec![
-            Node::new(VName::new("c", "", "src/auth.rs", "rust", "fn:AuthService"), "function"),
-            Node::new(VName::new("c", "", "src/pay.rs", "rust", "fn:PaymentHandler"), "function"),
+            Node::new(
+                VName::new("c", "", "src/auth.rs", "rust", "fn:AuthService"),
+                "function",
+            ),
+            Node::new(
+                VName::new("c", "", "src/pay.rs", "rust", "fn:PaymentHandler"),
+                "function",
+            ),
         ];
 
         // Reference: row-by-row path.
