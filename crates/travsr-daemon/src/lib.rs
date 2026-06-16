@@ -550,6 +550,14 @@ pub fn init_repo_with_progress(
         .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
+    // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
+    // path at query time without threading repo_root through function signatures.
+    if let Some(root_str) = repo_root.to_str() {
+        store
+            .set_meta("repo_root", root_str)
+            .context("writing repo_root to meta")?;
+    }
+
     // T4 (1b): scaffold .travsrignore before the walker reads it so default
     // patterns are active on the very first `travsr init` run.
     let scaffolded = scaffold_travsrignore(repo_root).unwrap_or(false);
