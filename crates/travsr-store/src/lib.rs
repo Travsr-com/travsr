@@ -1890,10 +1890,13 @@ impl SqliteStore {
                    language TEXT, signature TEXT, kind TEXT, \
                    package TEXT, line INTEGER, end_line INTEGER \
                  ); \
+                 CREATE INDEX IF NOT EXISTS nodes_stage_id ON nodes_stage(id); \
                  CREATE TEMP TABLE IF NOT EXISTS edges_stage( \
                    src INTEGER, dst INTEGER, kind TEXT, \
                    provenance TEXT, confidence INTEGER \
-                 );",
+                 ); \
+                 CREATE INDEX IF NOT EXISTS edges_stage_pk \
+                   ON edges_stage(src, dst, kind);",
             )
             .context("creating staging temp tables")?;
         self.staging_active = true;
@@ -1902,46 +1905,68 @@ impl SqliteStore {
 
     /// Flush staging tables to production in one deduplicating GROUP BY pass.
     ///
-    /// Deduplication semantics match the previous ON CONFLICT behaviour:
-    /// - nodes: `MAX(line)` / `MAX(end_line)` — equivalent to `COALESCE(excluded, existing)`
-    /// - edges: `MAX(confidence)` — any value is acceptable; DO NOTHING kept the first
+    /// Deduplication semantics match the incremental ON CONFLICT path:
+    /// - nodes: GROUP BY id deduplicates; MAX(line)/MAX(end_line) picks a value
+    ///   when at most one source row has a non-NULL value (by construction,
+    ///   same NodeId ⟹ same VName ⟹ same parse output, so all are equal).
+    ///   ON CONFLICT(id) DO UPDATE handles re-init where nodes already exist.
+    /// - edges: GROUP BY (src,dst,kind) deduplicates; ON CONFLICT DO NOTHING
+    ///   is a no-op for any edge already in production.
+    ///
+    /// Bare non-grouped columns in the nodes SELECT (corpus, root, path, …) are
+    /// safe: same id ⟹ same VName (NodeId is a deterministic hash of the VName),
+    /// so SQLite's arbitrary-value pick for the group is always correct.
     ///
     /// Must be called after all [`write_file_graphs_batch`] calls with
-    /// `staging_active=true` and before [`rebuild_fts_from_map`] (FTS map rows
-    /// are written to `nodes_fts_map` during the staging phase and read back
-    /// during the FTS rebuild — both reference node IDs that exist in production
-    /// after this flush).
+    /// `staging_active=true` and before [`rebuild_fts_from_map`].
     ///
-    /// Returns `(nodes_written, edges_written)` after deduplication.
+    /// Returns `(nodes_written, edges_written)` — rows inserted or updated
+    /// into production (post-deduplication).
     pub fn flush_staging_to_production(&mut self) -> anyhow::Result<(u64, u64)> {
-        let tx = self
-            .conn
-            .transaction()
-            .context("starting staging flush transaction")?;
+        if !self.staging_active {
+            return Ok((0, 0));
+        }
+        let result = (|| -> anyhow::Result<(u64, u64)> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting staging flush transaction")?;
 
-        tx.execute_batch(
-            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line) \
-               SELECT id,corpus,root,path,language,signature,kind,package, \
-                      MAX(line),MAX(end_line) \
-               FROM nodes_stage GROUP BY id; \
-             INSERT INTO edges(src,dst,kind,provenance,confidence) \
-               SELECT src,dst,kind,provenance,MAX(confidence) \
-               FROM edges_stage GROUP BY src,dst,kind; \
-             DROP TABLE nodes_stage; \
-             DROP TABLE edges_stage;",
-        )
-        .context("flushing staging tables to production")?;
+            let nodes_written = tx
+                .execute(
+                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line) \
+                       SELECT id,corpus,root,path,language,signature,kind,package, \
+                              MAX(line),MAX(end_line) \
+                       FROM nodes_stage GROUP BY id \
+                       ON CONFLICT(id) DO UPDATE SET \
+                         kind     = excluded.kind, \
+                         package  = excluded.package, \
+                         line     = COALESCE(excluded.line,     nodes.line), \
+                         end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                    [],
+                )
+                .context("inserting nodes from staging")?;
 
-        let nodes: i64 = tx
-            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
-            .context("counting nodes after staging flush")?;
-        let edges: i64 = tx
-            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
-            .context("counting edges after staging flush")?;
+            let edges_written = tx
+                .execute(
+                    "INSERT INTO edges(src,dst,kind,provenance,confidence) \
+                       SELECT src,dst,kind,provenance,MAX(confidence) \
+                       FROM edges_stage GROUP BY src,dst,kind \
+                       ON CONFLICT(src,dst,kind) DO NOTHING",
+                    [],
+                )
+                .context("inserting edges from staging")?;
 
-        tx.commit().context("committing staging flush")?;
+            tx.execute_batch("DROP TABLE nodes_stage; DROP TABLE edges_stage;")
+                .context("dropping staging tables")?;
+
+            tx.commit().context("committing staging flush")?;
+            Ok((nodes_written as u64, edges_written as u64))
+        })();
+        // Always clear the flag whether success or failure so callers that
+        // catch and continue don't write into a poisoned staging state.
         self.staging_active = false;
-        Ok((nodes as u64, edges as u64))
+        result
     }
 
     /// Retract a single node from the FTS index.  No-op if the node has no FTS entry.
@@ -4158,6 +4183,44 @@ mod tests {
         // GROUP BY must collapse duplicates.
         assert_eq!(nodes_written, 1, "duplicate node must be deduplicated");
         assert_eq!(edges_written, 1, "duplicate edge must be deduplicated");
+    }
+
+    #[test]
+    fn staging_flush_is_idempotent_on_existing_db() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+
+        let node = Node::new(
+            VName::new("c", "", "src/lib.rs", "rust", "fn:foo"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let batch = vec![FileGraph {
+            vname_path: "src/lib.rs".into(),
+            new_hash: "aaa".into(),
+            nodes: vec![node.clone()],
+            edges: vec![],
+        }];
+        store.write_file_graphs_batch(&batch, true).unwrap();
+        store.flush_staging_to_production().unwrap();
+        assert_eq!(
+            store.node_count().unwrap(),
+            1,
+            "first flush must produce one node"
+        );
+
+        // Second init — same node already in production; ON CONFLICT must upsert cleanly.
+        store.begin_staging_tables().unwrap();
+        store.write_file_graphs_batch(&batch, true).unwrap();
+        let result = store.flush_staging_to_production();
+        assert!(result.is_ok(), "re-init must not fail: {:?}", result.err());
+        assert_eq!(
+            store.node_count().unwrap(),
+            1,
+            "re-init must not duplicate nodes"
+        );
     }
 
     #[test]

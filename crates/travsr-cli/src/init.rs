@@ -46,7 +46,7 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
     use std::io::IsTerminal as _;
     if std::io::stdout().is_terminal()
         && stats.phase_b_report.is_none()
-        && !super::daemon_is_running(&repo_root, 1, 0)
+        && !super::daemon_is_running(&repo_root, 3, 100)
     {
         let exe = std::env::current_exe().context("finding current exe path")?;
         let _ = std::process::Command::new(&exe)

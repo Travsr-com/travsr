@@ -688,9 +688,15 @@ pub fn init_repo_with_progress(
     store
         .begin_bulk_fts_tracking()
         .context("creating bulk FTS tracking table")?;
-    store
-        .begin_staging_tables()
-        .context("creating staging temp tables")?;
+    // Only activate staging on a fresh DB (node_count == 0).
+    // Re-init of an existing repo falls back to the incremental path so that
+    // stale nodes for changed files are deleted before re-insertion and the
+    // FTS index is not corrupted by duplicate rowids.
+    if store.node_count().unwrap_or(0) == 0 {
+        store
+            .begin_staging_tables()
+            .context("creating staging temp tables")?;
+    }
 
     let edges_before = store.edge_count().unwrap_or(0);
     let t_parse = std::time::Instant::now();
