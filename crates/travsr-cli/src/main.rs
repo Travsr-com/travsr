@@ -514,7 +514,7 @@ fn send_daemon_command(
 /// transport may briefly be unavailable during restart. Without retries, a
 /// `daemon start` call immediately after `daemon stop` could incorrectly spawn
 /// a second daemon.
-fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
+pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
             // Blocking sleep is safe: no concurrent async tasks exist at daemon-start time.
