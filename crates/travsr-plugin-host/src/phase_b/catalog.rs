@@ -130,11 +130,14 @@ pub fn dart_scip_emitter_asset(_tag: &str, target: &str) -> Option<String> {
     }
 }
 
-/// travsr-objc-index-emitter — macOS-only (libclang-based); initial target aarch64-apple-darwin.
+/// travsr-lang-objectivec — macOS-only (libclang-based); aarch64 and x86_64 Apple Darwin.
 pub fn objc_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
     match target {
         "aarch64-apple-darwin" => {
-            Some("travsr-objc-index-emitter-aarch64-apple-darwin".to_string())
+            Some("travsr-lang-objectivec-aarch64-apple-darwin".to_string())
+        }
+        "x86_64-apple-darwin" => {
+            Some("travsr-lang-objectivec-x86_64-apple-darwin".to_string())
         }
         _ => None,
     }
@@ -531,7 +534,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "objectivec",
         npm_package: Some("@travsr-plugin/objectivec"),
-        command: "travsr-objc-index-emitter",
+        command: "travsr-lang-objectivec",
         args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
@@ -542,7 +545,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
             repo: "Travsr-com/travsr-lang",
             asset_fn: objc_index_emitter_asset,
-            install_name: "travsr-objc-index-emitter",
+            install_name: "travsr-lang-objectivec",
             version_fallback: "v0.1.0",
             verify_sha256: false,
         }),
