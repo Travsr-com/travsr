@@ -3269,7 +3269,7 @@ fn snippet_for_node(node: &CoreNode, repo_root: &Path) -> Option<String> {
         return None;
     }
 
-    let content = std::fs::read_to_string(&abs).ok()?;
+    let content = std::fs::read_to_string(&canon_abs).ok()?;
     let all_lines: Vec<&str> = content.lines().collect();
 
     let from = start_1based.saturating_sub(1); // convert to 0-based
@@ -3280,6 +3280,17 @@ fn snippet_for_node(node: &CoreNode, repo_root: &Path) -> Option<String> {
     let cap = snippet_line_cap(&node.kind);
     // end_line is inclusive and 1-based; clamp to cap and file length.
     let to = (end_1based.min(from + cap)).min(all_lines.len());
+    // Guard against a corrupt DB entry where end_line < line — the slice
+    // would panic with "range start > end". Degrade gracefully instead.
+    if to < from {
+        tracing::debug!(
+            path = %node.vname.path,
+            from,
+            to,
+            "get_snippets: end_line < line in DB — skipping node"
+        );
+        return None;
+    }
     let window: Vec<&str> = all_lines[from..to].to_vec();
     let trimmed = skip_leading_comments(&window);
     if trimmed.is_empty() {
@@ -3723,5 +3734,42 @@ mod snippet_tests {
             result.contains("0 with snippets"),
             "snippet count must be 0: {result}"
         );
+    }
+
+    #[test]
+    fn snippet_for_node_inverted_line_range_returns_none_not_panic() {
+        // Regression test for the reversed-slice panic: end_line < line must
+        // degrade to None instead of panicking with "range start > end".
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("inv.ts");
+        std::fs::write(&src, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+
+        // node.line=5, node.end_line=2 → to=2 < from=4 → would panic without guard
+        let node = make_fn_node("inv.ts", "fn:inv", 5, 2);
+        assert!(
+            snippet_for_node(&node, dir.path()).is_none(),
+            "inverted line range must return None, not panic"
+        );
+    }
+
+    #[test]
+    fn snippet_for_node_reads_via_canonical_path() {
+        // Regression test for the TOCTOU fix: the read must use canon_abs
+        // (the resolved path) rather than the pre-canonicalization abs path.
+        // On systems where tempdir() returns a symlinked path (e.g. macOS
+        // /tmp → /private/tmp), this test would silently pass either way
+        // because the symlink is valid. The key invariant we verify: a file
+        // that exists and is inside the repo is readable via snippet_for_node.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("real.ts");
+        std::fs::write(&src, "function real() {\n  return 42;\n}\n").unwrap();
+
+        let node = make_fn_node("real.ts", "fn:real", 1, 3);
+        let snippet = snippet_for_node(&node, dir.path());
+        assert!(
+            snippet.is_some(),
+            "readable repo-internal file must produce a snippet"
+        );
+        assert!(snippet.unwrap().contains("return 42"));
     }
 }

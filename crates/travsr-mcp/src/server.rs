@@ -872,6 +872,29 @@ fn tools_list_global() -> serde_json::Value {
                     "required": [],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_snippets",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction: functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached. Use this after any graph-navigation tool to read the actual code without opening files.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbols": {
+                            "type": "string",
+                            "description": "Newline- or comma-separated list of symbol names (e.g. 'PaymentService.charge\\nMAX_RETRIES'). Partial matches accepted — the closest matching non-file symbol is used for each name."
+                        },
+                        "token_budget": {
+                            "type": "integer",
+                            "description": "Hard token cap across all returned snippets. Default: 2000. Higher values return more symbols."
+                        },
+                        "repo": {
+                            "type": "string",
+                            "description": "Restrict to a specific registered repo by name."
+                        }
+                    },
+                    "required": ["symbols"],
+                    "additionalProperties": false
+                }
             }
         ]
     })
