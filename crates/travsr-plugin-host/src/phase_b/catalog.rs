@@ -130,6 +130,15 @@ pub fn dart_scip_emitter_asset(_tag: &str, target: &str) -> Option<String> {
     }
 }
 
+/// travsr-lang-objectivec — macOS-only (libclang-based); aarch64 and x86_64 Apple Darwin.
+pub fn objc_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => Some("travsr-lang-objectivec-aarch64-apple-darwin".to_string()),
+        "x86_64-apple-darwin" => Some("travsr-lang-objectivec-x86_64-apple-darwin".to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub struct PhaseBEntry {
     pub language: &'static str,
@@ -519,20 +528,23 @@ pub static CATALOG: &[PhaseBEntry] = &[
         has_share_assets: false,
     },
     PhaseBEntry {
-        // Phase B not yet available: no SCIP/LSIF indexer exists for ObjC.
-        // scip-clang covers C/C++/CUDA only. Candidate: libclang-based
-        // travsr-objc-index-emitter (see RFC pending).
         language: "objectivec",
         npm_package: Some("@travsr-plugin/objectivec"),
-        command: "",
+        command: "travsr-lang-objectivec",
         args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "No Phase B tool available for Objective-C yet — Phase A (tree-sitter) only",
-        underlying_tool_hint: "Phase B pending: travsr-objc-index-emitter (libclang-based, RFC in progress)",
+        install_hint: "travsr lang install objectivec",
+        underlying_tool_hint: "",
         provider_binary: Some("travsr-lang-objectivec"),
         elevated_hosts: &[],
-        scip_install: ScipInstall::Manual,
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "Travsr-com/travsr-lang",
+            asset_fn: objc_index_emitter_asset,
+            install_name: "travsr-lang-objectivec",
+            version_fallback: "v0.1.0",
+            verify_sha256: false,
+        }),
         extensions: &[".m", ".mm"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
