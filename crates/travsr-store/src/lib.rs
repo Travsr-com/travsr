@@ -350,6 +350,7 @@ pub struct BatchWriteCounts {
 #[derive(Debug)]
 pub struct SqliteStore {
     conn: Connection,
+    staging_active: bool,
 }
 
 impl Drop for SqliteStore {
@@ -372,7 +373,10 @@ impl SqliteStore {
             Self::configure(&conn)?;
             // Bootstrap the meta table before the runner reads the schema version.
             Self::bootstrap_meta(&conn)?;
-            let mut store = Self { conn };
+            let mut store = Self {
+                conn,
+                staging_active: false,
+            };
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations")?;
@@ -424,7 +428,10 @@ impl SqliteStore {
                 .context("setting mmap_size (read-only)")?;
             conn.pragma_update(None, "query_only", "ON")
                 .context("setting query_only=ON")?;
-            let store = Self { conn };
+            let store = Self {
+                conn,
+                staging_active: false,
+            };
             let current = store
                 .schema_version()
                 .context("reading schema version (read-only)")?;
@@ -444,7 +451,10 @@ impl SqliteStore {
         (|| -> AnyResult<Self> {
             let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
             Self::bootstrap_meta(&conn)?;
-            let mut store = Self { conn };
+            let mut store = Self {
+                conn,
+                staging_active: false,
+            };
             sqlite_migration_runner()
                 .run(&mut store)
                 .context("running SQLite migrations (in-memory)")?;
@@ -719,6 +729,7 @@ impl SqliteStore {
         batch: &[FileGraph],
         bulk: bool,
     ) -> Result<BatchWriteCounts, StoreError> {
+        let staging = self.staging_active;
         (|| -> AnyResult<BatchWriteCounts> {
             // _bulk_fts_pending is a temp table populated by put_node_fts_map_only
             // and consumed by rebuild_fts_from_map. Create it here so the table
@@ -739,106 +750,143 @@ impl SqliteStore {
             let mut counts = BatchWriteCounts::default();
 
             for file in batch {
-                // ── delete pass (mirrors delete_nodes_for_path logic) ─────────
-                // Load old FTS tokens BEFORE removing map rows so vocab can
-                // be decremented correctly.
-                let old_token_strings: Vec<String> = {
-                    let mut stmt = tx
-                        .prepare(
-                            "SELECT m.tokens FROM nodes_fts_map m \
-                             JOIN nodes n ON n.id = m.node_id WHERE n.path = ?1",
+                if staging {
+                    // ── staging path (bulk init only) ─────────────────────────
+                    // No delete pass — the DB is empty on a fresh init.
+                    // Plain INSERT into constraint-free TEMP tables: no B-tree
+                    // read, no index maintenance. flush_staging_to_production
+                    // deduplicates in one GROUP BY pass after all files are done.
+                    for node in &file.nodes {
+                        tx.execute(
+                            "INSERT INTO nodes_stage(id,corpus,root,path,language,\
+                             signature,kind,package,line,end_line) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                            params![
+                                node_id_to_i64(node.id),
+                                node.vname.corpus,
+                                node.vname.root,
+                                node.vname.path,
+                                node.vname.language,
+                                node.vname.signature,
+                                node.kind,
+                                node.package,
+                                node.line.map(|l| l as i64),
+                                node.end_line.map(|l| l as i64),
+                            ],
                         )
-                        .context("preparing old-token load")?;
-                    // Collect into an owned Result before `?` so the MappedRows
-                    // borrow on `stmt` ends before the block closes (E0597).
-                    let mapped = stmt
-                        .query_map(params![file.vname_path], |row| row.get::<_, String>(0))
-                        .context("querying old tokens")?;
-                    let owned: rusqlite::Result<Vec<String>> = mapped.collect();
-                    owned.context("collecting old tokens")?
-                };
-
-                // Retract FTS entries for the path.
-                tx.execute(
-                    "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
-                     SELECT 'delete', m.node_id, m.tokens \
-                     FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
-                     WHERE n.path = ?1",
-                    params![file.vname_path],
-                )
-                .context("retracting FTS rows")?;
-                tx.execute(
-                    "DELETE FROM nodes_fts_map \
-                     WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
-                    params![file.vname_path],
-                )
-                .context("removing FTS map rows")?;
-
-                for ts in &old_token_strings {
-                    Self::vocab_decrement(&tx, ts)?;
-                }
-
-                // Delete edges referencing this path's nodes, then the nodes.
-                tx.execute(
-                    "DELETE FROM edges \
-                     WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
-                        OR dst IN (SELECT id FROM nodes WHERE path = ?1)",
-                    params![file.vname_path],
-                )
-                .context("deleting edges for path")?;
-                tx.execute("DELETE FROM nodes WHERE path = ?1", params![file.vname_path])
-                    .context("deleting nodes for path")?;
-
-                // ── insert pass ───────────────────────────────────────────────
-                for node in &file.nodes {
-                    let id_i64 = node_id_to_i64(node.id);
-                    tx.execute(
-                        "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-                         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
-                           package = excluded.package, \
-                           line = COALESCE(excluded.line, nodes.line), \
-                           end_line = COALESCE(excluded.end_line, nodes.end_line)",
-                        params![
-                            id_i64,
-                            node.vname.corpus,
-                            node.vname.root,
-                            node.vname.path,
-                            node.vname.language,
-                            node.vname.signature,
-                            node.kind,
-                            node.package,
-                            node.line.map(|l| l as i64),
-                            node.end_line.map(|l| l as i64),
-                        ],
-                    )
-                    .context("inserting node in batch")?;
-                    if bulk {
+                        .context("staging: inserting node")?;
                         Self::put_node_fts_map_only(&tx, node)
-                            .context("batch put_node_fts_map_only")?;
-                    } else {
-                        Self::put_node_fts(&tx, node).context("batch put_node_fts")?;
+                            .context("staging: put_node_fts_map_only")?;
+                        counts.nodes_upserted += 1;
                     }
-                    counts.nodes_upserted += 1;
-                }
-
-                for edge in &file.edges {
+                    for edge in &file.edges {
+                        tx.execute(
+                            "INSERT INTO edges_stage(src,dst,kind,provenance,confidence) \
+                             VALUES(?1,?2,?3,'tree-sitter',?4)",
+                            params![
+                                node_id_to_i64(edge.src),
+                                node_id_to_i64(edge.dst),
+                                edge.kind.as_str(),
+                                edge.confidence.map(|c| c as i64),
+                            ],
+                        )
+                        .context("staging: inserting edge")?;
+                        counts.edges_upserted += 1;
+                    }
+                } else {
+                    // ── incremental path: delete existing rows, then upsert ───
+                    // Load old FTS tokens BEFORE removing map rows so vocab can
+                    // be decremented correctly.
+                    let old_token_strings: Vec<String> = {
+                        let mut stmt = tx
+                            .prepare(
+                                "SELECT m.tokens FROM nodes_fts_map m \
+                                 JOIN nodes n ON n.id = m.node_id WHERE n.path = ?1",
+                            )
+                            .context("preparing old-token load")?;
+                        let mapped = stmt
+                            .query_map(params![file.vname_path], |row| row.get::<_, String>(0))
+                            .context("querying old tokens")?;
+                        let owned: rusqlite::Result<Vec<String>> = mapped.collect();
+                        owned.context("collecting old tokens")?
+                    };
                     tx.execute(
-                        "INSERT INTO edges(src, dst, kind, provenance, confidence) \
-                         VALUES(?1, ?2, ?3, 'tree-sitter', ?4) \
-                         ON CONFLICT(src, dst, kind) DO NOTHING",
-                        params![
-                            node_id_to_i64(edge.src),
-                            node_id_to_i64(edge.dst),
-                            edge.kind.as_str(),
-                            edge.confidence.map(|c| c as i64),
-                        ],
+                        "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
+                         SELECT 'delete', m.node_id, m.tokens \
+                         FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
+                         WHERE n.path = ?1",
+                        params![file.vname_path],
                     )
-                    .context("inserting edge in batch")?;
-                    counts.edges_upserted += 1;
+                    .context("retracting FTS rows")?;
+                    tx.execute(
+                        "DELETE FROM nodes_fts_map \
+                         WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                        params![file.vname_path],
+                    )
+                    .context("removing FTS map rows")?;
+                    for ts in &old_token_strings {
+                        Self::vocab_decrement(&tx, ts)?;
+                    }
+                    tx.execute(
+                        "DELETE FROM edges \
+                         WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
+                            OR dst IN (SELECT id FROM nodes WHERE path = ?1)",
+                        params![file.vname_path],
+                    )
+                    .context("deleting edges for path")?;
+                    tx.execute("DELETE FROM nodes WHERE path = ?1", params![file.vname_path])
+                        .context("deleting nodes for path")?;
+
+                    for node in &file.nodes {
+                        let id_i64 = node_id_to_i64(node.id);
+                        tx.execute(
+                            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                             ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
+                               package = excluded.package, \
+                               line = COALESCE(excluded.line, nodes.line), \
+                               end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                            params![
+                                id_i64,
+                                node.vname.corpus,
+                                node.vname.root,
+                                node.vname.path,
+                                node.vname.language,
+                                node.vname.signature,
+                                node.kind,
+                                node.package,
+                                node.line.map(|l| l as i64),
+                                node.end_line.map(|l| l as i64),
+                            ],
+                        )
+                        .context("inserting node in batch")?;
+                        if bulk {
+                            Self::put_node_fts_map_only(&tx, node)
+                                .context("batch put_node_fts_map_only")?;
+                        } else {
+                            Self::put_node_fts(&tx, node).context("batch put_node_fts")?;
+                        }
+                        counts.nodes_upserted += 1;
+                    }
+                    for edge in &file.edges {
+                        tx.execute(
+                            "INSERT INTO edges(src,dst,kind,provenance,confidence) \
+                             VALUES(?1,?2,?3,'tree-sitter',?4) \
+                             ON CONFLICT(src,dst,kind) DO NOTHING",
+                            params![
+                                node_id_to_i64(edge.src),
+                                node_id_to_i64(edge.dst),
+                                edge.kind.as_str(),
+                                edge.confidence.map(|c| c as i64),
+                            ],
+                        )
+                        .context("inserting edge in batch")?;
+                        counts.edges_upserted += 1;
+                    }
                 }
 
-                // Upsert file hash.
+                // File hash goes to production in both paths — one row per
+                // source file, non-conflicting, needed for SHA256 delta detection.
                 tx.execute(
                     "INSERT INTO files(path, sha256, last_indexed_at) \
                      VALUES(?1, ?2, unixepoch()) \
@@ -1817,6 +1865,108 @@ impl SqliteStore {
             )
             .context("creating _bulk_fts_pending temp table")?;
         Ok(())
+    }
+
+    /// Create constraint-free TEMP tables for staging bulk init writes.
+    ///
+    /// During `travsr init`, nodes and edges are written here with plain INSERT
+    /// (no ON CONFLICT clause, no index maintenance).  After all files are
+    /// processed, call [`flush_staging_to_production`] which deduplicates in a
+    /// single GROUP BY pass and writes the clean result to the production tables.
+    ///
+    /// This eliminates the B-tree read (ON CONFLICT uniqueness check) from every
+    /// node and edge insert on the hot init path — converting N×(read+write) to
+    /// N×write + 1×sort, where the sort uses sequential I/O via SQLite's external
+    /// merge sort.
+    ///
+    /// Safe to call multiple times (TEMP tables use IF NOT EXISTS).  Crash-safe:
+    /// TEMP tables are dropped automatically on connection close, leaving the
+    /// production tables untouched.
+    pub fn begin_staging_tables(&mut self) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS nodes_stage( \
+                   id INTEGER, corpus TEXT, root TEXT, path TEXT, \
+                   language TEXT, signature TEXT, kind TEXT, \
+                   package TEXT, line INTEGER, end_line INTEGER \
+                 ); \
+                 CREATE INDEX IF NOT EXISTS nodes_stage_id ON nodes_stage(id); \
+                 CREATE TEMP TABLE IF NOT EXISTS edges_stage( \
+                   src INTEGER, dst INTEGER, kind TEXT, \
+                   provenance TEXT, confidence INTEGER \
+                 ); \
+                 CREATE INDEX IF NOT EXISTS edges_stage_pk \
+                   ON edges_stage(src, dst, kind);",
+            )
+            .context("creating staging temp tables")?;
+        self.staging_active = true;
+        Ok(())
+    }
+
+    /// Flush staging tables to production in one deduplicating GROUP BY pass.
+    ///
+    /// Deduplication semantics match the incremental ON CONFLICT path:
+    /// - nodes: GROUP BY id deduplicates; MAX(line)/MAX(end_line) picks a value
+    ///   when at most one source row has a non-NULL value (by construction,
+    ///   same NodeId ⟹ same VName ⟹ same parse output, so all are equal).
+    ///   ON CONFLICT(id) DO UPDATE handles re-init where nodes already exist.
+    /// - edges: GROUP BY (src,dst,kind) deduplicates; ON CONFLICT DO NOTHING
+    ///   is a no-op for any edge already in production.
+    ///
+    /// Bare non-grouped columns in the nodes SELECT (corpus, root, path, …) are
+    /// safe: same id ⟹ same VName (NodeId is a deterministic hash of the VName),
+    /// so SQLite's arbitrary-value pick for the group is always correct.
+    ///
+    /// Must be called after all [`write_file_graphs_batch`] calls with
+    /// `staging_active=true` and before [`rebuild_fts_from_map`].
+    ///
+    /// Returns `(nodes_written, edges_written)` — rows inserted or updated
+    /// into production (post-deduplication).
+    pub fn flush_staging_to_production(&mut self) -> anyhow::Result<(u64, u64)> {
+        if !self.staging_active {
+            return Ok((0, 0));
+        }
+        let result = (|| -> anyhow::Result<(u64, u64)> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting staging flush transaction")?;
+
+            let nodes_written = tx
+                .execute(
+                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line) \
+                       SELECT id,corpus,root,path,language,signature,kind,package, \
+                              MAX(line),MAX(end_line) \
+                       FROM nodes_stage GROUP BY id \
+                       ON CONFLICT(id) DO UPDATE SET \
+                         kind     = excluded.kind, \
+                         package  = excluded.package, \
+                         line     = COALESCE(excluded.line,     nodes.line), \
+                         end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                    [],
+                )
+                .context("inserting nodes from staging")?;
+
+            let edges_written = tx
+                .execute(
+                    "INSERT INTO edges(src,dst,kind,provenance,confidence) \
+                       SELECT src,dst,kind,provenance,MAX(confidence) \
+                       FROM edges_stage GROUP BY src,dst,kind \
+                       ON CONFLICT(src,dst,kind) DO NOTHING",
+                    [],
+                )
+                .context("inserting edges from staging")?;
+
+            tx.execute_batch("DROP TABLE nodes_stage; DROP TABLE edges_stage;")
+                .context("dropping staging tables")?;
+
+            tx.commit().context("committing staging flush")?;
+            Ok((nodes_written as u64, edges_written as u64))
+        })();
+        // Always clear the flag whether success or failure so callers that
+        // catch and continue don't write into a poisoned staging state.
+        self.staging_active = false;
+        result
     }
 
     /// Retract a single node from the FTS index.  No-op if the node has no FTS entry.
@@ -3923,6 +4073,198 @@ mod tests {
                 .iter()
                 .any(|n| n.vname.signature.contains("Auth")),
             "bulk FTS must find AuthService"
+        );
+    }
+
+    #[test]
+    fn staging_nodes_and_edges_reach_production_after_flush() {
+        let corpus = "staging-test";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+
+        let node_a = Node::new(
+            VName::new(corpus, "", "src/a.rs", "rust", "fn:foo"),
+            "function",
+        );
+        let node_b = Node::new(
+            VName::new(corpus, "", "src/b.rs", "rust", "fn:bar"),
+            "function",
+        );
+        let edge = travsr_core::Edge {
+            src: node_a.id,
+            dst: node_b.id,
+            kind: travsr_core::EdgeKind::RefCall,
+            confidence: None,
+        };
+
+        let batch = vec![
+            FileGraph {
+                vname_path: "src/a.rs".into(),
+                new_hash: "aaa".into(),
+                nodes: vec![node_a.clone()],
+                edges: vec![edge.clone()],
+            },
+            FileGraph {
+                vname_path: "src/b.rs".into(),
+                new_hash: "bbb".into(),
+                nodes: vec![node_b.clone()],
+                edges: vec![],
+            },
+        ];
+        store.write_file_graphs_batch(&batch, true).unwrap();
+
+        // Before flush: production tables must be empty.
+        assert_eq!(
+            store.node_count().unwrap(),
+            0,
+            "nodes must be in staging, not production yet"
+        );
+        assert_eq!(
+            store.edge_count().unwrap(),
+            0,
+            "edges must be in staging, not production yet"
+        );
+
+        let (nodes_written, edges_written) = store.flush_staging_to_production().unwrap();
+
+        assert_eq!(nodes_written, 2, "both nodes must reach production");
+        assert_eq!(edges_written, 1, "the ref/call edge must reach production");
+        assert!(
+            !store.staging_active,
+            "staging_active must be cleared after flush"
+        );
+
+        // Verify graph connectivity.
+        let callers = store.iter_edges_to(node_b.id).unwrap();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].src, node_a.id);
+    }
+
+    #[test]
+    fn staging_deduplicates_duplicate_nodes_and_edges() {
+        let corpus = "dup-test";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+
+        let node = Node::new(
+            VName::new(corpus, "", "src/lib.rs", "rust", "fn:init"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        // Same node emitted twice (e.g. two overlapping indexing passes).
+        let node_dup = node.clone();
+        let edge = travsr_core::Edge {
+            src: node.id,
+            dst: node.id,
+            kind: travsr_core::EdgeKind::RefCall,
+            confidence: None,
+        };
+
+        let batch = vec![
+            FileGraph {
+                vname_path: "src/lib.rs".into(),
+                new_hash: "aaa".into(),
+                nodes: vec![node.clone()],
+                edges: vec![edge.clone()],
+            },
+            FileGraph {
+                vname_path: "src/lib.rs".into(),
+                new_hash: "aaa".into(),
+                nodes: vec![node_dup],
+                edges: vec![edge],
+            },
+        ];
+        store.write_file_graphs_batch(&batch, true).unwrap();
+        let (nodes_written, edges_written) = store.flush_staging_to_production().unwrap();
+
+        // GROUP BY must collapse duplicates.
+        assert_eq!(nodes_written, 1, "duplicate node must be deduplicated");
+        assert_eq!(edges_written, 1, "duplicate edge must be deduplicated");
+    }
+
+    #[test]
+    fn staging_flush_is_idempotent_on_existing_db() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+
+        let node = Node::new(
+            VName::new("c", "", "src/lib.rs", "rust", "fn:foo"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let batch = vec![FileGraph {
+            vname_path: "src/lib.rs".into(),
+            new_hash: "aaa".into(),
+            nodes: vec![node.clone()],
+            edges: vec![],
+        }];
+        store.write_file_graphs_batch(&batch, true).unwrap();
+        store.flush_staging_to_production().unwrap();
+        assert_eq!(
+            store.node_count().unwrap(),
+            1,
+            "first flush must produce one node"
+        );
+
+        // Second init — same node already in production; ON CONFLICT must upsert cleanly.
+        store.begin_staging_tables().unwrap();
+        store.write_file_graphs_batch(&batch, true).unwrap();
+        let result = store.flush_staging_to_production();
+        assert!(result.is_ok(), "re-init must not fail: {:?}", result.err());
+        assert_eq!(
+            store.node_count().unwrap(),
+            1,
+            "re-init must not duplicate nodes"
+        );
+    }
+
+    #[test]
+    fn staging_fts_matches_bulk_path_after_flush() {
+        let nodes = vec![
+            Node::new(
+                VName::new("c", "", "src/auth.rs", "rust", "fn:AuthService"),
+                "function",
+            ),
+            Node::new(
+                VName::new("c", "", "src/pay.rs", "rust", "fn:PaymentHandler"),
+                "function",
+            ),
+        ];
+
+        // Reference: row-by-row path.
+        let mut ref_store = SqliteStore::open_in_memory().unwrap();
+        for n in &nodes {
+            ref_store.put_node(n).unwrap();
+        }
+        let ref_results = ref_store.search_nodes_fuzzy("auth").unwrap();
+
+        // Staging path.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.begin_bulk_fts_tracking().unwrap();
+        store.begin_staging_tables().unwrap();
+        let batch: Vec<FileGraph> = nodes
+            .iter()
+            .map(|n| FileGraph {
+                vname_path: n.vname.path.clone(),
+                new_hash: "hash".into(),
+                nodes: vec![n.clone()],
+                edges: vec![],
+            })
+            .collect();
+        store.write_file_graphs_batch(&batch, true).unwrap();
+        store.flush_staging_to_production().unwrap();
+        store.rebuild_fts_from_map().unwrap();
+        let stage_results = store.search_nodes_fuzzy("auth").unwrap();
+
+        assert_eq!(
+            ref_results.len(),
+            stage_results.len(),
+            "staging+flush FTS must return same results as row-by-row"
         );
     }
 

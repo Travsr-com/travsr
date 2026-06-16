@@ -338,10 +338,9 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
 
     match &stats.phase_b_report {
         None => {
-            // Phase B deferred — daemon picks it up if running, otherwise
-            // the user starts it with `travsr daemon start`.
+            // Phase B deferred — daemon auto-started by init, indexing in background.
             println!(
-                "  {} semantic call-edge indexing deferred — run `travsr daemon start` to index in background",
+                "  {} semantic call-edge indexing in background — run `travsr daemon status` to check progress",
                 pal.dim("ℹ"),
             );
         }

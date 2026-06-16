@@ -39,6 +39,24 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
         return Ok(());
     }
 
+    // Auto-start the daemon when Phase B was deferred so it picks up semantic
+    // indexing immediately without requiring a manual `travsr daemon start`.
+    // Guard with is_terminal so we never spawn a background process in CI,
+    // piped contexts, or integration tests (where it would race the DB lock).
+    use std::io::IsTerminal as _;
+    if std::io::stdout().is_terminal()
+        && stats.phase_b_report.is_none()
+        && !super::daemon_is_running(&repo_root, 3, 100)
+    {
+        let exe = std::env::current_exe().context("finding current exe path")?;
+        let _ = std::process::Command::new(&exe)
+            .args(["daemon", "start", "--foreground"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
     crate::progress::print_summary(&stats, elapsed, quiet);
 
     // Tips are advisory chatter — suppress under --quiet.

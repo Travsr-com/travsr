@@ -688,6 +688,15 @@ pub fn init_repo_with_progress(
     store
         .begin_bulk_fts_tracking()
         .context("creating bulk FTS tracking table")?;
+    // Only activate staging on a fresh DB (node_count == 0).
+    // Re-init of an existing repo falls back to the incremental path so that
+    // stale nodes for changed files are deleted before re-insertion and the
+    // FTS index is not corrupted by duplicate rowids.
+    if store.node_count().unwrap_or(0) == 0 {
+        store
+            .begin_staging_tables()
+            .context("creating staging temp tables")?;
+    }
 
     let edges_before = store.edge_count().unwrap_or(0);
     let t_parse = std::time::Instant::now();
@@ -704,6 +713,22 @@ pub fn init_repo_with_progress(
         elapsed_ms = t_parse.elapsed().as_millis(),
         "TIMING: index_paths_parallel done"
     );
+
+    // Flush staging tables → production in one deduplicating GROUP BY pass.
+    // Must happen before rebuild_fts_from_map, which reads nodes_fts_map rows
+    // written during the staging phase and joins them against production nodes.
+    let t_flush = std::time::Instant::now();
+    if index_result.is_ok() {
+        let (nodes_written, edges_written) = store
+            .flush_staging_to_production()
+            .context("flushing staging tables to production")?;
+        tracing::info!(
+            elapsed_ms = t_flush.elapsed().as_millis(),
+            nodes = nodes_written,
+            edges = edges_written,
+            "TIMING: flush_staging_to_production done"
+        );
+    }
 
     // Rebuild FTS + vocab in one pass now that all nodes are written.
     // Do this before restoring pragmas so the rebuild benefits from the
