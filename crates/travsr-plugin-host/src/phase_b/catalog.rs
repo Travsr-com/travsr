@@ -133,12 +133,8 @@ pub fn dart_scip_emitter_asset(_tag: &str, target: &str) -> Option<String> {
 /// travsr-lang-objectivec — macOS-only (libclang-based); aarch64 and x86_64 Apple Darwin.
 pub fn objc_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
     match target {
-        "aarch64-apple-darwin" => {
-            Some("travsr-lang-objectivec-aarch64-apple-darwin".to_string())
-        }
-        "x86_64-apple-darwin" => {
-            Some("travsr-lang-objectivec-x86_64-apple-darwin".to_string())
-        }
+        "aarch64-apple-darwin" => Some("travsr-lang-objectivec-aarch64-apple-darwin".to_string()),
+        "x86_64-apple-darwin" => Some("travsr-lang-objectivec-x86_64-apple-darwin".to_string()),
         _ => None,
     }
 }
