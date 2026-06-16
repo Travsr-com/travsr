@@ -3331,7 +3331,7 @@ fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize
     }
 
     if resolved.is_empty() {
-        return format!("No symbols matching the provided names found in the graph.");
+        return "No symbols matching the provided names found in the graph.".to_string();
     }
 
     // Accumulate blocks within budget.  All symbols are equally requested so
