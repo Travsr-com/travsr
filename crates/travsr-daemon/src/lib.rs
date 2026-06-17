@@ -550,6 +550,23 @@ pub fn init_repo_with_progress(
         .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
+    // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
+    // path at query time without threading repo_root through function signatures.
+    if let Some(root_str) = repo_root.to_str() {
+        store
+            .set_meta("repo_root", root_str)
+            .context("writing repo_root to meta")?;
+    } else {
+        // Non-UTF-8 repo paths are valid on Linux (ext4 allows arbitrary bytes)
+        // but cannot be stored in the meta table. Snippet retrieval will degrade
+        // to metadata-only output and prompt the user to re-init. Warn so the
+        // cause is visible in logs rather than silently degrading.
+        tracing::warn!(
+            path = %repo_root.display(),
+            "repo_root contains non-UTF-8 bytes — snippet tool will be unavailable for this repo"
+        );
+    }
+
     // T4 (1b): scaffold .travsrignore before the walker reads it so default
     // patterns are active on the very first `travsr init` run.
     let scaffolded = scaffold_travsrignore(repo_root).unwrap_or(false);
