@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "pairs": [
+    {
+      "pair": "ts-rust",
+      "fixture_root": "ts-rust/",
+      "xfail": true,
+      "xfail_reason": "wasm-bindgen FFI resolver not yet implemented — tracked in #306",
+      "edges": [
+        {
+          "src": {"language": "typescript", "path_contains": "addon.d.ts", "signature": "fn:add"},
+          "dst": {"language": "rust", "path_contains": "lib.rs", "signature": "fn:add"},
+          "min_confidence": 90,
+          "tag": "name+arity match"
+        },
+        {
+          "src": {"language": "typescript", "path_contains": "addon.d.ts", "signature": "fn:greet"},
+          "dst": {"language": "rust", "path_contains": "lib.rs", "signature": "fn:greet_impl"},
+          "min_confidence": 70,
+          "tag": "js_name alias match"
+        }
+      ]
+    },
+    {
+      "pair": "py-rust",
+      "fixture_root": "py-rust/",
+      "xfail": true,
+      "xfail_reason": "PyO3 FFI resolver not yet implemented — tracked in #306",
+      "edges": [
+        {
+          "src": {"language": "python", "path_contains": "_native.pyi", "signature": "fn:multiply"},
+          "dst": {"language": "rust", "path_contains": "lib.rs", "signature": "fn:multiply"},
+          "min_confidence": 90,
+          "tag": "name+arity match"
+        },
+        {
+          "src": {"language": "python", "path_contains": "_native.pyi", "signature": "fn:upper"},
+          "dst": {"language": "rust", "path_contains": "lib.rs", "signature": "fn:to_upper"},
+          "min_confidence": 70,
+          "tag": "pyo3 name alias match"
+        }
+      ]
+    },
+    {
+      "pair": "go-c",
+      "fixture_root": "go-c/",
+      "edges": [
+        {
+          "src": {"language": "go", "path_contains": "main.go", "signature": "fn:GoCallback"},
+          "dst": {"language": "c", "path_contains": "<cgo_synthetic>", "signature": "fn:GoCallback"},
+          "min_confidence": 90,
+          "tag": "//export exact name match"
+        }
+      ]
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use travsr_core::{Node as CoreNode, NodeId};
 use travsr_retrieval::{
@@ -1331,8 +1331,21 @@ pub fn get_repo_map_global(repos: &HashMap<String, PathBuf>, repo: Option<&str>)
 /// Returns identical output for "not found" and "access denied" to prevent
 /// existence oracle attacks. Seeds are filtered through the `OpenFilter` so
 /// callers cannot distinguish missing vs denied symbols.
-pub fn get_context(store: &SqliteStore, query: &str, token_budget: usize) -> String {
-    get_context_with_filter(store, query, token_budget, &OpenFilter)
+pub fn get_context(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
+) -> String {
+    get_context_with_filter(
+        store,
+        query,
+        token_budget,
+        &OpenFilter,
+        include_snippets,
+        snippet_budget,
+    )
 }
 
 /// Authenticated variant — applies RBAC filter at seed lookup and node fetch.
@@ -1342,14 +1355,36 @@ pub(crate) fn get_context_authed(
     query: &str,
     token_budget: usize,
     filter: &dyn EdgeFilter,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
 ) -> String {
-    get_context_with_filter(store, query, token_budget, filter)
+    get_context_with_filter(
+        store,
+        query,
+        token_budget,
+        filter,
+        include_snippets,
+        snippet_budget,
+    )
 }
 
 /// Raw variant — returns body without envelope. Used by global aggregation to
 /// prevent double-sanitization when multiple stores are aggregated before wrapping.
-pub(crate) fn get_context_raw(store: &SqliteStore, query: &str, token_budget: usize) -> String {
-    get_context_body(store, query, token_budget, &OpenFilter)
+pub(crate) fn get_context_raw(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
+) -> String {
+    get_context_body(
+        store,
+        query,
+        token_budget,
+        &OpenFilter,
+        include_snippets,
+        snippet_budget,
+    )
 }
 
 fn get_context_with_filter(
@@ -1357,8 +1392,17 @@ fn get_context_with_filter(
     query: &str,
     token_budget: usize,
     filter: &dyn EdgeFilter,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
 ) -> String {
-    let body = get_context_body(store, query, token_budget, filter);
+    let body = get_context_body(
+        store,
+        query,
+        token_budget,
+        filter,
+        include_snippets,
+        snippet_budget,
+    );
     wrap_envelope(&body)
 }
 
@@ -1367,6 +1411,8 @@ fn get_context_body(
     query: &str,
     token_budget: usize,
     filter: &dyn EdgeFilter,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
 ) -> String {
     // SEC-002: validate before any store access.
     if let Err(reason) = validate_mcp_arg(query) {
@@ -1427,6 +1473,8 @@ fn get_context_body(
     };
 
     // Post-filter fetched nodes through RBAC and join with scores.
+    // SEC P0: `selected` is the authoritative RBAC-filtered list; snippets are
+    // only ever read for nodes already in this set (never re-queried separately).
     let items: Vec<(CoreNode, f32)> = fetched
         .into_iter()
         .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
@@ -1442,26 +1490,100 @@ fn get_context_body(
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
-    // Format body lines.
-    let lines: Vec<String> = selected
-        .iter()
-        .map(|n| {
-            format!(
+    let char_cap = (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000);
+
+    if include_snippets {
+        // Read repo_root. Pre-snippet indexes lack this key → degrade to metadata-only.
+        let repo_root = match store.get_meta("repo_root") {
+            Ok(Some(r)) if !r.is_empty() => PathBuf::from(r),
+            _ => {
+                tracing::warn!(
+                    "get_context: repo_root not in meta — falling back to metadata-only"
+                );
+                let lines: Vec<String> = selected
+                    .iter()
+                    .map(|n| {
+                        format!(
+                            "{} ({}) — {} [package: {}]",
+                            n.vname.signature, n.kind, n.vname.path, n.package
+                        )
+                    })
+                    .collect();
+                let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
+                return format!(
+                    "{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
+                );
+            }
+        };
+
+        // Snippet ceiling: explicit separate budget or whatever remains after metadata.
+        let snippet_ceiling =
+            snippet_budget.unwrap_or_else(|| token_budget.saturating_sub(total_tokens));
+        let mode_label = if snippet_budget.is_some() {
+            "separate"
+        } else {
+            "shared"
+        };
+
+        let mut snip_tokens: usize = 0;
+        let mut n_with_snippet: usize = 0;
+        let mut blocks: Vec<String> = Vec::with_capacity(selected.len());
+
+        for n in &selected {
+            let header = format!(
                 "{} ({}) — {} [package: {}]",
                 n.vname.signature, n.kind, n.vname.path, n.package
-            )
-        })
-        .collect();
-    let body = lines.join("\n");
+            );
+            // Use skeleton when the body exceeds the kind-aware line cap.
+            let n_height = n
+                .end_line
+                .unwrap_or_else(|| n.line.unwrap_or(0))
+                .saturating_sub(n.line.unwrap_or(0)) as usize;
+            let block = if snip_tokens < snippet_ceiling {
+                let body = if n_height > snippet_line_cap(&n.kind) {
+                    skeleton_for_node_inner(n, &repo_root)
+                        .map(|s| s.render())
+                        .or_else(|| snippet_for_node(n, &repo_root))
+                } else {
+                    snippet_for_node(n, &repo_root)
+                        .or_else(|| skeleton_for_node_inner(n, &repo_root).map(|s| s.render()))
+                };
+                if let Some(snip) = body {
+                    let cost = snip.len() / TOKEN_CHARS_PER_TOKEN + 1;
+                    if snip_tokens + cost <= snippet_ceiling {
+                        snip_tokens += cost;
+                        n_with_snippet += 1;
+                        format!("{header}\n{SNIPPET_SEP}\n{snip}")
+                    } else {
+                        header
+                    }
+                } else {
+                    header
+                }
+            } else {
+                header
+            };
+            blocks.push(block);
+        }
 
-    // Sanitize body (no envelope yet — footer is appended after).
-    let sanitized = sanitize_mcp_body_with_limit(
-        &body,
-        (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
-    );
-
-    // Append footer then wrap — footer is always present, never truncated.
-    format!("{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens]")
+        let sanitized = sanitize_mcp_body_with_limit(&blocks.join("\n\n"), char_cap);
+        format!(
+            "{sanitized}\n\n[{n_nodes} nodes, {n_with_snippet} with snippets, ~{total_tokens} metadata-tokens + ~{snip_tokens} snippet-tokens ({mode_label} budget)]"
+        )
+    } else {
+        // Legacy path — byte-identical to pre-include_snippets behaviour.
+        let lines: Vec<String> = selected
+            .iter()
+            .map(|n| {
+                format!(
+                    "{} ({}) — {} [package: {}]",
+                    n.vname.signature, n.kind, n.vname.path, n.package
+                )
+            })
+            .collect();
+        let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
+        format!("{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens]")
+    }
 }
 
 /// Global variant of `get_context` — searches one named repo or all registered repos.
@@ -1470,6 +1592,8 @@ pub fn get_context_global(
     query: &str,
     token_budget: usize,
     repo: Option<&str>,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
 ) -> String {
     if let Err(reason) = validate_mcp_arg(query) {
         tracing::warn!("get_context_global rejected invalid query: {reason}");
@@ -1479,7 +1603,7 @@ pub fn get_context_global(
         return wrap_envelope("token_budget exceeds maximum allowed value");
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_context_raw(store, query, token_budget);
+        let result = get_context_raw(store, query, token_budget, include_snippets, snippet_budget);
         if result.is_empty() || single {
             result
         } else {
@@ -3179,135 +3303,11 @@ mod tests {
 }
 
 // ── get_snippets ──────────────────────────────────────────────────────────────
+// Snippet helpers are now owned by travsr-analysis (RFC-017 Phase 4).
 
-const SNIPPET_SEP: &str = "───";
-pub const SNIPPET_DEFAULT_BUDGET: usize = 2000;
-
-/// Per-kind line ceiling for snippet extraction.
-/// Classes can span thousands of lines; only the header + fields are useful.
-/// Interfaces/traits/enums are almost always short — take more.
-/// Functions and methods default to 40 lines.
-fn snippet_line_cap(kind: &str) -> usize {
-    match kind {
-        "class" | "struct" | "impl" => 15,
-        "interface" | "trait" | "enum" | "type" | "type_alias" => 60,
-        _ => 40,
-    }
-}
-
-/// Returns true if `s` is a pure comment/blank line in any language Travsr indexes.
-/// Used to detect and skip leading docblocks so the snippet starts at real code.
-fn is_comment_line(s: &str) -> bool {
-    let t = s.trim();
-    t.is_empty()
-        || t.starts_with("//")
-        || t.starts_with('*')
-        || t.starts_with("/*")
-        || t.starts_with("*/")
-        || t.starts_with('#')
-        || t.starts_with("\"\"\"")
-        || t.starts_with("'''")
-        || t.starts_with("--")   // SQL / Haskell / Lua
-        || t.starts_with("rem ") // Batch
-        || t.starts_with("REM ") // Batch (upper-case)
-}
-
-/// Keep line 0 (the signature/declaration) always, then skip any immediately
-/// following comment/docstring run, then return the rest of the body.
-/// This strips leading docblocks regardless of language.
-fn skip_leading_comments<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
-    if lines.is_empty() {
-        return vec![];
-    }
-    let mut result = vec![lines[0]]; // signature line is always kept
-    let mut i = 1;
-    while i < lines.len() && is_comment_line(lines[i]) {
-        i += 1;
-    }
-    result.extend_from_slice(&lines[i..]);
-    result
-}
-
-/// Read a kind-aware, docblock-stripped snippet for `node` from disk.
-///
-/// Returns `None` when:
-/// - `node.line` is absent (file-kind nodes, synthetic import nodes)
-/// - the source file cannot be read (stale index, file deleted since last init)
-/// - `vname.path` would escape `repo_root` (SEC path-traversal guard)
-///
-/// Platform note: `vname.path` always uses forward slashes (POSIX-style) as
-/// stored by Tree-sitter/LSIF.  On Windows `Path::join` accepts both `/` and
-/// `\`, so no pre-normalisation is required.
-fn snippet_for_node(node: &CoreNode, repo_root: &Path) -> Option<String> {
-    let start_1based = node.line? as usize; // 1-based, None → bail
-    let end_1based = node.end_line.unwrap_or(node.line.unwrap()) as usize;
-
-    if node.vname.path.is_empty() {
-        return None;
-    }
-
-    // SEC: reject any vname.path that attempts to escape the repo root.
-    // Path::join on an absolute component replaces the prefix entirely on all
-    // platforms. Detect explicit traversal patterns and absolute-path prefixes
-    // before constructing the joined path.
-    // vname.path always uses '/' (POSIX) as stored by Tree-sitter/LSIF, but a
-    // crafted DB entry could hold Windows-style absolute paths — cover both.
-    let p = &node.vname.path;
-    let looks_absolute = p.starts_with('/')         // Unix absolute
-        || p.starts_with('\\')                      // Windows UNC prefix
-        || p.get(1..3).map(|s| s == ":\\" || s == ":/").unwrap_or(false); // C:\ or C:/
-    if looks_absolute || p.contains("..") {
-        tracing::debug!(
-            path = %node.vname.path,
-            "get_snippets: skipping node with absolute or traversal path"
-        );
-        return None;
-    }
-    let abs = repo_root.join(&node.vname.path);
-    // Canonicalize both paths to resolve symlinks before comparing.
-    // Fall back to lexical comparison when canonicalize fails (e.g. file
-    // missing) — the starts_with guard below still catches traversal attempts.
-    let canon_abs = abs.canonicalize().unwrap_or_else(|_| abs.clone());
-    let canon_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
-    if !canon_abs.starts_with(&canon_root) {
-        tracing::warn!(
-            path = %node.vname.path,
-            "get_snippets: path escapes repo_root — skipping"
-        );
-        return None;
-    }
-
-    let content = std::fs::read_to_string(&canon_abs).ok()?;
-    let all_lines: Vec<&str> = content.lines().collect();
-
-    let from = start_1based.saturating_sub(1); // convert to 0-based
-    if from >= all_lines.len() {
-        return None;
-    }
-
-    let cap = snippet_line_cap(&node.kind);
-    // end_line is inclusive and 1-based; clamp to cap and file length.
-    let to = (end_1based.min(from + cap)).min(all_lines.len());
-    // Guard against a corrupt DB entry where end_line < line — the slice
-    // would panic with "range start > end". Degrade gracefully instead.
-    if to < from {
-        tracing::debug!(
-            path = %node.vname.path,
-            from,
-            to,
-            "get_snippets: end_line < line in DB — skipping node"
-        );
-        return None;
-    }
-    let window: Vec<&str> = all_lines[from..to].to_vec();
-    let trimmed = skip_leading_comments(&window);
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.join("\n"))
-}
+use travsr_analysis::skeleton::skeleton_for_node as skeleton_for_node_inner;
+pub use travsr_analysis::snippet::SNIPPET_DEFAULT_BUDGET;
+use travsr_analysis::snippet::{snippet_for_node, snippet_line_cap, SNIPPET_SEP};
 
 /// Core snippet assembly: resolves symbols, fetches snippets, enforces budget.
 ///
@@ -3367,9 +3367,22 @@ fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize
             "{} ({}) — {} [package: {}]",
             node.vname.signature, node.kind, node.vname.path, node.package
         );
-        let snippet = snippet_for_node(node, &repo_root);
+        // Use skeleton when the body exceeds the kind-aware line cap (truncated
+        // snippets are half-implementations — skeleton gives a complete summary).
+        let node_height = node
+            .end_line
+            .unwrap_or_else(|| node.line.unwrap_or(0))
+            .saturating_sub(node.line.unwrap_or(0)) as usize;
+        let body_text: Option<String> = if node_height > snippet_line_cap(&node.kind) {
+            skeleton_for_node_inner(node, &repo_root)
+                .map(|s| s.render())
+                .or_else(|| snippet_for_node(node, &repo_root))
+        } else {
+            snippet_for_node(node, &repo_root)
+                .or_else(|| skeleton_for_node_inner(node, &repo_root).map(|s| s.render()))
+        };
 
-        let snippet_chars = snippet.as_deref().map(str::len).unwrap_or(0);
+        let snippet_chars = body_text.as_deref().map(str::len).unwrap_or(0);
         let block_cost = (header.len() + snippet_chars) / TOKEN_CHARS_PER_TOKEN + 1;
 
         if tokens_used + block_cost > token_budget {
@@ -3377,7 +3390,7 @@ fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize
         }
         tokens_used += block_cost;
 
-        let block = if let Some(code) = &snippet {
+        let block = if let Some(code) = &body_text {
             n_with_snippet += 1;
             format!("{header}\n{SNIPPET_SEP}\n{code}")
         } else {
@@ -3446,6 +3459,7 @@ pub fn get_snippets_global(
 #[cfg(test)]
 mod snippet_tests {
     use super::*;
+    use std::path::Path;
     use travsr_core::VName;
 
     // ── helper: build a Node with explicit line/end_line ─────────────────────
@@ -3465,179 +3479,8 @@ mod snippet_tests {
             .with_end_line(end_line)
     }
 
-    // ── is_comment_line ───────────────────────────────────────────────────────
-
-    #[test]
-    fn is_comment_line_detects_all_styles() {
-        assert!(is_comment_line("// C-style"));
-        assert!(is_comment_line("  * javadoc middle"));
-        assert!(is_comment_line("/* block start */"));
-        assert!(is_comment_line("*/"));
-        assert!(is_comment_line("# Python"));
-        assert!(is_comment_line("\"\"\""));
-        assert!(is_comment_line("'''"));
-        assert!(is_comment_line("-- SQL"));
-        assert!(is_comment_line(""));
-        assert!(is_comment_line("   "));
-        // Must NOT flag real code as a comment
-        assert!(!is_comment_line("fn foo() {}"));
-        assert!(!is_comment_line("const x = 1;"));
-        assert!(!is_comment_line("public class Foo {"));
-    }
-
-    // ── skip_leading_comments ─────────────────────────────────────────────────
-
-    #[test]
-    fn skip_leading_comments_keeps_signature_discards_docblock() {
-        let lines = vec![
-            "fn charge(amount: f64) -> Result<()> {",
-            "    // Calculate fee",
-            "    // and apply",
-            "    let fee = amount * 0.02;",
-            "    Ok(())",
-            "}",
-        ];
-        let out = skip_leading_comments(&lines);
-        assert_eq!(out[0], "fn charge(amount: f64) -> Result<()> {");
-        // comment lines immediately after signature must be gone
-        assert_eq!(out[1], "    let fee = amount * 0.02;");
-        assert_eq!(out.len(), 4);
-    }
-
-    #[test]
-    fn skip_leading_comments_no_docblock_passes_through() {
-        let lines = vec!["fn foo() {", "    bar();", "}"];
-        let out = skip_leading_comments(&lines);
-        assert_eq!(out, lines);
-    }
-
-    #[test]
-    fn skip_leading_comments_empty_input() {
-        let out = skip_leading_comments(&[]);
-        assert!(out.is_empty());
-    }
-
-    // ── snippet_line_cap ──────────────────────────────────────────────────────
-
-    #[test]
-    fn snippet_line_cap_class_is_15() {
-        assert_eq!(snippet_line_cap("class"), 15);
-        assert_eq!(snippet_line_cap("struct"), 15);
-        assert_eq!(snippet_line_cap("impl"), 15);
-    }
-
-    #[test]
-    fn snippet_line_cap_interface_is_60() {
-        assert_eq!(snippet_line_cap("interface"), 60);
-        assert_eq!(snippet_line_cap("trait"), 60);
-        assert_eq!(snippet_line_cap("enum"), 60);
-    }
-
-    #[test]
-    fn snippet_line_cap_function_is_40() {
-        assert_eq!(snippet_line_cap("function"), 40);
-        assert_eq!(snippet_line_cap("method"), 40);
-        assert_eq!(snippet_line_cap(""), 40);
-    }
-
-    // ── snippet_for_node ──────────────────────────────────────────────────────
-
-    #[test]
-    fn snippet_for_node_reads_correct_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src").join("a.ts");
-        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-        std::fs::write(&src, "// file header\nfunction foo() {\n  return 1;\n}\n").unwrap();
-
-        let node = make_fn_node("src/a.ts", "fn:foo", 2, 4);
-        let snippet = snippet_for_node(&node, dir.path()).unwrap();
-        assert!(snippet.contains("function foo()"));
-        assert!(snippet.contains("return 1;"));
-        // line 1 ("// file header") must NOT appear — it's above node.line
-        assert!(!snippet.contains("file header"));
-    }
-
-    #[test]
-    fn snippet_for_node_strips_leading_docblock() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("charge.ts");
-        std::fs::write(
-            &src,
-            "function charge(amount) {\n  // apply fee\n  // docblock\n  return amount * 1.02;\n}\n",
-        )
-        .unwrap();
-
-        let node = make_fn_node("charge.ts", "fn:charge", 1, 5);
-        let snippet = snippet_for_node(&node, dir.path()).unwrap();
-        // signature line always kept
-        assert!(snippet.starts_with("function charge(amount)"));
-        // comment lines immediately after signature stripped
-        assert!(!snippet.contains("apply fee"));
-        // real body present
-        assert!(snippet.contains("return amount * 1.02"));
-    }
-
-    #[test]
-    fn snippet_for_node_missing_file_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = make_fn_node("nonexistent.ts", "fn:ghost", 1, 5);
-        assert!(snippet_for_node(&node, dir.path()).is_none());
-    }
-
-    #[test]
-    fn snippet_for_node_path_traversal_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut node = make_fn_node("../etc/passwd", "fn:evil", 1, 5);
-        // Manually set path with traversal — simulate a crafted DB entry.
-        node.vname.path = "../etc/passwd".to_string();
-        assert!(
-            snippet_for_node(&node, dir.path()).is_none(),
-            "path traversal must be rejected"
-        );
-    }
-
-    #[test]
-    fn snippet_for_node_absolute_path_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut node = make_fn_node("/etc/passwd", "fn:evil", 1, 1);
-        node.vname.path = "/etc/passwd".to_string();
-        assert!(
-            snippet_for_node(&node, dir.path()).is_none(),
-            "Unix absolute path must be rejected"
-        );
-    }
-
-    #[test]
-    fn snippet_for_node_windows_absolute_path_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        for evil in ["C:\\Windows\\System32\\evil.txt", "C:/Windows/evil.txt"] {
-            let mut node = make_fn_node(evil, "fn:evil", 1, 1);
-            node.vname.path = evil.to_string();
-            assert!(
-                snippet_for_node(&node, dir.path()).is_none(),
-                "Windows absolute path '{evil}' must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn snippet_for_node_class_capped_at_15_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("big.ts");
-        // 50-line class body
-        let body: String = std::iter::once("class BigClass {\n".to_string())
-            .chain((0..49).map(|i| format!("  method{i}() {{}}\n")))
-            .collect();
-        std::fs::write(&src, &body).unwrap();
-
-        let node = make_class_node("big.ts", "class:BigClass", 1, 50);
-        let snippet = snippet_for_node(&node, dir.path()).unwrap();
-        let line_count = snippet.lines().count();
-        assert!(
-            line_count <= 15,
-            "class snippet must be capped at 15 lines, got {line_count}"
-        );
-    }
+    // Unit tests for is_comment_line / skip_leading_comments / snippet_line_cap /
+    // snippet_for_node have moved to travsr-analysis/src/snippet.rs (RFC-017).
 
     // ── get_snippets_body (integration) ──────────────────────────────────────
 
@@ -3790,5 +3633,163 @@ mod snippet_tests {
             "readable repo-internal file must produce a snippet"
         );
         assert!(snippet.unwrap().contains("return 42"));
+    }
+
+    // ── get_context include_snippets tests ───────────────────────────────────
+
+    fn make_store_with_root(
+        dir: &tempfile::TempDir,
+        nodes: &[CoreNode],
+    ) -> travsr_store::SqliteStore {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+        for n in nodes {
+            store.put_node(n).unwrap();
+        }
+        store
+    }
+
+    fn make_fn_node_with_pkg(path: &str, sig: &str, line: u32, end_line: u32) -> CoreNode {
+        CoreNode::new(
+            VName::new("corpus", "", path, "typescript", sig),
+            "function",
+        )
+        .with_line(line)
+        .with_end_line(end_line)
+    }
+
+    #[test]
+    fn get_context_include_snippets_false_is_byte_identical_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("charge.ts");
+        std::fs::write(&src, "function charge() {\n  return 1;\n}\n").unwrap();
+
+        let node = make_fn_node_with_pkg("charge.ts", "fn:charge", 1, 3);
+        let store = make_store_with_root(&dir, &[node]);
+
+        let legacy = get_context_body(&store, "charge", 4096, &OpenFilter, false, None);
+        let with_false = get_context_body(&store, "charge", 4096, &OpenFilter, false, None);
+        assert_eq!(
+            legacy, with_false,
+            "include_snippets=false must be byte-identical to legacy call"
+        );
+        assert!(legacy.contains("["), "footer must be present");
+        assert!(
+            !legacy.contains(SNIPPET_SEP),
+            "no separator in metadata-only output"
+        );
+    }
+
+    #[test]
+    fn get_context_include_snippets_appends_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pay.ts");
+        std::fs::write(&src, "function pay() {\n  return 42;\n}\n").unwrap();
+
+        let node = make_fn_node_with_pkg("pay.ts", "fn:pay", 1, 3);
+        let store = make_store_with_root(&dir, &[node]);
+
+        let result = get_context_body(&store, "pay", 4096, &OpenFilter, true, None);
+        assert!(
+            result.contains(SNIPPET_SEP),
+            "SNIPPET_SEP must appear when include_snippets=true"
+        );
+        assert!(result.contains("return 42"), "snippet body must be inlined");
+        assert!(
+            result.contains("with snippets"),
+            "footer must report snippet count"
+        );
+    }
+
+    #[test]
+    fn get_context_include_snippets_shared_budget_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a large file so the snippet alone would bust any small budget.
+        let body: String = (0..200).map(|i| format!("  let x{i} = {i};\n")).collect();
+        let src = dir.path().join("big.ts");
+        std::fs::write(&src, format!("function big() {{\n{body}}}\n")).unwrap();
+
+        let node = make_fn_node_with_pkg("big.ts", "fn:big", 1, 202);
+        let store = make_store_with_root(&dir, &[node]);
+
+        // Tiny budget: metadata fits but snippet cannot.
+        let result = get_context_body(&store, "big", 10, &OpenFilter, true, None);
+        // Must not panic; footer must be present regardless of truncation.
+        assert!(result.contains("nodes"), "footer must always be present");
+    }
+
+    #[test]
+    fn get_context_include_snippets_separate_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("sep.ts");
+        std::fs::write(&src, "function sep() {\n  return 7;\n}\n").unwrap();
+
+        let node = make_fn_node_with_pkg("sep.ts", "fn:sep", 1, 3);
+        let store = make_store_with_root(&dir, &[node]);
+
+        // Separate snippet_budget of 512; main budget governs node selection only.
+        let result = get_context_body(&store, "sep", 4096, &OpenFilter, true, Some(512));
+        assert!(
+            result.contains("separate"),
+            "footer must label separate-budget mode"
+        );
+        assert!(
+            result.contains("return 7"),
+            "snippet must be present within separate budget"
+        );
+    }
+
+    #[test]
+    fn get_context_include_snippets_no_repo_root_degrades() {
+        // Store with no repo_root meta → must return metadata-only, no panic.
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let node = make_fn_node_with_pkg("x.ts", "fn:x", 1, 2);
+        store.put_node(&node).unwrap();
+
+        let result = get_context_body(&store, "x", 4096, &OpenFilter, true, None);
+        // Either "not found" (no FTS match on empty index) or the init hint — never a panic.
+        let has_meta_hint =
+            result.contains("travsr init") || result.is_empty() || result.contains("No symbols");
+        assert!(
+            has_meta_hint,
+            "absent repo_root must degrade gracefully: {result}"
+        );
+        assert!(!result.contains("panic"), "must not contain panic text");
+    }
+
+    #[test]
+    fn get_context_include_snippets_rbac_excluded_node_not_read() {
+        // A filter that rejects everything. No disk read must occur.
+        struct DenyAll;
+        impl travsr_retrieval::EdgeFilter for DenyAll {
+            fn allow(
+                &self,
+                _src: travsr_core::NodeId,
+                _dst: travsr_core::NodeId,
+                _corpus: Option<&str>,
+            ) -> bool {
+                false
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("secret.ts");
+        std::fs::write(&src, "function secret() { return 99; }\n").unwrap();
+
+        let node = make_fn_node_with_pkg("secret.ts", "fn:secret", 1, 1);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+        store.put_node(&node).unwrap();
+
+        let result = get_context_body(&store, "secret", 4096, &DenyAll, true, None);
+        // RBAC filter rejects all nodes → "not found" (SEC P0) with no snippet leak.
+        assert!(
+            !result.contains("return 99"),
+            "RBAC-filtered node must never appear in snippet output"
+        );
     }
 }

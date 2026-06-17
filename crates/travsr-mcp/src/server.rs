@@ -159,7 +159,9 @@ fn handle_tool_call(
         "get_context" => {
             let query = args["query"].as_str().unwrap_or("");
             let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
-            tools::get_context(store, query, token_budget)
+            let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
+            let snippet_budget = args["snippet_budget"].as_u64().map(|v| v as usize);
+            tools::get_context(store, query, token_budget, include_snippets, snippet_budget)
         }
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
@@ -352,12 +354,14 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). A three-layer heuristic normaliser (T0 stopword strip + synonym expansion + L2-A vocabulary-grounded expansion) translates NL to FTS seeds deterministically — no model or API key required.",
+                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). A three-layer heuristic normaliser (T0 stopword strip + synonym expansion + L2-A vocabulary-grounded expansion) translates NL to FTS seeds deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars)" },
-                        "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." }
+                        "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." },
+                        "include_snippets": { "type": "boolean", "description": "When true, appends the actual source body of each selected symbol (kind-aware, docblock-stripped). Defaults to false." },
+                        "snippet_budget": { "type": "integer", "description": "Optional separate token budget for the appended snippets. When omitted, snippets share the main token_budget (best-effort, stops before overflow). When provided, snippet retrieval uses this independent ceiling and does not affect node selection." }
                     },
                     "required": ["query"],
                     "additionalProperties": false
@@ -662,7 +666,16 @@ fn handle_tool_call_global(
         "get_context" => {
             let query = args["query"].as_str().unwrap_or("");
             let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
-            tools::get_context_global(repos, query, token_budget, repo_arg)
+            let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
+            let snippet_budget = args["snippet_budget"].as_u64().map(|v| v as usize);
+            tools::get_context_global(
+                repos,
+                query,
+                token_budget,
+                repo_arg,
+                include_snippets,
+                snippet_budget,
+            )
         }
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
@@ -843,13 +856,15 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). T0 + L2-A heuristic normaliser translates NL to FTS seeds deterministically — no model or API key required.",
+                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). T0 + L2-A heuristic normaliser translates NL to FTS seeds deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars)" },
                         "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." },
+                        "include_snippets": { "type": "boolean", "description": "When true, appends the actual source body of each selected symbol (kind-aware, docblock-stripped). Defaults to false." },
+                        "snippet_budget": { "type": "integer", "description": "Optional separate token budget for the appended snippets. When omitted, snippets share the main token_budget (best-effort, stops before overflow). When provided, snippet retrieval uses this independent ceiling and does not affect node selection." }
                     },
                     "required": ["query"],
                     "additionalProperties": false
