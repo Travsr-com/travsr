@@ -327,14 +327,24 @@ fn collect_global(
         None => repos.iter().map(|(k, v)| (k.as_str(), v)).collect(),
     };
 
+    // Filter stale entries before computing `single` so that a registry with
+    // one live repo and one deleted-db repo is treated as single-repo (no
+    // per-repo prefix on the output).
+    let candidates: Vec<(&str, &PathBuf)> = candidates
+        .into_iter()
+        .filter(|(_, db_path)| {
+            let exists = db_path.exists();
+            if !exists {
+                tracing::debug!("skipping stale registry entry: {}", db_path.display());
+            }
+            exists
+        })
+        .collect();
+
     let single = candidates.len() == 1;
     let mut parts: Vec<String> = Vec::new();
 
     for (repo_name, db_path) in candidates {
-        if !db_path.exists() {
-            tracing::debug!("skipping stale registry entry: {}", db_path.display());
-            continue;
-        }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
                 let result = f(&store, repo_name, single);
@@ -3700,15 +3710,24 @@ mod snippet_tests {
         ];
         let store = make_store_with_meta(&nodes, dir.path());
 
-        // Budget only fits one symbol (very tight — 5 tokens).
-        // The exact cutoff depends on header + snippet size; just verify
-        // that "aaa" appears and the footer reports truncation.
-        let result = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5);
-        // Either: budget too small → hint, OR first symbol fits and second is cut.
-        // Either way "bbb" must not appear when budget is extremely tight.
+        // Tight budget (5 tokens) — neither symbol fits; expect the hint.
+        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5);
         assert!(
-            result.contains("Token budget too small") || !result.contains("bbb"),
-            "second symbol must be excluded when budget exhausted: {result}"
+            tight.contains("Token budget too small"),
+            "5-token budget must return the hint: {tight}"
+        );
+
+        // Ordering budget (20 tokens) — enough for one symbol (header ~9 tokens +
+        // 3-line snippet ~8 tokens = ~17 tokens) but not both. The first symbol
+        // in request order ("aaa") must appear; the second ("bbb") must not.
+        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20);
+        assert!(
+            ordered.contains("aaa"),
+            "first symbol must be included within budget: {ordered}"
+        );
+        assert!(
+            !ordered.contains("bbb"),
+            "second symbol must be excluded when budget exhausted: {ordered}"
         );
     }
 

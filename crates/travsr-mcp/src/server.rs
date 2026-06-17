@@ -958,6 +958,7 @@ mod tests {
         "get_graph_stats",
         "get_context",
         "get_graph_json",
+        "get_snippets",
     ];
 
     /// Tools exposed only on the stdio (single-repo) server — never in the global

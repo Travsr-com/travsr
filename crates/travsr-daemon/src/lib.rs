@@ -556,6 +556,15 @@ pub fn init_repo_with_progress(
         store
             .set_meta("repo_root", root_str)
             .context("writing repo_root to meta")?;
+    } else {
+        // Non-UTF-8 repo paths are valid on Linux (ext4 allows arbitrary bytes)
+        // but cannot be stored in the meta table. Snippet retrieval will degrade
+        // to metadata-only output and prompt the user to re-init. Warn so the
+        // cause is visible in logs rather than silently degrading.
+        tracing::warn!(
+            path = %repo_root.display(),
+            "repo_root contains non-UTF-8 bytes — snippet tool will be unavailable for this repo"
+        );
     }
 
     // T4 (1b): scaffold .travsrignore before the walker reads it so default
