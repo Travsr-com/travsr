@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn isolated_node_has_shell_zero() {
         let a = make_node("fn:a", "function");
-        let s = store_with(&[a.clone()], &[]);
+        let s = store_with(std::slice::from_ref(&a), &[]);
         assert_eq!(shell(&s, a.id), 0);
     }
 
