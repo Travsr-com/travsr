@@ -1485,6 +1485,20 @@ fn get_context_body(
         return format!("No symbols matching '{query}' found in the graph.");
     }
 
+    // Boost PPR scores by k-core shell number (global structural importance).
+    // KCORE_ALPHA is small so PPR local relevance still dominates; shell number
+    // acts as a tiebreaker that favours structurally central nodes.
+    const KCORE_ALPHA: f32 = 0.05;
+    let item_ids: Vec<NodeId> = items.iter().map(|(n, _)| n.id).collect();
+    let shell_map = store.get_shell_numbers_batch(&item_ids).unwrap_or_default();
+    let items: Vec<(CoreNode, f32)> = items
+        .into_iter()
+        .map(|(n, s)| {
+            let shell = shell_map.get(&n.id).copied().unwrap_or(0);
+            (n, s * (1.0 + KCORE_ALPHA * shell as f32))
+        })
+        .collect();
+
     // Knapsack selection.
     let selected = knapsack(items, token_budget);
     let n_nodes = selected.len();

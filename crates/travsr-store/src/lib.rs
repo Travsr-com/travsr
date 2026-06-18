@@ -265,6 +265,20 @@ impl Migration for V14CoveringReverseIdx {
     }
 }
 
+/// V15: k-core shell numbers on nodes — recomputed by travsr-retrieval after every index.
+struct V15KcoreShells;
+impl Migration for V15KcoreShells {
+    fn version(&self) -> u32 {
+        15
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        if !store.column_exists("nodes", "shell_number")? {
+            store.exec_ddl(include_str!("migrations/v15_kcore_shells.sql"))?;
+        }
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -284,6 +298,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V12Vec0Embeddings);
     r.register(V13PhaseBUnification);
     r.register(V14CoveringReverseIdx);
+    r.register(V15KcoreShells);
     r
 }
 
@@ -1265,6 +1280,98 @@ LIMIT 100",
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding all_edges row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Return all `(NodeId, kind)` pairs — used by k-core for shell propagation.
+    ///
+    /// Cheaper than `all_nodes()` because it projects only `id` and `kind`.
+    pub fn all_node_ids_and_kinds(&self) -> Result<Vec<(NodeId, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(NodeId, String)>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, kind FROM nodes")
+                .context("preparing all_node_ids_and_kinds query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        i64_to_node_id(row.get::<_, i64>(0)?),
+                        row.get::<_, String>(1)?,
+                    ))
+                })
+                .context("executing all_node_ids_and_kinds query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding all_node_ids_and_kinds row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Batch-write shell numbers produced by k-core decomposition.
+    ///
+    /// Uses a single prepared statement executed inside one transaction for speed.
+    /// O(|shells|) writes — safe to call after every index pass.
+    pub fn write_shell_numbers(&mut self, shells: &[(NodeId, u32)]) -> Result<(), StoreError> {
+        if shells.is_empty() {
+            return Ok(());
+        }
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("begin write_shell_numbers tx")?;
+            {
+                let mut stmt = tx
+                    .prepare("UPDATE nodes SET shell_number = ?2 WHERE id = ?1")
+                    .context("preparing write_shell_numbers stmt")?;
+                for &(id, shell) in shells {
+                    stmt.execute(params![node_id_to_i64(id), shell as i64])
+                        .context("executing write_shell_numbers update")?;
+                }
+            }
+            tx.commit().context("committing write_shell_numbers tx")
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Batch-fetch shell numbers for a set of node IDs.
+    ///
+    /// Unknown IDs are silently skipped (shell defaults to 0 at the call site).
+    /// Splits into 500-ID chunks to stay under SQLite's variable limit (SQLITE_MAX_VARIABLE_NUMBER).
+    pub fn get_shell_numbers_batch(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<std::collections::HashMap<NodeId, u32>, StoreError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        (|| -> AnyResult<std::collections::HashMap<NodeId, u32>> {
+            let mut out = std::collections::HashMap::with_capacity(ids.len());
+            for chunk in ids.chunks(500) {
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql =
+                    format!("SELECT id, shell_number FROM nodes WHERE id IN ({placeholders})");
+                let mut stmt = self
+                    .conn
+                    .prepare(&sql)
+                    .context("preparing get_shell_numbers_batch")?;
+                let id_params: Vec<i64> = chunk.iter().map(|id| node_id_to_i64(*id)).collect();
+                let rows = stmt
+                    .query_map(params_from_iter(id_params.iter()), |row| {
+                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                        let shell: i64 = row.get(1)?;
+                        Ok((id, shell as u32))
+                    })
+                    .context("executing get_shell_numbers_batch")?;
+                for row in rows {
+                    let (id, shell) = row.context("decoding get_shell_numbers_batch row")?;
+                    out.insert(id, shell);
+                }
             }
             Ok(out)
         })()

@@ -3124,6 +3124,7 @@ dependencies = [
  "travsr-ipc",
  "travsr-mcp",
  "travsr-plugin-host",
+ "travsr-retrieval",
  "travsr-store",
  "walkdir",
 ]
