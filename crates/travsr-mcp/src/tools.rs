@@ -1406,6 +1406,30 @@ fn get_context_with_filter(
     wrap_envelope(&body)
 }
 
+/// Why a node appeared in `get_context` output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeRole {
+    /// Direct text match — one of the up-to-5 seeds.
+    Seed,
+    /// This node calls one of the seed symbols (reverse RefCall/RefImports/Depends edge).
+    Caller,
+    /// A seed symbol calls or imports this node (forward RefCall/Depends/RefImports edge).
+    Dependency,
+    /// PPR structural relevance; no direct 1-hop edge to or from any seed.
+    Context,
+}
+
+impl NodeRole {
+    fn label(self) -> &'static str {
+        match self {
+            NodeRole::Seed => "seed",
+            NodeRole::Caller => "caller",
+            NodeRole::Dependency => "dependency",
+            NodeRole::Context => "context",
+        }
+    }
+}
+
 fn get_context_body(
     store: &SqliteStore,
     query: &str,
@@ -1504,6 +1528,60 @@ fn get_context_body(
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
+    // Build 1-hop role map: classify each selected node's relationship to the seeds.
+    // O(S × avg_degree); seeds are capped at 5 so this is negligible.
+    // Errors are silently ignored — roles degrade to Context, never block output.
+    let roles: HashMap<NodeId, NodeRole> = {
+        use travsr_core::EdgeKind;
+        let seed_set: std::collections::HashSet<NodeId> = seeds.iter().copied().collect();
+        let selected_set: std::collections::HashSet<NodeId> =
+            selected.iter().map(|n| n.id).collect();
+        let mut map: HashMap<NodeId, NodeRole> =
+            selected.iter().map(|n| (n.id, NodeRole::Context)).collect();
+        for &seed in &seeds {
+            // Forward edges: seed → node  →  node is a Dependency of seed.
+            if let Ok(fwd) = store.iter_edges_from(seed) {
+                for e in fwd {
+                    if matches!(
+                        e.kind,
+                        EdgeKind::RefCall
+                            | EdgeKind::Depends
+                            | EdgeKind::RefImports
+                            | EdgeKind::Exports
+                    ) && selected_set.contains(&e.dst)
+                    {
+                        map.entry(e.dst).and_modify(|r| {
+                            if *r == NodeRole::Context {
+                                *r = NodeRole::Dependency;
+                            }
+                        });
+                    }
+                }
+            }
+            // Reverse edges: node → seed  →  node is a Caller of seed.
+            if let Ok(rev) = store.iter_edges_to(seed) {
+                for e in rev {
+                    if matches!(
+                        e.kind,
+                        EdgeKind::RefCall | EdgeKind::RefImports | EdgeKind::Depends
+                    ) && selected_set.contains(&e.src)
+                    {
+                        map.entry(e.src).and_modify(|r| {
+                            if *r == NodeRole::Context {
+                                *r = NodeRole::Caller;
+                            }
+                        });
+                    }
+                }
+            }
+            // Seed overrides both.
+            if seed_set.contains(&seed) {
+                map.insert(seed, NodeRole::Seed);
+            }
+        }
+        map
+    };
+
     let char_cap = (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000);
 
     if include_snippets {
@@ -1517,9 +1595,14 @@ fn get_context_body(
                 let lines: Vec<String> = selected
                     .iter()
                     .map(|n| {
+                        let role = roles
+                            .get(&n.id)
+                            .copied()
+                            .unwrap_or(NodeRole::Context)
+                            .label();
                         format!(
-                            "{} ({}) — {} [package: {}]",
-                            n.vname.signature, n.kind, n.vname.path, n.package
+                            "{} ({}) — {} [package: {}] [via: {}]",
+                            n.vname.signature, n.kind, n.vname.path, n.package, role
                         )
                     })
                     .collect();
@@ -1544,9 +1627,14 @@ fn get_context_body(
         let mut blocks: Vec<String> = Vec::with_capacity(selected.len());
 
         for n in &selected {
+            let role = roles
+                .get(&n.id)
+                .copied()
+                .unwrap_or(NodeRole::Context)
+                .label();
             let header = format!(
-                "{} ({}) — {} [package: {}]",
-                n.vname.signature, n.kind, n.vname.path, n.package
+                "{} ({}) — {} [package: {}] [via: {}]",
+                n.vname.signature, n.kind, n.vname.path, n.package, role
             );
             // Use skeleton when the body exceeds the kind-aware line cap.
             let n_height = n
@@ -1585,13 +1673,18 @@ fn get_context_body(
             "{sanitized}\n\n[{n_nodes} nodes, {n_with_snippet} with snippets, ~{total_tokens} metadata-tokens + ~{snip_tokens} snippet-tokens ({mode_label} budget)]"
         )
     } else {
-        // Legacy path — byte-identical to pre-include_snippets behaviour.
+        // Legacy path — metadata-only with role annotations.
         let lines: Vec<String> = selected
             .iter()
             .map(|n| {
+                let role = roles
+                    .get(&n.id)
+                    .copied()
+                    .unwrap_or(NodeRole::Context)
+                    .label();
                 format!(
-                    "{} ({}) — {} [package: {}]",
-                    n.vname.signature, n.kind, n.vname.path, n.package
+                    "{} ({}) — {} [package: {}] [via: {}]",
+                    n.vname.signature, n.kind, n.vname.path, n.package, role
                 )
             })
             .collect();
@@ -3801,6 +3894,140 @@ mod snippet_tests {
         assert!(
             !result.contains("return 99"),
             "RBAC-filtered node must never appear in snippet output"
+        );
+    }
+
+    // ── Edge-relationship annotation tests ──────────────────────────────────
+
+    fn make_store_with_edges(
+        nodes: &[CoreNode],
+        edges: &[(
+            travsr_core::NodeId,
+            travsr_core::NodeId,
+            travsr_core::EdgeKind,
+        )],
+    ) -> travsr_store::SqliteStore {
+        use travsr_store::Store;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for n in nodes {
+            store.put_node(n).unwrap();
+        }
+        for &(src, dst, kind) in edges {
+            store
+                .put_edge(&travsr_core::Edge::new(src, dst, kind))
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn get_context_annotation_labels_seed() {
+        // The node that directly matches the query must be labelled [via: seed].
+        let node = make_fn_node_with_pkg("seed.ts", "fn:seed_target", 1, 3);
+        let store = make_store_with_edges(&[node], &[]);
+
+        let result = get_context_body(&store, "seed_target", 4096, &OpenFilter, false, None);
+        assert!(
+            result.contains("[via: seed]"),
+            "direct match must be labelled [via: seed]: {result}"
+        );
+    }
+
+    #[test]
+    fn get_context_annotation_labels_caller() {
+        // caller_fn has a RefCall edge to seed_fn.
+        // get_context(query="seed_fn") → seed_fn=[via:seed], caller_fn=[via:caller].
+        // PPR BFS only follows forward edges, so caller_fn must be reachable
+        // from seed_fn via a forward path to appear in the output at all.
+        // Graph: seed_fn → Depends → bridge_fn → Depends → caller_fn
+        //        caller_fn → RefCall → seed_fn
+        // PPR surfaces caller_fn (forward path depth 2).
+        // Role check finds the reverse RefCall → labels caller_fn [via: caller].
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+        let seed_node = make_fn_node_with_pkg("s.ts", "fn:seed_fn", 1, 3);
+        let bridge_node = make_fn_node_with_pkg("b.ts", "fn:bridge_fn", 1, 3);
+        let caller_node = make_fn_node_with_pkg("c.ts", "fn:caller_fn", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let bridge_id = store.put_node(&bridge_node).unwrap();
+        let caller_id = store.put_node(&caller_node).unwrap();
+        // Forward path: seed_fn → bridge_fn → caller_fn (PPR discovery)
+        store
+            .put_edge(&travsr_core::Edge::new(seed_id, bridge_id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(
+                bridge_id,
+                caller_id,
+                EdgeKind::Depends,
+            ))
+            .unwrap();
+        // Reverse semantic edge: caller_fn calls seed_fn → earns [via: caller]
+        store
+            .put_edge(&travsr_core::Edge::new(
+                caller_id,
+                seed_id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let result = get_context_body(&store, "seed_fn", 4096, &OpenFilter, false, None);
+        assert!(
+            result.contains("[via: seed]"),
+            "seed node must be labelled [via: seed]: {result}"
+        );
+        assert!(
+            result.contains("[via: caller]"),
+            "caller node must be labelled [via: caller]: {result}"
+        );
+    }
+
+    #[test]
+    fn get_context_annotation_labels_dependency() {
+        // seed_fn has a Depends edge to dep_fn.
+        // get_context(query="seed_fn") → seed_fn=[via:seed], dep_fn=[via:dependency].
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+        let seed_node = make_fn_node_with_pkg("s.ts", "fn:seed_fn2", 1, 3);
+        let dep_node = make_fn_node_with_pkg("d.ts", "fn:dep_fn", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let dep_id = store.put_node(&dep_node).unwrap();
+        // seed_fn → Depends → dep_fn
+        store
+            .put_edge(&travsr_core::Edge::new(seed_id, dep_id, EdgeKind::Depends))
+            .unwrap();
+
+        let result = get_context_body(&store, "seed_fn2", 4096, &OpenFilter, false, None);
+        assert!(
+            result.contains("[via: seed]"),
+            "seed node must be labelled [via: seed]: {result}"
+        );
+        assert!(
+            result.contains("[via: dependency]"),
+            "dep node must be labelled [via: dependency]: {result}"
+        );
+    }
+
+    #[test]
+    fn get_context_annotation_labels_context() {
+        // A node with no edge to/from the seed is labelled [via: context].
+        use travsr_store::Store;
+        let seed_node = make_fn_node_with_pkg("s.ts", "fn:seed_only", 1, 3);
+        let ctx_node = make_fn_node_with_pkg("u.ts", "fn:unrelated_fn", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&seed_node).unwrap();
+        store.put_node(&ctx_node).unwrap();
+        // No edges between them — ctx_node is reachable only via PPR structural walk.
+
+        // Search for "seed_only" — ctx_node should appear as [via: context] if PPR
+        // surfaces it, or just not appear. Either way, if it does appear it must NOT
+        // carry seed/caller/dependency labels.
+        let result = get_context_body(&store, "seed_only", 4096, &OpenFilter, false, None);
+        assert!(
+            !result.contains("unrelated_fn") || result.contains("[via: context]"),
+            "unrelated node must be [via: context] if it appears at all: {result}"
         );
     }
 }
