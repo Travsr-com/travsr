@@ -22,6 +22,7 @@ use travsr_indexer::{
     link_imports_rust, run_lsif_emitter, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
+use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
 pub use hook::{changed_files_from_git, install_hook, try_dispatch_to_daemon};
@@ -895,6 +896,19 @@ pub fn init_repo_with_progress(
         }
     }
 
+    // Compute k-core shell numbers over the fully-built graph.
+    // Runs after Phase A + Phase B so shell numbers reflect the complete
+    // node/edge set (including SCIP semantic edges when Phase B ran inline).
+    match compute_kcore(&store) {
+        Ok(shells) => {
+            let pairs: Vec<_> = shells.into_iter().collect();
+            if let Err(e) = store.write_shell_numbers(&pairs) {
+                tracing::warn!("kcore: failed to write shell numbers after init: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("kcore: computation failed after init: {e}"),
+    }
+
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
         files_indexed: batch_counts.files_written,
@@ -1294,6 +1308,18 @@ pub fn reindex_files(
     if any_changed {
         if let Ok(sha) = read_head_commit_sha(repo_root) {
             let _ = store.set_meta("last_commit", &sha);
+        }
+
+        // Recompute k-core shell numbers so they stay fresh after every commit.
+        // O(V + E) — fast enough to run inline on the hook path at MVP scale.
+        match compute_kcore(store) {
+            Ok(shells) => {
+                let pairs: Vec<_> = shells.into_iter().collect();
+                if let Err(e) = store.write_shell_numbers(&pairs) {
+                    tracing::warn!("kcore: failed to write shell numbers: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("kcore: computation failed: {e}"),
         }
     }
 
