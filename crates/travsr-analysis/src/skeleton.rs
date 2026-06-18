@@ -9,8 +9,8 @@
 //!   3. Walks to the declaration at `node.line` and extracts structure.
 //!   4. Returns `AstSkeleton` — signature, params, return type, fields, callees.
 //!
-//! Supported languages (RFC-017 Phase 5): Rust, TypeScript, Python, Go.
-//! All other languages return `None` so callers can fall through to header-only.
+//! Supported languages: Rust, TypeScript, Python, Go, Java, Kotlin, C, C++,
+//! C#, Swift, Dart, Ruby, Scala, PHP, Objective-C (all 15 languages).
 //!
 //! Invariant: this module depends ONLY on travsr-core and tree-sitter crates.
 
@@ -75,7 +75,7 @@ impl AstSkeleton {
 ///
 /// Returns `None` when:
 /// - `node.line` is absent (file-kind or synthetic nodes)
-/// - the language is unsupported (non-Rust/TS/Python/Go)
+/// - the language is unsupported
 /// - the source file cannot be read (stale index, file deleted)
 /// - `vname.path` would escape `repo_root` (SEC path-traversal guard)
 pub fn skeleton_for_node(node: &Node, repo_root: &Path) -> Option<AstSkeleton> {
@@ -125,6 +125,17 @@ enum Lang {
     TypeScript { tsx: bool },
     Python,
     Go,
+    Java,
+    Kotlin,
+    C,
+    Cpp,
+    CSharp,
+    Swift,
+    Dart,
+    Ruby,
+    Scala,
+    Php,
+    ObjectiveC,
 }
 
 fn detect_lang(node: &Node) -> Option<Lang> {
@@ -136,6 +147,17 @@ fn detect_lang(node: &Node) -> Option<Lang> {
         }
         "python" => return Some(Lang::Python),
         "go" => return Some(Lang::Go),
+        "java" => return Some(Lang::Java),
+        "kotlin" => return Some(Lang::Kotlin),
+        "c" => return Some(Lang::C),
+        "cpp" | "c++" => return Some(Lang::Cpp),
+        "csharp" | "c#" => return Some(Lang::CSharp),
+        "swift" => return Some(Lang::Swift),
+        "dart" => return Some(Lang::Dart),
+        "ruby" => return Some(Lang::Ruby),
+        "scala" => return Some(Lang::Scala),
+        "php" => return Some(Lang::Php),
+        "objectivec" | "objective-c" | "objc" => return Some(Lang::ObjectiveC),
         _ => {}
     }
     let ext = node.vname.path.rsplit('.').next().unwrap_or("");
@@ -145,6 +167,17 @@ fn detect_lang(node: &Node) -> Option<Lang> {
         "tsx" | "jsx" => Some(Lang::TypeScript { tsx: true }),
         "py" | "pyi" => Some(Lang::Python),
         "go" => Some(Lang::Go),
+        "java" => Some(Lang::Java),
+        "kt" | "kts" => Some(Lang::Kotlin),
+        "c" | "h" => Some(Lang::C),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "c++" => Some(Lang::Cpp),
+        "cs" => Some(Lang::CSharp),
+        "swift" => Some(Lang::Swift),
+        "dart" => Some(Lang::Dart),
+        "rb" | "rake" | "gemspec" => Some(Lang::Ruby),
+        "scala" | "sc" => Some(Lang::Scala),
+        "php" | "phtml" | "php3" | "php4" | "php5" => Some(Lang::Php),
+        "m" | "mm" => Some(Lang::ObjectiveC),
         _ => None,
     }
 }
@@ -160,6 +193,17 @@ fn grammar_for(lang: &Lang, _path: &str) -> tree_sitter::Language {
         }
         Lang::Python => tree_sitter::Language::new(tree_sitter_python::LANGUAGE),
         Lang::Go => tree_sitter::Language::new(tree_sitter_go::LANGUAGE),
+        Lang::Java => tree_sitter::Language::new(tree_sitter_java::LANGUAGE),
+        Lang::Kotlin => (crate::kotlin::CONFIG.get_grammar)(),
+        Lang::C => (crate::c::CONFIG.get_grammar)(),
+        Lang::Cpp => (crate::cpp::CONFIG.get_grammar)(),
+        Lang::CSharp => (crate::csharp::CONFIG.get_grammar)(),
+        Lang::Swift => (crate::swift::CONFIG.get_grammar)(),
+        Lang::Dart => (crate::dart::CONFIG.get_grammar)(),
+        Lang::Ruby => (crate::ruby::CONFIG.get_grammar)(),
+        Lang::Scala => (crate::scala::CONFIG.get_grammar)(),
+        Lang::Php => (crate::php::CONFIG.get_grammar)(),
+        Lang::ObjectiveC => (crate::objc::CONFIG.get_grammar)(),
     }
 }
 
@@ -192,6 +236,75 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
             "function_declaration",
             "method_declaration",
             "type_declaration",
+        ],
+        Lang::Java => &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+            "annotation_type_declaration",
+            "method_declaration",
+            "constructor_declaration",
+        ],
+        Lang::Kotlin => &[
+            "class_declaration",
+            "object_declaration",
+            "function_declaration",
+            "secondary_constructor",
+        ],
+        Lang::C => &["function_definition", "struct_specifier", "enum_specifier"],
+        Lang::Cpp => &[
+            "function_definition",
+            "class_specifier",
+            "struct_specifier",
+            "template_declaration",
+            "enum_specifier",
+        ],
+        Lang::CSharp => &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "struct_declaration",
+            "record_declaration",
+            "record_struct_declaration",
+            "method_declaration",
+            "constructor_declaration",
+        ],
+        Lang::Swift => &[
+            "function_declaration",
+            "init_declaration",
+            "class_declaration",
+            "struct_declaration",
+            "enum_declaration",
+            "protocol_declaration",
+        ],
+        Lang::Dart => &[
+            "class_declaration",
+            "mixin_declaration",
+            "enum_declaration",
+            "function_declaration",
+            "method_declaration",
+        ],
+        Lang::Ruby => &["method", "singleton_method", "class", "module"],
+        Lang::Scala => &[
+            "function_definition",
+            "class_definition",
+            "object_definition",
+            "trait_definition",
+        ],
+        Lang::Php => &[
+            "function_definition",
+            "method_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+        ],
+        Lang::ObjectiveC => &[
+            "class_interface",
+            "class_implementation",
+            "protocol_declaration",
+            "method_definition",
+            "function_definition",
         ],
     }
 }
@@ -230,6 +343,17 @@ fn extract_skeleton(decl: TsNode<'_>, src: &[u8], node: &Node, lang: &Lang) -> A
         Lang::TypeScript { .. } => extract_typescript(decl, src, &node.kind, token_estimate),
         Lang::Python => extract_python(decl, src, &node.kind, token_estimate),
         Lang::Go => extract_go(decl, src, &node.kind, token_estimate),
+        Lang::Java => extract_java(decl, src, &node.kind, token_estimate),
+        Lang::Kotlin => extract_kotlin(decl, src, &node.kind, token_estimate),
+        Lang::C => extract_c(decl, src, &node.kind, token_estimate),
+        Lang::Cpp => extract_cpp(decl, src, &node.kind, token_estimate),
+        Lang::CSharp => extract_csharp(decl, src, &node.kind, token_estimate),
+        Lang::Swift => extract_swift(decl, src, &node.kind, token_estimate),
+        Lang::Dart => extract_dart(decl, src, &node.kind, token_estimate),
+        Lang::Ruby => extract_ruby(decl, src, &node.kind, token_estimate),
+        Lang::Scala => extract_scala(decl, src, &node.kind, token_estimate),
+        Lang::Php => extract_php(decl, src, &node.kind, token_estimate),
+        Lang::ObjectiveC => extract_objc(decl, src, &node.kind, token_estimate),
     }
 }
 
@@ -535,7 +659,6 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
             if let Some(r) = decl.child_by_field_name("result") {
                 return_type = Some(node_text(r, src).to_string());
             }
-            // body is a block — find it as a named child
             for i in 0..decl.named_child_count() {
                 let Some(c) = decl.named_child(i as u32) else {
                     continue;
@@ -547,7 +670,6 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
             }
         }
         "type_declaration" => {
-            // Walk type_spec children to find struct_type or interface_type
             for i in 0..decl.named_child_count() {
                 let Some(ts) = decl.named_child(i as u32) else {
                     continue;
@@ -601,6 +723,854 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
     }
 }
 
+// ── Java ──────────────────────────────────────────────────────────────────────
+
+fn extract_java(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut return_type: Option<String> = None;
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "method_declaration" => {
+            // formal_parameters -> formal_parameter children
+            if let Some(fp) = decl.child_by_field_name("parameters") {
+                collect_formal_params(
+                    fp,
+                    &["formal_parameter", "spread_parameter"],
+                    src,
+                    &mut params,
+                );
+            }
+            // return type is the `type` field
+            if let Some(rt) = decl.child_by_field_name("type") {
+                return_type = Some(node_text(rt, src).to_string());
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                // method_invocation -> name field (not "function")
+                collect_callees_field(body, src, "method_invocation", "name", &mut callees);
+            }
+        }
+        "constructor_declaration" => {
+            if let Some(fp) = decl.child_by_field_name("parameters") {
+                collect_formal_params(
+                    fp,
+                    &["formal_parameter", "spread_parameter"],
+                    src,
+                    &mut params,
+                );
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                collect_callees_field(body, src, "method_invocation", "name", &mut callees);
+            }
+        }
+        "class_declaration" | "record_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    match c.kind() {
+                        "method_declaration" | "constructor_declaration" => {
+                            fields.push(first_line(c, src))
+                        }
+                        "field_declaration" => fields.push(node_text(c, src).to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "interface_declaration" | "annotation_type_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if matches!(c.kind(), "method_declaration" | "constant_declaration") {
+                        fields.push(first_line(c, src));
+                    }
+                }
+            }
+        }
+        "enum_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "enum_constant" {
+                        if let Some(name) = c.child_by_field_name("name") {
+                            fields.push(node_text(name, src).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type,
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── Kotlin ────────────────────────────────────────────────────────────────────
+
+fn extract_kotlin(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "function_declaration" | "secondary_constructor" => {
+            // Parameters: function_value_parameters is a named child (not a field)
+            // tree-sitter-kotlin-ng: function_value_parameters -> parameter (direct children)
+            if let Some(fp) = named_child_of_kind(decl, "function_value_parameters") {
+                for i in 0..fp.named_child_count() {
+                    let Some(p) = fp.named_child(i as u32) else {
+                        continue;
+                    };
+                    // Kotlin-ng puts `parameter` directly in function_value_parameters
+                    if matches!(p.kind(), "parameter" | "function_value_parameter") {
+                        params.push(node_text(p, src).to_string());
+                    }
+                }
+            }
+            // Body is a function_body named child; collect callees from it
+            if let Some(body) = named_child_of_kind(decl, "function_body") {
+                collect_callees_dfs(body, src, "call_expression", &mut callees);
+            }
+        }
+        "class_declaration" | "object_declaration" => {
+            if let Some(body) = named_child_of_kind(decl, "class_body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if matches!(c.kind(), "function_declaration" | "secondary_constructor") {
+                        fields.push(first_line(c, src));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type: None, // shown in signature; no dedicated field in tree-sitter-kotlin-ng
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── C ─────────────────────────────────────────────────────────────────────────
+
+fn extract_c(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usize) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut return_type: Option<String> = None;
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "function_definition" => {
+            // Return type is the `type` field
+            if let Some(rt) = decl.child_by_field_name("type") {
+                return_type = Some(node_text(rt, src).to_string());
+            }
+            // Params: declarator -> function_declarator -> parameters (parameter_list)
+            if let Some(declarator) = decl.child_by_field_name("declarator") {
+                if let Some(fd) = first_descendant_of_kind(declarator, "function_declarator") {
+                    if let Some(pl) = fd.child_by_field_name("parameters") {
+                        for i in 0..pl.named_child_count() {
+                            let Some(p) = pl.named_child(i as u32) else {
+                                continue;
+                            };
+                            if p.kind() == "parameter_declaration" {
+                                params.push(node_text(p, src).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                collect_callees_dfs(body, src, "call_expression", &mut callees);
+            }
+        }
+        "struct_specifier" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "field_declaration" {
+                        fields.push(node_text(c, src).to_string());
+                    }
+                }
+            }
+        }
+        "enum_specifier" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "enumerator" {
+                        fields.push(first_line(c, src));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type,
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── C++ ───────────────────────────────────────────────────────────────────────
+
+fn extract_cpp(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    // function_definition and struct_specifier/enum_specifier share logic with C
+    match decl.kind() {
+        "function_definition" | "struct_specifier" | "enum_specifier" => {
+            return extract_c(decl, src, node_kind, token_estimate)
+        }
+        _ => {}
+    }
+
+    let mut fields: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "class_specifier" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                // field_declaration_list contains methods and fields
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    match c.kind() {
+                        "function_definition" | "declaration" => fields.push(first_line(c, src)),
+                        "field_declaration" => fields.push(node_text(c, src).to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "template_declaration" => {
+            // Template params shown in signature; delegate member extraction
+            // to the inner declaration if it's a class or struct
+            for i in 0..decl.named_child_count() {
+                let Some(c) = decl.named_child(i as u32) else {
+                    continue;
+                };
+                if matches!(c.kind(), "class_specifier" | "struct_specifier") {
+                    if let Some(body) = c.child_by_field_name("body") {
+                        for j in 0..body.named_child_count() {
+                            let Some(m) = body.named_child(j as u32) else {
+                                continue;
+                            };
+                            if matches!(m.kind(), "function_definition" | "declaration") {
+                                fields.push(first_line(m, src));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params: vec![],
+        return_type: None,
+        fields,
+        callees: vec![],
+        token_estimate,
+    }
+}
+
+// ── C# ────────────────────────────────────────────────────────────────────────
+
+fn extract_csharp(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut return_type: Option<String> = None;
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "method_declaration" => {
+            if let Some(fp) = decl.child_by_field_name("parameters") {
+                collect_formal_params(fp, &["parameter"], src, &mut params);
+            }
+            // C# uses `returns` (not `type`) for the return type field
+            if let Some(rt) = decl.child_by_field_name("returns") {
+                return_type = Some(node_text(rt, src).to_string());
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                collect_callees_dfs(body, src, "invocation_expression", &mut callees);
+            }
+        }
+        "constructor_declaration" => {
+            if let Some(fp) = decl.child_by_field_name("parameters") {
+                collect_formal_params(fp, &["parameter"], src, &mut params);
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                collect_callees_dfs(body, src, "invocation_expression", &mut callees);
+            }
+        }
+        "class_declaration"
+        | "interface_declaration"
+        | "struct_declaration"
+        | "record_declaration"
+        | "record_struct_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    match c.kind() {
+                        "method_declaration" | "constructor_declaration" => {
+                            fields.push(first_line(c, src))
+                        }
+                        "field_declaration" | "property_declaration" => {
+                            fields.push(first_line(c, src))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "enum_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "enum_member_declaration" {
+                        if let Some(name) = c.child_by_field_name("name") {
+                            fields.push(node_text(name, src).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type,
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── Swift ─────────────────────────────────────────────────────────────────────
+
+fn extract_swift(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut return_type: Option<String> = None;
+    let mut fields: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "function_declaration" | "protocol_function_declaration" => {
+            // return_type is a named field
+            if let Some(rt) = decl.child_by_field_name("return_type") {
+                return_type = Some(node_text(rt, src).to_string());
+            }
+            // Parameters are not a field: search for function_value_parameters child
+            if let Some(fp) = named_child_of_kind(decl, "function_value_parameters") {
+                for i in 0..fp.named_child_count() {
+                    let Some(p) = fp.named_child(i as u32) else {
+                        continue;
+                    };
+                    if p.kind() == "parameter" {
+                        params.push(node_text(p, src).to_string());
+                    }
+                }
+            }
+        }
+        "init_declaration" => {
+            if let Some(fp) = named_child_of_kind(decl, "function_value_parameters") {
+                for i in 0..fp.named_child_count() {
+                    let Some(p) = fp.named_child(i as u32) else {
+                        continue;
+                    };
+                    if p.kind() == "parameter" {
+                        params.push(node_text(p, src).to_string());
+                    }
+                }
+            }
+        }
+        "class_declaration" | "struct_declaration" | "protocol_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    match c.kind() {
+                        "function_declaration"
+                        | "init_declaration"
+                        | "deinit_declaration"
+                        | "protocol_function_declaration" => fields.push(first_line(c, src)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "enum_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "enum_entry" {
+                        if let Some(name) = c.child_by_field_name("name") {
+                            fields.push(node_text(name, src).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type,
+        fields,
+        callees: vec![], // call_expression in Swift has no named fields
+        token_estimate,
+    }
+}
+
+// ── Dart ──────────────────────────────────────────────────────────────────────
+
+fn extract_dart(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut return_type: Option<String> = None;
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "function_declaration"
+        | "method_declaration"
+        | "getter_declaration"
+        | "setter_declaration" => {
+            // The signature field (function_signature) holds name, parameters, return_type
+            if let Some(sig) = decl.child_by_field_name("signature") {
+                if let Some(rt) = sig.child_by_field_name("return_type") {
+                    return_type = Some(node_text(rt, src).to_string());
+                }
+                if let Some(fp) = sig.child_by_field_name("parameters") {
+                    for i in 0..fp.named_child_count() {
+                        let Some(p) = fp.named_child(i as u32) else {
+                            continue;
+                        };
+                        if p.kind() == "formal_parameter" {
+                            params.push(node_text(p, src).to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                collect_callees_dfs(body, src, "call_expression", &mut callees);
+            }
+        }
+        "class_declaration" => {
+            // class_body is a named child (not a field); members are wrapped in class_member
+            if let Some(body) = named_child_of_kind(decl, "class_body") {
+                for i in 0..body.named_child_count() {
+                    let Some(member) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    // class_member wraps each member; look inside it
+                    let member = if member.kind() == "class_member" {
+                        member.named_child(0).unwrap_or(member)
+                    } else {
+                        member
+                    };
+                    match member.kind() {
+                        "method_declaration"
+                        | "function_declaration"
+                        | "getter_declaration"
+                        | "setter_declaration" => fields.push(first_line(member, src)),
+                        "declaration" => {
+                            // constructor_signature or field_declaration wrapped in declaration
+                            if let Some(inner) = member.named_child(0) {
+                                if inner.kind() == "constructor_signature" {
+                                    fields.push(first_line(inner, src));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "mixin_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    let c = if c.kind() == "class_member" {
+                        c.named_child(0).unwrap_or(c)
+                    } else {
+                        c
+                    };
+                    if matches!(
+                        c.kind(),
+                        "method_declaration" | "getter_declaration" | "setter_declaration"
+                    ) {
+                        fields.push(first_line(c, src));
+                    }
+                }
+            }
+        }
+        "enum_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "enum_constant" {
+                        fields.push(first_line(c, src));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type,
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── Ruby ──────────────────────────────────────────────────────────────────────
+
+fn extract_ruby(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "method" | "singleton_method" => {
+            // parameters field -> method_parameters -> various param kinds
+            if let Some(fp) = decl.child_by_field_name("parameters") {
+                for i in 0..fp.named_child_count() {
+                    let Some(p) = fp.named_child(i as u32) else {
+                        continue;
+                    };
+                    match p.kind() {
+                        "identifier"
+                        | "optional_parameter"
+                        | "splat_parameter"
+                        | "hash_splat_parameter"
+                        | "block_parameter"
+                        | "keyword_parameter"
+                        | "destructured_parameter" => {
+                            params.push(node_text(p, src).to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                // Ruby call nodes: `call` -> method field
+                collect_callees_field(body, src, "call", "method", &mut callees);
+            }
+        }
+        "class" | "module" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if matches!(c.kind(), "method" | "singleton_method") {
+                        fields.push(first_line(c, src));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type: None, // Ruby is dynamically typed
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── Scala ─────────────────────────────────────────────────────────────────────
+
+fn extract_scala(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut return_type: Option<String> = None;
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "function_definition" => {
+            // parameters and return_type are named fields in tree-sitter-scala
+            if let Some(fp) = decl.child_by_field_name("parameters") {
+                for i in 0..fp.named_child_count() {
+                    let Some(p) = fp.named_child(i as u32) else {
+                        continue;
+                    };
+                    // Accept both `parameter` and `class_parameter`
+                    if matches!(p.kind(), "parameter" | "class_parameter") {
+                        params.push(node_text(p, src).to_string());
+                    }
+                }
+            }
+            if let Some(rt) = decl.child_by_field_name("return_type") {
+                return_type = Some(node_text(rt, src).to_string());
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                collect_callees_dfs(body, src, "call_expression", &mut callees);
+            }
+        }
+        "class_definition" | "object_definition" | "trait_definition" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                // body is template_body
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    match c.kind() {
+                        "function_definition" => fields.push(first_line(c, src)),
+                        "val_definition" | "var_definition" | "val_declaration"
+                        | "var_declaration" => fields.push(first_line(c, src)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type,
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── PHP ───────────────────────────────────────────────────────────────────────
+
+fn extract_php(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut params: Vec<String> = Vec::new();
+    let mut return_type: Option<String> = None;
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "function_definition" | "method_declaration" => {
+            if let Some(fp) = decl.child_by_field_name("parameters") {
+                collect_formal_params(
+                    fp,
+                    &[
+                        "simple_parameter",
+                        "variadic_parameter",
+                        "property_promotion_parameter",
+                    ],
+                    src,
+                    &mut params,
+                );
+            }
+            if let Some(rt) = decl.child_by_field_name("return_type") {
+                return_type = Some(node_text(rt, src).to_string());
+            }
+            if let Some(body) = decl.child_by_field_name("body") {
+                collect_callees_dfs(body, src, "function_call_expression", &mut callees);
+                // member calls use `name` field
+                collect_callees_field(body, src, "member_call_expression", "name", &mut callees);
+            }
+        }
+        "class_declaration" | "interface_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    match c.kind() {
+                        "method_declaration" => fields.push(first_line(c, src)),
+                        "property_declaration" => fields.push(first_line(c, src)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "enum_declaration" => {
+            if let Some(body) = decl.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "enum_case" {
+                        fields.push(first_line(c, src));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature: decl_header(decl, src),
+        params,
+        return_type,
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
+// ── Objective-C ───────────────────────────────────────────────────────────────
+
+fn extract_objc(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+) -> AstSkeleton {
+    let mut fields: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
+
+    match decl.kind() {
+        "function_definition" => {
+            // ObjC C-style functions are identical to C
+            return extract_c(decl, src, node_kind, token_estimate);
+        }
+        "method_definition" => {
+            // ObjC method body is compound_statement (not a field — added to decl_header fallback)
+            if let Some(body) = named_child_of_kind(decl, "compound_statement") {
+                // message_expression -> method field gives the selector
+                collect_callees_field(body, src, "message_expression", "method", &mut callees);
+            }
+        }
+        "class_interface" | "class_implementation" | "protocol_declaration" => {
+            // No body field — iterate all named children for method declarations/definitions
+            for i in 0..decl.named_child_count() {
+                let Some(c) = decl.named_child(i as u32) else {
+                    continue;
+                };
+                if matches!(c.kind(), "method_declaration" | "method_definition") {
+                    fields.push(first_line(c, src));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // For ObjC @interface/@implementation, first_line gives a cleaner signature
+    // than decl_header (which might grab method declarations before a body block).
+    let signature = match decl.kind() {
+        "class_interface" | "class_implementation" | "protocol_declaration" => {
+            first_line(decl, src)
+        }
+        _ => decl_header(decl, src),
+    };
+
+    AstSkeleton {
+        kind: node_kind.to_string(),
+        signature,
+        params: vec![], // ObjC selector syntax is fully in the signature
+        return_type: None,
+        fields,
+        callees,
+        token_estimate,
+    }
+}
+
 // ── Tree-sitter helpers ───────────────────────────────────────────────────────
 
 fn node_text<'a>(n: TsNode<'_>, src: &'a [u8]) -> &'a str {
@@ -618,32 +1588,35 @@ fn first_line(n: TsNode<'_>, src: &[u8]) -> String {
 
 /// Extract the declaration header up to (but not including) the body block.
 ///
-/// For multi-line signatures like:
-///   pub fn parse_file_with_vname(
-///       &self,
-///       abs_path: &Path,
-///   ) -> Result<ParseOutput, IndexError> {
-/// this returns the full signature without the opening `{`.
-///
-/// Falls back to the first line when no body block is found (e.g. struct fields,
-/// enum variants, type aliases — their "body" IS their entire text).
+/// Recognises `body` fields (Rust / TS / Python / Java / C / C# / Dart / PHP / Scala / Swift)
+/// plus named-child body-block kinds for languages where body is not a grammar field
+/// (Kotlin's `function_body` / `class_body`, ObjC method's `compound_statement`).
 fn decl_header(decl: TsNode<'_>, src: &[u8]) -> String {
-    // Find where the body block starts via the "body" field (Rust / TS / Python),
-    // or by locating the first child node of kind "block" (Go).
     let body_start: Option<usize> = decl
         .child_by_field_name("body")
         .map(|b| b.start_byte())
         .or_else(|| {
             (0..decl.named_child_count())
                 .filter_map(|i| decl.named_child(i as u32))
-                .find(|c| c.kind() == "block")
+                .find(|c| {
+                    matches!(
+                        c.kind(),
+                        "block"
+                            | "function_body"  // Kotlin
+                            | "class_body"     // Kotlin class
+                            | "compound_statement" // ObjC method_definition
+                            | "code_block"     // Swift
+                            | "declaration_list" // C# (fallback)
+                            | "template_body" // Scala (fallback)
+                    )
+                })
                 .map(|b| b.start_byte())
         });
 
     let end = body_start.unwrap_or(decl.end_byte());
     std::str::from_utf8(&src[decl.start_byte()..end])
         .unwrap_or("")
-        .trim_end_matches(['{', ':', ' ', '\n', '\r', '\t'])
+        .trim_end_matches(['{', ':', '=', ' ', '\n', '\r', '\t'])
         .trim()
         .to_string()
 }
@@ -656,6 +1629,35 @@ fn named_child_of_kind<'a>(n: TsNode<'a>, kind: &str) -> Option<TsNode<'a>> {
         }
     }
     None
+}
+
+/// DFS to find the first descendant (or self) of a given node kind.
+/// Used to locate `function_declarator` inside pointer/reference declarators in C/C++.
+fn first_descendant_of_kind<'a>(node: TsNode<'a>, kind: &str) -> Option<TsNode<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i as u32) {
+            if let Some(found) = first_descendant_of_kind(c, kind) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Collect parameter entries from a parameter-list node by iterating named children
+/// that match the given `param_kinds` slice.
+fn collect_formal_params(fp: TsNode<'_>, param_kinds: &[&str], src: &[u8], out: &mut Vec<String>) {
+    for i in 0..fp.named_child_count() {
+        let Some(p) = fp.named_child(i as u32) else {
+            continue;
+        };
+        if param_kinds.contains(&p.kind()) {
+            out.push(node_text(p, src).to_string());
+        }
+    }
 }
 
 /// DFS over named children collecting call expression targets.
@@ -679,6 +1681,38 @@ fn collect_callees_dfs(node: TsNode<'_>, src: &[u8], call_kind: &str, out: &mut 
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i as u32) {
             collect_callees_dfs(child, src, call_kind, out);
+        }
+    }
+}
+
+/// Variant of `collect_callees_dfs` for call nodes that use a field other than
+/// `"function"` for the callee name (e.g. Java `method_invocation` → `name`,
+/// Ruby `call` → `method`, ObjC `message_expression` → `method`).
+fn collect_callees_field(
+    node: TsNode<'_>,
+    src: &[u8],
+    call_kind: &str,
+    callee_field: &str,
+    out: &mut Vec<String>,
+) {
+    if out.len() >= 20 {
+        return;
+    }
+    if node.kind() == call_kind {
+        if let Some(fn_node) = node.child_by_field_name(callee_field) {
+            let text = node_text(fn_node, src);
+            let callee = text.rsplit('.').next().unwrap_or(text).trim();
+            if !callee.is_empty() && callee.len() < 64 {
+                let owned = callee.to_string();
+                if !out.contains(&owned) {
+                    out.push(owned);
+                }
+            }
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            collect_callees_field(child, src, call_kind, callee_field, out);
         }
     }
 }
@@ -774,11 +1808,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_language_returns_none() {
+    fn truly_unsupported_language_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("foo.java");
-        std::fs::write(&src, "public class Foo {}").unwrap();
-        let node = make_node("foo.java", "class:Foo", "java", "class", 1, 1);
+        let src = dir.path().join("main.cobol");
+        std::fs::write(&src, "IDENTIFICATION DIVISION.").unwrap();
+        let node = make_node("main.cobol", "fn:main", "cobol", "function", 1, 1);
         assert!(skeleton_for_node(&node, dir.path()).is_none());
     }
 
@@ -806,7 +1840,6 @@ mod tests {
         );
         assert!(!skel.params.is_empty(), "expected params");
         assert!(skel.return_type.is_some(), "expected return type");
-        // callees should include validate and/or process
         let callees_str = skel.callees.join(",");
         assert!(
             callees_str.contains("validate") || callees_str.contains("process"),
@@ -959,7 +1992,6 @@ mod tests {
             "sig: {}",
             skel.signature
         );
-        // methods should appear in fields
         let fields_str = skel.fields.join(",");
         assert!(
             fields_str.contains("__init__") || fields_str.contains("charge"),
@@ -991,6 +2023,397 @@ mod tests {
         );
         assert!(!skel.params.is_empty(), "expected params");
         assert!(skel.return_type.is_some(), "expected return type");
+    }
+
+    // ── Java ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn java_class_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Animal.java");
+        std::fs::write(
+            &src,
+            "public class Animal {\n\
+                 private String name;\n\
+                 public Animal(String name) { this.name = name; }\n\
+                 public void makeSound() { System.out.println(name); }\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("Animal.java", "class:Animal", "java", "class", 1, 5);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected class members");
+    }
+
+    #[test]
+    fn java_method_extracts_params_and_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Billing.java");
+        std::fs::write(
+            &src,
+            "public class Billing {\n\
+                 public Receipt charge(double amount, String currency) {\n\
+                     return process(amount);\n\
+                 }\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("Billing.java", "fn:charge", "java", "function", 2, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("charge"), "sig: {}", skel.signature);
+        assert!(!skel.params.is_empty(), "expected params");
+        assert!(
+            skel.return_type.is_some(),
+            "expected return type: {:?}",
+            skel.return_type
+        );
+    }
+
+    // ── Kotlin ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn kotlin_function_extracts_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("billing.kt");
+        std::fs::write(
+            &src,
+            "fun add(a: Int, b: Int): Int {\n\
+                 return a + b\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("billing.kt", "fn:add", "kotlin", "function", 1, 3);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("add"), "sig: {}", skel.signature);
+        assert!(!skel.params.is_empty(), "expected params for Kotlin fn");
+    }
+
+    #[test]
+    fn kotlin_class_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Greeter.kt");
+        std::fs::write(
+            &src,
+            "class Greeter(val name: String) {\n\
+                 fun greet(): String {\n\
+                     return \"Hello, $name\"\n\
+                 }\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("Greeter.kt", "class:Greeter", "kotlin", "class", 1, 5);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(
+            skel.signature.contains("Greeter"),
+            "sig: {}",
+            skel.signature
+        );
+        assert!(!skel.fields.is_empty(), "expected Kotlin class members");
+    }
+
+    // ── C ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn c_function_extracts_params_and_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("math.c");
+        std::fs::write(
+            &src,
+            "int add(int a, int b) {\n\
+                 return a + b;\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("math.c", "fn:add", "c", "function", 1, 3);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("add"), "sig: {}", skel.signature);
+        assert!(!skel.params.is_empty(), "expected C params");
+        assert!(skel.return_type.is_some(), "expected return type");
+    }
+
+    #[test]
+    fn c_struct_extracts_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("point.c");
+        std::fs::write(
+            &src,
+            "struct Point {\n\
+                 int x;\n\
+                 int y;\n\
+             };\n",
+        )
+        .unwrap();
+        let node = make_node("point.c", "class:Point", "c", "struct", 1, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Point"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected struct fields");
+    }
+
+    // ── C++ ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cpp_class_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("animal.cpp");
+        std::fs::write(
+            &src,
+            "class Animal {\n\
+             public:\n\
+                 std::string name;\n\
+                 void speak();\n\
+             };\n",
+        )
+        .unwrap();
+        let node = make_node("animal.cpp", "class:Animal", "cpp", "class", 1, 5);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected C++ class members");
+    }
+
+    // ── C# ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn csharp_method_extracts_params_and_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Billing.cs");
+        std::fs::write(
+            &src,
+            "public class Billing {\n\
+                 public Receipt Charge(double amount, string currency) {\n\
+                     return Process(amount);\n\
+                 }\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("Billing.cs", "fn:Charge", "csharp", "function", 2, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Charge"), "sig: {}", skel.signature);
+        assert!(!skel.params.is_empty(), "expected C# params");
+    }
+
+    #[test]
+    fn csharp_class_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Animal.cs");
+        std::fs::write(
+            &src,
+            "public class Animal {\n\
+                 public string Name { get; set; }\n\
+                 public void MakeSound() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("Animal.cs", "class:Animal", "csharp", "class", 1, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected C# class members");
+    }
+
+    // ── Swift ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn swift_function_extracts_params_and_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("billing.swift");
+        std::fs::write(
+            &src,
+            "func charge(amount: Double, currency: String) -> Bool {\n\
+                 return process(amount)\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("billing.swift", "fn:charge", "swift", "function", 1, 3);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("charge"), "sig: {}", skel.signature);
+        assert!(skel.return_type.is_some(), "expected Swift return type");
+    }
+
+    #[test]
+    fn swift_struct_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("animal.swift");
+        std::fs::write(
+            &src,
+            "struct Animal {\n\
+                 var name: String\n\
+                 func speak() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("animal.swift", "class:Animal", "swift", "class", 1, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected Swift struct members");
+    }
+
+    // ── Dart ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dart_class_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("animal.dart");
+        std::fs::write(
+            &src,
+            "class Animal {\n\
+                 String name;\n\
+                 Animal(this.name);\n\
+                 void speak() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("animal.dart", "class:Animal", "dart", "class", 1, 5);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected Dart class members");
+    }
+
+    // ── Ruby ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ruby_method_extracts_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("billing.rb");
+        std::fs::write(
+            &src,
+            "def charge(amount, currency)\n\
+                 process(amount)\n\
+             end\n",
+        )
+        .unwrap();
+        let node = make_node("billing.rb", "fn:charge", "ruby", "function", 1, 3);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("charge"), "sig: {}", skel.signature);
+        assert!(!skel.params.is_empty(), "expected Ruby params");
+    }
+
+    #[test]
+    fn ruby_class_extracts_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("animal.rb");
+        std::fs::write(
+            &src,
+            "class Animal\n\
+                 def initialize(name)\n\
+                     @name = name\n\
+                 end\n\
+                 def speak\n\
+                     puts @name\n\
+                 end\n\
+             end\n",
+        )
+        .unwrap();
+        let node = make_node("animal.rb", "class:Animal", "ruby", "class", 1, 9);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected Ruby class methods");
+    }
+
+    // ── Scala ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scala_function_extracts_params_and_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("billing.scala");
+        std::fs::write(
+            &src,
+            "def charge(amount: Double, currency: String): Boolean = {\n\
+                 process(amount)\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("billing.scala", "fn:charge", "scala", "function", 1, 3);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("charge"), "sig: {}", skel.signature);
+        assert!(!skel.params.is_empty(), "expected Scala params");
+        assert!(skel.return_type.is_some(), "expected Scala return type");
+    }
+
+    #[test]
+    fn scala_class_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("animal.scala");
+        std::fs::write(
+            &src,
+            "class Animal(val name: String) {\n\
+                 def speak(): String = name\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("animal.scala", "class:Animal", "scala", "class", 1, 3);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected Scala class members");
+    }
+
+    // ── PHP ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn php_function_extracts_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("billing.php");
+        std::fs::write(
+            &src,
+            "<?php\nfunction charge($amount, $currency) {\n    return process($amount);\n}\n",
+        )
+        .unwrap();
+        let node = make_node("billing.php", "fn:charge", "php", "function", 2, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("charge"), "sig: {}", skel.signature);
+        assert!(!skel.params.is_empty(), "expected PHP params");
+    }
+
+    #[test]
+    fn php_class_extracts_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Animal.php");
+        std::fs::write(
+            &src,
+            "<?php\nclass Animal {\n    private string $name;\n    public function speak(): void {}\n}\n",
+        )
+        .unwrap();
+        let node = make_node("Animal.php", "class:Animal", "php", "class", 2, 5);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Animal"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected PHP class members");
+    }
+
+    // ── Objective-C ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn objc_method_has_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Dog.m");
+        std::fs::write(
+            &src,
+            "@implementation Dog\n\
+             - (void)bark {\n\
+                 NSLog(@\"Woof!\");\n\
+             }\n\
+             @end\n",
+        )
+        .unwrap();
+        let node = make_node("Dog.m", "fn:bark", "objectivec", "function", 2, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("bark"), "sig: {}", skel.signature);
+    }
+
+    #[test]
+    fn objc_class_interface_extracts_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Dog.h");
+        std::fs::write(
+            &src,
+            "@interface Dog : NSObject\n\
+             - (void)bark;\n\
+             - (NSString *)name;\n\
+             @end\n",
+        )
+        .unwrap();
+        let node = make_node("Dog.h", "class:Dog", "objectivec", "class", 1, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Dog"), "sig: {}", skel.signature);
+        assert!(!skel.fields.is_empty(), "expected ObjC interface methods");
     }
 
     // ── token_estimate ────────────────────────────────────────────────────────
