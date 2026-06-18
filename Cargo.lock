@@ -3032,6 +3032,7 @@ name = "travsr-analysis"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "streaming-iterator",
  "tempfile",
  "toml",
@@ -3214,22 +3215,12 @@ dependencies = [
  "thiserror 1.0.69",
  "toml",
  "tracing",
+ "travsr-analysis",
  "travsr-core",
  "travsr-error",
  "travsr-indexer",
  "travsr-plugin-protocol",
  "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-dart",
- "tree-sitter-java",
- "tree-sitter-kotlin-ng",
- "tree-sitter-objc",
- "tree-sitter-php",
- "tree-sitter-ruby",
- "tree-sitter-scala",
- "tree-sitter-swift",
  "windows-sys 0.61.2",
 ]
 

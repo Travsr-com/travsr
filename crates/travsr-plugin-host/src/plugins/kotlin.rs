@@ -1,21 +1,2 @@
-use super::generic::LanguageConfig;
-use travsr_core::Language;
-
-pub const CONFIG: LanguageConfig = LanguageConfig {
-    language: Language::Kotlin,
-    extensions: &["kt", "kts"],
-    queries: r#"
-(class_declaration name: (identifier) @class.name)
-(object_declaration name: (identifier) @object.name)
-(function_declaration name: (identifier) @fn.name)
-(type_alias (identifier) @typealias.name)
-(import) @import
-"#,
-    capture_kinds: &[
-        ("class.name", "class", "class"),
-        ("object.name", "object", "class"),
-        ("fn.name", "function", "fn"),
-        ("typealias.name", "type", "type"),
-        ("import", "import", "import"),
-    ],
-};
+// CONFIG now lives in travsr-analysis::kotlin — re-exported here for registry.rs.
+pub use travsr_analysis::kotlin::CONFIG;

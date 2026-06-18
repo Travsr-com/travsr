@@ -8,6 +8,7 @@
 
 // Parser modules now live in travsr-analysis (RFC-017).
 // Re-export the bridge modules so callers (travsr-daemon) still compile.
+pub use travsr_analysis::phase_b_dart;
 pub use travsr_analysis::phase_b_python;
 pub use travsr_analysis::phase_b_rust;
 pub use travsr_analysis::phase_b_typescript;
@@ -16,7 +17,6 @@ pub mod ffi; // thin re-export wrapper → travsr_analysis::ffi
 mod ffi_resolver;
 mod hash;
 pub mod lsif;
-pub mod phase_b_dart;
 pub mod python_lsif;
 pub mod ra_runner;
 pub mod runner;

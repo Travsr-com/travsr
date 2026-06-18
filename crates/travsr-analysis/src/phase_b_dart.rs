@@ -1,3 +1,11 @@
+//! Phase B for Dart: call-site edges via the native AOT emitter.
+//!
+//! Calls the `travsr-dart-index-emitter` binary directly. Bypasses the
+//! travsr-lang-dart sidecar to avoid a Dart AOT SIGABRT (`kDartIsolateSnapshotData
+//! not found`) that occurs when the emitter is a nested subprocess of the sandboxed
+//! sidecar. Running it as a direct child of the daemon (which has a clean env with
+//! HOME intact) avoids the crash.
+
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -21,7 +29,6 @@ fn emitter_path() -> Option<PathBuf> {
     }
 
     let name = emitter_name();
-
     let exe = std::env::current_exe().ok();
 
     // 2. Dev monorepo: target/{debug|release}/travsr (or .exe on Windows)
@@ -45,7 +52,6 @@ fn emitter_path() -> Option<PathBuf> {
     }
 
     // 3. Installed: sibling of the daemon binary in the same bin directory.
-    //    Works when both travsr and travsr-dart-index-emitter are in ~/.travsr/bin/.
     if let Some(ref exe) = exe {
         let sibling = exe.parent().map(|bin| bin.join(&name));
         if let Some(ref p) = sibling {
@@ -72,12 +78,6 @@ fn emitter_path() -> Option<PathBuf> {
 }
 
 /// Call the Dart AOT emitter binary directly and return Phase B nodes + edges.
-///
-/// Bypasses the travsr-lang-dart sidecar entirely. The sidecar spawns the same
-/// emitter but crashes with SIGABRT (`kDartIsolateSnapshotData not found`) when
-/// the emitter is a nested subprocess of the sandboxed sidecar. Running it as a
-/// direct child of the daemon process (which has a clean env with HOME intact)
-/// avoids the crash.
 pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let emitter = emitter_path().context(
         "travsr-dart-index-emitter not found — \
