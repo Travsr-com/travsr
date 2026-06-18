@@ -3473,12 +3473,6 @@ mod snippet_tests {
         .with_end_line(end_line)
     }
 
-    fn make_class_node(path: &str, sig: &str, line: u32, end_line: u32) -> CoreNode {
-        CoreNode::new(VName::new("corpus", "", path, "typescript", sig), "class")
-            .with_line(line)
-            .with_end_line(end_line)
-    }
-
     // Unit tests for is_comment_line / skip_leading_comments / snippet_line_cap /
     // snippet_for_node have moved to travsr-analysis/src/snippet.rs (RFC-017).
 
