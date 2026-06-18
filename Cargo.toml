@@ -77,7 +77,7 @@ petgraph = "0.6"
 dashmap = "5"
 getrandom = "0.2"
 axum             = { version = "0.7", features = ["macros"] }
-tower            = { version = "0.4" }
+tower            = { version = "0.5" }
 tower-http       = { version = "0.5", features = ["trace"] }
 reqwest          = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hmac             = "0.13"
