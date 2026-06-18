@@ -250,7 +250,9 @@ fn extract_rust(
         "function_item" => {
             if let Some(p) = decl.child_by_field_name("parameters") {
                 for i in 0..p.named_child_count() {
-                    let c = p.named_child(i as u32).unwrap();
+                    let Some(c) = p.named_child(i as u32) else {
+                        continue;
+                    };
                     if c.kind() == "parameter" {
                         params.push(node_text(c, src).to_string());
                     }
@@ -266,7 +268,9 @@ fn extract_rust(
         "struct_item" => {
             if let Some(body) = decl.child_by_field_name("body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     if c.kind() == "field_declaration" {
                         let name = c
                             .child_by_field_name("name")
@@ -286,7 +290,9 @@ fn extract_rust(
         "enum_item" => {
             if let Some(body) = decl.child_by_field_name("body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     if c.kind() == "enum_variant" {
                         if let Some(name) = c.child_by_field_name("name") {
                             fields.push(node_text(name, src).to_string());
@@ -298,7 +304,9 @@ fn extract_rust(
         "trait_item" => {
             if let Some(body) = decl.child_by_field_name("body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     if matches!(c.kind(), "function_signature_item" | "function_item") {
                         fields.push(first_line(c, src));
                     }
@@ -308,7 +316,9 @@ fn extract_rust(
         "impl_item" => {
             if let Some(body) = decl.child_by_field_name("body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     if c.kind() == "function_item" {
                         fields.push(first_line(c, src));
                     }
@@ -346,7 +356,9 @@ fn extract_typescript(
         "function_declaration" | "method_definition" => {
             if let Some(p) = decl.child_by_field_name("parameters") {
                 for i in 0..p.named_child_count() {
-                    let c = p.named_child(i as u32).unwrap();
+                    let Some(c) = p.named_child(i as u32) else {
+                        continue;
+                    };
                     if matches!(
                         c.kind(),
                         "required_parameter"
@@ -370,7 +382,9 @@ fn extract_typescript(
         "class_declaration" | "abstract_class_declaration" => {
             if let Some(body) = decl.child_by_field_name("body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     match c.kind() {
                         "method_definition" => fields.push(first_line(c, src)),
                         "public_field_definition" => {
@@ -384,7 +398,9 @@ fn extract_typescript(
         "interface_declaration" => {
             if let Some(body) = decl.child_by_field_name("body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     if matches!(
                         c.kind(),
                         "property_signature" | "method_signature" | "call_signature"
@@ -397,7 +413,9 @@ fn extract_typescript(
         "enum_declaration" => {
             if let Some(body) = named_child_of_kind(decl, "enum_body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     if c.kind() == "property_identifier" || c.kind() == "enum_assignment" {
                         fields.push(node_text(c, src).to_string());
                     }
@@ -435,7 +453,9 @@ fn extract_python(
         "function_definition" => {
             if let Some(p) = decl.child_by_field_name("parameters") {
                 for i in 0..p.named_child_count() {
-                    let c = p.named_child(i as u32).unwrap();
+                    let Some(c) = p.named_child(i as u32) else {
+                        continue;
+                    };
                     match c.kind() {
                         "identifier" => {
                             let t = node_text(c, src);
@@ -464,7 +484,9 @@ fn extract_python(
         "class_definition" => {
             if let Some(body) = decl.child_by_field_name("body") {
                 for i in 0..body.named_child_count() {
-                    let c = body.named_child(i as u32).unwrap();
+                    let Some(c) = body.named_child(i as u32) else {
+                        continue;
+                    };
                     if c.kind() == "function_definition" {
                         if let Some(name) = c.child_by_field_name("name") {
                             fields.push(node_text(name, src).to_string());
@@ -499,7 +521,9 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
         "function_declaration" | "method_declaration" => {
             if let Some(p) = decl.child_by_field_name("parameters") {
                 for i in 0..p.named_child_count() {
-                    let c = p.named_child(i as u32).unwrap();
+                    let Some(c) = p.named_child(i as u32) else {
+                        continue;
+                    };
                     if matches!(
                         c.kind(),
                         "parameter_declaration" | "variadic_parameter_declaration"
@@ -513,7 +537,9 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
             }
             // body is a block — find it as a named child
             for i in 0..decl.named_child_count() {
-                let c = decl.named_child(i as u32).unwrap();
+                let Some(c) = decl.named_child(i as u32) else {
+                    continue;
+                };
                 if c.kind() == "block" {
                     collect_callees_dfs(c, src, "call_expression", &mut callees);
                     break;
@@ -523,7 +549,9 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
         "type_declaration" => {
             // Walk type_spec children to find struct_type or interface_type
             for i in 0..decl.named_child_count() {
-                let ts = decl.named_child(i as u32).unwrap();
+                let Some(ts) = decl.named_child(i as u32) else {
+                    continue;
+                };
                 if ts.kind() != "type_spec" {
                     continue;
                 }
@@ -536,7 +564,9 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
                             .or_else(|| ty.child_by_field_name("fields"));
                         if let Some(flist) = fdl {
                             for j in 0..flist.named_child_count() {
-                                let f = flist.named_child(j as u32).unwrap();
+                                let Some(f) = flist.named_child(j as u32) else {
+                                    continue;
+                                };
                                 if f.kind() == "field_declaration" {
                                     fields.push(node_text(f, src).to_string());
                                 }
@@ -545,7 +575,9 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
                     }
                     "interface_type" => {
                         for j in 0..ty.named_child_count() {
-                            let m = ty.named_child(j as u32).unwrap();
+                            let Some(m) = ty.named_child(j as u32) else {
+                                continue;
+                            };
                             if matches!(m.kind(), "method_spec" | "type_elem") {
                                 fields.push(node_text(m, src).to_string());
                             }

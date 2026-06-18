@@ -42,13 +42,16 @@ impl ParseOutput {
     /// Nodes are appended without dedup (dedup happens in each parser).
     pub fn merge_deduped(&mut self, other: ParseOutput) {
         self.nodes.extend(other.nodes);
-        let existing: std::collections::HashSet<(
+        // Build from self first, then insert from other — HashSet::insert returns
+        // false when the element already exists, which also catches duplicates
+        // within other.edges itself (not just against the original self.edges).
+        let mut existing: std::collections::HashSet<(
             travsr_core::NodeId,
             travsr_core::NodeId,
             travsr_core::EdgeKind,
         )> = self.edges.iter().map(|e| (e.src, e.dst, e.kind)).collect();
         for edge in other.edges {
-            if !existing.contains(&(edge.src, edge.dst, edge.kind)) {
+            if existing.insert((edge.src, edge.dst, edge.kind)) {
                 self.edges.push(edge);
             }
         }

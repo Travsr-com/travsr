@@ -31,7 +31,7 @@ pub fn is_comment_line(s: &str) -> bool {
         || t.starts_with('*')
         || t.starts_with("/*")
         || t.starts_with("*/")
-        || t.starts_with('#')
+        || (t.starts_with('#') && !t.starts_with("#[") && !t.starts_with("#![")) // Python/Ruby/shell — not Rust attributes
         || t.starts_with("\"\"\"")
         || t.starts_with("'''")
         || t.starts_with("--")   // SQL / Haskell / Lua
@@ -174,6 +174,10 @@ mod tests {
         assert!(!is_comment_line("fn foo() {}"));
         assert!(!is_comment_line("const x = 1;"));
         assert!(!is_comment_line("public class Foo {"));
+        // Rust attributes must NOT be treated as comments
+        assert!(!is_comment_line("#[inline]"));
+        assert!(!is_comment_line("#[derive(Debug, Clone)]"));
+        assert!(!is_comment_line("#![allow(dead_code)]"));
     }
 
     // ── skip_leading_comments ─────────────────────────────────────────────────

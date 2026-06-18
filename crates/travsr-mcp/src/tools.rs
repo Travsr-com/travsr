@@ -3661,7 +3661,7 @@ mod snippet_tests {
     }
 
     #[test]
-    fn get_context_include_snippets_false_is_byte_identical_to_legacy() {
+    fn get_context_include_snippets_false_has_no_separator() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("charge.ts");
         std::fs::write(&src, "function charge() {\n  return 1;\n}\n").unwrap();
@@ -3669,16 +3669,19 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("charge.ts", "fn:charge", 1, 3);
         let store = make_store_with_root(&dir, &[node]);
 
-        let legacy = get_context_body(&store, "charge", 4096, &OpenFilter, false, None);
-        let with_false = get_context_body(&store, "charge", 4096, &OpenFilter, false, None);
-        assert_eq!(
-            legacy, with_false,
-            "include_snippets=false must be byte-identical to legacy call"
-        );
-        assert!(legacy.contains("["), "footer must be present");
+        let without = get_context_body(&store, "charge", 4096, &OpenFilter, false, None);
+        let with_snip = get_context_body(&store, "charge", 4096, &OpenFilter, true, None);
+
+        // false path: metadata-only — no separator, footer present
+        assert!(without.contains("["), "footer must be present");
         assert!(
-            !legacy.contains(SNIPPET_SEP),
+            !without.contains(SNIPPET_SEP),
             "no separator in metadata-only output"
+        );
+        // true path must include the separator — same node, opposite outcome
+        assert!(
+            with_snip.contains(SNIPPET_SEP),
+            "SNIPPET_SEP must appear with include_snippets=true"
         );
     }
 
