@@ -136,86 +136,31 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
     register!(GoPlugin, "go", &["go"], false);
     register!(JavaPlugin, "java", &["java"], false);
 
-    // Languages driven entirely by GenericTreeSitterPlugin (config-only, no special logic)
-    check_fuzz_target("kotlin");
-    register_generic(
-        dispatcher,
-        &version,
+    // Languages driven entirely by GenericTreeSitterPlugin (config-only, no special logic).
+    // Grammar is obtained via config.get_grammar() inside GenericTreeSitterPlugin::new().
+    for config in &[
         &crate::plugins::kotlin::CONFIG,
-        tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
-    );
-    check_fuzz_target("ruby");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::ruby::CONFIG,
-        tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
-    );
-    check_fuzz_target("csharp");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::csharp::CONFIG,
-        tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
-    );
-    check_fuzz_target("php");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::php::CONFIG,
-        tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
-    );
-    check_fuzz_target("scala");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::scala::CONFIG,
-        tree_sitter::Language::new(tree_sitter_scala::LANGUAGE),
-    );
-    check_fuzz_target("cpp");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::cpp::CONFIG,
-        tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
-    );
-    check_fuzz_target("c");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::c::CONFIG,
-        tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
-    );
-    check_fuzz_target("swift");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::swift::CONFIG,
-        tree_sitter::Language::new(tree_sitter_swift::LANGUAGE),
-    );
-    check_fuzz_target("dart");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::dart::CONFIG,
-        tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
-    );
-    check_fuzz_target("objectivec");
-    register_generic(
-        dispatcher,
-        &version,
         &crate::plugins::objc::CONFIG,
-        tree_sitter::Language::new(tree_sitter_objc::LANGUAGE),
-    );
+    ] {
+        check_fuzz_target(config.language.as_str());
+        register_generic(dispatcher, &version, config);
+    }
 }
 
 fn register_generic(
     dispatcher: &mut Dispatcher,
     version: &str,
     config: &'static crate::plugins::generic::LanguageConfig,
-    grammar: tree_sitter::Language,
 ) {
-    let plugin = GenericTreeSitterPlugin::new(config, grammar);
+    let plugin = GenericTreeSitterPlugin::new(config);
     let hs = HandshakeResponse {
         protocol_version: PROTOCOL_VERSION,
         plugin_version: version.to_string(),

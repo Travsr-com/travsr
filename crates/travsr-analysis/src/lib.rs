@@ -2,6 +2,7 @@
 //!
 //! Canonical home for every capability that requires a parsed AST:
 //! - All 16 language parsers (Phase A + Phase B call-site edges)
+//! - Config-driven generic Phase A infrastructure (`generic`)
 //! - Edge construction helpers
 //! - Snippet extraction utilities
 //! - FFI boundary marker types
@@ -11,17 +12,37 @@
 
 #![forbid(unsafe_code)]
 
+// ── Infrastructure ────────────────────────────────────────────────────────────
 pub mod emit;
 pub mod ffi;
+pub mod generic;
+pub mod skeleton;
+pub mod snippet;
+
+// ── Phase A parsers — high-complexity (hand-crafted, FFI/LSIF aware) ─────────
 pub mod go;
+pub mod python;
+pub mod rust;
+pub mod typescript;
+
+// ── Phase A parsers — config-driven via generic::LanguageConfig ───────────────
+pub mod c;
+pub mod cpp;
+pub mod csharp;
+pub mod dart;
+pub mod java;
+pub mod kotlin;
+pub mod objc;
+pub mod php;
+pub mod ruby;
+pub mod scala;
+pub mod swift;
+
+// ── Phase B call-site parsers ─────────────────────────────────────────────────
+pub mod phase_b_dart;
 pub mod phase_b_python;
 pub mod phase_b_rust;
 pub mod phase_b_typescript;
-pub mod python;
-pub mod rust;
-pub mod skeleton;
-pub mod snippet;
-pub mod typescript;
 
 pub use travsr_core::Language;
 
