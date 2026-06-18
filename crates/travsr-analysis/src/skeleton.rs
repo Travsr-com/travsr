@@ -176,7 +176,7 @@ fn detect_lang(node: &Node) -> Option<Lang> {
         "dart" => Some(Lang::Dart),
         "rb" | "rake" | "gemspec" => Some(Lang::Ruby),
         "scala" | "sc" => Some(Lang::Scala),
-        "php" | "phtml" | "php3" | "php4" | "php5" => Some(Lang::Php),
+        "php" | "phtml" | "php3" | "php4" | "php5" | "php8" => Some(Lang::Php),
         "m" | "mm" => Some(Lang::ObjectiveC),
         _ => None,
     }
@@ -273,9 +273,7 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
         Lang::Swift => &[
             "function_declaration",
             "init_declaration",
-            "class_declaration",
-            "struct_declaration",
-            "enum_declaration",
+            "class_declaration", // covers struct/enum/actor/extension too (declaration_kind field)
             "protocol_declaration",
         ],
         Lang::Dart => &[
@@ -700,7 +698,7 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
                             let Some(m) = ty.named_child(j as u32) else {
                                 continue;
                             };
-                            if matches!(m.kind(), "method_spec" | "type_elem") {
+                            if matches!(m.kind(), "method_elem" | "type_elem") {
                                 fields.push(node_text(m, src).to_string());
                             }
                         }
@@ -846,8 +844,7 @@ fn extract_kotlin(
                     let Some(p) = fp.named_child(i as u32) else {
                         continue;
                     };
-                    // Kotlin-ng puts `parameter` directly in function_value_parameters
-                    if matches!(p.kind(), "parameter" | "function_value_parameter") {
+                    if p.kind() == "parameter" {
                         params.push(node_text(p, src).to_string());
                     }
                 }
@@ -1126,55 +1123,53 @@ fn extract_swift(
             if let Some(rt) = decl.child_by_field_name("return_type") {
                 return_type = Some(node_text(rt, src).to_string());
             }
-            // Parameters are not a field: search for function_value_parameters child
-            if let Some(fp) = named_child_of_kind(decl, "function_value_parameters") {
-                for i in 0..fp.named_child_count() {
-                    let Some(p) = fp.named_child(i as u32) else {
-                        continue;
-                    };
-                    if p.kind() == "parameter" {
-                        params.push(node_text(p, src).to_string());
-                    }
+            // Swift `parameter` nodes are direct named children of function_declaration
+            // (no function_value_parameters wrapper exists in tree-sitter-swift 0.7)
+            for i in 0..decl.named_child_count() {
+                let Some(c) = decl.named_child(i as u32) else {
+                    continue;
+                };
+                if c.kind() == "parameter" {
+                    params.push(node_text(c, src).to_string());
                 }
             }
         }
         "init_declaration" => {
-            if let Some(fp) = named_child_of_kind(decl, "function_value_parameters") {
-                for i in 0..fp.named_child_count() {
-                    let Some(p) = fp.named_child(i as u32) else {
-                        continue;
-                    };
-                    if p.kind() == "parameter" {
-                        params.push(node_text(p, src).to_string());
-                    }
+            for i in 0..decl.named_child_count() {
+                let Some(c) = decl.named_child(i as u32) else {
+                    continue;
+                };
+                if c.kind() == "parameter" {
+                    params.push(node_text(c, src).to_string());
                 }
             }
         }
-        "class_declaration" | "struct_declaration" | "protocol_declaration" => {
+        "class_declaration" | "protocol_declaration" => {
+            // class_declaration covers class/struct/enum/actor/extension (declaration_kind field)
             if let Some(body) = decl.child_by_field_name("body") {
-                for i in 0..body.named_child_count() {
-                    let Some(c) = body.named_child(i as u32) else {
-                        continue;
-                    };
-                    match c.kind() {
-                        "function_declaration"
-                        | "init_declaration"
-                        | "deinit_declaration"
-                        | "protocol_function_declaration" => fields.push(first_line(c, src)),
-                        _ => {}
+                if body.kind() == "enum_class_body" {
+                    // Swift enums: collect enum_entry names as variants
+                    for i in 0..body.named_child_count() {
+                        let Some(c) = body.named_child(i as u32) else {
+                            continue;
+                        };
+                        if c.kind() == "enum_entry" {
+                            if let Some(name) = c.child_by_field_name("name") {
+                                fields.push(node_text(name, src).to_string());
+                            }
+                        }
                     }
-                }
-            }
-        }
-        "enum_declaration" => {
-            if let Some(body) = decl.child_by_field_name("body") {
-                for i in 0..body.named_child_count() {
-                    let Some(c) = body.named_child(i as u32) else {
-                        continue;
-                    };
-                    if c.kind() == "enum_entry" {
-                        if let Some(name) = c.child_by_field_name("name") {
-                            fields.push(node_text(name, src).to_string());
+                } else {
+                    for i in 0..body.named_child_count() {
+                        let Some(c) = body.named_child(i as u32) else {
+                            continue;
+                        };
+                        match c.kind() {
+                            "function_declaration"
+                            | "init_declaration"
+                            | "deinit_declaration"
+                            | "protocol_function_declaration" => fields.push(first_line(c, src)),
+                            _ => {}
                         }
                     }
                 }
@@ -1212,8 +1207,16 @@ fn extract_dart(
         | "method_declaration"
         | "getter_declaration"
         | "setter_declaration" => {
-            // The signature field (function_signature) holds name, parameters, return_type
-            if let Some(sig) = decl.child_by_field_name("signature") {
+            // The `signature` field is function_signature for function_declaration, but
+            // method_signature for method_declaration. method_signature has no named fields —
+            // its first child is function_signature (or getter/setter/constructor_signature).
+            // Descend one level when needed to reach function_signature.
+            if let Some(sig_outer) = decl.child_by_field_name("signature") {
+                let sig = if sig_outer.kind() == "method_signature" {
+                    named_child_of_kind(sig_outer, "function_signature").unwrap_or(sig_outer)
+                } else {
+                    sig_outer
+                };
                 if let Some(rt) = sig.child_by_field_name("return_type") {
                     return_type = Some(node_text(rt, src).to_string());
                 }
@@ -1239,9 +1242,19 @@ fn extract_dart(
                     let Some(member) = body.named_child(i as u32) else {
                         continue;
                     };
-                    // class_member wraps each member; look inside it
+                    // class_member wraps each member; skip annotation nodes to find actual decl
                     let member = if member.kind() == "class_member" {
-                        member.named_child(0).unwrap_or(member)
+                        let mut inner = member;
+                        for j in 0..member.named_child_count() {
+                            let Some(c) = member.named_child(j as u32) else {
+                                continue;
+                            };
+                            if c.kind() != "annotation" {
+                                inner = c;
+                                break;
+                            }
+                        }
+                        inner
                     } else {
                         member
                     };
@@ -1249,7 +1262,12 @@ fn extract_dart(
                         "method_declaration"
                         | "function_declaration"
                         | "getter_declaration"
-                        | "setter_declaration" => fields.push(first_line(member, src)),
+                        | "setter_declaration" => {
+                            // Annotation is a child of method_declaration in tree-sitter-dart;
+                            // use the `signature` field's first line to skip past it.
+                            let sig = member.child_by_field_name("signature").unwrap_or(member);
+                            fields.push(first_line(sig, src));
+                        }
                         "declaration" => {
                             // constructor_signature or field_declaration wrapped in declaration
                             if let Some(inner) = member.named_child(0) {
@@ -1278,7 +1296,8 @@ fn extract_dart(
                         c.kind(),
                         "method_declaration" | "getter_declaration" | "setter_declaration"
                     ) {
-                        fields.push(first_line(c, src));
+                        let sig = c.child_by_field_name("signature").unwrap_or(c);
+                        fields.push(first_line(sig, src));
                     }
                 }
             }
@@ -1537,22 +1556,36 @@ fn extract_objc(
                 collect_callees_field(body, src, "message_expression", "method", &mut callees);
             }
         }
-        "class_interface" | "class_implementation" | "protocol_declaration" => {
-            // No body field — iterate all named children for method declarations/definitions
+        "class_interface" | "protocol_declaration" => {
+            // method_declaration nodes are direct named children of @interface / @protocol
             for i in 0..decl.named_child_count() {
                 let Some(c) = decl.named_child(i as u32) else {
                     continue;
                 };
-                if matches!(c.kind(), "method_declaration" | "method_definition") {
+                if c.kind() == "method_declaration" {
                     fields.push(first_line(c, src));
+                }
+            }
+        }
+        "class_implementation" => {
+            // method_definition nodes live inside implementation_definition, not directly
+            // on class_implementation (verified against tree-sitter-objc-3.0.2 node-types.json)
+            if let Some(impl_def) = named_child_of_kind(decl, "implementation_definition") {
+                for i in 0..impl_def.named_child_count() {
+                    let Some(c) = impl_def.named_child(i as u32) else {
+                        continue;
+                    };
+                    if c.kind() == "method_definition" {
+                        fields.push(first_line(c, src));
+                    }
                 }
             }
         }
         _ => {}
     }
 
-    // For ObjC @interface/@implementation, first_line gives a cleaner signature
-    // than decl_header (which might grab method declarations before a body block).
+    // For ObjC @interface/@implementation/@protocol, first_line gives a cleaner
+    // signature than decl_header (no body block to strip, just the opening line).
     let signature = match decl.kind() {
         "class_interface" | "class_implementation" | "protocol_declaration" => {
             first_line(decl, src)
@@ -1623,9 +1656,10 @@ fn decl_header(decl: TsNode<'_>, src: &[u8]) -> String {
 
 fn named_child_of_kind<'a>(n: TsNode<'a>, kind: &str) -> Option<TsNode<'a>> {
     for i in 0..n.named_child_count() {
-        let c = n.named_child(i as u32)?;
-        if c.kind() == kind {
-            return Some(c);
+        if let Some(c) = n.named_child(i as u32) {
+            if c.kind() == kind {
+                return Some(c);
+            }
         }
     }
     None
@@ -2414,6 +2448,148 @@ mod tests {
         let skel = skeleton_for_node(&node, dir.path()).unwrap();
         assert!(skel.signature.contains("Dog"), "sig: {}", skel.signature);
         assert!(!skel.fields.is_empty(), "expected ObjC interface methods");
+    }
+
+    // ── Go interface ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn go_interface_extracts_method_stubs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo.go");
+        std::fs::write(
+            &src,
+            "package repo\n\
+             \n\
+             type Repo interface {\n\
+             \tFind(id string) (*Item, error)\n\
+             \tSave(item *Item) error\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("repo.go", "type:Repo", "go", "interface", 3, 6);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(skel.signature.contains("Repo"), "sig: {}", skel.signature);
+        assert!(
+            !skel.fields.is_empty(),
+            "Go interface methods must not be empty"
+        );
+        let f = skel.fields.join(",");
+        assert!(f.contains("Find") || f.contains("Save"), "fields: {f}");
+    }
+
+    // ── Swift params + enum ───────────────────────────────────────────────────
+
+    #[test]
+    fn swift_function_extracts_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("billing.swift");
+        std::fs::write(
+            &src,
+            "func charge(amount: Double, currency: String) -> Bool {\n\
+                 return true\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("billing.swift", "fn:charge", "swift", "function", 1, 3);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(!skel.params.is_empty(), "Swift function must have params");
+        let p = skel.params.join(",");
+        assert!(
+            p.contains("amount") || p.contains("currency"),
+            "params: {p}"
+        );
+    }
+
+    #[test]
+    fn swift_enum_extracts_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("status.swift");
+        std::fs::write(
+            &src,
+            "enum Status {\n\
+                 case pending\n\
+                 case active\n\
+                 case failed\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("status.swift", "enum:Status", "swift", "enum", 1, 5);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(!skel.fields.is_empty(), "Swift enum must have cases");
+        let f = skel.fields.join(",");
+        assert!(f.contains("pending") || f.contains("active"), "cases: {f}");
+    }
+
+    // ── Dart method params + annotated member ─────────────────────────────────
+
+    #[test]
+    fn dart_method_extracts_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("animal.dart");
+        std::fs::write(
+            &src,
+            "class Animal {\n\
+                 String speak(String loudness, int times) {\n\
+                     return loudness;\n\
+                 }\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("animal.dart", "fn:speak", "dart", "function", 2, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(!skel.params.is_empty(), "Dart method must have params");
+        let p = skel.params.join(",");
+        assert!(p.contains("loudness") || p.contains("times"), "params: {p}");
+    }
+
+    #[test]
+    fn dart_annotated_class_member_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("animal.dart");
+        std::fs::write(
+            &src,
+            "class Animal {\n\
+                 @override\n\
+                 void speak() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("animal.dart", "class:Animal", "dart", "class", 1, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(
+            !skel.fields.is_empty(),
+            "annotated Dart member must appear in fields"
+        );
+        let f = skel.fields.join(",");
+        assert!(f.contains("speak"), "fields: {f}");
+    }
+
+    // ── ObjC @implementation extracts methods ─────────────────────────────────
+
+    #[test]
+    fn objc_implementation_extracts_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Dog.m");
+        std::fs::write(
+            &src,
+            "@implementation Dog\n\
+             - (void)bark {\n\
+                 NSLog(@\"Woof!\");\n\
+             }\n\
+             - (NSString *)name {\n\
+                 return _name;\n\
+             }\n\
+             @end\n",
+        )
+        .unwrap();
+        let node = make_node("Dog.m", "class:Dog", "objectivec", "class", 1, 8);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert!(
+            !skel.fields.is_empty(),
+            "@implementation must expose methods"
+        );
+        let f = skel.fields.join(",");
+        assert!(f.contains("bark") || f.contains("name"), "fields: {f}");
     }
 
     // ── token_estimate ────────────────────────────────────────────────────────
