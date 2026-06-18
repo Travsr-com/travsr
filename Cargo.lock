@@ -3028,6 +3028,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "travsr-analysis"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "streaming-iterator",
+ "tempfile",
+ "toml",
+ "tracing",
+ "travsr-core",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-dart",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-objc",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "travsr-cli"
 version = "0.7.0"
 dependencies = [
@@ -3121,6 +3149,7 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+ "travsr-analysis",
  "travsr-core",
  "travsr-error",
  "tree-sitter",
@@ -3165,6 +3194,7 @@ dependencies = [
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
+ "travsr-analysis",
  "travsr-core",
  "travsr-retrieval",
  "travsr-store",

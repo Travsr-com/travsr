@@ -6,29 +6,28 @@
 
 #![forbid(unsafe_code)]
 
-mod emit;
-pub mod ffi;
+// Parser modules now live in travsr-analysis (RFC-017).
+// Re-export the bridge modules so callers (travsr-daemon) still compile.
+pub use travsr_analysis::phase_b_python;
+pub use travsr_analysis::phase_b_rust;
+pub use travsr_analysis::phase_b_typescript;
+
+pub mod ffi; // thin re-export wrapper → travsr_analysis::ffi
 mod ffi_resolver;
-mod go;
 mod hash;
 pub mod lsif;
 pub mod phase_b_dart;
-pub mod phase_b_python;
-pub mod phase_b_rust;
-pub mod phase_b_typescript;
-mod python;
 pub mod python_lsif;
 pub mod ra_runner;
 pub mod runner;
-mod rust;
 pub mod sandbox;
 pub mod scip_unifier;
-mod typescript;
 
 use std::path::Path;
 
 use travsr_core::{EdgeKind, Language};
 
+// ParseOutput and FfiMarker are now owned by travsr-analysis.
 pub use ffi::{FfiMarker, FfiMarkerKind};
 pub use ffi_resolver::FfiConfig;
 pub use hash::hash_file;
@@ -36,6 +35,7 @@ pub use lsif::ingest as ingest_lsif;
 pub use lsif::{ingest_rust, ingest_rust_raw, ingest_scip};
 pub use ra_runner::run_ra_lsif;
 pub use runner::{run_lsif_emitter, run_scip_python};
+pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
 
@@ -45,28 +45,28 @@ pub fn typescript_parse(
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    typescript::parse(corpus, path, vname_path)
+    travsr_analysis::typescript::parse(corpus, path, vname_path)
 }
 pub fn rust_parse(
     corpus: &str,
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    rust::parse(corpus, path, vname_path)
+    travsr_analysis::rust::parse(corpus, path, vname_path)
 }
 pub fn python_parse(
     corpus: &str,
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    python::parse(corpus, path, vname_path)
+    travsr_analysis::python::parse(corpus, path, vname_path)
 }
 pub fn go_parse(
     corpus: &str,
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    go::parse(corpus, path, vname_path)
+    travsr_analysis::go::parse(corpus, path, vname_path)
 }
 
 /// Native Phase B for Dart: calls travsr-dart-index-emitter directly.
@@ -158,8 +158,8 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
         for ext in ["ts", "tsx"] {
             let candidate = normalized.with_extension(ext);
             let candidate_str = candidate.to_string_lossy().replace('\\', "/");
-            let target = emit::file_node(corpus, &candidate_str);
-            edges.push(emit::resolves_to_edge(node.id, target.id));
+            let target = travsr_analysis::emit::file_node(corpus, &candidate_str);
+            edges.push(travsr_analysis::emit::resolves_to_edge(node.id, target.id));
         }
     }
 
@@ -586,35 +586,6 @@ fn normalize_vname_path(path: &std::path::Path) -> std::path::PathBuf {
     parts.iter().collect()
 }
 
-/// All graph records produced by parsing a single source file.
-#[derive(Debug, Default)]
-pub struct ParseOutput {
-    pub nodes: Vec<Node>,
-    pub edges: Vec<Edge>,
-    /// FFI boundary markers collected by per-language indexers.
-    /// Consumed by `ffi_resolver` in the second pass.
-    pub ffi_markers: Vec<crate::ffi::FfiMarker>,
-}
-
-impl ParseOutput {
-    /// Merge `other` into `self`, deduplicating edges on `(src, dst, kind)`.
-    /// Nodes are appended without dedup (dedup happens in each indexer's parse fn).
-    pub fn merge_deduped(&mut self, other: ParseOutput) {
-        self.nodes.extend(other.nodes);
-        let existing: std::collections::HashSet<(
-            travsr_core::NodeId,
-            travsr_core::NodeId,
-            travsr_core::EdgeKind,
-        )> = self.edges.iter().map(|e| (e.src, e.dst, e.kind)).collect();
-        for edge in other.edges {
-            if !existing.contains(&(edge.src, edge.dst, edge.kind)) {
-                self.edges.push(edge);
-            }
-        }
-        self.ffi_markers.extend(other.ffi_markers);
-    }
-}
-
 /// Streaming indexer that walks a repository and emits graph records.
 ///
 /// The `corpus` field is the canonical repo identifier (ARCH-102) baked into
@@ -682,14 +653,15 @@ impl Indexer {
         };
         let mut output = match Language::from_extension(ext) {
             Some(Language::TypeScript) => {
-                typescript::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
+                travsr_analysis::typescript::parse(&self.corpus, abs_path, vname_path)
+                    .map_err(map_err)?
             }
             Some(Language::Rust) => {
-                rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
+                travsr_analysis::rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
             }
             Some(Language::Python) => {
-                let mut ts_out =
-                    python::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?;
+                let mut ts_out = travsr_analysis::python::parse(&self.corpus, abs_path, vname_path)
+                    .map_err(map_err)?;
                 // Best-effort semantic enrichment via pyright (RFC-005 §3).
                 // Runs after tree-sitter; failures are logged and silently ignored.
                 let pyright_out = python_lsif::parse_python_with_pyright(
@@ -700,7 +672,9 @@ impl Indexer {
                 ts_out.merge_deduped(pyright_out);
                 ts_out
             }
-            Some(Language::Go) => go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?,
+            Some(Language::Go) => {
+                travsr_analysis::go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
+            }
             // Other future languages (#[non_exhaustive]) are silently skipped
             // until their parsers ship.
             _ => ParseOutput::default(),
@@ -709,7 +683,7 @@ impl Indexer {
         // Collect per-language FFI call-site markers (RFC-005 §3).
         match Language::from_extension(ext) {
             Some(Language::TypeScript) => {
-                let napi_markers = typescript::collect_napi_dts_markers(
+                let napi_markers = travsr_analysis::typescript::collect_napi_dts_markers(
                     &self.corpus,
                     abs_path,
                     vname_path,
@@ -718,7 +692,7 @@ impl Indexer {
                 output.ffi_markers.extend(napi_markers);
             }
             Some(Language::Python) => {
-                let pyo3_markers = python::collect_pyo3_pyi_markers(
+                let pyo3_markers = travsr_analysis::python::collect_pyo3_pyi_markers(
                     &self.corpus,
                     abs_path,
                     vname_path,

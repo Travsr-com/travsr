@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/travsr-error",
     "crates/travsr-core",
+    "crates/travsr-analysis",
     "crates/travsr-ipc",
     "crates/travsr-plugin-protocol",
     "crates/travsr-plugin-sdk",
@@ -25,6 +26,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 travsr-error           = { path = "crates/travsr-error" }
+travsr-analysis        = { path = "crates/travsr-analysis" }
 travsr-ipc             = { path = "crates/travsr-ipc" }
 travsr-plugin-protocol = { path = "crates/travsr-plugin-protocol" }
 travsr-plugin-sdk      = { path = "crates/travsr-plugin-sdk" }

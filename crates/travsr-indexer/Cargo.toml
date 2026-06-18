@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 travsr-core = { path = "../travsr-core" }
+travsr-analysis = { workspace = true }
 travsr-error = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
