@@ -3108,6 +3108,7 @@ name = "travsr-daemon"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "fs2",
  "ignore",
  "libc",
@@ -3230,6 +3231,7 @@ dependencies = [
 name = "travsr-plugin-protocol"
 version = "0.7.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

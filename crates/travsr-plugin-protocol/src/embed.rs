@@ -39,6 +39,12 @@ pub trait EmbedPlugin: Send + Sync {
     /// Human-readable backend label for `travsr embed status`.
     fn backend(&self) -> &str;
 
+    /// Maximum texts per `EmbedRequest`. Reported in the handshake so the
+    /// daemon can chunk large batches. Defaults to 100.
+    fn max_batch(&self) -> u32 {
+        100
+    }
+
     /// Embed a batch of texts. Returns one BLOB per input, in the same order.
     /// The BLOB layout is backend-defined; the daemon stores it opaquely.
     fn embed_batch(&self, req: &EmbedRequest) -> EmbedResponse;
@@ -65,6 +71,14 @@ pub struct EmbedHandshakeResponse {
     pub embedding_dim: u32,
     /// Human-readable backend label (e.g. "nomic-embed-text-v1.5 int8 MRL-256").
     pub backend: String,
+    /// Maximum texts per EmbedRequest. Old plugin binaries that pre-date this
+    /// field get the safe default of 100 via serde(default).
+    #[serde(default = "default_max_batch")]
+    pub max_batch: u32,
+}
+
+fn default_max_batch() -> u32 {
+    100
 }
 
 // ── Embed batch ──────────────────────────────────────────────────────────────
@@ -215,6 +229,7 @@ mod tests {
             model_id: "nomic-v1.5-int8".into(),
             embedding_dim: 256,
             backend: "nomic-embed-text-v1.5 int8 MRL-256".into(),
+            max_batch: 100,
         });
         let encoded = encode_message(&resp).unwrap();
         let mut cursor = Cursor::new(encoded);

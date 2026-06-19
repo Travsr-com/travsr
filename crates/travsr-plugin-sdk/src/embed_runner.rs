@@ -43,6 +43,7 @@ pub fn run_embed_plugin<P: EmbedPlugin>(plugin: P) {
                     model_id: plugin.model_id().to_string(),
                     embedding_dim: plugin.embedding_dim(),
                     backend: plugin.backend().to_string(),
+                    max_batch: plugin.max_batch(),
                 })
             }
             EmbedPluginRequest::Embed(req) => EmbedPluginResponse::Embed(plugin.embed_batch(&req)),

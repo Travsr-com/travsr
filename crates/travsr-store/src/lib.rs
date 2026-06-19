@@ -24,6 +24,11 @@ pub use migration_manifest::{compute_manifest_kuzu, migrate_sqlite_to_kuzu};
 pub use migration_manifest::{Manifest, ManifestEntry, MigrationError};
 
 use std::path::Path;
+use std::sync::Arc;
+
+/// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
+pub type EmbedKnnHook =
+    Arc<dyn Fn(&str, u32) -> Result<Vec<NodeId>, StoreError> + Send + Sync>;
 
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -356,10 +361,14 @@ pub struct BatchWriteCounts {
 }
 
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
-#[derive(Debug)]
 pub struct SqliteStore {
     conn: Connection,
     staging_active: bool,
+    /// RFC-018 Step 4: optional semantic ANN hook injected by the daemon at
+    /// store-open time. `None` by default — zero cost when no embed plugin is
+    /// running. The store crate has zero knowledge of the plugin system; only the
+    /// daemon injects this via `set_embed_knn_hook`.
+    embed_knn_hook: Option<EmbedKnnHook>,
 }
 
 impl Drop for SqliteStore {
@@ -385,6 +394,7 @@ impl SqliteStore {
             let mut store = Self {
                 conn,
                 staging_active: false,
+                embed_knn_hook: None,
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -440,6 +450,7 @@ impl SqliteStore {
             let store = Self {
                 conn,
                 staging_active: false,
+                embed_knn_hook: None,
             };
             let current = store
                 .schema_version()
@@ -463,6 +474,7 @@ impl SqliteStore {
             let mut store = Self {
                 conn,
                 staging_active: false,
+                embed_knn_hook: None,
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -479,6 +491,15 @@ impl SqliteStore {
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Inject the RFC-018 Step 4 semantic-ANN hook.
+    ///
+    /// Called by the daemon after opening the store, when the embed supervisor
+    /// is active and the stored model_id matches the plugin's model_id. The hook
+    /// fires at the end of `search_nodes_fuzzy` (only when Steps 1–3 all miss).
+    pub fn set_embed_knn_hook(&mut self, hook: EmbedKnnHook) {
+        self.embed_knn_hook = Some(hook);
     }
 
     /// Create the `meta` table if it does not already exist.
@@ -2231,7 +2252,7 @@ impl SqliteStore {
 
         // Step 3 — L2-A vocabulary-grounded expansion (RFC-012 A1).
         // Only fires on combined Step 1 + Step 2 miss.
-        (|| -> AnyResult<Vec<Node>> {
+        let step3 = (|| -> AnyResult<Vec<Node>> {
             let raw_str = tokenize_identifier(query);
             if raw_str.is_empty() {
                 return Ok(Vec::new());
@@ -2271,7 +2292,23 @@ impl SqliteStore {
             );
             Ok(step3)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        if !step3.is_empty() {
+            return Ok(step3);
+        }
+
+        // Step 4 — semantic ANN (RFC-018). Fires only when Steps 1–3 all return
+        // empty. The hook is injected by the daemon's EmbedSupervisor at store-open
+        // time; it is None by default (zero cost — no embed plugin installed).
+        if let Some(knn_fn) = self.embed_knn_hook.as_ref() {
+            let ids = knn_fn(query, 20)?;
+            if !ids.is_empty() {
+                tracing::debug!(layer = "embed_ann", nodes_returned = ids.len());
+                return self.get_nodes(&ids);
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// Execute a raw FTS5 MATCH expression against the nodes index.

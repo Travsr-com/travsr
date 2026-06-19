@@ -6,6 +6,9 @@
 
 pub mod cache;
 pub mod dispatcher;
+pub mod embed_catalog;
+pub mod embed_sidecar;
+pub mod embed_supervisor;
 pub mod indexer;
 pub mod phase_b;
 pub mod plugins;
@@ -17,6 +20,11 @@ pub mod transport;
 pub mod trust;
 
 pub use dispatcher::Dispatcher;
+pub use embed_catalog::{
+    lookup as lookup_embed_backend, EmbedBackend, EmbedModelFile, BACKENDS as EMBED_BACKENDS,
+};
+pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
+pub use embed_supervisor::EmbedSupervisor;
 pub use indexer::{PhaseBInputs, PhaseBOutcome, PluginIndexer};
 pub use phase_b::{
     lookup as lookup_phase_b, OutputFormat, PhaseBEntry, SandboxRequirement,

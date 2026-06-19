@@ -2423,3 +2423,54 @@ fn run_query(
         other => anyhow::bail!("unknown query tool '{other}'"),
     }
 }
+
+/// Try to start an embed plugin supervisor and inject its KNN hook into `store`.
+///
+/// No-op when the default embed binary is not installed — `store.embed_knn_hook`
+/// stays `None` and Step 4 of `search_nodes_fuzzy` is silently disabled.
+/// Called by the daemon startup path AFTER the store is open and migrated.
+///
+/// The `db_path` argument must be the absolute path to the `graph.db` file
+/// opened by `store` so the sidecar can open its own read connection for ANN.
+pub fn try_inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
+    use travsr_plugin_host::{EmbedSupervisor, EMBED_BACKENDS};
+
+    let default_binary = EMBED_BACKENDS
+        .first()
+        .map(|b| b.binary_name)
+        .unwrap_or("travsr-embed-nomic-v1.5-int8");
+
+    let Some(home) = dirs::home_dir() else {
+        tracing::debug!("embed hook: HOME not set — skipping");
+        return;
+    };
+    let binary = home.join(".travsr").join("bin").join(default_binary);
+
+    let supervisor = EmbedSupervisor::try_start(&binary, db_path);
+    if !supervisor.is_active() {
+        return;
+    }
+
+    let model_id = match supervisor.model_id() {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    // Guard: stored model_id must match the plugin's to prevent stale ANN queries.
+    if let Ok(Some(stored)) = store.get_meta("current_embed_model") {
+        if stored != model_id {
+            tracing::warn!(
+                stored_model = %stored,
+                plugin_model = %model_id,
+                "embed model_id mismatch — Step 4 disabled. \
+                 Run `travsr embed init` to re-index with the installed model."
+            );
+            return;
+        }
+    }
+
+    if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
+        store.set_embed_knn_hook(hook);
+        tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
+    }
+}
