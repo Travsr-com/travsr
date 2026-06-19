@@ -33,6 +33,16 @@ pub enum EmbedCommand {
         #[arg(long)]
         reinstall: bool,
     },
+    /// Embed all un-embedded nodes in the current repo's graph.db.
+    ///
+    /// Invokes the active embed sidecar in --reindex mode.  Skips nodes that
+    /// already have an embedding for the active backend; safe to run repeatedly.
+    Reindex {
+        /// Path to graph.db to reindex (defaults to .travsr/graph.db in the
+        /// nearest git root).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// Show the currently active embedding model and binary status.
     Status,
     /// Switch the active embedding backend (binary must already be installed).
@@ -46,6 +56,7 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
     match cmd {
         EmbedCommand::List { json } => cmd_list(json),
         EmbedCommand::Init { backend, reinstall } => cmd_init(backend.as_deref(), reinstall),
+        EmbedCommand::Reindex { db } => cmd_reindex(db),
         EmbedCommand::Status => cmd_status(),
         EmbedCommand::Switch { backend } => cmd_switch(&backend),
     }
@@ -73,7 +84,10 @@ fn cmd_list(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<22} {:<12} {:<10} DESCRIPTION", "BACKEND", "DIM", "STATUS");
+    println!(
+        "{:<22} {:<12} {:<10} DESCRIPTION",
+        "BACKEND", "DIM", "STATUS"
+    );
     println!("{}", "-".repeat(90));
     for b in EMBED_BACKENDS {
         let installed = bin_dir.join(b.binary_name).exists();
@@ -85,7 +99,10 @@ fn cmd_list(json: bool) -> Result<()> {
         } else {
             "not installed".to_string()
         };
-        println!("{:<22} {:<12} {:<10} {}", b.id, b.dim, status, b.description);
+        println!(
+            "{:<22} {:<12} {:<10} {}",
+            b.id, b.dim, status, b.description
+        );
     }
     Ok(())
 }
@@ -94,8 +111,9 @@ fn cmd_list(json: bool) -> Result<()> {
 
 fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
     let backend = match backend_id {
-        Some(id) => lookup_embed_backend(id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown backend '{id}'. Run `travsr embed list` to see options."))?,
+        Some(id) => lookup_embed_backend(id).ok_or_else(|| {
+            anyhow::anyhow!("Unknown backend '{id}'. Run `travsr embed list` to see options.")
+        })?,
         None => EMBED_BACKENDS
             .first()
             .ok_or_else(|| anyhow::anyhow!("No embed backends in catalog."))?,
@@ -108,7 +126,10 @@ fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
     config.active = Some(backend.id.to_string());
     save_config(&config)?;
 
-    println!("\u{2713} '{}' is now the active embedding backend.", backend.id);
+    println!(
+        "\u{2713} '{}' is now the active embedding backend.",
+        backend.id
+    );
     println!("  Restart the daemon to apply: travsr daemon restart");
     Ok(())
 }
@@ -123,11 +144,14 @@ fn install_backend(backend: &'static EmbedBackend, reinstall: bool) -> Result<()
         let target = crate::install::current_target().context("determining install target")?;
 
         let repo = backend.github_repo.to_string();
-        let version = crate::lang::run_async(
-            async move { crate::install::fetch_latest_version_for_repo(&repo).await },
-        )
+        let version = crate::lang::run_async(async move {
+            crate::install::fetch_latest_version_for_repo(&repo).await
+        })
         .unwrap_or_else(|e| {
-            eprintln!("warning: could not fetch latest version ({e:#}), using {}", backend.version_fallback);
+            eprintln!(
+                "warning: could not fetch latest version ({e:#}), using {}",
+                backend.version_fallback
+            );
             backend.version_fallback.to_string()
         });
 
@@ -143,7 +167,11 @@ fn install_backend(backend: &'static EmbedBackend, reinstall: bool) -> Result<()
         })
         .context("downloading embed binary")?;
 
-        println!("\u{2713} {} installed to {}", backend.binary_name, path.display());
+        println!(
+            "\u{2713} {} installed to {}",
+            backend.binary_name,
+            path.display()
+        );
 
         if !crate::install::path_contains_travsr_bin() {
             println!(
@@ -214,8 +242,11 @@ async fn download_embed_binary(
     let bin_bytes = bin_resp.bytes().await.context("reading binary body")?;
     let sha_text = sha_resp.text().await.context("reading SHA256 body")?;
 
-    let expected = sha_text.split_whitespace().next()
-        .ok_or_else(|| anyhow::anyhow!("empty SHA256 file"))?.to_string();
+    let expected = sha_text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty SHA256 file"))?
+        .to_string();
     let actual = {
         let hash = Sha256::digest(&bin_bytes);
         hash.iter().fold(String::with_capacity(64), |mut s, b| {
@@ -230,8 +261,7 @@ async fn download_embed_binary(
     let dest_dir = embed_bin_dir()?;
     let dest = dest_dir.join(binary_name);
     let tmp = dest_dir.join(format!("{binary_name}.tmp"));
-    std::fs::write(&tmp, &bin_bytes)
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, &bin_bytes).with_context(|| format!("writing {}", tmp.display()))?;
 
     #[cfg(unix)]
     {
@@ -240,8 +270,7 @@ async fn download_embed_binary(
             .context("chmod +x embed binary")?;
     }
 
-    std::fs::rename(&tmp, &dest)
-        .with_context(|| format!("renaming into {}", dest.display()))?;
+    std::fs::rename(&tmp, &dest).with_context(|| format!("renaming into {}", dest.display()))?;
 
     Ok(dest)
 }
@@ -264,9 +293,64 @@ async fn download_model_file(
         bail!("model file download failed ({}): {url}", resp.status());
     }
     let bytes = resp.bytes().await.context("reading model file body")?;
-    std::fs::write(dest, &bytes)
-        .with_context(|| format!("writing model file {file_name}"))?;
-    println!("\u{2713} {} saved ({} MB).", file_name, bytes.len() / (1024 * 1024));
+    std::fs::write(dest, &bytes).with_context(|| format!("writing model file {file_name}"))?;
+    println!(
+        "\u{2713} {} saved ({} MB).",
+        file_name,
+        bytes.len() / (1024 * 1024)
+    );
+    Ok(())
+}
+
+// ── reindex ───────────────────────────────────────────────────────────────────
+
+fn cmd_reindex(db_override: Option<PathBuf>) -> Result<()> {
+    let db_path = match db_override {
+        Some(p) => p,
+        None => {
+            let cwd = std::env::current_dir().context("getting cwd")?;
+            let repo_root = crate::repo::find_git_root(&cwd)?;
+            let p = repo_root.join(".travsr/graph.db");
+            anyhow::ensure!(
+                p.exists(),
+                "graph.db not found at {}\n  Run `travsr init` first.",
+                p.display()
+            );
+            p
+        }
+    };
+
+    let config = load_config().ok_or_else(|| {
+        anyhow::anyhow!("No embedding backend active. Run `travsr embed init` first.")
+    })?;
+    let backend_id = config.active.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("No embedding backend active. Run `travsr embed init` first.")
+    })?;
+    let backend = lookup_embed_backend(backend_id)
+        .ok_or_else(|| anyhow::anyhow!("Active backend '{backend_id}' not in catalog."))?;
+
+    let bin_path = embed_bin_dir()?.join(backend.binary_name);
+    anyhow::ensure!(
+        bin_path.exists(),
+        "Sidecar binary not found: {}\n  Run `travsr embed init` to install it.",
+        bin_path.display()
+    );
+
+    println!(
+        "Reindexing {} with backend '{}'...",
+        db_path.display(),
+        backend_id
+    );
+
+    let status = std::process::Command::new(&bin_path)
+        .arg("--reindex")
+        .arg(&db_path)
+        .status()
+        .with_context(|| format!("spawning {}", bin_path.display()))?;
+
+    if !status.success() {
+        anyhow::bail!("reindex failed (exit code {:?})", status.code());
+    }
     Ok(())
 }
 
@@ -298,10 +382,23 @@ fn cmd_status() -> Result<()> {
                 println!("Active backend : {}", b.id);
                 println!("Description    : {}", b.description);
                 println!("Dimension      : {}", b.dim);
-                println!("Binary         : {} ({})", b.binary_name,
-                    if installed { "\u{2713} installed" } else { "\u{2717} missing — run `travsr embed init`" });
-                println!("Model files    : {}",
-                    if models_ok { "\u{2713} present" } else { "\u{2717} missing — run `travsr embed init`" });
+                println!(
+                    "Binary         : {} ({})",
+                    b.binary_name,
+                    if installed {
+                        "\u{2713} installed"
+                    } else {
+                        "\u{2717} missing — run `travsr embed init`"
+                    }
+                );
+                println!(
+                    "Model files    : {}",
+                    if models_ok {
+                        "\u{2713} present"
+                    } else {
+                        "\u{2717} missing — run `travsr embed init`"
+                    }
+                );
             }
         },
     }
@@ -311,8 +408,9 @@ fn cmd_status() -> Result<()> {
 // ── switch ────────────────────────────────────────────────────────────────────
 
 fn cmd_switch(backend_id: &str) -> Result<()> {
-    let backend = lookup_embed_backend(backend_id)
-        .ok_or_else(|| anyhow::anyhow!("Unknown backend '{backend_id}'. Run `travsr embed list`."))?;
+    let backend = lookup_embed_backend(backend_id).ok_or_else(|| {
+        anyhow::anyhow!("Unknown backend '{backend_id}'. Run `travsr embed list`.")
+    })?;
 
     let bin_dir = embed_bin_dir()?;
     if !bin_dir.join(backend.binary_name).exists() {
