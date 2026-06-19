@@ -6,6 +6,7 @@ mod ask;
 #[cfg(windows)]
 mod autostart;
 mod daemon_client;
+mod embed;
 mod graph;
 mod index;
 mod init;
@@ -161,6 +162,11 @@ enum Command {
     Synonym {
         #[command(subcommand)]
         action: synonym::SynonymCommand,
+    },
+    /// Manage embedding backends for semantic code search (RFC-018).
+    Embed {
+        #[command(subcommand)]
+        action: embed::EmbedCommand,
     },
 }
 
@@ -498,6 +504,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
+        Command::Embed { action } => embed::run(action)?,
     }
     Ok(())
 }

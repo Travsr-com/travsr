@@ -1071,7 +1071,7 @@ pub(crate) fn load_lang_config() -> Option<LangConfig> {
 /// lang::run() is a sync fn called from inside #[tokio::main(flavor = "current_thread")].
 /// Handle::current().block_on() would panic on a current-thread runtime (cannot block
 /// the thread driving it). Spawning a scoped thread with its own Runtime avoids this.
-fn run_async<F, T>(fut: F) -> Result<T>
+pub(crate) fn run_async<F, T>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
