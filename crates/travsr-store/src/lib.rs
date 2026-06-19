@@ -190,20 +190,15 @@ impl Migration for V11FtsSynonyms {
     }
 }
 
-#[cfg(feature = "embeddings")]
-struct V12Vec0Embeddings;
-#[cfg(feature = "embeddings")]
-impl Migration for V12Vec0Embeddings {
+/// RFC-018: plain blob embedding table — no sqlite-vec extension required in main process.
+/// EmbedPlugin sidecar opens its own DB connection for ANN queries.
+struct V12NodeEmbeddings;
+impl Migration for V12NodeEmbeddings {
     fn version(&self) -> u32 {
         12
     }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
-        // STUB (RFC-012 A2 F2, DEBT travsr-#259): the `embeddings` feature is not
-        // wired yet — the `ort` + `sqlite-vec` deps are unpinned and no extension
-        // loader exists. This DDL requires the `vec0` module to be registered on
-        // the connection first; until the loader lands, enabling `embeddings` will
-        // fail here. There is intentionally NO guard in this stub. Do not enable
-        // the `embeddings` feature in production until F2 is implemented.
+        // CREATE TABLE / INDEX IF NOT EXISTS — idempotent on re-run.
         store.exec_ddl(include_str!("migrations/v12_vec0_embeddings.sql"))
     }
 }
@@ -294,8 +289,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V9NodesFts);
     r.register(V10FtsVocab);
     r.register(V11FtsSynonyms);
-    #[cfg(feature = "embeddings")]
-    r.register(V12Vec0Embeddings);
+    r.register(V12NodeEmbeddings);
     r.register(V13PhaseBUnification);
     r.register(V14CoveringReverseIdx);
     r.register(V15KcoreShells);

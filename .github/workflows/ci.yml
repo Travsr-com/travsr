@@ -188,12 +188,25 @@ jobs:
           fi
           echo "OK: travsr-mcp has zero LLM provider dependencies"
 
-      - name: TL2 — assert travsr-mcp pulls zero embedding deps in default config
-        # Fail the build if any embedding/vector library appears in the default
-        # (no-features) dep tree.  L2-B/vec0 is opt-in only (feature flag).
+      - name: TL2 — workspace default build has zero embedding deps (cargo tree + metadata)
+        # RFC-018: ort / sqlite-vec live in travsr-embed repo, never in this workspace.
+        # Two complementary checks:
+        #   A) cargo tree: dep tree of travsr-mcp in default config (catches transitive pulls)
+        #   B) cargo metadata: workspace-level non-optional dep set (catches accidental direct adds)
         run: |
           if cargo tree -p travsr-mcp --no-default-features 2>/dev/null | grep -iE 'ort|onnx|candle|fastembed|usearch|sqlite-vec|vec0'; then
-            echo "FAIL: travsr-mcp has embedding dependency in default config (TL2 violation)"
+            echo "FAIL: travsr-mcp has embedding dependency in default config (TL2-A violation)"
             exit 1
           fi
-          echo "OK: travsr-mcp has zero embedding dependencies in default config"
+          echo "OK (TL2-A): travsr-mcp dep tree is embedding-free in default config"
+          cargo metadata --no-deps --format-version 1 \
+            | python3 -c "
+          import sys, json
+          meta = json.load(sys.stdin)
+          deps = {d['name'] for pkg in meta['packages']
+                  for d in pkg.get('dependencies', [])
+                  if not d.get('optional', False)}
+          banned = {'ort', 'sqlite-vec'} & deps
+          assert not banned, f'Embedding dep leaked into default workspace build: {banned}'
+          "
+          echo "OK (TL2-B): ort and sqlite-vec absent from workspace non-optional deps"
