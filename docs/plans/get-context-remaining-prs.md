@@ -192,14 +192,17 @@ Build and exercise end-to-end with the release binary before committing.
 only when Steps 1–3 all miss. Feature-gated behind `--features embeddings`; zero
 behavioral change for the default build.
 
-### Open questions — RESOLVED (2026-06-19)
+### Open questions — resolve before writing any code
 
-| # | Question | Resolution |
+These must be answered before P2-A (dep pinning). Start the investigation while
+PR-1 is in review.
+
+| # | Question | Action |
 |---|---|---|
-| Q1 | Does `ort 2.0` link cleanly on ARM64 macOS + ARM64 Linux? | ✅ Both `aarch64-apple-darwin` and `aarch64-unknown-linux-gnu` have prebuilt binaries in ort's `dist.txt`. ort CI tests on `ubuntu-24.04-arm` + `macos-15` (Apple Silicon). `download-binaries` feature covers both — no manual linking step. |
-| Q2 | `sqlite-vec` crate name, version, rusqlite API? | ✅ `sqlite-vec = "0.1.9"` (pin to stable; 0.1.10-alpha.* builds fail on docs.rs). Extension loading uses `sqlite3_auto_extension` + `sqlite3_vec_init`. One narrow `unsafe` block — pattern taken directly from the crate's own test suite. Requires documenting the transmute in code. |
-| Q3 | `nomic-embed-text-v1.5` ONNX availability + auth? | ✅ Public, no token. `onnx/` subfolder contains 8 variants. Use `model_int8.onnx` (137 MB, best size/quality tradeoff). Model output is 768-dim; for MRL-256, take `output[..256]` then L2-normalise — that's the MRL contract for this model. |
-| Q4 | RaBitQ defer? | ✅ Confirmed deferred. Ship FLOAT[256] + vec0 built-in ANN first. Mark debt as `// DEBT(travsr-#259): RaBitQ 1-bit quantisation`. |
+| Q1 | Does `ort 2.0` link cleanly on ARM64 macOS (dev) and ARM64 Linux (OCI A1)? | `cargo add ort@2.0 --optional` on a scratch branch, `cargo build --features embeddings`, test on both platforms |
+| Q2 | What is the exact `sqlite-vec` crate name and version on crates.io? Does it expose a rusqlite-compatible extension init function? | Check crates.io + the Alex Garcia sqlite-vec Rust repo |
+| Q3 | Is `nomic-embed-text-v1.5` ONNX export publicly available without a Hugging Face token? | `curl -I https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model.onnx` |
+| Q4 | RaBitQ scope — store full FLOAT[256] vectors (vec0 built-in ANN) for the first implementation, defer 1-bit quantisation? | Confirm with user; DEBT(travsr-#259) if deferred |
 
 ### Sub-phases (must land in order)
 
@@ -214,36 +217,24 @@ behavioral change for the default build.
 embeddings = ["dep:ort", "dep:sqlite-vec"]
 
 [dependencies]
-ort        = { version = "2.0.0-rc.12", optional = true, features = ["ndarray", "download-binaries"] }
-sqlite-vec = { version = "0.1.9",       optional = true }
+ort        = { version = "2.0", optional = true, features = ["ndarray"] }
+sqlite-vec = { version = "X.Y", optional = true }   # pin after Q2 resolved
 ```
 
-Note: `ort` is still pre-release (rc.12). Pin exact RC version so a future RC
-doesn't break the build. Upgrade to `"2.0"` once ort 2.0 final is released.
-
 **`crates/travsr-store/src/lib.rs`** — in `SqliteStore::open()`, before the
-migration runner, register the vec0 extension globally. This must run once
-before any connection opens the database so the v12 `CREATE VIRTUAL TABLE USING
-vec0` migration succeeds:
+migration runner, load the vec0 extension:
 
 ```rust
 #[cfg(feature = "embeddings")]
 {
-    use sqlite_vec::sqlite3_vec_init;
-    // SAFETY: transmute is between compatible C fn-pointer types — the standard
-    // pattern from sqlite-vec's own test suite. sqlite3_auto_extension is
-    // idempotent when called multiple times with the same function pointer
-    // (SQLite deduplicates internally).
-    unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(
-            std::mem::transmute(sqlite3_vec_init as *const ()),
-        ));
-    }
+    // Load sqlite-vec so the v12 CREATE VIRTUAL TABLE USING vec0 succeeds.
+    // Safety: extension loading is an SQLite API; only called once per connection.
+    sqlite_vec::load(&conn)
+        .map_err(|e| StoreError::Database(format!("sqlite-vec load failed: {e}")))?;
 }
 ```
 
-This is the sole `unsafe` block in the embeddings feature path. It is justified
-by RFC-012-ADDENDUM-02 (accepted) and mirrors the sqlite-vec crate's own tests.
+Exact call signature depends on Q2 resolution.
 
 **Acceptance criteria:**
 - [ ] `cargo build -p travsr-store` (no features) — zero `ort`/`sqlite-vec` in dep tree
@@ -264,9 +255,7 @@ static MODEL: OnceLock<ort::Session> = OnceLock::new();
 
 pub fn init_model(model_path: &Path) -> Result<(), StoreError> { ... }
 
-/// Embed text → MRL-256 float vector.
-/// nomic-embed-text-v1.5 outputs 768 dims; MRL contract is to take the
-/// first 256 dims then L2-normalise — this gives the 256-dim subspace.
+/// Embed text → MRL-256 float vector (first 256 dims of the model output).
 fn embed_text(text: &str) -> Result<[f32; 256], StoreError> { ... }
 
 pub fn put_node_embedding(
@@ -352,10 +341,8 @@ Subcommands:
 - `travsr embed status`
 
 `init` logic:
-1. Resolve model path: `--model` arg or `~/.travsr/models/nomic-embed-text-v1.5-int8.onnx`
-2. If model file missing: download with progress bar from
-   `https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model_int8.onnx`
-   (137 MB, no auth token required)
+1. Resolve model path: `--model` arg or `~/.travsr/models/nomic-embed-text-v1.5.onnx`
+2. If model file missing: download with progress bar (URL from Q3)
 3. Call `embeddings::init_model(&model_path)?`
 4. Open store; check meta `rabitq_rotation_seed` — if missing, generate 32-byte
    random seed via `rand::thread_rng()`, hex-encode, `store.set_meta("rabitq_rotation_seed", &hex)?`
@@ -391,12 +378,9 @@ doesn't appear in `--help` for default builds.
       | python3 -c "
 import sys, json
 meta = json.load(sys.stdin)
-# Filter optional=True — those are not compiled unless the feature is active.
-deps = {d['name'] for pkg in meta['packages']
-        for d in pkg.get('dependencies', [])
-        if not d.get('optional', False)}
-banned = {'ort', 'sqlite-vec'} & deps
-assert not banned, f'Embedding dep leaked into default build: {banned}'
+deps = {d['name'] for pkg in meta['packages'] for d in pkg.get('dependencies', [])}
+assert 'ort' not in deps and 'sqlite-vec' not in deps, \
+  f'Embedding dep leaked into default build: {deps & {\"ort\",\"sqlite-vec\"}}'
 "
 ```
 
@@ -424,9 +408,10 @@ on a real indexed repo before committing P2-D.
 ## Delivery sequence
 
 ```
-[done]         PR-1: edge annotation (committed 2776c08)
+[now]          PR-1: edge annotation           1.5d  no blockers
+               ├── investigate Q1–Q4 in parallel
                ↓
-[now]          P2-A: dep pinning + loader      3h    Q1–Q4 resolved
+[after PR-1]   P2-A: dep pinning + loader      3h    Q1+Q2 resolved
                ↓
                P2-B: write path (model + hooks) 1d
                ↓
@@ -444,4 +429,4 @@ on a real indexed repo before committing P2-D.
 | PR | Phases | Effort | Crates touched |
 |---|---|---|---|
 | PR-1 | Edge annotation | ~1.5d | `travsr-store`, `travsr-mcp` |
-| PR-2 | P2-A through P2-E | ~4.5d | `travsr-store`, `travsr-cli`, `.github/workflows` |
+| PR-2 | P2-A through P2-E | ~4.5d + dep unknowns | `travsr-store`, `travsr-cli`, `.github/workflows` |

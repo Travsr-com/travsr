@@ -4,20 +4,13 @@
 //! Kùzu, and hyperscale moves to RocksDB. All backends implement the
 //! `Store` trait below.
 
-// `deny` (not `forbid`) so the one justified unsafe block below — the sqlite-vec
-// auto-extension registration — can use `#[allow(unsafe_code)]` locally.
-// All other unsafe is still a compile error.  RFC-012-ADDENDUM-02 documents
-// and approves this exception.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 pub mod fts_tokenize;
 pub mod migration;
 pub mod migration_manifest;
 pub mod registry;
 mod seed_lexicon;
-
-#[cfg(feature = "embeddings")]
-pub mod embeddings;
 
 #[cfg(feature = "kuzu")]
 pub mod kuzu_store;
@@ -385,47 +378,11 @@ impl Drop for SqliteStore {
     }
 }
 
-/// Register the sqlite-vec extension globally so that all subsequent
-/// `Connection::open*` calls have the `vec0` virtual-table module available.
-/// Must be called before any `Connection` is opened, not after.
-///
-/// `sqlite3_auto_extension` is idempotent for the same function pointer
-/// (SQLite deduplicates internally), so the `Once` guard is just to avoid
-/// the redundant FFI round-trip on every store open.
-// Only justified unsafe in this crate.  RFC-012-ADDENDUM-02 documents the
-// approval; `sqlite3_vec_init` has the exact C signature expected by
-// `sqlite3_auto_extension`, and `transmute` is the canonical way to adapt it
-// from `extern "C" fn()` to the full `sqlite3_extension_init` signature.
-#[cfg(feature = "embeddings")]
-#[allow(unsafe_code)]
-fn register_vec0_once() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        use rusqlite::ffi::{sqlite3, sqlite3_api_routines};
-        use sqlite_vec::sqlite3_vec_init;
-        type ExtInitFn =
-            unsafe extern "C" fn(*mut sqlite3, *mut *mut i8, *const sqlite3_api_routines) -> i32;
-        // SAFETY: sqlite3_vec_init has the ExtInitFn signature. The transmute
-        // converts the extern "C" fn() alias exported by sqlite-vec into the
-        // typed fn pointer that sqlite3_auto_extension requires. Pattern taken
-        // directly from sqlite-vec v0.1.9 src/lib.rs.
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(
-                std::mem::transmute::<*const (), ExtInitFn>(sqlite3_vec_init as *const ()),
-            ));
-        }
-    });
-}
-
 impl SqliteStore {
     /// Open (or create) a SQLite-backed store at `path`, enabling WAL and
     /// running any pending migrations via [`MigrationRunner`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         (|| -> AnyResult<Self> {
-            // Must precede Connection::open — auto_extension fires on new connections.
-            #[cfg(feature = "embeddings")]
-            register_vec0_once();
             let conn = Connection::open(path)
                 .with_context(|| format!("opening sqlite database at {}", path.display()))?;
             Self::configure(&conn)?;
@@ -464,9 +421,6 @@ impl SqliteStore {
     /// returns an error so the caller can fall back to a full `open()`.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
         (|| -> AnyResult<Self> {
-            // Must precede Connection::open_with_flags.
-            #[cfg(feature = "embeddings")]
-            register_vec0_once();
             anyhow::ensure!(
                 path.exists(),
                 "no graph database at {} — run `travsr init`",
@@ -510,9 +464,6 @@ impl SqliteStore {
     /// on `:memory:` connections, so journal mode falls back to MEMORY.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         (|| -> AnyResult<Self> {
-            // Must precede Connection::open_in_memory.
-            #[cfg(feature = "embeddings")]
-            register_vec0_once();
             let conn = Connection::open_in_memory().context("opening in-memory sqlite database")?;
             Self::bootstrap_meta(&conn)?;
             let mut store = Self {
@@ -1033,15 +984,6 @@ impl SqliteStore {
                 Self::vocab_decrement(&tx, ts)?;
             }
 
-            // L2-B: batch-delete embeddings before the node rows disappear.
-            #[cfg(feature = "embeddings")]
-            tx.execute(
-                "DELETE FROM node_embeddings \
-                 WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
-                params![path],
-            )
-            .context("removing node_embeddings rows for path")?;
-
             tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
                 .context("deleting nodes for path")?;
 
@@ -1121,15 +1063,6 @@ impl SqliteStore {
             for ts in &prefix_token_strings {
                 Self::vocab_decrement(&tx, ts)?;
             }
-
-            // L2-B: batch-delete embeddings before the node rows disappear.
-            #[cfg(feature = "embeddings")]
-            tx.execute(
-                "DELETE FROM node_embeddings \
-                 WHERE node_id IN (SELECT id FROM nodes WHERE path LIKE ?1)",
-                params![pattern],
-            )
-            .context("removing node_embeddings rows for path prefix")?;
 
             tx.execute("DELETE FROM nodes WHERE path LIKE ?1", params![pattern])
                 .context("deleting nodes for path prefix")?;
@@ -1996,18 +1929,6 @@ impl SqliteStore {
         // Increment vocab refcounts for new tokens (v10 L2-A).
         Self::vocab_increment(conn, &new_tokens)?;
 
-        // L2-B: upsert embedding for incremental updates (best-effort, never blocks write).
-        #[cfg(feature = "embeddings")]
-        if let Err(e) = crate::embeddings::put_node_embedding(
-            conn,
-            node.id,
-            &node.vname.signature,
-            &node.kind,
-            &node.vname.path,
-        ) {
-            tracing::warn!(node_id = ?node.id, "embedding write skipped: {e}");
-        }
-
         Ok(())
     }
 
@@ -2182,13 +2103,6 @@ impl SqliteStore {
             Self::vocab_decrement(conn, &tokens)?;
         }
 
-        // L2-B: remove embedding (best-effort, never blocks delete).
-        #[cfg(feature = "embeddings")]
-        if let Err(e) = crate::embeddings::delete_node_embedding(conn, i64_to_node_id(node_id_i64))
-        {
-            tracing::warn!(node_id = node_id_i64, "embedding delete skipped: {e}");
-        }
-
         Ok(())
     }
 
@@ -2323,7 +2237,7 @@ impl SqliteStore {
 
         // Step 3 — L2-A vocabulary-grounded expansion (RFC-012 A1).
         // Only fires on combined Step 1 + Step 2 miss.
-        let step3 = (|| -> AnyResult<Vec<Node>> {
+        (|| -> AnyResult<Vec<Node>> {
             let raw_str = tokenize_identifier(query);
             if raw_str.is_empty() {
                 return Ok(Vec::new());
@@ -2363,25 +2277,7 @@ impl SqliteStore {
             );
             Ok(step3)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        if !step3.is_empty() {
-            return Ok(step3);
-        }
-
-        // Step 4 — L2-B semantic ANN (opt-in, RFC-012 A2 F2).
-        // Only fires when Steps 1–3 all miss and the embed model is loaded.
-        #[cfg(feature = "embeddings")]
-        {
-            let ids = crate::embeddings::vec_search(&self.conn, query, 20)
-                .map_err(|e| StoreError::Database(e.to_string()))?;
-            if !ids.is_empty() {
-                tracing::debug!(layer = "vec_ann", nodes_returned = ids.len());
-                return self.get_nodes(&ids);
-            }
-        }
-
-        Ok(Vec::new())
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Execute a raw FTS5 MATCH expression against the nodes index.
