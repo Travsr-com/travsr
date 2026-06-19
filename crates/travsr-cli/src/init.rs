@@ -59,6 +59,14 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
 
     crate::progress::print_summary(&stats, elapsed, quiet);
 
+    // Fire-and-forget: spawn the active embed sidecar in --reindex mode so
+    // new/changed nodes get embeddings without blocking the terminal.
+    // Silently skipped if no backend is installed (`travsr embed init` not run).
+    if std::io::stdout().is_terminal() && crate::embed::spawn_background_reindex(&db_path) && !quiet
+    {
+        println!("hint: embedding nodes in background (run `travsr embed status` to check)");
+    }
+
     // Tips are advisory chatter — suppress under --quiet.
     if !quiet {
         // DEBT-013 closed: hint users whose repo has no commits yet so

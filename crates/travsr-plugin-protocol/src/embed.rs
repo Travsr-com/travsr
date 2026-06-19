@@ -164,7 +164,11 @@ mod embeddings_serde {
         let strings: Vec<String> = Vec::deserialize(d)?;
         strings
             .iter()
-            .map(|s| BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom))
+            .map(|s| {
+                BASE64
+                    .decode(s.as_bytes())
+                    .map_err(serde::de::Error::custom)
+            })
             .collect()
     }
 
@@ -249,6 +253,9 @@ mod tests {
         let mut cursor = Cursor::new(encoded);
         // PluginRequest has variants Handshake/Parse/Invoke — "embed" is unknown.
         let result: Result<PluginRequest, _> = decode_message(&mut cursor);
-        assert!(result.is_err(), "embed message must not decode as PluginRequest");
+        assert!(
+            result.is_err(),
+            "embed message must not decode as PluginRequest"
+        );
     }
 }

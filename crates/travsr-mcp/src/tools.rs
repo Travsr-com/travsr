@@ -3954,7 +3954,11 @@ mod snippet_tests {
         let caller_id = store.put_node(&caller_node).unwrap();
         // Forward path: seed_fn → bridge_fn → caller_fn (PPR discovery)
         store
-            .put_edge(&travsr_core::Edge::new(seed_id, bridge_id, EdgeKind::Depends))
+            .put_edge(&travsr_core::Edge::new(
+                seed_id,
+                bridge_id,
+                EdgeKind::Depends,
+            ))
             .unwrap();
         store
             .put_edge(&travsr_core::Edge::new(

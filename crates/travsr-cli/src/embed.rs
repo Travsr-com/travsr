@@ -428,6 +428,50 @@ fn cmd_switch(backend_id: &str) -> Result<()> {
     Ok(())
 }
 
+// ── background reindex (called from init) ────────────────────────────────────
+
+/// Spawn `travsr-embed-<backend> --reindex <db_path>` as a fully detached
+/// background process.  Returns `true` if a process was actually launched.
+/// Silently returns `false` when no backend is active or the binary is missing
+/// (e.g. user hasn't run `travsr embed init` yet).  Never panics.
+pub fn spawn_background_reindex(db_path: &std::path::Path) -> bool {
+    match try_spawn_background_reindex(db_path) {
+        Ok(spawned) => spawned,
+        Err(e) => {
+            tracing::debug!("background embed reindex skipped: {e:#}");
+            false
+        }
+    }
+}
+
+fn try_spawn_background_reindex(db_path: &std::path::Path) -> Result<bool> {
+    let config = match load_config() {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    let backend_id = match config.active.as_deref() {
+        Some(id) => id,
+        None => return Ok(false),
+    };
+    let backend = match lookup_embed_backend(backend_id) {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+    let bin_path = embed_bin_dir()?.join(backend.binary_name);
+    if !bin_path.exists() {
+        return Ok(false);
+    }
+    std::process::Command::new(&bin_path)
+        .arg("--reindex")
+        .arg(db_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawning embed sidecar --reindex")?;
+    Ok(true)
+}
+
 // ── paths ─────────────────────────────────────────────────────────────────────
 
 fn travsr_dir() -> Result<PathBuf> {
