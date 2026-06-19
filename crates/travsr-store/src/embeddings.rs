@@ -70,11 +70,14 @@ pub fn model_loaded() -> bool {
     STATE.get().is_some()
 }
 
-/// Embed `text` and return an MRL-256 unit vector.
+/// Embed `text` with a nomic task prefix and return an MRL-256 unit vector.
 ///
-/// Prepends `"search_document: "` per the nomic-embed-text task-prefix contract.
+/// `task_prefix` must be one of the nomic-embed-text task strings:
+/// - `"search_document: "` — indexing (write path)
+/// - `"search_query: "`    — retrieval (read path / ANN search)
+///
 /// The model outputs 768 dims; we take the first 256 and L2-normalise.
-fn embed_text(text: &str) -> Result<[f32; 256], StoreError> {
+fn embed_text(task_prefix: &str, text: &str) -> Result<[f32; 256], StoreError> {
     let mutex = STATE
         .get()
         .ok_or_else(|| StoreError::Database("embed model not initialised".into()))?;
@@ -82,7 +85,7 @@ fn embed_text(text: &str) -> Result<[f32; 256], StoreError> {
         .lock()
         .map_err(|_| StoreError::Database("embed state mutex poisoned".into()))?;
 
-    let prefixed = format!("search_document: {text}");
+    let prefixed = format!("{task_prefix}{text}");
     let encoding = state
         .tokenizer
         .encode(prefixed, false)
@@ -182,7 +185,7 @@ pub fn put_node_embedding(
         return Ok(());
     }
     let text = format!("{sig} {kind} {path}");
-    let vec = embed_text(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vec = embed_text("search_document: ", &text).map_err(|e| anyhow::anyhow!("{e}"))?;
     // vec0 FLOAT[256] columns accept raw IEEE 754 little-endian bytes.
     // rusqlite can bind &[u8] as a blob; &[f32] has no ToSql impl.
     let bytes: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -204,4 +207,39 @@ pub fn delete_node_embedding(conn: &Connection, node_id: NodeId) -> anyhow::Resu
     )
     .context("deleting from node_embeddings")?;
     Ok(())
+}
+
+/// ANN search via vec0 KNN. Returns `NodeId`s ordered by distance (closest first).
+///
+/// Returns an empty `Vec` immediately when the model is not loaded so callers
+/// never need to guard against the uninitialized case themselves.
+///
+/// `k` is the maximum number of neighbours to return (typically 20 for Step 4
+/// in `search_nodes_fuzzy`).
+pub fn vec_search(conn: &Connection, query: &str, k: usize) -> Result<Vec<NodeId>, StoreError> {
+    if !model_loaded() {
+        return Ok(Vec::new());
+    }
+    // Use "search_query: " prefix for retrieval — nomic task-prefix contract.
+    let query_vec = embed_text("search_query: ", query)?;
+    // vec0 MATCH expects the same raw LE-bytes blob format used for inserts.
+    let bytes: Vec<u8> = query_vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT node_id FROM node_embeddings \
+             WHERE embedding MATCH ?1 AND k = ?2",
+        )
+        .map_err(|e| StoreError::Database(format!("preparing vec0 KNN: {e}")))?;
+
+    let ids = stmt
+        .query_map(rusqlite::params![bytes, k as i64], |row| {
+            let id_i64: i64 = row.get(0)?;
+            Ok(NodeId(id_i64 as u64))
+        })
+        .map_err(|e| StoreError::Database(format!("executing vec0 KNN: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StoreError::Database(format!("collecting vec0 KNN results: {e}")))?;
+
+    Ok(ids)
 }

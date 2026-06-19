@@ -2323,7 +2323,7 @@ impl SqliteStore {
 
         // Step 3 — L2-A vocabulary-grounded expansion (RFC-012 A1).
         // Only fires on combined Step 1 + Step 2 miss.
-        (|| -> AnyResult<Vec<Node>> {
+        let step3 = (|| -> AnyResult<Vec<Node>> {
             let raw_str = tokenize_identifier(query);
             if raw_str.is_empty() {
                 return Ok(Vec::new());
@@ -2363,7 +2363,25 @@ impl SqliteStore {
             );
             Ok(step3)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        if !step3.is_empty() {
+            return Ok(step3);
+        }
+
+        // Step 4 — L2-B semantic ANN (opt-in, RFC-012 A2 F2).
+        // Only fires when Steps 1–3 all miss and the embed model is loaded.
+        #[cfg(feature = "embeddings")]
+        {
+            let ids = crate::embeddings::vec_search(&self.conn, query, 20)
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            if !ids.is_empty() {
+                tracing::debug!(layer = "vec_ann", nodes_returned = ids.len());
+                return self.get_nodes(&ids);
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Execute a raw FTS5 MATCH expression against the nodes index.
