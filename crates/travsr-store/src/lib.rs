@@ -16,6 +16,9 @@ pub mod migration_manifest;
 pub mod registry;
 mod seed_lexicon;
 
+#[cfg(feature = "embeddings")]
+pub mod embeddings;
+
 #[cfg(feature = "kuzu")]
 pub mod kuzu_store;
 #[cfg(feature = "kuzu")]
@@ -1030,6 +1033,15 @@ impl SqliteStore {
                 Self::vocab_decrement(&tx, ts)?;
             }
 
+            // L2-B: batch-delete embeddings before the node rows disappear.
+            #[cfg(feature = "embeddings")]
+            tx.execute(
+                "DELETE FROM node_embeddings \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                params![path],
+            )
+            .context("removing node_embeddings rows for path")?;
+
             tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
                 .context("deleting nodes for path")?;
 
@@ -1109,6 +1121,15 @@ impl SqliteStore {
             for ts in &prefix_token_strings {
                 Self::vocab_decrement(&tx, ts)?;
             }
+
+            // L2-B: batch-delete embeddings before the node rows disappear.
+            #[cfg(feature = "embeddings")]
+            tx.execute(
+                "DELETE FROM node_embeddings \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE path LIKE ?1)",
+                params![pattern],
+            )
+            .context("removing node_embeddings rows for path prefix")?;
 
             tx.execute("DELETE FROM nodes WHERE path LIKE ?1", params![pattern])
                 .context("deleting nodes for path prefix")?;
@@ -1975,6 +1996,18 @@ impl SqliteStore {
         // Increment vocab refcounts for new tokens (v10 L2-A).
         Self::vocab_increment(conn, &new_tokens)?;
 
+        // L2-B: upsert embedding for incremental updates (best-effort, never blocks write).
+        #[cfg(feature = "embeddings")]
+        if let Err(e) = crate::embeddings::put_node_embedding(
+            conn,
+            node.id,
+            &node.vname.signature,
+            &node.kind,
+            &node.vname.path,
+        ) {
+            tracing::warn!(node_id = ?node.id, "embedding write skipped: {e}");
+        }
+
         Ok(())
     }
 
@@ -2147,6 +2180,13 @@ impl SqliteStore {
             .context("removing nodes_fts_map row")?;
             // Decrement vocab refcounts for retracted tokens (v10 L2-A).
             Self::vocab_decrement(conn, &tokens)?;
+        }
+
+        // L2-B: remove embedding (best-effort, never blocks delete).
+        #[cfg(feature = "embeddings")]
+        if let Err(e) = crate::embeddings::delete_node_embedding(conn, i64_to_node_id(node_id_i64))
+        {
+            tracing::warn!(node_id = node_id_i64, "embedding delete skipped: {e}");
         }
 
         Ok(())
