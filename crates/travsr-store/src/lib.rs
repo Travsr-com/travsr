@@ -27,8 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
-pub type EmbedKnnHook =
-    Arc<dyn Fn(&str, u32) -> Result<Vec<NodeId>, StoreError> + Send + Sync>;
+pub type EmbedKnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<NodeId>, StoreError> + Send + Sync>;
 
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -197,14 +196,15 @@ impl Migration for V11FtsSynonyms {
 
 /// RFC-018: plain blob embedding table — no sqlite-vec extension required in main process.
 /// EmbedPlugin sidecar opens its own DB connection for ANN queries.
-struct V12NodeEmbeddings;
-impl Migration for V12NodeEmbeddings {
+/// Numbered v16 so it runs on DBs already at v15 (kcore-shells branch).
+struct V16NodeEmbeddings;
+impl Migration for V16NodeEmbeddings {
     fn version(&self) -> u32 {
-        12
+        16
     }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
         // CREATE TABLE / INDEX IF NOT EXISTS — idempotent on re-run.
-        store.exec_ddl(include_str!("migrations/v12_vec0_embeddings.sql"))
+        store.exec_ddl(include_str!("migrations/v16_node_embeddings.sql"))
     }
 }
 
@@ -294,10 +294,10 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V9NodesFts);
     r.register(V10FtsVocab);
     r.register(V11FtsSynonyms);
-    r.register(V12NodeEmbeddings);
     r.register(V13PhaseBUnification);
     r.register(V14CoveringReverseIdx);
     r.register(V15KcoreShells);
+    r.register(V16NodeEmbeddings);
     r
 }
 

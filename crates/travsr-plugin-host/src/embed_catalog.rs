@@ -49,7 +49,7 @@ pub const BACKENDS: &[EmbedBackend] = &[
         id: "nomic-v1.5-int8",
         description: "nomic-embed-text-v1.5 int8 ONNX — 137 MB, MRL-256 (dim=256), local inference",
         dim: 256,
-        binary_name: "travsr-embed-nomic-v1.5-int8",
+        binary_name: "travsr-embed-nomic",
         github_repo: "Travsr-com/travsr-embed",
         version_fallback: "v1.0.0",
         model_files: &[

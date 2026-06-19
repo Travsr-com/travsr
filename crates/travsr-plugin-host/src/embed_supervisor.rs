@@ -41,7 +41,10 @@ impl EmbedSupervisor {
                 "embed plugin binary not found — Step 4 (semantic ANN) disabled. \
                  Run `travsr embed init` to install."
             );
-            return Self { inner: None, model_id: None };
+            return Self {
+                inner: None,
+                model_id: None,
+            };
         }
 
         match EmbedSidecar::spawn(binary, db_path) {
@@ -60,7 +63,10 @@ impl EmbedSupervisor {
             }
             Err(e) => {
                 tracing::warn!("embed sidecar start failed — Step 4 disabled: {e}");
-                Self { inner: None, model_id: None }
+                Self {
+                    inner: None,
+                    model_id: None,
+                }
             }
         }
     }
@@ -69,18 +75,15 @@ impl EmbedSupervisor {
     pub fn is_active(&self) -> bool {
         match &self.inner {
             None => false,
-            Some(arc) => arc
-                .lock()
-                .map(|s| s.is_alive())
-                .unwrap_or(false),
+            Some(arc) => arc.lock().map(|s| s.is_alive()).unwrap_or(false),
         }
     }
 
     /// Returns the negotiated capabilities, or `None` when inactive.
     pub fn capabilities(&self) -> Option<EmbedCapabilities> {
-        self.inner.as_ref().and_then(|arc| {
-            arc.lock().ok().map(|s| s.caps.clone())
-        })
+        self.inner
+            .as_ref()
+            .and_then(|arc| arc.lock().ok().map(|s| s.caps.clone()))
     }
 
     /// Build the knn_hook closure suitable for `SqliteStore::set_embed_knn_hook`.
@@ -94,9 +97,9 @@ impl EmbedSupervisor {
     pub fn knn_hook(&self, model_id: String) -> Option<KnnHook> {
         let arc = self.inner.as_ref()?.clone();
         Some(Arc::new(move |query: &str, k: u32| {
-            let sidecar = arc.lock().map_err(|_| {
-                StoreError::Database("embed sidecar mutex poisoned".into())
-            })?;
+            let sidecar = arc
+                .lock()
+                .map_err(|_| StoreError::Database("embed sidecar mutex poisoned".into()))?;
             if !sidecar.is_alive() {
                 return Ok(vec![]);
             }

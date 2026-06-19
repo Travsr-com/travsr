@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use travsr_plugin_protocol::{
     codec::{decode_message, write_message},
-    EmbedHandshakeRequest, EmbedPluginRequest, EmbedPluginResponse, KnnRequest, EmbedRequest,
+    EmbedHandshakeRequest, EmbedPluginRequest, EmbedPluginResponse, EmbedRequest, KnnRequest,
     EMBED_PROTOCOL_VERSION,
 };
 
@@ -33,7 +33,10 @@ impl std::fmt::Display for EmbedError {
             EmbedError::Spawn(e) => write!(f, "embed sidecar spawn failed: {e}"),
             EmbedError::Handshake(e) => write!(f, "embed sidecar handshake failed: {e}"),
             EmbedError::VersionMismatch { expected, got } => {
-                write!(f, "embed protocol version mismatch: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "embed protocol version mismatch: expected {expected}, got {got}"
+                )
             }
             EmbedError::Io(e) => write!(f, "embed sidecar I/O error: {e}"),
             EmbedError::PluginCrashed => write!(f, "embed plugin crashed"),
@@ -61,10 +64,7 @@ pub struct EmbedCapabilities {
 
 // ── I/O pair type alias ───────────────────────────────────────────────────────
 
-type SidecarIo = (
-    BufWriter<ChildStdin>,
-    BufReader<ChildStdout>,
-);
+type SidecarIo = (BufWriter<ChildStdin>, BufReader<ChildStdout>);
 
 // ── EmbedSidecar ─────────────────────────────────────────────────────────────
 
@@ -97,12 +97,14 @@ impl EmbedSidecar {
             .spawn()
             .map_err(|e| EmbedError::Spawn(e.to_string()))?;
 
-        let raw_stdin = child.stdin.take().ok_or_else(|| {
-            EmbedError::Spawn("piped stdin not available after spawn".into())
-        })?;
-        let raw_stdout = child.stdout.take().ok_or_else(|| {
-            EmbedError::Spawn("piped stdout not available after spawn".into())
-        })?;
+        let raw_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| EmbedError::Spawn("piped stdin not available after spawn".into()))?;
+        let raw_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| EmbedError::Spawn("piped stdout not available after spawn".into()))?;
 
         let mut writer = BufWriter::new(raw_stdin);
         let mut reader = BufReader::new(raw_stdout);
@@ -135,7 +137,11 @@ impl EmbedSidecar {
                     plugin_version: h.plugin_version,
                 }
             }
-            _ => return Err(EmbedError::Handshake("expected EmbedHandshakeResponse".into())),
+            _ => {
+                return Err(EmbedError::Handshake(
+                    "expected EmbedHandshakeResponse".into(),
+                ))
+            }
         };
 
         tracing::debug!(
@@ -187,9 +193,10 @@ impl EmbedSidecar {
 
         match decode_message::<EmbedPluginResponse>(reader) {
             Ok(EmbedPluginResponse::Embed(resp)) => Ok(resp.embeddings),
-            Ok(EmbedPluginResponse::Error(e)) => {
-                Err(EmbedError::Io(format!("plugin returned error: {}", e.message)))
-            }
+            Ok(EmbedPluginResponse::Error(e)) => Err(EmbedError::Io(format!(
+                "plugin returned error: {}",
+                e.message
+            ))),
             Ok(_) => Err(EmbedError::Io("unexpected response type for embed".into())),
             Err(e) => {
                 self.mark_crashed();
@@ -200,12 +207,7 @@ impl EmbedSidecar {
 
     /// Send a KNN query. The sidecar opens `self.db_path` with its own DB
     /// connection (with sqlite-vec or brute-force) and returns ranked node ids.
-    pub fn knn(
-        &self,
-        query_text: &str,
-        k: u32,
-        model_id: &str,
-    ) -> Result<Vec<i64>, EmbedError> {
+    pub fn knn(&self, query_text: &str, k: u32, model_id: &str) -> Result<Vec<i64>, EmbedError> {
         let req = EmbedPluginRequest::Knn(KnnRequest {
             db_path: self.db_path.clone(),
             query_text: query_text.to_string(),
@@ -223,9 +225,10 @@ impl EmbedSidecar {
 
         match decode_message::<EmbedPluginResponse>(reader) {
             Ok(EmbedPluginResponse::Knn(resp)) => Ok(resp.node_ids),
-            Ok(EmbedPluginResponse::Error(e)) => {
-                Err(EmbedError::Io(format!("plugin returned error: {}", e.message)))
-            }
+            Ok(EmbedPluginResponse::Error(e)) => Err(EmbedError::Io(format!(
+                "plugin returned error: {}",
+                e.message
+            ))),
             Ok(_) => Err(EmbedError::Io("unexpected response type for knn".into())),
             Err(e) => {
                 self.mark_crashed();
