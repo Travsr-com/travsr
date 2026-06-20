@@ -220,7 +220,7 @@ async fn rss_flood_under_200mb() {
 
     let repo_root = tmp.path().to_path_buf();
     let daemon_task = tokio::spawn(async move {
-        let _ = travsr_daemon::Daemon::run(repo_root).await;
+        let _ = travsr_daemon::Daemon::run(repo_root, false).await;
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
