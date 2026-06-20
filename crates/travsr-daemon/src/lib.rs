@@ -1949,6 +1949,14 @@ impl Daemon {
             SqliteStore::open_read_only(&db_path).context("opening graph.db read-only")?,
         ));
 
+        // Wire Step 4 (semantic ANN) into the query store. Must happen after
+        // both stores are open so the sidecar handshake can read the DB.
+        {
+            let mut rs = read_store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ws = store.lock().unwrap_or_else(|e| e.into_inner());
+            try_inject_embed_hook(&mut rs, &mut ws, &db_path);
+        }
+
         // #318 O2: LRU result cache for read-only queries served off the warm
         // store. Keyed on (tool, args, last_commit, phase_b_commit), so commits
         // and background Phase B refreshes invalidate it structurally.
@@ -2426,26 +2434,40 @@ fn run_query(
 
 /// Try to start an embed plugin supervisor and inject its KNN hook into `store`.
 ///
-/// No-op when the default embed binary is not installed — `store.embed_knn_hook`
-/// stays `None` and Step 4 of `search_nodes_fuzzy` is silently disabled.
-/// Called by the daemon startup path AFTER the store is open and migrated.
+/// Wire the embed KNN hook into the daemon stores.
 ///
-/// The `db_path` argument must be the absolute path to the `graph.db` file
-/// opened by `store` so the sidecar can open its own read connection for ANN.
-pub fn try_inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
-    use travsr_plugin_host::{EmbedSupervisor, EMBED_BACKENDS};
-
-    let default_binary = EMBED_BACKENDS
-        .first()
-        .map(|b| b.binary_name)
-        .unwrap_or("travsr-embed-nomic-v1.5-int8");
+/// `query_store` is the read-only connection used by MCP query dispatch — the
+/// hook must live here so every `search_nodes_fuzzy` call reaches Step 4.
+/// `write_store` is the write connection used for meta reads and writes.
+///
+/// No-op when the active backend binary is not installed.
+/// Called once at daemon startup AFTER both stores are open and migrated.
+pub fn try_inject_embed_hook(
+    query_store: &mut SqliteStore,
+    write_store: &mut SqliteStore,
+    db_path: &Path,
+) {
+    use travsr_plugin_host::{
+        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
+    };
 
     let Some(home) = dirs::home_dir() else {
         tracing::debug!("embed hook: HOME not set — skipping");
         return;
     };
-    let binary = home.join(".travsr").join("bin").join(default_binary);
 
+    // Prefer the user's active backend from ~/.travsr/embed.toml; fall back to
+    // the catalog default so a fresh install without `travsr embed switch` still works.
+    let backend = active_backend_id()
+        .as_deref()
+        .and_then(lookup_embed_backend)
+        .or_else(|| EMBED_BACKENDS.first())
+        .copied();
+    let Some(backend) = backend else {
+        return;
+    };
+
+    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
     let supervisor = EmbedSupervisor::try_start(&binary, db_path);
     if !supervisor.is_active() {
         return;
@@ -2456,21 +2478,26 @@ pub fn try_inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
         None => return,
     };
 
-    // Guard: stored model_id must match the plugin's to prevent stale ANN queries.
-    if let Ok(Some(stored)) = store.get_meta("current_embed_model") {
+    // Guard: if a model_id was previously recorded it must match the plugin's.
+    // When absent (first run after `travsr embed reindex`) we proceed and write it below.
+    if let Ok(Some(stored)) = write_store.get_meta("current_embed_model") {
         if stored != model_id {
             tracing::warn!(
                 stored_model = %stored,
                 plugin_model = %model_id,
                 "embed model_id mismatch — Step 4 disabled. \
-                 Run `travsr embed init` to re-index with the installed model."
+                 Run `travsr embed reindex` to rebuild embeddings with the installed model."
             );
             return;
         }
     }
 
     if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
-        store.set_embed_knn_hook(hook);
+        query_store.set_embed_knn_hook(hook);
+        // Persist the active model_id so future startups detect backend switches.
+        if let Err(e) = write_store.set_meta("current_embed_model", &model_id) {
+            tracing::warn!("embed: failed to persist current_embed_model: {e}");
+        }
         tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
     }
 }

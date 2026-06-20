@@ -293,7 +293,11 @@ async fn download_model_file(
         bail!("model file download failed ({}): {url}", resp.status());
     }
     let bytes = resp.bytes().await.context("reading model file body")?;
-    std::fs::write(dest, &bytes).with_context(|| format!("writing model file {file_name}"))?;
+    // Atomic write: stage to .tmp then rename so an interrupted download never
+    // leaves a truncated file that passes the dest.exists() re-download guard.
+    let tmp = dest.with_extension("tmp");
+    std::fs::write(&tmp, &bytes).with_context(|| format!("writing model file {file_name}"))?;
+    std::fs::rename(&tmp, dest).with_context(|| format!("installing model file {file_name}"))?;
     println!(
         "\u{2713} {} saved ({} MB).",
         file_name,

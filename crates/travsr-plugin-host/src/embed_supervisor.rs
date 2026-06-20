@@ -104,7 +104,23 @@ impl EmbedSupervisor {
                 return Ok(vec![]);
             }
             match sidecar.knn(query, k, &model_id) {
-                Ok(ids) => Ok(ids.into_iter().map(|id| NodeId(id as u64)).collect()),
+                Ok(ids) => {
+                    let nodes: Vec<NodeId> = ids
+                        .into_iter()
+                        .filter_map(|id| {
+                            if id < 0 {
+                                tracing::warn!(
+                                    id,
+                                    "embed sidecar returned negative node_id — skipping"
+                                );
+                                None
+                            } else {
+                                Some(NodeId(id as u64))
+                            }
+                        })
+                        .collect();
+                    Ok(nodes)
+                }
                 Err(e) => {
                     // Non-fatal: log and return empty rather than failing the query.
                     tracing::warn!("embed knn failed (non-fatal): {e}");

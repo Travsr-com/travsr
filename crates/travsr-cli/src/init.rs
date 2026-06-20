@@ -64,7 +64,7 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
     // Silently skipped if no backend is installed (`travsr embed init` not run).
     if std::io::stdout().is_terminal() && crate::embed::spawn_background_reindex(&db_path) && !quiet
     {
-        println!("hint: embedding nodes in background (run `travsr embed status` to check)");
+        println!("hint: embed sidecar launched — run `travsr embed status` to confirm progress");
     }
 
     // Tips are advisory chatter — suppress under --quiet.

@@ -77,6 +77,20 @@ pub fn lookup(id: &str) -> Option<&'static EmbedBackend> {
     BACKENDS.iter().find(|b| b.id == id)
 }
 
+/// Read the active backend id from `~/.travsr/embed.toml`.
+/// Returns `None` when the file is absent, unreadable, or has no `active` key.
+/// Used by the daemon to select the correct sidecar without depending on travsr-cli.
+pub fn active_backend_id() -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Config {
+        active: Option<String>,
+    }
+    let home = dirs::home_dir()?;
+    let content = std::fs::read_to_string(home.join(".travsr").join("embed.toml")).ok()?;
+    let cfg: Config = toml::from_str(&content).ok()?;
+    cfg.active
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
