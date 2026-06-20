@@ -237,7 +237,13 @@ async fn main() {
     let matches = Cli::command().before_help(logo::banner()).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    init_tracing();
+    let is_daemon_fg = matches!(
+        &cli.command,
+        Command::Daemon { action: DaemonAction::Start { foreground: true } }
+    );
+    if !is_daemon_fg {
+        init_tracing();
+    }
 
     let result = run(cli).await;
 

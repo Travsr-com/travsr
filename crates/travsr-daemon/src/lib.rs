@@ -1892,6 +1892,16 @@ impl Daemon {
         let travsr_dir = repo_root.join(".travsr");
         std::fs::create_dir_all(&travsr_dir).context("creating .travsr")?;
 
+        let file_appender = tracing_appender::rolling::never(&travsr_dir, "daemon.log");
+        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::fmt()
+            .with_writer(non_blocking)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");
         let lock_file = std::fs::OpenOptions::new()
