@@ -145,7 +145,7 @@ async fn rss_flood_under_200mb() {
     let daemon_task = tokio::spawn(async move {
         // Daemon::run blocks until SIGINT/SIGTERM or a control-socket Shutdown.
         // We cancel it via JoinHandle::abort() after the flood completes.
-        if let Err(e) = travsr_daemon::Daemon::run(repo_root).await {
+        if let Err(e) = travsr_daemon::Daemon::run(repo_root, false).await {
             // "another travsr daemon is already running" is the expected error
             // if the OS still has the lock from a previous test run in the
             // same process; tolerate it rather than panicking.
@@ -277,14 +277,14 @@ async fn daemon_start_twice_single_process() {
     let repo_root_2 = tmp.path().to_path_buf();
 
     // Start the first daemon — should succeed and keep running.
-    let daemon1 = tokio::spawn(async move { travsr_daemon::Daemon::run(repo_root_1).await });
+    let daemon1 = tokio::spawn(async move { travsr_daemon::Daemon::run(repo_root_1, false).await });
 
     // Give daemon 1 enough time to acquire the lock, create the socket, and
     // enter its select! loop.
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // Start the second daemon against the same directory — must fail immediately.
-    let result2 = travsr_daemon::Daemon::run(repo_root_2).await;
+    let result2 = travsr_daemon::Daemon::run(repo_root_2, false).await;
 
     // Graceful shutdown of daemon 1 before asserting, so the TempDir can be
     // cleaned up and the lockfile is released cleanly.
