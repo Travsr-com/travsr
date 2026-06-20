@@ -343,7 +343,7 @@ fn cmd_reindex(db_override: Option<PathBuf>) -> Result<()> {
     println!(
         "Reindexing {} with backend '{}'...",
         db_path.display(),
-        backend_id
+        backend_id,
     );
 
     let status = std::process::Command::new(&bin_path)
@@ -351,7 +351,6 @@ fn cmd_reindex(db_override: Option<PathBuf>) -> Result<()> {
         .arg(&db_path)
         .status()
         .with_context(|| format!("spawning {}", bin_path.display()))?;
-
     if !status.success() {
         anyhow::bail!("reindex failed (exit code {:?})", status.code());
     }

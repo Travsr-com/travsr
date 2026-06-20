@@ -161,7 +161,26 @@ fn handle_tool_call(
             let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
             let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
             let snippet_budget = args["snippet_budget"].as_u64().map(|v| v as usize);
-            tools::get_context(store, query, token_budget, include_snippets, snippet_budget)
+            // Use the embed-aware path when the daemon has injected a KNN hook
+            // (i.e. `travsr embed init` + `travsr embed reindex` have been run).
+            // Falls back to fuzzy text search automatically when the hook is absent.
+            match store.embed_knn_fn() {
+                Some(knn) => tools::get_context_embed(
+                    store,
+                    query,
+                    token_budget,
+                    include_snippets,
+                    snippet_budget,
+                    &knn,
+                ),
+                None => tools::get_context(
+                    store,
+                    query,
+                    token_budget,
+                    include_snippets,
+                    snippet_budget,
+                ),
+            }
         }
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");

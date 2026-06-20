@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use travsr_core::{Node as CoreNode, NodeId};
+use travsr_core::{EdgeKind, Node as CoreNode, NodeId};
 use travsr_retrieval::{
-    context_candidates, knapsack, token_cost, EdgeFilter, OpenFilter, MAX_CONTEXT_BUDGET,
-    TOKEN_CHARS_PER_TOKEN,
+    bm25_rank_symbols, context_candidates, knapsack, token_cost, EdgeFilter, OpenFilter,
+    MAX_CONTEXT_BUDGET, TOKEN_CHARS_PER_TOKEN,
 };
 use travsr_store::{SqliteStore, Store};
 
@@ -1384,7 +1384,36 @@ pub(crate) fn get_context_raw(
         &OpenFilter,
         include_snippets,
         snippet_budget,
+        None,
     )
+}
+
+/// Embedding-aware variant of [`get_context`].
+///
+/// `embed_knn(query, k)` should return up to `k` file node IDs ranked by
+/// cosine similarity to the embedded query (supplied by the daemon via
+/// `EmbedSupervisor`).  When the closure returns an empty vec (e.g. before
+/// `travsr embed reindex` has run), the function transparently falls back to
+/// `search_nodes_fuzzy` so callers never see an empty result due to a missing
+/// index.
+pub fn get_context_embed(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
+    embed_knn: &dyn Fn(&str, u32) -> Vec<NodeId>,
+) -> String {
+    let body = get_context_body(
+        store,
+        query,
+        token_budget,
+        &OpenFilter,
+        include_snippets,
+        snippet_budget,
+        Some(embed_knn),
+    );
+    wrap_envelope(&body)
 }
 
 fn get_context_with_filter(
@@ -1402,6 +1431,7 @@ fn get_context_with_filter(
         filter,
         include_snippets,
         snippet_budget,
+        None,
     );
     wrap_envelope(&body)
 }
@@ -1430,6 +1460,67 @@ impl NodeRole {
     }
 }
 
+/// Derive PPR seeds using embedding KNN on file nodes, then BM25-rank the
+/// contained symbols against the query.
+///
+/// Returns empty when KNN returns no file matches (embed index not yet built or
+/// no semantically similar files exist), so the caller can fall back to
+/// `search_nodes_fuzzy`.
+fn embed_path_seeds(
+    store: &SqliteStore,
+    query: &str,
+    knn_fn: &dyn Fn(&str, u32) -> Vec<NodeId>,
+    filter: &dyn EdgeFilter,
+) -> Vec<NodeId> {
+    // Stage 1: KNN over file embeddings — top 10 semantically matched files.
+    let file_ids = knn_fn(query, 10);
+    if file_ids.is_empty() {
+        return vec![];
+    }
+
+    // Stage 2: collect all symbols in those files via DefinesBinding edges.
+    let mut sym_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for &fid in &file_ids {
+        if let Ok(edges) = store.iter_edges_from_kind(fid, EdgeKind::DefinesBinding) {
+            for e in edges {
+                sym_ids.insert(e.dst);
+            }
+        }
+    }
+    if sym_ids.is_empty() {
+        return vec![];
+    }
+
+    let sym_nodes = match store.get_nodes(&sym_ids.into_iter().collect::<Vec<_>>()) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::warn!("embed_path_seeds get_nodes error: {e}");
+            return vec![];
+        }
+    };
+
+    let corpus_map: std::collections::HashMap<NodeId, String> =
+        sym_nodes.iter().map(|n| (n.id, n.vname.corpus.clone())).collect();
+
+    // Stage 3: BM25 rank the symbol pool against the query.
+    let bm25_texts: Vec<(NodeId, String)> = sym_nodes
+        .iter()
+        .filter(|n| n.kind != "file" && n.kind != "file-module")
+        .map(|n| (n.id, format!("{}: {}", n.kind, n.vname.signature)))
+        .collect();
+    let bm25_refs: Vec<(NodeId, &str)> =
+        bm25_texts.iter().map(|(id, t)| (*id, t.as_str())).collect();
+
+    bm25_rank_symbols(&bm25_refs, query, 20)
+        .into_iter()
+        .filter(|&id| {
+            let corpus = corpus_map.get(&id).map(String::as_str);
+            filter.allow(id, id, corpus)
+        })
+        .take(5)
+        .collect()
+}
+
 fn get_context_body(
     store: &SqliteStore,
     query: &str,
@@ -1437,6 +1528,7 @@ fn get_context_body(
     filter: &dyn EdgeFilter,
     include_snippets: bool,
     snippet_budget: Option<usize>,
+    embed_knn: Option<&dyn Fn(&str, u32) -> Vec<NodeId>>,
 ) -> String {
     // SEC-002: validate before any store access.
     if let Err(reason) = validate_mcp_arg(query) {
@@ -1451,17 +1543,43 @@ fn get_context_body(
         return String::new();
     }
 
-    // Seed lookup: up to 5 seeds matching query, RBAC-filtered (SEC P0).
-    let seeds: Vec<NodeId> = match store.search_nodes_fuzzy(query) {
-        Ok(nodes) => nodes
-            .into_iter()
-            .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
-            .take(5)
-            .map(|n| n.id)
-            .collect(),
-        Err(e) => {
-            tracing::warn!("get_context seed search error: {e}");
-            return String::new();
+    // Fuzzy-search fallback, shared by both the no-embed path and the embed
+    // path when KNN returns no results (embed index not yet built).
+    let fuzzy_seeds = || match store.search_nodes_fuzzy(query) {
+        Ok(nodes) => Ok(
+            nodes
+                .into_iter()
+                .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+                .take(5)
+                .map(|n| n.id)
+                .collect::<Vec<_>>(),
+        ),
+        Err(e) => Err(e),
+    };
+
+    // Seed lookup: embed KNN → BM25 (when available), else fuzzy text search.
+    let seeds: Vec<NodeId> = if let Some(knn_fn) = embed_knn {
+        let embed_seeds = embed_path_seeds(store, query, knn_fn, filter);
+        if !embed_seeds.is_empty() {
+            embed_seeds
+        } else {
+            // KNN returned nothing — embed index may not be built yet.
+            tracing::debug!("embed knn returned no file seeds; falling back to fuzzy search");
+            match fuzzy_seeds() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("get_context seed search error: {e}");
+                    return String::new();
+                }
+            }
+        }
+    } else {
+        match fuzzy_seeds() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("get_context seed search error: {e}");
+                return String::new();
+            }
         }
     };
 
@@ -3770,8 +3888,8 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("charge.ts", "fn:charge", 1, 3);
         let store = make_store_with_root(&dir, &[node]);
 
-        let without = get_context_body(&store, "charge", 4096, &OpenFilter, false, None);
-        let with_snip = get_context_body(&store, "charge", 4096, &OpenFilter, true, None);
+        let without = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        let with_snip = get_context_body(&store, "charge", 4096, &OpenFilter, true, None, None);
 
         // false path: metadata-only — no separator, footer present
         assert!(without.contains("["), "footer must be present");
@@ -3795,7 +3913,7 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("pay.ts", "fn:pay", 1, 3);
         let store = make_store_with_root(&dir, &[node]);
 
-        let result = get_context_body(&store, "pay", 4096, &OpenFilter, true, None);
+        let result = get_context_body(&store, "pay", 4096, &OpenFilter, true, None, None);
         assert!(
             result.contains(SNIPPET_SEP),
             "SNIPPET_SEP must appear when include_snippets=true"
@@ -3819,7 +3937,7 @@ mod snippet_tests {
         let store = make_store_with_root(&dir, &[node]);
 
         // Tiny budget: metadata fits but snippet cannot.
-        let result = get_context_body(&store, "big", 10, &OpenFilter, true, None);
+        let result = get_context_body(&store, "big", 10, &OpenFilter, true, None, None);
         // Must not panic; footer must be present regardless of truncation.
         assert!(result.contains("nodes"), "footer must always be present");
     }
@@ -3834,7 +3952,7 @@ mod snippet_tests {
         let store = make_store_with_root(&dir, &[node]);
 
         // Separate snippet_budget of 512; main budget governs node selection only.
-        let result = get_context_body(&store, "sep", 4096, &OpenFilter, true, Some(512));
+        let result = get_context_body(&store, "sep", 4096, &OpenFilter, true, Some(512), None);
         assert!(
             result.contains("separate"),
             "footer must label separate-budget mode"
@@ -3852,7 +3970,7 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("x.ts", "fn:x", 1, 2);
         store.put_node(&node).unwrap();
 
-        let result = get_context_body(&store, "x", 4096, &OpenFilter, true, None);
+        let result = get_context_body(&store, "x", 4096, &OpenFilter, true, None, None);
         // Either "not found" (no FTS match on empty index) or the init hint — never a panic.
         let has_meta_hint =
             result.contains("travsr init") || result.is_empty() || result.contains("No symbols");
@@ -3889,7 +4007,7 @@ mod snippet_tests {
             .unwrap();
         store.put_node(&node).unwrap();
 
-        let result = get_context_body(&store, "secret", 4096, &DenyAll, true, None);
+        let result = get_context_body(&store, "secret", 4096, &DenyAll, true, None, None);
         // RBAC filter rejects all nodes → "not found" (SEC P0) with no snippet leak.
         assert!(
             !result.contains("return 99"),
@@ -3926,7 +4044,7 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("seed.ts", "fn:seed_target", 1, 3);
         let store = make_store_with_edges(&[node], &[]);
 
-        let result = get_context_body(&store, "seed_target", 4096, &OpenFilter, false, None);
+        let result = get_context_body(&store, "seed_target", 4096, &OpenFilter, false, None, None);
         assert!(
             result.contains("[via: seed]"),
             "direct match must be labelled [via: seed]: {result}"
@@ -3976,7 +4094,7 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        let result = get_context_body(&store, "seed_fn", 4096, &OpenFilter, false, None);
+        let result = get_context_body(&store, "seed_fn", 4096, &OpenFilter, false, None, None);
         assert!(
             result.contains("[via: seed]"),
             "seed node must be labelled [via: seed]: {result}"
@@ -4003,7 +4121,7 @@ mod snippet_tests {
             .put_edge(&travsr_core::Edge::new(seed_id, dep_id, EdgeKind::Depends))
             .unwrap();
 
-        let result = get_context_body(&store, "seed_fn2", 4096, &OpenFilter, false, None);
+        let result = get_context_body(&store, "seed_fn2", 4096, &OpenFilter, false, None, None);
         assert!(
             result.contains("[via: seed]"),
             "seed node must be labelled [via: seed]: {result}"
@@ -4028,7 +4146,7 @@ mod snippet_tests {
         // Search for "seed_only" — ctx_node should appear as [via: context] if PPR
         // surfaces it, or just not appear. Either way, if it does appear it must NOT
         // carry seed/caller/dependency labels.
-        let result = get_context_body(&store, "seed_only", 4096, &OpenFilter, false, None);
+        let result = get_context_body(&store, "seed_only", 4096, &OpenFilter, false, None, None);
         assert!(
             !result.contains("unrelated_fn") || result.contains("[via: context]"),
             "unrelated node must be [via: context] if it appears at all: {result}"

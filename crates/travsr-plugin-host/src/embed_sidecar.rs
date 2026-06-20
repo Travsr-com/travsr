@@ -90,7 +90,12 @@ impl EmbedSidecar {
     /// `binary` — absolute path to `travsr-embed-<backend>`.
     /// `db_path` — absolute path to the repo's `graph.db` file.
     pub fn spawn(binary: &Path, db_path: &Path) -> Result<Self, EmbedError> {
+        // Pass --db-path so the sidecar loads the per-repo HNSW index
+        // (node IDs are SQLite rowids scoped to one db; a global index causes
+        //  cross-repo collisions and wrong KNN results).
         let mut child = Command::new(binary)
+            .arg("--db-path")
+            .arg(db_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

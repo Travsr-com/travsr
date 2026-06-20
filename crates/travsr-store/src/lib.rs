@@ -502,6 +502,18 @@ impl SqliteStore {
         self.embed_knn_hook = Some(hook);
     }
 
+    /// Return a callable wrapper around the embed KNN hook, or `None` when no
+    /// hook has been injected (embed plugin not installed or index not built).
+    ///
+    /// The closure owns an `Arc` clone so it can outlive the `SqliteStore`
+    /// borrow. Errors from the underlying hook are swallowed into an empty vec.
+    pub fn embed_knn_fn(&self) -> Option<impl Fn(&str, u32) -> Vec<NodeId>> {
+        let hook = self.embed_knn_hook.clone()?;
+        Some(move |query: &str, k: u32| -> Vec<NodeId> {
+            hook(query, k).unwrap_or_default()
+        })
+    }
+
     /// Create the `meta` table if it does not already exist.
     /// Must run before the migration runner, which uses meta to read the version.
     fn bootstrap_meta(conn: &Connection) -> AnyResult<()> {
