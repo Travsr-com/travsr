@@ -239,7 +239,9 @@ async fn main() {
 
     let is_daemon_fg = matches!(
         &cli.command,
-        Command::Daemon { action: DaemonAction::Start { foreground: true } }
+        Command::Daemon {
+            action: DaemonAction::Start { foreground: true }
+        }
     );
     if !is_daemon_fg {
         init_tracing();

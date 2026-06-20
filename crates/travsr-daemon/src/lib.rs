@@ -1900,7 +1900,8 @@ impl Daemon {
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
             )
-            .init();
+            .try_init()
+            .ok();
 
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");
