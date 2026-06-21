@@ -1,16 +1,19 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use travsr_core::{EdgeKind, Node as CoreNode, NodeId};
+use travsr_core::{Node as CoreNode, NodeId};
 use travsr_retrieval::{
-    bm25_rank_symbols, context_candidates, knapsack, token_cost, EdgeFilter, OpenFilter,
-    MAX_CONTEXT_BUDGET, TOKEN_CHARS_PER_TOKEN,
+    context_candidates, knapsack, token_cost, EdgeFilter, OpenFilter, MAX_CONTEXT_BUDGET,
+    TOKEN_CHARS_PER_TOKEN,
 };
 use travsr_store::{SqliteStore, Store};
 
 use crate::sanitize::{
     sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, wrap_envelope,
 };
+
+/// Short alias for the embed KNN closure used throughout `get_context` variants.
+type EmbedKnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
 
 /// Return the import targets (Depends edges) of the given file path.
 /// Empty string when nothing is found — callers must NOT return an RPC error
@@ -1402,7 +1405,7 @@ pub fn get_context_embed(
     token_budget: usize,
     include_snippets: bool,
     snippet_budget: Option<usize>,
-    embed_knn: &dyn Fn(&str, u32) -> Vec<NodeId>,
+    embed_knn: EmbedKnnFn<'_>,
 ) -> String {
     let body = get_context_body(
         store,
@@ -1460,65 +1463,81 @@ impl NodeRole {
     }
 }
 
-/// Derive PPR seeds using embedding KNN on file nodes, then BM25-rank the
-/// contained symbols against the query.
+/// Minimum number of PPR seeds from KNN — always try to include this many.
+const MIN_EMBED_SEEDS: usize = 5;
+/// Maximum number of PPR seeds from KNN — never include more than this.
+const MAX_EMBED_SEEDS: usize = 20;
+/// Cosine-similarity threshold: nodes scoring at or above this are included
+/// even when `seeds.len() >= MIN_EMBED_SEEDS`, up to `MAX_EMBED_SEEDS`.
+const EMBED_SCORE_THRESHOLD: f32 = 0.75;
+/// Maximum seeds per unique file path — prevents all seeds clustering in one file.
+const MAX_SEEDS_PER_PATH: usize = 2;
+
+/// Derive PPR seeds from symbol-level KNN results with score-based selection.
 ///
-/// Returns empty when KNN returns no file matches (embed index not yet built or
-/// no semantically similar files exist), so the caller can fall back to
-/// `search_nodes_fuzzy`.
+/// Strategy:
+/// - Always include the top `MIN_EMBED_SEEDS` results (regardless of score).
+/// - Extend with any additional results whose cosine similarity >= `EMBED_SCORE_THRESHOLD`.
+/// - Cap at `MAX_EMBED_SEEDS`.
+/// - Deduplicate by file path: at most `MAX_SEEDS_PER_PATH` symbols from any one file,
+///   preventing all seeds from clustering inside a single large file.
+///
+/// Returns empty when KNN returns nothing (index not yet built), so the caller
+/// can fall back to `search_nodes_fuzzy`.
 fn embed_path_seeds(
     store: &SqliteStore,
     query: &str,
-    knn_fn: &dyn Fn(&str, u32) -> Vec<NodeId>,
+    knn_fn: EmbedKnnFn<'_>,
     filter: &dyn EdgeFilter,
 ) -> Vec<NodeId> {
-    // Stage 1: KNN over file embeddings — top 10 semantically matched files.
-    let file_ids = knn_fn(query, 10);
-    if file_ids.is_empty() {
+    // Over-request to give path-dedup room to still find MIN seeds after filtering.
+    let knn_pairs = knn_fn(query, (MAX_EMBED_SEEDS as u32).saturating_mul(4));
+    if knn_pairs.is_empty() {
         return vec![];
     }
 
-    // Stage 2: collect all symbols in those files via DefinesBinding edges.
-    let mut sym_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-    for &fid in &file_ids {
-        if let Ok(edges) = store.iter_edges_from_kind(fid, EdgeKind::DefinesBinding) {
-            for e in edges {
-                sym_ids.insert(e.dst);
-            }
-        }
-    }
-    if sym_ids.is_empty() {
-        return vec![];
-    }
-
-    let sym_nodes = match store.get_nodes(&sym_ids.into_iter().collect::<Vec<_>>()) {
+    // Fetch node metadata for filter + path dedup.
+    let all_ids: Vec<NodeId> = knn_pairs.iter().map(|&(id, _)| id).collect();
+    let nodes = match store.get_nodes(&all_ids) {
         Ok(ns) => ns,
         Err(e) => {
             tracing::warn!("embed_path_seeds get_nodes error: {e}");
             return vec![];
         }
     };
+    let node_map: std::collections::HashMap<NodeId, CoreNode> =
+        nodes.into_iter().map(|n| (n.id, n)).collect();
 
-    let corpus_map: std::collections::HashMap<NodeId, String> =
-        sym_nodes.iter().map(|n| (n.id, n.vname.corpus.clone())).collect();
+    let mut path_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut seeds: Vec<NodeId> = Vec::with_capacity(MAX_EMBED_SEEDS);
 
-    // Stage 3: BM25 rank the symbol pool against the query.
-    let bm25_texts: Vec<(NodeId, String)> = sym_nodes
-        .iter()
-        .filter(|n| n.kind != "file" && n.kind != "file-module")
-        .map(|n| (n.id, format!("{}: {}", n.kind, n.vname.signature)))
-        .collect();
-    let bm25_refs: Vec<(NodeId, &str)> =
-        bm25_texts.iter().map(|(id, t)| (*id, t.as_str())).collect();
+    for &(id, score) in &knn_pairs {
+        if seeds.len() >= MAX_EMBED_SEEDS {
+            break;
+        }
+        // Include if: we still owe MIN seeds, OR this node scores above threshold.
+        if seeds.len() >= MIN_EMBED_SEEDS && score < EMBED_SCORE_THRESHOLD {
+            continue;
+        }
+        let node = match node_map.get(&id) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !filter.allow(id, id, Some(node.vname.corpus.as_str())) {
+            continue;
+        }
+        let path_count = path_counts
+            .entry(node.vname.path.clone())
+            .or_insert(0);
+        if *path_count >= MAX_SEEDS_PER_PATH {
+            continue;
+        }
+        *path_count += 1;
+        seeds.push(id);
+    }
 
-    bm25_rank_symbols(&bm25_refs, query, 20)
-        .into_iter()
-        .filter(|&id| {
-            let corpus = corpus_map.get(&id).map(String::as_str);
-            filter.allow(id, id, corpus)
-        })
-        .take(5)
-        .collect()
+    seeds
 }
 
 fn get_context_body(
@@ -1528,7 +1547,7 @@ fn get_context_body(
     filter: &dyn EdgeFilter,
     include_snippets: bool,
     snippet_budget: Option<usize>,
-    embed_knn: Option<&dyn Fn(&str, u32) -> Vec<NodeId>>,
+    embed_knn: Option<EmbedKnnFn<'_>>,
 ) -> String {
     // SEC-002: validate before any store access.
     if let Err(reason) = validate_mcp_arg(query) {

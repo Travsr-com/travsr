@@ -27,7 +27,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
-pub type EmbedKnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<NodeId>, StoreError> + Send + Sync>;
+/// Returns `(NodeId, cosine_similarity_score)` pairs in descending score order.
+pub type EmbedKnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -507,9 +508,9 @@ impl SqliteStore {
     ///
     /// The closure owns an `Arc` clone so it can outlive the `SqliteStore`
     /// borrow. Errors from the underlying hook are swallowed into an empty vec.
-    pub fn embed_knn_fn(&self) -> Option<impl Fn(&str, u32) -> Vec<NodeId>> {
+    pub fn embed_knn_fn(&self) -> Option<impl Fn(&str, u32) -> Vec<(NodeId, f32)>> {
         let hook = self.embed_knn_hook.clone()?;
-        Some(move |query: &str, k: u32| -> Vec<NodeId> {
+        Some(move |query: &str, k: u32| -> Vec<(NodeId, f32)> {
             hook(query, k).unwrap_or_default()
         })
     }
@@ -2314,9 +2315,10 @@ impl SqliteStore {
         // empty. The hook is injected by the daemon's EmbedSupervisor at store-open
         // time; it is None by default (zero cost — no embed plugin installed).
         if let Some(knn_fn) = self.embed_knn_hook.as_ref() {
-            let ids = knn_fn(query, 20)?;
-            if !ids.is_empty() {
-                tracing::debug!(layer = "embed_ann", nodes_returned = ids.len());
+            let pairs = knn_fn(query, 20)?;
+            if !pairs.is_empty() {
+                tracing::debug!(layer = "embed_ann", nodes_returned = pairs.len());
+                let ids: Vec<NodeId> = pairs.into_iter().map(|(id, _score)| id).collect();
                 return self.get_nodes(&ids);
             }
         }

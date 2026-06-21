@@ -59,11 +59,12 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
 
     crate::progress::print_summary(&stats, elapsed, quiet);
 
-    // Fire-and-forget: spawn the active embed sidecar in --reindex mode so
-    // new/changed nodes get embeddings without blocking the terminal.
+    // Fire-and-forget: spawn Phase 1 embed sidecar (high-centrality symbols).
+    // Always run regardless of TTY — the daemon spawns Phase 2, the CLI handles
+    // Phase 1, and both need to fire after init whether run interactively or not.
     // Silently skipped if no backend is installed (`travsr embed init` not run).
-    if std::io::stdout().is_terminal() && crate::embed::spawn_background_reindex(&db_path) && !quiet
-    {
+    let embed_launched = crate::embed::spawn_background_reindex(&db_path);
+    if embed_launched && !quiet && std::io::stdout().is_terminal() {
         println!("hint: embed sidecar launched — run `travsr embed status` to confirm progress");
     }
 

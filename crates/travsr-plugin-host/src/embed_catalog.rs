@@ -77,6 +77,43 @@ pub fn lookup(id: &str) -> Option<&'static EmbedBackend> {
     BACKENDS.iter().find(|b| b.id == id)
 }
 
+/// Spawn `travsr-embed-<backend> --reindex <db_path> --phase2 <threshold>` as a
+/// fully detached background process.  Returns `true` if a process was launched.
+///
+/// Phase 2 covers symbol nodes with `shell_number < threshold` — the low-centrality
+/// symbols deferred from the fast Phase 1 pass.  The sidecar skips inline HNSW
+/// updates and rebuilds the full index at the end, so both Phase 1 and Phase 2
+/// nodes end up in the final HNSW without a file-write race.
+///
+/// Silently returns `false` when no backend is configured or the binary is missing
+/// (`travsr embed init` not yet run) — callers should treat this as a no-op.
+pub fn spawn_background_reindex_phase2(db_path: &std::path::Path, threshold: u32) -> bool {
+    (|| -> Option<bool> {
+        let backend_id = active_backend_id()?;
+        let backend = lookup(&backend_id)?;
+        let home = dirs::home_dir()?;
+        let bin_path = home
+            .join(".travsr")
+            .join("bin")
+            .join(backend.binary_name);
+        if !bin_path.exists() {
+            return Some(false);
+        }
+        std::process::Command::new(&bin_path)
+            .arg("--reindex")
+            .arg(db_path)
+            .arg("--phase2")
+            .arg(threshold.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(true)
+    })()
+    .unwrap_or(false)
+}
+
 /// Read the active backend id from `~/.travsr/embed.toml`.
 /// Returns `None` when the file is absent, unreadable, or has no `active` key.
 /// Used by the daemon to select the correct sidecar without depending on travsr-cli.

@@ -42,6 +42,10 @@ pub enum EmbedCommand {
         /// nearest git root).
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Only embed symbol nodes with shell_number >= N (Phase 1 high-centrality pass).
+        /// Omit to embed all pending nodes.
+        #[arg(long)]
+        phase1: Option<u32>,
     },
     /// Show the currently active embedding model and binary status.
     Status,
@@ -56,7 +60,7 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
     match cmd {
         EmbedCommand::List { json } => cmd_list(json),
         EmbedCommand::Init { backend, reinstall } => cmd_init(backend.as_deref(), reinstall),
-        EmbedCommand::Reindex { db } => cmd_reindex(db),
+        EmbedCommand::Reindex { db, phase1 } => cmd_reindex(db, phase1),
         EmbedCommand::Status => cmd_status(),
         EmbedCommand::Switch { backend } => cmd_switch(&backend),
     }
@@ -308,7 +312,7 @@ async fn download_model_file(
 
 // ── reindex ───────────────────────────────────────────────────────────────────
 
-fn cmd_reindex(db_override: Option<PathBuf>) -> Result<()> {
+fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> {
     let db_path = match db_override {
         Some(p) => p,
         None => {
@@ -346,9 +350,12 @@ fn cmd_reindex(db_override: Option<PathBuf>) -> Result<()> {
         backend_id,
     );
 
-    let status = std::process::Command::new(&bin_path)
-        .arg("--reindex")
-        .arg(&db_path)
+    let mut cmd = std::process::Command::new(&bin_path);
+    cmd.arg("--reindex").arg(&db_path);
+    if let Some(t) = phase1 {
+        cmd.arg("--phase1").arg(t.to_string());
+    }
+    let status = cmd
         .status()
         .with_context(|| format!("spawning {}", bin_path.display()))?;
     if !status.success() {
@@ -464,14 +471,18 @@ fn try_spawn_background_reindex(db_path: &std::path::Path) -> Result<bool> {
     if !bin_path.exists() {
         return Ok(false);
     }
+    // Phase 1: embed only high-centrality symbols (shell_number >= 3, ~26s).
+    // Phase 2 (shell < 3) is triggered separately by the daemon after k-core.
     std::process::Command::new(&bin_path)
         .arg("--reindex")
         .arg(db_path)
+        .arg("--phase1")
+        .arg("3")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .context("spawning embed sidecar --reindex")?;
+        .context("spawning embed sidecar --reindex --phase1")?;
     Ok(true)
 }
 

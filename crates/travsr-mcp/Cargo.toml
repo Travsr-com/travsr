@@ -13,6 +13,8 @@ travsr-core = { path = "../travsr-core" }
 travsr-analysis = { workspace = true }
 travsr-retrieval = { path = "../travsr-retrieval" }
 travsr-store = { path = "../travsr-store" }
+travsr-plugin-host = { path = "../travsr-plugin-host" }
+dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

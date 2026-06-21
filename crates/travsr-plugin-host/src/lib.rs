@@ -21,8 +21,8 @@ pub mod trust;
 
 pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
-    active_backend_id, lookup as lookup_embed_backend, EmbedBackend, EmbedModelFile,
-    BACKENDS as EMBED_BACKENDS,
+    active_backend_id, lookup as lookup_embed_backend, spawn_background_reindex_phase2,
+    EmbedBackend, EmbedModelFile, BACKENDS as EMBED_BACKENDS,
 };
 pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
 pub use embed_supervisor::EmbedSupervisor;

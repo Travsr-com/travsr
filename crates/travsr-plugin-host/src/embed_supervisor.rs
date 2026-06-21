@@ -13,7 +13,7 @@ use travsr_error::StoreError;
 use crate::embed_sidecar::{EmbedCapabilities, EmbedSidecar};
 
 /// Callback type for Step 4 — matches `travsr_store::EmbedKnnHook`.
-type KnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<NodeId>, StoreError> + Send + Sync>;
+type KnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
 /// Manages the embed plugin subprocess for one daemon session.
 ///
@@ -104,20 +104,14 @@ impl EmbedSupervisor {
                 return Ok(vec![]);
             }
             match sidecar.knn(query, k, &model_id) {
-                Ok(ids) => {
-                    let nodes: Vec<NodeId> = ids
+                Ok(pairs) => {
+                    // Kythe VName hashes are signed i64 and can be negative; usearch
+                    // stores them as u64 via bit-reinterpretation and returns the same
+                    // bit pattern. Both NodeId(positive_as_u64) and NodeId(neg_as_u64)
+                    // are valid — SQLite stores the original i64 and the cast roundtrips.
+                    let nodes: Vec<(NodeId, f32)> = pairs
                         .into_iter()
-                        .filter_map(|id| {
-                            if id < 0 {
-                                tracing::warn!(
-                                    id,
-                                    "embed sidecar returned negative node_id — skipping"
-                                );
-                                None
-                            } else {
-                                Some(NodeId(id as u64))
-                            }
-                        })
+                        .map(|(id, score)| (NodeId(id as u64), score))
                         .collect();
                     Ok(nodes)
                 }
@@ -135,3 +129,4 @@ impl EmbedSupervisor {
         self.model_id.as_deref()
     }
 }
+

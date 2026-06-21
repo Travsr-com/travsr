@@ -211,8 +211,9 @@ impl EmbedSidecar {
     }
 
     /// Send a KNN query. The sidecar opens `self.db_path` with its own DB
-    /// connection (with sqlite-vec or brute-force) and returns ranked node ids.
-    pub fn knn(&self, query_text: &str, k: u32, model_id: &str) -> Result<Vec<i64>, EmbedError> {
+    /// connection (with sqlite-vec or brute-force) and returns ranked
+    /// `(node_id, cosine_similarity_score)` pairs in descending score order.
+    pub fn knn(&self, query_text: &str, k: u32, model_id: &str) -> Result<Vec<(i64, f32)>, EmbedError> {
         let req = EmbedPluginRequest::Knn(KnnRequest {
             db_path: self.db_path.clone(),
             query_text: query_text.to_string(),
@@ -229,7 +230,9 @@ impl EmbedSidecar {
         })?;
 
         match decode_message::<EmbedPluginResponse>(reader) {
-            Ok(EmbedPluginResponse::Knn(resp)) => Ok(resp.node_ids),
+            Ok(EmbedPluginResponse::Knn(resp)) => {
+                Ok(resp.node_ids.into_iter().zip(resp.scores).collect())
+            }
             Ok(EmbedPluginResponse::Error(e)) => Err(EmbedError::Io(format!(
                 "plugin returned error: {}",
                 e.message

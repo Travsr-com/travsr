@@ -909,6 +909,12 @@ pub fn init_repo_with_progress(
         Err(e) => tracing::warn!("kcore: computation failed after init: {e}"),
     }
 
+    // Trigger Phase 2 embed (shell_number < 3) as a background job.
+    // Phase 1 (shell >= 3) is spawned by the CLI after init returns.
+    // Phase 2 skips inline HNSW updates and rebuilds the full index at the end,
+    // so it is safe to run concurrently with Phase 1's HNSW writes.
+    travsr_plugin_host::spawn_background_reindex_phase2(&db_path, 3);
+
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
         files_indexed: batch_counts.files_written,
