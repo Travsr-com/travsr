@@ -1881,7 +1881,7 @@ impl Daemon {
 
     /// Run the daemon event loop. Acquires an exclusive lockfile, starts the
     /// file watcher, control socket, and GC ticker. Blocks until SIGTERM/SIGINT.
-    pub async fn run(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
+    pub async fn run(repo_root: std::path::PathBuf, foreground: bool) -> anyhow::Result<()> {
         use fs2::FileExt as _;
         use std::sync::{Arc, Mutex};
         #[cfg(unix)]
@@ -1891,6 +1891,32 @@ impl Daemon {
 
         let travsr_dir = repo_root.join(".travsr");
         std::fs::create_dir_all(&travsr_dir).context("creating .travsr")?;
+
+        let file_appender = tracing_appender::rolling::daily(&travsr_dir, "daemon.log");
+        // Must be held for the daemon's lifetime — dropping flushes and closes daemon.log.
+        let (non_blocking, _appender_guard) = tracing_appender::non_blocking(file_appender);
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false);
+        let init_result = if foreground {
+            tracing_subscriber::registry()
+                .with(file_layer)
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(env_filter)
+                .try_init()
+        } else {
+            tracing_subscriber::registry()
+                .with(file_layer)
+                .with(env_filter)
+                .try_init()
+        };
+        if let Err(e) = init_result {
+            eprintln!("travsr daemon: could not init file logger: {e}");
+        }
 
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");

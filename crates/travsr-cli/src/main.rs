@@ -237,7 +237,10 @@ async fn main() {
     let matches = Cli::command().before_help(logo::banner()).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    init_tracing();
+    let is_daemon = matches!(&cli.command, Command::Daemon { .. });
+    if !is_daemon {
+        init_tracing();
+    }
 
     let result = run(cli).await;
 
@@ -353,7 +356,7 @@ async fn run(cli: Cli) -> Result<()> {
             match action {
                 DaemonAction::Start { foreground } => {
                     if foreground {
-                        travsr_daemon::Daemon::run(repo_root).await?;
+                        travsr_daemon::Daemon::run(repo_root, foreground).await?;
                     } else {
                         // Guard: if a daemon is already responding on the transport,
                         // don't spawn another one. Each `daemon start` call was
