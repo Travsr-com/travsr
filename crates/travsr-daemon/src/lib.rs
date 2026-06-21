@@ -333,8 +333,39 @@ fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Top-level directory names that are well-known source roots, never dep/vendor dirs.
+/// Auto-exclusion never fires for these regardless of file count.
+const KNOWN_SOURCE_DIRS: &[&str] = &[
+    "src",
+    "lib",
+    "pkg",
+    "internal",
+    "cmd",
+    "api",
+    "test",
+    "tests",
+    "app",
+    "apps",
+    "plugins",
+    "modules",
+    "services",
+    "components",
+    "core",
+    "common",
+    "shared",
+    "utils",
+    "crates",
+    "staging",
+    "hack",
+    "cluster",
+    "docs",
+    "examples",
+    "samples",
+];
+
 /// Heuristic: a single directory holding ≥ 1 000 source-language files AND
-/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir".
+/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir",
+/// unless the directory name is in `KNOWN_SOURCE_DIRS`.
 ///
 /// Returns `(dir_name, file_count, total_count)` for the first such directory
 /// that is not already excluded by the walker (SKIP_DIRS or .travsrignore).
@@ -358,6 +389,9 @@ fn detect_large_dep_dir(indexable: &[PathBuf], repo_root: &Path) -> Option<(Stri
     }
 
     for (dir, count) in top_counts {
+        if KNOWN_SOURCE_DIRS.contains(&dir.as_str()) {
+            continue;
+        }
         let pct = count * 100 / total;
         if count >= 1_000 && pct >= 15 {
             return Some((dir, count, total));
