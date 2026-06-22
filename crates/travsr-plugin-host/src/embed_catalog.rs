@@ -77,6 +77,47 @@ pub fn lookup(id: &str) -> Option<&'static EmbedBackend> {
     BACKENDS.iter().find(|b| b.id == id)
 }
 
+/// Spawn `travsr-embed-<backend> --reindex <db_path> --phase1 <threshold>` as a
+/// fully detached background process.  Returns `true` if a process was launched.
+///
+/// Phase 1 covers symbol nodes with `shell_number >= threshold` — the
+/// high-centrality core.  The sidecar rebuilds the HNSW index at the end so
+/// KNN queries become available as soon as this pass finishes.
+///
+/// Silently returns `false` when no backend is configured or the binary is
+/// missing (`travsr embed init` not yet run).
+pub fn spawn_background_reindex_phase1(db_path: &std::path::Path, threshold: u32) -> bool {
+    (|| -> Option<bool> {
+        let backend_id = active_backend_id()?;
+        let backend = lookup(&backend_id)?;
+        let home = dirs::home_dir()?;
+        let bin_path = home
+            .join(".travsr")
+            .join("bin")
+            .join(backend.binary_name);
+        if !bin_path.exists() {
+            return Some(false);
+        }
+        // RFC-019: pass embed.db path explicitly so the sidecar writes embeddings
+        // there instead of into graph.db, eliminating WAL write contention.
+        let embed_db_path = db_path.with_file_name("embed.db");
+        std::process::Command::new(&bin_path)
+            .arg("--reindex")
+            .arg(db_path)
+            .arg("--embed-db")
+            .arg(&embed_db_path)
+            .arg("--phase1")
+            .arg(threshold.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(true)
+    })()
+    .unwrap_or(false)
+}
+
 /// Spawn `travsr-embed-<backend> --reindex <db_path> --phase2 <threshold>` as a
 /// fully detached background process.  Returns `true` if a process was launched.
 ///
@@ -99,11 +140,56 @@ pub fn spawn_background_reindex_phase2(db_path: &std::path::Path, threshold: u32
         if !bin_path.exists() {
             return Some(false);
         }
+        let embed_db_path = db_path.with_file_name("embed.db");
         std::process::Command::new(&bin_path)
             .arg("--reindex")
             .arg(db_path)
+            .arg("--embed-db")
+            .arg(&embed_db_path)
             .arg("--phase2")
             .arg(threshold.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(true)
+    })()
+    .unwrap_or(false)
+}
+
+/// Spawn `travsr-embed-<backend> --reindex <db_path>` as a fully detached
+/// background process.  Embeds ALL symbol nodes that do not yet have an
+/// embedding row, regardless of `shell_number`.  Returns `true` if launched.
+///
+/// Used after Phase B completes to pick up newly-added SCIP semantic nodes
+/// that were absent when Phase 1/2 ran (those nodes have `shell_number = NULL`
+/// and are invisible to `spawn_background_reindex_phase2`'s threshold filter).
+///
+/// The sidecar is idempotent — nodes already embedded are skipped via the
+/// `NOT EXISTS` subquery in the reindex SQL — so calling this when no new
+/// nodes exist is a fast no-op.
+///
+/// Silently returns `false` when no backend is configured or the binary is
+/// missing (`travsr embed init` not yet run).
+pub fn spawn_background_reindex_all(db_path: &std::path::Path) -> bool {
+    (|| -> Option<bool> {
+        let backend_id = active_backend_id()?;
+        let backend = lookup(&backend_id)?;
+        let home = dirs::home_dir()?;
+        let bin_path = home
+            .join(".travsr")
+            .join("bin")
+            .join(backend.binary_name);
+        if !bin_path.exists() {
+            return Some(false);
+        }
+        let embed_db_path = db_path.with_file_name("embed.db");
+        std::process::Command::new(&bin_path)
+            .arg("--reindex")
+            .arg(db_path)
+            .arg("--embed-db")
+            .arg(&embed_db_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

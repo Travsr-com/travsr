@@ -209,6 +209,21 @@ impl Migration for V16NodeEmbeddings {
     }
 }
 
+/// RFC-019: move node_embeddings to embed.db; add CDC tombstone trigger.
+///
+/// graph.db drops node_embeddings (now owned by the embed sidecar in embed.db)
+/// and gains node_tombstones + capture_node_delete trigger so the sidecar can
+/// prune stale embeddings between reindex passes without a full-table scan.
+struct V17NodeTombstones;
+impl Migration for V17NodeTombstones {
+    fn version(&self) -> u32 {
+        17
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl(include_str!("migrations/v17_node_tombstones.sql"))
+    }
+}
+
 /// RFC-014 WS2: end_line column, symbol_aliases table, edge_sites table, G3 cleanup.
 struct V13PhaseBUnification;
 impl Migration for V13PhaseBUnification {
@@ -299,6 +314,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V14CoveringReverseIdx);
     r.register(V15KcoreShells);
     r.register(V16NodeEmbeddings);
+    r.register(V17NodeTombstones);
     r
 }
 
@@ -370,6 +386,10 @@ pub struct SqliteStore {
     /// running. The store crate has zero knowledge of the plugin system; only the
     /// daemon injects this via `set_embed_knn_hook`.
     embed_knn_hook: Option<EmbedKnnHook>,
+    /// RFC-019: sibling embed.db path (e.g. `.travsr/embed.db`). `None` for
+    /// in-memory stores. Used by `embed_progress` to ATTACH embed.db and count
+    /// embedded nodes without polluting the graph.db WAL with embedding BLOBs.
+    embed_db_path: Option<std::path::PathBuf>,
 }
 
 impl Drop for SqliteStore {
@@ -396,6 +416,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_db_path: Some(path.with_file_name("embed.db")),
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -452,6 +473,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_db_path: Some(path.with_file_name("embed.db")),
             };
             let current = store
                 .schema_version()
@@ -476,6 +498,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_db_path: None,
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -642,6 +665,102 @@ impl SqliteStore {
                 .query_row("SELECT count(*) FROM edges", [], |row| row.get(0))
                 .context("counting edges")?;
             Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Embedding coverage counts for a given model, split by k-core shell threshold.
+    ///
+    /// Returns `(total_symbols, embedded, phase1_total, phase1_done)` where
+    /// "embeddable" matches the sidecar's kind filter exactly:
+    ///   NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')
+    /// phase1 = embeddable nodes with `shell_number >= threshold` (high-centrality core).
+    /// Phase2 totals can be derived: `phase2_total = total_symbols - phase1_total`.
+    ///
+    /// RFC-019: embedded counts are read from embed.db (sibling of graph.db) via
+    /// ATTACH. Returns (total, 0, phase1_total, 0) when embed.db does not yet
+    /// exist (first run before any reindex completes).
+    pub fn embed_progress(
+        &self,
+        model_id: &str,
+        shell_threshold: u32,
+    ) -> Result<(u64, u64, u64, u64), StoreError> {
+        // Must match travsr-embed sidecar's kind exclusion list exactly.
+        const KIND_FILTER: &str =
+            "kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')";
+
+        (|| -> AnyResult<(u64, u64, u64, u64)> {
+            let total_symbols: i64 = self
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM nodes WHERE {KIND_FILTER}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .context("counting embeddable nodes")?;
+
+            let phase1_total: i64 = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM nodes WHERE {KIND_FILTER} AND shell_number >= ?1"
+                    ),
+                    rusqlite::params![shell_threshold],
+                    |r| r.get(0),
+                )
+                .context("counting phase1 embeddable")?;
+
+            // RFC-019: node_embeddings lives in embed.db. ATTACH it to count
+            // embedded nodes. Return zeros when embed.db does not exist yet
+            // (before first sidecar reindex pass).
+            let (embedded, phase1_done) = self
+                .embed_db_path
+                .as_deref()
+                .filter(|p| p.exists())
+                .map(|embed_path| -> AnyResult<(i64, i64)> {
+                    let embed_path_str = embed_path
+                        .to_str()
+                        .context("embed.db path is not valid UTF-8")?;
+                    self.conn
+                        .execute_batch(&format!(
+                            "ATTACH DATABASE '{embed_path_str}' AS edb"
+                        ))
+                        .context("attaching embed.db")?;
+                    let embedded: i64 = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
+                            rusqlite::params![model_id],
+                            |r| r.get(0),
+                        )
+                        .context("counting embedded nodes")?;
+                    let phase1_done: i64 = self
+                        .conn
+                        .query_row(
+                            &format!(
+                                "SELECT COUNT(*) FROM edb.node_embeddings ne \
+                                 JOIN nodes n ON ne.node_id = n.id \
+                                 WHERE ne.model_id = ?1 AND n.{KIND_FILTER} \
+                                 AND n.shell_number >= ?2"
+                            ),
+                            rusqlite::params![model_id, shell_threshold],
+                            |r| r.get(0),
+                        )
+                        .context("counting phase1 embedded")?;
+                    self.conn
+                        .execute_batch("DETACH DATABASE edb")
+                        .context("detaching embed.db")?;
+                    Ok((embedded, phase1_done))
+                })
+                .transpose()?
+                .unwrap_or((0, 0));
+
+            Ok((
+                total_symbols as u64,
+                embedded as u64,
+                phase1_total as u64,
+                phase1_done as u64,
+            ))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }

@@ -407,7 +407,23 @@ async fn run(cli: Cli) -> Result<()> {
                             let transport = if cfg!(windows) { "named_pipe" } else { "unix" };
                             println!("running [transport={transport}]");
                         }
-                        Err(_) => println!("not running"),
+                        Err(_) => {
+                            // Socket not ready yet — check lock file PID.
+                            // On a large repo the watcher initial scan can take
+                            // 10-30 s; the daemon is alive but hasn't bound its
+                            // socket yet.
+                            let lock_path = repo_root.join(".travsr/daemon.lock");
+                            let starting = std::fs::read_to_string(&lock_path)
+                                .ok()
+                                .and_then(|s| s.trim().parse::<u32>().ok())
+                                .map(|pid| pid_is_alive(pid))
+                                .unwrap_or(false);
+                            if starting {
+                                println!("starting (scanning file tree — socket not ready yet)");
+                            } else {
+                                println!("not running");
+                            }
+                        }
                     }
                 }
                 DaemonAction::Restart => {
@@ -509,6 +525,27 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Check whether a process with the given PID is currently alive.
+/// Uses `kill -0` on Unix (no signal sent, just existence check).
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // /proc/<pid> exists on Linux; on macOS use kill -0 via Command.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Connect to the daemon's control transport for `repo_root`.
 /// Moved to `daemon_client` (#318 O1) — kept as a local alias for callers here.
 fn send_daemon_command(
@@ -520,21 +557,26 @@ fn send_daemon_command(
 
 /// Retry pinging the daemon transport up to `attempts` times with `delay_ms` between tries.
 ///
-/// launchd `KeepAlive: true` restarts the daemon after `daemon stop`, so the
-/// transport may briefly be unavailable during restart. Without retries, a
-/// `daemon start` call immediately after `daemon stop` could incorrectly spawn
-/// a second daemon.
+/// Also checks the lock file PID so that a daemon that is alive but still
+/// doing its initial file-tree scan (socket not bound yet) is not mistaken
+/// for "not running" — which would cause a second daemon to be spawned and
+/// crash immediately with "another daemon already running".
 pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
-            // Blocking sleep is safe: no concurrent async tasks exist at daemon-start time.
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
         if send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status).is_ok() {
             return true;
         }
     }
-    false
+    // Socket not ready — fall back to lock-file PID check.
+    let lock_path = repo_root.join(".travsr/daemon.lock");
+    std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(pid_is_alive)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

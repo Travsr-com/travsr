@@ -366,20 +366,90 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
 
 // ── status ────────────────────────────────────────────────────────────────────
 
+struct EmbedStats {
+    total_symbols: u64,
+    embedded: u64,
+    phase1_total: u64,
+    phase1_done: u64,
+    phase2_total: u64,
+    phase2_done: u64,
+}
+
+fn query_embed_stats(db_path: &std::path::Path, model_id: &str) -> Result<EmbedStats> {
+    let store = travsr_store::SqliteStore::open_read_only(db_path)
+        .with_context(|| format!("opening {}", db_path.display()))?;
+    let (total_symbols, embedded, phase1_total, phase1_done) =
+        store.embed_progress(model_id, 3)?;
+    let phase2_total = total_symbols.saturating_sub(phase1_total);
+    let phase2_done = embedded.saturating_sub(phase1_done);
+    Ok(EmbedStats {
+        total_symbols,
+        embedded,
+        phase1_total,
+        phase1_done,
+        phase2_total,
+        phase2_done,
+    })
+}
+
+fn progress_bar(done: u64, total: u64, width: usize) -> String {
+    if total == 0 {
+        return format!("[{}]", " ".repeat(width));
+    }
+    let filled = ((done as f64 / total as f64) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    format!("[{}{}]", "=".repeat(filled), " ".repeat(empty))
+}
+
+fn fmt_eta(remaining: u64, nodes_per_sec: f64) -> String {
+    if nodes_per_sec < 1.0 || remaining == 0 {
+        return String::new();
+    }
+    let secs = (remaining as f64 / nodes_per_sec).round() as u64;
+    if secs < 60 {
+        format!("~{secs}s remaining")
+    } else if secs < 3600 {
+        format!("~{}m remaining", secs / 60)
+    } else {
+        format!("~{}h {}m remaining", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn fmt_count(n: u64) -> String {
+    // group digits with commas: 126820 → "126,820"
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn file_size_mb(path: &std::path::Path) -> Option<f64> {
+    std::fs::metadata(path).ok().map(|m| m.len() as f64 / 1_048_576.0)
+}
+
 fn cmd_status() -> Result<()> {
     let config = load_config();
     let active_id = config.as_ref().and_then(|c| c.active.as_deref());
     let bin_dir = embed_bin_dir()?;
 
-    match active_id {
+    // ── backend / install state ───────────────────────────────────────────────
+    let (backend_ok, backend) = match active_id {
         None => {
             println!("No embedding backend is active.");
             println!("Run `travsr embed init` to install one.");
+            return Ok(());
         }
         Some(id) => match lookup_embed_backend(id) {
             None => {
                 println!("Active backend '{id}' is not in the catalog (stale config?).");
                 println!("Run `travsr embed list` to see available backends.");
+                return Ok(());
             }
             Some(b) => {
                 let installed = bin_dir.join(b.binary_name).exists();
@@ -389,29 +459,147 @@ fn cmd_status() -> Result<()> {
                     .map(|d| b.model_files.iter().all(|f| d.join(f.name).exists()))
                     .unwrap_or(false);
 
-                println!("Active backend : {}", b.id);
+                let ok = installed && models_ok;
+                println!("Backend        : {}", b.id);
                 println!("Description    : {}", b.description);
-                println!("Dimension      : {}", b.dim);
                 println!(
-                    "Binary         : {} ({})",
-                    b.binary_name,
-                    if installed {
-                        "\u{2713} installed"
-                    } else {
-                        "\u{2717} missing — run `travsr embed init`"
-                    }
+                    "Binary         : {}",
+                    if installed { "\u{2713} installed" } else { "\u{2717} missing — run `travsr embed init`" }
                 );
                 println!(
                     "Model files    : {}",
-                    if models_ok {
-                        "\u{2713} present"
-                    } else {
-                        "\u{2717} missing — run `travsr embed init`"
-                    }
+                    if models_ok { "\u{2713} present" } else { "\u{2717} missing — run `travsr embed init`" }
                 );
+                (ok, b)
             }
         },
+    };
+
+    if !backend_ok {
+        println!("\nRun `travsr embed init` to complete installation.");
+        return Ok(());
     }
+
+    // ── repo progress ─────────────────────────────────────────────────────────
+    let db_path = {
+        let cwd = std::env::current_dir().context("getting cwd")?;
+        match crate::repo::find_git_root(&cwd) {
+            Ok(root) => root.join(".travsr/graph.db"),
+            Err(_) => {
+                println!("\n(not inside a travsr repo — run `travsr init` first to see progress)");
+                return Ok(());
+            }
+        }
+    };
+
+    if !db_path.exists() {
+        println!("\n(graph.db not found — run `travsr init` first)");
+        return Ok(());
+    }
+
+    println!();
+    println!("Repo           : {}", db_path.parent().unwrap_or(&db_path).display());
+
+    let stats = query_embed_stats(&db_path, backend.id)?;
+
+    if stats.total_symbols == 0 {
+        println!("No symbol nodes found — run `travsr init` to index the repo.");
+        return Ok(());
+    }
+
+    let pct = stats.embedded as f64 / stats.total_symbols as f64 * 100.0;
+    // Phase 1 throughput ~400 nodes/sec (k8s: 109k nodes / 4.5 min).
+    // Phase 2 is background and ~10× slower on a loaded machine.
+    let nodes_per_sec: f64 = if stats.phase1_done < stats.phase1_total {
+        400.0
+    } else {
+        40.0
+    };
+    let remaining = stats.total_symbols.saturating_sub(stats.embedded);
+    let eta = fmt_eta(remaining, nodes_per_sec);
+    let bar = progress_bar(stats.embedded, stats.total_symbols, 36);
+
+    println!(
+        "Total symbols  : {}",
+        fmt_count(stats.total_symbols)
+    );
+    println!(
+        "Embedded       : {}  ({:.0}%)",
+        fmt_count(stats.embedded),
+        pct
+    );
+    if eta.is_empty() {
+        println!("{bar}  done");
+    } else {
+        println!("{bar}  {eta}");
+    }
+
+    // ── per-phase breakdown ───────────────────────────────────────────────────
+    println!();
+    let p1_pct = if stats.phase1_total > 0 {
+        stats.phase1_done as f64 / stats.phase1_total as f64 * 100.0
+    } else {
+        100.0
+    };
+    let p1_bar = progress_bar(stats.phase1_done, stats.phase1_total, 24);
+    let p1_eta = fmt_eta(
+        stats.phase1_total.saturating_sub(stats.phase1_done),
+        400.0,
+    );
+    println!(
+        "Phase 1 (shell \u{2265}3) {} {}/{}  ({:.0}%)  {}",
+        p1_bar,
+        fmt_count(stats.phase1_done),
+        fmt_count(stats.phase1_total),
+        p1_pct,
+        if p1_eta.is_empty() { "\u{2713} complete".to_string() } else { p1_eta },
+    );
+
+    let p2_pct = if stats.phase2_total > 0 {
+        stats.phase2_done as f64 / stats.phase2_total as f64 * 100.0
+    } else {
+        100.0
+    };
+    let p2_bar = progress_bar(stats.phase2_done, stats.phase2_total, 24);
+    let p2_eta = fmt_eta(
+        stats.phase2_total.saturating_sub(stats.phase2_done),
+        40.0,
+    );
+    println!(
+        "Phase 2 (shell <3) {} {}/{}  ({:.0}%)  {}",
+        p2_bar,
+        fmt_count(stats.phase2_done),
+        fmt_count(stats.phase2_total),
+        p2_pct,
+        if p2_eta.is_empty() { "\u{2713} complete".to_string() } else { p2_eta },
+    );
+
+    // ── HNSW index ────────────────────────────────────────────────────────────
+    println!();
+    let hnsw_path = travsr_dir()?
+        .join("models")
+        .join(backend.id)
+        .join("hnsw.usearch");
+    if let Some(mb) = file_size_mb(&hnsw_path) {
+        println!(
+            "HNSW index     : {mb:.0} MB  ({} vectors)",
+            fmt_count(stats.embedded),
+        );
+    } else {
+        println!("HNSW index     : not built yet (completes after Phase 1 finishes)");
+    }
+
+    // ── actionable hints ──────────────────────────────────────────────────────
+    if stats.embedded == 0 && stats.total_symbols > 0 {
+        println!();
+        println!("hint: no nodes embedded yet — the daemon triggers embedding after Phase B.");
+        println!("      If the daemon is not running: travsr daemon start");
+    } else if remaining > 0 {
+        println!();
+        println!("hint: embedding is running in the background via the daemon.");
+        println!("      Watch live: travsr daemon logs --follow");
+    }
+
     Ok(())
 }
 
@@ -436,54 +624,6 @@ fn cmd_switch(backend_id: &str) -> Result<()> {
     println!("\u{2713} Switched active backend to '{}'.", backend_id);
     println!("  Restart the daemon to apply: travsr daemon restart");
     Ok(())
-}
-
-// ── background reindex (called from init) ────────────────────────────────────
-
-/// Spawn `travsr-embed-<backend> --reindex <db_path>` as a fully detached
-/// background process.  Returns `true` if a process was actually launched.
-/// Silently returns `false` when no backend is active or the binary is missing
-/// (e.g. user hasn't run `travsr embed init` yet).  Never panics.
-pub fn spawn_background_reindex(db_path: &std::path::Path) -> bool {
-    match try_spawn_background_reindex(db_path) {
-        Ok(spawned) => spawned,
-        Err(e) => {
-            tracing::debug!("background embed reindex skipped: {e:#}");
-            false
-        }
-    }
-}
-
-fn try_spawn_background_reindex(db_path: &std::path::Path) -> Result<bool> {
-    let config = match load_config() {
-        Some(c) => c,
-        None => return Ok(false),
-    };
-    let backend_id = match config.active.as_deref() {
-        Some(id) => id,
-        None => return Ok(false),
-    };
-    let backend = match lookup_embed_backend(backend_id) {
-        Some(b) => b,
-        None => return Ok(false),
-    };
-    let bin_path = embed_bin_dir()?.join(backend.binary_name);
-    if !bin_path.exists() {
-        return Ok(false);
-    }
-    // Phase 1: embed only high-centrality symbols (shell_number >= 3, ~26s).
-    // Phase 2 (shell < 3) is triggered separately by the daemon after k-core.
-    std::process::Command::new(&bin_path)
-        .arg("--reindex")
-        .arg(db_path)
-        .arg("--phase1")
-        .arg("3")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawning embed sidecar --reindex --phase1")?;
-    Ok(true)
 }
 
 // ── paths ─────────────────────────────────────────────────────────────────────

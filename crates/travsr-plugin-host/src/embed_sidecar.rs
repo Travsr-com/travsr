@@ -79,9 +79,10 @@ pub struct EmbedSidecar {
     io: Mutex<SidecarIo>,
     pub caps: EmbedCapabilities,
     alive: Mutex<bool>,
-    /// Absolute path to the graph.db file. Forwarded in KnnRequest so the
-    /// sidecar can open its own DB connection with sqlite-vec for ANN.
-    db_path: PathBuf,
+    /// RFC-019: absolute path to embed.db (sibling of graph.db). Forwarded in
+    /// KnnRequest so the sidecar opens embed.db with sqlite-vec for ANN — never
+    /// the shared graph.db WAL which would reintroduce write contention.
+    embed_db_path: PathBuf,
 }
 
 impl EmbedSidecar {
@@ -161,7 +162,9 @@ impl EmbedSidecar {
             io: Mutex::new((writer, reader)),
             caps,
             alive: Mutex::new(true),
-            db_path: db_path.to_path_buf(),
+            // RFC-019: KNN queries target embed.db, not graph.db, to avoid
+            // competing with the daemon's WAL write lock.
+            embed_db_path: db_path.with_file_name("embed.db"),
         })
     }
 
@@ -210,12 +213,12 @@ impl EmbedSidecar {
         }
     }
 
-    /// Send a KNN query. The sidecar opens `self.db_path` with its own DB
-    /// connection (with sqlite-vec or brute-force) and returns ranked
-    /// `(node_id, cosine_similarity_score)` pairs in descending score order.
+    /// Send a KNN query. The sidecar opens `self.embed_db_path` (embed.db) with
+    /// sqlite-vec and returns ranked `(node_id, cosine_similarity_score)` pairs
+    /// in descending score order.
     pub fn knn(&self, query_text: &str, k: u32, model_id: &str) -> Result<Vec<(i64, f32)>, EmbedError> {
         let req = EmbedPluginRequest::Knn(KnnRequest {
-            db_path: self.db_path.clone(),
+            db_path: self.embed_db_path.clone(),
             query_text: query_text.to_string(),
             model_id: model_id.to_string(),
             k,

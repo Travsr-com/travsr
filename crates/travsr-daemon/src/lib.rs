@@ -943,12 +943,6 @@ pub fn init_repo_with_progress(
         Err(e) => tracing::warn!("kcore: computation failed after init: {e}"),
     }
 
-    // Trigger Phase 2 embed (shell_number < 3) as a background job.
-    // Phase 1 (shell >= 3) is spawned by the CLI after init returns.
-    // Phase 2 skips inline HNSW updates and rebuilds the full index at the end,
-    // so it is safe to run concurrently with Phase 1's HNSW writes.
-    travsr_plugin_host::spawn_background_reindex_phase2(&db_path, 3);
-
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
         files_indexed: batch_counts.files_written,
@@ -1105,6 +1099,61 @@ fn collect_present_languages_and_paths(
 /// on every 5 s tick would push the 30 s deadline forward forever — Phase B
 /// would never fire. `arm_immediate` is a no-op when a commit-triggered
 /// debounce is already counting down.
+/// Spawn embed Phase 2 if Phase 1 is complete and Phase 2 still has pending nodes.
+///
+/// Called from the daemon's embed_tick (every 60 s). The `phase2_spawned` flag
+/// prevents re-spawning on every tick — it is reset to false whenever the daemon
+/// detects new Phase 1 work (e.g. after a re-init or new Phase B run).
+fn maybe_spawn_embed_phase2(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase2_spawned: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    if phase2_spawned.load(Ordering::Relaxed) {
+        return;
+    }
+    let db_path = repo_root.join(".travsr/graph.db");
+    if !db_path.exists() {
+        return;
+    }
+    let backend_id = match travsr_plugin_host::active_backend_id() {
+        Some(id) => id,
+        None => return,
+    };
+    let (total, _embedded, phase1_total, phase1_done) = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        match s.embed_progress(&backend_id, 3) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("embed_tick: embed_progress query failed: {e}");
+                return;
+            }
+        }
+    };
+    let phase2_total = total.saturating_sub(phase1_total);
+    let phase2_remaining = phase2_total.saturating_sub(_embedded.saturating_sub(phase1_done));
+    if phase1_done < phase1_total {
+        tracing::debug!(
+            phase1_done,
+            phase1_total,
+            "embed_tick: Phase 1 still running — deferring Phase 2"
+        );
+        return;
+    }
+    if phase2_remaining == 0 {
+        phase2_spawned.store(true, Ordering::Relaxed);
+        return;
+    }
+    tracing::info!(
+        phase2_remaining,
+        "embed_tick: Phase 1 complete — spawning Phase 2"
+    );
+    if travsr_plugin_host::spawn_background_reindex_phase2(&db_path, 3) {
+        phase2_spawned.store(true, Ordering::Relaxed);
+    }
+}
+
 fn arm_phase_b_if_pending(
     store: &std::sync::Mutex<SqliteStore>,
     sched: &phase_b_sched::PhaseBScheduler,
@@ -1199,6 +1248,54 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         crashed = report.crashed.len(),
         "background phase B refresh complete"
     );
+
+    // Re-run k-core while the lock is still held: Phase B edges change the
+    // graph structure so shell numbers computed at init time are stale.
+    // Phase B nodes themselves have shell_number = NULL (k-core ran before
+    // Phase B); recomputing assigns them real shell numbers so Phase 1/2
+    // threshold filters work correctly on the full node set.
+    if succeeded {
+        match compute_kcore(&s) {
+            Ok(shells) => {
+                let pairs: Vec<_> = shells.into_iter().collect();
+                if let Err(e) = s.write_shell_numbers(&pairs) {
+                    tracing::warn!("kcore: failed to update shell numbers after phase B: {e}");
+                } else {
+                    tracing::info!("kcore: shell numbers updated after phase B");
+                }
+            }
+            Err(e) => tracing::warn!("kcore: computation failed after phase B: {e}"),
+        }
+    }
+
+    // Stamp the Phase 1 start time before dropping the lock so `travsr embed
+    // status` can compute actual throughput (nodes/sec) instead of guessing.
+    if succeeded {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = s.set_meta("embed_p1_start", &now_secs.to_string());
+    }
+
+    // Release the store lock before spawning: the embed sidecars read graph.db
+    // for unembed nodes but write embeddings to embed.db — zero WAL contention
+    // with the daemon's graph.db write slot.
+    drop(s);
+
+    // Start Phase 1 embedding only after Phase B and k-core are both complete:
+    //   1. No concurrent writes between Phase B and embed (contention-free).
+    //   2. Phase B nodes have real shell_number values for Phase 1/2 filters.
+    //   3. Phase 1 finishes quickly and builds a usable HNSW index.
+    // Phase 2 is intentionally NOT spawned here — the embed_tick in the daemon
+    // event loop detects when Phase 1 is done and then spawns Phase 2, so the
+    // two phases never write to embed.db concurrently.
+    if succeeded {
+        let db_path = repo_root.join(".travsr/graph.db");
+        if travsr_plugin_host::spawn_background_reindex_phase1(&db_path, 3) {
+            tracing::info!("triggered post-phase-B embed Phase 1");
+        }
+    }
 
     succeeded
 }
@@ -2024,10 +2121,14 @@ impl Daemon {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
 
+        // watcher::spawn() blocks until the initial kqueue/inotify scan is fully
+        // established and .travsr/ is unwatched. Only then is it safe to create
+        // the socket — otherwise kqueue opens the socket file and gets ENOTSUP,
+        // crashing the entire watch setup.
         let _watcher_handle =
             watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
 
-        // Control socket — Unix domain socket at .travsr/daemon-<hex>.sock (Unix only).
+        // Control socket bound AFTER watcher scan completes (see above).
         #[cfg(unix)]
         let listener = UnixListener::bind(&sock_path).context("binding control socket")?;
         #[cfg(unix)]
@@ -2041,6 +2142,10 @@ impl Daemon {
         // window without busy-waiting. The tick is cheap (a single mutex peek);
         // it only spawns work when a re-run is actually due.
         let mut phase_b_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Polls every 60 s to spawn embed Phase 2 once Phase 1 is complete.
+        // Phase 2 must not overlap Phase 1 — both write node_embeddings in embed.db.
+        let mut embed_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let embed_phase2_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
         tracing::info!(repo = %repo_root.display(), "travsr daemon started");
@@ -2240,10 +2345,22 @@ impl Daemon {
                             let store_bg = Arc::clone(&store);
                             let repo_bg = Arc::clone(&repo_root_arc);
                             let sched_bg = Arc::clone(&phase_b_scheduler);
+                            let p2_flag = Arc::clone(&embed_phase2_spawned);
+                            // Reset the Phase 2 flag so the embed_tick re-evaluates
+                            // after the new Phase B + Phase 1 run completes.
+                            p2_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             tokio::task::spawn_blocking(move || {
                                 run_background_phase_b(repo_bg.as_path(), &store_bg, &sched_bg);
                             });
                         }
+                    }
+                    _ = embed_tick.tick() => {
+                        let store_bg = Arc::clone(&store);
+                        let repo_bg = Arc::clone(&repo_root_arc);
+                        let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        tokio::task::spawn_blocking(move || {
+                            maybe_spawn_embed_phase2(repo_bg.as_path(), &store_bg, &p2_flag);
+                        });
                     }
                     _ = &mut shutdown => {
                         tracing::info!("travsr daemon shutting down (SIGINT)");
@@ -2282,10 +2399,20 @@ impl Daemon {
                             let store_bg = Arc::clone(&store);
                             let repo_bg = Arc::clone(&repo_root_arc);
                             let sched_bg = Arc::clone(&phase_b_scheduler);
+                            let p2_flag = Arc::clone(&embed_phase2_spawned);
+                            p2_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             tokio::task::spawn_blocking(move || {
                                 run_background_phase_b(repo_bg.as_path(), &store_bg, &sched_bg);
                             });
                         }
+                    }
+                    _ = embed_tick.tick() => {
+                        let store_bg = Arc::clone(&store);
+                        let repo_bg = Arc::clone(&repo_root_arc);
+                        let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        tokio::task::spawn_blocking(move || {
+                            maybe_spawn_embed_phase2(repo_bg.as_path(), &store_bg, &p2_flag);
+                        });
                     }
                     _ = &mut shutdown => {
                         tracing::info!("travsr daemon shutting down");
