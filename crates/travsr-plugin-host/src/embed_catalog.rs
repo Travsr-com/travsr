@@ -200,6 +200,16 @@ fn available_memory_mb() -> u64 {
 
 // ── Per-repo threshold derivation ────────────────────────────────────────────
 
+/// Public re-export for `travsr embed reindex` so it can show the resolved worker count.
+pub fn derive_num_workers_for_cli() -> usize {
+    derive_num_workers()
+}
+
+/// Public re-export for `travsr embed status` so it shows the real threshold label.
+pub fn derive_phase1_threshold_for_status(db_path: &Path) -> Option<u32> {
+    derive_phase1_threshold(db_path, PHASE1_COVERAGE_FRACTION)
+}
+
 /// Derive per-repo Phase 1 shell_number threshold from the k-core distribution.
 ///
 /// Returns the minimum shell_number such that symbol nodes with
@@ -248,7 +258,7 @@ fn run_parallel_reindex(
     embed_db_path: &Path,
     _model_id: &str,
     phase: PhaseFilter,
-) {
+) -> anyhow::Result<()> {
     let n = derive_num_workers();
 
     let mut cmd = Command::new(bin_path);
@@ -258,7 +268,12 @@ fn run_parallel_reindex(
         .arg(embed_db_path)
         .arg("--parallel")
         .arg(n.to_string())
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        // Suppress sidecar tracing logs from the user terminal; they are
+        // internal diagnostics, not user-facing output. The sidecar's
+        // progress/completion messages go to stdout and are still shown.
+        // Failures are surfaced via the exit-code check below.
+        .stderr(Stdio::null());
 
     if let Some((flag, val)) = phase.sidecar_flag() {
         cmd.arg(flag).arg(val.to_string());
@@ -274,12 +289,15 @@ fn run_parallel_reindex(
     match cmd.status() {
         Ok(s) if s.success() => {
             tracing::info!(n, "embed: reindex completed");
+            Ok(())
         }
         Ok(s) => {
             tracing::warn!(exit = ?s.code(), "embed: sidecar exited with failure");
+            anyhow::bail!("embed sidecar exited with code {:?}", s.code())
         }
         Err(e) => {
             tracing::warn!(error = %e, "embed: failed to spawn sidecar");
+            Err(anyhow::Error::from(e).context("failed to spawn embed sidecar"))
         }
     }
 }
@@ -309,13 +327,15 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
     std::thread::Builder::new()
         .name("embed-reindex-phase1".into())
         .spawn(move || {
-            run_parallel_reindex(
+            if let Err(e) = run_parallel_reindex(
                 &bin_path,
                 &db_path,
                 &embed_db_path,
                 &model_id,
                 PhaseFilter::Phase1 { threshold },
-            );
+            ) {
+                tracing::warn!("embed Phase 1 failed: {e:#}");
+            }
         })
         .is_ok()
 }
@@ -345,7 +365,9 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
     std::thread::Builder::new()
         .name("embed-reindex-phase2".into())
         .spawn(move || {
-            run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase);
+            if let Err(e) = run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase) {
+                tracing::warn!("embed Phase 2 failed: {e:#}");
+            }
         })
         .is_ok()
 }
@@ -360,13 +382,15 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
     std::thread::Builder::new()
         .name("embed-reindex-all".into())
         .spawn(move || {
-            run_parallel_reindex(
+            if let Err(e) = run_parallel_reindex(
                 &bin_path,
                 &db_path,
                 &embed_db_path,
                 &model_id,
                 PhaseFilter::All,
-            );
+            ) {
+                tracing::warn!("embed reindex-all failed: {e:#}");
+            }
         })
         .is_ok()
 }
@@ -391,8 +415,7 @@ pub fn run_parallel_reindex_blocking(
         None => PhaseFilter::All,
     };
 
-    run_parallel_reindex(&bin_path, db_path, &embed_db_path, &model_id, phase);
-    Ok(())
+    run_parallel_reindex(&bin_path, db_path, &embed_db_path, &model_id, phase)
 }
 
 // ── Shared resolution helper ──────────────────────────────────────────────────

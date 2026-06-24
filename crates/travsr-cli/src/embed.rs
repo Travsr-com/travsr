@@ -328,19 +328,12 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
         }
     };
 
-    let workers = std::env::var("TRAVSR_EMBED_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0); // 0 = auto
-
+    let workers = travsr_plugin_host::derive_num_workers_for_cli();
     println!(
-        "Reindexing {} (parallel workers: {})...",
+        "Reindexing {} ({} parallel worker{})...",
         db_path.display(),
-        if workers == 0 {
-            "auto".to_string()
-        } else {
-            workers.to_string()
-        },
+        workers,
+        if workers == 1 { "" } else { "s" },
     );
 
     // RFC-020: delegate to the parallel orchestrator in travsr-plugin-host.
@@ -364,20 +357,33 @@ struct EmbedStats {
     phase2_done: u64,
 }
 
-fn query_embed_stats(db_path: &std::path::Path, model_id: &str) -> Result<EmbedStats> {
+struct EmbedStatsWithThreshold {
+    stats: EmbedStats,
+    threshold: u32,
+}
+
+fn query_embed_stats(db_path: &std::path::Path, model_id: &str) -> Result<EmbedStatsWithThreshold> {
+    // Derive the per-repo threshold the same way the reindex orchestrator does
+    // so the phase breakdown labels match what was actually embedded.
+    // Falls back to 3 when k-core data isn't available (pre-init or very small repos).
+    let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(db_path)
+        .unwrap_or(3);
     let store = travsr_store::SqliteStore::open_read_only(db_path)
         .with_context(|| format!("opening {}", db_path.display()))?;
     let (total_symbols, embedded, phase1_total, phase1_done) =
-        store.embed_progress(model_id, 3)?;
+        store.embed_progress(model_id, threshold)?;
     let phase2_total = total_symbols.saturating_sub(phase1_total);
     let phase2_done = embedded.saturating_sub(phase1_done);
-    Ok(EmbedStats {
-        total_symbols,
-        embedded,
-        phase1_total,
-        phase1_done,
-        phase2_total,
-        phase2_done,
+    Ok(EmbedStatsWithThreshold {
+        stats: EmbedStats {
+            total_symbols,
+            embedded,
+            phase1_total,
+            phase1_done,
+            phase2_total,
+            phase2_done,
+        },
+        threshold,
     })
 }
 
@@ -489,7 +495,7 @@ fn cmd_status() -> Result<()> {
     println!();
     println!("Repo           : {}", db_path.parent().unwrap_or(&db_path).display());
 
-    let stats = query_embed_stats(&db_path, backend.id)?;
+    let EmbedStatsWithThreshold { stats, threshold } = query_embed_stats(&db_path, backend.id)?;
 
     if stats.total_symbols == 0 {
         println!("No symbol nodes found — run `travsr init` to index the repo.");
@@ -536,7 +542,7 @@ fn cmd_status() -> Result<()> {
         400.0,
     );
     println!(
-        "Phase 1 (shell \u{2265}3) {} {}/{}  ({:.0}%)  {}",
+        "Phase 1 (shell \u{2265}{threshold}) {} {}/{}  ({:.0}%)  {}",
         p1_bar,
         fmt_count(stats.phase1_done),
         fmt_count(stats.phase1_total),
@@ -555,7 +561,7 @@ fn cmd_status() -> Result<()> {
         40.0,
     );
     println!(
-        "Phase 2 (shell <3) {} {}/{}  ({:.0}%)  {}",
+        "Phase 2 (shell <{threshold}) {} {}/{}  ({:.0}%)  {}",
         p2_bar,
         fmt_count(stats.phase2_done),
         fmt_count(stats.phase2_total),
@@ -588,7 +594,7 @@ fn cmd_status() -> Result<()> {
     } else if remaining > 0 {
         println!();
         println!("hint: embedding is running in the background via the daemon.");
-        println!("      Watch live: travsr daemon logs --follow");
+        println!("      Run `travsr embed status` again in a few minutes to see progress.");
     }
 
     Ok(())

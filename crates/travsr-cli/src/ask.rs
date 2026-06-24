@@ -24,6 +24,9 @@ struct Row {
 }
 
 pub fn run(query_str: &str) -> anyhow::Result<()> {
+    if query_str.trim().is_empty() {
+        anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
+    }
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
     let db_path = repo_root.join(".travsr/graph.db");

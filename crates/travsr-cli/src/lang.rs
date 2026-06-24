@@ -232,11 +232,16 @@ fn cmd_list(json: bool) -> Result<()> {
         let status = if entry.sandbox == SandboxRequirement::RequiresElevated && !approved {
             "needs security approval (travsr lang install — run interactively)".to_string()
         } else if wrapper_only {
+            let hint = if entry.underlying_tool_hint.is_empty() {
+                entry.install_hint
+            } else {
+                entry.underlying_tool_hint
+            };
             format!(
                 "wrapper-only  ({} installed, {} missing — {})",
                 entry.provider_binary.unwrap(),
                 entry.command,
-                entry.underlying_tool_hint,
+                hint,
             )
         } else if registered && fully_ready && !sandbox_ok && !entry.builtin {
             #[cfg(target_os = "linux")]

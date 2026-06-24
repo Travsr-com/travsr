@@ -39,6 +39,14 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
         return Ok(());
     }
 
+    // Auto-prune stale entries silently on every list — test temp dirs and
+    // deleted repos accumulate otherwise and pollute the output for new users.
+    let pruned = registry::prune().unwrap_or_default();
+    if !pruned.is_empty() {
+        eprintln!("(auto-pruned {} stale entr{} from registry)", pruned.len(),
+            if pruned.len() == 1 { "y" } else { "ies" });
+    }
+
     let repos = registry::all_repos()?;
 
     if json {

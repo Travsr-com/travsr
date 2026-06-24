@@ -21,7 +21,8 @@ pub mod trust;
 
 pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
-    active_backend_id, lookup as lookup_embed_backend,
+    active_backend_id, derive_num_workers_for_cli, derive_phase1_threshold_for_status,
+    lookup as lookup_embed_backend,
     run_parallel_reindex_blocking, spawn_background_reindex_all,
     spawn_background_reindex_phase1, spawn_background_reindex_phase2, EmbedBackend,
     EmbedModelFile, MAX_EMBED_WORKERS, BACKENDS as EMBED_BACKENDS,
