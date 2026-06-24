@@ -3213,6 +3213,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "rusqlite",
  "serde",
  "serde_json",
  "streaming-iterator",

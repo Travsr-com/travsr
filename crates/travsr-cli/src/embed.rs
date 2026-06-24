@@ -328,39 +328,28 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
         }
     };
 
-    let config = load_config().ok_or_else(|| {
-        anyhow::anyhow!("No embedding backend active. Run `travsr embed init` first.")
-    })?;
-    let backend_id = config.active.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("No embedding backend active. Run `travsr embed init` first.")
-    })?;
-    let backend = lookup_embed_backend(backend_id)
-        .ok_or_else(|| anyhow::anyhow!("Active backend '{backend_id}' not in catalog."))?;
-
-    let bin_path = embed_bin_dir()?.join(backend.binary_name);
-    anyhow::ensure!(
-        bin_path.exists(),
-        "Sidecar binary not found: {}\n  Run `travsr embed init` to install it.",
-        bin_path.display()
-    );
+    let workers = std::env::var("TRAVSR_EMBED_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0); // 0 = auto
 
     println!(
-        "Reindexing {} with backend '{}'...",
+        "Reindexing {} (parallel workers: {})...",
         db_path.display(),
-        backend_id,
+        if workers == 0 {
+            "auto".to_string()
+        } else {
+            workers.to_string()
+        },
     );
 
-    let mut cmd = std::process::Command::new(&bin_path);
-    cmd.arg("--reindex").arg(&db_path);
-    if let Some(t) = phase1 {
-        cmd.arg("--phase1").arg(t.to_string());
-    }
-    let status = cmd
-        .status()
-        .with_context(|| format!("spawning {}", bin_path.display()))?;
-    if !status.success() {
-        anyhow::bail!("reindex failed (exit code {:?})", status.code());
-    }
+    // RFC-020: delegate to the parallel orchestrator in travsr-plugin-host.
+    // It handles worker count derivation, range partitioning, temp-file isolation,
+    // merge, and failure recovery per C-01 … C-08.
+    travsr_plugin_host::run_parallel_reindex_blocking(&db_path, phase1)
+        .context("parallel reindex failed")?;
+
+    println!("\u{2713} Reindex complete.");
     Ok(())
 }
 
@@ -575,11 +564,13 @@ fn cmd_status() -> Result<()> {
     );
 
     // ── HNSW index ────────────────────────────────────────────────────────────
+    // Index is repo-local (node IDs are per-db SQLite rowids).
+    // Sidecar places it at <repo>/.travsr/<backend-id>.hnsw.usearch.
     println!();
-    let hnsw_path = travsr_dir()?
-        .join("models")
-        .join(backend.id)
-        .join("hnsw.usearch");
+    let hnsw_path = db_path
+        .parent()
+        .unwrap_or(&db_path)
+        .join(format!("{}.hnsw.usearch", backend.id));
     if let Some(mb) = file_size_mb(&hnsw_path) {
         println!(
             "HNSW index     : {mb:.0} MB  ({} vectors)",
