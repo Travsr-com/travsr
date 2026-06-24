@@ -1149,7 +1149,7 @@ fn maybe_spawn_embed_phase2(
         phase2_remaining,
         "embed_tick: Phase 1 complete — spawning Phase 2"
     );
-    if travsr_plugin_host::spawn_background_reindex_phase2(&db_path, 3) {
+    if travsr_plugin_host::spawn_background_reindex_phase2(&db_path) {
         phase2_spawned.store(true, Ordering::Relaxed);
     }
 }
@@ -1292,7 +1292,7 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     // two phases never write to embed.db concurrently.
     if succeeded {
         let db_path = repo_root.join(".travsr/graph.db");
-        if travsr_plugin_host::spawn_background_reindex_phase1(&db_path, 3) {
+        if travsr_plugin_host::spawn_background_reindex_phase1(&db_path) {
             tracing::info!("triggered post-phase-B embed Phase 1");
         }
     }

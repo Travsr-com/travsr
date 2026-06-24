@@ -22,6 +22,12 @@ pub const MAX_EMBED_WORKERS: usize = 8;
 /// the number of sidecar processes (which is always 1).
 const WORKER_RAM_BUDGET_MB: u64 = 500;
 
+/// Fraction of symbol nodes targeted by Phase 1 (eager) embedding.
+/// The shell_number threshold is derived so that nodes with
+/// shell_number >= threshold cover at most this fraction of total symbol nodes.
+/// Smaller repos where this fraction covers nearly all nodes skip the phase split.
+const PHASE1_COVERAGE_FRACTION: f64 = 0.25;
+
 // ── Catalog types ─────────────────────────────────────────────────────────────
 
 /// One model file the CLI must download from HuggingFace.
@@ -192,6 +198,44 @@ fn available_memory_mb() -> u64 {
     0
 }
 
+// ── Per-repo threshold derivation ────────────────────────────────────────────
+
+/// Derive per-repo Phase 1 shell_number threshold from the k-core distribution.
+///
+/// Returns the minimum shell_number such that symbol nodes with
+/// shell_number >= threshold cover at most `fraction` of all symbol nodes.
+/// This makes Phase 1 time roughly proportional to repo size while always
+/// embedding the structurally most important nodes first.
+///
+/// Returns None when the db has no shell_number data (pre-k-core run) or
+/// when every node is covered before reaching the fraction limit (small repos).
+fn derive_phase1_threshold(db_path: &Path, fraction: f64) -> Option<u32> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row(
+        "SELECT MIN(shell_number) \
+         FROM ( \
+             SELECT shell_number, \
+                    SUM(COUNT(*)) OVER (ORDER BY shell_number DESC) AS cum, \
+                    SUM(COUNT(*)) OVER ()                            AS total \
+             FROM nodes \
+             WHERE kind NOT IN \
+                 ('file','file-module','import','module','field','variable') \
+               AND shell_number IS NOT NULL \
+             GROUP BY shell_number \
+         ) \
+         WHERE CAST(cum AS REAL) / total <= ?1",
+        [fraction],
+        |r| r.get(0),
+    )
+    .ok()
+    .flatten()
+}
+
 // ── Core orchestrator ─────────────────────────────────────────────────────────
 
 /// Spawn ONE sidecar with `--parallel N` and wait for it to complete.
@@ -242,12 +286,25 @@ fn run_parallel_reindex(
 
 // ── Public spawn functions ────────────────────────────────────────────────────
 
-/// Spawn reindex for Phase 1 (shell_number >= threshold) as a detached
+/// Spawn reindex for Phase 1 (shell_number >= derived threshold) as a detached
 /// background thread. Returns true if the orchestrator thread was launched.
-pub fn spawn_background_reindex_phase1(db_path: &Path, threshold: u32) -> bool {
+///
+/// The threshold is derived per-repo from the k-core shell_number distribution
+/// so that Phase 1 covers the top PHASE1_COVERAGE_FRACTION of symbol nodes by
+/// centrality. This ensures Phase 1 completes in a few minutes regardless of
+/// repo size while always embedding the structurally most important nodes first.
+pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
         return false;
     };
+    let Some(threshold) = derive_phase1_threshold(db_path, PHASE1_COVERAGE_FRACTION) else {
+        tracing::warn!(
+            db = %db_path.display(),
+            "embed Phase 1: k-core data not ready — skipping (will retry after next Phase B)"
+        );
+        return false;
+    };
+    tracing::info!(threshold, "embed Phase 1: derived shell_number threshold");
     let db_path = db_path.to_path_buf();
     std::thread::Builder::new()
         .name("embed-reindex-phase1".into())
@@ -263,23 +320,32 @@ pub fn spawn_background_reindex_phase1(db_path: &Path, threshold: u32) -> bool {
         .is_ok()
 }
 
-/// Spawn reindex for Phase 2 (shell_number < threshold) as a detached
+/// Spawn reindex for Phase 2 (shell_number < derived threshold) as a detached
 /// background thread. Returns true if the orchestrator thread was launched.
-pub fn spawn_background_reindex_phase2(db_path: &Path, threshold: u32) -> bool {
+///
+/// Uses the same threshold derivation as Phase 1 so the two phases are
+/// complementary and together cover all symbol nodes.
+pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
         return false;
+    };
+    // Derive same threshold as Phase 1 for complementary coverage.
+    // If k-core data is missing, fall back to embedding all remaining nodes.
+    let phase = match derive_phase1_threshold(db_path, PHASE1_COVERAGE_FRACTION) {
+        Some(threshold) => {
+            tracing::info!(threshold, "embed Phase 2: derived shell_number threshold");
+            PhaseFilter::Phase2 { threshold }
+        }
+        None => {
+            tracing::warn!("embed Phase 2: k-core data missing — embedding all remaining nodes");
+            PhaseFilter::All
+        }
     };
     let db_path = db_path.to_path_buf();
     std::thread::Builder::new()
         .name("embed-reindex-phase2".into())
         .spawn(move || {
-            run_parallel_reindex(
-                &bin_path,
-                &db_path,
-                &embed_db_path,
-                &model_id,
-                PhaseFilter::Phase2 { threshold },
-            );
+            run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase);
         })
         .is_ok()
 }
