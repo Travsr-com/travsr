@@ -326,7 +326,7 @@
     "@vscode/test-electron": "^2.3.9",
     "@vscode/vsce": "^3.9.1",
     "mocha": "^10.3.0",
-    "ovsx": "0.9.5",
+    "ovsx": "1.0.2",
     "typescript": "^6.0.3"
   }
 }
