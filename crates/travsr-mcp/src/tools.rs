@@ -1482,6 +1482,10 @@ const MAX_SEEDS_PER_PATH: usize = 2;
 /// - Deduplicate by file path: at most `MAX_SEEDS_PER_PATH` symbols from any one file,
 ///   preventing all seeds from clustering inside a single large file.
 ///
+/// Returns `(NodeId, cosine_score)` pairs so the caller can pass them as
+/// weighted seeds to [`ppr_weighted`] — the similarity score drives the PPR
+/// personalisation vector instead of being discarded after selection.
+///
 /// Returns empty when KNN returns nothing (index not yet built), so the caller
 /// can fall back to `search_nodes_fuzzy`.
 fn embed_path_seeds(
@@ -1489,7 +1493,7 @@ fn embed_path_seeds(
     query: &str,
     knn_fn: EmbedKnnFn<'_>,
     filter: &dyn EdgeFilter,
-) -> Vec<NodeId> {
+) -> Vec<(NodeId, f32)> {
     // Over-request to give path-dedup room to still find MIN seeds after filtering.
     let knn_pairs = knn_fn(query, (MAX_EMBED_SEEDS as u32).saturating_mul(4));
     if knn_pairs.is_empty() {
@@ -1510,7 +1514,7 @@ fn embed_path_seeds(
 
     let mut path_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    let mut seeds: Vec<NodeId> = Vec::with_capacity(MAX_EMBED_SEEDS);
+    let mut seeds: Vec<(NodeId, f32)> = Vec::with_capacity(MAX_EMBED_SEEDS);
 
     for &(id, score) in &knn_pairs {
         if seeds.len() >= MAX_EMBED_SEEDS {
@@ -1532,7 +1536,7 @@ fn embed_path_seeds(
             continue;
         }
         *path_count += 1;
-        seeds.push(id);
+        seeds.push((id, score));
     }
 
     seeds
@@ -1572,39 +1576,51 @@ fn get_context_body(
         Err(e) => Err(e),
     };
 
-    // Seed lookup: embed KNN → BM25 (when available), else fuzzy text search.
-    let seeds: Vec<NodeId> = if let Some(knn_fn) = embed_knn {
-        let embed_seeds = embed_path_seeds(store, query, knn_fn, filter);
-        if !embed_seeds.is_empty() {
-            embed_seeds
+    // Seed lookup: embed KNN (with scores for weighted PPR) → fuzzy text search.
+    // `weighted_seeds` carries cosine-similarity scores used to weight the PPR
+    // personalisation vector; None on the fuzzy path which uses uniform weights.
+    let weighted_seeds: Option<Vec<(NodeId, f32)>>;
+    let seed_ids: Vec<NodeId>;
+    if let Some(knn_fn) = embed_knn {
+        let scored = embed_path_seeds(store, query, knn_fn, filter);
+        if !scored.is_empty() {
+            seed_ids = scored.iter().map(|&(id, _)| id).collect();
+            weighted_seeds = Some(scored);
         } else {
             // KNN returned nothing — embed index may not be built yet.
             tracing::debug!("embed knn returned no file seeds; falling back to fuzzy search");
-            match fuzzy_seeds() {
+            seed_ids = match fuzzy_seeds() {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!("get_context seed search error: {e}");
                     return String::new();
                 }
-            }
+            };
+            weighted_seeds = None;
         }
     } else {
-        match fuzzy_seeds() {
+        seed_ids = match fuzzy_seeds() {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("get_context seed search error: {e}");
                 return String::new();
             }
-        }
-    };
+        };
+        weighted_seeds = None;
+    }
 
     // SEC P0: identical response for "not found" and "access denied".
-    if seeds.is_empty() {
+    if seed_ids.is_empty() {
         return format!("No symbols matching '{query}' found in the graph.");
     }
 
-    // PPR over the seed set.
-    let ppr_scores = match travsr_retrieval::ppr(store, &seeds, context_candidates()) {
+    // PPR over the seed set — KNN cosine-similarity scores weight the
+    // personalisation vector when available (issue #365); uniform otherwise.
+    let ppr_scores = match weighted_seeds {
+        Some(ws) => travsr_retrieval::ppr_weighted(store, &ws, context_candidates()),
+        None => travsr_retrieval::ppr(store, &seed_ids, context_candidates()),
+    };
+    let ppr_scores = match ppr_scores {
         Ok(scores) => scores,
         Err(e) => {
             tracing::warn!("get_context ppr error: {e}");
@@ -1666,12 +1682,12 @@ fn get_context_body(
     // Errors are silently ignored — roles degrade to Context, never block output.
     let roles: HashMap<NodeId, NodeRole> = {
         use travsr_core::EdgeKind;
-        let seed_set: std::collections::HashSet<NodeId> = seeds.iter().copied().collect();
+        let seed_set: std::collections::HashSet<NodeId> = seed_ids.iter().copied().collect();
         let selected_set: std::collections::HashSet<NodeId> =
             selected.iter().map(|n| n.id).collect();
         let mut map: HashMap<NodeId, NodeRole> =
             selected.iter().map(|n| (n.id, NodeRole::Context)).collect();
-        for &seed in &seeds {
+        for &seed in &seed_ids {
             // Forward edges: seed → node  →  node is a Dependency of seed.
             if let Ok(fwd) = store.iter_edges_from(seed) {
                 for e in fwd {
@@ -4166,5 +4182,62 @@ mod snippet_tests {
             !result.contains("unrelated_fn") || result.contains("[via: context]"),
             "unrelated node must be [via: context] if it appears at all: {result}"
         );
+    }
+
+    /// KNN cosine-similarity weights must drive PPR: the neighbor of the
+    /// high-weight seed must appear in the output, and if both neighbors appear
+    /// the high-weight neighbor must rank earlier (output is PPR-score-ordered).
+    #[test]
+    fn get_context_knn_weights_drive_ppr_seed_preference() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph:  node_a (knn score 0.95) → node_x (RefCall)
+        //         node_b (knn score 0.10) → node_y (RefCall)
+        // Symmetric topology — uniform PPR gives x ≈ y; weighted PPR gives x >> y.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:wt_node_a", 1, 3);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:wt_node_b", 1, 3);
+        let node_x = make_fn_node_with_pkg("x.ts", "fn:wt_node_x", 1, 3);
+        let node_y = make_fn_node_with_pkg("y.ts", "fn:wt_node_y", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        let x_id = store.put_node(&node_x).unwrap();
+        let y_id = store.put_node(&node_y).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(a_id, x_id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, y_id, EdgeKind::RefCall))
+            .unwrap();
+
+        // KNN closure: a has high cosine similarity, b has low.
+        let knn_fn: &dyn Fn(&str, u32) -> Vec<(NodeId, f32)> =
+            &|_query, _k| vec![(a_id, 0.95), (b_id, 0.10)];
+
+        let result = get_context_body(
+            &store,
+            "wt_node",
+            4096,
+            &OpenFilter,
+            false,
+            None,
+            Some(knn_fn),
+        );
+
+        // node_x must appear (neighbor of the dominant KNN seed).
+        assert!(
+            result.contains("wt_node_x"),
+            "neighbor of high-weight KNN seed must appear in context: {result}"
+        );
+        // If both neighbors appear, x must rank before y (output order = PPR score).
+        if result.contains("wt_node_y") {
+            let pos_x = result.find("wt_node_x").unwrap();
+            let pos_y = result.find("wt_node_y").unwrap();
+            assert!(
+                pos_x < pos_y,
+                "high-weight seed's neighbor must appear before low-weight seed's neighbor"
+            );
+        }
     }
 }
