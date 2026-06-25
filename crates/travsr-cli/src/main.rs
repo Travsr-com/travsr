@@ -435,7 +435,7 @@ async fn run(cli: Cli) -> Result<()> {
                             let starting = std::fs::read_to_string(&lock_path)
                                 .ok()
                                 .and_then(|s| s.trim().parse::<u32>().ok())
-                                .map(|pid| pid_is_alive(pid))
+                                .map(pid_is_alive)
                                 .unwrap_or(false);
                             if starting {
                                 println!("starting (scanning file tree — socket not ready yet)");
