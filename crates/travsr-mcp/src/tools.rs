@@ -1473,10 +1473,35 @@ const EMBED_SCORE_THRESHOLD: f32 = 0.75;
 /// Maximum seeds per unique file path — prevents all seeds clustering in one file.
 const MAX_SEEDS_PER_PATH: usize = 2;
 
+/// Returns `true` for nodes that should never be used as PPR seeds regardless
+/// of their KNN cosine score.
+///
+/// Two categories are excluded:
+///
+/// - `kind == "crate"` — Cargo dependency nodes from `Cargo.toml`. They have
+///   no code body; seeding PPR on one walks into the dependency manifest graph
+///   instead of the implementation, flooding results with unrelated crates.
+///
+/// - Paths under `tests/` or `benches/` — integration-test helpers and
+///   benchmark fixtures are often named after the concepts they exercise
+///   (e.g. `fn:nl_query_ppr_traversal`, `fn:bench_ppr_chain`), so the embed
+///   model ranks them highly for implementation queries even though they contain
+///   no implementation logic. Only exclude the Rust-conventional directories;
+///   in-`src/` unit-test functions are kept because PPR from them naturally
+///   reaches the implementation they test.
+fn is_noise_seed(node: &CoreNode) -> bool {
+    if node.kind == "crate" {
+        return true;
+    }
+    let p = &node.vname.path;
+    p.contains("/tests/") || p.contains("/benches/")
+}
+
 /// Derive PPR seeds from symbol-level KNN results with score-based selection.
 ///
 /// Strategy:
-/// - Always include the top `MIN_EMBED_SEEDS` results (regardless of score).
+/// - Noise nodes (Cargo crates, test/bench paths) are skipped unconditionally.
+/// - Always include the top `MIN_EMBED_SEEDS` non-noise results (regardless of score).
 /// - Extend with any additional results whose cosine similarity >= `EMBED_SCORE_THRESHOLD`.
 /// - Cap at `MAX_EMBED_SEEDS`.
 /// - Deduplicate by file path: at most `MAX_SEEDS_PER_PATH` symbols from any one file,
@@ -1494,13 +1519,13 @@ fn embed_path_seeds(
     knn_fn: EmbedKnnFn<'_>,
     filter: &dyn EdgeFilter,
 ) -> Vec<(NodeId, f32)> {
-    // Over-request to give path-dedup room to still find MIN seeds after filtering.
-    let knn_pairs = knn_fn(query, (MAX_EMBED_SEEDS as u32).saturating_mul(4));
+    // Over-request 6× to keep MIN_EMBED_SEEDS filled after noise + RBAC filtering.
+    let knn_pairs = knn_fn(query, (MAX_EMBED_SEEDS as u32).saturating_mul(6));
     if knn_pairs.is_empty() {
         return vec![];
     }
 
-    // Fetch node metadata for filter + path dedup.
+    // Fetch node metadata for noise filter + RBAC + path dedup.
     let all_ids: Vec<NodeId> = knn_pairs.iter().map(|&(id, _)| id).collect();
     let nodes = match store.get_nodes(&all_ids) {
         Ok(ns) => ns,
@@ -1528,6 +1553,10 @@ fn embed_path_seeds(
             Some(n) => n,
             None => continue,
         };
+        // Skip Cargo dependency nodes and test/bench fixtures unconditionally.
+        if is_noise_seed(node) {
+            continue;
+        }
         if !filter.allow(id, id, Some(node.vname.corpus.as_str())) {
             continue;
         }
@@ -4182,6 +4211,75 @@ mod snippet_tests {
             !result.contains("unrelated_fn") || result.contains("[via: context]"),
             "unrelated node must be [via: context] if it appears at all: {result}"
         );
+    }
+
+    // ── is_noise_seed tests ───────────────────────────────────────────────────
+
+    fn make_node_with_kind_and_path(kind: &str, path: &str, sig: &str) -> travsr_core::Node {
+        travsr_core::Node::new(
+            travsr_core::VName::new("corp", "", path, "rust", sig),
+            kind,
+        )
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_crate_kind() {
+        let n = make_node_with_kind_and_path("crate", "crates/travsr-retrieval/Cargo.toml", "crate:travsr-retrieval");
+        assert!(is_noise_seed(&n), "crate nodes must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_tests_path() {
+        let n = make_node_with_kind_and_path("function", "crates/travsr-mcp/tests/conformance.rs", "fn:run_mcp");
+        assert!(is_noise_seed(&n), "integration test files must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_benches_path() {
+        let n = make_node_with_kind_and_path("function", "crates/travsr-retrieval/benches/retrieval.rs", "fn:bench_ppr_chain");
+        assert!(is_noise_seed(&n), "benchmark files must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_allows_src_functions() {
+        let n = make_node_with_kind_and_path("function", "crates/travsr-mcp/src/tools.rs", "fn:get_context_body");
+        assert!(!is_noise_seed(&n), "src/ implementation functions must not be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_allows_src_unit_tests() {
+        // Unit tests inside src/ are kept — PPR from them reaches the impl they test.
+        let n = make_node_with_kind_and_path("function", "crates/travsr-retrieval/src/ppr.rs", "fn:ppr_handles_cycles");
+        assert!(!is_noise_seed(&n), "in-src unit test functions must not be excluded");
+    }
+
+    #[test]
+    fn embed_path_seeds_filters_noise_nodes() {
+        // KNN returns a crate node + a tests/ function + a real src function.
+        // Only the real src function must become a seed.
+        use travsr_store::Store;
+        let crate_node = make_node_with_kind_and_path(
+            "crate", "crates/travsr-retrieval/Cargo.toml", "crate:travsr-retrieval",
+        );
+        let test_node = make_node_with_kind_and_path(
+            "function", "crates/travsr-mcp/tests/conformance.rs", "fn:run_mcp",
+        );
+        let impl_node = make_node_with_kind_and_path(
+            "function", "crates/travsr-mcp/src/tools.rs", "fn:get_context_body",
+        );
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let crate_id = store.put_node(&crate_node).unwrap();
+        let test_id  = store.put_node(&test_node).unwrap();
+        let impl_id  = store.put_node(&impl_node).unwrap();
+
+        // KNN returns all three with high scores.
+        let knn: &dyn Fn(&str, u32) -> Vec<(NodeId, f32)> =
+            &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
+
+        let seeds = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        assert!(seeds.iter().all(|&(id, _)| id == impl_id),
+            "only the src impl node should be a seed; got: {seeds:?}");
+        assert_eq!(seeds.len(), 1, "exactly one seed expected");
     }
 
     /// KNN cosine-similarity weights must drive PPR: the neighbor of the
