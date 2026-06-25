@@ -2429,6 +2429,14 @@ impl Daemon {
                         );
                     }
                     _ = phase_b_tick.tick() => {
+                        // C3: .travsr is in SKIP_DIRS so the file watcher never fires
+                        // for graph.db deletions. Poll every 5 s as the only trigger.
+                        if !db_path.exists() {
+                            eprintln!(
+                                "travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild."
+                            );
+                            std::process::exit(0);
+                        }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
                         // restarted after a crash mid-Phase-B).
                         arm_phase_b_if_pending(&store, &phase_b_scheduler);
@@ -2483,6 +2491,13 @@ impl Daemon {
                         );
                     }
                     _ = phase_b_tick.tick() => {
+                        // C3: poll every 5 s since .travsr is in SKIP_DIRS.
+                        if !db_path.exists() {
+                            eprintln!(
+                                "travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild."
+                            );
+                            std::process::exit(0);
+                        }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
                         // restarted after a crash mid-Phase-B).
                         arm_phase_b_if_pending(&store, &phase_b_scheduler);
@@ -2552,18 +2567,6 @@ fn handle_watch_event(
     store: &std::sync::Mutex<SqliteStore>,
 ) {
     use watcher::WatchEvent;
-
-    // C3: if graph.db was deleted (e.g. user ran `rm -rf .travsr`), the daemon
-    // has nothing to serve — exit cleanly so the supervisor/shell can inform
-    // the user to re-run `travsr init`.
-    let db_path = repo_root.join(".travsr/graph.db");
-    if !db_path.exists() {
-        tracing::warn!(
-            "graph.db no longer exists — daemon exiting. Re-run `travsr init` to rebuild."
-        );
-        eprintln!("travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild.");
-        std::process::exit(0);
-    }
 
     match ev {
         WatchEvent::Upsert(path) => {
