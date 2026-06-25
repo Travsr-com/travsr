@@ -264,7 +264,8 @@ async fn download_embed_binary(
 
     let dest_dir = embed_bin_dir()?;
     let dest = dest_dir.join(binary_name);
-    let tmp = dest_dir.join(format!("{binary_name}.tmp"));
+    // L4: use a UUID suffix so concurrent installs don't clobber each other's tmp file.
+    let tmp = dest_dir.join(format!("{binary_name}.{}.tmp", uuid::Uuid::new_v4().as_simple()));
     std::fs::write(&tmp, &bin_bytes).with_context(|| format!("writing {}", tmp.display()))?;
 
     #[cfg(unix)]
@@ -327,6 +328,22 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
             p
         }
     };
+
+    // M6: prevent concurrent `travsr embed reindex` runs from writing to the same
+    // embed.db simultaneously (two terminals, CI + local). Flock on embed.lock in
+    // the same directory as graph.db. Blocks until the other run finishes.
+    let embed_lock_path = db_path
+        .parent()
+        .map(|p| p.join("embed.lock"))
+        .unwrap_or_else(|| std::path::PathBuf::from("embed.lock"));
+    let embed_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&embed_lock_path)
+        .context("opening embed.lock")?;
+    fs2::FileExt::lock_exclusive(&embed_lock)
+        .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
 
     let workers = travsr_plugin_host::derive_num_workers_for_cli();
     println!(

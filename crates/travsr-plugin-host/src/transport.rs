@@ -78,6 +78,14 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
+    /// Returns the OS PID of the sidecar subprocess, used by the C1 watchdog
+    /// to send SIGTERM if the sidecar exceeds the per-language timeout.
+    pub fn child_pid(&self) -> Option<u32> {
+        self._child
+            .as_ref()
+            .and_then(|m| m.lock().ok().map(|c| c.id()))
+    }
+
     /// Kept for test compatibility (P5-S1 skeleton).
     pub fn stub(language: impl Into<String>) -> Self {
         Self {

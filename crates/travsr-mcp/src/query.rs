@@ -128,23 +128,40 @@ pub struct AskPayload {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusPayload {
     pub nodes: u64,
+    /// L11: number of FTS rows — should equal `nodes`. A mismatch indicates a
+    /// partial write or corrupt FTS index; user should re-run `travsr init`.
+    #[serde(default)]
+    pub fts_nodes: u64,
     pub edges: u64,
     pub schema: u32,
     pub journal: String,
     pub last_commit: Option<String>,
     pub signature_format_version: u8,
+    /// M7: commit at which Phase B last completed successfully. Compare with
+    /// `last_commit` to know if Phase B is pending, complete, or running.
+    pub phase_b_commit: Option<String>,
+    /// H3: warnings from the last Phase B run (crashed/version_mismatch/needs_approval).
+    /// Empty string = no warnings.
+    pub phase_b_warnings: Option<String>,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
 
 pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
+    let nodes = store.node_count()?;
+    // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.
+    // fts_count is the number of rows in nodes_fts (virtual FTS table).
+    let fts_count = store.fts_node_count().unwrap_or(nodes);
     Ok(StatusPayload {
-        nodes: store.node_count()?,
+        nodes,
+        fts_nodes: fts_count,
         edges: store.edge_count()?,
         schema: store.schema_version()?,
         journal: store.journal_mode()?,
         last_commit: store.get_meta("last_commit")?,
         signature_format_version: store.get_signature_format_version()?,
+        phase_b_commit: store.get_meta("phase_b_commit")?,
+        phase_b_warnings: store.get_meta("phase_b_warnings")?,
     })
 }
 
@@ -157,6 +174,31 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
 
     let matches = store.search_nodes_fuzzy(query)?;
     if matches.is_empty() {
+        return Ok(AskPayload {
+            matched: false,
+            no_results: false,
+            rows: Vec::new(),
+            total_tokens: 0,
+        });
+    }
+
+    // H1: FTS5 can return false positives for very short or unrelated queries.
+    // Gate `matched = true` on a minimal relevance check: at least one query
+    // token (≥3 chars) must appear in the top result's signature or path.
+    // This prevents `travsr ask "zxqw"` from returning unrelated results.
+    let top = &matches[0];
+    let top_text = format!(
+        "{} {}",
+        top.vname.signature.to_lowercase(),
+        top.vname.path.to_lowercase()
+    );
+    let q_lower = query.to_lowercase();
+    let has_relevant_token = q_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .any(|token| top_text.contains(token));
+
+    if !has_relevant_token {
         return Ok(AskPayload {
             matched: false,
             no_results: false,
@@ -401,8 +443,21 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
 
 /// Whole-graph payload for `travsr graph --all`. No traversal: every node at
 /// depth 0, edges verbatim from the store (with true provenance).
+/// L7: threshold above which `graph --all` truncates and warns the user.
+pub const GRAPH_ALL_NODE_LIMIT: usize = 50_000;
+
 pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
-    let all = store.all_nodes()?;
+    let mut all = store.all_nodes()?;
+    // L7: cap at GRAPH_ALL_NODE_LIMIT to prevent OOM on very large repos.
+    if all.len() > GRAPH_ALL_NODE_LIMIT {
+        eprintln!(
+            "warning: graph has {} nodes — showing first {} only. \
+             Use `travsr graph <symbol>` for focused traversal.",
+            all.len(),
+            GRAPH_ALL_NODE_LIMIT
+        );
+        all.truncate(GRAPH_ALL_NODE_LIMIT);
+    }
     let nodes: Vec<NodeEntry> = all.iter().map(|n| node_entry(n, 0)).collect();
     let edges_raw = store.all_edges()?;
     let edges = resolve_edge_sigs(store, &nodes, edges_raw)?;

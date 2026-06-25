@@ -137,6 +137,18 @@ struct ResolvedEntry {
 pub struct CatalogResolver {
     /// Pre-resolved entries keyed by language string.
     entries: Vec<ResolvedEntry>,
+    /// H5: languages that are RequiresElevated but have no PSE approval in
+    /// lang.toml. Surfaced in PhaseBOutcome so the CLI can print an actionable
+    /// "run `travsr lang approve <lang>`" message rather than silently skipping.
+    needs_approval: Vec<String>,
+}
+
+impl CatalogResolver {
+    /// Languages that were skipped due to missing PSE approval. Caller should
+    /// copy these into `PhaseBOutcome::skipped_needs_approval`.
+    pub fn needs_approval(&self) -> &[String] {
+        &self.needs_approval
+    }
 }
 
 impl CatalogResolver {
@@ -152,6 +164,7 @@ impl CatalogResolver {
         let lang_config = load_lang_config();
 
         let mut entries = Vec::new();
+        let mut needs_approval = Vec::new();
 
         tracing::debug!(
             "CatalogResolver: registered languages from disk: {:?}",
@@ -227,6 +240,7 @@ impl CatalogResolver {
                             lang,
                             lang
                         );
+                        needs_approval.push(lang.to_string());
                         continue;
                     };
 
@@ -273,7 +287,10 @@ impl CatalogResolver {
             });
         }
 
-        Self { entries }
+        Self {
+            entries,
+            needs_approval,
+        }
     }
 }
 

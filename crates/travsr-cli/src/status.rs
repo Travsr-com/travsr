@@ -30,10 +30,16 @@ pub fn run() -> anyhow::Result<()> {
             }
         };
 
-    let last_commit = payload.last_commit.unwrap_or_else(|| "(none)".to_string());
+    let last_commit = payload.last_commit.as_deref().unwrap_or("(none)");
+    // M7: compare last_commit vs phase_b_commit to show Phase B freshness.
+    let phase_b_state = match payload.phase_b_commit.as_deref() {
+        Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => "complete",
+        Some(pb) if !pb.is_empty() => "pending",
+        _ => "not run",
+    };
     println!(
-        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {last_commit}",
-        payload.nodes, payload.edges, payload.schema, payload.journal
+        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {} | phase_b: {}",
+        payload.nodes, payload.edges, payload.schema, payload.journal, last_commit, phase_b_state
     );
 
     // RFC-014 #317 re-index policy: surface signature-format skew so the user
@@ -41,9 +47,45 @@ pub fn run() -> anyhow::Result<()> {
     let sig_v = payload.signature_format_version;
     if sig_v != travsr_core::SIGNATURE_FORMAT_VERSION {
         eprintln!(
-            "⚠ signature format v{sig_v} ≠ current v{} — graph built with an older format; run `travsr init` to re-index",
+            "warning: signature format v{sig_v} != current v{} — graph built with an older format; run `travsr init` to re-index",
             travsr_core::SIGNATURE_FORMAT_VERSION
         );
+    }
+
+    // L11: detect FTS/nodes skew — indicates a partial write or corrupt FTS index.
+    let fts = payload.fts_nodes;
+    if fts > 0 && fts != payload.nodes {
+        eprintln!(
+            "warning: FTS index has {fts} rows but graph has {} nodes — run `travsr init` to rebuild",
+            payload.nodes
+        );
+    }
+
+    // H3: surface Phase B warnings so the user knows about crashed/mismatched
+    // analyzers without having to re-read the init output.
+    if let Some(warnings) = &payload.phase_b_warnings {
+        if !warnings.is_empty() {
+            for warn in warnings.split(',') {
+                let parts: Vec<&str> = warn.splitn(2, ':').collect();
+                match parts.as_slice() {
+                    ["crashed", lang] => eprintln!(
+                        "warning: phase B analyzer for '{lang}' crashed — re-run `travsr init --semantic` to retry"
+                    ),
+                    ["version_mismatch", rest] => {
+                        let v: Vec<&str> = rest.splitn(3, ':').collect();
+                        if let [lang, expected, got] = v.as_slice() {
+                            eprintln!(
+                                "warning: '{lang}' sidecar protocol v{got} != expected v{expected} — run `travsr lang install {lang}`"
+                            );
+                        }
+                    }
+                    ["needs_approval", lang] => eprintln!(
+                        "warning: '{lang}' requires elevated sandbox approval — run `travsr lang approve {lang}`"
+                    ),
+                    _ => {}
+                }
+            }
+        }
     }
 
     Ok(())

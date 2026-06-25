@@ -63,8 +63,15 @@ pub struct PhaseBReport {
     pub skipped_no_analyzer: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
+    /// Languages that are RequiresElevated but have no PSE approval in lang.toml.
+    /// Shown to the user with a `travsr lang approve` call-to-action.
+    pub skipped_needs_approval: Vec<String>,
     /// Languages whose analyzer spawned but died or errored mid-invoke.
     pub crashed: Vec<String>,
+    /// Languages whose sidecar responded with a mismatched protocol version.
+    /// Shown to the user with a `travsr lang install <lang>` call-to-action.
+    /// Tuple: (language, expected_version, got_version).
+    pub version_mismatch: Vec<(String, u32, u32)>,
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -467,12 +474,40 @@ pub fn init_repo_with_progress(
     semantic: bool,
     on_progress: &mut dyn FnMut(InitProgress),
 ) -> anyhow::Result<InitStats> {
+    // M3: canonicalize so ~/.travsr/registry.json never gets two entries for the
+    // same repo (e.g. `/home/user/proj` vs `/home/user/proj/`).
+    let repo_root = &repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+
     let travsr_dir = repo_root.join(".travsr");
     std::fs::create_dir_all(&travsr_dir).context("creating .travsr directory")?;
 
+    // C2: cross-process init lock — prevents two concurrent `travsr init` runs
+    // (two terminals, CI + local) from writing the same graph.db simultaneously.
+    // Uses an exclusive flock so the second caller blocks until the first
+    // finishes, then proceeds (incremental re-init is idempotent).
+    let init_lock_path = travsr_dir.join("init.lock");
+    let init_lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&init_lock_path)
+        .with_context(|| format!("opening {}", init_lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&init_lock_file)
+        .context("acquiring init.lock — another `travsr init` may be running for this repo")?;
+
     let db_path = travsr_dir.join("graph.db");
-    let mut store =
-        SqliteStore::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    let mut store = SqliteStore::open(&db_path).with_context(|| {
+        // M5: distinguish corruption from other open failures so the user knows
+        // whether to re-run init (corrupt) vs fix disk space (full).
+        let hint = if db_path.exists() {
+            " — if graph.db is corrupted, delete it and re-run `travsr init`"
+        } else {
+            ""
+        };
+        format!("opening {}{hint}", db_path.display())
+    })?;
 
     // SEC: graph.db contains derived IP — restrict to owner only.
     // A silent failure here would leave the file world-readable, so warn loudly.
@@ -559,11 +594,10 @@ pub fn init_repo_with_progress(
     // TRAVSR_DISABLE_REGISTRY=1 bypasses registration — set in tests and CI to
     // prevent temp-dir paths polluting ~/.travsr/registry.json.
     if std::env::var("TRAVSR_DISABLE_REGISTRY").as_deref() != Ok("1") {
-        let repo_name = repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        if let Err(e) = travsr_store::registry::register(repo_name, &db_path) {
+        // M3: use the canonicalized absolute path as the registry key so
+        // `~/proj` and `/home/user/proj` never create duplicate entries.
+        let registry_key = repo_root.to_string_lossy().into_owned();
+        if let Err(e) = travsr_store::registry::register(&registry_key, &db_path) {
             tracing::warn!("registry update failed (non-fatal): {e}");
         }
     }
@@ -663,6 +697,15 @@ pub fn init_repo_with_progress(
         }
     }
 
+    // L13: warn if a rebase is in progress — init during rebase risks indexing
+    // conflict-marker noise into graph.db; the user should finish rebasing first.
+    if repo_root.join(".git").join("REBASE_HEAD").exists() {
+        eprintln!(
+            "warning: a git rebase is in progress — consider finishing or aborting it \
+             before running `travsr init` to avoid indexing conflict markers"
+        );
+    }
+
     // T4 (1c): detect a large un-excluded dep dir and prompt/auto-exclude it.
     // If the user accepts, re-discover so the excluded files are dropped.
     if let Some((dir, count, total)) = detect_large_dep_dir(&indexable_paths, repo_root) {
@@ -699,6 +742,17 @@ pub fn init_repo_with_progress(
         }
     }
 
+    // M10: warn before spending minutes indexing when the file count is unusually
+    // large — likely a missing .gitignore / .travsrignore entry for generated code.
+    const LARGE_REPO_THRESHOLD: usize = 200_000;
+    if indexable_paths.len() > LARGE_REPO_THRESHOLD {
+        eprintln!(
+            "warning: {} source files found — indexing may take several minutes. \
+             Add large generated directories to .travsrignore to speed up future runs.",
+            indexable_paths.len()
+        );
+    }
+
     // Count source files the walker would have found without any ignore rules so
     // we can surface how many were excluded by .gitignore / .travsrignore in the
     // terminal summary. This walk does no I/O (stat only) so it is fast.
@@ -733,7 +787,8 @@ pub fn init_repo_with_progress(
 
     // Bulk-init mode: skip fsync on WAL writes + expand page cache for the
     // duration of indexing. Safe because `travsr init` is always re-runnable.
-    // Restored unconditionally after indexing (success or error path below).
+    // L10 note: SQLite pragmas (synchronous, cache_size) are connection-scoped —
+    // they reset automatically when `store` drops, so early `?` returns are safe.
     store
         .set_bulk_init_mode(true)
         .context("enabling bulk init mode")?;
@@ -810,7 +865,16 @@ pub fn init_repo_with_progress(
         "TIMING: set_bulk_init_mode(false) + optimize done"
     );
 
-    let (batch_counts, files_skipped_unchanged) = index_result?;
+    // M4: translate SQLITE_FULL into an actionable message so the user knows
+    // exactly what to do rather than seeing a raw SQLite error code.
+    let (batch_counts, files_skipped_unchanged) = index_result.map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("disk I/O error") || msg.contains("database or disk is full") || msg.contains("SQLITE_FULL") {
+            anyhow::anyhow!("disk is full — free space and re-run `travsr init` (original: {e:#})")
+        } else {
+            e
+        }
+    })?;
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
@@ -875,13 +939,7 @@ pub fn init_repo_with_progress(
     } else if phase_b_already_done {
         // Phase B is current for this commit — nothing to do, no message.
         // Return Some(empty) so init.rs skips the daemon spawn.
-        Some(PhaseBReport {
-            ran: vec![],
-            crashed: vec![],
-            skipped_not_in_repo: vec![],
-            skipped_no_analyzer: vec![],
-            skipped_unregistered: vec![],
-        })
+        Some(PhaseBReport::default())
     } else {
         on_progress(InitProgress::PhaseBDeferred);
         None
@@ -922,10 +980,16 @@ pub fn init_repo_with_progress(
     // suppressed the stamp on clean re-runs (PR #207).
     if let Ok(sha) = read_head_commit_sha(repo_root) {
         let _ = store.set_meta("last_commit", &sha);
-        // phase_b_commit is stamped only when Phase B ran inline. On the
-        // deferred path we leave it absent so the daemon's phase_b_tick
+        // C4: phase_b_commit is stamped only when Phase B ran inline AND no
+        // language crashed. A partial result should not suppress the next
+        // background refresh, which might recover the crashed language.
+        // On the deferred path we leave it absent so the daemon's phase_b_tick
         // auto-arms the scheduler when it opens the store.
-        if run_phase_b_inline {
+        let phase_b_clean = phase_b_report
+            .as_ref()
+            .map(|r| r.crashed.is_empty())
+            .unwrap_or(false);
+        if run_phase_b_inline && phase_b_clean {
             let _ = store.set_meta("phase_b_commit", &sha);
         }
     }
@@ -1032,12 +1096,32 @@ fn write_phase_b_results(
             "phase B indexing complete"
         );
     }
+    // H3: stamp phase_b_warnings in the meta table so `travsr status` can surface
+    // actionable issues without the user having to re-read init output.
+    let mut warnings: Vec<String> = Vec::new();
+    for lang in &pb_outcome.crashed {
+        warnings.push(format!("crashed:{lang}"));
+    }
+    for (lang, expected, got) in &pb_outcome.version_mismatch {
+        warnings.push(format!("version_mismatch:{lang}:{expected}:{got}"));
+    }
+    for lang in &pb_outcome.skipped_needs_approval {
+        warnings.push(format!("needs_approval:{lang}"));
+    }
+    if !warnings.is_empty() {
+        let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
+    } else {
+        let _ = store.set_meta("phase_b_warnings", "");
+    }
+
     PhaseBReport {
         ran: pb_outcome.ran,
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
         skipped_unregistered: pb_outcome.skipped_unregistered,
+        skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,
+        version_mismatch: pb_outcome.version_mismatch,
     }
 }
 
@@ -1237,7 +1321,13 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     }
 
     let report = write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
-    let _ = s.set_meta("phase_b_commit", &target_sha);
+
+    // C4: only advance phase_b_commit when no language crashed. A partial result
+    // should not suppress the next background refresh so crashed languages can
+    // be retried once the user installs the missing tool or clears disk space.
+    if report.crashed.is_empty() {
+        let _ = s.set_meta("phase_b_commit", &target_sha);
+    }
 
     let succeeded = !report.ran.is_empty() || !lsif_edges.is_empty() || report.crashed.is_empty();
 
@@ -2459,6 +2549,19 @@ fn handle_watch_event(
     store: &std::sync::Mutex<SqliteStore>,
 ) {
     use watcher::WatchEvent;
+
+    // C3: if graph.db was deleted (e.g. user ran `rm -rf .travsr`), the daemon
+    // has nothing to serve — exit cleanly so the supervisor/shell can inform
+    // the user to re-run `travsr init`.
+    let db_path = repo_root.join(".travsr/graph.db");
+    if !db_path.exists() {
+        tracing::warn!(
+            "graph.db no longer exists — daemon exiting. Re-run `travsr init` to rebuild."
+        );
+        eprintln!("travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild.");
+        std::process::exit(0);
+    }
+
     match ev {
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());

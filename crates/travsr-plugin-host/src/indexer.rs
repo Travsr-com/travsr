@@ -22,9 +22,15 @@ pub struct PhaseBOutcome {
     /// `travsr lang add <lang>`.
     pub skipped_no_analyzer: Vec<String>,
     pub skipped_unregistered: Vec<String>,
+    /// Languages registered as RequiresElevated but lacking a PSE approval
+    /// entry in lang.toml. User-actionable: `travsr lang approve <lang>`.
+    pub skipped_needs_approval: Vec<String>,
     /// Languages whose analyzer was found and spawned but died or errored
     /// mid-invoke.
     pub crashed: Vec<String>,
+    /// Languages whose sidecar binary responded with a mismatched protocol
+    /// version. User-actionable: `travsr lang install <lang>` to upgrade.
+    pub version_mismatch: Vec<(String, u32, u32)>,
 }
 
 /// Inputs for [`PluginIndexer::invoke_phase_b_all`].
@@ -153,15 +159,20 @@ impl PluginIndexer {
             .map(String::from)
             .collect();
 
+        // H5: collect needs_approval before boxing so we can surface it in outcome.
+        let catalog = crate::resolver::CatalogResolver::new();
+        let needs_approval_langs: Vec<String> = catalog.needs_approval().to_vec();
+
         let resolver = crate::resolver::CompositeResolver::new(vec![
             Box::new(crate::resolver::BuiltinResolver::new(
                 current_exe,
                 builtin_langs,
             )),
-            Box::new(crate::resolver::CatalogResolver::new()),
+            Box::new(catalog),
         ]);
 
         let mut outcome = PhaseBOutcome::default();
+        outcome.skipped_needs_approval = needs_approval_langs;
 
         let providable = resolver.providable_languages();
         tracing::debug!(
@@ -279,6 +290,9 @@ impl PluginIndexer {
             ran: bool,
             skipped_no_analyzer: bool,
             crashed: bool,
+            /// Some((expected, got)) when the sidecar binary's protocol version
+            /// does not match the daemon's PROTOCOL_VERSION.
+            version_mismatch: Option<(u32, u32)>,
         }
 
         // P2: fan out per-language work in parallel. Each thread owns its work
@@ -309,6 +323,7 @@ impl PluginIndexer {
                                             ran: true,
                                             skipped_no_analyzer: false,
                                             crashed: false,
+                                            version_mismatch: None,
                                         }
                                     }
                                     Err(e) => {
@@ -323,11 +338,16 @@ impl PluginIndexer {
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
+                                            version_mismatch: None,
                                         }
                                     }
                                 }
                             }
                             LangWork::Sidecar(spec) => {
+                                // C1: per-language timeout — kill the child if it doesn't
+                                // respond within TIMEOUT_SECS. Prevents KLS/sbt hangs from
+                                // starving the Tokio blocking thread pool indefinitely.
+                                const TIMEOUT_SECS: u64 = 300; // 5 min
                                 let req = travsr_plugin_protocol::InvokeRequest {
                                     root: repo_root.to_path_buf(),
                                     corpus: corpus.to_string(),
@@ -338,7 +358,26 @@ impl PluginIndexer {
                                 };
                                 match crate::transport::Sidecar::spawn(&spec, repo_root) {
                                     Ok(sidecar) => {
-                                        match crate::transport::Transport::invoke_phase_b(
+                                        // Watchdog: kills the child after TIMEOUT_SECS so the
+                                        // blocking thread never hangs indefinitely.
+                                        let pid = sidecar.child_pid();
+                                        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                        let done_wg = std::sync::Arc::clone(&done);
+                                        let lang_wg = lang.clone();
+                                        std::thread::spawn(move || {
+                                            std::thread::sleep(std::time::Duration::from_secs(TIMEOUT_SECS));
+                                            if !done_wg.load(std::sync::atomic::Ordering::SeqCst) {
+                                                tracing::warn!(
+                                                    lang = %lang_wg,
+                                                    timeout_secs = TIMEOUT_SECS,
+                                                    "Phase B timeout — killing sidecar"
+                                                );
+                                                if let Some(p) = pid {
+                                                    sidecar_kill(p);
+                                                }
+                                            }
+                                        });
+                                        let result = match crate::transport::Transport::invoke_phase_b(
                                             &sidecar, req,
                                         ) {
                                             Ok(resp) => {
@@ -357,6 +396,7 @@ impl PluginIndexer {
                                                     ran: true,
                                                     skipped_no_analyzer: false,
                                                     crashed: false,
+                                                    version_mismatch: None,
                                                 }
                                             }
                                             Err(travsr_error::IndexError::PhaseNotSupported) => {
@@ -372,6 +412,31 @@ impl PluginIndexer {
                                                     ran: false,
                                                     skipped_no_analyzer: true,
                                                     crashed: false,
+                                                    version_mismatch: None,
+                                                }
+                                            }
+                                            // H4: version mismatch is actionable — surface it
+                                            // separately from generic crashes so the user knows
+                                            // to run `travsr lang install <lang>` to upgrade.
+                                            Err(travsr_error::IndexError::ProtocolVersionMismatch {
+                                                expected,
+                                                got,
+                                            }) => {
+                                                tracing::warn!(
+                                                    lang = %lang,
+                                                    expected,
+                                                    got,
+                                                    "Phase B: protocol version mismatch — run `travsr lang install {lang}` to upgrade"
+                                                );
+                                                LangResult {
+                                                    lang,
+                                                    nodes: Vec::new(),
+                                                    edges: Vec::new(),
+                                                    refs: Vec::new(),
+                                                    ran: false,
+                                                    skipped_no_analyzer: false,
+                                                    crashed: false,
+                                                    version_mismatch: Some((expected, got)),
                                                 }
                                             }
                                             Err(e) => {
@@ -384,9 +449,12 @@ impl PluginIndexer {
                                                     ran: false,
                                                     skipped_no_analyzer: false,
                                                     crashed: true,
+                                                    version_mismatch: None,
                                                 }
                                             }
-                                        }
+                                        };
+                                        done.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        result
                                     }
                                     Err(e) => {
                                         // Resolver confirmed the binary exists — spawn failure is a crash.
@@ -399,6 +467,7 @@ impl PluginIndexer {
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
+                                            version_mismatch: None,
                                         }
                                     }
                                 }
@@ -420,6 +489,7 @@ impl PluginIndexer {
                         ran: false,
                         skipped_no_analyzer: false,
                         crashed: true,
+                        version_mismatch: None,
                     })
                 })
                 .collect()
@@ -437,6 +507,8 @@ impl PluginIndexer {
         for r in lang_results {
             if r.ran {
                 outcome.ran.push(r.lang);
+            } else if let Some((expected, got)) = r.version_mismatch {
+                outcome.version_mismatch.push((r.lang, expected, got));
             } else if r.skipped_no_analyzer {
                 outcome.skipped_no_analyzer.push(r.lang);
             } else if r.crashed {
@@ -474,6 +546,15 @@ impl PluginIndexer {
     ) -> Vec<travsr_core::Edge> {
         travsr_indexer::Indexer::with_corpus(&self.corpus).resolve_ffi_edges(markers)
     }
+}
+
+/// C1: SIGTERM a sidecar process by OS PID when the per-language watchdog fires.
+/// Uses a shell `kill` invocation to avoid adding `libc` as a dependency.
+/// Best-effort — if the process already exited, this is a no-op.
+fn sidecar_kill(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
 }
 
 #[cfg(test)]

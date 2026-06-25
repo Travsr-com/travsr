@@ -669,6 +669,19 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// L11: row count in the FTS index. Should match `node_count()`.
+    /// A mismatch indicates partial FTS write — user should re-run `travsr init`.
+    pub fn fts_node_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM nodes_fts", [], |row| row.get(0))
+                .context("counting nodes_fts")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Embedding coverage counts for a given model, split by k-core shell threshold.
     ///
     /// Returns `(total_symbols, embedded, phase1_total, phase1_done)` where

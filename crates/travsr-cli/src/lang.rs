@@ -682,7 +682,10 @@ fn cmd_detect() -> Result<()> {
     use std::io::IsTerminal as _;
 
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let found = detect_languages_in(&cwd);
+    // L5: `travsr lang detect` should operate from the repo root, not an
+    // arbitrary subdirectory, so it scans the full project.
+    let repo_root = crate::repo::find_git_root(&cwd).unwrap_or(cwd);
+    let found = detect_languages_in(&repo_root);
 
     if found.is_empty() {
         println!("No supported languages detected in the current directory.");
@@ -825,7 +828,7 @@ fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
                     }
                     Ok(s) => {
                         println!(
-                            "Warning: npm install exited with {s}.\n\
+                            "warning: npm install exited with {s}.\n\
                              Install manually: {}",
                             entry.install_hint
                         );
@@ -833,7 +836,7 @@ fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
                     }
                     Err(e) => {
                         println!(
-                            "Warning: could not run npm ({e}).\n\
+                            "warning: could not run npm ({e}).\n\
                              Install manually: {}",
                             entry.install_hint
                         );
@@ -842,7 +845,7 @@ fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
                 }
             } else {
                 println!(
-                    "Warning: '{}' is not on PATH.\n\
+                    "warning: '{}' is not on PATH.\n\
                      Install manually: {}",
                     entry.provider_binary.unwrap_or(entry.command),
                     entry.install_hint
@@ -854,7 +857,7 @@ fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
 
     if wrapper_installed && !which(entry.command) && !entry.underlying_tool_hint.is_empty() {
         println!(
-            "Warning: {} not found on PATH.\n\
+            "warning: {} not found on PATH.\n\
              Install it: {}\n\
              Phase B for '{}' will be inactive until {} is installed.",
             entry.command, entry.underlying_tool_hint, entry.language, entry.command,

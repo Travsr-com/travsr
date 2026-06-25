@@ -3067,6 +3067,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dirs",
+ "fs2",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -3272,6 +3273,7 @@ name = "travsr-store"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "fs2",
  "kuzu",
  "rusqlite",
  "serde",

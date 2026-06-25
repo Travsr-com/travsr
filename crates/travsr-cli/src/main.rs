@@ -393,7 +393,26 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DaemonAction::Stop => {
-                    send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown)?;
+                    // M2/L1: if the daemon is not running, tell the user clearly
+                    // and exit 0 — it's not an error to stop something already stopped.
+                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown) {
+                        Ok(_) => {
+                            eprintln!("travsr daemon stopped");
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("No such file")
+                                || msg.contains("Connection refused")
+                                || msg.contains("os error 2")
+                                || msg.contains("os error 111")
+                                || msg.contains("os error 61")
+                            {
+                                eprintln!("travsr daemon is not running");
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
                     // Windows: remove the auto-start task so the daemon stays
                     // stopped after the user logs out and back in.
                     #[cfg(windows)]
@@ -458,6 +477,19 @@ async fn run(cli: Cli) -> Result<()> {
                     repo_root.join(".travsr/graph.db")
                 };
                 if !db_path.exists() {
+                    // H2: MCP clients read stdout as a JSON-RPC stream. An abrupt
+                    // exit with no output causes an opaque EOF error on the client.
+                    // Write a notification-style error first so the client can
+                    // show a human-readable message before disconnecting.
+                    let err_msg = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/message",
+                        "params": {
+                            "level": "error",
+                            "data": "travsr: not initialized — run `travsr init` first, then retry"
+                        }
+                    });
+                    println!("{err_msg}");
                     anyhow::bail!("not initialized — run `travsr init` first");
                 }
                 travsr_mcp::serve_stdio(&db_path)?;

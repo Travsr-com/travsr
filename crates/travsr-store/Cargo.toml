@@ -26,6 +26,7 @@ sha2        = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 kuzu        = { version = "0.11", optional = true }
+fs2         = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
