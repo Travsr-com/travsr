@@ -43,8 +43,11 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
     // deleted repos accumulate otherwise and pollute the output for new users.
     let pruned = registry::prune().unwrap_or_default();
     if !pruned.is_empty() {
-        eprintln!("(auto-pruned {} stale entr{} from registry)", pruned.len(),
-            if pruned.len() == 1 { "y" } else { "ies" });
+        eprintln!(
+            "(auto-pruned {} stale entr{} from registry)",
+            pruned.len(),
+            if pruned.len() == 1 { "y" } else { "ies" }
+        );
     }
 
     let repos = registry::all_repos()?;

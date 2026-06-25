@@ -55,30 +55,28 @@ pub struct EmbedBackend {
     pub model_files: &'static [EmbedModelFile],
 }
 
-pub const BACKENDS: &[EmbedBackend] = &[
-    EmbedBackend {
-        id: "bge-small-en-v1.5",
-        description: "BAAI/bge-small-en-v1.5 — tract ONNX fp32, CLS-384, 33M params (~127 MB)",
-        dim: 384,
-        binary_name: "travsr-embed-nomic",
-        github_repo: "Travsr-com/travsr-embed",
-        version_fallback: "v1.0.0",
-        model_files: &[
-            EmbedModelFile {
-                name: "model.onnx",
-                url_path: "onnx/model.onnx",
-                hf_repo: "BAAI/bge-small-en-v1.5",
-                size_hint_mb: 127,
-            },
-            EmbedModelFile {
-                name: "tokenizer.json",
-                url_path: "tokenizer.json",
-                hf_repo: "BAAI/bge-small-en-v1.5",
-                size_hint_mb: 1,
-            },
-        ],
-    },
-];
+pub const BACKENDS: &[EmbedBackend] = &[EmbedBackend {
+    id: "bge-small-en-v1.5",
+    description: "BAAI/bge-small-en-v1.5 — tract ONNX fp32, CLS-384, 33M params (~127 MB)",
+    dim: 384,
+    binary_name: "travsr-embed-nomic",
+    github_repo: "Travsr-com/travsr-embed",
+    version_fallback: "v1.0.0",
+    model_files: &[
+        EmbedModelFile {
+            name: "model.onnx",
+            url_path: "onnx/model.onnx",
+            hf_repo: "BAAI/bge-small-en-v1.5",
+            size_hint_mb: 127,
+        },
+        EmbedModelFile {
+            name: "tokenizer.json",
+            url_path: "tokenizer.json",
+            hf_repo: "BAAI/bge-small-en-v1.5",
+            size_hint_mb: 1,
+        },
+    ],
+}];
 
 /// Look up a backend by its stable id string.
 pub fn lookup(id: &str) -> Option<&'static EmbedBackend> {
@@ -222,8 +220,7 @@ pub fn derive_phase1_threshold_for_status(db_path: &Path) -> Option<u32> {
 fn derive_phase1_threshold(db_path: &Path, fraction: f64) -> Option<u32> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
     conn.query_row(
@@ -365,7 +362,9 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
     std::thread::Builder::new()
         .name("embed-reindex-phase2".into())
         .spawn(move || {
-            if let Err(e) = run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase) {
+            if let Err(e) =
+                run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase)
+            {
                 tracing::warn!("embed Phase 2 failed: {e:#}");
             }
         })
@@ -404,11 +403,12 @@ pub fn run_parallel_reindex_blocking(
     db_path: &Path,
     phase1_threshold: Option<u32>,
 ) -> anyhow::Result<()> {
-    let (bin_path, embed_db_path, model_id) = resolve_backend(db_path)
-        .ok_or_else(|| anyhow::anyhow!(
+    let (bin_path, embed_db_path, model_id) = resolve_backend(db_path).ok_or_else(|| {
+        anyhow::anyhow!(
             "No embedding backend active or binary missing. \
              Run `travsr embed init` first."
-        ))?;
+        )
+    })?;
 
     let phase = match phase1_threshold {
         Some(t) => PhaseFilter::Phase1 { threshold: t },
@@ -426,10 +426,7 @@ fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
     let backend_id = active_backend_id()?;
     let backend = lookup(&backend_id)?;
     let home = dirs::home_dir()?;
-    let bin_path = home
-        .join(".travsr")
-        .join("bin")
-        .join(backend.binary_name);
+    let bin_path = home.join(".travsr").join("bin").join(backend.binary_name);
     if !bin_path.exists() {
         return None;
     }
@@ -447,8 +444,7 @@ pub fn active_backend_id() -> Option<String> {
         active: Option<String>,
     }
     let home = dirs::home_dir()?;
-    let content =
-        std::fs::read_to_string(home.join(".travsr").join("embed.toml")).ok()?;
+    let content = std::fs::read_to_string(home.join(".travsr").join("embed.toml")).ok()?;
     let cfg: Config = toml::from_str(&content).ok()?;
     cfg.active
 }
@@ -485,7 +481,11 @@ mod tests {
 
     #[test]
     fn worker_count_env_override_is_clamped() {
-        assert_eq!(derive_num_workers_inner(2, 16_000, Some(0)), 1, "0 should clamp to 1");
+        assert_eq!(
+            derive_num_workers_inner(2, 16_000, Some(0)),
+            1,
+            "0 should clamp to 1"
+        );
         assert_eq!(
             derive_num_workers_inner(16, 64_000, Some(100)),
             MAX_EMBED_WORKERS,
@@ -497,7 +497,10 @@ mod tests {
     #[test]
     fn worker_count_cpu_bound() {
         assert_eq!(derive_num_workers_inner(2, 16_000, None), 2);
-        assert_eq!(derive_num_workers_inner(12, 64_000, None), MAX_EMBED_WORKERS);
+        assert_eq!(
+            derive_num_workers_inner(12, 64_000, None),
+            MAX_EMBED_WORKERS
+        );
     }
 
     #[test]

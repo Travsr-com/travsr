@@ -86,8 +86,7 @@ pub fn bm25_rank_symbols(symbols: &[(NodeId, &str)], query: &str, k: usize) -> V
                     }
                     // Robertson-Sparck Jones IDF with smoothing (+1) so IDF is
                     // always positive even when every doc contains the term.
-                    let idf =
-                        ((n - df_t as f32 + 0.5) / (df_t as f32 + 0.5) + 1.0).ln();
+                    let idf = ((n - df_t as f32 + 0.5) / (df_t as f32 + 0.5) + 1.0).ln();
                     let tf = tokens.iter().filter(|t| t.as_str() == qt).count() as f32;
                     let denom = tf + K1 * (1.0 - B + B * dl / avgdl);
                     idf * tf * (K1 + 1.0) / denom
@@ -101,7 +100,11 @@ pub fn bm25_rank_symbols(symbols: &[(NodeId, &str)], query: &str, k: usize) -> V
     // Stable sort so that ties between zero-score docs preserve input order.
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let take = if k == 0 { scored.len() } else { k.min(scored.len()) };
+    let take = if k == 0 {
+        scored.len()
+    } else {
+        k.min(scored.len())
+    };
     scored[..take].iter().map(|(id, _)| *id).collect()
 }
 
@@ -150,8 +153,8 @@ mod tests {
     #[test]
     fn multi_term_query_prefers_more_overlap() {
         let syms = [
-            sym("a", "fn: get_payment_status"),  // matches "payment" + "status" + "get"
-            sym("b", "fn: list_users"),           // no query overlap
+            sym("a", "fn: get_payment_status"), // matches "payment" + "status" + "get"
+            sym("b", "fn: list_users"),         // no query overlap
         ];
         let result = bm25_rank_symbols(&syms, "get payment status", 10);
         assert_eq!(result[0], id("a"), "more overlap must rank higher");
@@ -159,10 +162,7 @@ mod tests {
 
     #[test]
     fn camel_case_query_and_doc_are_split_consistently() {
-        let syms = [
-            sym("a", "fn: processPayment"),
-            sym("b", "fn: validateUser"),
-        ];
+        let syms = [sym("a", "fn: processPayment"), sym("b", "fn: validateUser")];
         // "process" and "payment" are sub-tokens of processPayment.
         let result = bm25_rank_symbols(&syms, "processPayment", 10);
         assert_eq!(result[0], id("a"));
@@ -181,7 +181,11 @@ mod tests {
 
     #[test]
     fn k_zero_returns_all() {
-        let syms = [sym("a", "fn: foo"), sym("b", "fn: bar"), sym("c", "fn: baz")];
+        let syms = [
+            sym("a", "fn: foo"),
+            sym("b", "fn: bar"),
+            sym("c", "fn: baz"),
+        ];
         let result = bm25_rank_symbols(&syms, "foo", 0);
         assert_eq!(result.len(), 3);
     }
@@ -189,7 +193,11 @@ mod tests {
     #[test]
     fn zero_matching_terms_preserves_stable_order() {
         // "zzz" is not in any doc — all scores are 0; stable sort keeps input order.
-        let syms = [sym("a", "fn: foo"), sym("b", "fn: bar"), sym("c", "fn: baz")];
+        let syms = [
+            sym("a", "fn: foo"),
+            sym("b", "fn: bar"),
+            sym("c", "fn: baz"),
+        ];
         let result = bm25_rank_symbols(&syms, "zzz", 0);
         assert_eq!(result, vec![id("a"), id("b"), id("c")]);
     }
@@ -198,10 +206,7 @@ mod tests {
     fn idf_down_weights_common_terms() {
         // "get" appears in both; "payment" only in b.
         // b should score higher because "payment" has higher IDF.
-        let syms = [
-            sym("a", "fn: get_user"),
-            sym("b", "fn: get_payment"),
-        ];
+        let syms = [sym("a", "fn: get_user"), sym("b", "fn: get_payment")];
         let result = bm25_rank_symbols(&syms, "get payment", 10);
         assert_eq!(result[0], id("b"), "rare term 'payment' lifts b above a");
     }

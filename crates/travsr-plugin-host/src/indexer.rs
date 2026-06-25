@@ -171,8 +171,10 @@ impl PluginIndexer {
             Box::new(catalog),
         ]);
 
-        let mut outcome = PhaseBOutcome::default();
-        outcome.skipped_needs_approval = needs_approval_langs;
+        let mut outcome = PhaseBOutcome {
+            skipped_needs_approval: needs_approval_langs,
+            ..Default::default()
+        };
 
         let providable = resolver.providable_languages();
         tracing::debug!(

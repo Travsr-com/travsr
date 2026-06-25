@@ -216,7 +216,12 @@ impl EmbedSidecar {
     /// Send a KNN query. The sidecar opens `self.embed_db_path` (embed.db) with
     /// sqlite-vec and returns ranked `(node_id, cosine_similarity_score)` pairs
     /// in descending score order.
-    pub fn knn(&self, query_text: &str, k: u32, model_id: &str) -> Result<Vec<(i64, f32)>, EmbedError> {
+    pub fn knn(
+        &self,
+        query_text: &str,
+        k: u32,
+        model_id: &str,
+    ) -> Result<Vec<(i64, f32)>, EmbedError> {
         let req = EmbedPluginRequest::Knn(KnnRequest {
             db_path: self.embed_db_path.clone(),
             query_text: query_text.to_string(),

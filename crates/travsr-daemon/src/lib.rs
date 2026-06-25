@@ -869,7 +869,10 @@ pub fn init_repo_with_progress(
     // exactly what to do rather than seeing a raw SQLite error code.
     let (batch_counts, files_skipped_unchanged) = index_result.map_err(|e| {
         let msg = e.to_string();
-        if msg.contains("disk I/O error") || msg.contains("database or disk is full") || msg.contains("SQLITE_FULL") {
+        if msg.contains("disk I/O error")
+            || msg.contains("database or disk is full")
+            || msg.contains("SQLITE_FULL")
+        {
             anyhow::anyhow!("disk is full — free space and re-run `travsr init` (original: {e:#})")
         } else {
             e

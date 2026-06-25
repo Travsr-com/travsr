@@ -1527,9 +1527,7 @@ fn embed_path_seeds(
         if !filter.allow(id, id, Some(node.vname.corpus.as_str())) {
             continue;
         }
-        let path_count = path_counts
-            .entry(node.vname.path.clone())
-            .or_insert(0);
+        let path_count = path_counts.entry(node.vname.path.clone()).or_insert(0);
         if *path_count >= MAX_SEEDS_PER_PATH {
             continue;
         }
@@ -1565,14 +1563,12 @@ fn get_context_body(
     // Fuzzy-search fallback, shared by both the no-embed path and the embed
     // path when KNN returns no results (embed index not yet built).
     let fuzzy_seeds = || match store.search_nodes_fuzzy(query) {
-        Ok(nodes) => Ok(
-            nodes
-                .into_iter()
-                .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
-                .take(5)
-                .map(|n| n.id)
-                .collect::<Vec<_>>(),
-        ),
+        Ok(nodes) => Ok(nodes
+            .into_iter()
+            .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+            .take(5)
+            .map(|n| n.id)
+            .collect::<Vec<_>>()),
         Err(e) => Err(e),
     };
 

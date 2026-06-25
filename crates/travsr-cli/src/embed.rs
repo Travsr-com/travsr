@@ -265,7 +265,10 @@ async fn download_embed_binary(
     let dest_dir = embed_bin_dir()?;
     let dest = dest_dir.join(binary_name);
     // L4: use a UUID suffix so concurrent installs don't clobber each other's tmp file.
-    let tmp = dest_dir.join(format!("{binary_name}.{}.tmp", uuid::Uuid::new_v4().as_simple()));
+    let tmp = dest_dir.join(format!(
+        "{binary_name}.{}.tmp",
+        uuid::Uuid::new_v4().as_simple()
+    ));
     std::fs::write(&tmp, &bin_bytes).with_context(|| format!("writing {}", tmp.display()))?;
 
     #[cfg(unix)]
@@ -383,8 +386,7 @@ fn query_embed_stats(db_path: &std::path::Path, model_id: &str) -> Result<EmbedS
     // Derive the per-repo threshold the same way the reindex orchestrator does
     // so the phase breakdown labels match what was actually embedded.
     // Falls back to 3 when k-core data isn't available (pre-init or very small repos).
-    let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(db_path)
-        .unwrap_or(3);
+    let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(db_path).unwrap_or(3);
     let store = travsr_store::SqliteStore::open_read_only(db_path)
         .with_context(|| format!("opening {}", db_path.display()))?;
     let (total_symbols, embedded, phase1_total, phase1_done) =
@@ -442,7 +444,9 @@ fn fmt_count(n: u64) -> String {
 }
 
 fn file_size_mb(path: &std::path::Path) -> Option<f64> {
-    std::fs::metadata(path).ok().map(|m| m.len() as f64 / 1_048_576.0)
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.len() as f64 / 1_048_576.0)
 }
 
 fn cmd_status() -> Result<()> {
@@ -476,11 +480,19 @@ fn cmd_status() -> Result<()> {
                 println!("Description    : {}", b.description);
                 println!(
                     "Binary         : {}",
-                    if installed { "\u{2713} installed" } else { "\u{2717} missing — run `travsr embed init`" }
+                    if installed {
+                        "\u{2713} installed"
+                    } else {
+                        "\u{2717} missing — run `travsr embed init`"
+                    }
                 );
                 println!(
                     "Model files    : {}",
-                    if models_ok { "\u{2713} present" } else { "\u{2717} missing — run `travsr embed init`" }
+                    if models_ok {
+                        "\u{2713} present"
+                    } else {
+                        "\u{2717} missing — run `travsr embed init`"
+                    }
                 );
                 (ok, b)
             }
@@ -510,7 +522,10 @@ fn cmd_status() -> Result<()> {
     }
 
     println!();
-    println!("Repo           : {}", db_path.parent().unwrap_or(&db_path).display());
+    println!(
+        "Repo           : {}",
+        db_path.parent().unwrap_or(&db_path).display()
+    );
 
     let EmbedStatsWithThreshold { stats, threshold } = query_embed_stats(&db_path, backend.id)?;
 
@@ -531,10 +546,7 @@ fn cmd_status() -> Result<()> {
     let eta = fmt_eta(remaining, nodes_per_sec);
     let bar = progress_bar(stats.embedded, stats.total_symbols, 36);
 
-    println!(
-        "Total symbols  : {}",
-        fmt_count(stats.total_symbols)
-    );
+    println!("Total symbols  : {}", fmt_count(stats.total_symbols));
     println!(
         "Embedded       : {}  ({:.0}%)",
         fmt_count(stats.embedded),
@@ -554,17 +566,18 @@ fn cmd_status() -> Result<()> {
         100.0
     };
     let p1_bar = progress_bar(stats.phase1_done, stats.phase1_total, 24);
-    let p1_eta = fmt_eta(
-        stats.phase1_total.saturating_sub(stats.phase1_done),
-        400.0,
-    );
+    let p1_eta = fmt_eta(stats.phase1_total.saturating_sub(stats.phase1_done), 400.0);
     println!(
         "Phase 1 (shell \u{2265}{threshold}) {} {}/{}  ({:.0}%)  {}",
         p1_bar,
         fmt_count(stats.phase1_done),
         fmt_count(stats.phase1_total),
         p1_pct,
-        if p1_eta.is_empty() { "\u{2713} complete".to_string() } else { p1_eta },
+        if p1_eta.is_empty() {
+            "\u{2713} complete".to_string()
+        } else {
+            p1_eta
+        },
     );
 
     let p2_pct = if stats.phase2_total > 0 {
@@ -573,17 +586,18 @@ fn cmd_status() -> Result<()> {
         100.0
     };
     let p2_bar = progress_bar(stats.phase2_done, stats.phase2_total, 24);
-    let p2_eta = fmt_eta(
-        stats.phase2_total.saturating_sub(stats.phase2_done),
-        40.0,
-    );
+    let p2_eta = fmt_eta(stats.phase2_total.saturating_sub(stats.phase2_done), 40.0);
     println!(
         "Phase 2 (shell <{threshold}) {} {}/{}  ({:.0}%)  {}",
         p2_bar,
         fmt_count(stats.phase2_done),
         fmt_count(stats.phase2_total),
         p2_pct,
-        if p2_eta.is_empty() { "\u{2713} complete".to_string() } else { p2_eta },
+        if p2_eta.is_empty() {
+            "\u{2713} complete".to_string()
+        } else {
+            p2_eta
+        },
     );
 
     // ── HNSW index ────────────────────────────────────────────────────────────

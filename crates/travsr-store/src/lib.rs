@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 /// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
 /// Returns `(NodeId, cosine_similarity_score)` pairs in descending score order.
-pub type EmbedKnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
+pub type EmbedKnnHook =
+    Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -735,9 +736,7 @@ impl SqliteStore {
                         .to_str()
                         .context("embed.db path is not valid UTF-8")?;
                     self.conn
-                        .execute_batch(&format!(
-                            "ATTACH DATABASE '{embed_path_str}' AS edb"
-                        ))
+                        .execute_batch(&format!("ATTACH DATABASE '{embed_path_str}' AS edb"))
                         .context("attaching embed.db")?;
                     let embedded: i64 = self
                         .conn

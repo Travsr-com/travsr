@@ -129,4 +129,3 @@ impl EmbedSupervisor {
         self.model_id.as_deref()
     }
 }
-

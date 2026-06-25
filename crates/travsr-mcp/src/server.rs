@@ -173,13 +173,9 @@ fn handle_tool_call(
                     snippet_budget,
                     &knn,
                 ),
-                None => tools::get_context(
-                    store,
-                    query,
-                    token_budget,
-                    include_snippets,
-                    snippet_budget,
-                ),
+                None => {
+                    tools::get_context(store, query, token_budget, include_snippets, snippet_budget)
+                }
             }
         }
         "get_graph_json" => {
