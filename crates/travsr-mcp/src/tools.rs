@@ -131,21 +131,30 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
         }
     };
 
-    let ids: Vec<NodeId> = edges
+    const DEFAULT_DEPS_TOP_K: usize = 25;
+
+    let all_ids: Vec<NodeId> = edges
         .iter()
         .filter(|e| e.kind.as_str() == "depends")
         .map(|e| e.dst)
         .collect();
+    let total_deps = all_ids.len();
+    let ids = &all_ids[..all_ids.len().min(DEFAULT_DEPS_TOP_K)];
     let node_map: HashMap<NodeId, CoreNode> = store
-        .get_nodes(&ids)
+        .get_nodes(ids)
         .unwrap_or_default()
         .into_iter()
         .map(|n| (n.id, n))
         .collect();
-    let lines: Vec<String> = ids
+    let mut lines: Vec<String> = ids
         .iter()
         .filter_map(|id| node_map.get(id).map(|n| n.vname.signature.clone()))
         .collect();
+    if total_deps > DEFAULT_DEPS_TOP_K {
+        lines.push(format!(
+            "[showing {DEFAULT_DEPS_TOP_K} of {total_deps} — use get_context for ranked coverage or get_dependencies with transitive=true for the full tree]"
+        ));
+    }
     lines.join("\n")
 }
 
@@ -237,9 +246,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         .iter()
         .filter_map(|(edge, tag)| {
             node_map.get(&edge.src).map(|src_node| {
+                let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
                 format!(
-                    "{tag} {} ({}) — {}",
-                    src_node.vname.signature, src_node.kind, src_node.vname.path
+                    "{tag} {} ({}) — {}{}",
+                    src_node.vname.signature, src_node.kind, src_node.vname.path, loc
                 )
             })
         })
@@ -832,7 +842,10 @@ fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
     let lines: Vec<String> = nodes
         .iter()
         .take(MAX_SEARCH_RESULTS)
-        .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
+        .map(|n| {
+            let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+            format!("{} ({}) — {}{loc}", n.vname.signature, n.kind, n.vname.path)
+        })
         .collect();
     lines.join("\n")
 }
@@ -2967,6 +2980,70 @@ mod tests {
         );
     }
 
+    // ── search_symbol / get_callers path:line tests ───────────────────────────
+
+    #[test]
+    fn search_symbol_emits_path_line_when_present() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("", "", "src/foo.rs", "rust", "fn:bar"),
+            "function",
+        )
+        .with_line(42);
+        store.put_node(&n).unwrap();
+        let result = search_symbol(&store, "bar");
+        assert!(
+            result.contains("src/foo.rs:42"),
+            "search_symbol must emit path:line, got: {result}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_omits_line_when_absent() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("", "", "src/foo.rs", "rust", "fn:baz"),
+            "function",
+        );
+        store.put_node(&n).unwrap();
+        let result = search_symbol(&store, "baz");
+        assert!(
+            result.contains("src/foo.rs"),
+            "path must still appear: {result}"
+        );
+        assert!(
+            !result.contains("src/foo.rs:"),
+            "no colon-suffix when line absent, got: {result}"
+        );
+    }
+
+    #[test]
+    fn get_callers_emits_path_line_when_present() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let callee = Node::new(
+            VName::new("", "", "src/callee.rs", "rust", "fn:callee"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("", "", "src/caller.rs", "rust", "fn:caller"),
+            "function",
+        )
+        .with_line(10);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        let result = get_callers(&store, "fn:callee");
+        assert!(
+            result.contains("src/caller.rs:10"),
+            "get_callers must emit path:line for caller, got: {result}"
+        );
+    }
+
     // ── blast radius unit tests ───────────────────────────────────────────────
 
     fn make_store(
@@ -3361,6 +3438,61 @@ mod tests {
         let trans = get_dependencies(&store, "a.ts", true, 3);
         assert!(trans.contains("b.ts"), "b.ts missing: {trans}");
         assert!(trans.contains("c.ts"), "transitive c.ts missing: {trans}");
+    }
+
+    // ── get_dependencies top-k cap tests ─────────────────────────────────────
+
+    #[test]
+    fn get_dependencies_raw_caps_at_top_k_and_emits_footer() {
+        use travsr_core::{EdgeKind, Node, VName};
+        // Seed file + 30 dep nodes (> DEFAULT_DEPS_TOP_K=25).
+        let seed = Node::new(
+            VName::new("", "", "src/big.ts", "typescript", "src/big.ts"),
+            "file",
+        );
+        let mut nodes = vec![seed.clone()];
+        let mut edges = Vec::new();
+        for i in 0..30u32 {
+            let dep = Node::new(
+                VName::new("", "", &format!("dep{i}.ts"), "typescript", &format!("dep{i}.ts")),
+                "file",
+            );
+            edges.push((seed.id, dep.id, EdgeKind::Depends));
+            nodes.push(dep);
+        }
+        let store = make_store(&nodes, &edges);
+        let result = get_dependencies(&store, "src/big.ts", false, 1);
+        assert!(
+            result.contains("showing 25 of 30"),
+            "footer must report 25 of 30, got: {result}"
+        );
+        assert!(
+            result.contains("get_context for ranked coverage"),
+            "footer must include get_context hint, got: {result}"
+        );
+    }
+
+    #[test]
+    fn get_dependencies_raw_no_footer_when_under_top_k() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let seed = Node::new(
+            VName::new("", "", "src/small.ts", "typescript", "src/small.ts"),
+            "file",
+        );
+        let dep = Node::new(
+            VName::new("", "", "dep.ts", "typescript", "dep.ts"),
+            "file",
+        );
+        let store = make_store(
+            &[seed.clone(), dep.clone()],
+            &[(seed.id, dep.id, EdgeKind::Depends)],
+        );
+        let result = get_dependencies(&store, "src/small.ts", false, 1);
+        assert!(
+            !result.contains("showing"),
+            "no footer when under top-k, got: {result}"
+        );
+        assert!(result.contains("dep.ts"), "dep must appear: {result}");
     }
 
     // ── get_repo_map unit tests ───────────────────────────────────────────────

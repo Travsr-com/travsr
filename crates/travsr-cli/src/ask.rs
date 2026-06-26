@@ -64,7 +64,10 @@ pub fn run(query_str: &str) -> anyhow::Result<()> {
         .map(|r| Row {
             kind: r.kind,
             signature: r.signature,
-            path: r.path,
+            path: match r.line {
+                Some(l) => format!("{}:{}", r.path, l),
+                None => r.path,
+            },
             score: format!("{:.3}", r.score),
         })
         .collect();

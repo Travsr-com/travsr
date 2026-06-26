@@ -112,6 +112,8 @@ pub struct AskRow {
     pub kind: String,
     pub signature: String,
     pub path: String,
+    #[serde(default)]
+    pub line: Option<u32>,
     pub score: f32,
 }
 
@@ -242,6 +244,7 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
             kind: n.kind,
             signature: n.vname.signature,
             path: n.vname.path,
+            line: n.line,
         })
         .collect();
 
