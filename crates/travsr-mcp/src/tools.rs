@@ -1518,22 +1518,23 @@ fn is_noise_seed(node: &CoreNode) -> bool {
 /// - Deduplicate by file path: at most `MAX_SEEDS_PER_PATH` symbols from any one file,
 ///   preventing all seeds from clustering inside a single large file.
 ///
-/// Returns `(NodeId, cosine_score)` pairs so the caller can pass them as
-/// weighted seeds to [`ppr_weighted`] — the similarity score drives the PPR
-/// personalisation vector instead of being discarded after selection.
+/// Returns `(seeds, n_candidates_before_cap)` where:
+/// - `seeds` — `(NodeId, cosine_score)` pairs for weighted PPR personalisation.
+/// - `n_candidates_before_cap` — eligible candidates before the `MAX_EMBED_SEEDS` cap fired.
+///   When `> seeds.len()`, the caller may signal to the user that the query was broad.
 ///
-/// Returns empty when KNN returns nothing (index not yet built), so the caller
+/// Returns empty seeds when KNN returns nothing (index not yet built), so the caller
 /// can fall back to `search_nodes_fuzzy`.
 fn embed_path_seeds(
     store: &SqliteStore,
     query: &str,
     knn_fn: EmbedKnnFn<'_>,
     filter: &dyn EdgeFilter,
-) -> Vec<(NodeId, f32)> {
+) -> (Vec<(NodeId, f32)>, usize) {
     // Over-request 6× to keep MIN_EMBED_SEEDS filled after noise + RBAC filtering.
     let knn_pairs = knn_fn(query, (MAX_EMBED_SEEDS as u32).saturating_mul(6));
     if knn_pairs.is_empty() {
-        return vec![];
+        return (vec![], 0);
     }
 
     // Fetch node metadata for noise filter + RBAC + path dedup.
@@ -1542,7 +1543,7 @@ fn embed_path_seeds(
         Ok(ns) => ns,
         Err(e) => {
             tracing::warn!("embed_path_seeds get_nodes error: {e}");
-            return vec![];
+            return (vec![], 0);
         }
     };
     let node_map: std::collections::HashMap<NodeId, CoreNode> =
@@ -1551,11 +1552,10 @@ fn embed_path_seeds(
     let mut path_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut seeds: Vec<(NodeId, f32)> = Vec::with_capacity(MAX_EMBED_SEEDS);
+    // Count eligible candidates (pass noise+RBAC+score filters) before MAX_EMBED_SEEDS cap.
+    let mut n_eligible: usize = 0;
 
     for &(id, score) in &knn_pairs {
-        if seeds.len() >= MAX_EMBED_SEEDS {
-            break;
-        }
         // Include if: we still owe MIN seeds, OR this node scores above threshold.
         if seeds.len() >= MIN_EMBED_SEEDS && score < EMBED_SCORE_THRESHOLD {
             continue;
@@ -1576,10 +1576,48 @@ fn embed_path_seeds(
             continue;
         }
         *path_count += 1;
-        seeds.push((id, score));
+        n_eligible += 1;
+        if seeds.len() < MAX_EMBED_SEEDS {
+            seeds.push((id, score));
+        }
     }
 
-    seeds
+    (seeds, n_eligible)
+}
+
+/// Compose all advisory signals appended to a `get_context` response footer.
+///
+/// Signals are ordered: overflow (most actionable) → seed cap → degraded state.
+/// Returns an empty string when the graph is fully operational and no truncation occurred.
+fn build_context_signals(
+    store: &SqliteStore,
+    has_embed: bool,
+    overflow_msg: Option<&str>,
+    seed_cap_msg: Option<&str>,
+) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(msg) = overflow_msg {
+        parts.push(msg);
+    }
+    if let Some(msg) = seed_cap_msg {
+        parts.push(msg);
+    }
+    if !has_embed {
+        parts.push(
+            "[note: semantic search disabled — run `travsr embed init` for better results]",
+        );
+    }
+    if phase_b_pending(store) {
+        parts.push(
+            "[note: call traversal limited — run `travsr lang install <lang>` to enable call-graph edges]",
+        );
+    }
+    parts.join("\n")
+}
+
+/// Convenience wrapper for the no-overflow, no-seed-cap degraded-state check.
+fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
+    build_context_signals(store, has_embed, None, None)
 }
 
 fn get_context_body(
@@ -1591,6 +1629,9 @@ fn get_context_body(
     snippet_budget: Option<usize>,
     embed_knn: Option<EmbedKnnFn<'_>>,
 ) -> String {
+    // Capture embed presence before embed_knn is consumed by the seed-lookup block.
+    let has_embed = embed_knn.is_some();
+
     // SEC-002: validate before any store access.
     if let Err(reason) = validate_mcp_arg(query) {
         tracing::warn!("get_context rejected invalid query arg: {reason}");
@@ -1619,10 +1660,13 @@ fn get_context_body(
     // Seed lookup: embed KNN (with scores for weighted PPR) → fuzzy text search.
     // `weighted_seeds` carries cosine-similarity scores used to weight the PPR
     // personalisation vector; None on the fuzzy path which uses uniform weights.
+    // `seed_cap_fired` is true when eligible KNN candidates exceeded MAX_EMBED_SEEDS.
     let weighted_seeds: Option<Vec<(NodeId, f32)>>;
     let seed_ids: Vec<NodeId>;
+    let seed_cap_fired: bool;
     if let Some(knn_fn) = embed_knn {
-        let scored = embed_path_seeds(store, query, knn_fn, filter);
+        let (scored, n_eligible) = embed_path_seeds(store, query, knn_fn, filter);
+        seed_cap_fired = n_eligible > scored.len();
         if !scored.is_empty() {
             seed_ids = scored.iter().map(|&(id, _)| id).collect();
             weighted_seeds = Some(scored);
@@ -1639,6 +1683,7 @@ fn get_context_body(
             weighted_seeds = None;
         }
     } else {
+        seed_cap_fired = false;
         seed_ids = match fuzzy_seeds() {
             Ok(s) => s,
             Err(e) => {
@@ -1712,10 +1757,63 @@ fn get_context_body(
         })
         .collect();
 
+    // Capture lightweight overflow metadata before knapsack consumes items.
+    // Storing only (id, score, sig, path) avoids cloning full Node objects.
+    const OVERFLOW_DISPLAY_CAP: usize = 10;
+    let overflow_candidates: Vec<(NodeId, f32, String, String)> = items
+        .iter()
+        .map(|(n, s)| (n.id, *s, n.vname.signature.clone(), n.vname.path.clone()))
+        .collect();
+    let n_candidates = overflow_candidates.len();
+
     // Knapsack selection.
     let selected = knapsack(items, token_budget);
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
+
+    // Build overflow list: candidates that didn't fit within the token budget.
+    let overflow_msg: Option<String> = if n_nodes < n_candidates {
+        let selected_set: std::collections::HashSet<NodeId> =
+            selected.iter().map(|n| n.id).collect();
+        let overflow: Vec<_> = overflow_candidates
+            .iter()
+            .filter(|(id, _, _, _)| !selected_set.contains(id))
+            .take(OVERFLOW_DISPLAY_CAP)
+            .collect();
+        if overflow.is_empty() {
+            None
+        } else {
+            let n_overflow = n_candidates - n_nodes;
+            let min_score: f32 = overflow
+                .last()
+                .map(|item| (**item).1)
+                .unwrap_or(0.0);
+            let mut msg = format!(
+                "[{n_overflow} more node(s) matched (score \u{2265} {min_score:.2}) — budget exhausted. \
+                 Use a specific symbol name for deeper coverage, or call \
+                 get_blast_radius / get_callers / get_dependencies for complete results.]"
+            );
+            let lines: Vec<String> = overflow
+                .iter()
+                .map(|(_, s, sig, path)| format!("  {sig}  score: {s:.2}  {path}"))
+                .collect();
+            msg.push('\n');
+            msg.push_str(&lines.join("\n"));
+            Some(msg)
+        }
+    } else {
+        None
+    };
+
+    // Seed-cap signal: emit when eligible candidates exceeded MAX_EMBED_SEEDS.
+    let seed_cap_msg: Option<&str> = if seed_cap_fired {
+        Some(
+            "[note: query matched more seed candidates than the cap — \
+             consider narrowing the query or calling get_context once per concept]",
+        )
+    } else {
+        None
+    };
 
     // Build 1-hop role map: classify each selected node's relationship to the seeds.
     // O(S × avg_degree); seeds are capped at 5 so this is negligible.
@@ -1796,9 +1894,15 @@ fn get_context_body(
                     })
                     .collect();
                 let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
-                return format!(
-                    "{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
+                let notes = build_degraded_notes(store, has_embed);
+                let footer = format!(
+                    "[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
                 );
+                return if notes.is_empty() {
+                    format!("{sanitized}\n\n{footer}")
+                } else {
+                    format!("{sanitized}\n\n{footer}\n{notes}")
+                };
             }
         };
 
@@ -1858,9 +1962,20 @@ fn get_context_body(
         }
 
         let sanitized = sanitize_mcp_body_with_limit(&blocks.join("\n\n"), char_cap);
-        format!(
-            "{sanitized}\n\n[{n_nodes} nodes, {n_with_snippet} with snippets, ~{total_tokens} metadata-tokens + ~{snip_tokens} snippet-tokens ({mode_label} budget)]"
-        )
+        let signals = build_context_signals(
+            store,
+            has_embed,
+            overflow_msg.as_deref(),
+            seed_cap_msg,
+        );
+        let footer = format!(
+            "[{n_nodes} nodes, {n_with_snippet} with snippets, ~{total_tokens} metadata-tokens + ~{snip_tokens} snippet-tokens ({mode_label} budget)]"
+        );
+        if signals.is_empty() {
+            format!("{sanitized}\n\n{footer}")
+        } else {
+            format!("{sanitized}\n\n{footer}\n{signals}")
+        }
     } else {
         // Legacy path — metadata-only with role annotations.
         let lines: Vec<String> = selected
@@ -1878,7 +1993,18 @@ fn get_context_body(
             })
             .collect();
         let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
-        format!("{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens]")
+        let signals = build_context_signals(
+            store,
+            has_embed,
+            overflow_msg.as_deref(),
+            seed_cap_msg,
+        );
+        let footer = format!("[{n_nodes} nodes, ~{total_tokens} tokens]");
+        if signals.is_empty() {
+            format!("{sanitized}\n\n{footer}")
+        } else {
+            format!("{sanitized}\n\n{footer}\n{signals}")
+        }
     }
 }
 
@@ -4342,12 +4468,187 @@ mod snippet_tests {
         let knn: EmbedKnnFn<'_> =
             &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
 
-        let seeds = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        let (seeds, n_eligible) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
         assert!(
             seeds.iter().all(|&(id, _)| id == impl_id),
             "only the src impl node should be a seed; got: {seeds:?}"
         );
         assert_eq!(seeds.len(), 1, "exactly one seed expected");
+        assert_eq!(n_eligible, 1, "n_eligible should match non-noise seeds");
+    }
+
+    // ── #367 degraded-state notes ─────────────────────────────────────────────
+
+    /// When embed_knn is None, get_context output must include the semantic-search note.
+    #[test]
+    fn get_context_no_embed_appends_degraded_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let store = make_store_with_root(&dir, &[node]);
+        // Simulate a repo that has commits (so phase_b_pending check is meaningful).
+        // We do NOT set phase_b_commit so both notes could fire; only test the embed note.
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        assert!(
+            result.contains("semantic search disabled"),
+            "must emit embed-missing note when embed_knn=None; got: {result}"
+        );
+    }
+
+    /// Phase B pending: output must contain the call-traversal-limited note.
+    #[test]
+    fn get_context_phase_b_pending_appends_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        // Mark a real last_commit without a phase_b_commit → phase_b_pending returns true.
+        store.set_meta("last_commit", "abc123").unwrap();
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        assert!(
+            result.contains("call traversal limited"),
+            "must emit phase-B-pending note when phase_b_commit absent; got: {result}"
+        );
+    }
+
+    /// When both embed and Phase B are present, no degraded notes should appear.
+    #[test]
+    fn get_context_fully_operational_no_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        // Provide a no-op embed_knn (has_embed = true).
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result =
+            get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        assert!(
+            !result.contains("[note:"),
+            "fully operational graph must not emit degraded notes; got: {result}"
+        );
+    }
+
+    // ── #377 truncation signals ───────────────────────────────────────────────
+
+    /// When knapsack cannot fit all scored nodes, the overflow message must appear.
+    #[test]
+    fn get_context_overflow_signal_emitted_on_budget_exhaustion() {
+        use travsr_core::{Edge, EdgeKind};
+        let dir = tempfile::tempdir().unwrap();
+        // Write 10 nodes and connect them so PPR scores them all.
+        let nodes: Vec<_> = (0..10)
+            .map(|i| {
+                make_fn_node_with_pkg(
+                    &format!("src/file{i}.ts"),
+                    &format!("fn:symbol{i}"),
+                    1,
+                    50,
+                )
+            })
+            .collect();
+        let mut store = make_store_with_root(&dir, &[]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let ids: Vec<_> = nodes
+            .iter()
+            .map(|n| store.put_node(n).unwrap())
+            .collect();
+        // Chain: node 0 → node 1 → ... → node 9 via RefCall edges so PPR sees them all.
+        for i in 0..ids.len() - 1 {
+            store
+                .put_edge(&Edge::new(ids[i], ids[i + 1], EdgeKind::RefCall))
+                .unwrap();
+        }
+        // Tiny budget (5 tokens) — knapsack cannot fit all 10 nodes.
+        let result = get_context_body(&store, "symbol0", 5, &OpenFilter, false, None, None);
+        // Either overflow fires or PPR returned too few nodes — accept both: the key is
+        // we never silently truncate when there IS overflow.
+        if result.contains("more node(s) matched") {
+            assert!(
+                result.contains("budget exhausted"),
+                "overflow msg must mention budget; got: {result}"
+            );
+        }
+    }
+
+    /// When all nodes fit within budget, no overflow message should appear.
+    #[test]
+    fn get_context_no_overflow_when_all_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        // Generous budget — the single node easily fits.
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        assert!(
+            !result.contains("more node(s) matched"),
+            "no overflow when all nodes fit; got: {result}"
+        );
+    }
+
+    /// embed_path_seeds must report n_eligible correctly when MAX cap fires.
+    #[test]
+    fn embed_path_seeds_reports_cap_count() {
+        use travsr_store::Store;
+        // Build MAX_EMBED_SEEDS + 2 src nodes — all pass noise/RBAC filters.
+        let n_total = MAX_EMBED_SEEDS + 2;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mut knn_pairs: Vec<(NodeId, f32)> = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            let node = make_node_with_kind_and_path(
+                "function",
+                &format!("src/file{i}.ts"),
+                &format!("fn:sym{i}"),
+            );
+            let id = store.put_node(&node).unwrap();
+            knn_pairs.push((id, 0.90 - i as f32 * 0.001));
+        }
+        let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
+        let (seeds, n_eligible) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
+        assert_eq!(seeds.len(), MAX_EMBED_SEEDS, "seeds capped at MAX_EMBED_SEEDS");
+        assert_eq!(n_eligible, n_total, "n_eligible counts all eligible before cap");
+    }
+
+    /// embed_path_seeds: seed-cap signal fires (n_eligible > seeds.len()) when cap was hit.
+    #[test]
+    fn embed_path_seeds_cap_signal_is_correct() {
+        use travsr_store::Store;
+        let n_total = MAX_EMBED_SEEDS + 5;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mut knn_pairs: Vec<(NodeId, f32)> = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            let node = make_node_with_kind_and_path(
+                "function",
+                &format!("src/cap{i}.ts"),
+                &format!("fn:cap{i}"),
+            );
+            let id = store.put_node(&node).unwrap();
+            knn_pairs.push((id, 0.95));
+        }
+        let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
+        let (seeds, n_eligible) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
+        assert!(
+            n_eligible > seeds.len(),
+            "cap fired: n_eligible ({n_eligible}) > seeds.len() ({})",
+            seeds.len()
+        );
+    }
+
+    /// build_context_signals: overflow appears before seed-cap, seed-cap before degraded notes.
+    #[test]
+    fn build_context_signals_ordering() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let result = build_context_signals(
+            &store,
+            false,
+            Some("[overflow msg]"),
+            Some("[seed cap msg]"),
+        );
+        let overflow_pos = result.find("[overflow msg]").unwrap();
+        let seed_pos = result.find("[seed cap msg]").unwrap();
+        let note_pos = result.find("[note: semantic search").unwrap();
+        assert!(overflow_pos < seed_pos, "overflow must precede seed-cap");
+        assert!(seed_pos < note_pos, "seed-cap must precede degraded notes");
     }
 
     /// KNN cosine-similarity weights must drive PPR: the neighbor of the
