@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use travsr_core::{display_label, is_noise_node, NodeId};
+
+type KnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
 use travsr_retrieval::{context_candidates, knapsack, ppr_weighted, token_cost, OpenFilter};
 use travsr_store::{SqliteStore, Store, StoreMigratable};
 
@@ -185,7 +187,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
 pub fn ask_query(
     store: &SqliteStore,
     query: &str,
-    knn_fn: Option<&dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>>,
+    knn_fn: Option<KnnFn<'_>>,
 ) -> anyhow::Result<AskPayload> {
     // Strip a leading `:` so VS Code graph-panel queries pass through cleanly.
     let query = query.strip_prefix(':').unwrap_or(query).trim();

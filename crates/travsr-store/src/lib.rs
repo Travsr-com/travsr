@@ -2801,8 +2801,10 @@ LIMIT 100",
             if !pairs.is_empty() {
                 let ids: Vec<NodeId> = pairs.into_iter().map(|(id, _score)| id).collect();
                 let nodes = self.get_nodes(&ids)?;
-                let filtered: Vec<Node> =
-                    nodes.into_iter().filter(|n| n.vname.language == lang).collect();
+                let filtered: Vec<Node> = nodes
+                    .into_iter()
+                    .filter(|n| n.vname.language == lang)
+                    .collect();
                 if !filtered.is_empty() {
                     tracing::debug!(layer = "embed_ann_lang", nodes_returned = filtered.len());
                     return Ok(filtered);

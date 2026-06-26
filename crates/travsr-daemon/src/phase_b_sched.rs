@@ -145,7 +145,10 @@ impl PhaseBScheduler {
 
     /// Whether a Phase B run is armed and waiting for its debounce window.
     pub fn is_pending(&self) -> bool {
-        self.dirty.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 }
 

@@ -75,7 +75,11 @@ pub fn run(query_str: &str) -> anyhow::Result<()> {
 
     let n = rows.len();
     println!("{}", Table::new(rows));
-    let embed_note = if payload.embed_used { " · [embed-enhanced]" } else { "" };
+    let embed_note = if payload.embed_used {
+        " · [embed-enhanced]"
+    } else {
+        ""
+    };
     println!("\n{n} nodes · ~{} tokens{embed_note}", payload.total_tokens);
     Ok(())
 }

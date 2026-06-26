@@ -545,8 +545,7 @@ pub fn repo_backend_id(repo_root: &Path) -> Option<String> {
     struct Config {
         active: Option<String>,
     }
-    let content =
-        std::fs::read_to_string(repo_root.join(".travsr").join("embed.toml")).ok()?;
+    let content = std::fs::read_to_string(repo_root.join(".travsr").join("embed.toml")).ok()?;
     let cfg: Config = toml::from_str(&content).ok()?;
     cfg.active
 }

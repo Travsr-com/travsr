@@ -471,13 +471,21 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     if nodes.is_empty() {
         return;
     }
-    tracing::debug!(count = nodes.len(), ?richness, "computing embed_text for nodes");
+    tracing::debug!(
+        count = nodes.len(),
+        ?richness,
+        "computing embed_text for nodes"
+    );
     const BATCH: usize = 500;
     let mut pairs: Vec<(travsr_core::NodeId, String)> = Vec::with_capacity(BATCH);
     for node in &nodes {
         if let Some(skel) = skeleton_for_node(node, repo_root) {
-            let text =
-                skel.to_embed_text(&node.kind, &node.vname.signature, &node.vname.path, richness);
+            let text = skel.to_embed_text(
+                &node.kind,
+                &node.vname.signature,
+                &node.vname.path,
+                richness,
+            );
             pairs.push((node.id, text));
             if pairs.len() >= BATCH {
                 if let Err(e) = store.write_embed_texts_batch(&pairs) {
@@ -2777,7 +2785,11 @@ fn handle_control_message(
         Ok(ControlMessage::Status) => {
             let s = read_store.lock().unwrap_or_else(|e| e.into_inner());
             let last_commit = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
-            let phase_b_commit = s.get_meta("phase_b_commit").ok().flatten().unwrap_or_default();
+            let phase_b_commit = s
+                .get_meta("phase_b_commit")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let nodes = s.node_count().unwrap_or(0);
             let edges = s.edge_count().unwrap_or(0);
 
@@ -2797,13 +2809,15 @@ fn handle_control_message(
             };
 
             // Embed progress — per-repo configured model only.
-            let embed_line = if let Some(backend_id) = travsr_plugin_host::repo_backend_id(repo_root) {
+            let embed_line = if let Some(backend_id) =
+                travsr_plugin_host::repo_backend_id(repo_root)
+            {
                 let threshold = 3u32;
                 match s.embed_progress(&backend_id, threshold) {
                     Ok((total, embedded, phase1_total, phase1_done)) => {
                         let phase2_done = embedded.saturating_sub(phase1_done);
                         let phase2_total = total.saturating_sub(phase1_total);
-                        let pct = if total > 0 { embedded * 100 / total } else { 100 };
+                        let pct = (embedded * 100).checked_div(total).unwrap_or(100);
                         format!(
                             "embedding ({backend_id}): {embedded}/{total} ({pct}%) — \
                              Phase 1: {phase1_done}/{phase1_total} · Phase 2: {phase2_done}/{phase2_total}"
@@ -2893,7 +2907,9 @@ fn run_query(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("ask query missing 'query' arg"))?;
             let knn = store.embed_knn_fn();
-            let knn_ref = knn.as_ref().map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
+            let knn_ref = knn
+                .as_ref()
+                .map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
             Ok(serde_json::to_value(query::ask_query(store, q, knn_ref)?)?)
         }
         "status" => Ok(serde_json::to_value(query::status_query(store)?)?),

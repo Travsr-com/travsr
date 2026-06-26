@@ -419,11 +419,7 @@ fn reindex_after_init(backend: &'static EmbedBackend, db_path: &std::path::Path)
         .and_then(|p| p.parent())
         .unwrap_or(std::path::Path::new("."));
     if super::daemon_is_running(repo_root, 1, 0) {
-        println!(
-            "  {} {} is now active",
-            pal.green("\u{25cf}"),
-            backend.id,
-        );
+        println!("  {} {} is now active", pal.green("\u{25cf}"), backend.id,);
         println!(
             "  {} the daemon is embedding {} nodes in the background",
             pal.dim("\u{2139}"),

@@ -442,7 +442,9 @@ async fn run(cli: Cli) -> Result<()> {
                                 .map(pid_is_alive)
                                 .unwrap_or(false);
                             if starting {
-                                println!("daemon: starting (scanning file tree — socket not ready yet)");
+                                println!(
+                                    "daemon: starting (scanning file tree — socket not ready yet)"
+                                );
                             } else {
                                 println!("daemon: not running");
                             }

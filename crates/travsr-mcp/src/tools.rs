@@ -990,7 +990,7 @@ pub fn search_symbol_global(
             }
         }
         // Most matches first — most relevant repo surfaces at the top.
-        parts.sort_by(|a, b| b.0.cmp(&a.0));
+        parts.sort_by_key(|b| std::cmp::Reverse(b.0));
         parts
             .into_iter()
             .map(|(_, text)| text)
@@ -1742,9 +1742,7 @@ fn build_context_signals(
         parts.push(msg);
     }
     if !has_embed {
-        parts.push(
-            "[note: semantic search disabled — run `travsr embed init` for better results]",
-        );
+        parts.push("[note: semantic search disabled — run `travsr embed init` for better results]");
     }
     if phase_b_pending(store) {
         parts.push(
@@ -1923,10 +1921,7 @@ fn get_context_body(
             None
         } else {
             let n_overflow = n_candidates - n_nodes;
-            let min_score: f32 = overflow
-                .last()
-                .map(|item| (**item).1)
-                .unwrap_or(0.0);
+            let min_score: f32 = overflow.last().map(|item| item.1).unwrap_or(0.0);
             let mut msg = format!(
                 "[{n_overflow} more node(s) matched (score \u{2265} {min_score:.2}) — budget exhausted. \
                  Use a specific symbol name for deeper coverage, or call \
@@ -2101,12 +2096,8 @@ fn get_context_body(
         }
 
         let sanitized = sanitize_mcp_body_with_limit(&blocks.join("\n\n"), char_cap);
-        let signals = build_context_signals(
-            store,
-            has_embed,
-            overflow_msg.as_deref(),
-            seed_cap_msg,
-        );
+        let signals =
+            build_context_signals(store, has_embed, overflow_msg.as_deref(), seed_cap_msg);
         let footer = format!(
             "[{n_nodes} nodes, {n_with_snippet} with snippets, ~{total_tokens} metadata-tokens + ~{snip_tokens} snippet-tokens ({mode_label} budget)]"
         );
@@ -2132,12 +2123,8 @@ fn get_context_body(
             })
             .collect();
         let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
-        let signals = build_context_signals(
-            store,
-            has_embed,
-            overflow_msg.as_deref(),
-            seed_cap_msg,
-        );
+        let signals =
+            build_context_signals(store, has_embed, overflow_msg.as_deref(), seed_cap_msg);
         let footer = format!("[{n_nodes} nodes, ~{total_tokens} tokens]");
         if signals.is_empty() {
             format!("{sanitized}\n\n{footer}")
@@ -2171,8 +2158,13 @@ pub fn get_context_global(
 
     let raw = if repo.is_some() {
         collect_global(repos, repo, |store, repo_name, single| {
-            let result =
-                get_context_raw(store, seed_query, token_budget, include_snippets, snippet_budget);
+            let result = get_context_raw(
+                store,
+                seed_query,
+                token_budget,
+                include_snippets,
+                snippet_budget,
+            );
             if result.is_empty() || single {
                 result
             } else {
@@ -2218,7 +2210,7 @@ pub fn get_context_global(
                 Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
             }
         }
-        parts.sort_by(|a, b| b.0.cmp(&a.0));
+        parts.sort_by_key(|b| std::cmp::Reverse(b.0));
         parts
             .into_iter()
             .map(|(_, text)| text)
@@ -3215,7 +3207,10 @@ mod tests {
     fn infer_lang_aliases_map_correctly() {
         assert_eq!(infer_language_from_query("foo c++").1, Some("cpp"));
         assert_eq!(infer_language_from_query("foo c#").1, Some("csharp"));
-        assert_eq!(infer_language_from_query("foo objective-c").1, Some("objectivec"));
+        assert_eq!(
+            infer_language_from_query("foo objective-c").1,
+            Some("objectivec")
+        );
         assert_eq!(infer_language_from_query("foo objc").1, Some("objectivec"));
         assert_eq!(infer_language_from_query("foo golang").1, Some("go"));
         assert_eq!(infer_language_from_query("foo csharp").1, Some("csharp"));
@@ -3249,29 +3244,53 @@ mod tests {
     fn search_symbol_global_filters_by_inferred_language() {
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let rs_node = Node::new(VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"), "function");
-        let ts_node = Node::new(VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"), "function");
+        let rs_node = Node::new(
+            VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"),
+            "function",
+        );
+        let ts_node = Node::new(
+            VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"),
+            "function",
+        );
         store.put_node(&rs_node).unwrap();
         store.put_node(&ts_node).unwrap();
 
         // "auth handler typescript" should return only the TypeScript node.
         let result = search_symbol_raw(&store, "auth", Some("typescript"));
-        assert!(result.contains("src/auth.ts"), "expected typescript node: {result}");
-        assert!(!result.contains("src/auth.rs"), "rust node must be filtered out: {result}");
+        assert!(
+            result.contains("src/auth.ts"),
+            "expected typescript node: {result}"
+        );
+        assert!(
+            !result.contains("src/auth.rs"),
+            "rust node must be filtered out: {result}"
+        );
     }
 
     #[test]
     fn search_symbol_raw_no_filter_returns_both_languages() {
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let rs_node = Node::new(VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"), "function");
-        let ts_node = Node::new(VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"), "function");
+        let rs_node = Node::new(
+            VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"),
+            "function",
+        );
+        let ts_node = Node::new(
+            VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"),
+            "function",
+        );
         store.put_node(&rs_node).unwrap();
         store.put_node(&ts_node).unwrap();
 
         let result = search_symbol_raw(&store, "auth", None);
-        assert!(result.contains("auth.rs"), "rust node must appear: {result}");
-        assert!(result.contains("auth.ts"), "typescript node must appear: {result}");
+        assert!(
+            result.contains("auth.rs"),
+            "rust node must appear: {result}"
+        );
+        assert!(
+            result.contains("auth.ts"),
+            "typescript node must appear: {result}"
+        );
     }
 
     #[test]
@@ -3709,7 +3728,13 @@ mod tests {
         let mut edges = Vec::new();
         for i in 0..30u32 {
             let dep = Node::new(
-                VName::new("", "", &format!("dep{i}.ts"), "typescript", &format!("dep{i}.ts")),
+                VName::new(
+                    "",
+                    "",
+                    format!("dep{i}.ts"),
+                    "typescript",
+                    format!("dep{i}.ts"),
+                ),
                 "file",
             );
             edges.push((seed.id, dep.id, EdgeKind::Depends));
@@ -3729,15 +3754,12 @@ mod tests {
 
     #[test]
     fn get_dependencies_raw_no_footer_when_under_top_k() {
-        use travsr_core::{Edge, EdgeKind, Node, VName};
+        use travsr_core::{EdgeKind, Node, VName};
         let seed = Node::new(
             VName::new("", "", "src/small.ts", "typescript", "src/small.ts"),
             "file",
         );
-        let dep = Node::new(
-            VName::new("", "", "dep.ts", "typescript", "dep.ts"),
-            "file",
-        );
+        let dep = Node::new(VName::new("", "", "dep.ts", "typescript", "dep.ts"), "file");
         let store = make_store(
             &[seed.clone(), dep.clone()],
             &[(seed.id, dep.id, EdgeKind::Depends)],
@@ -4906,8 +4928,7 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc123").unwrap();
         // Provide a no-op embed_knn (has_embed = true).
         let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
-        let result =
-            get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
         assert!(
             !result.contains("[note:"),
             "fully operational graph must not emit degraded notes; got: {result}"
@@ -4924,21 +4945,13 @@ mod snippet_tests {
         // Write 10 nodes and connect them so PPR scores them all.
         let nodes: Vec<_> = (0..10)
             .map(|i| {
-                make_fn_node_with_pkg(
-                    &format!("src/file{i}.ts"),
-                    &format!("fn:symbol{i}"),
-                    1,
-                    50,
-                )
+                make_fn_node_with_pkg(&format!("src/file{i}.ts"), &format!("fn:symbol{i}"), 1, 50)
             })
             .collect();
         let mut store = make_store_with_root(&dir, &[]);
         store.set_meta("last_commit", "abc123").unwrap();
         store.set_meta("phase_b_commit", "abc123").unwrap();
-        let ids: Vec<_> = nodes
-            .iter()
-            .map(|n| store.put_node(n).unwrap())
-            .collect();
+        let ids: Vec<_> = nodes.iter().map(|n| store.put_node(n).unwrap()).collect();
         // Chain: node 0 → node 1 → ... → node 9 via RefCall edges so PPR sees them all.
         for i in 0..ids.len() - 1 {
             store
@@ -4992,8 +5005,15 @@ mod snippet_tests {
         }
         let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
         let (seeds, n_eligible) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
-        assert_eq!(seeds.len(), MAX_EMBED_SEEDS, "seeds capped at MAX_EMBED_SEEDS");
-        assert_eq!(n_eligible, n_total, "n_eligible counts all eligible before cap");
+        assert_eq!(
+            seeds.len(),
+            MAX_EMBED_SEEDS,
+            "seeds capped at MAX_EMBED_SEEDS"
+        );
+        assert_eq!(
+            n_eligible, n_total,
+            "n_eligible counts all eligible before cap"
+        );
     }
 
     /// embed_path_seeds: seed-cap signal fires (n_eligible > seeds.len()) when cap was hit.
