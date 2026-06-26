@@ -21,6 +21,7 @@ use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
     link_imports_rust, run_lsif_emitter, FfiMarker,
 };
+use travsr_analysis::skeleton::skeleton_for_node;
 use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
@@ -452,6 +453,45 @@ fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -
         }
     }
     exclude
+}
+
+/// Compute and persist `embed_text` for all nodes where it is currently NULL.
+///
+/// Called after Phase A indexing so the embed sidecar (travsr-embed) can read
+/// a pre-computed AST-skeleton string instead of assembling it from SQL subqueries.
+/// Batch size of 500 keeps SQLite transactions short and avoids memory pressure
+/// on large repos.
+fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path) {
+    let nodes = match store.nodes_missing_embed_text() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("update_embed_texts: failed to query missing nodes: {e}");
+            return;
+        }
+    };
+    if nodes.is_empty() {
+        return;
+    }
+    tracing::debug!(count = nodes.len(), "computing embed_text for nodes");
+    const BATCH: usize = 500;
+    let mut pairs: Vec<(travsr_core::NodeId, String)> = Vec::with_capacity(BATCH);
+    for node in &nodes {
+        if let Some(skel) = skeleton_for_node(node, repo_root) {
+            let text = skel.to_embed_text(&node.kind, &node.vname.signature, &node.vname.path);
+            pairs.push((node.id, text));
+            if pairs.len() >= BATCH {
+                if let Err(e) = store.write_embed_texts_batch(&pairs) {
+                    tracing::warn!("update_embed_texts: batch write failed: {e}");
+                }
+                pairs.clear();
+            }
+        }
+    }
+    if !pairs.is_empty() {
+        if let Err(e) = store.write_embed_texts_batch(&pairs) {
+            tracing::warn!("update_embed_texts: final batch write failed: {e}");
+        }
+    }
 }
 
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
@@ -1010,6 +1050,10 @@ pub fn init_repo_with_progress(
         Err(e) => tracing::warn!("kcore: computation failed after init: {e}"),
     }
 
+    // Pre-compute AST-skeleton embed text for all nodes so the embed sidecar
+    // can read richer text without cross-repo dependencies.
+    update_embed_texts(&mut store, repo_root);
+
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
         files_indexed: batch_counts.files_written,
@@ -1551,6 +1595,9 @@ pub fn reindex_files(
             }
             Err(e) => tracing::warn!("kcore: computation failed: {e}"),
         }
+
+        // Populate embed_text for newly-indexed nodes.
+        update_embed_texts(store, repo_root);
     }
 
     // PERF-002: The LSIF semantic pass was running on every `reindex_files`

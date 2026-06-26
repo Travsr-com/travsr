@@ -296,6 +296,20 @@ impl Migration for V15KcoreShells {
     }
 }
 
+/// V18: embed_text column — pre-computed AST-skeleton embed text per node.
+struct V18EmbedText;
+impl Migration for V18EmbedText {
+    fn version(&self) -> u32 {
+        18
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        if !store.column_exists("nodes", "embed_text")? {
+            store.exec_ddl(include_str!("migrations/v18_embed_text.sql"))?;
+        }
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -316,6 +330,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V15KcoreShells);
     r.register(V16NodeEmbeddings);
     r.register(V17NodeTombstones);
+    r.register(V18EmbedText);
     r
 }
 
@@ -1475,6 +1490,80 @@ LIMIT 100",
     ///
     /// Uses a single prepared statement executed inside one transaction for speed.
     /// O(|shells|) writes — safe to call after every index pass.
+    /// Batch-update the `embed_text` column for a set of nodes.
+    ///
+    /// Called by the daemon after Phase A indexing to store pre-computed
+    /// AST-skeleton text so the embed sidecar stays a pure embedding machine.
+    pub fn write_embed_texts_batch(
+        &mut self,
+        pairs: &[(NodeId, String)],
+    ) -> Result<(), StoreError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("begin write_embed_texts_batch tx")?;
+            {
+                let mut stmt = tx
+                    .prepare("UPDATE nodes SET embed_text = ?2 WHERE id = ?1")
+                    .context("preparing write_embed_texts_batch stmt")?;
+                for (id, text) in pairs {
+                    stmt.execute(params![node_id_to_i64(*id), text])
+                        .context("executing write_embed_texts_batch update")?;
+                }
+            }
+            tx.commit().context("committing write_embed_texts_batch tx")
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Return all nodes where `embed_text IS NULL` and the kind is embeddable
+    /// (i.e. excludes file/import/module/variable structural noise).
+    ///
+    /// Called by the daemon after Phase A to find nodes that need embed_text
+    /// populated via `skeleton_for_node`.
+    pub fn nodes_missing_embed_text(&self) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line \
+                 FROM nodes \
+                 WHERE embed_text IS NULL \
+                   AND kind NOT IN ('file', 'file-module', 'import', 'module', 'variable')",
+            ).context("preparing nodes_missing_embed_text query")?;
+            let rows = stmt.query_map([], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                Ok(Node {
+                    id,
+                    vname,
+                    kind,
+                    package,
+                    line: line.and_then(|l| u32::try_from(l).ok()),
+                    end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                })
+            }).context("executing nodes_missing_embed_text query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding nodes_missing_embed_text row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn write_shell_numbers(&mut self, shells: &[(NodeId, u32)]) -> Result<(), StoreError> {
         if shells.is_empty() {
             return Ok(());

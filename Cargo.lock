@@ -3122,6 +3122,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "travsr-analysis",
  "travsr-core",
  "travsr-indexer",
  "travsr-ipc",

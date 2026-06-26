@@ -16,6 +16,7 @@ travsr-indexer = { path = "../travsr-indexer" }
 travsr-retrieval = { path = "../travsr-retrieval" }
 travsr-store = { path = "../travsr-store" }
 travsr-plugin-host = { path = "../travsr-plugin-host" }
+travsr-analysis = { path = "../travsr-analysis" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

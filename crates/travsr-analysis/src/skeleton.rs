@@ -37,6 +37,10 @@ pub struct AstSkeleton {
     /// Unresolved direct callee identifiers within the body (structural, not semantic).
     /// Capped at 20. Member calls are de-qualified: `self.foo()` → `foo`.
     pub callees: Vec<String>,
+    /// Doc comments (preceding siblings) + body comments (DFS within body), stripped
+    /// of comment markers. Collected in source order; up to 60 entries pre-subsampling.
+    /// Even subsampling is applied at render/embed time so coverage spans the full body.
+    pub comments: Vec<String>,
     /// Rough token estimate: `(declaration_byte_length / 4).max(512)`.
     pub token_estimate: usize,
 }
@@ -65,8 +69,58 @@ impl AstSkeleton {
         if !self.callees.is_empty() {
             out.push(format!("  calls: {}", self.callees.join(", ")));
         }
+        if !self.comments.is_empty() {
+            let sampled = subsample_comments(&self.comments, 15);
+            out.push(format!("  doc: {}", sampled.join(" | ")));
+        }
         out.join("\n")
     }
+
+    /// Compact single-line text optimised for embedding.
+    ///
+    /// Format: `kind: sig | module: path | params: … | returns: … | calls: … | doc: …`
+    /// All fields are pipe-separated on one line. Comments are evenly subsampled to
+    /// 15 entries and joined with spaces so they read as flowing prose for the encoder.
+    /// Total length is capped at 1800 chars (~450 tokens) to stay within BGE-small's
+    /// 512-token input window after the kind/module prefix.
+    pub fn to_embed_text(&self, kind: &str, signature: &str, module: &str) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("{kind}: {signature}"));
+        if !module.is_empty() {
+            parts.push(format!("module: {module}"));
+        }
+        if !self.params.is_empty() {
+            parts.push(format!("params: {}", self.params.join(", ")));
+        }
+        if let Some(r) = &self.return_type {
+            if !r.is_empty() {
+                parts.push(format!("returns: {r}"));
+            }
+        }
+        if !self.callees.is_empty() {
+            parts.push(format!("calls: {}", self.callees.join(", ")));
+        }
+        if !self.comments.is_empty() {
+            let sampled = subsample_comments(&self.comments, 15);
+            parts.push(format!("doc: {}", sampled.join(" ")));
+        }
+        let text = parts.join(" | ");
+        if text.len() > 1800 {
+            text[..1800].to_string()
+        } else {
+            text
+        }
+    }
+}
+
+/// Even subsampling: pick at most `max_count` entries spread across `comments`.
+/// step = max(1, len / max_count) — coverage across the full body regardless of length.
+fn subsample_comments(comments: &[String], max_count: usize) -> Vec<&str> {
+    if comments.is_empty() {
+        return vec![];
+    }
+    let step = (comments.len() / max_count).max(1);
+    comments.iter().step_by(step).map(|s| s.as_str()).collect()
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -336,22 +390,23 @@ fn find_decl_dfs<'a>(node: TsNode<'a>, target_row: usize, kinds: &[&str]) -> Opt
 
 fn extract_skeleton(decl: TsNode<'_>, src: &[u8], node: &Node, lang: &Lang) -> AstSkeleton {
     let token_estimate = ((decl.end_byte() - decl.start_byte()) / 4).max(512);
+    let ck = comment_kinds_for(lang);
     match lang {
-        Lang::Rust => extract_rust(decl, src, &node.kind, token_estimate),
-        Lang::TypeScript { .. } => extract_typescript(decl, src, &node.kind, token_estimate),
-        Lang::Python => extract_python(decl, src, &node.kind, token_estimate),
-        Lang::Go => extract_go(decl, src, &node.kind, token_estimate),
-        Lang::Java => extract_java(decl, src, &node.kind, token_estimate),
-        Lang::Kotlin => extract_kotlin(decl, src, &node.kind, token_estimate),
-        Lang::C => extract_c(decl, src, &node.kind, token_estimate),
-        Lang::Cpp => extract_cpp(decl, src, &node.kind, token_estimate),
-        Lang::CSharp => extract_csharp(decl, src, &node.kind, token_estimate),
-        Lang::Swift => extract_swift(decl, src, &node.kind, token_estimate),
-        Lang::Dart => extract_dart(decl, src, &node.kind, token_estimate),
-        Lang::Ruby => extract_ruby(decl, src, &node.kind, token_estimate),
-        Lang::Scala => extract_scala(decl, src, &node.kind, token_estimate),
-        Lang::Php => extract_php(decl, src, &node.kind, token_estimate),
-        Lang::ObjectiveC => extract_objc(decl, src, &node.kind, token_estimate),
+        Lang::Rust => extract_rust(decl, src, &node.kind, token_estimate, ck),
+        Lang::TypeScript { .. } => extract_typescript(decl, src, &node.kind, token_estimate, ck),
+        Lang::Python => extract_python(decl, src, &node.kind, token_estimate, ck),
+        Lang::Go => extract_go(decl, src, &node.kind, token_estimate, ck),
+        Lang::Java => extract_java(decl, src, &node.kind, token_estimate, ck),
+        Lang::Kotlin => extract_kotlin(decl, src, &node.kind, token_estimate, ck),
+        Lang::C => extract_c(decl, src, &node.kind, token_estimate, ck),
+        Lang::Cpp => extract_cpp(decl, src, &node.kind, token_estimate, ck),
+        Lang::CSharp => extract_csharp(decl, src, &node.kind, token_estimate, ck),
+        Lang::Swift => extract_swift(decl, src, &node.kind, token_estimate, ck),
+        Lang::Dart => extract_dart(decl, src, &node.kind, token_estimate, ck),
+        Lang::Ruby => extract_ruby(decl, src, &node.kind, token_estimate, ck),
+        Lang::Scala => extract_scala(decl, src, &node.kind, token_estimate, ck),
+        Lang::Php => extract_php(decl, src, &node.kind, token_estimate, ck),
+        Lang::ObjectiveC => extract_objc(decl, src, &node.kind, token_estimate, ck),
     }
 }
 
@@ -362,11 +417,13 @@ fn extract_rust(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_item" => {
@@ -385,6 +442,7 @@ fn extract_rust(
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "struct_item" => {
@@ -457,6 +515,7 @@ fn extract_rust(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -468,11 +527,13 @@ fn extract_typescript(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_declaration" | "method_definition" => {
@@ -493,12 +554,12 @@ fn extract_typescript(
                 }
             }
             if let Some(r) = decl.child_by_field_name("return_type") {
-                // type_annotation text is ": SomeType" — strip the leading colon.
                 let raw = node_text(r, src);
                 return_type = Some(raw.trim_start_matches(':').trim().to_string());
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
@@ -554,6 +615,7 @@ fn extract_typescript(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -565,11 +627,14 @@ fn extract_python(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    // Python has no preceding doc-comment siblings; docstrings live inside the body.
+    let mut comments: Vec<String> = Vec::new();
 
     match decl.kind() {
         "function_definition" => {
@@ -600,11 +665,19 @@ fn extract_python(
                 return_type = Some(node_text(r, src).to_string());
             }
             if let Some(body) = decl.child_by_field_name("body") {
+                // Docstring is the first expression_statement → string in the body.
+                if let Some(doc) = collect_python_docstring(body, src) {
+                    comments.push(doc);
+                }
                 collect_callees_dfs(body, src, "call", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_definition" => {
             if let Some(body) = decl.child_by_field_name("body") {
+                if let Some(doc) = collect_python_docstring(body, src) {
+                    comments.push(doc);
+                }
                 for i in 0..body.named_child_count() {
                     let Some(c) = body.named_child(i as u32) else {
                         continue;
@@ -627,17 +700,19 @@ fn extract_python(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
 
 // ── Go ────────────────────────────────────────────────────────────────────────
 
-fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usize) -> AstSkeleton {
+fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usize, ck: &[&str]) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_declaration" | "method_declaration" => {
@@ -663,6 +738,7 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
                 };
                 if c.kind() == "block" {
                     collect_callees_dfs(c, src, "call_expression", &mut callees);
+                    collect_body_comments_dfs(c, src, ck, &mut comments);
                     break;
                 }
             }
@@ -717,6 +793,7 @@ fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usi
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -728,15 +805,16 @@ fn extract_java(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "method_declaration" => {
-            // formal_parameters -> formal_parameter children
             if let Some(fp) = decl.child_by_field_name("parameters") {
                 collect_formal_params(
                     fp,
@@ -745,13 +823,12 @@ fn extract_java(
                     &mut params,
                 );
             }
-            // return type is the `type` field
             if let Some(rt) = decl.child_by_field_name("type") {
                 return_type = Some(node_text(rt, src).to_string());
             }
             if let Some(body) = decl.child_by_field_name("body") {
-                // method_invocation -> name field (not "function")
                 collect_callees_field(body, src, "method_invocation", "name", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "constructor_declaration" => {
@@ -765,6 +842,7 @@ fn extract_java(
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_field(body, src, "method_invocation", "name", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_declaration" | "record_declaration" => {
@@ -819,6 +897,7 @@ fn extract_java(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -830,10 +909,12 @@ fn extract_kotlin(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_declaration" | "secondary_constructor" => {
@@ -852,6 +933,7 @@ fn extract_kotlin(
             // Body is a function_body named child; collect callees from it
             if let Some(body) = named_child_of_kind(decl, "function_body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_declaration" | "object_declaration" => {
@@ -876,17 +958,25 @@ fn extract_kotlin(
         return_type: None, // shown in signature; no dedicated field in tree-sitter-kotlin-ng
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
 
 // ── C ─────────────────────────────────────────────────────────────────────────
 
-fn extract_c(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usize) -> AstSkeleton {
+fn extract_c(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+    ck: &[&str],
+) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_definition" => {
@@ -911,6 +1001,7 @@ fn extract_c(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usiz
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "struct_specifier" => {
@@ -947,6 +1038,7 @@ fn extract_c(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usiz
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -958,16 +1050,18 @@ fn extract_cpp(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     // function_definition and struct_specifier/enum_specifier share logic with C
     match decl.kind() {
         "function_definition" | "struct_specifier" | "enum_specifier" => {
-            return extract_c(decl, src, node_kind, token_estimate)
+            return extract_c(decl, src, node_kind, token_estimate, ck)
         }
         _ => {}
     }
 
     let mut fields: Vec<String> = Vec::new();
+    let comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "class_specifier" => {
@@ -1017,6 +1111,7 @@ fn extract_cpp(
         return_type: None,
         fields,
         callees: vec![],
+        comments,
         token_estimate,
     }
 }
@@ -1028,11 +1123,13 @@ fn extract_csharp(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "method_declaration" => {
@@ -1045,6 +1142,7 @@ fn extract_csharp(
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "invocation_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "constructor_declaration" => {
@@ -1053,6 +1151,7 @@ fn extract_csharp(
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "invocation_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_declaration"
@@ -1101,6 +1200,7 @@ fn extract_csharp(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -1112,10 +1212,12 @@ fn extract_swift(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_declaration" | "protocol_function_declaration" => {
@@ -1133,6 +1235,9 @@ fn extract_swift(
                     params.push(node_text(c, src).to_string());
                 }
             }
+            if let Some(body) = named_child_of_kind(decl, "code_block") {
+                collect_body_comments_dfs(body, src, ck, &mut comments);
+            }
         }
         "init_declaration" => {
             for i in 0..decl.named_child_count() {
@@ -1142,6 +1247,9 @@ fn extract_swift(
                 if c.kind() == "parameter" {
                     params.push(node_text(c, src).to_string());
                 }
+            }
+            if let Some(body) = named_child_of_kind(decl, "code_block") {
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_declaration" | "protocol_declaration" => {
@@ -1185,6 +1293,7 @@ fn extract_swift(
         return_type,
         fields,
         callees: vec![], // call_expression in Swift has no named fields
+        comments,
         token_estimate,
     }
 }
@@ -1196,11 +1305,13 @@ fn extract_dart(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_declaration"
@@ -1233,6 +1344,7 @@ fn extract_dart(
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_declaration" => {
@@ -1324,6 +1436,7 @@ fn extract_dart(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -1335,10 +1448,12 @@ fn extract_ruby(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "method" | "singleton_method" => {
@@ -1365,6 +1480,7 @@ fn extract_ruby(
             if let Some(body) = decl.child_by_field_name("body") {
                 // Ruby call nodes: `call` -> method field
                 collect_callees_field(body, src, "call", "method", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class" | "module" => {
@@ -1389,6 +1505,7 @@ fn extract_ruby(
         return_type: None, // Ruby is dynamically typed
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -1400,11 +1517,13 @@ fn extract_scala(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_definition" => {
@@ -1425,6 +1544,7 @@ fn extract_scala(
             }
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_definition" | "object_definition" | "trait_definition" => {
@@ -1453,6 +1573,7 @@ fn extract_scala(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -1464,11 +1585,13 @@ fn extract_php(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_definition" | "method_declaration" => {
@@ -1491,6 +1614,7 @@ fn extract_php(
                 collect_callees_dfs(body, src, "function_call_expression", &mut callees);
                 // member calls use `name` field
                 collect_callees_field(body, src, "member_call_expression", "name", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_declaration" | "interface_declaration" => {
@@ -1529,6 +1653,7 @@ fn extract_php(
         return_type,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -1540,20 +1665,23 @@ fn extract_objc(
     src: &[u8],
     node_kind: &str,
     token_estimate: usize,
+    ck: &[&str],
 ) -> AstSkeleton {
     let mut fields: Vec<String> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
+    let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
         "function_definition" => {
             // ObjC C-style functions are identical to C
-            return extract_c(decl, src, node_kind, token_estimate);
+            return extract_c(decl, src, node_kind, token_estimate, ck);
         }
         "method_definition" => {
             // ObjC method body is compound_statement (not a field — added to decl_header fallback)
             if let Some(body) = named_child_of_kind(decl, "compound_statement") {
                 // message_expression -> method field gives the selector
                 collect_callees_field(body, src, "message_expression", "method", &mut callees);
+                collect_body_comments_dfs(body, src, ck, &mut comments);
             }
         }
         "class_interface" | "protocol_declaration" => {
@@ -1600,6 +1728,7 @@ fn extract_objc(
         return_type: None,
         fields,
         callees,
+        comments,
         token_estimate,
     }
 }
@@ -1694,6 +1823,118 @@ fn collect_formal_params(fp: TsNode<'_>, param_kinds: &[&str], src: &[u8], out: 
     }
 }
 
+// ── Comment helpers ───────────────────────────────────────────────────────────
+
+/// Tree-sitter named-node kinds that represent comments in each language.
+fn comment_kinds_for(lang: &Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Rust => &["line_comment", "block_comment"],
+        Lang::TypeScript { .. } => &["comment"],
+        Lang::Python => &["comment"],
+        Lang::Go => &["comment"],
+        Lang::Java => &["line_comment", "block_comment"],
+        Lang::Kotlin => &["line_comment", "multiline_comment"],
+        Lang::C | Lang::Cpp | Lang::ObjectiveC => &["comment"],
+        Lang::CSharp => &["line_comment", "block_comment"],
+        Lang::Swift => &["comment", "multiline_comment"],
+        Lang::Dart => &["comment", "documentation_comment"],
+        Lang::Ruby => &["comment"],
+        Lang::Scala => &["line_comment", "block_comment"],
+        Lang::Php => &["comment", "doc_comment"],
+    }
+}
+
+/// Strip leading comment-marker syntax and trailing close-markers, returning
+/// the clean prose text. Works for `//`, `///`, `/** */`, `#`, `--`, `*` etc.
+fn strip_comment_marker(s: &str) -> String {
+    let s = s.trim();
+    // Strip leading markers (longest first to avoid partial matches)
+    let s = s
+        .trim_start_matches("///")
+        .trim_start_matches("//!")
+        .trim_start_matches("//")
+        .trim_start_matches("/**")
+        .trim_start_matches("/*!")
+        .trim_start_matches("/*")
+        .trim_start_matches("*/")
+        .trim_start_matches('*')
+        .trim_start_matches("--")
+        .trim_start_matches('#')
+        .trim();
+    // Strip trailing close-marker
+    let s = s.trim_end_matches("*/").trim();
+    s.to_string()
+}
+
+/// Walk `prev_named_sibling()` from `decl` to collect adjacent doc-comment nodes.
+/// Stops at the first non-comment named sibling. Results are reversed to source order.
+fn collect_doc_comments(decl: TsNode<'_>, src: &[u8], comment_kinds: &[&str]) -> Vec<String> {
+    let mut docs: Vec<String> = Vec::new();
+    let mut cursor = decl.prev_named_sibling();
+    while let Some(sib) = cursor {
+        if comment_kinds.contains(&sib.kind()) {
+            let stripped = strip_comment_marker(node_text(sib, src));
+            if !stripped.is_empty() {
+                docs.push(stripped);
+            }
+            cursor = sib.prev_named_sibling();
+        } else {
+            break;
+        }
+    }
+    docs.reverse();
+    docs
+}
+
+/// DFS over `node` collecting comment-kind nodes into `out`.
+/// Capped at 60 entries; even subsampling to ≤15 is applied at render time.
+fn collect_body_comments_dfs(
+    node: TsNode<'_>,
+    src: &[u8],
+    comment_kinds: &[&str],
+    out: &mut Vec<String>,
+) {
+    if out.len() >= 60 {
+        return;
+    }
+    if comment_kinds.contains(&node.kind()) {
+        let stripped = strip_comment_marker(node_text(node, src));
+        if !stripped.is_empty() {
+            out.push(stripped);
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            collect_body_comments_dfs(child, src, comment_kinds, out);
+        }
+    }
+}
+
+/// Extract a Python docstring: the first `string` child of an `expression_statement`
+/// that is the first statement in `body`. Returns the stripped text.
+fn collect_python_docstring(body: TsNode<'_>, src: &[u8]) -> Option<String> {
+    let first = body.named_child(0)?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let string_node = first.named_child(0)?;
+    if string_node.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(string_node, src);
+    let stripped = raw
+        .trim_start_matches("\"\"\"")
+        .trim_start_matches("'''")
+        .trim_end_matches("\"\"\"")
+        .trim_end_matches("'''")
+        .trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
 /// DFS over named children collecting call expression targets.
 /// Capped at 20 entries; member calls are de-qualified: `self.foo()` → `foo`.
 fn collect_callees_dfs(node: TsNode<'_>, src: &[u8], call_kind: &str, out: &mut Vec<String>) {
@@ -1782,6 +2023,7 @@ mod tests {
             return_type: Some("Result<()>".to_string()),
             fields: vec![],
             callees: vec!["validate".to_string()],
+            comments: vec![],
             token_estimate: 512,
         };
         let r = s.render();
