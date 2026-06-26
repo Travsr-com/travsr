@@ -73,7 +73,7 @@ pub const BACKENDS: &[EmbedBackend] = &[
         mteb: 62.2,
         ram_mb: 200,
         init_secs: 11,
-        binary_name: "travsr-embed-nomic",
+        binary_name: "travsr-embed",
         github_repo: "Travsr-com/travsr-embed",
         version_fallback: "v1.0.0",
         model_files: &[
@@ -101,7 +101,7 @@ pub const BACKENDS: &[EmbedBackend] = &[
         mteb: 63.6,
         ram_mb: 450,
         init_secs: 47,
-        binary_name: "travsr-embed-nomic",
+        binary_name: "travsr-embed",
         github_repo: "Travsr-com/travsr-embed",
         version_fallback: "v1.0.0",
         model_files: &[
@@ -129,7 +129,7 @@ pub const BACKENDS: &[EmbedBackend] = &[
         mteb: 64.2,
         ram_mb: 1400,
         init_secs: 150,
-        binary_name: "travsr-embed-nomic",
+        binary_name: "travsr-embed",
         github_repo: "Travsr-com/travsr-embed",
         version_fallback: "v1.0.0",
         model_files: &[
@@ -326,6 +326,7 @@ fn run_parallel_reindex(
     embed_db_path: &Path,
     _model_id: &str,
     phase: PhaseFilter,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let n = derive_num_workers();
 
@@ -339,11 +340,12 @@ fn run_parallel_reindex(
         .arg("--parallel")
         .arg(n.to_string())
         .stdin(Stdio::null())
-        // Suppress sidecar tracing logs from the user terminal; they are
-        // internal diagnostics, not user-facing output. The sidecar's
-        // progress/completion messages go to stdout and are still shown.
-        // Failures are surfaced via the exit-code check below.
         .stderr(Stdio::null());
+    // Suppress sidecar stdout when the caller renders its own progress UI
+    // (e.g. `travsr embed init`). Background daemon paths leave it inherited.
+    if quiet {
+        cmd.stdout(Stdio::null());
+    }
 
     if let Some((flag, val)) = phase.sidecar_flag() {
         cmd.arg(flag).arg(val.to_string());
@@ -403,6 +405,7 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
                 &embed_db_path,
                 &model_id,
                 PhaseFilter::Phase1 { threshold },
+                false,
             ) {
                 tracing::warn!("embed Phase 1 failed: {e:#}");
             }
@@ -436,7 +439,7 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
         .name("embed-reindex-phase2".into())
         .spawn(move || {
             if let Err(e) =
-                run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase)
+                run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase, false)
             {
                 tracing::warn!("embed Phase 2 failed: {e:#}");
             }
@@ -460,6 +463,7 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
                 &embed_db_path,
                 &model_id,
                 PhaseFilter::All,
+                false,
             ) {
                 tracing::warn!("embed reindex-all failed: {e:#}");
             }
@@ -488,7 +492,26 @@ pub fn run_parallel_reindex_blocking(
         None => PhaseFilter::All,
     };
 
-    run_parallel_reindex(&bin_path, db_path, &embed_db_path, &model_id, phase)
+    run_parallel_reindex(&bin_path, db_path, &embed_db_path, &model_id, phase, false)
+}
+
+/// Blocking reindex with sidecar stdout suppressed — called from `travsr embed init`
+/// which renders its own progress UI. All nodes, no phase split.
+pub fn run_parallel_reindex_blocking_quiet(db_path: &Path) -> anyhow::Result<()> {
+    let (bin_path, embed_db_path, model_id) = resolve_backend(db_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No embedding backend active or binary missing. \
+             Run `travsr embed init` first."
+        )
+    })?;
+    run_parallel_reindex(
+        &bin_path,
+        db_path,
+        &embed_db_path,
+        &model_id,
+        PhaseFilter::All,
+        true,
+    )
 }
 
 // ── Shared resolution helper ──────────────────────────────────────────────────

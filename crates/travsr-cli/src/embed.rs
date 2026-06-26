@@ -5,8 +5,15 @@
 
 use anyhow::{bail, Context as _, Result};
 use clap::Subcommand;
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use travsr_plugin_host::{lookup_embed_backend, EmbedBackend, EMBED_BACKENDS};
+
+use crate::progress::{fmt_dur, Palette};
 
 const EMBED_RELEASES_BASE: &str = "https://github.com";
 const HF_BASE: &str = "https://huggingface.co";
@@ -139,100 +146,313 @@ fn cmd_list(json: bool) -> Result<()> {
 // ── init ──────────────────────────────────────────────────────────────────────
 
 fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
-    let backend = match backend_id {
+    let pal = Palette::for_stream(std::io::stdout().is_terminal());
+
+    let backend: &'static EmbedBackend = match backend_id {
         Some(id) => lookup_embed_backend(id).ok_or_else(|| {
             anyhow::anyhow!("Unknown backend '{id}'. Run `travsr embed list` to see options.")
         })?,
-        None => EMBED_BACKENDS
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No embed backends in catalog."))?,
+        None => {
+            use std::io::IsTerminal as _;
+            if !std::io::stdin().is_terminal() {
+                // Non-interactive: list and exit without selecting.
+                println!("Available embedding models (run with --backend <id> to install):\n");
+                for b in EMBED_BACKENDS {
+                    let dl_mb: u32 = b.model_files.iter().map(|f| f.size_hint_mb).sum();
+                    println!("  {}  ({} MB download)", b.id, dl_mb);
+                    println!("  {}\n", b.description);
+                }
+                return Ok(());
+            }
+            match pick_backend_interactive()? {
+                Some(b) => b,
+                None => return Ok(()),
+            }
+        }
     };
 
-    install_backend(backend, reinstall)?;
+    println!();
+    install_backend_with_progress(backend, reinstall)?;
 
-    // Activate immediately if this is the first install or explicit choice.
+    // Activate.
     let mut config = load_config().unwrap_or_default();
     config.active = Some(backend.id.to_string());
     save_config(&config)?;
 
-    println!(
-        "\u{2713} '{}' is now the active embedding backend.",
-        backend.id
-    );
-    println!("  Restart the daemon to apply: travsr daemon restart");
+    // Auto-reindex the current repo if one exists.
+    let db_path = std::env::current_dir()
+        .ok()
+        .and_then(|c| crate::repo::find_git_root(&c).ok())
+        .map(|r| r.join(".travsr/graph.db"))
+        .filter(|p| p.exists());
+
+    match db_path {
+        Some(ref p) => reindex_after_init(backend, p)?,
+        None => {
+            println!("\n  {} {} is now active", pal.green("\u{25cf}"), backend.id);
+            println!(
+                "  {} run `travsr embed reindex` inside a travsr repo to build embeddings",
+                pal.dim("\u{2139}")
+            );
+            println!(
+                "  {} then restart the daemon: travsr daemon restart",
+                pal.dim("\u{2139}")
+            );
+        }
+    }
+
     Ok(())
 }
 
-fn install_backend(backend: &'static EmbedBackend, reinstall: bool) -> Result<()> {
+/// Interactive numbered model selector, matching the `travsr lang detect` style.
+fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
+    let active = load_config().and_then(|c| c.active);
+    let bin_dir = embed_bin_dir()?;
+
+    println!("  Available embedding models:\n");
+    for (i, b) in EMBED_BACKENDS.iter().enumerate() {
+        let is_active = active.as_deref() == Some(b.id);
+        let installed = bin_dir.join(b.binary_name).exists()
+            && embed_model_dir(b.id)
+                .map(|d| b.model_files.iter().all(|f| d.join(f.name).exists()))
+                .unwrap_or(false);
+        let tag = if is_active {
+            "  (active)"
+        } else if installed {
+            "  (installed)"
+        } else {
+            ""
+        };
+        let dl_mb: u32 = b.model_files.iter().map(|f| f.size_hint_mb).sum();
+        let ram = if b.ram_mb >= 1000 {
+            format!("~{:.1} GB RAM", b.ram_mb as f32 / 1024.0)
+        } else {
+            format!("~{} MB RAM", b.ram_mb)
+        };
+        println!(
+            "  [{}] {}{}\n      {} dim · {}M params · MTEB {} · {} MB download · {}\n      {}\n",
+            i + 1,
+            b.id,
+            tag,
+            b.dim,
+            b.params_m,
+            b.mteb,
+            dl_mb,
+            ram,
+            b.description,
+        );
+    }
+
+    use std::io::Write as _;
+    print!("  Which model? (1-{}, q to quit): ", EMBED_BACKENDS.len());
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.eq_ignore_ascii_case("q") || input.is_empty() {
+        return Ok(None);
+    }
+
+    match input.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= EMBED_BACKENDS.len() => Ok(Some(&EMBED_BACKENDS[n - 1])),
+        _ => {
+            println!("  invalid selection '{input}'");
+            Ok(None)
+        }
+    }
+}
+
+fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool) -> Result<()> {
+    let pal = Palette::for_stream(std::io::stdout().is_terminal());
     let bin_dir = embed_bin_dir()?;
     let dest = bin_dir.join(backend.binary_name);
 
     if dest.exists() && !reinstall {
-        println!("\u{2713} {} already installed.", backend.binary_name);
+        println!("  {} {} ready", pal.green("\u{25cf}"), backend.binary_name);
     } else {
         let target = crate::install::current_target().context("determining install target")?;
-
         let repo = backend.github_repo.to_string();
         let version = crate::lang::run_async(async move {
             crate::install::fetch_latest_version_for_repo(&repo).await
         })
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "warning: could not fetch latest version ({e:#}), using {}",
-                backend.version_fallback
-            );
-            backend.version_fallback.to_string()
-        });
-
-        println!("Downloading {} {} ...", backend.binary_name, version);
+        .unwrap_or_else(|_| backend.version_fallback.to_string());
 
         let bin_name = backend.binary_name.to_string();
         let repo2 = backend.github_repo.to_string();
         let ver2 = version.clone();
         let tgt = target.to_string();
-
         let path = crate::lang::run_async(async move {
             download_embed_binary(&repo2, &ver2, &bin_name, &tgt).await
         })
         .context("downloading embed binary")?;
 
         println!(
-            "\u{2713} {} installed to {}",
+            "  {} {} installed  ({})",
+            pal.green("\u{25cf}"),
             backend.binary_name,
             path.display()
         );
 
         if !crate::install::path_contains_travsr_bin() {
             println!(
-                "\nhint: add ~/.travsr/bin to your PATH:\n\n\
-                 \texport PATH=\"$HOME/.travsr/bin:$PATH\"\n"
+                "\n  hint: add ~/.travsr/bin to your PATH:\n\
+                 \n\t  export PATH=\"$HOME/.travsr/bin:$PATH\"\n"
             );
         }
     }
 
-    // Download model files.
+    // Model files — one spinner per file.
     let model_dir = embed_model_dir(backend.id)?;
-    let mut any_downloaded = false;
     for mf in backend.model_files {
         let dest = model_dir.join(mf.name);
         if dest.exists() && !reinstall {
-            println!("\u{2713} {} already present.", mf.name);
+            println!("  {} {} already present", pal.green("\u{25cf}"), mf.name);
             continue;
         }
-        println!("Downloading {} (~{} MB) ...", mf.name, mf.size_hint_mb);
         let hf_repo = mf.hf_repo.to_string();
         let url_path = mf.url_path.to_string();
         let name = mf.name.to_string();
-        let dest2 = dest.clone();
+        let size_mb = mf.size_hint_mb;
         crate::lang::run_async(async move {
-            download_model_file(&hf_repo, &url_path, &name, &dest2).await
+            download_model_file_with_progress(&hf_repo, &url_path, &name, &dest, size_mb).await
         })
-        .with_context(|| format!("downloading model file {}", mf.name))?;
-        any_downloaded = true;
+        .with_context(|| format!("downloading {}", mf.name))?;
     }
-    if !any_downloaded && !reinstall {
-        println!("\u{2713} All model files already present.");
+
+    Ok(())
+}
+
+async fn download_model_file_with_progress(
+    hf_repo: &str,
+    url_path: &str,
+    file_name: &str,
+    dest: &std::path::Path,
+    size_hint_mb: u32,
+) -> Result<()> {
+    let url = format!("{HF_BASE}/{hf_repo}/resolve/main/{url_path}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+
+    let resp = client.get(&url).send().await.context("GET model file")?;
+    if !resp.status().is_success() {
+        bail!("model file download failed ({}): {url}", resp.status());
     }
+    let total_mb = resp
+        .content_length()
+        .map(|n| n / 1_048_576)
+        .unwrap_or(size_hint_mb as u64);
+
+    let is_tty = std::io::stderr().is_terminal();
+    let name = file_name.to_string();
+
+    // Spinner task — aborted once bytes() resolves.
+    let spinner = if is_tty {
+        Some(tokio::spawn(async move {
+            use std::io::Write as _;
+            const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+            let pal = Palette::for_stream(true);
+            let start = std::time::Instant::now();
+            let mut i = 0usize;
+            loop {
+                let spin = pal.orange(&FRAMES[i % 4].to_string());
+                let elapsed = start.elapsed().as_secs();
+                eprint!("\r  {spin} downloading {name} ({total_mb} MB) ...  {elapsed}s    ");
+                let _ = std::io::stderr().flush();
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }))
+    } else {
+        eprintln!("  downloading {file_name} ({total_mb} MB) ...");
+        None
+    };
+
+    let bytes = resp.bytes().await.context("reading model file body")?;
+
+    if let Some(h) = spinner {
+        h.abort();
+        use std::io::Write as _;
+        eprint!("\r{}\r", " ".repeat(72));
+        let _ = std::io::stderr().flush();
+    }
+
+    let tmp = dest.with_extension("tmp");
+    std::fs::write(&tmp, &bytes).with_context(|| format!("writing model file {file_name}"))?;
+    std::fs::rename(&tmp, dest).with_context(|| format!("installing model file {file_name}"))?;
+
+    let actual_mb = bytes.len() / 1_048_576;
+    let pal = Palette::for_stream(std::io::stdout().is_terminal());
+    println!(
+        "  {} {file_name} ready · {actual_mb} MB",
+        pal.green("\u{25cf}")
+    );
+    Ok(())
+}
+
+/// Reindex with a spinner, suppressing sidecar stdout, then show count + daemon hint.
+fn reindex_after_init(backend: &'static EmbedBackend, db_path: &std::path::Path) -> Result<()> {
+    let is_tty = std::io::stderr().is_terminal();
+    let pal = Palette::for_stream(std::io::stdout().is_terminal());
+
+    println!();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done2 = Arc::clone(&done);
+    let mid = backend.id.to_string();
+
+    let spinner = std::thread::spawn(move || {
+        if !is_tty {
+            return;
+        }
+        use std::io::Write as _;
+        const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+        let pal2 = Palette::for_stream(true);
+        let start = std::time::Instant::now();
+        let mut i = 0usize;
+        while !done2.load(Ordering::Relaxed) {
+            let spin = pal2.orange(&FRAMES[i % 4].to_string());
+            let elapsed = start.elapsed().as_secs();
+            eprint!("\r  {spin} reindexing with {mid} ...  {elapsed}s    ");
+            let _ = std::io::stderr().flush();
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+
+    let start = std::time::Instant::now();
+    let result = travsr_plugin_host::run_parallel_reindex_blocking_quiet(db_path);
+
+    done.store(true, Ordering::Relaxed);
+    let _ = spinner.join();
+
+    if is_tty {
+        use std::io::Write as _;
+        eprint!("\r{}\r", " ".repeat(72));
+        let _ = std::io::stderr().flush();
+    }
+
+    result?;
+
+    let elapsed = fmt_dur(start.elapsed());
+    let embedded = query_embed_stats(db_path, backend.id)
+        .map(|s| s.stats.embedded)
+        .unwrap_or(0);
+
+    println!(
+        "  {} {} — {} nodes embedded · {elapsed}",
+        pal.green("\u{25cf}"),
+        backend.id,
+        fmt_count(embedded),
+    );
+    println!(
+        "\n  {} restart the daemon to apply: travsr daemon restart",
+        pal.dim("\u{2139}")
+    );
 
     Ok(())
 }
@@ -306,37 +526,6 @@ async fn download_embed_binary(
     std::fs::rename(&tmp, &dest).with_context(|| format!("renaming into {}", dest.display()))?;
 
     Ok(dest)
-}
-
-async fn download_model_file(
-    hf_repo: &str,
-    url_path: &str,
-    file_name: &str,
-    dest: &std::path::Path,
-) -> Result<()> {
-    let url = format!("{HF_BASE}/{hf_repo}/resolve/main/{url_path}");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
-
-    let resp = client.get(&url).send().await.context("GET model file")?;
-    if !resp.status().is_success() {
-        bail!("model file download failed ({}): {url}", resp.status());
-    }
-    let bytes = resp.bytes().await.context("reading model file body")?;
-    // Atomic write: stage to .tmp then rename so an interrupted download never
-    // leaves a truncated file that passes the dest.exists() re-download guard.
-    let tmp = dest.with_extension("tmp");
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing model file {file_name}"))?;
-    std::fs::rename(&tmp, dest).with_context(|| format!("installing model file {file_name}"))?;
-    println!(
-        "\u{2713} {} saved ({} MB).",
-        file_name,
-        bytes.len() / (1024 * 1024)
-    );
-    Ok(())
 }
 
 // ── reindex ───────────────────────────────────────────────────────────────────
