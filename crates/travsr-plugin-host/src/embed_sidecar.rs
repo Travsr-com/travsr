@@ -88,15 +88,20 @@ pub struct EmbedSidecar {
 impl EmbedSidecar {
     /// Spawn the embed plugin binary and perform the capabilities handshake.
     ///
-    /// `binary` — absolute path to `travsr-embed-<backend>`.
-    /// `db_path` — absolute path to the repo's `graph.db` file.
-    pub fn spawn(binary: &Path, db_path: &Path) -> Result<Self, EmbedError> {
+    /// `binary`   — absolute path to `travsr-embed-<backend>`.
+    /// `db_path`  — absolute path to the repo's `graph.db` file.
+    /// `model_id` — backend catalog ID (e.g. `"bge-base-en-v1.5"`); passed as
+    ///              `--model-id` so the sidecar loads the correct ONNX weights.
+    pub fn spawn(binary: &Path, db_path: &Path, model_id: &str) -> Result<Self, EmbedError> {
         // Pass --db-path so the sidecar loads the per-repo HNSW index
         // (node IDs are SQLite rowids scoped to one db; a global index causes
         //  cross-repo collisions and wrong KNN results).
+        // Pass --model-id so the sidecar selects the right ONNX model weights.
         let mut child = Command::new(binary)
             .arg("--db-path")
             .arg(db_path)
+            .arg("--model-id")
+            .arg(model_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

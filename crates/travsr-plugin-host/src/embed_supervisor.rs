@@ -29,12 +29,13 @@ pub struct EmbedSupervisor {
 impl EmbedSupervisor {
     /// Try to start the embed plugin supervisor.
     ///
-    /// `binary` — absolute path to a `travsr-embed-<backend>` binary.
-    /// `db_path` — absolute path to the repo's `graph.db` file.
+    /// `binary`   — absolute path to a `travsr-embed-<backend>` binary.
+    /// `db_path`  — absolute path to the repo's `graph.db` file.
+    /// `model_id` — backend catalog ID forwarded to the sidecar via `--model-id`.
     ///
     /// Returns a disabled supervisor (is_active() == false) if the binary is
     /// absent or the handshake fails — never panics, never returns an error.
-    pub fn try_start(binary: &Path, db_path: &Path) -> Self {
+    pub fn try_start(binary: &Path, db_path: &Path, model_id: &str) -> Self {
         if !binary.exists() {
             tracing::debug!(
                 binary = %binary.display(),
@@ -47,7 +48,7 @@ impl EmbedSupervisor {
             };
         }
 
-        match EmbedSidecar::spawn(binary, db_path) {
+        match EmbedSidecar::spawn(binary, db_path, model_id) {
             Ok(sidecar) => {
                 let model_id = sidecar.caps.model_id.clone();
                 tracing::info!(

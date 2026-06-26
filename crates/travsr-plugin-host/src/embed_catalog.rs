@@ -49,34 +49,105 @@ pub struct EmbedBackend {
     pub id: &'static str,
     pub description: &'static str,
     pub dim: u32,
+    /// Model parameter count in millions (e.g. 33 for bge-small).
+    pub params_m: u32,
+    /// MTEB retrieval score (higher = better, max ~68).
+    pub mteb: f32,
+    /// Approximate peak RAM during reindex in MB.
+    pub ram_mb: u32,
+    /// Approximate reindex time in seconds for a 3.5k-node repo.
+    pub init_secs: u32,
     pub binary_name: &'static str,
     pub github_repo: &'static str,
     pub version_fallback: &'static str,
     pub model_files: &'static [EmbedModelFile],
 }
 
-pub const BACKENDS: &[EmbedBackend] = &[EmbedBackend {
-    id: "bge-small-en-v1.5",
-    description: "BAAI/bge-small-en-v1.5 — tract ONNX fp32, CLS-384, 33M params (~127 MB)",
-    dim: 384,
-    binary_name: "travsr-embed-nomic",
-    github_repo: "Travsr-com/travsr-embed",
-    version_fallback: "v1.0.0",
-    model_files: &[
-        EmbedModelFile {
-            name: "model.onnx",
-            url_path: "onnx/model.onnx",
-            hf_repo: "BAAI/bge-small-en-v1.5",
-            size_hint_mb: 127,
-        },
-        EmbedModelFile {
-            name: "tokenizer.json",
-            url_path: "tokenizer.json",
-            hf_repo: "BAAI/bge-small-en-v1.5",
-            size_hint_mb: 1,
-        },
-    ],
-}];
+pub const BACKENDS: &[EmbedBackend] = &[
+    EmbedBackend {
+        id: "bge-small-en-v1.5",
+        description: "Fastest. Good for everyday use on any machine. May miss specialised \
+                      technical vocabulary (e.g. algorithm-specific jargon).",
+        dim: 384,
+        params_m: 33,
+        mteb: 62.2,
+        ram_mb: 200,
+        init_secs: 11,
+        binary_name: "travsr-embed-nomic",
+        github_repo: "Travsr-com/travsr-embed",
+        version_fallback: "v1.0.0",
+        model_files: &[
+            EmbedModelFile {
+                name: "model.onnx",
+                url_path: "onnx/model.onnx",
+                hf_repo: "BAAI/bge-small-en-v1.5",
+                size_hint_mb: 127,
+            },
+            EmbedModelFile {
+                name: "tokenizer.json",
+                url_path: "tokenizer.json",
+                hf_repo: "BAAI/bge-small-en-v1.5",
+                size_hint_mb: 1,
+            },
+        ],
+    },
+    EmbedBackend {
+        id: "bge-base-en-v1.5",
+        description: "Recommended for technical codebases. 3× parameter increase closes \
+                      specialised vocabulary gaps (algorithm names, domain jargon). \
+                      ~4× slower reindex; same BERT architecture, ARM64 compatible.",
+        dim: 768,
+        params_m: 109,
+        mteb: 63.6,
+        ram_mb: 450,
+        init_secs: 47,
+        binary_name: "travsr-embed-nomic",
+        github_repo: "Travsr-com/travsr-embed",
+        version_fallback: "v1.0.0",
+        model_files: &[
+            EmbedModelFile {
+                name: "model.onnx",
+                url_path: "onnx/model.onnx",
+                hf_repo: "BAAI/bge-base-en-v1.5",
+                size_hint_mb: 270,
+            },
+            EmbedModelFile {
+                name: "tokenizer.json",
+                url_path: "tokenizer.json",
+                hf_repo: "BAAI/bge-base-en-v1.5",
+                size_hint_mb: 1,
+            },
+        ],
+    },
+    EmbedBackend {
+        id: "bge-large-en-v1.5",
+        description: "Maximum accuracy. Best semantic coverage for large or multilingual \
+                      codebases. Requires ~1.4 GB RAM; ~13× slower reindex than small. \
+                      Not recommended on machines with less than 8 GB available RAM.",
+        dim: 1024,
+        params_m: 335,
+        mteb: 64.2,
+        ram_mb: 1400,
+        init_secs: 150,
+        binary_name: "travsr-embed-nomic",
+        github_repo: "Travsr-com/travsr-embed",
+        version_fallback: "v1.0.0",
+        model_files: &[
+            EmbedModelFile {
+                name: "model.onnx",
+                url_path: "onnx/model.onnx",
+                hf_repo: "BAAI/bge-large-en-v1.5",
+                size_hint_mb: 800,
+            },
+            EmbedModelFile {
+                name: "tokenizer.json",
+                url_path: "tokenizer.json",
+                hf_repo: "BAAI/bge-large-en-v1.5",
+                size_hint_mb: 1,
+            },
+        ],
+    },
+];
 
 /// Look up a backend by its stable id string.
 pub fn lookup(id: &str) -> Option<&'static EmbedBackend> {
@@ -259,7 +330,9 @@ fn run_parallel_reindex(
     let n = derive_num_workers();
 
     let mut cmd = Command::new(bin_path);
-    cmd.arg("--reindex")
+    cmd.arg("--model-id")
+        .arg(_model_id)
+        .arg("--reindex")
         .arg(db_path)
         .arg("--embed-db")
         .arg(embed_db_path)

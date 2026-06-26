@@ -79,8 +79,16 @@ fn cmd_list(json: bool) -> Result<()> {
                 let installed = bin_dir.join(b.binary_name).exists();
                 let is_active = active.as_deref() == Some(b.id);
                 format!(
-                    r#"{{"id":"{}","description":"{}","dim":{},"installed":{},"active":{}}}"#,
-                    b.id, b.description, b.dim, installed, is_active
+                    r#"{{"id":"{}","description":"{}","dim":{},"params_m":{},"mteb":{:.1},"ram_mb":{},"download_mb":{},"installed":{},"active":{}}}"#,
+                    b.id,
+                    b.description,
+                    b.dim,
+                    b.params_m,
+                    b.mteb,
+                    b.ram_mb,
+                    b.model_files.iter().map(|f| f.size_hint_mb).sum::<u32>(),
+                    installed,
+                    is_active
                 )
             })
             .collect();
@@ -89,23 +97,40 @@ fn cmd_list(json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<22} {:<12} {:<10} DESCRIPTION",
-        "BACKEND", "DIM", "STATUS"
+        "{:<22} {:<5} {:<7} {:<5} {:<10} {:<8} STATUS",
+        "BACKEND", "DIM", "PARAMS", "MTEB", "DOWNLOAD", "RAM"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(92));
     for b in EMBED_BACKENDS {
         let installed = bin_dir.join(b.binary_name).exists();
         let is_active = active.as_deref() == Some(b.id);
         let status = if installed && is_active {
-            "\u{2713} active".to_string()
+            format!("\u{2713} active  {}", b.description)
         } else if installed {
-            "installed".to_string()
+            format!("installed  {}", b.description)
         } else {
-            "not installed".to_string()
+            format!("not installed  {}", b.description)
+        };
+        let download_mb: u32 = b.model_files.iter().map(|f| f.size_hint_mb).sum();
+        let ram_str = if b.ram_mb >= 1000 {
+            format!("~{:.1}GB", b.ram_mb as f32 / 1024.0)
+        } else {
+            format!("~{}MB", b.ram_mb)
+        };
+        let backend_label = if is_active {
+            format!("{} *", b.id)
+        } else {
+            b.id.to_string()
         };
         println!(
-            "{:<22} {:<12} {:<10} {}",
-            b.id, b.dim, status, b.description
+            "{:<22} {:<5} {:<7} {:<5} {:<10} {:<8} {}",
+            backend_label,
+            b.dim,
+            format!("{}M", b.params_m),
+            format!("{:.1}", b.mteb),
+            format!("{download_mb} MB"),
+            ram_str,
+            status,
         );
     }
     Ok(())

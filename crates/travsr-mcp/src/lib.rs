@@ -74,7 +74,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     let Some(backend) = backend else { return };
 
     let binary = home.join(".travsr").join("bin").join(backend.binary_name);
-    let supervisor = EmbedSupervisor::try_start(&binary, db_path);
+    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
     if !supervisor.is_active() {
         return;
     }
