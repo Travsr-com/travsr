@@ -4,7 +4,7 @@
   "description": "Graph-native code intelligence for VS Code. Live call graph, blast radius, and callers — powered by the local Travsr daemon over MCP.",
   "version": "0.8.0",
   "publisher": "travsr",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "icon": "icon.png",
   "galleryBanner": {
     "color": "#1A1A1A",
