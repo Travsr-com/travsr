@@ -806,7 +806,13 @@ pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
         tracing::warn!("search_symbol rejected invalid arg: {reason}");
         return String::new();
     }
-    sanitize_for_mcp(&search_symbol_raw(store, name))
+    let raw = search_symbol_raw(store, name);
+    let content = if raw.is_empty() {
+        format!("No symbols matching '{name}' found in the graph.")
+    } else {
+        raw
+    };
+    sanitize_for_mcp(&content)
 }
 
 fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
@@ -853,7 +859,12 @@ pub fn search_symbol_global(
                 .join("\n")
         }
     });
-    sanitize_for_mcp(&raw)
+    let content = if raw.is_empty() {
+        format!("No symbols matching '{name}' found in the graph.")
+    } else {
+        raw
+    };
+    sanitize_for_mcp(&content)
 }
 
 // ── get_repo_map ──────────────────────────────────────────────────────────────
@@ -2801,6 +2812,32 @@ mod tests {
         assert_eq!(
             result, "<travsr-data></travsr-data>",
             "absolute path in repo arg must be rejected and return empty envelope"
+        );
+    }
+
+    // ── search_symbol unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn search_symbol_no_match_returns_explicit_message() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let result = search_symbol(&store, "NonExistentSymbol");
+        assert!(
+            result.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
+            "no-match should return explicit not-found message, got: {result}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_global_no_match_returns_explicit_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        // Create an empty file-backed store (no nodes).
+        drop(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let repos: HashMap<String, PathBuf> = [("myrepo".to_string(), db_path)].into();
+        let result = search_symbol_global(&repos, "NonExistentSymbol", None);
+        assert!(
+            result.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
+            "global no-match should return explicit not-found message, got: {result}"
         );
     }
 
