@@ -71,9 +71,19 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
 
         // Non-fatal: detection errors must not fail `travsr init`.
         let _ = hint_lang_detect(&repo_root);
+        hint_embed_missing();
     }
 
     Ok(())
+}
+
+/// Print a tip when no embed backend is active so users know about semantic search.
+fn hint_embed_missing() {
+    if travsr_plugin_host::active_backend_id().is_none() {
+        println!(
+            "tip: semantic search is not set up — run `travsr embed init` for natural-language queries"
+        );
+    }
 }
 
 /// After indexing, scan for supported languages and suggest `travsr lang detect`

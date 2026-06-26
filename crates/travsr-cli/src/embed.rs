@@ -741,6 +741,24 @@ fn cmd_status() -> Result<()> {
         db_path.parent().unwrap_or(&db_path).display()
     );
 
+    // Phase B state: compare phase_b_commit vs last_commit.
+    {
+        let store = travsr_store::SqliteStore::open_read_only(&db_path)
+            .with_context(|| format!("opening {}", db_path.display()))?;
+        let last = store.get_meta("last_commit")?.unwrap_or_default();
+        let phase_b = store.get_meta("phase_b_commit")?.unwrap_or_default();
+        let state = if last.is_empty() {
+            "not run (no commits yet)"
+        } else if phase_b.is_empty() {
+            "pending (run `travsr daemon start` to trigger)"
+        } else if phase_b == last {
+            "complete"
+        } else {
+            "stale (new commits since last Phase B)"
+        };
+        println!("Phase B state  : {state}");
+    }
+
     let EmbedStatsWithThreshold { stats, threshold } = query_embed_stats(&db_path, backend.id)?;
 
     if stats.total_symbols == 0 {
