@@ -2590,6 +2590,219 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// Language-scoped variant of [`search_nodes_by_name`].
+    /// Appends `AND language = ?2` so only nodes from the requested language
+    /// are returned, before the 100-row LIMIT.
+    fn search_nodes_by_name_with_lang(
+        &self,
+        name: &str,
+        lang: &str,
+    ) -> Result<Vec<Node>, StoreError> {
+        let _span =
+            tracing::debug_span!("store.search_nodes_by_name_with_lang", query = name, lang)
+                .entered();
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line,
+  (
+    CASE
+      WHEN signature = ?1 THEN 0
+      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 THEN 10
+      WHEN signature LIKE ?1 || '%' THEN 20
+      WHEN path = ?1 THEN 5
+      WHEN path LIKE '%/' || ?1 THEN 15
+      ELSE 40
+    END
+    + CASE WHEN path LIKE '%_test.go' OR path LIKE '%test/%'
+           OR path LIKE '%.test.%' OR path LIKE '%_test.%'
+           OR path LIKE 'tests/%' OR path LIKE '%/tests/%' THEN 25 ELSE 0 END
+    + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
+           OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
+    + (LENGTH(path) / 32)
+  ) AS rank
+FROM nodes
+WHERE (signature LIKE '%' || ?1 || '%'
+   OR path LIKE '%' || ?1 || '%')
+  AND language = ?2
+ORDER BY rank ASC, id ASC
+LIMIT 100",
+                )
+                .context("preparing lang-filtered search query")?;
+            let rows = stmt
+                .query_map(params![name, lang], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing lang-filtered search query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding search row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Language-scoped variant of [`fts_query_nodes`].
+    /// Appends `AND n.language = ?2` before the 50-row FTS LIMIT.
+    fn fts_query_nodes_with_lang(&self, match_expr: &str, lang: &str) -> AnyResult<Vec<Node>> {
+        let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                          n.kind, n.package, n.line, n.end_line \
+                   FROM nodes_fts \
+                   JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
+                   JOIN nodes n ON n.id = m.node_id \
+                   WHERE nodes_fts MATCH ?1 \
+                     AND n.language = ?2 \
+                   ORDER BY bm25(nodes_fts) \
+                   LIMIT 50";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("preparing lang-filtered FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr, lang], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                Ok(Node {
+                    id,
+                    vname,
+                    kind,
+                    package,
+                    line: line.and_then(|l| u32::try_from(l).ok()),
+                    end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                })
+            })
+            .context("executing lang-filtered FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding lang-filtered FTS5 row")?);
+        }
+        Ok(out)
+    }
+
+    /// Language-filtered variant of [`search_nodes_fuzzy`].
+    ///
+    /// When `lang_filter` is `None`, delegates to [`search_nodes_fuzzy`] unchanged.
+    /// When `Some(lang)`, each of the 4 search steps applies `AND language = ?`
+    /// at the SQL level — before the 50-result FTS cap — guaranteeing results
+    /// are from the requested language only.
+    pub fn search_nodes_fuzzy_filtered(
+        &self,
+        query: &str,
+        lang_filter: Option<&str>,
+    ) -> Result<Vec<Node>, StoreError> {
+        let lang = match lang_filter {
+            None => return self.search_nodes_fuzzy(query),
+            Some(l) => l,
+        };
+        let _span =
+            tracing::debug_span!("store.search_nodes_fuzzy_filtered", query, lang).entered();
+
+        // Step 1 — exact substring, language-filtered.
+        let exact = self.search_nodes_by_name_with_lang(query, lang)?;
+        if !exact.is_empty() {
+            tracing::debug!(layer = "exact_lang", nodes_returned = exact.len());
+            return Ok(exact);
+        }
+
+        // Step 2 — FTS5, language-filtered.
+        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+        let step2 = self
+            .fts_query_nodes_with_lang(&step2_expr, lang)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !step2.is_empty() {
+            tracing::debug!(layer = "fts5_t0_lang", nodes_returned = step2.len());
+            return Ok(step2);
+        }
+
+        // Step 3 — L2-A expansion, language-filtered.
+        let step3 = (|| -> AnyResult<Vec<Node>> {
+            let raw_str = tokenize_identifier(query);
+            if raw_str.is_empty() {
+                return Ok(Vec::new());
+            }
+            let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
+            let t0_tokens = crate::seed_lexicon::expand_tokens(&raw);
+            let l2a_extra = self.expand_query(&t0_tokens)?;
+            if l2a_extra.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut arms: Vec<String> = t0_tokens;
+            for c in l2a_extra {
+                if arms.len() >= 16 {
+                    break;
+                }
+                if !arms.iter().any(|t| t == &c) {
+                    arms.push(c);
+                }
+            }
+            arms.sort();
+            arms.truncate(16);
+            let match_expr = arms
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            self.fts_query_nodes_with_lang(&match_expr, lang)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !step3.is_empty() {
+            tracing::debug!(layer = "fts5_l2a_lang", nodes_returned = step3.len());
+            return Ok(step3);
+        }
+
+        // Step 4 — embed ANN + post-filter by language.
+        if let Some(knn_fn) = self.embed_knn_hook.as_ref() {
+            let pairs = knn_fn(query, 20)?;
+            if !pairs.is_empty() {
+                let ids: Vec<NodeId> = pairs.into_iter().map(|(id, _score)| id).collect();
+                let nodes = self.get_nodes(&ids)?;
+                let filtered: Vec<Node> =
+                    nodes.into_iter().filter(|n| n.vname.language == lang).collect();
+                if !filtered.is_empty() {
+                    tracing::debug!(layer = "embed_ann_lang", nodes_returned = filtered.len());
+                    return Ok(filtered);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// L2-A: vocabulary-grounded token expansion (RFC-012 A1 Step 3).
     ///
     /// Scans `fts_vocab` for tokens with Jaccard(byte-trigrams) ≥ `L2A_JACCARD_THRESHOLD`

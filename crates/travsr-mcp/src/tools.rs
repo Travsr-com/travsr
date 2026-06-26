@@ -816,7 +816,12 @@ pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
         tracing::warn!("search_symbol rejected invalid arg: {reason}");
         return String::new();
     }
-    let raw = search_symbol_raw(store, name);
+    // Strip language token from query so FTS gets a clean term.
+    // In single-repo mode we don't apply the language filter (multi-language
+    // repos), but stripping "in rust" from "knapsack in rust" prevents the
+    // FTS from matching unrelated files that contain "rust" as a token.
+    let (stripped, lang_filter) = infer_language_from_query(name);
+    let raw = search_symbol_raw(store, stripped.as_str(), lang_filter);
     let content = if raw.is_empty() {
         format!("No symbols matching '{name}' found in the graph.")
     } else {
@@ -825,13 +830,80 @@ pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
     sanitize_for_mcp(&content)
 }
 
-fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
+/// Parse a query string for an embedded language token.
+///
+/// Returns `(stripped_query, lang_id)`.  `stripped_query` has the matched
+/// language word (and an optional preceding "in" connector) removed.
+/// When no language token is detected the original query is returned unchanged.
+///
+/// Examples:
+/// - `"PaymentService in Kotlin"` → `("PaymentService", Some("kotlin"))`
+/// - `"auth handler javascript"` → `("auth handler", Some("javascript"))`
+/// - `"knapsack"`               → `("knapsack", None)`
+fn infer_language_from_query(query: &str) -> (String, Option<&'static str>) {
+    // (query_token_lowercase → db language id).
+    // Longer / more-specific tokens are listed first so "objective-c" beats
+    // "c" before reaching the single-char "c" entry.
+    const LANG_TOKENS: &[(&str, &str)] = &[
+        ("typescript", "typescript"),
+        ("javascript", "javascript"),
+        ("objective-c", "objectivec"),
+        ("objectivec", "objectivec"),
+        ("csharp", "csharp"),
+        ("golang", "go"),
+        ("kotlin", "kotlin"),
+        ("python", "python"),
+        ("scala", "scala"),
+        ("swift", "swift"),
+        ("objc", "objectivec"),
+        ("dart", "dart"),
+        ("java", "java"),
+        ("ruby", "ruby"),
+        ("rust", "rust"),
+        ("cpp", "cpp"),
+        ("php", "php"),
+        ("c++", "cpp"),
+        ("c#", "csharp"),
+        ("go", "go"),
+        ("c", "c"),
+    ];
+
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return (query.to_owned(), None);
+    }
+    for (i, word) in words.iter().enumerate() {
+        let lower = word.to_ascii_lowercase();
+        if let Some(&(_, lang_id)) = LANG_TOKENS.iter().find(|(tok, _)| *tok == lower.as_str()) {
+            // Strip the language word and an optional preceding "in" connector.
+            let strip_from = if i > 0 && words[i - 1].eq_ignore_ascii_case("in") {
+                i - 1
+            } else {
+                i
+            };
+            let remaining: Vec<&str> = words[..strip_from]
+                .iter()
+                .chain(words[i + 1..].iter())
+                .copied()
+                .collect();
+            let stripped = remaining.join(" ");
+            // Preserve original when stripping leaves nothing to search for.
+            if stripped.trim().is_empty() {
+                return (query.to_owned(), Some(lang_id));
+            }
+            return (stripped, Some(lang_id));
+        }
+    }
+    (query.to_owned(), None)
+}
+
+fn search_symbol_raw(store: &SqliteStore, name: &str, lang_filter: Option<&str>) -> String {
     // Cap results: prevents self-DoS from wildcard queries (e.g. "a") and limits
     // accidental bulk exfiltration. The store LIKE query has no SQL LIMIT yet —
     // this Rust-side cap is the guard until that is added at the store layer.
     const MAX_SEARCH_RESULTS: usize = 50;
 
-    let nodes = match store.search_nodes_fuzzy(name) {
+    let nodes = match store.search_nodes_fuzzy_filtered(name, lang_filter) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("search_symbol error: {e}");
@@ -851,6 +923,10 @@ fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
 }
 
 /// Global variant of `search_symbol`.
+///
+/// Infers a language filter from the query (e.g. `"PaymentService in Kotlin"` →
+/// search `"PaymentService"`, filter `language = kotlin`) and ranks repos in
+/// fan-out mode by match count (most matches first).
 pub fn search_symbol_global(
     repos: &HashMap<String, PathBuf>,
     name: &str,
@@ -860,18 +936,68 @@ pub fn search_symbol_global(
         tracing::warn!("search_symbol_global rejected invalid arg: {reason}");
         return String::new();
     }
-    let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = search_symbol_raw(store, name);
-        if result.is_empty() || single {
-            result
-        } else {
-            result
-                .lines()
-                .map(|l| format!("[{repo_name}] {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+
+    let (stripped, lang_filter) = infer_language_from_query(name);
+    let search_term = stripped.as_str();
+
+    let raw = if repo.is_some() {
+        // Single-repo path: SEC + stale filtering handled by collect_global.
+        collect_global(repos, repo, |store, repo_name, single| {
+            let result = search_symbol_raw(store, search_term, lang_filter);
+            if result.is_empty() || single {
+                result
+            } else {
+                result
+                    .lines()
+                    .map(|l| format!("[{repo_name}] {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+    } else {
+        // Fan-out path: open each live repo, collect results, rank by match
+        // count descending so the most relevant repo appears first.
+        if let Some(r) = repo {
+            if validate_mcp_arg(r).is_err() {
+                return String::new();
+            }
         }
-    });
+        let mut candidates: Vec<(&str, &PathBuf)> =
+            repos.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        candidates.retain(|(_, db)| db.exists());
+        let single = candidates.len() == 1;
+
+        let mut parts: Vec<(usize, String)> = Vec::new();
+        for (repo_name, db_path) in &candidates {
+            match SqliteStore::open_read_only(db_path) {
+                Ok(store) => {
+                    let result = search_symbol_raw(&store, search_term, lang_filter);
+                    if !result.is_empty() {
+                        let count = result.lines().count();
+                        let text = if single {
+                            result
+                        } else {
+                            result
+                                .lines()
+                                .map(|l| format!("[{repo_name}] {l}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        parts.push((count, text));
+                    }
+                }
+                Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+            }
+        }
+        // Most matches first — most relevant repo surfaces at the top.
+        parts.sort_by(|a, b| b.0.cmp(&a.0));
+        parts
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let content = if raw.is_empty() {
         format!("No symbols matching '{name}' found in the graph.")
     } else {
@@ -2037,18 +2163,68 @@ pub fn get_context_global(
     if token_budget > MAX_CONTEXT_BUDGET {
         return wrap_envelope("token_budget exceeds maximum allowed value");
     }
-    let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_context_raw(store, query, token_budget, include_snippets, snippet_budget);
-        if result.is_empty() || single {
-            result
-        } else {
-            result
-                .lines()
-                .map(|l| format!("[{repo_name}] {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+
+    // Strip any embedded language token so FTS seeding gets a clean query.
+    // E.g. "auth handler javascript" → seed PPR with "auth handler".
+    let (stripped, _lang_filter) = infer_language_from_query(query);
+    let seed_query = stripped.as_str();
+
+    let raw = if repo.is_some() {
+        collect_global(repos, repo, |store, repo_name, single| {
+            let result =
+                get_context_raw(store, seed_query, token_budget, include_snippets, snippet_budget);
+            if result.is_empty() || single {
+                result
+            } else {
+                result
+                    .lines()
+                    .map(|l| format!("[{repo_name}] {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+    } else {
+        // Fan-out: rank repos by result size (token-rich responses first).
+        let mut candidates: Vec<(&str, &PathBuf)> =
+            repos.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        candidates.retain(|(_, db)| db.exists());
+        let single = candidates.len() == 1;
+
+        let mut parts: Vec<(usize, String)> = Vec::new();
+        for (repo_name, db_path) in &candidates {
+            match SqliteStore::open_read_only(db_path) {
+                Ok(store) => {
+                    let result = get_context_raw(
+                        &store,
+                        seed_query,
+                        token_budget,
+                        include_snippets,
+                        snippet_budget,
+                    );
+                    if !result.is_empty() {
+                        let count = result.len();
+                        let text = if single {
+                            result
+                        } else {
+                            result
+                                .lines()
+                                .map(|l| format!("[{repo_name}] {l}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        parts.push((count, text));
+                    }
+                }
+                Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+            }
         }
-    });
+        parts.sort_by(|a, b| b.0.cmp(&a.0));
+        parts
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     wrap_envelope(&raw)
 }
 
@@ -3017,6 +3193,85 @@ mod tests {
             !result.contains("src/foo.rs:"),
             "no colon-suffix when line absent, got: {result}"
         );
+    }
+
+    // ── infer_language_from_query ────────────────────────────────────────────
+
+    #[test]
+    fn infer_lang_strips_trailing_token() {
+        let (q, lang) = infer_language_from_query("auth handler javascript");
+        assert_eq!(q, "auth handler");
+        assert_eq!(lang, Some("javascript"));
+    }
+
+    #[test]
+    fn infer_lang_strips_in_connector() {
+        let (q, lang) = infer_language_from_query("PaymentService in Kotlin");
+        assert_eq!(q, "PaymentService");
+        assert_eq!(lang, Some("kotlin"));
+    }
+
+    #[test]
+    fn infer_lang_aliases_map_correctly() {
+        assert_eq!(infer_language_from_query("foo c++").1, Some("cpp"));
+        assert_eq!(infer_language_from_query("foo c#").1, Some("csharp"));
+        assert_eq!(infer_language_from_query("foo objective-c").1, Some("objectivec"));
+        assert_eq!(infer_language_from_query("foo objc").1, Some("objectivec"));
+        assert_eq!(infer_language_from_query("foo golang").1, Some("go"));
+        assert_eq!(infer_language_from_query("foo csharp").1, Some("csharp"));
+    }
+
+    #[test]
+    fn infer_lang_no_token_returns_original() {
+        let (q, lang) = infer_language_from_query("knapsack budget optimizer");
+        assert_eq!(q, "knapsack budget optimizer");
+        assert_eq!(lang, None);
+    }
+
+    #[test]
+    fn infer_lang_preserves_original_when_stripping_leaves_empty() {
+        // Query is JUST a language name — keep it as-is so search still runs.
+        let (q, lang) = infer_language_from_query("rust");
+        assert_eq!(q, "rust");
+        assert_eq!(lang, Some("rust"));
+    }
+
+    #[test]
+    fn infer_lang_case_insensitive() {
+        let (q, lang) = infer_language_from_query("session PYTHON");
+        assert_eq!(q, "session");
+        assert_eq!(lang, Some("python"));
+    }
+
+    // ── search_symbol language filter ────────────────────────────────────────
+
+    #[test]
+    fn search_symbol_global_filters_by_inferred_language() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let rs_node = Node::new(VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"), "function");
+        let ts_node = Node::new(VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"), "function");
+        store.put_node(&rs_node).unwrap();
+        store.put_node(&ts_node).unwrap();
+
+        // "auth handler typescript" should return only the TypeScript node.
+        let result = search_symbol_raw(&store, "auth", Some("typescript"));
+        assert!(result.contains("src/auth.ts"), "expected typescript node: {result}");
+        assert!(!result.contains("src/auth.rs"), "rust node must be filtered out: {result}");
+    }
+
+    #[test]
+    fn search_symbol_raw_no_filter_returns_both_languages() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let rs_node = Node::new(VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"), "function");
+        let ts_node = Node::new(VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"), "function");
+        store.put_node(&rs_node).unwrap();
+        store.put_node(&ts_node).unwrap();
+
+        let result = search_symbol_raw(&store, "auth", None);
+        assert!(result.contains("auth.rs"), "rust node must appear: {result}");
+        assert!(result.contains("auth.ts"), "typescript node must appear: {result}");
     }
 
     #[test]
