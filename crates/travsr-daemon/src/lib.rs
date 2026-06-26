@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
+use travsr_analysis::skeleton::skeleton_for_node;
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
     link_imports_rust, run_lsif_emitter, FfiMarker,
 };
-use travsr_analysis::skeleton::skeleton_for_node;
 use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};

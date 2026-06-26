@@ -116,12 +116,10 @@ pub fn ppr<S: Store>(
         return Ok(Vec::new());
     }
     let seed_score = 1.0 / seeds.len() as f32;
-    let personalization: HashMap<NodeId, f32> = seeds
-        .iter()
-        .fold(HashMap::new(), |mut m, &id| {
-            *m.entry(id).or_insert(0.0) += seed_score;
-            m
-        });
+    let personalization: HashMap<NodeId, f32> = seeds.iter().fold(HashMap::new(), |mut m, &id| {
+        *m.entry(id).or_insert(0.0) += seed_score;
+        m
+    });
     ppr_inner(store, &personalization, k).map_err(|e| TravsrError::Internal(e.to_string()))
 }
 
@@ -183,8 +181,7 @@ fn ppr_inner<S: Store>(
 
     if adj.is_empty() {
         // Seeds not in the graph — return seeds scored by their personalisation weight.
-        let mut out: Vec<(NodeId, f32)> =
-            personalization.iter().map(|(&id, &s)| (id, s)).collect();
+        let mut out: Vec<(NodeId, f32)> = personalization.iter().map(|(&id, &s)| (id, s)).collect();
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         if k > 0 {
             out.truncate(k);
@@ -628,10 +625,7 @@ mod tests {
     fn ppr_weighted_uniform_weights_consistent_with_ppr() {
         let a = make_node("fn:a");
         let b = make_node("fn:b");
-        let store = store_with(
-            &[a.clone(), b.clone()],
-            &[(a.id, b.id, EdgeKind::RefCall)],
-        );
+        let store = store_with(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
         let uniform = ppr(&store, &[a.id, b.id], 10).unwrap();
         let weighted = ppr_weighted(&store, &[(a.id, 1.0), (b.id, 1.0)], 10).unwrap();
         // Both must return the same set of node IDs in the same order.
@@ -650,6 +644,9 @@ mod tests {
         let store = store_with(std::slice::from_ref(&a), &[]);
         let result = ppr_weighted(&store, &[(a.id, 0.0)], 5);
         assert!(result.is_ok(), "zero-weight seeds must not error");
-        assert!(!result.unwrap().is_empty(), "must still return the seed node");
+        assert!(
+            !result.unwrap().is_empty(),
+            "must still return the seed node"
+        );
     }
 }

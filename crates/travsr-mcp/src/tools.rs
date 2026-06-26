@@ -4216,41 +4216,64 @@ mod snippet_tests {
     // ── is_noise_seed tests ───────────────────────────────────────────────────
 
     fn make_node_with_kind_and_path(kind: &str, path: &str, sig: &str) -> travsr_core::Node {
-        travsr_core::Node::new(
-            travsr_core::VName::new("corp", "", path, "rust", sig),
-            kind,
-        )
+        travsr_core::Node::new(travsr_core::VName::new("corp", "", path, "rust", sig), kind)
     }
 
     #[test]
     fn is_noise_seed_excludes_crate_kind() {
-        let n = make_node_with_kind_and_path("crate", "crates/travsr-retrieval/Cargo.toml", "crate:travsr-retrieval");
+        let n = make_node_with_kind_and_path(
+            "crate",
+            "crates/travsr-retrieval/Cargo.toml",
+            "crate:travsr-retrieval",
+        );
         assert!(is_noise_seed(&n), "crate nodes must be excluded");
     }
 
     #[test]
     fn is_noise_seed_excludes_tests_path() {
-        let n = make_node_with_kind_and_path("function", "crates/travsr-mcp/tests/conformance.rs", "fn:run_mcp");
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-mcp/tests/conformance.rs",
+            "fn:run_mcp",
+        );
         assert!(is_noise_seed(&n), "integration test files must be excluded");
     }
 
     #[test]
     fn is_noise_seed_excludes_benches_path() {
-        let n = make_node_with_kind_and_path("function", "crates/travsr-retrieval/benches/retrieval.rs", "fn:bench_ppr_chain");
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-retrieval/benches/retrieval.rs",
+            "fn:bench_ppr_chain",
+        );
         assert!(is_noise_seed(&n), "benchmark files must be excluded");
     }
 
     #[test]
     fn is_noise_seed_allows_src_functions() {
-        let n = make_node_with_kind_and_path("function", "crates/travsr-mcp/src/tools.rs", "fn:get_context_body");
-        assert!(!is_noise_seed(&n), "src/ implementation functions must not be excluded");
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-mcp/src/tools.rs",
+            "fn:get_context_body",
+        );
+        assert!(
+            !is_noise_seed(&n),
+            "src/ implementation functions must not be excluded"
+        );
     }
 
     #[test]
     fn is_noise_seed_allows_src_unit_tests() {
         // Unit tests inside src/ are kept — PPR from them reaches the impl they test.
-        let n = make_node_with_kind_and_path("function", "crates/travsr-retrieval/src/ppr.rs", "fn:ppr_handles_cycles");
-        assert!(!is_noise_seed(&n), "in-src unit test functions must not be excluded");
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-retrieval/src/ppr.rs",
+            "fn:ppr_handles_cycles",
+        );
+        assert!(
+            !is_noise_seed(&n),
+            "in-src unit test functions must not be excluded"
+        );
     }
 
     #[test]
@@ -4259,26 +4282,34 @@ mod snippet_tests {
         // Only the real src function must become a seed.
         use travsr_store::Store;
         let crate_node = make_node_with_kind_and_path(
-            "crate", "crates/travsr-retrieval/Cargo.toml", "crate:travsr-retrieval",
+            "crate",
+            "crates/travsr-retrieval/Cargo.toml",
+            "crate:travsr-retrieval",
         );
         let test_node = make_node_with_kind_and_path(
-            "function", "crates/travsr-mcp/tests/conformance.rs", "fn:run_mcp",
+            "function",
+            "crates/travsr-mcp/tests/conformance.rs",
+            "fn:run_mcp",
         );
         let impl_node = make_node_with_kind_and_path(
-            "function", "crates/travsr-mcp/src/tools.rs", "fn:get_context_body",
+            "function",
+            "crates/travsr-mcp/src/tools.rs",
+            "fn:get_context_body",
         );
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let crate_id = store.put_node(&crate_node).unwrap();
-        let test_id  = store.put_node(&test_node).unwrap();
-        let impl_id  = store.put_node(&impl_node).unwrap();
+        let test_id = store.put_node(&test_node).unwrap();
+        let impl_id = store.put_node(&impl_node).unwrap();
 
         // KNN returns all three with high scores.
-        let knn: &dyn Fn(&str, u32) -> Vec<(NodeId, f32)> =
+        let knn: EmbedKnnFn<'_> =
             &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
 
         let seeds = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
-        assert!(seeds.iter().all(|&(id, _)| id == impl_id),
-            "only the src impl node should be a seed; got: {seeds:?}");
+        assert!(
+            seeds.iter().all(|&(id, _)| id == impl_id),
+            "only the src impl node should be a seed; got: {seeds:?}"
+        );
         assert_eq!(seeds.len(), 1, "exactly one seed expected");
     }
 
@@ -4310,8 +4341,7 @@ mod snippet_tests {
             .unwrap();
 
         // KNN closure: a has high cosine similarity, b has low.
-        let knn_fn: &dyn Fn(&str, u32) -> Vec<(NodeId, f32)> =
-            &|_query, _k| vec![(a_id, 0.95), (b_id, 0.10)];
+        let knn_fn: EmbedKnnFn<'_> = &|_query, _k| vec![(a_id, 0.95), (b_id, 0.10)];
 
         let result = get_context_body(
             &store,

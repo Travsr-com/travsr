@@ -707,7 +707,13 @@ fn extract_python(
 
 // ── Go ────────────────────────────────────────────────────────────────────────
 
-fn extract_go(decl: TsNode<'_>, src: &[u8], node_kind: &str, token_estimate: usize, ck: &[&str]) -> AstSkeleton {
+fn extract_go(
+    decl: TsNode<'_>,
+    src: &[u8],
+    node_kind: &str,
+    token_estimate: usize,
+    ck: &[&str],
+) -> AstSkeleton {
     let mut params: Vec<String> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut fields: Vec<String> = Vec::new();

@@ -1533,28 +1533,30 @@ LIMIT 100",
                  WHERE embed_text IS NULL \
                    AND kind NOT IN ('file', 'file-module', 'import', 'module', 'variable')",
             ).context("preparing nodes_missing_embed_text query")?;
-            let rows = stmt.query_map([], |row| {
-                let id = i64_to_node_id(row.get::<_, i64>(0)?);
-                let vname = VName::new(
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                );
-                let kind: String = row.get(6)?;
-                let package: String = row.get(7)?;
-                let line: Option<i64> = row.get(8)?;
-                let end_line: Option<i64> = row.get(9)?;
-                Ok(Node {
-                    id,
-                    vname,
-                    kind,
-                    package,
-                    line: line.and_then(|l| u32::try_from(l).ok()),
-                    end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+            let rows = stmt
+                .query_map([], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
                 })
-            }).context("executing nodes_missing_embed_text query")?;
+                .context("executing nodes_missing_embed_text query")?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding nodes_missing_embed_text row")?);
