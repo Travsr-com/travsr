@@ -22,10 +22,10 @@ pub mod trust;
 pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
     active_backend_id, derive_num_workers_for_cli, derive_phase1_threshold_for_status,
-    lookup as lookup_embed_backend, run_parallel_reindex_blocking,
+    lookup as lookup_embed_backend, repo_backend_id, run_parallel_reindex_blocking,
     run_parallel_reindex_blocking_quiet, spawn_background_reindex_all,
-    spawn_background_reindex_phase1, spawn_background_reindex_phase2, EmbedBackend, EmbedModelFile,
-    BACKENDS as EMBED_BACKENDS, MAX_EMBED_WORKERS,
+    spawn_background_reindex_phase1, spawn_background_reindex_phase2, write_repo_backend_id,
+    EmbedBackend, EmbedModelFile, BACKENDS as EMBED_BACKENDS, MAX_EMBED_WORKERS,
 };
 pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
 pub use embed_supervisor::EmbedSupervisor;

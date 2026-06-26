@@ -21,6 +21,31 @@ use tree_sitter::{Node as TsNode, Parser};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// Controls how much context is packed into the embedding text for a node.
+///
+/// Larger models extract richer semantic signal from more verbose input.
+/// Derive the tier from the installed backend's `params_m` at reindex time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedRichness {
+    /// ≤50M params (e.g. bge-small): compact one-liner, 15 subsampled comments, 1800-char cap.
+    Compact,
+    /// 51–150M params (e.g. bge-base): full comment set, complete field list, 2600-char cap.
+    Standard,
+    /// >150M params (e.g. bge-large): multi-line prose, all comments, per-field rows, 4000-char cap.
+    Rich,
+}
+
+impl EmbedRichness {
+    /// Derive the richness tier from a model's parameter count in millions.
+    pub fn from_params_m(params_m: u32) -> Self {
+        match params_m {
+            0..=50 => Self::Compact,
+            51..=150 => Self::Standard,
+            _ => Self::Rich,
+        }
+    }
+}
+
 /// Structured summary of a declaration extracted from its live AST.
 #[derive(Debug, Clone, Default)]
 pub struct AstSkeleton {
@@ -58,12 +83,7 @@ impl AstSkeleton {
             out.push(format!("  returns: {r}"));
         }
         if !self.fields.is_empty() {
-            let label = match self.kind.as_str() {
-                "impl" | "trait" => "methods",
-                "interface" => "members",
-                "enum" => "variants",
-                _ => "fields",
-            };
+            let label = field_label(&self.kind);
             out.push(format!("  {label}: {}", self.fields.join(", ")));
         }
         if !self.callees.is_empty() {
@@ -76,14 +96,29 @@ impl AstSkeleton {
         out.join("\n")
     }
 
-    /// Compact single-line text optimised for embedding.
+    /// Generate embedding text at the specified richness tier.
     ///
-    /// Format: `kind: sig | module: path | params: … | returns: … | calls: … | doc: …`
-    /// All fields are pipe-separated on one line. Comments are evenly subsampled to
-    /// 15 entries and joined with spaces so they read as flowing prose for the encoder.
-    /// Total length is capped at 1800 chars (~450 tokens) to stay within BGE-small's
-    /// 512-token input window after the kind/module prefix.
-    pub fn to_embed_text(&self, kind: &str, signature: &str, module: &str) -> String {
+    /// All tiers open with `kind: sig | module: path` so the structural anchor
+    /// always survives tokenizer truncation regardless of tier.
+    ///
+    /// - `Compact` (bge-small ≤50M): single-line, 15 subsampled comments, 1800-char cap.
+    /// - `Standard` (bge-base 51–150M): single-line, full fields, all comments, 2600-char cap.
+    /// - `Rich` (bge-large >150M): multi-line prose, per-field rows, all comments, 4000-char cap.
+    pub fn to_embed_text(
+        &self,
+        kind: &str,
+        signature: &str,
+        module: &str,
+        richness: EmbedRichness,
+    ) -> String {
+        match richness {
+            EmbedRichness::Compact => self.embed_compact(kind, signature, module),
+            EmbedRichness::Standard => self.embed_standard(kind, signature, module),
+            EmbedRichness::Rich => self.embed_rich(kind, signature, module),
+        }
+    }
+
+    fn embed_compact(&self, kind: &str, signature: &str, module: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         parts.push(format!("{kind}: {signature}"));
         if !module.is_empty() {
@@ -105,11 +140,91 @@ impl AstSkeleton {
             parts.push(format!("doc: {}", sampled.join(" ")));
         }
         let text = parts.join(" | ");
-        if text.len() > 1800 {
-            text[..1800].to_string()
-        } else {
-            text
+        truncate_at_char_boundary(&text, 1800)
+    }
+
+    fn embed_standard(&self, kind: &str, signature: &str, module: &str) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("{kind}: {signature}"));
+        if !module.is_empty() {
+            parts.push(format!("module: {module}"));
         }
+        if !self.params.is_empty() {
+            parts.push(format!("params: {}", self.params.join(", ")));
+        }
+        if let Some(r) = &self.return_type {
+            if !r.is_empty() {
+                parts.push(format!("returns: {r}"));
+            }
+        }
+        if !self.fields.is_empty() {
+            let label = field_label(&self.kind);
+            parts.push(format!("{label}: {}", self.fields.join(", ")));
+        }
+        if !self.callees.is_empty() {
+            parts.push(format!("calls: {}", self.callees.join(", ")));
+        }
+        if !self.comments.is_empty() {
+            parts.push(format!("doc: {}", self.comments.join(" ")));
+        }
+        let text = parts.join(" | ");
+        truncate_at_char_boundary(&text, 2600)
+    }
+
+    fn embed_rich(&self, kind: &str, signature: &str, module: &str) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        // Structural anchor — always first line, always survives truncation.
+        let mut header = format!("{kind}: {signature}");
+        if !module.is_empty() {
+            header.push_str(&format!(" | module: {module}"));
+        }
+        lines.push(header);
+        if !self.params.is_empty() {
+            lines.push(format!("params: {}", self.params.join(", ")));
+        }
+        if let Some(r) = &self.return_type {
+            if !r.is_empty() {
+                lines.push(format!("returns: {r}"));
+            }
+        }
+        // One line per field so bge-large can attend to each independently.
+        if !self.fields.is_empty() {
+            let label = field_label(&self.kind);
+            for f in &self.fields {
+                lines.push(format!("{label}: {f}"));
+            }
+        }
+        if !self.callees.is_empty() {
+            lines.push(format!("calls: {}", self.callees.join(", ")));
+        }
+        // Comments go last — least harmful if the tokenizer truncates here.
+        if !self.comments.is_empty() {
+            lines.push(format!("doc: {}", self.comments.join(" | ")));
+        }
+        let text = lines.join("\n");
+        truncate_at_char_boundary(&text, 4000)
+    }
+}
+
+/// Truncate `s` to at most `max_bytes` without splitting a UTF-8 character boundary.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    s[..boundary].to_string()
+}
+
+/// Return the plural label for the `fields` slot based on the declaration kind.
+fn field_label(kind: &str) -> &'static str {
+    match kind {
+        "impl" | "trait" => "methods",
+        "interface" => "members",
+        "enum" => "variants",
+        _ => "fields",
     }
 }
 

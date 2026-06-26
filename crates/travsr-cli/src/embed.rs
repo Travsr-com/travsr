@@ -11,6 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use travsr_daemon::regenerate_embed_texts_if_stale;
 use travsr_plugin_host::{lookup_embed_backend, EmbedBackend, EMBED_BACKENDS};
 
 use crate::progress::{fmt_dur, Palette};
@@ -174,28 +175,35 @@ fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
     println!();
     install_backend_with_progress(backend, reinstall)?;
 
-    // Activate.
+    // Record as globally installed/active (used by `travsr embed list` and hints).
     let mut config = load_config().unwrap_or_default();
     config.active = Some(backend.id.to_string());
     save_config(&config)?;
 
-    // Auto-reindex the current repo if one exists.
-    let db_path = std::env::current_dir()
+    // Write per-repo config so the daemon only auto-embeds repos the user
+    // explicitly opted into. The repo must already be initialised (graph.db exists).
+    let repo_root = std::env::current_dir()
         .ok()
-        .and_then(|c| crate::repo::find_git_root(&c).ok())
+        .and_then(|c| crate::repo::find_git_root(&c).ok());
+    let db_path = repo_root
+        .as_ref()
         .map(|r| r.join(".travsr/graph.db"))
         .filter(|p| p.exists());
+
+    if let Some(ref root) = repo_root {
+        if db_path.is_some() {
+            if let Err(e) = travsr_plugin_host::write_repo_backend_id(root, backend.id) {
+                tracing::warn!("could not write repo embed config: {e}");
+            }
+        }
+    }
 
     match db_path {
         Some(ref p) => reindex_after_init(backend, p)?,
         None => {
-            println!("\n  {} {} is now active", pal.green("\u{25cf}"), backend.id);
+            println!("\n  {} {} installed", pal.green("\u{25cf}"), backend.id);
             println!(
-                "  {} run `travsr embed reindex` inside a travsr repo to build embeddings",
-                pal.dim("\u{2139}")
-            );
-            println!(
-                "  {} then restart the daemon: travsr daemon restart",
+                "  {} run `travsr embed init` inside a travsr repo to activate for that repo",
                 pal.dim("\u{2139}")
             );
         }
@@ -394,12 +402,44 @@ async fn download_model_file_with_progress(
     Ok(())
 }
 
-/// Reindex with a spinner, suppressing sidecar stdout, then show count + daemon hint.
+/// Reindex after `embed init`. If the daemon is already running we hand off to
+/// it rather than spawning a second sidecar that fights for the embed.db lock.
 fn reindex_after_init(backend: &'static EmbedBackend, db_path: &std::path::Path) -> Result<()> {
     let is_tty = std::io::stderr().is_terminal();
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
 
     println!();
+
+    // If the daemon is running it already embeds autonomously in the background.
+    // Spawning a second sidecar here would create two concurrent writers on
+    // embed.db — SQLite lock contention that throttles throughput to ~5 nodes/s.
+    // Also skip embed_text regen — the daemon handles that in maybe_spawn_embed_phase2.
+    let repo_root = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(std::path::Path::new("."));
+    if super::daemon_is_running(repo_root, 1, 0) {
+        println!(
+            "  {} {} is now active",
+            pal.green("\u{25cf}"),
+            backend.id,
+        );
+        println!(
+            "  {} the daemon is embedding {} nodes in the background",
+            pal.dim("\u{2139}"),
+            backend.id,
+        );
+        println!(
+            "  {} run `travsr embed status` to monitor progress",
+            pal.dim("\u{2139}"),
+        );
+        return Ok(());
+    }
+
+    // Daemon not running: regen embed_text then run the blocking reindex inline.
+    if let Err(e) = regenerate_embed_texts_if_stale(db_path) {
+        tracing::warn!("embed_text regen check failed (non-fatal): {e}");
+    }
 
     let done = Arc::new(AtomicBool::new(false));
     let done2 = Arc::clone(&done);
@@ -570,6 +610,11 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
         if workers == 1 { "" } else { "s" },
     );
 
+    // Regenerate embed_text with correct richness if the model tier changed.
+    if let Err(e) = regenerate_embed_texts_if_stale(&db_path) {
+        tracing::warn!("embed_text regen check failed (non-fatal): {e}");
+    }
+
     // RFC-020: delegate to the parallel orchestrator in travsr-plugin-host.
     // It handles worker count derivation, range partitioning, temp-file isolation,
     // merge, and failure recovery per C-01 … C-08.
@@ -664,15 +709,25 @@ fn file_size_mb(path: &std::path::Path) -> Option<f64> {
 }
 
 fn cmd_status() -> Result<()> {
-    let config = load_config();
-    let active_id = config.as_ref().and_then(|c| c.active.as_deref());
     let bin_dir = embed_bin_dir()?;
 
+    // Resolve the repo-local model first. Fall back to global active only for
+    // the install-state display (binary/model files check).
+    let cwd = std::env::current_dir().context("getting cwd")?;
+    let repo_root = crate::repo::find_git_root(&cwd).ok();
+    let repo_active_id = repo_root
+        .as_ref()
+        .and_then(|r| travsr_plugin_host::repo_backend_id(r));
+
+    // For install checks: use whichever model the user has configured globally.
+    let global_id = load_config().and_then(|c| c.active);
+    let display_id = repo_active_id.as_deref().or(global_id.as_deref());
+
     // ── backend / install state ───────────────────────────────────────────────
-    let (backend_ok, backend) = match active_id {
+    let (backend_ok, _) = match display_id {
         None => {
-            println!("No embedding backend is active.");
-            println!("Run `travsr embed init` to install one.");
+            println!("No embedding backend is installed.");
+            println!("Run `travsr embed init` to install and activate one for this repo.");
             return Ok(());
         }
         Some(id) => match lookup_embed_backend(id) {
@@ -690,7 +745,7 @@ fn cmd_status() -> Result<()> {
                     .unwrap_or(false);
 
                 let ok = installed && models_ok;
-                println!("Backend        : {}", b.id);
+                println!("Backend        : {} (installed)", b.id);
                 println!("Description    : {}", b.description);
                 println!(
                     "Binary         : {}",
@@ -708,7 +763,7 @@ fn cmd_status() -> Result<()> {
                         "\u{2717} missing — run `travsr embed init`"
                     }
                 );
-                (ok, b)
+                (ok, ())
             }
         },
     };
@@ -718,9 +773,16 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     }
 
+    // ── per-repo activation state ─────────────────────────────────────────────
+    match &repo_active_id {
+        Some(id) => println!("Repo model     : {id} (configured for this repo)"),
+        None => {
+            println!("Repo model     : not configured — run `travsr embed init` to activate for this repo");
+        }
+    }
+
     // ── repo progress ─────────────────────────────────────────────────────────
     let db_path = {
-        let cwd = std::env::current_dir().context("getting cwd")?;
         match crate::repo::find_git_root(&cwd) {
             Ok(root) => root.join(".travsr/graph.db"),
             Err(_) => {
@@ -759,7 +821,12 @@ fn cmd_status() -> Result<()> {
         println!("Phase B state  : {state}");
     }
 
-    let EmbedStatsWithThreshold { stats, threshold } = query_embed_stats(&db_path, backend.id)?;
+    // If this repo hasn't been configured, skip the per-repo progress section.
+    let repo_model = match repo_active_id.as_deref() {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+    let EmbedStatsWithThreshold { stats, threshold } = query_embed_stats(&db_path, repo_model)?;
 
     if stats.total_symbols == 0 {
         println!("No symbol nodes found — run `travsr init` to index the repo.");
@@ -839,7 +906,7 @@ fn cmd_status() -> Result<()> {
     let hnsw_path = db_path
         .parent()
         .unwrap_or(&db_path)
-        .join(format!("{}.hnsw.usearch", backend.id));
+        .join(format!("{}.hnsw.usearch", repo_model));
     if let Some(mb) = file_size_mb(&hnsw_path) {
         println!(
             "HNSW index     : {mb:.0} MB  ({} vectors)",

@@ -1664,7 +1664,7 @@ fn is_noise_seed(node: &CoreNode) -> bool {
 ///
 /// Returns empty seeds when KNN returns nothing (index not yet built), so the caller
 /// can fall back to `search_nodes_fuzzy`.
-fn embed_path_seeds(
+pub(crate) fn embed_path_seeds(
     store: &SqliteStore,
     query: &str,
     knn_fn: EmbedKnnFn<'_>,

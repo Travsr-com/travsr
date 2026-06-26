@@ -1490,6 +1490,15 @@ LIMIT 100",
     ///
     /// Uses a single prepared statement executed inside one transaction for speed.
     /// O(|shells|) writes — safe to call after every index pass.
+    /// Set `embed_text = NULL` for all nodes.
+    ///
+    /// Called before regenerating embed_text with a new richness tier (model switch).
+    pub fn clear_all_embed_texts(&mut self) -> Result<(), StoreError> {
+        self.conn
+            .execute_batch("UPDATE nodes SET embed_text = NULL")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Batch-update the `embed_text` column for a set of nodes.
     ///
     /// Called by the daemon after Phase A indexing to store pre-computed

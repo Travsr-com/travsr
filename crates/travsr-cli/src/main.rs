@@ -422,9 +422,13 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 DaemonAction::Status => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Status) {
-                        Ok(_) => {
+                        Ok(resp) => {
                             let transport = if cfg!(windows) { "named_pipe" } else { "unix" };
-                            println!("running [transport={transport}]");
+                            println!("daemon: running [transport={transport}]");
+                            if let Some(msg) = resp.message {
+                                println!();
+                                println!("{msg}");
+                            }
                         }
                         Err(_) => {
                             // Socket not ready yet — check lock file PID.
@@ -438,9 +442,9 @@ async fn run(cli: Cli) -> Result<()> {
                                 .map(pid_is_alive)
                                 .unwrap_or(false);
                             if starting {
-                                println!("starting (scanning file tree — socket not ready yet)");
+                                println!("daemon: starting (scanning file tree — socket not ready yet)");
                             } else {
-                                println!("not running");
+                                println!("daemon: not running");
                             }
                         }
                     }

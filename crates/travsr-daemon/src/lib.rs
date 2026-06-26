@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
-use travsr_analysis::skeleton::skeleton_for_node;
+use travsr_analysis::skeleton::{skeleton_for_node, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
@@ -457,11 +457,10 @@ fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -
 
 /// Compute and persist `embed_text` for all nodes where it is currently NULL.
 ///
-/// Called after Phase A indexing so the embed sidecar (travsr-embed) can read
-/// a pre-computed AST-skeleton string instead of assembling it from SQL subqueries.
-/// Batch size of 500 keeps SQLite transactions short and avoids memory pressure
-/// on large repos.
-fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path) {
+/// `richness` controls how much context is packed per node — derived from the
+/// installed embed model's `params_m` at call time. Pass `EmbedRichness::Compact`
+/// when no model is installed (safe default; regenerated at first reindex).
+fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: EmbedRichness) {
     let nodes = match store.nodes_missing_embed_text() {
         Ok(n) => n,
         Err(e) => {
@@ -472,12 +471,13 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path) {
     if nodes.is_empty() {
         return;
     }
-    tracing::debug!(count = nodes.len(), "computing embed_text for nodes");
+    tracing::debug!(count = nodes.len(), ?richness, "computing embed_text for nodes");
     const BATCH: usize = 500;
     let mut pairs: Vec<(travsr_core::NodeId, String)> = Vec::with_capacity(BATCH);
     for node in &nodes {
         if let Some(skel) = skeleton_for_node(node, repo_root) {
-            let text = skel.to_embed_text(&node.kind, &node.vname.signature, &node.vname.path);
+            let text =
+                skel.to_embed_text(&node.kind, &node.vname.signature, &node.vname.path, richness);
             pairs.push((node.id, text));
             if pairs.len() >= BATCH {
                 if let Err(e) = store.write_embed_texts_batch(&pairs) {
@@ -492,6 +492,70 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path) {
             tracing::warn!("update_embed_texts: final batch write failed: {e}");
         }
     }
+}
+
+/// Derive the richness tier for the model currently configured in this repo.
+/// Returns `Compact` when no model is configured (safe default).
+fn richness_from_meta(repo_root: &Path) -> EmbedRichness {
+    travsr_plugin_host::repo_backend_id(repo_root)
+        .and_then(|id| travsr_plugin_host::lookup_embed_backend(&id))
+        .map(|b| EmbedRichness::from_params_m(b.params_m))
+        .unwrap_or(EmbedRichness::Compact)
+}
+
+/// If the active embed model differs from what generated the stored `embed_text`,
+/// NULL all embed_text rows, regenerate with the correct richness, and update
+/// the meta key — ensuring the sidecar always sees correctly-tiered text.
+///
+/// The meta key is written AFTER regeneration so a crash mid-way leaves the key
+/// pointing to the old model and triggers a clean retry on the next call.
+///
+/// Returns `true` when regeneration was performed.
+pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
+    let repo_root = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("cannot derive repo_root from db_path"))?;
+    // Use the PER-REPO configured model, not the global active.
+    // If this repo has not been configured via `travsr embed init`, skip silently.
+    let active_id = match travsr_plugin_host::repo_backend_id(repo_root) {
+        Some(id) => id,
+        None => return Ok(false),
+    };
+    let backend = match travsr_plugin_host::lookup_embed_backend(&active_id) {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+
+    let mut store = travsr_store::SqliteStore::open(db_path)
+        .context("opening store for embed_text regeneration")?;
+
+    let stored_id = store.get_meta("embed_text_model_id").ok().flatten();
+    if stored_id.as_deref() == Some(active_id.as_str()) {
+        return Ok(false);
+    }
+
+    let richness = EmbedRichness::from_params_m(backend.params_m);
+    tracing::info!(
+        old = ?stored_id,
+        new = %active_id,
+        ?richness,
+        "embed model changed — regenerating embed_text"
+    );
+
+    // NULL all rows so update_embed_texts picks them all up.
+    store
+        .clear_all_embed_texts()
+        .context("clearing embed_text for model tier change")?;
+
+    update_embed_texts(&mut store, repo_root, richness);
+
+    // Write the new model_id only after successful regeneration.
+    store
+        .set_meta("embed_text_model_id", &active_id)
+        .context("writing embed_text_model_id")?;
+
+    Ok(true)
 }
 
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
@@ -1050,9 +1114,13 @@ pub fn init_repo_with_progress(
         Err(e) => tracing::warn!("kcore: computation failed after init: {e}"),
     }
 
-    // Pre-compute AST-skeleton embed text for all nodes so the embed sidecar
-    // can read richer text without cross-repo dependencies.
-    update_embed_texts(&mut store, repo_root);
+    // Embed text generation is intentionally omitted here.
+    // `regenerate_embed_texts_if_stale` (called from `travsr embed init` and
+    // `travsr embed reindex`) generates embed_text with the correct richness
+    // tier for the active model just before the sidecar runs — that is the
+    // right place. Running it inline during `travsr init` blocks the terminal
+    // for minutes on large repos and produces Compact-richness text that would
+    // be regenerated immediately anyway.
 
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
@@ -1248,7 +1316,8 @@ fn maybe_spawn_embed_phase2(
     if !db_path.exists() {
         return;
     }
-    let backend_id = match travsr_plugin_host::active_backend_id() {
+    // Use per-repo config — do not auto-embed repos that haven't opted in.
+    let backend_id = match travsr_plugin_host::repo_backend_id(repo_root) {
         Some(id) => id,
         None => return,
     };
@@ -1596,8 +1665,10 @@ pub fn reindex_files(
             Err(e) => tracing::warn!("kcore: computation failed: {e}"),
         }
 
-        // Populate embed_text for newly-indexed nodes.
-        update_embed_texts(store, repo_root);
+        // Populate embed_text for newly-indexed nodes (commit-hook path).
+        // Only runs when a model is configured for this repo.
+        let richness = richness_from_meta(repo_root);
+        update_embed_texts(store, repo_root, richness);
     }
 
     // PERF-002: The LSIF semantic pass was running on every `reindex_files`
@@ -2234,6 +2305,32 @@ impl Daemon {
             try_inject_embed_hook(&mut rs, &mut ws, &db_path);
         }
 
+        // Migration: repos initialised before per-repo embed config was introduced
+        // have an `embed_text_model_id` meta key in graph.db but no
+        // `<repo>/.travsr/embed.toml`. Write the local config from the meta key so
+        // the user's existing embed setup continues to work without re-running
+        // `travsr embed init`.
+        {
+            let repo_embed_cfg = travsr_dir.join("embed.toml");
+            if !repo_embed_cfg.exists() {
+                let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                if let Ok(Some(model_id)) = s.get_meta("embed_text_model_id") {
+                    if travsr_plugin_host::lookup_embed_backend(&model_id).is_some() {
+                        if let Err(e) =
+                            travsr_plugin_host::write_repo_backend_id(&repo_root, &model_id)
+                        {
+                            tracing::warn!("embed config migration failed: {e}");
+                        } else {
+                            tracing::info!(
+                                model_id = %model_id,
+                                "migrated embed config to per-repo embed.toml"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // #318 O2: LRU result cache for read-only queries served off the warm
         // store. Keyed on (tool, args, last_commit, phase_b_commit), so commits
         // and background Phase B refreshes invalidate it structurally.
@@ -2677,7 +2774,54 @@ fn handle_control_message(
             }
             (ControlResponse::ok(None), false)
         }
-        Ok(ControlMessage::Status) => (ControlResponse::ok(Some("running".to_string())), false),
+        Ok(ControlMessage::Status) => {
+            let s = read_store.lock().unwrap_or_else(|e| e.into_inner());
+            let last_commit = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+            let phase_b_commit = s.get_meta("phase_b_commit").ok().flatten().unwrap_or_default();
+            let nodes = s.node_count().unwrap_or(0);
+            let edges = s.edge_count().unwrap_or(0);
+
+            // Live Phase B activity from the scheduler.
+            let phase_b_activity = if phase_b_scheduler.is_running() {
+                "running".to_string()
+            } else if phase_b_scheduler.is_pending() {
+                "pending (debounce)".to_string()
+            } else if last_commit.is_empty() {
+                "not run (no commits yet)".to_string()
+            } else if phase_b_commit.is_empty() {
+                "pending".to_string()
+            } else if phase_b_commit == last_commit {
+                "up-to-date".to_string()
+            } else {
+                "stale (new commits since last run)".to_string()
+            };
+
+            // Embed progress — per-repo configured model only.
+            let embed_line = if let Some(backend_id) = travsr_plugin_host::repo_backend_id(repo_root) {
+                let threshold = 3u32;
+                match s.embed_progress(&backend_id, threshold) {
+                    Ok((total, embedded, phase1_total, phase1_done)) => {
+                        let phase2_done = embedded.saturating_sub(phase1_done);
+                        let phase2_total = total.saturating_sub(phase1_total);
+                        let pct = if total > 0 { embedded * 100 / total } else { 100 };
+                        format!(
+                            "embedding ({backend_id}): {embedded}/{total} ({pct}%) — \
+                             Phase 1: {phase1_done}/{phase1_total} · Phase 2: {phase2_done}/{phase2_total}"
+                        )
+                    }
+                    Err(_) => format!("embedding ({backend_id}): progress unavailable"),
+                }
+            } else {
+                "embedding: no backend active".to_string()
+            };
+
+            let msg = format!(
+                "nodes: {nodes} | edges: {edges} | last_commit: {last_commit}\n\
+                 phase B : {phase_b_activity}\n\
+                 {embed_line}"
+            );
+            (ControlResponse::ok(Some(msg)), false)
+        }
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
         // #318 O1: read-only CLI queries served from the daemon's warm store —
         // skips the per-command store open that dominates CLI latency.
@@ -2748,7 +2892,9 @@ fn run_query(
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("ask query missing 'query' arg"))?;
-            Ok(serde_json::to_value(query::ask_query(store, q)?)?)
+            let knn = store.embed_knn_fn();
+            let knn_ref = knn.as_ref().map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
+            Ok(serde_json::to_value(query::ask_query(store, q, knn_ref)?)?)
         }
         "status" => Ok(serde_json::to_value(query::status_query(store)?)?),
         other => anyhow::bail!("unknown query tool '{other}'"),

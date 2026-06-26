@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use travsr_core::{display_label, is_noise_node, NodeId};
-use travsr_retrieval::{context_candidates, knapsack, token_cost};
+use travsr_retrieval::{context_candidates, knapsack, ppr_weighted, token_cost, OpenFilter};
 use travsr_store::{SqliteStore, Store, StoreMigratable};
 
 /// Token budget for `travsr ask` and the default for `travsr graph --budget`.
@@ -125,6 +125,9 @@ pub struct AskPayload {
     pub no_results: bool,
     pub rows: Vec<AskRow>,
     pub total_tokens: usize,
+    /// True when KNN embed seeds drove PPR instead of FTS. Absent in old JSON → false.
+    #[serde(default)]
+    pub embed_used: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,11 +172,69 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
 
 // ── ask ───────────────────────────────────────────────────────────────────────
 
-pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload> {
-    // Strip a leading `:` so VS Code graph-panel queries (which prefix with `:`
-    // to bypass the colon-delimited command syntax) pass through cleanly.
+/// Run an ask query, optionally enhanced with KNN embed seeds.
+///
+/// When `knn_fn` is `Some`, the embed path is tried first:
+///   embed_path_seeds → ppr_weighted → knapsack
+/// If KNN returns no seeds (index not yet built) or `knn_fn` is `None`,
+/// falls back to the FTS path:
+///   search_nodes_fuzzy → uniform ppr → knapsack
+///
+/// The FTS relevance gate (token-in-signature check) only applies on the
+/// FTS path — embed may find semantically similar nodes with no surface overlap.
+pub fn ask_query(
+    store: &SqliteStore,
+    query: &str,
+    knn_fn: Option<&dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>>,
+) -> anyhow::Result<AskPayload> {
+    // Strip a leading `:` so VS Code graph-panel queries pass through cleanly.
     let query = query.strip_prefix(':').unwrap_or(query).trim();
 
+    // ── Embed path (KNN → weighted PPR) ───────────────────────────────────────
+    if let Some(knn) = knn_fn {
+        let (seeds, _) = crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
+        if !seeds.is_empty() {
+            let ppr_scores = ppr_weighted(store, &seeds, context_candidates())?;
+            if ppr_scores.is_empty() {
+                return Ok(AskPayload {
+                    matched: true,
+                    no_results: true,
+                    rows: Vec::new(),
+                    total_tokens: 0,
+                    embed_used: true,
+                });
+            }
+            let node_ids: Vec<_> = ppr_scores.iter().map(|(id, _)| *id).collect();
+            let score_map: HashMap<_, f32> = ppr_scores.into_iter().collect();
+            let nodes = store.get_nodes(&node_ids)?;
+            let items: Vec<_> = nodes
+                .into_iter()
+                .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
+                .collect();
+            let selected = knapsack(items, DEFAULT_TOKEN_BUDGET);
+            let total_tokens: usize = selected.iter().map(token_cost).sum();
+            let rows = selected
+                .into_iter()
+                .map(|n| AskRow {
+                    score: score_map.get(&n.id).copied().unwrap_or(0.0),
+                    kind: n.kind,
+                    signature: n.vname.signature,
+                    path: n.vname.path,
+                    line: n.line,
+                })
+                .collect();
+            return Ok(AskPayload {
+                matched: true,
+                no_results: false,
+                rows,
+                total_tokens,
+                embed_used: true,
+            });
+        }
+        // KNN returned no seeds — fall through to FTS path below.
+    }
+
+    // ── FTS path (fuzzy search → uniform PPR) ─────────────────────────────────
     let matches = store.search_nodes_fuzzy(query)?;
     if matches.is_empty() {
         return Ok(AskPayload {
@@ -181,13 +242,13 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
             no_results: false,
             rows: Vec::new(),
             total_tokens: 0,
+            embed_used: false,
         });
     }
 
     // H1: FTS5 can return false positives for very short or unrelated queries.
     // Gate `matched = true` on a minimal relevance check: at least one query
     // token (≥3 chars) must appear in the top result's signature or path.
-    // This prevents `travsr ask "zxqw"` from returning unrelated results.
     let top = &matches[0];
     let top_text = format!(
         "{} {}",
@@ -206,6 +267,7 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
             no_results: false,
             rows: Vec::new(),
             total_tokens: 0,
+            embed_used: false,
         });
     }
 
@@ -224,6 +286,7 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
             no_results: true,
             rows: Vec::new(),
             total_tokens: 0,
+            embed_used: false,
         });
     }
 
@@ -253,6 +316,7 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
         no_results: false,
         rows,
         total_tokens,
+        embed_used: false,
     })
 }
 
@@ -680,7 +744,7 @@ mod tests {
     #[test]
     fn ask_query_returns_rows_within_budget() {
         let (store, ..) = seeded_store();
-        let payload = ask_query(&store, "PaymentService").unwrap();
+        let payload = ask_query(&store, "PaymentService", None).unwrap();
         assert!(payload.matched);
         assert!(payload.total_tokens <= DEFAULT_TOKEN_BUDGET);
     }

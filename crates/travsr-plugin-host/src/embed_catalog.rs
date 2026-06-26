@@ -517,9 +517,13 @@ pub fn run_parallel_reindex_blocking_quiet(db_path: &Path) -> anyhow::Result<()>
 // ── Shared resolution helper ──────────────────────────────────────────────────
 
 /// Resolve the active backend's binary path, embed.db path, and model_id.
-/// Returns None when no backend is configured or the binary is missing.
+///
+/// Reads the PER-REPO config from `<repo>/.travsr/embed.toml` (derived from
+/// `db_path`). Returns `None` when the repo has not been configured with
+/// `travsr embed init` — callers must not auto-embed unconfigured repos.
 fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
-    let backend_id = active_backend_id()?;
+    let repo_root = db_path.parent().and_then(|p| p.parent())?;
+    let backend_id = repo_backend_id(repo_root)?;
     let backend = lookup(&backend_id)?;
     let home = dirs::home_dir()?;
     let bin_path = home.join(".travsr").join("bin").join(backend.binary_name);
@@ -532,8 +536,37 @@ fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
 
 // ── Config helpers ────────────────────────────────────────────────────────────
 
+/// Read the embed backend configured for a specific repo.
+///
+/// Reads `<repo_root>/.travsr/embed.toml`. Returns `None` when absent —
+/// absence means "not configured; do not auto-embed this repo."
+pub fn repo_backend_id(repo_root: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Config {
+        active: Option<String>,
+    }
+    let content =
+        std::fs::read_to_string(repo_root.join(".travsr").join("embed.toml")).ok()?;
+    let cfg: Config = toml::from_str(&content).ok()?;
+    cfg.active
+}
+
+/// Write the per-repo embed model choice to `<repo_root>/.travsr/embed.toml`.
+///
+/// Called by `travsr embed init` after the user selects a model in a repo.
+/// The `.travsr/` directory must already exist (guaranteed by `travsr init`).
+pub fn write_repo_backend_id(repo_root: &Path, backend_id: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let path = repo_root.join(".travsr").join("embed.toml");
+    let content = format!("active = \"{backend_id}\"\n");
+    std::fs::write(&path, content)
+        .with_context(|| format!("writing repo embed config to {}", path.display()))
+}
+
 /// Read the active backend id from `~/.travsr/embed.toml`.
-/// Returns None when absent, unreadable, or no `active` key set.
+///
+/// Machine-scoped: records what is installed. Use `repo_backend_id` for
+/// per-repo embedding decisions; this is only for install/list/hint paths.
 pub fn active_backend_id() -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Config {

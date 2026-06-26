@@ -42,8 +42,9 @@ pub fn run(query_str: &str) -> anyhow::Result<()> {
     ) {
         Some(p) => p,
         None => {
+            // Direct path: no daemon running, no sidecar available → pass None for knn_fn.
             let store = daemon_client::open_read_store(&db_path)?;
-            query::ask_query(&store, query_str)?
+            query::ask_query(&store, query_str, None)?
         }
     };
 
@@ -74,6 +75,7 @@ pub fn run(query_str: &str) -> anyhow::Result<()> {
 
     let n = rows.len();
     println!("{}", Table::new(rows));
-    println!("\n{n} nodes · ~{} tokens", payload.total_tokens);
+    let embed_note = if payload.embed_used { " · [embed-enhanced]" } else { "" };
+    println!("\n{n} nodes · ~{} tokens{embed_note}", payload.total_tokens);
     Ok(())
 }
