@@ -11,7 +11,7 @@
 [![Bench](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml)
 [![Phase 2 Exit](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml)
 [![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ---
 
@@ -533,4 +533,4 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome. Licensed MIT.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome. Licensed under Apache 2.0.

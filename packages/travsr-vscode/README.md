@@ -45,4 +45,4 @@ Telemetry is **off by default**. When enabled, only anonymous usage events are s
 
 ## License
 
-MIT — [github.com/raj-rkv/travsr](https://github.com/raj-rkv/travsr)
+Apache-2.0 — [github.com/raj-rkv/travsr](https://github.com/raj-rkv/travsr)
