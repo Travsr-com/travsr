@@ -89,6 +89,9 @@ enum Command {
     Ask {
         /// Symbol name to search for (partial match supported).
         query: String,
+        /// Output format: table (default) or json.
+        #[arg(long, value_enum, default_value = "table")]
+        format: ask::OutputFormat,
     },
     /// Show the dependency graph for a symbol or file as a tree or DOT.
     Graph {
@@ -512,7 +515,7 @@ async fn run(cli: Cli) -> Result<()> {
             json,
         } => repos::run(prune, remove.as_deref(), json)?,
         Command::Status => status::run()?,
-        Command::Ask { query } => ask::run(&query)?,
+        Command::Ask { query, format } => ask::run(&query, format)?,
         Command::Graph {
             query,
             all,

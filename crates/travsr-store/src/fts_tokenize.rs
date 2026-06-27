@@ -377,7 +377,10 @@ mod tests {
     #[test]
     fn normalize_internal_words_untouched() {
         // Punctuation in the middle of a word (e.g. camelCase) is not stripped.
-        assert_eq!(normalize_nl_query("find PaymentService.charge"), "find PaymentService.charge");
+        assert_eq!(
+            normalize_nl_query("find PaymentService.charge"),
+            "find PaymentService.charge"
+        );
     }
 
     #[test]

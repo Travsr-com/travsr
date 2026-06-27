@@ -5,11 +5,21 @@ hallucination**. This harness answers the same structural question two ways and
 compares the answer quality and the context-token cost each approach imposes on
 an LLM agent.
 
-## The two arms
+## Task classes
+
+Three classes of structural question are evaluated:
+
+| Class | Graph arm | Files arm | Gate |
+|---|---|---|---|
+| `callers` | `travsr graph --direction callers --format json` | `git grep -l` + read every candidate | exact + cheaper |
+| `context` | `travsr ask --format json` (full PPR+knapsack pipeline) | `git grep -l` + read every candidate | exact + cheaper |
+| `ask` | `travsr ask --format json` — rank-1 seed resolution | — | top result matches expected symbol |
+
+## The two arms (callers + context classes)
 
 | Arm | What it models | Answer | Context cost |
 |---|---|---|---|
-| **graph** | An agent wired to the Travsr MCP server | the file nodes returned by one `travsr graph` query | tokens of the **answer payload** (resolved paths + signatures) — 0 source files read |
+| **graph** | An agent wired to the Travsr MCP server | file nodes / ranked rows returned by one Travsr query | tokens of the **answer payload** — 0 source files read |
 | **files-only** | An agent with only `grep` + `read` (Copilot/Cursor-style) | every file that textually mentions the symbol (`git grep -l`) | tokens of **all** those files, read in full |
 
 The graph arm's cost is the answer Travsr returns, not the `--format json` CLI

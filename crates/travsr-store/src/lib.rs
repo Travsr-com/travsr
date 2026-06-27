@@ -554,6 +554,36 @@ impl SqliteStore {
         })
     }
 
+    /// Batch in-degree counts (number of incoming edges) for the given node IDs.
+    ///
+    /// Nodes with no incoming edges are included with a count of 0.
+    /// Chunked at 500 IDs per query to stay within SQLite's parameter limit.
+    pub fn in_degrees(&self, ids: &[NodeId]) -> AnyResult<std::collections::HashMap<NodeId, u32>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut result: std::collections::HashMap<NodeId, u32> =
+            ids.iter().map(|&id| (id, 0u32)).collect();
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT dst, COUNT(*) as cnt FROM edges WHERE dst IN ({placeholders}) GROUP BY dst"
+            );
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let params: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(id.0 as i64))
+                .collect();
+            let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+            while let Some(row) = rows.next()? {
+                let dst: i64 = row.get(0)?;
+                let cnt: u32 = row.get(1)?;
+                result.insert(NodeId(dst as u64), cnt);
+            }
+        }
+        Ok(result)
+    }
+
     /// Create the `meta` table if it does not already exist.
     /// Must run before the migration runner, which uses meta to read the version.
     fn bootstrap_meta(conn: &Connection) -> AnyResult<()> {
@@ -1276,6 +1306,18 @@ impl SqliteStore {
     + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
            OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
     + (LENGTH(path) / 32)
+    + CASE kind
+        WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
+        WHEN 'class'       THEN 2 WHEN 'interface'   THEN 2 WHEN 'struct'      THEN 2
+        WHEN 'enum'        THEN 2 WHEN 'trait'       THEN 2 WHEN 'union'       THEN 2
+        WHEN 'constant'    THEN 3 WHEN 'static'      THEN 3
+        WHEN 'impl'        THEN 4 WHEN 'type'        THEN 4 WHEN 'module'      THEN 4
+        WHEN 'field'       THEN 6 WHEN 'var'         THEN 6 WHEN 'variable'    THEN 6
+        WHEN 'property'    THEN 6
+        WHEN 'import'      THEN 8 WHEN 'file-module' THEN 8 WHEN 'crate'       THEN 8
+        WHEN 'go-pkg'      THEN 10
+        ELSE 4
+      END
   ) AS rank
 FROM nodes
 WHERE signature LIKE '%' || ?1 || '%'
@@ -1423,7 +1465,10 @@ LIMIT 100",
             let sql = format!(
                 "SELECT id, signature, path FROM nodes WHERE signature IN ({placeholders})"
             );
-            let mut stmt = self.conn.prepare(&sql).context("preparing nodes_by_signatures")?;
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("preparing nodes_by_signatures")?;
             let params_vec: Vec<&dyn rusqlite::ToSql> =
                 sigs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
             let rows = stmt
@@ -2669,6 +2714,18 @@ impl SqliteStore {
     + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
            OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
     + (LENGTH(path) / 32)
+    + CASE kind
+        WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
+        WHEN 'class'       THEN 2 WHEN 'interface'   THEN 2 WHEN 'struct'      THEN 2
+        WHEN 'enum'        THEN 2 WHEN 'trait'       THEN 2 WHEN 'union'       THEN 2
+        WHEN 'constant'    THEN 3 WHEN 'static'      THEN 3
+        WHEN 'impl'        THEN 4 WHEN 'type'        THEN 4 WHEN 'module'      THEN 4
+        WHEN 'field'       THEN 6 WHEN 'var'         THEN 6 WHEN 'variable'    THEN 6
+        WHEN 'property'    THEN 6
+        WHEN 'import'      THEN 8 WHEN 'file-module' THEN 8 WHEN 'crate'       THEN 8
+        WHEN 'go-pkg'      THEN 10
+        ELSE 4
+      END
   ) AS rank
 FROM nodes
 WHERE (signature LIKE '%' || ?1 || '%'

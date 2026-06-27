@@ -1626,6 +1626,39 @@ const MAX_SEEDS_PER_PATH: usize = 2;
 const FTS_EXACT_WEIGHT: f32 = 1.0;
 /// PPR seed weight for a fuzzy/trigram FTS match (L2-A expansion, no literal substring match).
 const FTS_FUZZY_WEIGHT: f32 = 0.6;
+
+/// Per-kind multiplier applied to FTS seed weights before PPR personalisation.
+///
+/// Boosts definitive code entities (methods, classes, structs, traits) and
+/// suppresses structural/import nodes that produce noisy PPR walks on large
+/// graphs. Language is required because `"module"` means different things:
+/// a Rust `mod foo {}` block is real code (1.0×) while a Go package
+/// declaration node is graph connective tissue (0.05×).
+fn kind_boost(kind: &str, language: &str) -> f32 {
+    match kind {
+        // Primary callables — highest value across all languages
+        "method" | "function" | "constructor" => 2.0,
+        // Named type definitions — Rust struct/enum/trait, Go class, TS interface
+        "class" | "interface" | "struct" | "enum" | "trait" | "union" => 1.5,
+        // Named value definitions — Rust constant/static, important anchors
+        "constant" | "static" => 1.2,
+        // Impl blocks and type aliases — moderate; contain methods but aren't entry points
+        "impl" | "type" => 1.0,
+        // Data members and local bindings — lower value, often noise at seed level
+        "field" | "var" | "variable" | "property" => 0.7,
+        // Imports and file-boundary structural nodes
+        "import" | "file-module" | "crate" => 0.3,
+        // Go-specific package identifier nodes — always structural noise
+        "go-pkg" => 0.05,
+        // Module kind is language-dependent:
+        //   Go   → scip-go package declaration node, structural, high in-degree → suppress
+        //   Rust → `mod foo {}` declaration, real code entity → keep
+        "module" if language == "go" => 0.05,
+        "module" => 1.0,
+        _ => 1.0,
+    }
+}
+
 /// Circuit-breaker threshold for KNN sidecar inference (ms). Calls exceeding this
 /// are discarded and the caller falls back to FTS seeds.
 ///
@@ -1709,7 +1742,10 @@ pub(crate) fn embed_path_seeds(
     // Normalize before embedding: strip sentence punctuation from word edges so
     // "work?" and "work ?" produce the same vector ("how daemon work?" == "how daemon work ?").
     let normalized_query = travsr_store::fts_tokenize::normalize_nl_query(query);
-    let knn_pairs = knn_fn(&normalized_query, (MAX_EMBED_SEEDS as u32).saturating_mul(6));
+    let knn_pairs = knn_fn(
+        &normalized_query,
+        (MAX_EMBED_SEEDS as u32).saturating_mul(6),
+    );
     let knn_elapsed_ms = t0.elapsed().as_millis();
     if knn_pairs.is_empty() {
         return (vec![], 0, knn_elapsed_ms);
@@ -1801,6 +1837,13 @@ fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
 /// - Exact substring match (`search_nodes_by_name`) → `FTS_EXACT_WEIGHT` (1.0)
 /// - Trigram/L2-A fuzzy match (`search_nodes_fuzzy`) → `FTS_FUZZY_WEIGHT` (0.6)
 ///
+/// Dot-notation queries (e.g. `"Kubelet.syncPod"`) are split on the last `.`:
+/// the name part is searched; results are filtered to those whose signature
+/// contains the qualifier, ensuring `var:SyncPod` never beats `method:Kubelet.syncPod`.
+///
+/// Each seed weight is multiplied by `kind_boost` so callable definitions
+/// (method, function, constructor) rank above structural nodes (import, module).
+///
 /// Returns up to 5 seeds (capped to prevent FTS from flooding the seed pool).
 pub(crate) fn fts_seeds_weighted(
     store: &SqliteStore,
@@ -1819,12 +1862,16 @@ pub(crate) fn fts_seeds_weighted(
             }
         }
     };
+
     nodes
         .into_iter()
         .filter(|n| !is_noise_seed(n))
         .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
         .take(5)
-        .map(|n| (n.id, weight))
+        .map(|n| {
+            let boosted = weight * kind_boost(&n.kind, &n.vname.language);
+            (n.id, boosted)
+        })
         .collect()
 }
 
@@ -1994,12 +2041,7 @@ pub(crate) fn enrich_seeds_with_callers(
 
         // Sort by descending outgoing degree — more central callers first.
         production_callers.sort_unstable_by_key(|&id| {
-            std::cmp::Reverse(
-                store
-                    .iter_edges_from(id)
-                    .map(|e| e.len())
-                    .unwrap_or(0),
-            )
+            std::cmp::Reverse(store.iter_edges_from(id).map(|e| e.len()).unwrap_or(0))
         });
 
         let caller_weight = seed_weight * 0.35;
@@ -5155,7 +5197,8 @@ mod snippet_tests {
         let seeds = fts_seeds_weighted(&store, "random_walk", &OpenFilter);
         assert!(
             seeds.iter().all(|&(id, _)| id == impl_id),
-            "crate-kind nodes must be filtered from FTS seeds; got {:?}", seeds
+            "crate-kind nodes must be filtered from FTS seeds; got {:?}",
+            seeds
         );
     }
 
@@ -5559,7 +5602,11 @@ mod snippet_tests {
         let seed_id = store.put_node(&seed_node).unwrap();
         let caller_id = store.put_node(&caller_node).unwrap();
         store
-            .put_edge(&travsr_core::Edge::new(caller_id, seed_id, EdgeKind::RefCall))
+            .put_edge(&travsr_core::Edge::new(
+                caller_id,
+                seed_id,
+                EdgeKind::RefCall,
+            ))
             .unwrap();
 
         let seeds = vec![(seed_id, 1.0)];
@@ -5591,7 +5638,11 @@ mod snippet_tests {
             .unwrap();
 
         let result = enrich_seeds_with_callers(&store, vec![(seed_id, 1.0)], usize::MAX);
-        assert_eq!(result.len(), 1, "test caller must be filtered, only seed remains");
+        assert_eq!(
+            result.len(),
+            1,
+            "test caller must be filtered, only seed remains"
+        );
         assert!(!result.iter().any(|&(id, _)| id == test_id));
     }
 
@@ -5614,7 +5665,11 @@ mod snippet_tests {
         // Both are already seeds — b should not be added again at reduced weight.
         let seeds = vec![(a_id, 1.0), (b_id, 0.9)];
         let result = enrich_seeds_with_callers(&store, seeds.clone(), usize::MAX);
-        assert_eq!(result.len(), 2, "no duplicates when caller already in seed set");
+        assert_eq!(
+            result.len(),
+            2,
+            "no duplicates when caller already in seed set"
+        );
         // b must retain original weight 0.9, not get demoted to 0.35
         let b_weight = result.iter().find(|&&(id, _)| id == b_id).unwrap().1;
         assert!(
@@ -5647,8 +5702,16 @@ mod snippet_tests {
         let parent_id = store.put_node(&parent).unwrap();
         let gp_id = store.put_node(&grandparent).unwrap();
 
-        store.put_edge(&travsr_core::Edge::new(parent_id, child_id, EdgeKind::RefCall)).unwrap();
-        store.put_edge(&travsr_core::Edge::new(gp_id, parent_id, EdgeKind::RefCall)).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(
+                parent_id,
+                child_id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(gp_id, parent_id, EdgeKind::RefCall))
+            .unwrap();
 
         // Simulate what get_context_body / ask_query do: two sequential enrich calls.
         let seeds = vec![(child_id, 1.0)];
@@ -5656,14 +5719,26 @@ mod snippet_tests {
         let seeds = enrich_seeds_with_callers(&store, seeds, 10); // depth-2
 
         let ids: Vec<_> = seeds.iter().map(|&(id, _)| id).collect();
-        assert!(ids.contains(&parent_id), "depth-1 caller (parent) must be seeded");
-        assert!(ids.contains(&gp_id), "depth-2 caller (grandparent) must be seeded");
+        assert!(
+            ids.contains(&parent_id),
+            "depth-1 caller (parent) must be seeded"
+        );
+        assert!(
+            ids.contains(&gp_id),
+            "depth-2 caller (grandparent) must be seeded"
+        );
 
         // Weights decrease per hop: parent ≈ 0.35, grandparent ≈ 0.35²
         let parent_w = seeds.iter().find(|&&(id, _)| id == parent_id).unwrap().1;
         let gp_w = seeds.iter().find(|&&(id, _)| id == gp_id).unwrap().1;
-        assert!((parent_w - 0.35).abs() < 1e-5, "parent weight = 0.35; got {parent_w}");
-        assert!((gp_w - 0.35 * 0.35).abs() < 1e-4, "grandparent weight = 0.35²; got {gp_w}");
+        assert!(
+            (parent_w - 0.35).abs() < 1e-5,
+            "parent weight = 0.35; got {parent_w}"
+        );
+        assert!(
+            (gp_w - 0.35 * 0.35).abs() < 1e-4,
+            "grandparent weight = 0.35²; got {gp_w}"
+        );
     }
 
     #[test]
@@ -5677,22 +5752,27 @@ mod snippet_tests {
         let hub_id = store.put_node(&hub).unwrap();
 
         for i in 0..8u32 {
-            let caller = make_fn_node_with_pkg(
-                &format!("caller{i}.rs"),
-                &format!("fn:caller_{i}"),
-                1,
-                2,
-            );
+            let caller =
+                make_fn_node_with_pkg(&format!("caller{i}.rs"), &format!("fn:caller_{i}"), 1, 2);
             let caller_id = store.put_node(&caller).unwrap();
             store
-                .put_edge(&travsr_core::Edge::new(caller_id, hub_id, EdgeKind::RefCall))
+                .put_edge(&travsr_core::Edge::new(
+                    caller_id,
+                    hub_id,
+                    EdgeKind::RefCall,
+                ))
                 .unwrap();
         }
 
         let seeds = vec![(hub_id, 1.0)];
         let result = enrich_seeds_with_callers(&store, seeds, 3);
         // 1 original + at most 3 new callers
-        assert_eq!(result.len(), 4, "max_new_total=3 must cap additions; got {}", result.len());
+        assert_eq!(
+            result.len(),
+            4,
+            "max_new_total=3 must cap additions; got {}",
+            result.len()
+        );
     }
 
     // ── KNN circuit-breaker ──────────────────────────────────────────────────

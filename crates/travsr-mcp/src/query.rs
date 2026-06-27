@@ -221,7 +221,7 @@ pub fn ask_query(
     // Caller enrichment: depth-1 then depth-2 production callers at 0.35× weight per hop.
     let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 15); // depth-1
     let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 10); // depth-2
-    // Drop seeds whose 1-hop PPR expansion would overlap a higher-scored accepted seed.
+                                                                                   // Drop seeds whose 1-hop PPR expansion would overlap a higher-scored accepted seed.
     let seeds = crate::tools::dedup_adjacent_seeds(store, raw_seeds);
 
     if seeds.is_empty() {
@@ -247,8 +247,33 @@ pub fn ask_query(
     }
 
     let node_ids: Vec<_> = ppr_scores.iter().map(|(id, _)| *id).collect();
-    let score_map: HashMap<_, f32> = ppr_scores.into_iter().collect();
+    let raw_score_map: HashMap<_, f32> = ppr_scores.into_iter().collect();
     let nodes = store.get_nodes(&node_ids)?;
+
+    // Filter structural package nodes — never valid context regardless of language.
+    // Go `go-pkg` nodes are scip-go package identifiers (often 1000+ in-edges).
+    // Go `module` nodes are package declarations; Rust `module` nodes (`mod foo`)
+    // are real code entities and must NOT be filtered.
+    let nodes: Vec<_> = nodes
+        .into_iter()
+        .filter(|n| !(n.kind == "go-pkg" || (n.kind == "module" && n.vname.language == "go")))
+        .collect();
+
+    // Degree damping: penalise hub nodes proportional to their in-degree.
+    // adjusted = ppr_score × 1/(1 + ln(max(1, in_degree)))
+    // A node with 1000 in-edges is damped to ~14% of its raw PPR score;
+    // a node with 5 in-edges retains ~38% — hub nodes are suppressed, not zeroed.
+    let filtered_ids: Vec<_> = nodes.iter().map(|n| n.id).collect();
+    let in_degrees = store.in_degrees(&filtered_ids)?;
+    let score_map: HashMap<NodeId, f32> = raw_score_map
+        .into_iter()
+        .filter_map(|(id, s)| {
+            let degree = in_degrees.get(&id).copied().unwrap_or(0);
+            let damped = s * (1.0 / (1.0 + (degree as f32).max(1.0).ln()));
+            Some((id, damped))
+        })
+        .collect();
+
     let items: Vec<_> = nodes
         .into_iter()
         .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))

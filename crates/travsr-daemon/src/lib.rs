@@ -1045,7 +1045,10 @@ pub fn init_repo_with_progress(
             let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
             let resolved = resolve_unresolved_calls(&store, &pb_unresolved);
-            tracing::debug!(resolved_cross_crate_edges = resolved.len(), "Phase B UnresolvedCall resolution complete");
+            tracing::debug!(
+                resolved_cross_crate_edges = resolved.len(),
+                "Phase B UnresolvedCall resolution complete"
+            );
             pb_edges.extend(resolved);
             write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
         };
@@ -1186,7 +1189,10 @@ fn resolve_unresolved_calls(
     let mut by_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str)>> =
         std::collections::HashMap::new();
     for (id, sig, path) in &candidates {
-        by_sig.entry(sig.as_str()).or_default().push((*id, path.as_str()));
+        by_sig
+            .entry(sig.as_str())
+            .or_default()
+            .push((*id, path.as_str()));
     }
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
@@ -1206,7 +1212,11 @@ fn resolve_unresolved_calls(
         };
         for (dst, _) in filtered {
             if u.src != dst {
-                edges.push(travsr_core::Edge::new(u.src, dst, travsr_core::EdgeKind::RefCall));
+                edges.push(travsr_core::Edge::new(
+                    u.src,
+                    dst,
+                    travsr_core::EdgeKind::RefCall,
+                ));
             }
         }
     }
@@ -1508,7 +1518,10 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
 
     let resolved = resolve_unresolved_calls(&s, &pb_unresolved);
-    tracing::debug!(resolved_cross_crate_edges = resolved.len(), "Phase B UnresolvedCall resolution complete");
+    tracing::debug!(
+        resolved_cross_crate_edges = resolved.len(),
+        "Phase B UnresolvedCall resolution complete"
+    );
     pb_edges.extend(resolved);
 
     // Write LSIF edges first (pre-collected lock-free above).
@@ -3076,5 +3089,50 @@ pub fn try_inject_embed_hook(
             tracing::warn!("embed: failed to persist current_embed_model: {e}");
         }
         tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
+    }
+}
+
+/// Cold-path variant of [`try_inject_embed_hook`] for read-only CLI queries.
+///
+/// Injects the embed KNN hook into a store opened without a write connection,
+/// so `travsr ask` benefits from embedding-enhanced seed selection even when
+/// no daemon is running. The meta write (`current_embed_model`) is skipped
+/// because the store is read-only; the model-id guard still runs to prevent
+/// stale-embedding queries.
+///
+/// No-op when the backend binary is absent, the HNSW index has not been built,
+/// or the stored model id does not match the installed sidecar.
+pub fn try_inject_embed_hook_readonly(store: &mut SqliteStore, db_path: &std::path::Path) {
+    use travsr_plugin_host::{
+        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
+    };
+    let Some(home) = dirs::home_dir() else { return };
+    let backend = active_backend_id()
+        .as_deref()
+        .and_then(lookup_embed_backend)
+        .or_else(|| EMBED_BACKENDS.first())
+        .copied();
+    let Some(backend) = backend else { return };
+    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
+    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
+    if !supervisor.is_active() {
+        return;
+    }
+    let Some(model_id) = supervisor.model_id() else {
+        return;
+    };
+    if let Ok(Some(stored)) = store.get_meta("current_embed_model") {
+        if stored != model_id {
+            tracing::debug!(
+                stored_model = %stored,
+                plugin_model = %model_id,
+                "cold-path embed: model_id mismatch — skipping KNN"
+            );
+            return;
+        }
+    }
+    if let Some(hook) = supervisor.knn_hook(model_id.to_string()) {
+        store.set_embed_knn_hook(hook);
+        tracing::debug!(model_id = %model_id, "cold-path embed: KNN hook active");
     }
 }

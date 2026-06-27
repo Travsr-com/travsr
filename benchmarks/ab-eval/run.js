@@ -3,25 +3,24 @@
 
 // A/B eval runner (#318 O9) — the receipt for the headline claim.
 //
-// For every task in tasks.json we answer the SAME structural question two ways
-// and compare correctness and context token cost:
+// Three task classes:
 //
-//   GRAPH arm  — run one `travsr graph` query and read only the answer
-//                subgraph (the file nodes Travsr returns). This is what an
-//                agent wired to the Travsr MCP server would feed its LLM.
+//   callers  — GRAPH arm runs `travsr graph --direction callers --format json`
+//              and checks which file nodes are returned. FILES arm runs `git
+//              grep -l` and reads every candidate. Gated: exact (recall=1,
+//              precision=1) and graph tokens ≤ file tokens.
 //
-//   FILES arm  — model an agent WITHOUT Travsr: `git grep` the symbol to find
-//                candidate files, then read every candidate in full to decide
-//                the answer (you cannot tell a real call site from a comment or
-//                a same-named token without reading the file). The answer is the
-//                set of grepped files; the context cost is the sum of their
-//                sizes.
+//   context  — GRAPH arm runs `travsr ask <query> --format json` (the full
+//              PPR+knapsack pipeline) and checks that expected symbols and
+//              files appear in the ranked rows. FILES arm is the same grep
+//              baseline. Gated: recall=1, precision=1, graph tokens ≤ file
+//              tokens. Measures end-to-end retrieval quality.
 //
-// We report, per task: answer recall/precision for each arm, the context tokens
-// each arm costs, and the token reduction the graph arm achieves. The GRAPH arm
-// is gated to be exact (recall == precision == 1 — zero structural
-// hallucination) and to never cost more tokens than reading files. The mean
-// token-reduction figure is reported as the publishable headline.
+//   ask      — Seed resolution quality. GRAPH arm runs `travsr ask <query>
+//              --format json` and asserts that the top-ranked row's signature
+//              contains expect_top_symbol and that the expected file is present.
+//              No A/B token comparison — this class is purely about seed
+//              accuracy (does the right symbol surface at rank 1?).
 //
 // Plain Node >= 18, no dependencies. Usage:
 //   node benchmarks/ab-eval/run.js [--out report.json] [--bin path/to/travsr]
@@ -55,7 +54,6 @@ function sh(cmd, args, cwd) {
   execFileSync(cmd, args, { cwd, env: ENV, stdio: 'pipe' });
 }
 
-/** Run the travsr binary, returning { stdout, status }. */
 function travsr(args, cwd) {
   const res = spawnSync(BIN, args, { cwd, env: ENV, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
   return { stdout: res.stdout || '', stderr: res.stderr || '', status: res.status };
@@ -84,9 +82,32 @@ function prepareFixture(fixtureRelPath, name) {
   return dir;
 }
 
-// ── GRAPH arm: one Travsr query; the answer IS the context ────────────────────
-function graphArm(task, dir) {
-  const args = ['graph', task.symbol, '--direction', task.relation, '--format', 'json', '--budget', '0'];
+// ── FILES arm (shared by callers + context classes) ───────────────────────────
+// Model an agent without Travsr: git grep the symbol/query to find candidate
+// files, then read every candidate in full to decide the answer.
+function filesArm(task, dir) {
+  const term = task.symbol || task.query;
+  let candidates = [];
+  try {
+    const out = execFileSync('git', ['grep', '-I', '-l', '--fixed-strings', term], {
+      cwd: dir, env: ENV, encoding: 'utf8',
+    });
+    candidates = out.split('\n').map(s => s.trim()).filter(Boolean);
+  } catch (_) { /* no matches → empty */ }
+
+  let contextChars = 0;
+  for (const rel of candidates) {
+    try { contextChars += fs.readFileSync(path.join(dir, rel), 'utf8').length; } catch (_) { /* skip */ }
+  }
+  const selfPath = task.self_path || null;
+  const got = new Set(candidates.filter(p => p !== selfPath));
+  const m = setMetrics(task.expect_files || [], got);
+  return { ...m, context_tokens: Math.ceil(contextChars / 4), candidates };
+}
+
+// ── GRAPH arm: callers class ──────────────────────────────────────────────────
+function callersArm(task, dir) {
+  const args = ['graph', task.symbol, '--direction', 'callers', '--format', 'json', '--budget', '0'];
   let res = null;
   for (let i = 0; i < MANIFEST.iterations; i++) res = travsr(args, dir);
   let parsed = null;
@@ -94,39 +115,71 @@ function graphArm(task, dir) {
   const answerNodes = ((parsed && parsed.nodes) || [])
     .filter(n => n.kind === 'file' && n.depth_from_seed > 0 && n.path !== task.self_path);
   const got = new Set(answerNodes.map(n => n.path));
-  const m = setMetrics(task.expect_files, got);
-  // The graph hands the agent the answer directly — the resolved file paths and
-  // their signatures. That compact answer, NOT any source file, is what enters
-  // the LLM context. (We deliberately do not count the `--format json` debug
-  // envelope: an MCP-wired agent forwards the answer, not the raw CLI framing.)
+  const m = setMetrics(task.expect_files || [], got);
   const answerPayload = answerNodes.map(n => ({ path: n.path, signature: n.signature }));
   return { ...m, context_tokens: tokens(JSON.stringify(answerPayload)), command: `travsr ${args.join(' ')}` };
 }
 
-// ── FILES arm: git grep the symbol, then read every candidate file ────────────
-function filesArm(task, dir) {
-  // Candidate files an agent would have to open: anything textually mentioning
-  // the symbol. `git grep -l` is the cheapest discovery an LLM agent has
-  // without a code graph.
-  let candidates = [];
-  try {
-    const out = execFileSync('git', ['grep', '-I', '-l', '--fixed-strings', task.symbol], {
-      cwd: dir, env: ENV, encoding: 'utf8',
-    });
-    candidates = out.split('\n').map(s => s.trim()).filter(Boolean);
-  } catch (_) { /* no matches → empty */ }
+// ── GRAPH arm: context class ──────────────────────────────────────────────────
+// Runs the full PPR+knapsack pipeline via `travsr ask --format json`.
+// Checks that expected symbols appear in the ranked rows and expected files
+// are represented. Context cost = AskPayload.total_tokens (what an MCP-wired
+// agent would forward — not raw file bytes).
+function contextArm(task, dir) {
+  const args = ['ask', task.query, '--format', 'json'];
+  let res = null;
+  for (let i = 0; i < MANIFEST.iterations; i++) res = travsr(args, dir);
+  let payload = null;
+  try { payload = JSON.parse(res.stdout); } catch (_) { /* scored as miss */ }
 
-  // The agent must READ each candidate to decide the answer — that is the
-  // context cost. Sum the bytes of every candidate file.
-  let contextChars = 0;
-  for (const rel of candidates) {
-    try { contextChars += fs.readFileSync(path.join(dir, rel), 'utf8').length; } catch (_) { /* skip */ }
-  }
-  // The answer grep+read yields is "every file that mentions the symbol" minus
-  // the file the symbol is defined in — a textual superset of the true answer.
-  const got = new Set(candidates.filter(p => p !== task.self_path));
-  const m = setMetrics(task.expect_files, got);
-  return { ...m, context_tokens: Math.ceil(contextChars / 4), candidates };
+  const rows = (payload && payload.rows) || [];
+  const returnedSymbols = new Set(rows.map(r => r.signature));
+  const returnedFiles = new Set(rows.map(r => r.path.replace(/:\d+$/, '')));
+
+  // Precision/recall over expected files (primary gate — same as callers class).
+  const fileMet = setMetrics(task.expect_files || [], returnedFiles);
+  // Symbol recall is reported but not gated (signatures may be qualified).
+  const expectSymbols = task.expect_symbols || [];
+  const symbolRecall = expectSymbols.length === 0 ? 1
+    : expectSymbols.filter(s => [...returnedSymbols].some(sig => sig.includes(s))).length / expectSymbols.length;
+
+  const contextTokens = (payload && payload.total_tokens) || tokens(res.stdout);
+  return {
+    recall: fileMet.recall,
+    precision: fileMet.precision,
+    got: fileMet.got,
+    symbol_recall: symbolRecall,
+    embed_used: (payload && payload.embed_used) || false,
+    context_tokens: contextTokens,
+    command: `travsr ${args.join(' ')}`,
+  };
+}
+
+// ── GRAPH arm: ask class ──────────────────────────────────────────────────────
+// Seed resolution: does the top-ranked row's signature match expect_top_symbol
+// and does expect_files[0] appear in the results?
+function askArm(task, dir) {
+  const args = ['ask', task.query, '--format', 'json'];
+  let res = null;
+  for (let i = 0; i < MANIFEST.iterations; i++) res = travsr(args, dir);
+  let payload = null;
+  try { payload = JSON.parse(res.stdout); } catch (_) { /* scored as miss */ }
+
+  const rows = (payload && payload.rows) || [];
+  const topSig = rows.length > 0 ? rows[0].signature : '';
+  const topMatch = topSig.includes(task.expect_top_symbol || '');
+  const returnedFiles = new Set(rows.map(r => r.path.replace(/:\d+$/, '')));
+  const filePresent = (task.expect_files || []).every(f => returnedFiles.has(f));
+
+  return {
+    top_match: topMatch,
+    top_signature: topSig,
+    file_present: filePresent,
+    returned_files: [...returnedFiles].sort(),
+    embed_used: (payload && payload.embed_used) || false,
+    context_tokens: (payload && payload.total_tokens) || 0,
+    command: `travsr ${args.join(' ')}`,
+  };
 }
 
 const report = {
@@ -141,7 +194,8 @@ let graphSuccesses = 0;
 let filesSuccesses = 0;
 
 for (const task of MANIFEST.tasks) {
-  console.log(`\n=== task: ${task.name} — "${task.question}" ===`);
+  const cls = task.class || 'callers';
+  console.log(`\n=== [${cls}] ${task.name} — "${task.question}" ===`);
   const dir = prepareFixture(task.fixture, task.name);
   const init = travsr(['init', '--quiet'], dir);
   if (init.status !== 0) {
@@ -150,7 +204,36 @@ for (const task of MANIFEST.tasks) {
     continue;
   }
 
-  const graph = graphArm(task, dir);
+  if (cls === 'ask') {
+    // Seed resolution — no A/B token comparison.
+    const arm = askArm(task, dir);
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    const pass = arm.top_match && arm.file_present;
+    if (pass) graphSuccesses += 1;
+
+    report.tasks.push({
+      name: task.name,
+      class: cls,
+      question: task.question,
+      ask: {
+        top_match: arm.top_match,
+        top_signature: arm.top_signature,
+        file_present: arm.file_present,
+        returned_files: arm.returned_files,
+        embed_used: arm.embed_used,
+      },
+      pass,
+    });
+
+    console.log(`  ask   : top="${arm.top_signature}" match=${arm.top_match} · files=${JSON.stringify(arm.returned_files)}`);
+    console.log(`  ${pass ? '✓' : '✗'} seed resolution (top_match=${arm.top_match}, file_present=${arm.file_present})`);
+    if (!pass) failures.push(`${task.name}: top_match=${arm.top_match} file_present=${arm.file_present}`);
+    continue;
+  }
+
+  // callers and context classes share the A/B structure.
+  const graph = cls === 'callers' ? callersArm(task, dir) : contextArm(task, dir);
   const files = filesArm(task, dir);
   fs.rmSync(dir, { recursive: true, force: true });
 
@@ -160,7 +243,6 @@ for (const task of MANIFEST.tasks) {
   if (graphExact) graphSuccesses += 1;
   if (filesExact) filesSuccesses += 1;
 
-  // Token reduction the graph arm achieves over reading files.
   const reduction = files.context_tokens === 0
     ? 0
     : 1 - graph.context_tokens / files.context_tokens;
@@ -169,16 +251,23 @@ for (const task of MANIFEST.tasks) {
   const cheaper = graph.context_tokens <= files.context_tokens;
   const pass = graphExact && cheaper && reduction >= MANIFEST.thresholds.min_token_reduction;
 
-  report.tasks.push({
+  const taskEntry = {
     name: task.name,
+    class: cls,
     question: task.question,
     graph: { recall: graph.recall, precision: graph.precision, context_tokens: graph.context_tokens, answer: graph.got },
     files_only: { recall: files.recall, precision: files.precision, context_tokens: files.context_tokens, answer: files.got, files_read: files.candidates.length },
     token_reduction: Number(reduction.toFixed(3)),
     pass,
-  });
+  };
+  if (cls === 'context') {
+    taskEntry.graph.symbol_recall = graph.symbol_recall;
+    taskEntry.graph.embed_used = graph.embed_used;
+  }
+  report.tasks.push(taskEntry);
 
-  console.log(`  graph : recall ${graph.recall} precision ${graph.precision} · ${graph.context_tokens} ctx tokens → ${JSON.stringify(graph.got)}`);
+  const extra = cls === 'context' ? ` · symbol_recall=${graph.symbol_recall.toFixed(2)} embed=${graph.embed_used}` : '';
+  console.log(`  graph : recall ${graph.recall} precision ${graph.precision} · ${graph.context_tokens} ctx tokens → ${JSON.stringify(graph.got)}${extra}`);
   console.log(`  files : recall ${files.recall} precision ${files.precision} · ${files.context_tokens} ctx tokens (read ${files.candidates.length} files) → ${JSON.stringify(files.got)}`);
   console.log(`  ${pass ? '✓' : '✗'} token reduction ${(reduction * 100).toFixed(1)}%  (graph exact: ${graphExact}, files exact: ${filesExact})`);
   if (!pass) failures.push(`${task.name}: graphExact=${graphExact} cheaper=${cheaper} reduction=${reduction.toFixed(3)}`);
