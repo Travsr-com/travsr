@@ -219,6 +219,8 @@ pub fn ask_query(
         fts_weighted
     };
 
+    // Caller enrichment: surface production callers of each seed as lower-weight seeds.
+    let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds);
     // Drop seeds whose 1-hop PPR expansion would overlap a higher-scored accepted seed.
     let seeds = crate::tools::dedup_adjacent_seeds(store, raw_seeds);
 

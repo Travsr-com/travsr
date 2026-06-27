@@ -1884,6 +1884,107 @@ pub(crate) fn dedup_adjacent_seeds(
     accepted
 }
 
+/// Enrich a seed set with depth-1 production callers of each seed.
+///
+/// PPR follows outgoing edges from seeds, so callers of a seed node are never
+/// reachable unless they are themselves seeds. This function adds the top-5
+/// non-test callers of each seed at 35% of the seed's weight, giving PPR a
+/// starting point inside each caller's neighborhood.
+///
+/// Must run BEFORE `dedup_adjacent_seeds` so that the dedup pass can suppress
+/// any caller that is itself a callee of a higher-scored accepted seed.
+///
+/// Filters applied to each candidate caller:
+///   - `EdgeKind::RefCall` only (imports / structural edges are not callers)
+///   - Skip path containing `/tests/` or `/benches/`
+///   - Skip signature starting with `fn:test_`, `fn:bench_`, `fn:prop_`
+///   - Skip nodes already in the seed set (keeps existing higher weight)
+///   - Cap: top 5 by outgoing-edge degree (more central = more relevant)
+///
+/// O(s × c × d) where s = seed count, c = callers per seed (typically < 20
+/// after test filter), d = outgoing degree per caller (1 store query each).
+pub(crate) fn enrich_seeds_with_callers(
+    store: &SqliteStore,
+    mut seeds: Vec<(NodeId, f32)>,
+) -> Vec<(NodeId, f32)> {
+    use travsr_core::EdgeKind;
+
+    if seeds.is_empty() {
+        return seeds;
+    }
+
+    let existing: std::collections::HashSet<NodeId> = seeds.iter().map(|&(id, _)| id).collect();
+    let mut to_add: Vec<(NodeId, f32)> = Vec::new();
+
+    for &(seed_id, seed_weight) in &seeds {
+        // Collect RefCall incoming edges (who calls this seed?)
+        let incoming = match store.iter_edges_to(seed_id) {
+            Ok(edges) => edges,
+            Err(_) => continue,
+        };
+
+        let caller_ids: Vec<NodeId> = incoming
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::RefCall)
+            .map(|e| e.src)
+            .filter(|id| !existing.contains(id))
+            .collect();
+
+        if caller_ids.is_empty() {
+            continue;
+        }
+
+        // Batch-fetch caller nodes for path/signature filtering.
+        let caller_nodes = match store.get_nodes(&caller_ids) {
+            Ok(nodes) => nodes,
+            Err(_) => continue,
+        };
+
+        // Apply noise filter: skip test/bench callers.
+        let mut production_callers: Vec<NodeId> = caller_nodes
+            .into_iter()
+            .filter(|n| {
+                let path = &n.vname.path;
+                let sig = &n.vname.signature;
+                !path.contains("/tests/")
+                    && !path.contains("/benches/")
+                    && !sig.starts_with("fn:test_")
+                    && !sig.starts_with("fn:bench_")
+                    && !sig.starts_with("fn:prop_")
+            })
+            .map(|n| n.id)
+            .collect();
+
+        if production_callers.is_empty() {
+            continue;
+        }
+
+        // Sort by descending outgoing degree — more central callers first.
+        production_callers.sort_unstable_by_key(|&id| {
+            std::cmp::Reverse(
+                store
+                    .iter_edges_from(id)
+                    .map(|e| e.len())
+                    .unwrap_or(0),
+            )
+        });
+
+        let caller_weight = seed_weight * 0.35;
+        for caller_id in production_callers.into_iter().take(5) {
+            to_add.push((caller_id, caller_weight));
+        }
+    }
+
+    // Deduplicate to_add against itself (same caller may be added via multiple seeds;
+    // keep the higher weight).
+    to_add.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen: std::collections::HashSet<NodeId> = existing;
+    to_add.retain(|(id, _)| seen.insert(*id));
+
+    seeds.extend(to_add);
+    seeds
+}
+
 fn get_context_body(
     store: &SqliteStore,
     query: &str,
@@ -1946,6 +2047,18 @@ fn get_context_body(
         // ppr() for a single weight but correctly ranks multiple seeds by confidence.
         (fts_weighted, false)
     };
+
+    // Capture original FTS/KNN seeds before enrichment for role annotation below.
+    // Enriched callers are PPR starting-points, not primary query matches, so they
+    // must not override the [via: caller] annotation with [via: seed].
+    let primary_seed_ids: std::collections::HashSet<NodeId> =
+        weighted_seeds.iter().map(|&(id, _)| id).collect();
+
+    // Caller enrichment: add depth-1 production callers of each seed at 0.35× weight.
+    // PPR only follows outgoing edges, so callers are otherwise unreachable unless seeded
+    // directly. Must run before dedup_adjacent_seeds so redundant caller+callee pairs
+    // are still pruned in the dedup pass.
+    let weighted_seeds = enrich_seeds_with_callers(store, weighted_seeds);
 
     // Structural 2-hop seed dedup: drop seeds directly adjacent (in either direction)
     // to a higher-scored accepted seed. PPR already traverses edges, so including both
@@ -2076,7 +2189,6 @@ fn get_context_body(
     let seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
     let roles: HashMap<NodeId, NodeRole> = {
         use travsr_core::EdgeKind;
-        let seed_set: std::collections::HashSet<NodeId> = seed_ids.iter().copied().collect();
         let selected_set: std::collections::HashSet<NodeId> =
             selected.iter().map(|n| n.id).collect();
         let mut map: HashMap<NodeId, NodeRole> =
@@ -2117,8 +2229,10 @@ fn get_context_body(
                     }
                 }
             }
-            // Seed overrides both.
-            if seed_set.contains(&seed) {
+            // Only primary FTS/KNN seeds get the Seed role.
+            // Enriched callers (added by enrich_seeds_with_callers) keep their Caller
+            // role so the annotation correctly shows [via: caller] for them.
+            if primary_seed_ids.contains(&seed) {
                 map.insert(seed, NodeRole::Seed);
             }
         }
@@ -5353,6 +5467,92 @@ mod snippet_tests {
         let seeds = vec![(a_id, 1.0), (b_id, 0.9)];
         let result = dedup_adjacent_seeds(&store, seeds.clone());
         assert_eq!(result, seeds, "edges to non-seeds must not trigger dedup");
+    }
+
+    // ── enrich_seeds_with_callers ────────────────────────────────────────────
+
+    #[test]
+    fn enrich_adds_production_caller_at_reduced_weight() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph: caller (fn:caller_fn) → seed (fn:target_fn) via RefCall.
+        // After enrichment the caller should appear at 35% of the seed's weight.
+        let seed_node = make_fn_node_with_pkg("lib.rs", "fn:target_fn", 1, 2);
+        let caller_node = make_fn_node_with_pkg("main.rs", "fn:caller_fn", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let caller_id = store.put_node(&caller_node).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(caller_id, seed_id, EdgeKind::RefCall))
+            .unwrap();
+
+        let seeds = vec![(seed_id, 1.0)];
+        let result = enrich_seeds_with_callers(&store, seeds);
+
+        assert_eq!(result.len(), 2, "caller should be added");
+        let caller_entry = result.iter().find(|&&(id, _)| id == caller_id);
+        assert!(caller_entry.is_some(), "caller_id missing from result");
+        let weight = caller_entry.unwrap().1;
+        assert!(
+            (weight - 0.35).abs() < 1e-5,
+            "caller weight should be 0.35, got {weight}"
+        );
+    }
+
+    #[test]
+    fn enrich_skips_test_callers() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // A test-function caller (signature: fn:test_foo) must be filtered out.
+        let seed_node = make_fn_node_with_pkg("lib.rs", "fn:important_fn", 1, 2);
+        let test_caller = make_fn_node_with_pkg("lib.rs", "fn:test_important_fn", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let test_id = store.put_node(&test_caller).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(test_id, seed_id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = enrich_seeds_with_callers(&store, vec![(seed_id, 1.0)]);
+        assert_eq!(result.len(), 1, "test caller must be filtered, only seed remains");
+        assert!(!result.iter().any(|&(id, _)| id == test_id));
+    }
+
+    #[test]
+    fn enrich_skips_already_present_seed() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // When the caller is already a seed, it must not be duplicated.
+        let seed_a = make_fn_node_with_pkg("a.rs", "fn:fn_a", 1, 2);
+        let seed_b = make_fn_node_with_pkg("b.rs", "fn:fn_b", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&seed_a).unwrap();
+        let b_id = store.put_node(&seed_b).unwrap();
+        // b calls a
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, a_id, EdgeKind::RefCall))
+            .unwrap();
+
+        // Both are already seeds — b should not be added again at reduced weight.
+        let seeds = vec![(a_id, 1.0), (b_id, 0.9)];
+        let result = enrich_seeds_with_callers(&store, seeds.clone());
+        assert_eq!(result.len(), 2, "no duplicates when caller already in seed set");
+        // b must retain original weight 0.9, not get demoted to 0.35
+        let b_weight = result.iter().find(|&&(id, _)| id == b_id).unwrap().1;
+        assert!(
+            (b_weight - 0.9).abs() < 1e-5,
+            "existing seed weight must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn enrich_empty_seeds_passthrough() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let result = enrich_seeds_with_callers(&store, vec![]);
+        assert!(result.is_empty());
     }
 
     // ── KNN circuit-breaker ──────────────────────────────────────────────────
