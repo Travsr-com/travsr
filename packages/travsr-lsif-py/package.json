@@ -1,0 +1,26 @@
+{
+  "name": "travsr-lsif-py",
+  "version": "0.1.0",
+  "description": "Python LSIF emitter for Travsr code intelligence — semantic edges via tree-sitter",
+  "main": "dist/index.js",
+  "bin": {
+    "travsr-lsif-py": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/test/integration.test.js dist/test/security.test.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "tree-sitter": "^0.25.0",
+    "tree-sitter-python": "^0.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.8.0",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

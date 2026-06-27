@@ -21,20 +21,67 @@ use crate::sandbox::{build_sandboxed_command, SandboxConfig, SandboxStatus};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Return `true` when `rust-analyzer` is on PATH.
+/// Return the path to the `rust-analyzer` binary, or `None` if unavailable.
 ///
-/// Result is cached via `OnceLock` — the probe subprocess runs at most once
-/// per process lifetime since PATH does not change during a daemon run.
+/// Search order:
+/// 1. `rust-analyzer` on the process PATH.
+/// 2. `$CARGO_HOME/bin/rust-analyzer` — explicit install root.
+/// 3. `$HOME/.cargo/bin/rust-analyzer` — default Cargo install location.
+///
+/// Fallbacks 2 and 3 ensure LSIF enrichment works even when the daemon's PATH
+/// has been stripped to `/usr/bin:/bin:/usr/sbin:/sbin` (e.g. when forked to
+/// background by the CLI where the parent shell had `~/.cargo/bin` on PATH).
+///
+/// Result is cached via `OnceLock` — the probe runs at most once per process
+/// lifetime.
+pub fn ra_binary_path() -> Option<std::path::PathBuf> {
+    static RA_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    RA_PATH
+        .get_or_init(|| {
+            // 1. PATH probe: preferred — honours user's active toolchain.
+            let on_path = std::process::Command::new("rust-analyzer")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok();
+            if on_path {
+                return Some(std::path::PathBuf::from("rust-analyzer"));
+            }
+            // 2 + 3. Explicit home-relative fallbacks survive daemon PATH stripping.
+            let candidates = [
+                std::env::var("CARGO_HOME").ok().map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join("bin")
+                        .join("rust-analyzer")
+                }),
+                std::env::var("HOME").ok().map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join(".cargo")
+                        .join("bin")
+                        .join("rust-analyzer")
+                }),
+            ];
+            for candidate in candidates.into_iter().flatten() {
+                if candidate.exists() {
+                    tracing::info!(
+                        path = %candidate.display(),
+                        "rust-analyzer found via cargo home (not on PATH)"
+                    );
+                    return Some(candidate);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+/// Return `true` when `rust-analyzer` is available.
+///
+/// Checks PATH first, then `$CARGO_HOME/bin` and `$HOME/.cargo/bin` as
+/// fallback — see [`ra_binary_path`] for full search order.
 pub fn ra_available() -> bool {
-    static RA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RA_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("rust-analyzer")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    })
+    ra_binary_path().is_some()
 }
 
 /// Run `rust-analyzer lsif <repo_root>` inside the SEC-201 sandbox and
@@ -53,14 +100,17 @@ pub fn ra_available() -> bool {
 /// Propagates spawn failures, timeout kills, and non-zero exit status.
 /// Empty stdout is NOT an error — some crates produce no LSIF output.
 pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Option<String>> {
-    if !ra_available() {
-        tracing::info!("rust-analyzer not found on PATH — skipping Rust LSIF ingestion");
-        return Ok(None);
-    }
-
+    let ra_path = match ra_binary_path() {
+        Some(p) => p,
+        None => {
+            tracing::info!("rust-analyzer not found — skipping Rust LSIF ingestion");
+            return Ok(None);
+        }
+    };
+    let ra_str = ra_path.to_string_lossy().into_owned();
     let repo_str = repo_root.to_string_lossy();
     let (mut cmd, status) =
-        build_sandboxed_command("rust-analyzer", &["lsif", repo_str.as_ref()], cfg);
+        build_sandboxed_command(ra_str.as_str(), &["lsif", repo_str.as_ref()], cfg);
 
     match &status {
         SandboxStatus::Active { mechanism } => {

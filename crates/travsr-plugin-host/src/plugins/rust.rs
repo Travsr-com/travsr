@@ -73,9 +73,8 @@ impl Plugin for RustPlugin {
         nodes.dedup_by_key(|n| n.id);
         edges.sort_unstable_by_key(|e| (e.src, e.dst));
         edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
-        unresolved_calls.sort_unstable_by(|a, b| {
-            a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig))
-        });
+        unresolved_calls
+            .sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
         unresolved_calls.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
 
         InvokeResponse {

@@ -190,6 +190,13 @@ impl PluginIndexer {
         enum LangWork {
             /// Dart AOT emitter: run in-process (avoids nested-subprocess SIGABRT).
             Dart,
+            /// Rust: run in-process (PATH-independent; avoids daemon PATH stripping
+            /// that silently prevents rust-analyzer from being found via sidecar).
+            NativeRust,
+            /// TypeScript: run in-process for same reason as NativeRust.
+            NativeTypescript,
+            /// Python: run in-process for same reason as NativeRust.
+            NativePython,
             /// All other languages: spawn a sidecar subprocess.
             Sidecar(crate::resolver::PluginSpec),
         }
@@ -263,6 +270,38 @@ impl PluginIndexer {
                     lang,
                     work: LangWork::Dart,
                     files: None,
+                });
+                continue;
+            }
+
+            // Builtin languages (rust, typescript, javascript, python) ship inside
+            // the travsr binary. Run them in-process so that:
+            // (a) rust-analyzer is found via $HOME/.cargo/bin even when the daemon's
+            //     PATH has been stripped to /usr/bin:/bin (background fork — #XXX).
+            // (b) We avoid spawning a sidecar subprocess whose ENV_ALLOWLIST only
+            //     forwards the already-stripped PATH, silently preventing LSIF
+            //     enrichment for Rust.
+            if lang == "rust" {
+                work_items.push(WorkItem {
+                    lang,
+                    work: LangWork::NativeRust,
+                    files: lang_files("rust"),
+                });
+                continue;
+            }
+            if lang == "typescript" || lang == "javascript" {
+                work_items.push(WorkItem {
+                    lang: lang.clone(),
+                    work: LangWork::NativeTypescript,
+                    files: lang_files(&lang),
+                });
+                continue;
+            }
+            if lang == "python" {
+                work_items.push(WorkItem {
+                    lang,
+                    work: LangWork::NativePython,
+                    files: lang_files("python"),
                 });
                 continue;
             }
@@ -347,6 +386,205 @@ impl PluginIndexer {
                                             version_mismatch: None,
                                         }
                                     }
+                                }
+                            }
+                            LangWork::NativeRust => {
+                                use travsr_indexer::sandbox::SandboxConfig;
+                                // Convert pre-walked relative paths to (abs, vname) pairs.
+                                let files_owned: Option<Vec<(std::path::PathBuf, String)>> =
+                                    item.files.as_ref().map(|rel| {
+                                        rel.iter()
+                                            .map(|r| (repo_root.join(r), r.clone()))
+                                            .collect()
+                                    });
+                                let (mut nodes, mut edges, mut unresolved_calls) =
+                                    travsr_indexer::phase_b_native_rust(
+                                        corpus,
+                                        repo_root,
+                                        files_owned.as_deref(),
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("rust native phase_b: {e}");
+                                        (vec![], vec![], vec![])
+                                    });
+                                tracing::debug!(
+                                    nodes = nodes.len(),
+                                    edges = edges.len(),
+                                    unresolved_calls = unresolved_calls.len(),
+                                    "Phase B: native rust complete"
+                                );
+                                // LSIF enrichment via rust-analyzer — uses $HOME/.cargo/bin
+                                // fallback so it works even when daemon PATH is stripped.
+                                let cfg = SandboxConfig {
+                                    repo_root: repo_root.to_path_buf(),
+                                    ..Default::default()
+                                };
+                                match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
+                                    Ok(Some(dump)) => {
+                                        match travsr_indexer::ingest_rust(&dump, corpus) {
+                                            Ok(lsif_out) => {
+                                                tracing::debug!(
+                                                    nodes = lsif_out.nodes.len(),
+                                                    edges = lsif_out.edges.len(),
+                                                    "Phase B: rust lsif enrichment merged"
+                                                );
+                                                nodes.extend(lsif_out.nodes);
+                                                edges.extend(lsif_out.edges);
+                                            }
+                                            Err(e) => tracing::warn!("rust lsif ingest: {e}"),
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        tracing::debug!(
+                                            "rust-analyzer not available — native phase_b only"
+                                        )
+                                    }
+                                    Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
+                                }
+                                nodes.sort_unstable_by_key(|n| n.id);
+                                nodes.dedup_by_key(|n| n.id);
+                                edges.sort_unstable_by_key(|e| (e.src, e.dst));
+                                edges
+                                    .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                unresolved_calls.sort_unstable_by(|a, b| {
+                                    a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig))
+                                });
+                                unresolved_calls
+                                    .dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+                                LangResult {
+                                    lang,
+                                    nodes,
+                                    edges,
+                                    refs: Vec::new(),
+                                    unresolved_calls,
+                                    ran: true,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
+                                }
+                            }
+                            LangWork::NativeTypescript => {
+                                let files_owned: Option<Vec<(std::path::PathBuf, String)>> =
+                                    item.files.as_ref().map(|rel| {
+                                        rel.iter()
+                                            .map(|r| (repo_root.join(r), r.clone()))
+                                            .collect()
+                                    });
+                                let (mut nodes, mut edges) =
+                                    travsr_indexer::phase_b_native_typescript(
+                                        corpus,
+                                        repo_root,
+                                        files_owned.as_deref(),
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("ts native phase_b: {e}");
+                                        (vec![], vec![])
+                                    });
+                                tracing::debug!(
+                                    nodes = nodes.len(),
+                                    edges = edges.len(),
+                                    "Phase B: native typescript complete"
+                                );
+                                // LSIF enrichment via travsr-lsif-ts when tsconfig.json exists.
+                                let tsconfig = repo_root.join("tsconfig.json");
+                                if tsconfig.exists() {
+                                    match travsr_indexer::run_lsif_emitter(&tsconfig) {
+                                        Ok(dump) => {
+                                            match travsr_indexer::ingest_lsif(&dump, corpus) {
+                                                Ok(lsif_out) => {
+                                                    tracing::debug!(
+                                                        nodes = lsif_out.nodes.len(),
+                                                        edges = lsif_out.edges.len(),
+                                                        "Phase B: ts lsif enrichment merged"
+                                                    );
+                                                    nodes.extend(lsif_out.nodes);
+                                                    edges.extend(lsif_out.edges);
+                                                }
+                                                Err(e) => tracing::warn!("ts lsif ingest: {e}"),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!("ts lsif emitter not available: {e}")
+                                        }
+                                    }
+                                }
+                                nodes.sort_unstable_by_key(|n| n.id);
+                                nodes.dedup_by_key(|n| n.id);
+                                edges.sort_unstable_by_key(|e| (e.src, e.dst));
+                                edges
+                                    .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                LangResult {
+                                    lang,
+                                    nodes,
+                                    edges,
+                                    refs: Vec::new(),
+                                    unresolved_calls: Vec::new(),
+                                    ran: true,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
+                                }
+                            }
+                            LangWork::NativePython => {
+                                let files_owned: Option<Vec<(std::path::PathBuf, String)>> =
+                                    item.files.as_ref().map(|rel| {
+                                        rel.iter()
+                                            .map(|r| (repo_root.join(r), r.clone()))
+                                            .collect()
+                                    });
+                                let (mut nodes, mut edges) =
+                                    travsr_indexer::phase_b_native_python(
+                                        corpus,
+                                        repo_root,
+                                        files_owned.as_deref(),
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("python native phase_b: {e}");
+                                        (vec![], vec![])
+                                    });
+                                tracing::debug!(
+                                    nodes = nodes.len(),
+                                    edges = edges.len(),
+                                    "Phase B: native python complete"
+                                );
+                                // LSIF enrichment via travsr-lsif-py (bundled, PATH-independent).
+                                // travsr-lsif-py resolves via current_exe walk-up so it works
+                                // even when the daemon's PATH has been stripped by the OS.
+                                match travsr_indexer::run_lsif_py_emitter(repo_root) {
+                                    Ok(Some(dump)) => {
+                                        match travsr_indexer::ingest_lsif(&dump, corpus) {
+                                            Ok(lsif_out) => {
+                                                tracing::debug!(
+                                                    nodes = lsif_out.nodes.len(),
+                                                    edges = lsif_out.edges.len(),
+                                                    "Phase B: python lsif enrichment merged"
+                                                );
+                                                nodes.extend(lsif_out.nodes);
+                                                edges.extend(lsif_out.edges);
+                                            }
+                                            Err(e) => tracing::warn!("python lsif ingest: {e}"),
+                                        }
+                                    }
+                                    Ok(None) => tracing::debug!(
+                                        "travsr-lsif-py not found — native phase_b tree-sitter edges only"
+                                    ),
+                                    Err(e) => tracing::warn!("travsr-lsif-py failed: {e}"),
+                                }
+                                nodes.sort_unstable_by_key(|n| n.id);
+                                nodes.dedup_by_key(|n| n.id);
+                                edges.sort_unstable_by_key(|e| (e.src, e.dst));
+                                edges
+                                    .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                LangResult {
+                                    lang,
+                                    nodes,
+                                    edges,
+                                    refs: Vec::new(),
+                                    unresolved_calls: Vec::new(),
+                                    ran: true,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
                                 }
                             }
                             LangWork::Sidecar(spec) => {
@@ -550,9 +788,8 @@ impl PluginIndexer {
                 .then(a.callee_id.0.cmp(&b.callee_id.0))
         });
 
-        all_unresolved.sort_unstable_by(|a, b| {
-            a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig))
-        });
+        all_unresolved
+            .sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
         all_unresolved.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
 
         (all_nodes, all_edges, all_refs, all_unresolved, outcome)
@@ -634,7 +871,10 @@ mod tests {
         assert!(nodes.is_empty(), "expected no nodes when all langs absent");
         assert!(edges.is_empty(), "expected no edges when all langs absent");
         assert!(refs.is_empty(), "expected no refs when all langs absent");
-        assert!(unresolved.is_empty(), "expected no unresolved when all langs absent");
+        assert!(
+            unresolved.is_empty(),
+            "expected no unresolved when all langs absent"
+        );
         // skipped_not_in_repo OR skipped_unregistered should account for every lang
         let total_skipped = outcome.skipped_not_in_repo.len() + outcome.skipped_unregistered.len();
         assert!(

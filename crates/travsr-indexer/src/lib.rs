@@ -34,7 +34,7 @@ pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{ingest_rust, ingest_rust_raw, ingest_scip};
 pub use ra_runner::run_ra_lsif;
-pub use runner::{run_lsif_emitter, run_scip_python};
+pub use runner::{run_lsif_emitter, run_lsif_py_emitter, run_scip_python};
 pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;

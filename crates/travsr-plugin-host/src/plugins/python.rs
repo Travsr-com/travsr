@@ -52,25 +52,25 @@ impl Plugin for PythonPlugin {
             "python native phase_b complete"
         );
 
-        // SCIP enrichment: merge higher-fidelity edges when scip-python is available.
-        match travsr_indexer::run_scip_python(&req.root, &req.corpus) {
-            Ok(Some(bytes)) => match travsr_indexer::ingest_scip(&bytes, &req.corpus) {
-                Ok(scip_out) => {
+        // LSIF enrichment via travsr-lsif-py (bundled, PATH-independent).
+        // Resolves via current_exe walk-up; Ok(None) = not yet built / not found.
+        match travsr_indexer::run_lsif_py_emitter(&req.root) {
+            Ok(Some(dump)) => match travsr_indexer::ingest_lsif(&dump, &req.corpus) {
+                Ok(lsif_out) => {
                     tracing::debug!(
-                        nodes = scip_out.nodes.len(),
-                        edges = scip_out.edges.len(),
-                        "python scip enrichment merged"
+                        nodes = lsif_out.nodes.len(),
+                        edges = lsif_out.edges.len(),
+                        "python lsif enrichment merged"
                     );
-                    nodes.extend(scip_out.nodes);
-                    edges.extend(scip_out.edges);
+                    nodes.extend(lsif_out.nodes);
+                    edges.extend(lsif_out.edges);
                 }
-                Err(e) => tracing::warn!("python scip ingest: {e}"),
+                Err(e) => tracing::warn!("python lsif ingest: {e}"),
             },
-            Ok(None) => tracing::debug!(
-                "scip-python not available — native phase_b only \
-                 (install: npm install -g @sourcegraph/scip-python)"
-            ),
-            Err(e) => tracing::warn!("scip-python failed: {e}"),
+            Ok(None) => {
+                tracing::debug!("travsr-lsif-py not found — native phase_b tree-sitter edges only")
+            }
+            Err(e) => tracing::warn!("travsr-lsif-py failed: {e}"),
         }
 
         // Dedup merged output

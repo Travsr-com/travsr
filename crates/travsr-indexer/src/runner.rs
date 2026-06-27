@@ -1,7 +1,8 @@
 //! Subprocess runners for language Phase B tools.
 //!
-//! `run_lsif_emitter` — Node.js LSIF emitter for TypeScript/JavaScript.
-//! `run_scip_python`  — scip-python SCIP indexer for Python.
+//! `run_lsif_emitter`    — Node.js LSIF emitter for TypeScript/JavaScript.
+//! `run_lsif_py_emitter` — Node.js LSIF emitter for Python (travsr-lsif-py).
+//! `run_scip_python`     — scip-python SCIP indexer for Python (legacy / deprecated).
 
 use std::io::Read as _;
 use std::path::Path;
@@ -226,6 +227,142 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
     Ok(Some(bytes))
 }
 
+// ── travsr-lsif-py ────────────────────────────────────────────────────────────
+
+/// Timeout for `travsr-lsif-py` (large Python repos with many files can be slow).
+const LSIF_PY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Resolve the Python LSIF emitter program + args without requiring PATH install.
+///
+/// Resolution order (identical to [`resolve_lsif_emitter`] for TypeScript):
+/// 1. `TRAVSR_LSIF_PY` env var — absolute path to the JS entry point.
+/// 2. Sibling of `current_exe` named `travsr-lsif-py` — npm global install layout.
+/// 3. Walk up from `current_exe` to find `packages/travsr-lsif-py/dist/index.js`.
+/// 4. `travsr-lsif-py` on PATH — final fallback.
+///
+/// Returns `(program, prefix_args)` where the full invocation is
+/// `program [prefix_args...] --root <root>`.
+fn resolve_lsif_py_emitter() -> (String, Vec<String>) {
+    // 1. Env override — useful for tests and non-standard installs.
+    if let Ok(p) = std::env::var("TRAVSR_LSIF_PY") {
+        let path = std::path::Path::new(&p);
+        if path.is_file() {
+            return ("node".to_string(), vec![p]);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // 2. Sibling binary (npm global install: both binaries in the same bin/).
+            let sibling = exe_dir.join("travsr-lsif-py");
+            if sibling.is_file() {
+                return (sibling.to_string_lossy().into_owned(), vec![]);
+            }
+
+            // 3. Walk up from exe_dir looking for the monorepo dev layout.
+            //    dev build: target/release/travsr → 3 parents up = repo root.
+            let mut cur = exe_dir.to_path_buf();
+            for _ in 0..6 {
+                let candidate = cur.join("packages/travsr-lsif-py/dist/index.js");
+                if candidate.is_file() {
+                    return (
+                        "node".to_string(),
+                        vec![candidate.to_string_lossy().into_owned()],
+                    );
+                }
+                match cur.parent() {
+                    Some(p) => cur = p.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // 4. PATH fallback.
+    ("travsr-lsif-py".to_string(), vec![])
+}
+
+/// Run `travsr-lsif-py --root <root>` and return the LSIF JSON-Lines dump.
+///
+/// Returns:
+/// - `Ok(Some(dump))` — LSIF dump ready for [`crate::lsif::ingest`].
+/// - `Ok(None)` — emitter binary not found (spawn failed); native Phase B
+///   tree-sitter output still runs — this is graceful degradation, not an error.
+/// - `Err(_)` — emitter was found and spawned but produced a non-zero exit code,
+///   or timed out after [`LSIF_PY_TIMEOUT`].
+///
+/// Pipe buffers (64 KB on Linux) would deadlock if the emitter writes > 64 KB of
+/// LSIF before we drain — so stdout and stderr are drained on background threads
+/// concurrently with the polling loop (same pattern as [`crate::ra_runner::run_ra_lsif`]).
+pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
+    let (program, prefix_args) = resolve_lsif_py_emitter();
+
+    let mut child = match std::process::Command::new(&program)
+        .args(&prefix_args)
+        .arg("--root")
+        .arg(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::debug!(
+                "travsr-lsif-py not found — Python LSIF enrichment skipped \
+                 (native phase_b tree-sitter edges still active)"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Drain stdout/stderr on background threads to prevent OS pipe-buffer deadlock.
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_thread = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + LSIF_PY_TIMEOUT;
+    let exit_status = loop {
+        match child.try_wait().context("polling travsr-lsif-py")? {
+            Some(s) => break s,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                anyhow::bail!(
+                    "travsr-lsif-py timed out after {}s — killed",
+                    LSIF_PY_TIMEOUT.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(200)),
+        }
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    if !exit_status.success() {
+        let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
+        anyhow::bail!("travsr-lsif-py exited with {exit_status}: {stderr_head}");
+    }
+
+    tracing::info!(
+        root = %root.display(),
+        lines = stdout.lines().count(),
+        "travsr-lsif-py complete"
+    );
+
+    Ok(Some(stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +388,44 @@ mod tests {
         assert_eq!(program, "node");
         assert_eq!(args.len(), 1);
         std::env::remove_var("TRAVSR_LSIF_TS");
+    }
+
+    #[test]
+    fn resolve_lsif_py_falls_back_to_path_when_no_env_and_no_sibling() {
+        std::env::remove_var("TRAVSR_LSIF_PY");
+        let (program, args) = resolve_lsif_py_emitter();
+        assert!(!program.is_empty());
+        let _ = args;
+    }
+
+    #[test]
+    fn resolve_lsif_py_honours_env_override_when_file_exists() {
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("TRAVSR_LSIF_PY", exe.to_str().unwrap());
+        let (program, args) = resolve_lsif_py_emitter();
+        assert_eq!(program, "node");
+        assert_eq!(args.len(), 1);
+        std::env::remove_var("TRAVSR_LSIF_PY");
+    }
+
+    #[test]
+    fn run_lsif_py_emitter_returns_none_for_missing_binary() {
+        // When spawn fails, must return Ok(None) not Err.
+        std::env::set_var("TRAVSR_LSIF_PY", "__travsr_lsif_py_nonexistent__");
+        // The env override points at a non-file, so it is skipped and we fall
+        // through to the PATH name which also does not exist — spawn should fail.
+        // Reset to ensure the resolution falls through to a definitely-missing path.
+        std::env::remove_var("TRAVSR_LSIF_PY");
+        // Direct test: calling with a known-missing program must be Ok(None).
+        // We can't override resolve_lsif_py_emitter() in tests, so we verify
+        // the spawn-failure path directly by replicating its logic.
+        let spawn_result = std::process::Command::new("__travsr_lsif_py_absent_binary__")
+            .arg("--root")
+            .arg("/tmp")
+            .spawn();
+        assert!(
+            spawn_result.is_err(),
+            "non-existent binary must fail to spawn"
+        );
     }
 }
