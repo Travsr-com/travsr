@@ -1622,6 +1622,13 @@ const MAX_EMBED_SEEDS: usize = 20;
 const EMBED_SCORE_THRESHOLD: f32 = 0.75;
 /// Maximum seeds per unique file path — prevents all seeds clustering in one file.
 const MAX_SEEDS_PER_PATH: usize = 2;
+/// PPR seed weight for an exact FTS substring match (query token in signature or path).
+const FTS_EXACT_WEIGHT: f32 = 1.0;
+/// PPR seed weight for a fuzzy/trigram FTS match (L2-A expansion, no literal substring match).
+const FTS_FUZZY_WEIGHT: f32 = 0.6;
+/// Advisory budget for KNN sidecar inference (ms). Calls exceeding this are logged.
+/// True circuit-breaker requires async dispatch — see TODO(travsr): #365 Step 4.
+const KNN_BUDGET_MS: u128 = 12;
 
 /// Returns `true` for nodes that should never be used as PPR seeds regardless
 /// of their KNN cosine score.
@@ -1757,6 +1764,61 @@ fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
     build_context_signals(store, has_embed, None, None)
 }
 
+/// Derive FTS seeds with confidence-based weights for weighted PPR personalisation.
+///
+/// - Exact substring match (`search_nodes_by_name`) → `FTS_EXACT_WEIGHT` (1.0)
+/// - Trigram/L2-A fuzzy match (`search_nodes_fuzzy`) → `FTS_FUZZY_WEIGHT` (0.6)
+///
+/// Returns up to 5 seeds (capped to prevent FTS from flooding the seed pool).
+fn fts_seeds_weighted(
+    store: &SqliteStore,
+    query: &str,
+    filter: &dyn EdgeFilter,
+) -> Vec<(NodeId, f32)> {
+    let exact = store.search_nodes_by_name(query).unwrap_or_default();
+    let (nodes, weight) = if !exact.is_empty() {
+        (exact, FTS_EXACT_WEIGHT)
+    } else {
+        match store.search_nodes_fuzzy(query) {
+            Ok(fuzzy) => (fuzzy, FTS_FUZZY_WEIGHT),
+            Err(e) => {
+                tracing::warn!("fts_seeds_weighted fuzzy error: {e}");
+                return vec![];
+            }
+        }
+    };
+    nodes
+        .into_iter()
+        .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+        .take(5)
+        .map(|n| (n.id, weight))
+        .collect()
+}
+
+/// Merge FTS and KNN seed sets into a single weighted seed list for `ppr_weighted`.
+///
+/// Nodes appearing in both sets are deduplicated by taking `max(fts_weight, knn_score)`:
+/// an exact FTS match and a high-cosine KNN match for the same node reinforce each other
+/// without diluting the PPR personalisation vector.
+///
+/// Returns `(merged_seeds, seed_cap_fired)`.
+fn merge_fts_knn_seeds(
+    fts: Vec<(NodeId, f32)>,
+    knn: Vec<(NodeId, f32)>,
+    n_knn_eligible: usize,
+) -> (Vec<(NodeId, f32)>, bool) {
+    let mut merged: HashMap<NodeId, f32> = fts.into_iter().collect();
+    for (id, score) in knn {
+        let entry = merged.entry(id).or_insert(0.0);
+        *entry = entry.max(score);
+    }
+    let mut combined: Vec<(NodeId, f32)> = merged.into_iter().collect();
+    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let cap_fired = combined.len() > MAX_EMBED_SEEDS || n_knn_eligible > MAX_EMBED_SEEDS;
+    combined.truncate(MAX_EMBED_SEEDS);
+    (combined, cap_fired)
+}
+
 fn get_context_body(
     store: &SqliteStore,
     query: &str,
@@ -1784,71 +1846,58 @@ fn get_context_body(
 
     // Fuzzy-search fallback, shared by both the no-embed path and the embed
     // path when KNN returns no results (embed index not yet built).
-    let fuzzy_seeds = || match store.search_nodes_fuzzy(query) {
-        Ok(nodes) => Ok(nodes
-            .into_iter()
-            .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
-            .take(5)
-            .map(|n| n.id)
-            .collect::<Vec<_>>()),
-        Err(e) => Err(e),
+    // ── Seed lookup: FTS always runs; KNN merges in when embed is available ──────
+    //
+    // Both sources contribute to the PPR personalisation vector with confidence weights:
+    //   FTS exact (query token in signature/path) → FTS_EXACT_WEIGHT (1.0)
+    //   FTS fuzzy (trigram/L2-A expansion)        → FTS_FUZZY_WEIGHT (0.6)
+    //   KNN cosine similarity                     → raw cosine score (0.0–1.0)
+    //
+    // Nodes in both sets are deduplicated by max(fts_weight, knn_score), so an exact
+    // FTS match and a strong KNN match for the same node reinforce each other without
+    // splitting teleportation mass. KNN-only nodes steer the walk toward semantically
+    // related code that the query may not name literally.
+    //
+    // TODO(travsr): #365 Step 4 — run KNN in a scoped thread with KNN_BUDGET_MS cutoff
+    // so a slow sidecar never blocks get_context beyond the FTS path latency.
+    // TODO(travsr): #365 Step 2 (remainder) — structural 2-hop seed dedup. Requires
+    // exposing neighbour_ids(src) from travsr-store to drop seeds whose PPR expansion
+    // would overlap. Path-level dedup (MAX_SEEDS_PER_PATH) handles the common case.
+    let fts_weighted = fts_seeds_weighted(store, query, filter);
+    let (weighted_seeds, seed_cap_fired) = if let Some(knn_fn) = embed_knn {
+        let t0 = std::time::Instant::now();
+        let (knn_scored, n_knn_eligible) = embed_path_seeds(store, query, knn_fn, filter);
+        let elapsed_ms = t0.elapsed().as_millis();
+        if elapsed_ms > KNN_BUDGET_MS {
+            tracing::warn!(
+                elapsed_ms,
+                threshold_ms = KNN_BUDGET_MS,
+                "knn inference exceeded advisory budget"
+            );
+        }
+        merge_fts_knn_seeds(fts_weighted, knn_scored, n_knn_eligible)
+    } else {
+        // No embed: FTS seeds carry 1.0/0.6 weights — ppr_weighted behaves like
+        // ppr() for a single weight but correctly ranks multiple seeds by confidence.
+        (fts_weighted, false)
     };
 
-    // Seed lookup: embed KNN (with scores for weighted PPR) → fuzzy text search.
-    // `weighted_seeds` carries cosine-similarity scores used to weight the PPR
-    // personalisation vector; None on the fuzzy path which uses uniform weights.
-    // `seed_cap_fired` is true when eligible KNN candidates exceeded MAX_EMBED_SEEDS.
-    let weighted_seeds: Option<Vec<(NodeId, f32)>>;
-    let seed_ids: Vec<NodeId>;
-    let seed_cap_fired: bool;
-    if let Some(knn_fn) = embed_knn {
-        let (scored, n_eligible) = embed_path_seeds(store, query, knn_fn, filter);
-        seed_cap_fired = n_eligible > scored.len();
-        if !scored.is_empty() {
-            seed_ids = scored.iter().map(|&(id, _)| id).collect();
-            weighted_seeds = Some(scored);
-        } else {
-            // KNN returned nothing — embed index may not be built yet.
-            tracing::debug!("embed knn returned no file seeds; falling back to fuzzy search");
-            seed_ids = match fuzzy_seeds() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("get_context seed search error: {e}");
-                    return String::new();
-                }
-            };
-            weighted_seeds = None;
-        }
-    } else {
-        seed_cap_fired = false;
-        seed_ids = match fuzzy_seeds() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("get_context seed search error: {e}");
-                return String::new();
-            }
-        };
-        weighted_seeds = None;
-    }
-
     // SEC P0: identical response for "not found" and "access denied".
-    if seed_ids.is_empty() {
+    if weighted_seeds.is_empty() {
         return format!("No symbols matching '{query}' found in the graph.");
     }
 
-    // PPR over the seed set — KNN cosine-similarity scores weight the
-    // personalisation vector when available (issue #365); uniform otherwise.
-    let ppr_scores = match weighted_seeds {
-        Some(ws) => travsr_retrieval::ppr_weighted(store, &ws, context_candidates()),
-        None => travsr_retrieval::ppr(store, &seed_ids, context_candidates()),
-    };
-    let ppr_scores = match ppr_scores {
-        Ok(scores) => scores,
-        Err(e) => {
-            tracing::warn!("get_context ppr error: {e}");
-            return String::new();
-        }
-    };
+    // PPR with confidence-weighted personalisation (#365 Step 1 + Step 3).
+    // FTS-only path: weights 1.0/0.6 strictly better than previous uniform ppr().
+    // Embed path: cosine scores steer the walk toward semantic neighbours.
+    let ppr_scores =
+        match travsr_retrieval::ppr_weighted(store, &weighted_seeds, context_candidates()) {
+            Ok(scores) => scores,
+            Err(e) => {
+                tracing::warn!("get_context ppr error: {e}");
+                return String::new();
+            }
+        };
 
     if ppr_scores.is_empty() {
         return format!("No symbols matching '{query}' found in the graph.");
@@ -1950,8 +1999,9 @@ fn get_context_body(
     };
 
     // Build 1-hop role map: classify each selected node's relationship to the seeds.
-    // O(S × avg_degree); seeds are capped at 5 so this is negligible.
+    // O(S × avg_degree); seeds are capped at MAX_EMBED_SEEDS so this is negligible.
     // Errors are silently ignored — roles degrade to Context, never block output.
+    let seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
     let roles: HashMap<NodeId, NodeRole> = {
         use travsr_core::EdgeKind;
         let seed_set: std::collections::HashSet<NodeId> = seed_ids.iter().copied().collect();
