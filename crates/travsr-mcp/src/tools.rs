@@ -1706,7 +1706,10 @@ pub(crate) fn embed_path_seeds(
     // Over-request 6× to keep MIN_EMBED_SEEDS filled after noise + RBAC filtering.
     // Time only the KNN inference call — not the subsequent SQLite get_nodes fetch.
     let t0 = std::time::Instant::now();
-    let knn_pairs = knn_fn(query, (MAX_EMBED_SEEDS as u32).saturating_mul(6));
+    // Normalize before embedding: strip sentence punctuation from word edges so
+    // "work?" and "work ?" produce the same vector ("how daemon work?" == "how daemon work ?").
+    let normalized_query = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let knn_pairs = knn_fn(&normalized_query, (MAX_EMBED_SEEDS as u32).saturating_mul(6));
     let knn_elapsed_ms = t0.elapsed().as_millis();
     if knn_pairs.is_empty() {
         return (vec![], 0, knn_elapsed_ms);

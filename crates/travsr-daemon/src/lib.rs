@@ -2815,6 +2815,19 @@ fn handle_watch_event(
     }
 }
 
+/// Normalize the `query` field of NL tool args so punctuation variants like
+/// `"work?"` and `"work ?"` collapse to the same cache key and embedding input.
+/// Only applied to the `"ask"` tool — symbol-name tools are left unchanged.
+fn normalize_nl_query_args(tool: &str, mut args: serde_json::Value) -> serde_json::Value {
+    if tool == "ask" {
+        if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
+            let normalized = travsr_store::fts_tokenize::normalize_nl_query(q);
+            args["query"] = serde_json::Value::String(normalized);
+        }
+    }
+    args
+}
+
 /// Returns `(response, should_shutdown)`.
 ///
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
@@ -2929,6 +2942,11 @@ fn handle_control_message(
                     false,
                 );
             }
+            // Normalize the NL query field before cache lookup and dispatch so
+            // "work?" and "work ?" share the same cache entry and produce
+            // identical embedding vectors. Only applied to NL tools ("ask");
+            // symbol-name tools ("graph") are left as-is.
+            let args = normalize_nl_query_args(&tool, args);
             // R5 (#342): use the dedicated read-only connection so this lock
             // does not block the indexer worker from acquiring the write store.
             let s = read_store.lock().unwrap_or_else(|e| e.into_inner());
