@@ -1404,6 +1404,45 @@ LIMIT 100",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Bulk-lookup nodes by signature strings. Returns `(id, signature, path)` triples.
+    /// Used by the daemon to resolve `UnresolvedCall`s emitted by Phase B.
+    pub fn nodes_by_signatures(
+        &self,
+        sigs: &[String],
+    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+        if sigs.is_empty() {
+            return Ok(Vec::new());
+        }
+        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+            let placeholders = sigs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, signature, path FROM nodes WHERE signature IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql).context("preparing nodes_by_signatures")?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                sigs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt
+                .query_map(params_vec.as_slice(), |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let sig: String = row.get(1)?;
+                    let path: String = row.get(2)?;
+                    Ok((id, sig, path))
+                })
+                .context("executing nodes_by_signatures")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding nodes_by_signatures row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Return all (src_path, dst_path) pairs via the two-hop import chain:
     /// any_node --[depends]--> import_node --[resolves-to]--> file.
     /// src_path is the path of the node making the import (any kind: file, function, etc.).

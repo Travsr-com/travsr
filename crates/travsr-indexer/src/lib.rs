@@ -82,13 +82,20 @@ pub fn phase_b_native_dart(
 /// Native Phase B for Rust: Cargo.toml dep graph + tree-sitter call edges.
 /// Zero external-tool downloads. LSIF enrichment is merged by the caller.
 ///
+/// Returns `(nodes, edges, unresolved_calls)`. Cross-crate bare calls are in
+/// `unresolved_calls`; the daemon resolves them using Phase A store nodes.
+///
 /// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
 /// Pass `None` to fall back to a local directory walk.
 pub fn phase_b_native_rust(
     corpus: &str,
     root: &std::path::Path,
     files: Option<&[(std::path::PathBuf, String)]>,
-) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+) -> anyhow::Result<(
+    Vec<travsr_core::Node>,
+    Vec<travsr_core::Edge>,
+    Vec<travsr_core::UnresolvedCall>,
+)> {
     phase_b_rust::extract_native_phase_b(corpus, root, files)
 }
 

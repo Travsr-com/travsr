@@ -1042,8 +1042,11 @@ pub fn init_repo_with_progress(
                 // skip their own directory walks.
                 indexable_paths: &indexable_paths,
             };
-            let (pb_nodes, pb_edges, pb_refs, pb_outcome) =
+            let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
+            let resolved = resolve_unresolved_calls(&store, &pb_unresolved);
+            tracing::debug!(resolved_cross_crate_edges = resolved.len(), "Phase B UnresolvedCall resolution complete");
+            pb_edges.extend(resolved);
             write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
         };
         tracing::info!(
@@ -1147,6 +1150,72 @@ pub fn init_repo_with_progress(
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
+/// Resolve cross-crate `UnresolvedCall`s emitted by Phase B into real `RefCall` edges.
+///
+/// Phase B cannot anchor callee VNames for cross-crate bare/scoped calls because
+/// it only has the caller file in scope. This function batch-queries the store
+/// (which holds all Phase A nodes) to find the real callee NodeId by signature,
+/// then emits `EdgeKind::RefCall` edges for each resolved pair.
+///
+/// Overconnection is safe: when multiple nodes share a signature (e.g. two crates
+/// both define `fn:new`) all matches are emitted. PPR damping absorbs the noise.
+fn resolve_unresolved_calls(
+    store: &SqliteStore,
+    unresolved: &[travsr_core::UnresolvedCall],
+) -> Vec<travsr_core::Edge> {
+    if unresolved.is_empty() {
+        return Vec::new();
+    }
+
+    let sigs: Vec<String> = {
+        let mut s: Vec<String> = unresolved.iter().map(|u| u.callee_sig.clone()).collect();
+        s.sort_unstable();
+        s.dedup();
+        s
+    };
+
+    let candidates = match store.nodes_by_signatures(&sigs) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("resolve_unresolved_calls: store query failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    // sig → Vec<(NodeId, path)>
+    let mut by_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str)>> =
+        std::collections::HashMap::new();
+    for (id, sig, path) in &candidates {
+        by_sig.entry(sig.as_str()).or_default().push((*id, path.as_str()));
+    }
+
+    let mut edges: Vec<travsr_core::Edge> = Vec::new();
+    for u in unresolved {
+        let Some(matches) = by_sig.get(u.callee_sig.as_str()) else {
+            continue;
+        };
+        let filtered: Vec<_> = if let Some(hint) = &u.hint_crate {
+            let hint_dash = hint.replace('_', "-");
+            matches
+                .iter()
+                .filter(|(_, path)| path.contains(hint.as_str()) || path.contains(&*hint_dash))
+                .copied()
+                .collect()
+        } else {
+            matches.to_vec()
+        };
+        for (dst, _) in filtered {
+            if u.src != dst {
+                edges.push(travsr_core::Edge::new(u.src, dst, travsr_core::EdgeKind::RefCall));
+            }
+        }
+    }
+
+    edges.sort_unstable_by_key(|e| (e.src.0, e.dst.0));
+    edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
+    edges
+}
+
 /// Factored out of `init_repo_with_progress` so the background refresh
 /// (#318 O3, [`run_background_phase_b`]) writes results through the exact same
 /// unification + attribution path as a full init — there is one and only one
@@ -1432,10 +1501,15 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         present_languages,
         indexable_paths: &indexable_paths,
     };
-    let (pb_nodes, pb_edges, pb_refs, pb_outcome) = indexer.invoke_phase_b_all(&inputs);
+    let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+        indexer.invoke_phase_b_all(&inputs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+
+    let resolved = resolve_unresolved_calls(&s, &pb_unresolved);
+    tracing::debug!(resolved_cross_crate_edges = resolved.len(), "Phase B UnresolvedCall resolution complete");
+    pb_edges.extend(resolved);
 
     // Write LSIF edges first (pre-collected lock-free above).
     for edge in &lsif_edges {

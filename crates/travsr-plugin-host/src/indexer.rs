@@ -138,6 +138,7 @@ impl PluginIndexer {
         Vec<travsr_core::Node>,
         Vec<travsr_core::Edge>,
         Vec<travsr_core::ScipRef>,
+        Vec<travsr_core::UnresolvedCall>,
         PhaseBOutcome,
     ) {
         let repo_root = inputs.repo_root;
@@ -289,6 +290,7 @@ impl PluginIndexer {
             nodes: Vec<travsr_core::Node>,
             edges: Vec<travsr_core::Edge>,
             refs: Vec<travsr_core::ScipRef>,
+            unresolved_calls: Vec<travsr_core::UnresolvedCall>,
             ran: bool,
             skipped_no_analyzer: bool,
             crashed: bool,
@@ -322,6 +324,7 @@ impl PluginIndexer {
                                             nodes,
                                             edges,
                                             refs: Vec::new(),
+                                            unresolved_calls: Vec::new(),
                                             ran: true,
                                             skipped_no_analyzer: false,
                                             crashed: false,
@@ -337,6 +340,7 @@ impl PluginIndexer {
                                             nodes: Vec::new(),
                                             edges: Vec::new(),
                                             refs: Vec::new(),
+                                            unresolved_calls: Vec::new(),
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
@@ -388,6 +392,7 @@ impl PluginIndexer {
                                                     nodes = resp.nodes.len(),
                                                     edges = resp.edges.len(),
                                                     refs = resp.refs.len(),
+                                                    unresolved_calls = resp.unresolved_calls.len(),
                                                     "Phase B: invoke complete"
                                                 );
                                                 LangResult {
@@ -395,6 +400,7 @@ impl PluginIndexer {
                                                     nodes: resp.nodes,
                                                     edges: resp.edges,
                                                     refs: resp.refs,
+                                                    unresolved_calls: resp.unresolved_calls,
                                                     ran: true,
                                                     skipped_no_analyzer: false,
                                                     crashed: false,
@@ -411,6 +417,7 @@ impl PluginIndexer {
                                                     nodes: Vec::new(),
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
+                                                    unresolved_calls: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: true,
                                                     crashed: false,
@@ -435,6 +442,7 @@ impl PluginIndexer {
                                                     nodes: Vec::new(),
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
+                                                    unresolved_calls: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: false,
                                                     crashed: false,
@@ -448,6 +456,7 @@ impl PluginIndexer {
                                                     nodes: Vec::new(),
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
+                                                    unresolved_calls: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: false,
                                                     crashed: true,
@@ -466,6 +475,7 @@ impl PluginIndexer {
                                             nodes: Vec::new(),
                                             edges: Vec::new(),
                                             refs: Vec::new(),
+                                            unresolved_calls: Vec::new(),
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
@@ -488,6 +498,7 @@ impl PluginIndexer {
                         nodes: Vec::new(),
                         edges: Vec::new(),
                         refs: Vec::new(),
+                        unresolved_calls: Vec::new(),
                         ran: false,
                         skipped_no_analyzer: false,
                         crashed: true,
@@ -505,6 +516,7 @@ impl PluginIndexer {
         let mut all_nodes: Vec<travsr_core::Node> = Vec::new();
         let mut all_edges: Vec<travsr_core::Edge> = Vec::new();
         let mut all_refs: Vec<travsr_core::ScipRef> = Vec::new();
+        let mut all_unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
 
         for r in lang_results {
             if r.ran {
@@ -519,6 +531,7 @@ impl PluginIndexer {
             all_nodes.extend(r.nodes);
             all_edges.extend(r.edges);
             all_refs.extend(r.refs);
+            all_unresolved.extend(r.unresolved_calls);
         }
 
         // Secondary sort within each language's contribution for full determinism.
@@ -537,7 +550,12 @@ impl PluginIndexer {
                 .then(a.callee_id.0.cmp(&b.callee_id.0))
         });
 
-        (all_nodes, all_edges, all_refs, outcome)
+        all_unresolved.sort_unstable_by(|a, b| {
+            a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig))
+        });
+        all_unresolved.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+
+        (all_nodes, all_edges, all_refs, all_unresolved, outcome)
     }
 
     /// Resolve cross-language FFI edges from accumulated markers.
@@ -612,10 +630,11 @@ mod tests {
             present_languages: ["__no_such_lang__".to_string()].into_iter().collect(),
             indexable_paths: &[],
         };
-        let (nodes, edges, refs, outcome) = indexer.invoke_phase_b_all(&inputs);
+        let (nodes, edges, refs, unresolved, outcome) = indexer.invoke_phase_b_all(&inputs);
         assert!(nodes.is_empty(), "expected no nodes when all langs absent");
         assert!(edges.is_empty(), "expected no edges when all langs absent");
         assert!(refs.is_empty(), "expected no refs when all langs absent");
+        assert!(unresolved.is_empty(), "expected no unresolved when all langs absent");
         // skipped_not_in_repo OR skipped_unregistered should account for every lang
         let total_skipped = outcome.skipped_not_in_repo.len() + outcome.skipped_unregistered.len();
         assert!(
@@ -636,8 +655,8 @@ mod tests {
             present_languages: HashSet::new(), // no gating
             indexable_paths: &[],
         };
-        let (_, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
-        let (_, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);
+        let (_, _, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
+        let (_, _, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);
         assert_eq!(
             outcome1.skipped_not_in_repo, outcome2.skipped_not_in_repo,
             "skipped_not_in_repo must be deterministic across runs"

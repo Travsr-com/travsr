@@ -286,7 +286,7 @@ impl VName {
 ///
 /// `NodeId` is a stable BLAKE3-derived hash of a `VName` (see
 /// [`VName::id`]). It is the SQLite primary key for the `nodes` table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub struct NodeId(pub u64);
 
 /// The kinds of edges supported in the Travsr multiplex graph.
@@ -555,6 +555,27 @@ impl Edge {
             confidence: Some(confidence),
         }
     }
+}
+
+/// A cross-crate call that Phase B could not resolve to a concrete NodeId.
+///
+/// Phase B tree-sitter extraction knows the callee name but not its file path
+/// (the file path is part of the VName hash). The daemon resolves these after
+/// Phase B completes by querying Phase A nodes already in the store.
+///
+/// Propagated through `InvokeResponse.unresolved_calls`; resolved in the daemon
+/// before writing to the graph (see `resolve_unresolved_calls` in travsr-daemon).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UnresolvedCall {
+    /// The caller node ID (already resolved — it's in the same file as the call site).
+    pub src: NodeId,
+    /// Signature of the callee to resolve, e.g. `"fn:ppr_weighted"`.
+    pub callee_sig: String,
+    /// Last path segment of the qualifying crate/module for `call.scoped`, e.g.
+    /// `"travsr_retrieval"` from `travsr_retrieval::ppr_weighted(...)`.
+    /// `None` for bare `call.fn` identifiers — resolver uses name-only lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_crate: Option<String>,
 }
 
 // ── Import Resolution ────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+// SYNC: keep in sync with crates/travsr-indexer/src/phase_b_rust.rs (TODO: extract to shared crate)
 //! Native Rust Phase B — zero external-tool dependencies.
 //!
 //! Sources of edges:
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use streaming_iterator::StreamingIterator as _;
-use travsr_core::{Edge, EdgeKind, Node, VName};
+use travsr_core::{Edge, EdgeKind, Node, UnresolvedCall, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 // ── Tree-sitter query ─────────────────────────────────────────────────────────
@@ -28,13 +29,25 @@ const CALL_QUERY: &str = "
 (call_expression function: (scoped_identifier name: (identifier) @call.scoped))
 ";
 
+/// Common names that generate enormous noise (ubiquitous in every Rust crate) and
+/// provide no meaningful cross-crate signal. Drop them entirely — no edge, no
+/// UnresolvedCall.
+const NOISE_NAMES: &[&str] = &[
+    "new", "from", "into", "clone", "default", "fmt", "drop", "iter", "next", "unwrap",
+    "expect", "ok", "err", "map", "and_then", "unwrap_or", "collect", "push", "len", "is_empty",
+];
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Extract native Phase B edges for a Rust corpus rooted at `root`.
 ///
-/// Returns `(nodes, edges)`:
+/// Returns `(nodes, edges, unresolved_calls)`:
 ///   - crate nodes + `Depends` edges from Cargo.toml dependency graph
 ///   - `RefCall` edges from tree-sitter call-site analysis
+///   - `UnresolvedCall`s for cross-crate calls that cannot be anchored locally
+///
+/// Note: travsr-analysis does not have daemon plumbing, so `unresolved_calls`
+/// are returned to the caller but are NOT resolved against the store here.
 ///
 /// When `files` is `Some`, the caller supplies pre-walked `(abs_path, vname_path)`
 /// pairs from the daemon's Phase A walk (P6 — #329); the extractor uses them
@@ -44,9 +57,10 @@ pub fn extract_native_phase_b(
     corpus: &str,
     root: &Path,
     files: Option<&[(PathBuf, String)]>,
-) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<UnresolvedCall>)> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    let mut unresolved: Vec<UnresolvedCall> = Vec::new();
 
     // Pass 1: crate dependency graph via Cargo.toml
     match extract_cargo_deps(corpus, root) {
@@ -63,7 +77,7 @@ pub fn extract_native_phase_b(
         Ok(q) => q,
         Err(e) => {
             tracing::warn!(err = %e, "rust call-site query compile failed — skipping Phase B calls");
-            return Ok((nodes, edges));
+            return Ok((nodes, edges, unresolved));
         }
     };
 
@@ -80,7 +94,10 @@ pub fn extract_native_phase_b(
 
     for (abs_path, vname_path) in file_pairs {
         match extract_file_call_edges(corpus, abs_path, vname_path, &language, &query) {
-            Ok(file_edges) => edges.extend(file_edges),
+            Ok((file_edges, file_unresolved)) => {
+                edges.extend(file_edges);
+                unresolved.extend(file_unresolved);
+            }
             Err(e) => {
                 tracing::debug!(err = %e, path = %abs_path.display(), "rust call extraction skipped")
             }
@@ -92,8 +109,10 @@ pub fn extract_native_phase_b(
     nodes.dedup_by_key(|n| n.id);
     edges.sort_unstable_by_key(|e| (e.src, e.dst));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+    unresolved.sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
+    unresolved.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
 
-    Ok((nodes, edges))
+    Ok((nodes, edges, unresolved))
 }
 
 // ── Cargo.toml dependency graph ───────────────────────────────────────────────
@@ -213,7 +232,7 @@ fn extract_file_call_edges(
     vname_path: &str,
     language: &tree_sitter::Language,
     query: &Query,
-) -> anyhow::Result<Vec<Edge>> {
+) -> anyhow::Result<(Vec<Edge>, Vec<UnresolvedCall>)> {
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
@@ -223,7 +242,7 @@ fn extract_file_call_edges(
         .context("loading Rust grammar")?;
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
-        None => return Ok(vec![]),
+        None => return Ok((vec![], vec![])),
     };
 
     let cap_names: Vec<String> = query
@@ -235,6 +254,8 @@ fn extract_file_call_edges(
     let mut iter = cursor.matches(query, tree.root_node(), source.as_slice());
 
     let mut edges: Vec<Edge> = Vec::new();
+    let mut unresolved: Vec<UnresolvedCall> = Vec::new();
+
     while let Some(m) = iter.next() {
         for &cap in m.captures {
             let Some(cap_name) = cap_names.get(cap.index as usize) else {
@@ -265,10 +286,10 @@ fn extract_file_call_edges(
                 None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
             };
 
-            let callee_id = match cap_name.as_str() {
+            match cap_name.as_str() {
                 "call.method" => {
-                    // Best-effort: resolve to same-file impl method
-                    match &caller_impl {
+                    // Best-effort: resolve to same-file impl method — no cross-crate issue here
+                    let callee_id = match &caller_impl {
                         Some(t) => VName::new(
                             corpus,
                             "",
@@ -281,42 +302,73 @@ fn extract_file_call_edges(
                             VName::new(corpus, "", vname_path, "rust", format!("fn:{callee_name}"))
                                 .id()
                         }
+                    };
+                    if caller_id != callee_id {
+                        edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
                     }
                 }
                 "call.scoped" => {
-                    // Extract qualifying type from the scoped path parent node
-                    let qual_type = cap
+                    // Extract qualifying segment from the scoped path parent node
+                    let qual_raw = cap
                         .node
                         .parent()
                         .and_then(|p| p.child_by_field_name("path"))
                         .and_then(|path_node| path_node.utf8_text(source.as_slice()).ok())
                         .and_then(|t| t.split("::").last().map(str::to_string))
                         .filter(|s| !s.is_empty() && s != callee_name);
-                    match qual_type {
-                        Some(t) => VName::new(
-                            corpus,
-                            "",
-                            vname_path,
-                            "rust",
-                            format!("fn:{t}.{callee_name}"),
-                        )
-                        .id(),
+
+                    match qual_raw {
+                        Some(ref qual) if qual.starts_with(|c: char| c.is_uppercase()) => {
+                            // Uppercase qualifier → same-file struct/enum call; emit phantom edge
+                            let callee_id = VName::new(
+                                corpus,
+                                "",
+                                vname_path,
+                                "rust",
+                                format!("fn:{qual}.{callee_name}"),
+                            )
+                            .id();
+                            if caller_id != callee_id {
+                                edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
+                            }
+                        }
+                        Some(ref qual) => {
+                            // Lowercase qualifier → likely a crate/module path; emit UnresolvedCall
+                            if !NOISE_NAMES.contains(&callee_name) {
+                                unresolved.push(UnresolvedCall {
+                                    src: caller_id,
+                                    callee_sig: format!("fn:{callee_name}"),
+                                    hint_crate: Some(qual.clone()),
+                                });
+                            }
+                        }
                         None => {
-                            VName::new(corpus, "", vname_path, "rust", format!("fn:{callee_name}"))
-                                .id()
+                            // No qualifier found — treat as bare call
+                            if !NOISE_NAMES.contains(&callee_name) {
+                                unresolved.push(UnresolvedCall {
+                                    src: caller_id,
+                                    callee_sig: format!("fn:{callee_name}"),
+                                    hint_crate: None,
+                                });
+                            }
                         }
                     }
                 }
-                _ => VName::new(corpus, "", vname_path, "rust", format!("fn:{callee_name}")).id(),
-            };
-
-            if caller_id != callee_id {
-                edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
+                _ /* call.fn */ => {
+                    // Bare identifier — cannot anchor callee to a file; emit UnresolvedCall
+                    if !NOISE_NAMES.contains(&callee_name) {
+                        unresolved.push(UnresolvedCall {
+                            src: caller_id,
+                            callee_sig: format!("fn:{callee_name}"),
+                            hint_crate: None,
+                        });
+                    }
+                }
             }
         }
     }
 
-    Ok(edges)
+    Ok((edges, unresolved))
 }
 
 /// Walk up the tree-sitter AST to find the nearest enclosing `function_item`.
