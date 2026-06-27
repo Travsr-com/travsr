@@ -174,16 +174,15 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
 
 // ── ask ───────────────────────────────────────────────────────────────────────
 
-/// Run an ask query, optionally enhanced with KNN embed seeds.
+/// Run an ask query with unified FTS+KNN seed selection.
 ///
-/// When `knn_fn` is `Some`, the embed path is tried first:
-///   embed_path_seeds → ppr_weighted → knapsack
-/// If KNN returns no seeds (index not yet built) or `knn_fn` is `None`,
-/// falls back to the FTS path:
-///   search_nodes_fuzzy → uniform ppr → knapsack
+/// Both FTS and KNN always run when embed is available; results are merged with
+/// `max(fts_weight, knn_score)` deduplication so the two sources reinforce shared
+/// nodes rather than competing. Seeds structurally adjacent to a higher-scored seed
+/// are then dropped (`dedup_adjacent_seeds`) to avoid diluting PPR teleportation mass.
 ///
-/// The FTS relevance gate (token-in-signature check) only applies on the
-/// FTS path — embed may find semantically similar nodes with no surface overlap.
+/// KNN is subject to a `KNN_BUDGET_MS` circuit-breaker: if the sidecar takes too long
+/// its results are discarded and only FTS seeds steer PPR.
 pub fn ask_query(
     store: &SqliteStore,
     query: &str,
@@ -192,53 +191,38 @@ pub fn ask_query(
     // Strip a leading `:` so VS Code graph-panel queries pass through cleanly.
     let query = query.strip_prefix(':').unwrap_or(query).trim();
 
-    // ── Embed path (KNN → weighted PPR) ───────────────────────────────────────
-    if let Some(knn) = knn_fn {
-        let (seeds, _) = crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
-        if !seeds.is_empty() {
-            let ppr_scores = ppr_weighted(store, &seeds, context_candidates())?;
-            if ppr_scores.is_empty() {
-                return Ok(AskPayload {
-                    matched: true,
-                    no_results: true,
-                    rows: Vec::new(),
-                    total_tokens: 0,
-                    embed_used: true,
-                });
-            }
-            let node_ids: Vec<_> = ppr_scores.iter().map(|(id, _)| *id).collect();
-            let score_map: HashMap<_, f32> = ppr_scores.into_iter().collect();
-            let nodes = store.get_nodes(&node_ids)?;
-            let items: Vec<_> = nodes
-                .into_iter()
-                .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
-                .collect();
-            let selected = knapsack(items, DEFAULT_TOKEN_BUDGET);
-            let total_tokens: usize = selected.iter().map(token_cost).sum();
-            let rows = selected
-                .into_iter()
-                .map(|n| AskRow {
-                    score: score_map.get(&n.id).copied().unwrap_or(0.0),
-                    kind: n.kind,
-                    signature: n.vname.signature,
-                    path: n.vname.path,
-                    line: n.line,
-                })
-                .collect();
-            return Ok(AskPayload {
-                matched: true,
-                no_results: false,
-                rows,
-                total_tokens,
-                embed_used: true,
-            });
+    // ── Unified seed selection (FTS always + KNN when available) ──────────────
+    let fts_weighted = crate::tools::fts_seeds_weighted(store, query, &OpenFilter);
+
+    let embed_contributed;
+    let raw_seeds = if let Some(knn) = knn_fn {
+        let t0 = std::time::Instant::now();
+        let (knn_seeds, n_eligible) =
+            crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
+        let elapsed_ms = t0.elapsed().as_millis();
+        if elapsed_ms > crate::tools::KNN_BUDGET_MS {
+            tracing::warn!(
+                elapsed_ms,
+                threshold_ms = crate::tools::KNN_BUDGET_MS,
+                "ask_query knn exceeded circuit-breaker — falling back to FTS seeds"
+            );
+            embed_contributed = false;
+            fts_weighted
+        } else {
+            embed_contributed = !knn_seeds.is_empty();
+            let (merged, _) =
+                crate::tools::merge_fts_knn_seeds(fts_weighted, knn_seeds, n_eligible);
+            merged
         }
-        // KNN returned no seeds — fall through to FTS path below.
-    }
+    } else {
+        embed_contributed = false;
+        fts_weighted
+    };
 
-    // ── FTS path (fuzzy search → uniform PPR) ─────────────────────────────────
-    let matches = store.search_nodes_fuzzy(query)?;
-    if matches.is_empty() {
+    // Drop seeds whose 1-hop PPR expansion would overlap a higher-scored accepted seed.
+    let seeds = crate::tools::dedup_adjacent_seeds(store, raw_seeds);
+
+    if seeds.is_empty() {
         return Ok(AskPayload {
             matched: false,
             no_results: false,
@@ -248,47 +232,15 @@ pub fn ask_query(
         });
     }
 
-    // H1: FTS5 can return false positives for very short or unrelated queries.
-    // Gate `matched = true` on a minimal relevance check: at least one query
-    // token (≥3 chars) must appear in the top result's signature or path.
-    let top = &matches[0];
-    let top_text = format!(
-        "{} {}",
-        top.vname.signature.to_lowercase(),
-        top.vname.path.to_lowercase()
-    );
-    let q_lower = query.to_lowercase();
-    let has_relevant_token = q_lower
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 3)
-        .any(|token| top_text.contains(token));
-
-    if !has_relevant_token {
-        return Ok(AskPayload {
-            matched: false,
-            no_results: false,
-            rows: Vec::new(),
-            total_tokens: 0,
-            embed_used: false,
-        });
-    }
-
-    // Prefer structural seeds over file nodes for richer PPR traversal.
-    let preferred = ["class", "function", "method", "file"];
-    let seed_node = preferred
-        .iter()
-        .find_map(|k| matches.iter().find(|n| n.kind == *k))
-        .unwrap_or(&matches[0]);
-    let seed = seed_node.id;
-
-    let ppr_scores = travsr_retrieval::ppr(store, &[seed], context_candidates())?;
+    // ── PPR with confidence-weighted personalisation ───────────────────────────
+    let ppr_scores = ppr_weighted(store, &seeds, context_candidates())?;
     if ppr_scores.is_empty() {
         return Ok(AskPayload {
             matched: true,
             no_results: true,
             rows: Vec::new(),
             total_tokens: 0,
-            embed_used: false,
+            embed_used: embed_contributed,
         });
     }
 
@@ -318,7 +270,7 @@ pub fn ask_query(
         no_results: false,
         rows,
         total_tokens,
-        embed_used: false,
+        embed_used: embed_contributed,
     })
 }
 

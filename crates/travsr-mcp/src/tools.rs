@@ -1626,9 +1626,13 @@ const MAX_SEEDS_PER_PATH: usize = 2;
 const FTS_EXACT_WEIGHT: f32 = 1.0;
 /// PPR seed weight for a fuzzy/trigram FTS match (L2-A expansion, no literal substring match).
 const FTS_FUZZY_WEIGHT: f32 = 0.6;
-/// Advisory budget for KNN sidecar inference (ms). Calls exceeding this are logged.
-/// True circuit-breaker requires async dispatch — see TODO(travsr): #365 Step 4.
-const KNN_BUDGET_MS: u128 = 12;
+/// Circuit-breaker threshold for KNN sidecar inference (ms). Calls exceeding this
+/// are discarded and the caller falls back to FTS seeds. A degraded sidecar returning
+/// results after 12ms is likely under load; its cosine scores are not trustworthy enough
+/// to steer PPR. True non-blocking dispatch (parallel FTS+KNN) requires an Arc-owned
+/// EmbedKnnFn so the closure can be sent to a detached thread — a follow-on improvement.
+/// Shared with `travsr ask` via `query.rs`.
+pub(crate) const KNN_BUDGET_MS: u128 = 12;
 
 /// Returns `true` for nodes that should never be used as PPR seeds regardless
 /// of their KNN cosine score.
@@ -1770,7 +1774,7 @@ fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
 /// - Trigram/L2-A fuzzy match (`search_nodes_fuzzy`) → `FTS_FUZZY_WEIGHT` (0.6)
 ///
 /// Returns up to 5 seeds (capped to prevent FTS from flooding the seed pool).
-fn fts_seeds_weighted(
+pub(crate) fn fts_seeds_weighted(
     store: &SqliteStore,
     query: &str,
     filter: &dyn EdgeFilter,
@@ -1802,7 +1806,7 @@ fn fts_seeds_weighted(
 /// without diluting the PPR personalisation vector.
 ///
 /// Returns `(merged_seeds, seed_cap_fired)`.
-fn merge_fts_knn_seeds(
+pub(crate) fn merge_fts_knn_seeds(
     fts: Vec<(NodeId, f32)>,
     knn: Vec<(NodeId, f32)>,
     n_knn_eligible: usize,
@@ -1817,6 +1821,64 @@ fn merge_fts_knn_seeds(
     let cap_fired = combined.len() > MAX_EMBED_SEEDS || n_knn_eligible > MAX_EMBED_SEEDS;
     combined.truncate(MAX_EMBED_SEEDS);
     (combined, cap_fired)
+}
+
+/// Drop seeds whose PPR expansion would immediately overlap a higher-scored accepted seed.
+///
+/// Algorithm (O(n × q) where n ≤ MAX_EMBED_SEEDS and q = one `iter_edges_from` per seed):
+///
+/// 1. Pre-fetch all outgoing edges for every seed and filter to seed→seed pairs.
+///    This costs at most `MAX_EMBED_SEEDS` SQLite queries.
+/// 2. Visit seeds in descending score order. Accept a seed unless any already-accepted
+///    seed is directly adjacent to it (A→B or B→A edge). Adjacent seeds are structurally
+///    redundant: PPR teleportation from the higher-scored seed already walks toward the
+///    lower-scored one along real graph edges, so including it as a second seed only
+///    dilutes the walk's focus without adding new coverage.
+///
+/// Returns the filtered list in the same descending-score order.
+pub(crate) fn dedup_adjacent_seeds(
+    store: &SqliteStore,
+    seeds: Vec<(NodeId, f32)>,
+) -> Vec<(NodeId, f32)> {
+    if seeds.len() <= 1 {
+        return seeds;
+    }
+
+    let seed_ids: std::collections::HashSet<NodeId> = seeds.iter().map(|&(id, _)| id).collect();
+
+    // Pre-fetch seed→seed adjacency (both directions stored as directed pairs).
+    let mut adj: std::collections::HashSet<(NodeId, NodeId)> = std::collections::HashSet::new();
+    for &(id, _) in &seeds {
+        if let Ok(edges) = store.iter_edges_from(id) {
+            for e in edges {
+                if seed_ids.contains(&e.dst) {
+                    adj.insert((id, e.dst));
+                }
+            }
+        }
+    }
+
+    // If no seed→seed edges exist, nothing to dedup — return early.
+    if adj.is_empty() {
+        return seeds;
+    }
+
+    // Greedy selection: highest score wins; drop candidates adjacent to any accepted seed.
+    // seeds is already sorted desc by score (merge_fts_knn_seeds guarantees this;
+    // fts-only seeds share equal weight so order is stable regardless).
+    let mut accepted: Vec<(NodeId, f32)> = Vec::with_capacity(seeds.len());
+    let mut accepted_set: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+
+    for (id, score) in seeds {
+        let adjacent_to_accepted = accepted_set
+            .iter()
+            .any(|&acc| adj.contains(&(acc, id)) || adj.contains(&(id, acc)));
+        if !adjacent_to_accepted {
+            accepted_set.insert(id);
+            accepted.push((id, score));
+        }
+    }
+    accepted
 }
 
 fn get_context_body(
@@ -1858,29 +1920,36 @@ fn get_context_body(
     // splitting teleportation mass. KNN-only nodes steer the walk toward semantically
     // related code that the query may not name literally.
     //
-    // TODO(travsr): #365 Step 4 — run KNN in a scoped thread with KNN_BUDGET_MS cutoff
-    // so a slow sidecar never blocks get_context beyond the FTS path latency.
-    // TODO(travsr): #365 Step 2 (remainder) — structural 2-hop seed dedup. Requires
-    // exposing neighbour_ids(src) from travsr-store to drop seeds whose PPR expansion
-    // would overlap. Path-level dedup (MAX_SEEDS_PER_PATH) handles the common case.
     let fts_weighted = fts_seeds_weighted(store, query, filter);
     let (weighted_seeds, seed_cap_fired) = if let Some(knn_fn) = embed_knn {
         let t0 = std::time::Instant::now();
         let (knn_scored, n_knn_eligible) = embed_path_seeds(store, query, knn_fn, filter);
         let elapsed_ms = t0.elapsed().as_millis();
         if elapsed_ms > KNN_BUDGET_MS {
+            // Hard circuit-breaker: discard KNN results from a slow sidecar and fall
+            // back to FTS seeds. Results arriving after KNN_BUDGET_MS come from a
+            // degraded process; their cosine scores are unreliable PPR starting points.
             tracing::warn!(
                 elapsed_ms,
                 threshold_ms = KNN_BUDGET_MS,
-                "knn inference exceeded advisory budget"
+                "knn exceeded circuit-breaker threshold — falling back to FTS seeds"
             );
+            (fts_weighted, false)
+        } else {
+            merge_fts_knn_seeds(fts_weighted, knn_scored, n_knn_eligible)
         }
-        merge_fts_knn_seeds(fts_weighted, knn_scored, n_knn_eligible)
     } else {
         // No embed: FTS seeds carry 1.0/0.6 weights — ppr_weighted behaves like
         // ppr() for a single weight but correctly ranks multiple seeds by confidence.
         (fts_weighted, false)
     };
+
+    // Structural 2-hop seed dedup: drop seeds directly adjacent (in either direction)
+    // to a higher-scored accepted seed. PPR already traverses edges, so including both
+    // a node and its direct caller/callee as separate seeds dilutes teleportation mass
+    // without adding coverage. Path-level dedup (MAX_SEEDS_PER_PATH) handles the
+    // within-file case; this handles the cross-node structural case.
+    let weighted_seeds = dedup_adjacent_seeds(store, weighted_seeds);
 
     // SEC P0: identical response for "not found" and "access denied".
     if weighted_seeds.is_empty() {
@@ -5119,10 +5188,15 @@ mod snippet_tests {
         // Graph:  node_a (knn score 0.95) → node_x (RefCall)
         //         node_b (knn score 0.10) → node_y (RefCall)
         // Symmetric topology — uniform PPR gives x ≈ y; weighted PPR gives x >> y.
-        let node_a = make_fn_node_with_pkg("a.ts", "fn:wt_node_a", 1, 3);
-        let node_b = make_fn_node_with_pkg("b.ts", "fn:wt_node_b", 1, 3);
-        let node_x = make_fn_node_with_pkg("x.ts", "fn:wt_node_x", 1, 3);
-        let node_y = make_fn_node_with_pkg("y.ts", "fn:wt_node_y", 1, 3);
+        //
+        // IMPORTANT: node signatures must NOT contain the query string. If FTS matches
+        // all four nodes with equal weight 1.0, the KNN score differential is masked by
+        // max(fts, knn) merge and the test degenerates. Use an unresolvable query so
+        // only KNN drives the PPR seed weights.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:knnwt_alpha", 1, 3);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:knnwt_beta", 1, 3);
+        let node_x = make_fn_node_with_pkg("x.ts", "fn:downstream_x", 1, 3);
+        let node_y = make_fn_node_with_pkg("y.ts", "fn:downstream_y", 1, 3);
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let a_id = store.put_node(&node_a).unwrap();
         let b_id = store.put_node(&node_b).unwrap();
@@ -5136,11 +5210,13 @@ mod snippet_tests {
             .unwrap();
 
         // KNN closure: a has high cosine similarity, b has low.
+        // The query is a random token not present in any node signature so FTS
+        // returns empty — KNN scores (0.95 vs 0.10) are the sole PPR weights.
         let knn_fn: EmbedKnnFn<'_> = &|_query, _k| vec![(a_id, 0.95), (b_id, 0.10)];
 
         let result = get_context_body(
             &store,
-            "wt_node",
+            "xqz_no_fts_match_token",
             4096,
             &OpenFilter,
             false,
@@ -5148,19 +5224,170 @@ mod snippet_tests {
             Some(knn_fn),
         );
 
-        // node_x must appear (neighbor of the dominant KNN seed).
+        // node_x must appear (neighbor of the dominant KNN seed, score 0.95).
         assert!(
-            result.contains("wt_node_x"),
+            result.contains("downstream_x"),
             "neighbor of high-weight KNN seed must appear in context: {result}"
         );
-        // If both neighbors appear, x must rank before y (output order = PPR score).
-        if result.contains("wt_node_y") {
-            let pos_x = result.find("wt_node_x").unwrap();
-            let pos_y = result.find("wt_node_y").unwrap();
+        // If both neighbors appear, x must rank before y (output order = PPR score desc).
+        if result.contains("downstream_y") {
+            let pos_x = result.find("downstream_x").unwrap();
+            let pos_y = result.find("downstream_y").unwrap();
             assert!(
                 pos_x < pos_y,
                 "high-weight seed's neighbor must appear before low-weight seed's neighbor"
             );
         }
+    }
+
+    // ── dedup_adjacent_seeds ─────────────────────────────────────────────────
+
+    #[test]
+    fn dedup_adjacent_seeds_empty_and_single_passthrough() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert!(dedup_adjacent_seeds(&store, vec![]).is_empty());
+
+        let node = make_fn_node_with_pkg("a.ts", "fn:solo", 1, 2);
+        let mut s = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let id = s.put_node(&node).unwrap();
+        let result = dedup_adjacent_seeds(&s, vec![(id, 1.0)]);
+        assert_eq!(result, vec![(id, 1.0)]);
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_drops_lower_scored_direct_neighbor() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph: a (score 1.0) → b (score 0.7) via RefCall.
+        // b is a direct outgoing neighbor of a; it should be dropped.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:dedup_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:dedup_b", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(a_id, b_id, EdgeKind::RefCall))
+            .unwrap();
+
+        let seeds = vec![(a_id, 1.0), (b_id, 0.7)];
+        let result = dedup_adjacent_seeds(&store, seeds);
+        assert_eq!(
+            result,
+            vec![(a_id, 1.0)],
+            "b must be dropped as neighbor of a"
+        );
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_drops_upstream_neighbor_too() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph: b (score 0.7) → a (score 1.0) via RefCall (b calls a).
+        // b is an incoming caller of a; still structurally adjacent — b should be dropped
+        // because a has higher score and PPR from a naturally reaches b through reverse edges.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:upstr_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:upstr_b", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, a_id, EdgeKind::RefCall))
+            .unwrap();
+
+        // a has higher score so it is processed first.
+        let seeds = vec![(a_id, 1.0), (b_id, 0.7)];
+        let result = dedup_adjacent_seeds(&store, seeds);
+        assert_eq!(
+            result,
+            vec![(a_id, 1.0)],
+            "b must be dropped as upstream neighbor of a"
+        );
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_keeps_unconnected_seeds() {
+        use travsr_store::Store;
+
+        // Three nodes with no edges between them: all must be kept.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:iso_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:iso_b", 1, 2);
+        let node_c = make_fn_node_with_pkg("c.ts", "fn:iso_c", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        let c_id = store.put_node(&node_c).unwrap();
+
+        let seeds = vec![(a_id, 1.0), (b_id, 0.9), (c_id, 0.8)];
+        let result = dedup_adjacent_seeds(&store, seeds.clone());
+        assert_eq!(result, seeds, "no edges means no dedup");
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_keeps_non_seed_edges() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // a → x (not a seed) and b → y (not a seed). a and b have no edge between them.
+        // Both seeds must be kept even though each has outgoing edges.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:ext_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:ext_b", 1, 2);
+        let node_x = make_fn_node_with_pkg("x.ts", "fn:ext_x", 1, 2);
+        let node_y = make_fn_node_with_pkg("y.ts", "fn:ext_y", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        let x_id = store.put_node(&node_x).unwrap();
+        let y_id = store.put_node(&node_y).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(a_id, x_id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, y_id, EdgeKind::RefCall))
+            .unwrap();
+
+        let seeds = vec![(a_id, 1.0), (b_id, 0.9)];
+        let result = dedup_adjacent_seeds(&store, seeds.clone());
+        assert_eq!(result, seeds, "edges to non-seeds must not trigger dedup");
+    }
+
+    // ── KNN circuit-breaker ──────────────────────────────────────────────────
+
+    #[test]
+    fn knn_circuit_breaker_falls_back_to_fts_on_slow_sidecar() {
+        use travsr_store::Store;
+
+        // A slow KNN closure that sleeps beyond KNN_BUDGET_MS — get_context must
+        // still return a result derived from FTS seeds rather than panicking or
+        // hanging indefinitely (it will block for the sleep duration, but the
+        // result must not include the KNN-only node).
+        let node_fts = make_fn_node_with_pkg("fts.ts", "fn:cb_fts_sym", 1, 2);
+        let node_knn_only = make_fn_node_with_pkg("knn.ts", "fn:cb_knn_only", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&node_fts).unwrap();
+        let knn_id = store.put_node(&node_knn_only).unwrap();
+
+        // Sleep just over the budget so the circuit-breaker fires.
+        let slow_knn: EmbedKnnFn<'_> = &|_q, _k| {
+            std::thread::sleep(std::time::Duration::from_millis(KNN_BUDGET_MS as u64 + 5));
+            vec![(knn_id, 0.99)]
+        };
+
+        let result = get_context_body(
+            &store,
+            "cb_fts_sym",
+            4096,
+            &OpenFilter,
+            false,
+            None,
+            Some(slow_knn),
+        );
+
+        // The KNN-only node must not appear — circuit-breaker discarded those results.
+        assert!(
+            !result.contains("cb_knn_only"),
+            "circuit-breaker must discard KNN results after timeout; got: {result}"
+        );
     }
 }
