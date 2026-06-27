@@ -196,14 +196,13 @@ pub fn ask_query(
 
     let embed_contributed;
     let raw_seeds = if let Some(knn) = knn_fn {
-        let t0 = std::time::Instant::now();
-        let (knn_seeds, n_eligible) =
+        let (knn_seeds, n_eligible, knn_elapsed_ms) =
             crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
-        let elapsed_ms = t0.elapsed().as_millis();
-        if elapsed_ms > crate::tools::KNN_BUDGET_MS {
+        let budget_ms = crate::tools::knn_budget_ms();
+        if knn_elapsed_ms > budget_ms {
             tracing::warn!(
-                elapsed_ms,
-                threshold_ms = crate::tools::KNN_BUDGET_MS,
+                knn_elapsed_ms,
+                threshold_ms = budget_ms,
                 "ask_query knn exceeded circuit-breaker — falling back to FTS seeds"
             );
             embed_contributed = false;
@@ -219,8 +218,9 @@ pub fn ask_query(
         fts_weighted
     };
 
-    // Caller enrichment: surface production callers of each seed as lower-weight seeds.
-    let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds);
+    // Caller enrichment: depth-1 then depth-2 production callers at 0.35× weight per hop.
+    let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 15); // depth-1
+    let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 10); // depth-2
     // Drop seeds whose 1-hop PPR expansion would overlap a higher-scored accepted seed.
     let seeds = crate::tools::dedup_adjacent_seeds(store, raw_seeds);
 

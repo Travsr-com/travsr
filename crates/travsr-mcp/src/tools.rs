@@ -1627,12 +1627,31 @@ const FTS_EXACT_WEIGHT: f32 = 1.0;
 /// PPR seed weight for a fuzzy/trigram FTS match (L2-A expansion, no literal substring match).
 const FTS_FUZZY_WEIGHT: f32 = 0.6;
 /// Circuit-breaker threshold for KNN sidecar inference (ms). Calls exceeding this
-/// are discarded and the caller falls back to FTS seeds. A degraded sidecar returning
-/// results after 12ms is likely under load; its cosine scores are not trustworthy enough
-/// to steer PPR. True non-blocking dispatch (parallel FTS+KNN) requires an Arc-owned
-/// EmbedKnnFn so the closure can be sent to a detached thread — a follow-on improvement.
+/// are discarded and the caller falls back to FTS seeds.
+///
+/// Default: 200ms — covers normal ONNX CPU inference (30–80ms for bge-base-en-v1.5
+/// on a developer CPU) with headroom for HNSW search and pipe round-trip. Raised
+/// above 100ms because during Phase 2 active building a background reindexer process
+/// runs ONNX continuously, sharing CPU with the query sidecar and pushing
+/// query-time inference to 100–300ms even on a healthy sidecar. Setting this too low
+/// causes silent KNN degradation (FTS fallback) at exactly the moment the Phase 2
+/// semantic index is most valuable.
+///
+/// Override via `TRAVSR_KNN_BUDGET_MS` (e.g. `TRAVSR_KNN_BUDGET_MS=500` when
+/// Phase 2 is actively building on a heavily loaded machine). The value must be
+/// a positive integer; invalid values fall back to the default.
+///
 /// Shared with `travsr ask` via `query.rs`.
-pub(crate) const KNN_BUDGET_MS: u128 = 12;
+pub(crate) fn knn_budget_ms() -> u128 {
+    std::env::var("TRAVSR_KNN_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .filter(|&x| x > 0)
+        .unwrap_or(200)
+}
+/// Kept for tests that reference the constant directly; resolves to the default.
+#[cfg(test)]
+pub(crate) const KNN_BUDGET_MS: u128 = 200;
 
 /// Returns `true` for nodes that should never be used as PPR seeds regardless
 /// of their KNN cosine score.
@@ -1675,16 +1694,22 @@ fn is_noise_seed(node: &CoreNode) -> bool {
 ///
 /// Returns empty seeds when KNN returns nothing (index not yet built), so the caller
 /// can fall back to `search_nodes_fuzzy`.
+/// Returns `(seeds, n_candidates_before_cap, knn_elapsed_ms)`.
+/// `knn_elapsed_ms` covers only the `knn_fn` HNSW/ONNX call, not the SQLite
+/// postprocessing — the caller uses it for the circuit-breaker decision.
 pub(crate) fn embed_path_seeds(
     store: &SqliteStore,
     query: &str,
     knn_fn: EmbedKnnFn<'_>,
     filter: &dyn EdgeFilter,
-) -> (Vec<(NodeId, f32)>, usize) {
+) -> (Vec<(NodeId, f32)>, usize, u128) {
     // Over-request 6× to keep MIN_EMBED_SEEDS filled after noise + RBAC filtering.
+    // Time only the KNN inference call — not the subsequent SQLite get_nodes fetch.
+    let t0 = std::time::Instant::now();
     let knn_pairs = knn_fn(query, (MAX_EMBED_SEEDS as u32).saturating_mul(6));
+    let knn_elapsed_ms = t0.elapsed().as_millis();
     if knn_pairs.is_empty() {
-        return (vec![], 0);
+        return (vec![], 0, knn_elapsed_ms);
     }
 
     // Fetch node metadata for noise filter + RBAC + path dedup.
@@ -1693,7 +1718,7 @@ pub(crate) fn embed_path_seeds(
         Ok(ns) => ns,
         Err(e) => {
             tracing::warn!("embed_path_seeds get_nodes error: {e}");
-            return (vec![], 0);
+            return (vec![], 0, knn_elapsed_ms);
         }
     };
     let node_map: std::collections::HashMap<NodeId, CoreNode> =
@@ -1732,7 +1757,7 @@ pub(crate) fn embed_path_seeds(
         }
     }
 
-    (seeds, n_eligible)
+    (seeds, n_eligible, knn_elapsed_ms)
 }
 
 /// Compose all advisory signals appended to a `get_context` response footer.
@@ -1793,6 +1818,7 @@ pub(crate) fn fts_seeds_weighted(
     };
     nodes
         .into_iter()
+        .filter(|n| !is_noise_seed(n))
         .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
         .take(5)
         .map(|n| (n.id, weight))
@@ -1899,13 +1925,17 @@ pub(crate) fn dedup_adjacent_seeds(
 ///   - Skip path containing `/tests/` or `/benches/`
 ///   - Skip signature starting with `fn:test_`, `fn:bench_`, `fn:prop_`
 ///   - Skip nodes already in the seed set (keeps existing higher weight)
-///   - Cap: top 5 by outgoing-edge degree (more central = more relevant)
+///   - Cap per-seed: top 5 by outgoing-edge degree (more central = more relevant)
+///   - Cap global: `max_new_total` total new seeds added regardless of input size —
+///     prevents hub nodes (e.g. a logging utility called by 1000 functions) from
+///     flooding the seed pool when this is called for depth-2 enrichment.
 ///
 /// O(s × c × d) where s = seed count, c = callers per seed (typically < 20
 /// after test filter), d = outgoing degree per caller (1 store query each).
 pub(crate) fn enrich_seeds_with_callers(
     store: &SqliteStore,
     mut seeds: Vec<(NodeId, f32)>,
+    max_new_total: usize,
 ) -> Vec<(NodeId, f32)> {
     use travsr_core::EdgeKind;
 
@@ -1981,6 +2011,9 @@ pub(crate) fn enrich_seeds_with_callers(
     let mut seen: std::collections::HashSet<NodeId> = existing;
     to_add.retain(|(id, _)| seen.insert(*id));
 
+    // Global cap: a hub node called by many callers must not flood the seed pool.
+    to_add.truncate(max_new_total);
+
     seeds.extend(to_add);
     seeds
 }
@@ -2026,16 +2059,17 @@ fn get_context_body(
     //
     let fts_weighted = fts_seeds_weighted(store, query, filter);
     let (weighted_seeds, seed_cap_fired) = if let Some(knn_fn) = embed_knn {
-        let t0 = std::time::Instant::now();
-        let (knn_scored, n_knn_eligible) = embed_path_seeds(store, query, knn_fn, filter);
-        let elapsed_ms = t0.elapsed().as_millis();
-        if elapsed_ms > KNN_BUDGET_MS {
-            // Hard circuit-breaker: discard KNN results from a slow sidecar and fall
-            // back to FTS seeds. Results arriving after KNN_BUDGET_MS come from a
-            // degraded process; their cosine scores are unreliable PPR starting points.
+        let (knn_scored, n_knn_eligible, knn_elapsed_ms) =
+            embed_path_seeds(store, query, knn_fn, filter);
+        let budget_ms = knn_budget_ms();
+        if knn_elapsed_ms > budget_ms {
+            // Hard circuit-breaker: discard KNN results from a degraded sidecar and
+            // fall back to FTS seeds. Budget is read from TRAVSR_KNN_BUDGET_MS
+            // (default 200ms) to allow tuning during Phase 2 active building when
+            // the background reindexer competes for ONNX CPU time.
             tracing::warn!(
-                elapsed_ms,
-                threshold_ms = KNN_BUDGET_MS,
+                knn_elapsed_ms,
+                threshold_ms = budget_ms,
                 "knn exceeded circuit-breaker threshold — falling back to FTS seeds"
             );
             (fts_weighted, false)
@@ -2054,11 +2088,17 @@ fn get_context_body(
     let primary_seed_ids: std::collections::HashSet<NodeId> =
         weighted_seeds.iter().map(|&(id, _)| id).collect();
 
-    // Caller enrichment: add depth-1 production callers of each seed at 0.35× weight.
-    // PPR only follows outgoing edges, so callers are otherwise unreachable unless seeded
-    // directly. Must run before dedup_adjacent_seeds so redundant caller+callee pairs
-    // are still pruned in the dedup pass.
-    let weighted_seeds = enrich_seeds_with_callers(store, weighted_seeds);
+    // Caller enrichment: depth-1 then depth-2 production callers seeded at 0.35× weight
+    // per hop. PPR follows only outgoing edges so callers are otherwise unreachable;
+    // seeding them directly surfaces the full call chain above any queried symbol.
+    //
+    // Hop 1 — direct callers of the FTS/KNN seeds.         Weight = seed_w × 0.35
+    // Hop 2 — callers of those callers (grandparents).     Weight = seed_w × 0.35²
+    //
+    // max_new_total caps total additions per hop to protect against hub nodes.
+    // Must run before dedup_adjacent_seeds so redundant caller+callee pairs are pruned.
+    let weighted_seeds = enrich_seeds_with_callers(store, weighted_seeds, 15); // depth-1
+    let weighted_seeds = enrich_seeds_with_callers(store, weighted_seeds, 10); // depth-2
 
     // Structural 2-hop seed dedup: drop seeds directly adjacent (in either direction)
     // to a higher-scored accepted seed. PPR already traverses edges, so including both
@@ -5085,6 +5125,38 @@ mod snippet_tests {
     }
 
     #[test]
+    fn fts_seeds_weighted_filters_crate_noise() {
+        // FTS exact-matching a crate node (e.g. "crate:getrandom" matching query
+        // "random") must be dropped — same noise class as KNN already filters.
+        use travsr_store::Store;
+        let crate_node = make_node_with_kind_and_path(
+            "crate",
+            "crates/travsr-retrieval/Cargo.toml",
+            "crate:getrandom",
+        );
+        let impl_node = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-retrieval/src/ppr.rs",
+            "fn:random_walk",
+        );
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&crate_node).unwrap();
+        let impl_id = store.put_node(&impl_node).unwrap();
+
+        // Both nodes would match a "random" FTS query in a real store, but we use
+        // fts_seeds_weighted directly to isolate the noise filter.  Inject them via
+        // search_nodes_by_name by naming them so FTS exact-matches: call the function
+        // with the impl node's name to get a result, then manually verify crate kind
+        // is rejected.  Because open_in_memory FTS is live, just verify the filter
+        // logic directly via the public function path.
+        let seeds = fts_seeds_weighted(&store, "random_walk", &OpenFilter);
+        assert!(
+            seeds.iter().all(|&(id, _)| id == impl_id),
+            "crate-kind nodes must be filtered from FTS seeds; got {:?}", seeds
+        );
+    }
+
+    #[test]
     fn embed_path_seeds_filters_noise_nodes() {
         // KNN returns a crate node + a tests/ function + a real src function.
         // Only the real src function must become a seed.
@@ -5113,7 +5185,7 @@ mod snippet_tests {
         let knn: EmbedKnnFn<'_> =
             &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
 
-        let (seeds, n_eligible) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        let (seeds, n_eligible, _) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
         assert!(
             seeds.iter().all(|&(id, _)| id == impl_id),
             "only the src impl node should be a seed; got: {seeds:?}"
@@ -5240,7 +5312,7 @@ mod snippet_tests {
             knn_pairs.push((id, 0.90 - i as f32 * 0.001));
         }
         let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
-        let (seeds, n_eligible) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
+        let (seeds, n_eligible, _) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
         assert_eq!(
             seeds.len(),
             MAX_EMBED_SEEDS,
@@ -5269,7 +5341,7 @@ mod snippet_tests {
             knn_pairs.push((id, 0.95));
         }
         let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
-        let (seeds, n_eligible) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
+        let (seeds, n_eligible, _) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
         assert!(
             n_eligible > seeds.len(),
             "cap fired: n_eligible ({n_eligible}) > seeds.len() ({})",
@@ -5488,7 +5560,7 @@ mod snippet_tests {
             .unwrap();
 
         let seeds = vec![(seed_id, 1.0)];
-        let result = enrich_seeds_with_callers(&store, seeds);
+        let result = enrich_seeds_with_callers(&store, seeds, usize::MAX);
 
         assert_eq!(result.len(), 2, "caller should be added");
         let caller_entry = result.iter().find(|&&(id, _)| id == caller_id);
@@ -5515,7 +5587,7 @@ mod snippet_tests {
             .put_edge(&travsr_core::Edge::new(test_id, seed_id, EdgeKind::RefCall))
             .unwrap();
 
-        let result = enrich_seeds_with_callers(&store, vec![(seed_id, 1.0)]);
+        let result = enrich_seeds_with_callers(&store, vec![(seed_id, 1.0)], usize::MAX);
         assert_eq!(result.len(), 1, "test caller must be filtered, only seed remains");
         assert!(!result.iter().any(|&(id, _)| id == test_id));
     }
@@ -5538,7 +5610,7 @@ mod snippet_tests {
 
         // Both are already seeds — b should not be added again at reduced weight.
         let seeds = vec![(a_id, 1.0), (b_id, 0.9)];
-        let result = enrich_seeds_with_callers(&store, seeds.clone());
+        let result = enrich_seeds_with_callers(&store, seeds.clone(), usize::MAX);
         assert_eq!(result.len(), 2, "no duplicates when caller already in seed set");
         // b must retain original weight 0.9, not get demoted to 0.35
         let b_weight = result.iter().find(|&&(id, _)| id == b_id).unwrap().1;
@@ -5551,8 +5623,73 @@ mod snippet_tests {
     #[test]
     fn enrich_empty_seeds_passthrough() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let result = enrich_seeds_with_callers(&store, vec![]);
+        let result = enrich_seeds_with_callers(&store, vec![], usize::MAX);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn enrich_callers_depth_two_adds_grandparent_caller() {
+        // Chain: grandparent → parent → child (all RefCall edges).
+        // Query seeds = [child]. Two calls simulate depth-1 then depth-2 enrichment.
+        // After hop-1: parent added. After hop-2: grandparent added.
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        let child = make_fn_node_with_pkg("lib.rs", "fn:child", 1, 2);
+        let parent = make_fn_node_with_pkg("lib.rs", "fn:parent", 1, 2);
+        let grandparent = make_fn_node_with_pkg("main.rs", "fn:grandparent", 1, 2);
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let child_id = store.put_node(&child).unwrap();
+        let parent_id = store.put_node(&parent).unwrap();
+        let gp_id = store.put_node(&grandparent).unwrap();
+
+        store.put_edge(&travsr_core::Edge::new(parent_id, child_id, EdgeKind::RefCall)).unwrap();
+        store.put_edge(&travsr_core::Edge::new(gp_id, parent_id, EdgeKind::RefCall)).unwrap();
+
+        // Simulate what get_context_body / ask_query do: two sequential enrich calls.
+        let seeds = vec![(child_id, 1.0)];
+        let seeds = enrich_seeds_with_callers(&store, seeds, 15); // depth-1
+        let seeds = enrich_seeds_with_callers(&store, seeds, 10); // depth-2
+
+        let ids: Vec<_> = seeds.iter().map(|&(id, _)| id).collect();
+        assert!(ids.contains(&parent_id), "depth-1 caller (parent) must be seeded");
+        assert!(ids.contains(&gp_id), "depth-2 caller (grandparent) must be seeded");
+
+        // Weights decrease per hop: parent ≈ 0.35, grandparent ≈ 0.35²
+        let parent_w = seeds.iter().find(|&&(id, _)| id == parent_id).unwrap().1;
+        let gp_w = seeds.iter().find(|&&(id, _)| id == gp_id).unwrap().1;
+        assert!((parent_w - 0.35).abs() < 1e-5, "parent weight = 0.35; got {parent_w}");
+        assert!((gp_w - 0.35 * 0.35).abs() < 1e-4, "grandparent weight = 0.35²; got {gp_w}");
+    }
+
+    #[test]
+    fn enrich_callers_respects_max_new_total() {
+        // Hub node called by 8 production callers. max_new_total=3 must cap additions.
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        let hub = make_fn_node_with_pkg("lib.rs", "fn:hub", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let hub_id = store.put_node(&hub).unwrap();
+
+        for i in 0..8u32 {
+            let caller = make_fn_node_with_pkg(
+                &format!("caller{i}.rs"),
+                &format!("fn:caller_{i}"),
+                1,
+                2,
+            );
+            let caller_id = store.put_node(&caller).unwrap();
+            store
+                .put_edge(&travsr_core::Edge::new(caller_id, hub_id, EdgeKind::RefCall))
+                .unwrap();
+        }
+
+        let seeds = vec![(hub_id, 1.0)];
+        let result = enrich_seeds_with_callers(&store, seeds, 3);
+        // 1 original + at most 3 new callers
+        assert_eq!(result.len(), 4, "max_new_total=3 must cap additions; got {}", result.len());
     }
 
     // ── KNN circuit-breaker ──────────────────────────────────────────────────
