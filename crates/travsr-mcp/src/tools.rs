@@ -1823,17 +1823,22 @@ pub(crate) fn merge_fts_knn_seeds(
     (combined, cap_fired)
 }
 
-/// Drop seeds whose PPR expansion would immediately overlap a higher-scored accepted seed.
+/// Drop seeds that are direct **callees** of a higher-scored accepted seed.
 ///
-/// Algorithm (O(n × q) where n ≤ MAX_EMBED_SEEDS and q = one `iter_edges_from` per seed):
+/// PPR follows outgoing edges at each step, so from seed A the walk naturally
+/// reaches everything A calls/imports. Including A's callee B as a *second* seed
+/// only adds redundant teleportation mass — PPR from A already covers B.
 ///
-/// 1. Pre-fetch all outgoing edges for every seed and filter to seed→seed pairs.
-///    This costs at most `MAX_EMBED_SEEDS` SQLite queries.
-/// 2. Visit seeds in descending score order. Accept a seed unless any already-accepted
-///    seed is directly adjacent to it (A→B or B→A edge). Adjacent seeds are structurally
-///    redundant: PPR teleportation from the higher-scored seed already walks toward the
-///    lower-scored one along real graph edges, so including it as a second seed only
-///    dilutes the walk's focus without adding new coverage.
+/// **Callers are never dropped.** If B calls A (B→A edge), PPR from A cannot walk
+/// backward to B, so B provides genuinely orthogonal coverage and must be kept.
+/// Dropping callers would hide usage context, which is often the most valuable part
+/// of the result set for a query about a function.
+///
+/// Algorithm (O(n × q) where n ≤ MAX_EMBED_SEEDS, q = one `iter_edges_from` per seed):
+///
+/// 1. Pre-fetch all outgoing edges for every seed filtered to seed→seed pairs (≤ 20 queries).
+/// 2. Visit seeds in descending score order. Drop a candidate only when an already-accepted
+///    seed has a direct **outgoing** edge to it (accepted → candidate direction).
 ///
 /// Returns the filtered list in the same descending-score order.
 pub(crate) fn dedup_adjacent_seeds(
@@ -1846,7 +1851,7 @@ pub(crate) fn dedup_adjacent_seeds(
 
     let seed_ids: std::collections::HashSet<NodeId> = seeds.iter().map(|&(id, _)| id).collect();
 
-    // Pre-fetch seed→seed adjacency (both directions stored as directed pairs).
+    // Pre-fetch seed→seed outgoing edges (directed: src calls/depends-on dst).
     let mut adj: std::collections::HashSet<(NodeId, NodeId)> = std::collections::HashSet::new();
     for &(id, _) in &seeds {
         if let Ok(edges) = store.iter_edges_from(id) {
@@ -1863,17 +1868,15 @@ pub(crate) fn dedup_adjacent_seeds(
         return seeds;
     }
 
-    // Greedy selection: highest score wins; drop candidates adjacent to any accepted seed.
-    // seeds is already sorted desc by score (merge_fts_knn_seeds guarantees this;
-    // fts-only seeds share equal weight so order is stable regardless).
+    // Greedy selection: highest score wins.
+    // Drop a candidate only when an accepted seed has an OUTGOING edge to it
+    // (accepted → candidate). Never drop because candidate → accepted (caller direction).
     let mut accepted: Vec<(NodeId, f32)> = Vec::with_capacity(seeds.len());
     let mut accepted_set: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
 
     for (id, score) in seeds {
-        let adjacent_to_accepted = accepted_set
-            .iter()
-            .any(|&acc| adj.contains(&(acc, id)) || adj.contains(&(id, acc)));
-        if !adjacent_to_accepted {
+        let is_callee_of_accepted = accepted_set.iter().any(|&acc| adj.contains(&(acc, id)));
+        if !is_callee_of_accepted {
             accepted_set.insert(id);
             accepted.push((id, score));
         }
@@ -5280,13 +5283,14 @@ mod snippet_tests {
     }
 
     #[test]
-    fn dedup_adjacent_seeds_drops_upstream_neighbor_too() {
+    fn dedup_adjacent_seeds_keeps_upstream_callers() {
         use travsr_core::EdgeKind;
         use travsr_store::Store;
 
-        // Graph: b (score 0.7) → a (score 1.0) via RefCall (b calls a).
-        // b is an incoming caller of a; still structurally adjacent — b should be dropped
-        // because a has higher score and PPR from a naturally reaches b through reverse edges.
+        // Graph: b (score 0.7) → a (score 1.0) via RefCall (b CALLS a).
+        // b is a CALLER of a. PPR from a follows outgoing edges — it cannot walk
+        // backwards to b. Callers provide orthogonal coverage (usage context / call sites)
+        // and must NEVER be dropped, even when they score lower than their callee.
         let node_a = make_fn_node_with_pkg("a.ts", "fn:upstr_a", 1, 2);
         let node_b = make_fn_node_with_pkg("b.ts", "fn:upstr_b", 1, 2);
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
@@ -5298,11 +5302,10 @@ mod snippet_tests {
 
         // a has higher score so it is processed first.
         let seeds = vec![(a_id, 1.0), (b_id, 0.7)];
-        let result = dedup_adjacent_seeds(&store, seeds);
+        let result = dedup_adjacent_seeds(&store, seeds.clone());
         assert_eq!(
-            result,
-            vec![(a_id, 1.0)],
-            "b must be dropped as upstream neighbor of a"
+            result, seeds,
+            "b is a caller — must be kept for orthogonal PPR coverage"
         );
     }
 
