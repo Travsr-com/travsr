@@ -64,6 +64,15 @@ impl PluginIndexer {
         Ok(response_to_output(resp))
     }
 
+    /// Register Phase A sidecar plugins (RFC-013 Direction A).
+    ///
+    /// Must be called with the repo root after construction so the sandbox can
+    /// grant read access to the source tree. Fail-closed: missing binaries are
+    /// logged and skipped, never a panic or hard error.
+    pub fn register_phase_a_sidecars(&mut self, repo_root: &std::path::Path) {
+        crate::registry::register_phase_a_sidecars(&mut self.dispatcher, repo_root);
+    }
+
     /// Phase B: semantic indexing for all trusted, registered languages.
     /// Called from `init_repo` once per full index — not per commit.
     /// ADR-017 Rule 3: checks trust before any code-executing subprocess spawns.
@@ -133,7 +142,7 @@ impl PluginIndexer {
             };
 
             match crate::transport::Sidecar::spawn(&spec, repo_root) {
-                Ok(sidecar) => match crate::transport::Transport::invoke_phase_b(&sidecar, req) {
+                Ok((sidecar, _hs)) => match crate::transport::Transport::invoke_phase_b(&sidecar, req) {
                     Ok(resp) => {
                         all_nodes.extend(resp.nodes);
                         all_edges.extend(resp.edges);

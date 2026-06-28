@@ -1,5 +1,5 @@
-//! Phase A golden fixtures for the grammars added to support the travsr-lang
-//! Phase B packages: Scala, C, and C++.
+//! Phase A golden fixtures for the grammars that register as in-process builtins:
+//! Scala and C.
 //!
 //! These prove two things at once:
 //!   1. `register_builtins` compiles each grammar's tree-sitter query (a bad
@@ -7,6 +7,10 @@
 //!   2. the `GenericTreeSitterPlugin` actually extracts the expected structural
 //!      nodes — the ADR-017 Rule 4 "fixture-gated" condition for an in-process
 //!      grammar.
+//!
+//! C++ is no longer an in-process grammar (RFC-013 Direction A). Its Phase A
+//! parser lives in the `travsr-lang-cpp` sidecar binary. The sidecar test below
+//! runs only when that binary is on PATH so CI without the binary still passes.
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -69,8 +73,24 @@ int add(int a, int b) { return a + b; }
     }
 }
 
+/// Integration test for the travsr-lang-cpp Phase A sidecar (RFC-013 Direction A).
+///
+/// Skipped automatically when `travsr-lang-cpp` is not on PATH so standard CI
+/// (which builds the workspace but does not install sidecar binaries) still passes.
+/// To run: `cargo build -p travsr-lang-cpp && cargo test -p travsr-plugin-host cpp_sidecar`
 #[test]
-fn cpp_phase_a_extracts_structure() {
+fn cpp_phase_a_sidecar_extracts_structure() {
+    // Skip if the sidecar binary is not installed.
+    let sidecar_on_path = std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+    .any(|dir| dir.join("travsr-lang-cpp").is_file());
+
+    if !sidecar_on_path {
+        eprintln!("SKIP: travsr-lang-cpp not on PATH — build it first to run this test");
+        return;
+    }
+
     let src = r#"
 #include <vector>
 namespace app {
@@ -79,11 +99,27 @@ struct Pod { int n; };
 int compute(int x) { return x * 2; }
 }
 "#;
-    let k = kinds(src, "cpp");
+    let mut f = tempfile::Builder::new()
+        .suffix(".cpp")
+        .tempfile()
+        .expect("tempfile");
+    f.write_all(src.as_bytes()).expect("write fixture");
+    f.flush().expect("flush fixture");
+
+    let repo_root = f.path().parent().unwrap();
+    let mut indexer = PluginIndexer::new(CORPUS);
+    indexer.register_phase_a_sidecars(repo_root);
+
+    let nodes = indexer
+        .parse_file_with_vname(f.path(), "fixture.cpp")
+        .expect("parse")
+        .nodes;
+    let k: HashSet<String> = nodes.into_iter().map(|n| n.kind).collect();
+
     for expected in ["class", "struct", "namespace", "function", "import"] {
         assert!(
             k.contains(expected),
-            "cpp: missing {expected:?} node — got {k:?}"
+            "cpp sidecar: missing {expected:?} node — got {k:?}"
         );
     }
 }

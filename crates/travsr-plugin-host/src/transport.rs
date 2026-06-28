@@ -93,12 +93,15 @@ impl Sidecar {
 
     /// Spawn the plugin binary under the ADR-017 sandbox described by `spec`.
     ///
+    /// Returns the transport and the validated `HandshakeResponse` so the caller
+    /// can extract extensions and capability flags for dispatcher registration.
+    ///
     /// `spec.program` is the binary to execute; `spec.args` are its arguments;
     /// `spec.policy` controls the sandbox level applied before spawning.
     pub fn spawn(
         spec: &crate::resolver::PluginSpec,
         repo_root: &std::path::Path,
-    ) -> Result<Self, IndexError> {
+    ) -> Result<(Self, travsr_plugin_protocol::HandshakeResponse), IndexError> {
         let lang = &spec.language;
         // Create per-invocation scratch tmpdir (ADR-017 Rule 1).
         // Dropped when Sidecar drops — guarantees cleanup even on error paths.
@@ -153,7 +156,7 @@ impl Sidecar {
             message: e.to_string(),
         })?;
 
-        let plugin_version = match hs {
+        let handshake = match hs {
             PluginResponse::Handshake(h) => {
                 if h.protocol_version != PROTOCOL_VERSION {
                     return Err(IndexError::ProtocolVersionMismatch {
@@ -161,7 +164,7 @@ impl Sidecar {
                         got: h.protocol_version,
                     });
                 }
-                h.plugin_version
+                h
             }
             _ => {
                 return Err(IndexError::Parse {
@@ -171,14 +174,15 @@ impl Sidecar {
             }
         };
 
-        Ok(Self {
+        let sidecar = Self {
             language: lang.to_string(),
-            plugin_version,
+            plugin_version: handshake.plugin_version.clone(),
             child: Some(Mutex::new(child)),
             io: Some(Mutex::new((writer, reader))),
             health: Mutex::new(PluginHealth::Ok),
             _scratch: Some(scratch),
-        })
+        };
+        Ok((sidecar, handshake))
     }
 
     #[cfg(target_os = "linux")]

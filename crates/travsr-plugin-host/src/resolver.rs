@@ -323,7 +323,7 @@ impl PluginResolver for CompositeResolver {
 /// Search PATH for a binary with the given name. Returns the absolute path as
 /// a `String` if found, or `None` if not on PATH. Mirrors the `which()` helper
 /// in `crates/travsr-cli/src/lang.rs` lines 398-401.
-fn which_binary(name: &str) -> Option<String> {
+pub(crate) fn which_binary(name: &str) -> Option<String> {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|dir| dir.join(name))
         .find(|p| p.is_file())

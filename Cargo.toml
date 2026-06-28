@@ -6,6 +6,7 @@ members = [
     "crates/travsr-plugin-protocol",
     "crates/travsr-plugin-sdk",
     "crates/travsr-plugin-host",
+    "crates/travsr-lang-cpp",
     "crates/travsr-indexer",
     "crates/travsr-store",
     "crates/travsr-retrieval",

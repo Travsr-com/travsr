@@ -3120,6 +3120,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "travsr-lang-cpp"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "tracing-subscriber",
+ "travsr-plugin-sdk",
+ "tree-sitter",
+ "tree-sitter-cpp",
+]
+
+[[package]]
 name = "travsr-mcp"
 version = "0.7.0"
 dependencies = [
@@ -3168,7 +3180,6 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
- "tree-sitter-cpp",
  "tree-sitter-java",
  "tree-sitter-kotlin",
  "tree-sitter-php",

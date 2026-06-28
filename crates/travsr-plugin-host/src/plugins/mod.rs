@@ -1,6 +1,5 @@
 pub mod c;
 mod convert;
-pub mod cpp;
 pub mod csharp;
 pub mod generic;
 pub mod go;

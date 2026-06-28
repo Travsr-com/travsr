@@ -5,7 +5,9 @@ use crate::plugins::java::JavaPlugin;
 use crate::plugins::python::PythonPlugin;
 use crate::plugins::rust::RustPlugin;
 use crate::plugins::typescript::TypeScriptPlugin;
-use crate::transport::InProcess;
+use crate::resolver::{which_binary, PluginSpec};
+use crate::sandbox::policy::SandboxPolicy;
+use crate::transport::{InProcess, Sidecar};
 use std::sync::Arc;
 use travsr_plugin_protocol::{HandshakeResponse, PROTOCOL_VERSION};
 
@@ -22,7 +24,7 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("csharp", "fuzz_csharp_parser.rs"), // TODO: create this fuzz target
     ("php", "fuzz_php_parser.rs"),   // TODO: create this fuzz target
     ("scala", "fuzz_scala_parser.rs"), // TODO: create this fuzz target
-    ("cpp", "fuzz_cpp_parser.rs"),   // TODO: create this fuzz target
+    // C++ is a Phase A sidecar (travsr-lang-cpp) — fuzzed in that crate, not here.
     ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
 ];
 
@@ -162,13 +164,6 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         &crate::plugins::scala::CONFIG,
         tree_sitter_scala::language(),
     );
-    check_fuzz_target("cpp");
-    register_generic(
-        dispatcher,
-        &version,
-        &crate::plugins::cpp::CONFIG,
-        tree_sitter_cpp::language(),
-    );
     check_fuzz_target("c");
     register_generic(
         dispatcher,
@@ -176,8 +171,57 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         &crate::plugins::c::CONFIG,
         tree_sitter_c::language(),
     );
+    // C++: moved to travsr-lang-cpp sidecar (RFC-013 Direction A).
+    // Call register_phase_a_sidecars(dispatcher, repo_root) after PluginIndexer
+    // construction to activate C++ Phase A when the binary is on PATH.
+
     // Swift: blocked — all available tree-sitter-swift crates require tree-sitter ^0.21
     // which conflicts with workspace tree-sitter = "0.22". Re-enable when a compatible crate ships.
+}
+
+/// Attempt to register Phase A sidecar plugins that carry their grammar blob in
+/// a separate binary rather than the host process (RFC-013 Direction A).
+///
+/// Called once per PluginIndexer with the repo root so the sandbox can grant
+/// read access to the source tree being parsed.
+///
+/// Fail-closed per ADR-017 Rule 2: if the binary is absent or fails to spawn,
+/// the language is simply unregistered — no panic, no partial state.
+pub fn register_phase_a_sidecars(dispatcher: &mut Dispatcher, repo_root: &std::path::Path) {
+    register_cpp_sidecar(dispatcher, repo_root);
+}
+
+fn register_cpp_sidecar(dispatcher: &mut Dispatcher, repo_root: &std::path::Path) {
+    let Some(program) = which_binary("travsr-lang-cpp") else {
+        tracing::info!(
+            "travsr-lang-cpp not found on PATH — C++ Phase A indexing disabled \
+             (install the sidecar binary or run `travsr lang install cpp`)"
+        );
+        return;
+    };
+
+    let spec = PluginSpec {
+        language: "cpp".to_string(),
+        program,
+        args: vec![],
+        policy: SandboxPolicy::Standard,
+    };
+
+    match Sidecar::spawn(&spec, repo_root) {
+        Ok((sidecar, hs)) => {
+            if let Err(e) = dispatcher.register(hs, Arc::new(sidecar)) {
+                tracing::warn!("C++ Phase A sidecar registration failed: {e}");
+            } else {
+                tracing::info!("C++ Phase A sidecar registered via travsr-lang-cpp");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "C++ Phase A sidecar spawn failed: {e} \
+                 — C++ files will not be indexed (ADR-017 Rule 2 fail-closed)"
+            );
+        }
+    }
 }
 
 fn register_generic(

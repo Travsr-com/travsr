@@ -180,6 +180,8 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         let trust = travsr_plugin_host::trust::TrustConfig::from_disk();
         let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
         let (pb_nodes, pb_edges) = phase_b_indexer.invoke_phase_b_all(repo_root, &trust);
+        // Note: phase_b_indexer is constructed only for Phase B — Phase A sidecar
+        // registration is done on the per-file indexer below.
         for node in &pb_nodes {
             if let Err(e) = store.put_node(node) {
                 tracing::warn!("phase B node write error: {e}");
@@ -273,6 +275,7 @@ pub fn reindex_files(
     };
 
     let mut indexer = PluginIndexer::new(&corpus);
+    indexer.register_phase_a_sidecars(repo_root);
     // Accumulate FFI markers across all files for repo-level cross-language
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.
