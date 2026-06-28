@@ -373,21 +373,23 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
 mod tests {
     use super::*;
 
+    // Env-var mutations are process-global. Serialize all tests that touch
+    // TRAVSR_LSIF_TS / TRAVSR_LSIF_PY to prevent races on parallel test runners
+    // (especially Windows, which schedules threads differently from Linux/macOS).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_falls_back_to_path_when_no_env_and_no_sibling() {
-        // Without TRAVSR_LSIF_TS set and no sibling binary, must fall back to PATH name.
-        // We can't control current_exe in tests, but we can verify the env-override path.
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("TRAVSR_LSIF_TS");
         let (program, args) = resolve_lsif_emitter();
-        // Either it found a real candidate (monorepo walk succeeded) or fell back.
-        // Either way: program must be non-empty and args must be a Vec.
         assert!(!program.is_empty());
-        let _ = args; // just verify it compiles and returns
+        let _ = args;
     }
 
     #[test]
     fn resolve_honours_env_override_when_file_exists() {
-        // Point TRAVSR_LSIF_TS at a file that definitely exists.
+        let _g = ENV_LOCK.lock().unwrap();
         let exe = std::env::current_exe().unwrap();
         std::env::set_var("TRAVSR_LSIF_TS", exe.to_str().unwrap());
         let (program, args) = resolve_lsif_emitter();
@@ -398,6 +400,7 @@ mod tests {
 
     #[test]
     fn resolve_lsif_py_falls_back_to_path_when_no_env_and_no_sibling() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("TRAVSR_LSIF_PY");
         let (program, args) = resolve_lsif_py_emitter();
         assert!(!program.is_empty());
@@ -406,6 +409,7 @@ mod tests {
 
     #[test]
     fn resolve_lsif_py_honours_env_override_when_file_exists() {
+        let _g = ENV_LOCK.lock().unwrap();
         let exe = std::env::current_exe().unwrap();
         std::env::set_var("TRAVSR_LSIF_PY", exe.to_str().unwrap());
         let (program, args) = resolve_lsif_py_emitter();
@@ -416,15 +420,8 @@ mod tests {
 
     #[test]
     fn run_lsif_py_emitter_returns_none_for_missing_binary() {
-        // When spawn fails, must return Ok(None) not Err.
-        std::env::set_var("TRAVSR_LSIF_PY", "__travsr_lsif_py_nonexistent__");
-        // The env override points at a non-file, so it is skipped and we fall
-        // through to the PATH name which also does not exist — spawn should fail.
-        // Reset to ensure the resolution falls through to a definitely-missing path.
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("TRAVSR_LSIF_PY");
-        // Direct test: calling with a known-missing program must be Ok(None).
-        // We can't override resolve_lsif_py_emitter() in tests, so we verify
-        // the spawn-failure path directly by replicating its logic.
         let spawn_result = std::process::Command::new("__travsr_lsif_py_absent_binary__")
             .arg("--root")
             .arg("/tmp")
