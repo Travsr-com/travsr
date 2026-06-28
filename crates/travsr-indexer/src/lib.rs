@@ -22,6 +22,7 @@ mod typescript;
 
 use std::path::Path;
 
+pub use hash::hash_and_read;
 use travsr_core::{EdgeKind, Language};
 
 pub use ffi::{FfiMarker, FfiMarkerKind};
@@ -413,6 +414,51 @@ fn py_file_node_id(corpus: &str, path: &str) -> travsr_core::NodeId {
 /// deferred to Phase 4 Go LSIF sprint.
 ///
 /// `corpus` must match the corpus used when file nodes were indexed (ARCH-102).
+/// Resolve Java import declarations to `ResolvesTo` edges pointing at indexed
+/// `.java` files within the same repo.
+///
+/// `import com.example.Foo;` is converted to `com/example/Foo.java` and probed
+/// against common Maven/Gradle/Android source roots. Only imports whose target
+/// file actually exists on disk produce an edge — wildcard imports are skipped.
+pub fn link_imports_java(nodes: &[Node], corpus: &str, repo_root: &Path) -> Vec<Edge> {
+    const SRC_ROOTS: &[&str] = &[
+        "src/main/java",
+        "src/test/java",
+        "src",
+        "app/src/main/java",
+        "app/src/test/java",
+    ];
+
+    let mut edges = Vec::new();
+
+    for node in nodes {
+        if node.kind != "import" {
+            continue;
+        }
+        let Some(import_path) = node.vname.signature.strip_prefix("import:") else {
+            continue;
+        };
+        // Wildcard imports (com.example.*) cannot resolve to a single file.
+        if import_path.ends_with(".*") {
+            continue;
+        }
+
+        let file_rel = import_path.replace('.', "/") + ".java";
+
+        for src_root in SRC_ROOTS {
+            let candidate = format!("{src_root}/{file_rel}");
+            if repo_root.join(&candidate).exists() {
+                let target_id =
+                    travsr_core::VName::new(corpus, "", &candidate, "java", "file").id();
+                edges.push(Edge::new(node.id, target_id, EdgeKind::ResolvesTo));
+                break;
+            }
+        }
+    }
+
+    edges
+}
+
 pub fn link_imports_go(
     nodes: &[Node],
     _vname_path: &str,

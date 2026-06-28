@@ -5,7 +5,7 @@ use crate::registry::register_builtins;
 use crate::resolver::PluginResolver;
 use std::path::Path;
 use travsr_error::IndexError;
-use travsr_indexer::{hash_file, ParseOutput};
+use travsr_indexer::{hash_and_read, ParseOutput};
 
 /// Drop-in replacement for travsr_indexer::Indexer.
 /// Routes files through the plugin Dispatcher, caches results by
@@ -35,26 +35,44 @@ impl PluginIndexer {
         abs_path: &Path,
         vname_path: &str,
     ) -> Result<ParseOutput, IndexError> {
-        let file_hash = hash_file(abs_path).map_err(|e| IndexError::Parse {
+        let (file_hash, _) = hash_and_read(abs_path).map_err(|e| IndexError::Parse {
             file: abs_path.display().to_string(),
             message: e.to_string(),
         })?;
+        self.parse_file_with_vname_prehashed(abs_path, vname_path, file_hash)
+    }
+
+    /// Parse a file using a pre-computed SHA-256 hash (e.g. already computed
+    /// for change detection in the caller).  Avoids re-hashing the file.
+    ///
+    /// Sends `source: None` — sidecar plugins read directly from the
+    /// bind-mounted filesystem, which is served from the kernel page cache
+    /// after the caller's hash read.  This avoids serialising raw bytes as a
+    /// JSON integer array, which inflates a 50 KB file to ~150 KB on the pipe.
+    pub fn parse_file_with_vname_prehashed(
+        &mut self,
+        abs_path: &Path,
+        vname_path: &str,
+        file_hash: [u8; 32],
+    ) -> Result<ParseOutput, IndexError> {
         let version = env!("CARGO_PKG_VERSION");
         let key = CacheKey {
             plugin_version: version.to_string(),
             file_hash,
         };
 
-        // Cache hit
+        // Cache hit — no IPC needed.
         if let Some(cached) = self.cache.get(version, file_hash) {
             return Ok(response_to_output(cached.clone()));
         }
 
-        // Cache miss: dispatch through plugin
+        // Cache miss: dispatch to plugin. Pass source: None so sidecar plugins
+        // read from the filesystem (page-cached after caller's hash_file read)
+        // rather than receiving large byte arrays through the JSON pipe.
         let corpus = self.dispatcher.corpus.clone();
         let resp = match self
             .dispatcher
-            .parse_file(abs_path, vname_path, &corpus, "")?
+            .parse_file(abs_path, vname_path, &corpus, "", None)?
         {
             Some(r) => r,
             None => return Ok(ParseOutput::default()),
@@ -62,6 +80,19 @@ impl PluginIndexer {
 
         self.cache.insert(key, resp.clone());
         Ok(response_to_output(resp))
+    }
+
+    /// Parse a file when the caller already has the file bytes and hash.
+    /// The `source` bytes are available for in-process plugins; sidecar
+    /// plugins ignore them and read from the filesystem as normal.
+    pub fn parse_file_preread(
+        &mut self,
+        abs_path: &Path,
+        vname_path: &str,
+        file_hash: [u8; 32],
+        _source: Vec<u8>,
+    ) -> Result<ParseOutput, IndexError> {
+        self.parse_file_with_vname_prehashed(abs_path, vname_path, file_hash)
     }
 
     /// Register Phase A sidecar plugins (RFC-013 Direction A).

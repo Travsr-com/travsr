@@ -123,6 +123,17 @@ pub fn build_sandboxed_command(
         cmd.args(["--ro-bind-try", path, path]);
     }
     cmd.args(["--proc", "/proc", "--dev", "/dev"]);
+    // Bind-mount the directory containing the plugin binary so bwrap can exec it.
+    // The binary may live outside standard system paths (e.g. target/debug/ during
+    // development or a non-standard install prefix like /opt/travsr/bin/).
+    // Without this, bwrap exits with "execvp: No such file or directory" for any
+    // binary not under /usr, /bin, /sbin, /lib, or /lib64.
+    if let Some(bin_dir) = Path::new(program).parent() {
+        let bin_dir_str = bin_dir.to_string_lossy();
+        if !bin_dir_str.is_empty() {
+            cmd.args(["--ro-bind-try", bin_dir_str.as_ref(), bin_dir_str.as_ref()]);
+        }
+    }
     // Provide a writable scratch area inside the sandbox at /travsr-scratch by
     // bind-mounting the host scratch dir there. The host dir is owned by the
     // real UID (created via tempfile by the daemon), so the sandboxed process —
@@ -151,6 +162,11 @@ pub fn build_sandboxed_command(
         }
     }
     cmd.env("TMPDIR", "/travsr-scratch");
+    // TERM=dumb prevents build tools (Gradle, Maven) from calling `tput` and
+    // failing with "No value for $TERM" when TERM is absent in the sandbox.
+    // Pass the real TERM if available, otherwise fall back to "dumb".
+    let term = std::env::var("TERM").unwrap_or_else(|_| "dumb".to_string());
+    cmd.env("TERM", term);
     Ok(cmd)
 }
 

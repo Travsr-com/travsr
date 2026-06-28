@@ -38,6 +38,7 @@ toml = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
+indicatif = { workspace = true }
 # Optional OTLP deps — only compiled with `--features otlp`
 opentelemetry         = { workspace = true, optional = true }
 opentelemetry_sdk     = { workspace = true, optional = true }

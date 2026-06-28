@@ -439,6 +439,81 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Write all nodes, edges, and the file hash for one source file in a single
+    /// SQLite transaction.
+    ///
+    /// Replaces the per-node `put_node` / per-edge `put_edge` / `put_file_hash`
+    /// loop, reducing N transactions per file to one — the dominant cost driver
+    /// for large C++ / Java projects with many symbols per file.
+    pub fn batch_write_file(
+        &mut self,
+        nodes: &[travsr_core::Node],
+        edges: &[travsr_core::Edge],
+        vname_path: &str,
+        hash_hex: &str,
+    ) -> Result<(), StoreError> {
+        (|| -> anyhow::Result<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting batch_write_file transaction")?;
+
+            for node in nodes {
+                let id_i64 = node_id_to_i64(node.id);
+                tx.execute(
+                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       kind = excluded.kind, \
+                       package = excluded.package, \
+                       line = COALESCE(excluded.line, nodes.line)",
+                    rusqlite::params![
+                        id_i64,
+                        node.vname.corpus,
+                        node.vname.root,
+                        node.vname.path,
+                        node.vname.language,
+                        node.vname.signature,
+                        node.kind,
+                        node.package,
+                        node.line.map(|l| l as i64),
+                    ],
+                )
+                .context("batch inserting node")?;
+                Self::put_node_fts(&tx, node).context("batch put_node_fts")?;
+            }
+
+            for edge in edges {
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1,?2,?3,'tree-sitter',?4) \
+                     ON CONFLICT(src, dst, kind) DO NOTHING",
+                    rusqlite::params![
+                        node_id_to_i64(edge.src),
+                        node_id_to_i64(edge.dst),
+                        edge.kind.as_str(),
+                        edge.confidence.map(|c| c as i64),
+                    ],
+                )
+                .context("batch inserting edge")?;
+            }
+
+            tx.execute(
+                "INSERT INTO files(path, sha256, last_indexed_at) \
+                 VALUES(?1,?2,unixepoch()) \
+                 ON CONFLICT(path) DO UPDATE SET \
+                   sha256 = excluded.sha256, \
+                   last_indexed_at = excluded.last_indexed_at",
+                rusqlite::params![vname_path, hash_hex],
+            )
+            .context("batch writing file hash")?;
+
+            tx.commit().context("committing batch_write_file transaction")?;
+            Ok(())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn put_file_hash(&mut self, path: &str, hex: &str) -> Result<(), StoreError> {
         self.conn
             .execute(

@@ -15,8 +15,8 @@ use anyhow::Context as _;
 use ignore::WalkBuilder;
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_file, ingest_lsif, link_imports, link_imports_python_fs, link_imports_rust,
-    run_lsif_emitter, FfiMarker,
+    hash_file, ingest_lsif, link_imports, link_imports_java, link_imports_python_fs,
+    link_imports_rust, run_lsif_emitter, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
 use travsr_store::{SqliteStore, Store};
@@ -46,6 +46,22 @@ pub struct InitStats {
 ///    and index them via the delta path so the `files` hash table is populated
 ///    from the start.
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
+    init_repo_impl(repo_root, &|_, _| {})
+}
+
+/// Like [`init_repo`] but calls `on_progress(files_done, total_files)` after
+/// each file is indexed, so callers can drive a progress bar.
+pub fn init_repo_with_progress(
+    repo_root: &Path,
+    on_progress: impl Fn(u64, u64),
+) -> anyhow::Result<InitStats> {
+    init_repo_impl(repo_root, &on_progress)
+}
+
+fn init_repo_impl(
+    repo_root: &Path,
+    on_progress: &dyn Fn(u64, u64),
+) -> anyhow::Result<InitStats> {
     let travsr_dir = repo_root.join(".travsr");
     std::fs::create_dir_all(&travsr_dir).context("creating .travsr directory")?;
 
@@ -112,7 +128,7 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
         .context("writing corpus to meta (ARCH-102)")?;
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
-    let mut files_indexed: u64 = 0;
+    let files_indexed: u64;
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
@@ -162,11 +178,12 @@ pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     // PERF: Two COUNT(*) per file (N files → 2N full-table scans) was causing
     // WAL page-cache bloat during large init_repo runs. Replaced with two
     // total counts: one snapshot before the loop, one after.
+    //
+    // Pass all paths in one batch so reindex_files creates a single PluginIndexer
+    // (and registers Phase A sidecars once) rather than once per file.
     let edges_before = store.edge_count().unwrap_or(0);
-    for abs_path in &indexable_paths {
-        reindex_files(std::slice::from_ref(abs_path), repo_root, &mut store)?;
-        files_indexed += 1;
-    }
+    files_indexed = indexable_paths.len() as u64;
+    reindex_files_inner(&indexable_paths, repo_root, &mut store, on_progress)?;
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
@@ -234,6 +251,15 @@ pub fn reindex_files(
     repo_root: &Path,
     store: &mut SqliteStore,
 ) -> anyhow::Result<()> {
+    reindex_files_inner(paths, repo_root, store, &|_, _| {})
+}
+
+fn reindex_files_inner(
+    paths: &[PathBuf],
+    repo_root: &Path,
+    store: &mut SqliteStore,
+    on_file_done: &dyn Fn(u64, u64),
+) -> anyhow::Result<()> {
     // RFC-002: detect signature format version mismatch before touching the
     // graph. The hook must never block a commit, so return Ok(()) on mismatch
     // and let the user resolve it with `travsr init`.
@@ -281,6 +307,8 @@ pub fn reindex_files(
     // markers from both sides of each FFI boundary are available.
     let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
     let mut any_changed = false;
+    let total_paths = paths.len() as u64;
+    let mut paths_done: u64 = 0;
 
     for abs_path in paths {
         let vname_path = abs_path
@@ -293,6 +321,8 @@ pub fn reindex_files(
             Ok(h) => h,
             Err(err) => {
                 tracing::warn!("skipping {}: {err}", abs_path.display());
+                paths_done += 1;
+                on_file_done(paths_done, total_paths);
                 continue;
             }
         };
@@ -300,29 +330,22 @@ pub fn reindex_files(
 
         let old_hex = store.get_file_hash(&vname_path)?;
         if old_hex.as_deref() == Some(&new_hex) {
+            paths_done += 1;
+            on_file_done(paths_done, total_paths);
             continue; // unchanged — skip
         }
 
         store.delete_nodes_for_path(&vname_path)?;
 
-        let out = match indexer.parse_file_with_vname(abs_path, &vname_path) {
+        let out = match indexer.parse_file_with_vname_prehashed(abs_path, &vname_path, new_hash) {
             Ok(o) => o,
             Err(err) => {
                 tracing::warn!("parse error for {}: {err}", abs_path.display());
+                paths_done += 1;
+                on_file_done(paths_done, total_paths);
                 continue;
             }
         };
-
-        for node in &out.nodes {
-            if let Err(err) = store.put_node(node) {
-                tracing::warn!("node write error: {err}");
-            }
-        }
-        for edge in &out.edges {
-            if let Err(err) = store.put_edge(edge) {
-                tracing::warn!("edge write error: {err}");
-            }
-        }
 
         // Route to the language-appropriate import resolver.
         let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -332,19 +355,25 @@ pub fn reindex_files(
             Some(Language::Python) => {
                 link_imports_python_fs(&out.nodes, &vname_path, &corpus, repo_root)
             }
+            Some(Language::Java) => link_imports_java(&out.nodes, &corpus, repo_root),
             _ => Vec::new(),
         };
-        for edge in import_edges {
-            if let Err(err) = store.put_edge(&edge) {
-                tracing::warn!("resolves-to edge write error: {err}");
-            }
-        }
 
-        store.put_file_hash(&vname_path, &new_hex)?;
+        // Merge structural + import edges, then write all nodes, edges, and
+        // the file hash in one transaction — reduces ~60 SQLite commits per
+        // file to 1, the dominant cost for large C++ / Java projects.
+        let mut all_edges = out.edges.clone();
+        all_edges.extend(import_edges);
+        if let Err(err) = store.batch_write_file(&out.nodes, &all_edges, &vname_path, &new_hex) {
+            tracing::warn!("batch write error for {}: {err}", abs_path.display());
+        }
         any_changed = true;
 
         // Collect FFI markers for the repo-level pass (RFC-005).
         all_ffi_markers.extend(out.ffi_markers);
+
+        paths_done += 1;
+        on_file_done(paths_done, total_paths);
     }
 
     // Cross-language FFI resolution — single pass over all accumulated markers

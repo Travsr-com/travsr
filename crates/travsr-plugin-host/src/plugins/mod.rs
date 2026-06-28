@@ -4,7 +4,6 @@ pub mod csharp;
 pub mod generic;
 pub mod go;
 pub mod java;
-pub mod kotlin;
 pub mod php;
 pub mod python;
 pub mod ruby;

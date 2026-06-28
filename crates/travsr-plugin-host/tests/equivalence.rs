@@ -328,36 +328,3 @@ fn java_golden_fixture_produces_expected_nodes() {
     );
 }
 
-// ── Kotlin golden fixture ─────────────────────────────────────────────────────
-
-#[test]
-fn kotlin_golden_fixture_produces_expected_nodes() {
-    let fixture = std::path::Path::new("tests/fixtures/Hello.kt");
-    if !fixture.exists() {
-        panic!("fixture missing: tests/fixtures/Hello.kt");
-    }
-    let out = new_parse(fixture, "src/PaymentService.kt");
-
-    assert!(
-        out.nodes.iter().any(|n| n.kind == "file"),
-        "missing file node"
-    );
-    assert!(
-        out.nodes
-            .iter()
-            .any(|n| n.kind == "class" && n.vname.signature.contains("PaymentService")),
-        "missing PaymentService class\nnodes: {:?}",
-        out.nodes
-            .iter()
-            .map(|n| (&n.kind, &n.vname.signature))
-            .collect::<Vec<_>>()
-    );
-    let fns: Vec<_> = out.nodes.iter().filter(|n| n.kind == "function").collect();
-    assert!(!fns.is_empty(), "expected ≥1 function, got {}", fns.len());
-
-    let old = old_parse(fixture, "src/PaymentService.kt");
-    assert!(
-        out.nodes.len() > old.nodes.len(),
-        "PluginIndexer should produce more than old empty path"
-    );
-}

@@ -1,0 +1,21 @@
+[package]
+name = "travsr-lang-kotlin"
+description = "Travsr sidecar plugin for Kotlin Phase A parsing (RFC-013 Direction A)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "travsr-lang-kotlin"
+path = "src/main.rs"
+
+[dependencies]
+travsr-plugin-sdk = { path = "../travsr-plugin-sdk" }
+tree-sitter        = { workspace = true }
+tree-sitter-kotlin = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

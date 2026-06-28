@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use travsr_core::{Language, Node, VName};
+use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
 use travsr_plugin_protocol::{
     FfiMarker as WireFfi, FfiMarkerKind as WireKind, InvokeRequest, InvokeResponse, ParseRequest,
     ParseResponse, Plugin,
@@ -47,6 +47,25 @@ impl Plugin for JavaPlugin {
     }
 }
 
+/// Walk up from a name-identifier node (inside a method/constructor declaration)
+/// through: name → decl → class_body → class/interface/enum declaration → name field.
+/// Returns the enclosing type name, or None if the method is not inside a type body.
+fn enclosing_type_name(name_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let decl = name_node.parent()?; // method_declaration or constructor_declaration
+    let body = decl.parent()?; // class_body / interface_body / enum_body
+    let type_decl = body.parent()?; // class_declaration / interface_declaration / enum_declaration
+    let type_name = type_decl.child_by_field_name("name")?;
+    type_name.utf8_text(source).ok().map(|s| s.to_string())
+}
+
+fn java_vname(corpus: &str, vname_path: &str, sig: &str) -> VName {
+    VName::new(corpus, "", vname_path, "java", sig)
+}
+
+fn java_node_id(corpus: &str, vname_path: &str, sig: &str) -> NodeId {
+    java_vname(corpus, vname_path, sig).id()
+}
+
 fn parse_java_file(
     corpus: &str,
     abs_path: &Path,
@@ -67,9 +86,10 @@ fn parse_java_file(
     let query = Query::new(&lang_obj, JAVA_QUERIES).context("building Java query")?;
     let mut cursor = QueryCursor::new();
 
-    let file_vname = VName::new(corpus, "", vname_path, "java", "file");
-    let file_node = Node::new(file_vname, "file");
+    let file_node = Node::new(java_vname(corpus, vname_path, "file"), "file");
+    let file_id = file_node.id;
     let mut nodes: Vec<Node> = vec![file_node];
+    let mut edges: Vec<Edge> = vec![];
     let mut ffi_markers: Vec<WireFfi> = vec![];
     let names = query.capture_names();
 
@@ -81,21 +101,34 @@ fn parse_java_file(
 
             match *cap_name {
                 "class.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", format!("class:{text}"));
-                    nodes.push(Node::new(vn, "class").with_line(line));
+                    let node = Node::new(
+                        java_vname(corpus, vname_path, &format!("class:{text}")),
+                        "class",
+                    )
+                    .with_line(line);
+                    edges.push(Edge::new(file_id, node.id, EdgeKind::DefinesBinding));
+                    nodes.push(node);
                 }
                 "interface.name" => {
-                    let vn =
-                        VName::new(corpus, "", vname_path, "java", format!("interface:{text}"));
-                    nodes.push(Node::new(vn, "interface").with_line(line));
+                    let node = Node::new(
+                        java_vname(corpus, vname_path, &format!("interface:{text}")),
+                        "interface",
+                    )
+                    .with_line(line);
+                    edges.push(Edge::new(file_id, node.id, EdgeKind::DefinesBinding));
+                    nodes.push(node);
                 }
                 "enum.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", format!("enum:{text}"));
-                    nodes.push(Node::new(vn, "enum").with_line(line));
+                    let node = Node::new(
+                        java_vname(corpus, vname_path, &format!("enum:{text}")),
+                        "enum",
+                    )
+                    .with_line(line);
+                    edges.push(Edge::new(file_id, node.id, EdgeKind::DefinesBinding));
+                    nodes.push(node);
                 }
                 "method.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
-                    // Check for native modifier on the parent method_declaration node.
+                    let vn = java_vname(corpus, vname_path, &format!("fn:{text}"));
                     let is_native = cap
                         .node
                         .parent()
@@ -105,6 +138,12 @@ fn parse_java_file(
                     let node = Node::new(vn, "method").with_line(line);
                     let node_id = node.id;
                     nodes.push(node);
+
+                    let parent_id = enclosing_type_name(cap.node, &source)
+                        .map(|cls| java_node_id(corpus, vname_path, &format!("class:{cls}")))
+                        .unwrap_or(file_id);
+                    edges.push(Edge::new(parent_id, node_id, EdgeKind::DefinesBinding));
+
                     if is_native {
                         ffi_markers.push(WireFfi {
                             source_node_id: node_id.0,
@@ -118,8 +157,18 @@ fn parse_java_file(
                     }
                 }
                 "constructor.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
-                    nodes.push(Node::new(vn, "constructor").with_line(line));
+                    let node = Node::new(
+                        java_vname(corpus, vname_path, &format!("fn:{text}")),
+                        "constructor",
+                    )
+                    .with_line(line);
+                    let node_id = node.id;
+                    nodes.push(node);
+
+                    let parent_id = enclosing_type_name(cap.node, &source)
+                        .map(|cls| java_node_id(corpus, vname_path, &format!("class:{cls}")))
+                        .unwrap_or(file_id);
+                    edges.push(Edge::new(parent_id, node_id, EdgeKind::DefinesBinding));
                 }
                 "import" => {
                     let raw = cap.node.utf8_text(&source).unwrap_or("").trim().to_string();
@@ -129,8 +178,13 @@ fn parse_java_file(
                         .trim_end_matches(';')
                         .trim()
                         .to_string();
-                    let vn = VName::new(corpus, "", vname_path, "java", format!("import:{module}"));
-                    nodes.push(Node::new(vn, "import").with_line(line));
+                    let node = Node::new(
+                        java_vname(corpus, vname_path, &format!("import:{module}")),
+                        "import",
+                    )
+                    .with_line(line);
+                    edges.push(Edge::new(file_id, node.id, EdgeKind::Depends));
+                    nodes.push(node);
                 }
                 _ => {}
             }
@@ -139,7 +193,7 @@ fn parse_java_file(
 
     Ok(ParseResponse {
         nodes,
-        edges: vec![],
+        edges,
         ffi_markers,
     })
 }

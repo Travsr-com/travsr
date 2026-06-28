@@ -5,6 +5,7 @@
 //! Sidecar::spawn; communicates over stdin/stdout using the plugin wire protocol.
 
 use anyhow::Context as _;
+use std::sync::Mutex;
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, Language, Node, ParseRequest, ParseResponse, Plugin,
     VName,
@@ -40,6 +41,9 @@ const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
 struct CppPlugin {
     grammar: tree_sitter::Language,
     query: Query,
+    // Reused across files — avoids Parser::new() + set_language() per file.
+    // Mutex because Plugin: Send + Sync; never actually contended (single-threaded sidecar).
+    parser: Mutex<Parser>,
 }
 
 impl CppPlugin {
@@ -47,7 +51,15 @@ impl CppPlugin {
         let grammar = tree_sitter_cpp::language();
         let query = Query::new(&grammar, QUERIES)
             .expect("invalid C++ tree-sitter query — this is a bug in travsr-lang-cpp");
-        Self { grammar, query }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar)
+            .expect("failed to set C++ grammar on parser");
+        Self {
+            grammar,
+            query,
+            parser: Mutex::new(parser),
+        }
     }
 }
 
@@ -65,7 +77,7 @@ impl Plugin for CppPlugin {
     }
 
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
-        parse_cpp(&self.grammar, &self.query, req).unwrap_or_else(|e| {
+        parse_cpp(&self.grammar, &self.query, &self.parser, req).unwrap_or_else(|e| {
             tracing::warn!("cpp parse {}: {e}", req.path.display());
             ParseResponse::default()
         })
@@ -77,29 +89,40 @@ impl Plugin for CppPlugin {
 }
 
 fn parse_cpp(
-    grammar: &tree_sitter::Language,
+    _grammar: &tree_sitter::Language,
     query: &Query,
+    parser_mutex: &Mutex<Parser>,
     req: &ParseRequest,
 ) -> anyhow::Result<ParseResponse> {
-    let size = std::fs::metadata(&req.path)
-        .with_context(|| format!("stat {}", req.path.display()))?
-        .len();
+    // Use source bytes sent by the host if available (avoids re-reading the
+    // file from inside the bwrap sandbox). Fall back to a direct read for
+    // callers that don't supply source (e.g. tests, future CLI tools).
+    let source: Vec<u8> = if let Some(s) = req.source.clone() {
+        s
+    } else {
+        let size = std::fs::metadata(&req.path)
+            .with_context(|| format!("stat {}", req.path.display()))?
+            .len();
+        anyhow::ensure!(size <= MAX_FILE_BYTES, "file too large: {} bytes", size);
+        std::fs::read(&req.path).with_context(|| format!("reading {}", req.path.display()))?
+    };
+
     anyhow::ensure!(
-        size <= MAX_FILE_BYTES,
+        source.len() as u64 <= MAX_FILE_BYTES,
         "file too large: {} bytes",
-        size
+        source.len()
     );
 
-    let source =
-        std::fs::read(&req.path).with_context(|| format!("reading {}", req.path.display()))?;
-
-    let mut parser = Parser::new();
-    parser.set_language(grammar).context("set C++ grammar")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
-
-    let tree = parser
-        .parse(&source, None)
-        .context("parse timed out or returned None")?;
+    let tree = {
+        let mut parser = parser_mutex.lock().expect("parser mutex poisoned");
+        // reset() clears incremental-parse state from the previous file so
+        // the parser starts fresh. Far cheaper than Parser::new() each call.
+        parser.reset();
+        parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
+        parser
+            .parse(&source, None)
+            .context("parse timed out or returned None")?
+    };
 
     let file_vname = VName::new(&req.corpus, "", &req.vname_path, "cpp", "file");
     let mut nodes = vec![Node::new(file_vname, "file")];

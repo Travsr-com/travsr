@@ -8,9 +8,10 @@
 //!      nodes — the ADR-017 Rule 4 "fixture-gated" condition for an in-process
 //!      grammar.
 //!
-//! C++ is no longer an in-process grammar (RFC-013 Direction A). Its Phase A
-//! parser lives in the `travsr-lang-cpp` sidecar binary. The sidecar test below
-//! runs only when that binary is on PATH so CI without the binary still passes.
+//! C++ and Kotlin are no longer in-process grammars (RFC-013 Direction A). Their
+//! Phase A parsers live in sidecar binaries (`travsr-lang-cpp`, `travsr-lang-kotlin`).
+//! The sidecar tests below run only when those binaries are on PATH so CI without
+//! them still passes.
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -71,6 +72,57 @@ int add(int a, int b) { return a + b; }
             "c: missing {expected:?} node — got {k:?}"
         );
     }
+}
+
+/// Integration test for the travsr-lang-kotlin Phase A sidecar (RFC-013 Direction A).
+///
+/// Skipped automatically when `travsr-lang-kotlin` is not on PATH so standard CI
+/// (which builds the workspace but does not install sidecar binaries) still passes.
+/// To run: `cargo build -p travsr-lang-kotlin && cargo test -p travsr-plugin-host kotlin_sidecar`
+#[test]
+fn kotlin_phase_a_sidecar_extracts_structure() {
+    let sidecar_on_path = std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+    .any(|dir| dir.join("travsr-lang-kotlin").is_file());
+
+    if !sidecar_on_path {
+        eprintln!("SKIP: travsr-lang-kotlin not on PATH — build it first to run this test");
+        return;
+    }
+
+    let fixture = std::path::Path::new("tests/fixtures/Hello.kt");
+    if !fixture.exists() {
+        panic!("fixture missing: tests/fixtures/Hello.kt");
+    }
+
+    let repo_root = fixture.parent().unwrap();
+    let mut indexer = PluginIndexer::new(CORPUS);
+    indexer.register_phase_a_sidecars(repo_root);
+
+    let nodes = indexer
+        .parse_file_with_vname(fixture, "src/PaymentService.kt")
+        .expect("parse")
+        .nodes;
+    let k: HashSet<String> = nodes.iter().map(|n| n.kind.clone()).collect();
+
+    for expected in ["file", "class", "function", "import"] {
+        assert!(
+            k.contains(expected),
+            "kotlin sidecar: missing {expected:?} node — got {k:?}"
+        );
+    }
+
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n.kind == "class" && n.vname.signature.contains("PaymentService")),
+        "kotlin sidecar: missing PaymentService class\nnodes: {:?}",
+        nodes
+            .iter()
+            .map(|n| (&n.kind, &n.vname.signature))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Integration test for the travsr-lang-cpp Phase A sidecar (RFC-013 Direction A).

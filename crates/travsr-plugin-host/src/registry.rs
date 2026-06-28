@@ -19,12 +19,11 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("python", "fuzz_pyright_lsif_parser.rs"),
     ("go", "fuzz_go_parser.rs"),
     ("java", "fuzz_java_parser.rs"), // TODO: create this fuzz target
-    ("kotlin", "fuzz_kotlin_parser.rs"), // TODO: create this fuzz target
     ("ruby", "fuzz_ruby_parser.rs"), // TODO: create this fuzz target
     ("csharp", "fuzz_csharp_parser.rs"), // TODO: create this fuzz target
     ("php", "fuzz_php_parser.rs"),   // TODO: create this fuzz target
     ("scala", "fuzz_scala_parser.rs"), // TODO: create this fuzz target
-    // C++ is a Phase A sidecar (travsr-lang-cpp) — fuzzed in that crate, not here.
+    // C++ and Kotlin are Phase A sidecars — fuzzed in their own crates, not here.
     ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
 ];
 
@@ -129,13 +128,6 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
     register!(JavaPlugin, "java", &["java"], false);
 
     // Languages driven entirely by GenericTreeSitterPlugin (config-only, no special logic)
-    check_fuzz_target("kotlin");
-    register_generic(
-        dispatcher,
-        &version,
-        &crate::plugins::kotlin::CONFIG,
-        tree_sitter_kotlin::language(),
-    );
     check_fuzz_target("ruby");
     register_generic(
         dispatcher,
@@ -171,9 +163,9 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         &crate::plugins::c::CONFIG,
         tree_sitter_c::language(),
     );
-    // C++: moved to travsr-lang-cpp sidecar (RFC-013 Direction A).
+    // C++ and Kotlin: moved to sidecar binaries (RFC-013 Direction A).
     // Call register_phase_a_sidecars(dispatcher, repo_root) after PluginIndexer
-    // construction to activate C++ Phase A when the binary is on PATH.
+    // construction to activate them when the binaries are on PATH.
 
     // Swift: blocked — all available tree-sitter-swift crates require tree-sitter ^0.21
     // which conflicts with workspace tree-sitter = "0.22". Re-enable when a compatible crate ships.
@@ -189,6 +181,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
 /// the language is simply unregistered — no panic, no partial state.
 pub fn register_phase_a_sidecars(dispatcher: &mut Dispatcher, repo_root: &std::path::Path) {
     register_cpp_sidecar(dispatcher, repo_root);
+    register_kotlin_sidecar(dispatcher, repo_root);
 }
 
 fn register_cpp_sidecar(dispatcher: &mut Dispatcher, repo_root: &std::path::Path) {
@@ -219,6 +212,39 @@ fn register_cpp_sidecar(dispatcher: &mut Dispatcher, repo_root: &std::path::Path
             tracing::warn!(
                 "C++ Phase A sidecar spawn failed: {e} \
                  — C++ files will not be indexed (ADR-017 Rule 2 fail-closed)"
+            );
+        }
+    }
+}
+
+fn register_kotlin_sidecar(dispatcher: &mut Dispatcher, repo_root: &std::path::Path) {
+    let Some(program) = which_binary("travsr-lang-kotlin") else {
+        tracing::info!(
+            "travsr-lang-kotlin not found on PATH — Kotlin Phase A indexing disabled \
+             (install the sidecar binary or run `travsr lang install kotlin`)"
+        );
+        return;
+    };
+
+    let spec = PluginSpec {
+        language: "kotlin".to_string(),
+        program,
+        args: vec![],
+        policy: SandboxPolicy::Standard,
+    };
+
+    match Sidecar::spawn(&spec, repo_root) {
+        Ok((sidecar, hs)) => {
+            if let Err(e) = dispatcher.register(hs, Arc::new(sidecar)) {
+                tracing::warn!("Kotlin Phase A sidecar registration failed: {e}");
+            } else {
+                tracing::info!("Kotlin Phase A sidecar registered via travsr-lang-kotlin");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Kotlin Phase A sidecar spawn failed: {e} \
+                 — Kotlin files will not be indexed (ADR-017 Rule 2 fail-closed)"
             );
         }
     }
