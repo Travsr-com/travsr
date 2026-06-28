@@ -149,6 +149,50 @@ pub fn build_fuzzy_match_expr_db(
     Ok(if expr.is_empty() { None } else { Some(expr) })
 }
 
+/// Normalize a natural-language query before embedding.
+///
+/// Strips only curated sentence-ending punctuation (`?!.,;:`) from the trailing
+/// edge of each whitespace-token, and collapses internal whitespace so that
+/// `"how daemon work?"` and `"how daemon work ?"` produce identical text and
+/// therefore identical embedding vectors.
+///
+/// CO-C2: previous version stripped ALL non-alphanumeric chars from both ends,
+/// which corrupted language names and symbols:
+///   `"C++"` → `"C"`, `"c#"` → `"c"`, `"_private"` → `"private"`, `"->ptr"` → `"ptr"`.
+/// Now only trailing `?!.,;:` are stripped; leading characters (including `_`, `->`)
+/// are preserved so language-filter inference and symbol lookup remain correct.
+///
+/// Rules:
+/// - Split on whitespace.
+/// - For each token, strip trailing occurrences of `?`, `!`, `.`, `,`, `;`, `:`.
+/// - Drop tokens that become empty after stripping (e.g. a bare `?`).
+/// - Rejoin with single spaces.
+///
+/// # Examples
+/// ```
+/// # use travsr_store::fts_tokenize::normalize_nl_query;
+/// assert_eq!(normalize_nl_query("how daemon work?"),  "how daemon work");
+/// assert_eq!(normalize_nl_query("how daemon work ?"), "how daemon work");
+/// assert_eq!(normalize_nl_query("  what is PaymentService?  "), "what is PaymentService");
+/// assert_eq!(normalize_nl_query("C++"), "C++");
+/// assert_eq!(normalize_nl_query("_private"), "_private");
+/// ```
+pub fn normalize_nl_query(query: &str) -> String {
+    const TRAILING_PUNCT: &[char] = &['?', '!', '.', ',', ';', ':'];
+    query
+        .split_whitespace()
+        .filter_map(|word| {
+            let stripped = word.trim_end_matches(TRAILING_PUNCT);
+            if stripped.is_empty() {
+                None
+            } else {
+                Some(stripped)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Build the MATCH expression for `search_nodes_fuzzy`.
 ///
 /// Tokenises `query`, double-quotes each token (neutralises all FTS5 operators),
@@ -299,5 +343,91 @@ mod tests {
             foo_count, 1,
             "duplicate token 'foo' should appear only once"
         );
+    }
+
+    // ── normalize_nl_query ────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_trailing_question_mark_attached() {
+        assert_eq!(normalize_nl_query("how daemon work?"), "how daemon work");
+    }
+
+    #[test]
+    fn normalize_trailing_question_mark_detached() {
+        assert_eq!(normalize_nl_query("how daemon work ?"), "how daemon work");
+    }
+
+    #[test]
+    fn normalize_both_forms_are_identical() {
+        assert_eq!(
+            normalize_nl_query("how daemon work?"),
+            normalize_nl_query("how daemon work ?"),
+        );
+    }
+
+    #[test]
+    fn normalize_leading_and_trailing_whitespace() {
+        assert_eq!(
+            normalize_nl_query("  what is PaymentService?  "),
+            "what is PaymentService"
+        );
+    }
+
+    #[test]
+    fn normalize_bare_punctuation_token_dropped() {
+        // A lone `?` surrounded by spaces disappears.
+        assert_eq!(normalize_nl_query("hello ? world"), "hello world");
+    }
+
+    #[test]
+    fn normalize_multiple_punctuation_types() {
+        // Only trailing punctuation is stripped per word; "what!?" → "what" (! then ? stripped).
+        assert_eq!(normalize_nl_query("what!? is this."), "what is this");
+    }
+
+    #[test]
+    fn normalize_internal_words_untouched() {
+        // Punctuation in the middle of a word (e.g. camelCase) is not stripped.
+        assert_eq!(
+            normalize_nl_query("find PaymentService.charge"),
+            "find PaymentService.charge"
+        );
+    }
+
+    // ── CO-C2 regression: preserve language/symbol chars ─────────────────────
+
+    #[test]
+    fn normalize_cpp_preserved() {
+        assert_eq!(normalize_nl_query("C++"), "C++");
+        assert_eq!(normalize_nl_query("C++ generics"), "C++ generics");
+    }
+
+    #[test]
+    fn normalize_csharp_preserved() {
+        assert_eq!(normalize_nl_query("c#"), "c#");
+    }
+
+    #[test]
+    fn normalize_leading_underscore_preserved() {
+        assert_eq!(normalize_nl_query("_private"), "_private");
+    }
+
+    #[test]
+    fn normalize_arrow_preserved() {
+        assert_eq!(normalize_nl_query("->ptr"), "->ptr");
+    }
+
+    #[test]
+    fn normalize_trailing_question_only() {
+        // Only trailing sentence-ending chars are removed.
+        assert_eq!(normalize_nl_query("hello?"), "hello");
+        assert_eq!(normalize_nl_query("hello!"), "hello");
+        assert_eq!(normalize_nl_query("hello."), "hello");
+    }
+
+    #[test]
+    fn normalize_empty_and_all_punct() {
+        assert_eq!(normalize_nl_query(""), "");
+        assert_eq!(normalize_nl_query("? ! ."), "");
     }
 }

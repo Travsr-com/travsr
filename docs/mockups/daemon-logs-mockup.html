@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<!--
+  Travsr — Daemon Logs sidebar view mockup (NOT production code).
+  Open directly in a browser — no CDN dependencies, self-contained.
+
+  Shows three states (toggle buttons at top):
+    1. Active  — daemon running, warnings + errors → diagnostic cards shown
+    2. Healthy — daemon running, no issues → green "All clear" state
+    3. Offline — no daemon / no log file → CTA state
+
+  Renders a faithful VS Code window simulation:
+    · Title bar + traffic-light buttons
+    · Activity bar (file/search/git/extensions/travsr icons)
+    · Travsr sidebar panel: Travsr Graph (collapsed), Repo Files (collapsed),
+      Daemon Logs (expanded — this is the new view)
+    · Main editor area (dimmed code, for spatial context)
+    · Bottom status bar
+
+  Designer tokens: canonical travsr-designer palette (charcoal + linen + green/orange/error).
+  Font: system-ui / monospace — no CDN required.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Travsr — Daemon Logs View Mockup</title>
+<style>
+/* ── reset ─────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── canonical travsr-designer tokens ──────────────────────────────────────── */
+:root {
+  --ch-800: #141414; --ch-750: #181818; --ch-700: #1a1a1a; --ch-650: #242424;
+  --ch-600: #2c2c2c; --ch-550: #333333; --ch-500: #4d4d4d; --ch-400: #808080;
+  --ch-300: #b3b3b3; --ch-200: #cccccc;
+
+  --linen-100: #f6f1ed; --linen-200: #e8ddd5; --linen-400: #c8b7ab;
+  --linen-500: #a8958a; --linen-600: #8f7a6c;
+
+  --green-300: #86df86; --green-500: #429429; --green-deep: #17340e;
+  --gold-300:  #fcd053; --gold-deep:  #3b2700;
+  --orange-400:#fb923c; --orange-deep:#4f2000;
+  --red-400:   #ef4444; --red-deep:   #2d0b0b;
+  --blue-400:  #60a5fa; --blue-deep:  #0f2040;
+
+  /* VS Code chrome colours */
+  --vsc-titlebar:  #1e1e1e;
+  --vsc-actbar:    #333333;
+  --vsc-panel:     #252526;
+  --vsc-panel-hdr: #2d2d2d;
+  --vsc-editor:    #1e1e1e;
+  --vsc-statusbar: #007acc;
+  --vsc-border:    #3c3c3c;
+  --vsc-fg:        #cccccc;
+  --vsc-fg-dim:    #858585;
+  --vsc-fg-dimmer: #454545;
+  --vsc-sel:       #094771;
+}
+
+body {
+  background: #0f0f0f;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px 40px;
+  font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+  min-height: 100vh;
+  color: var(--linen-100);
+}
+
+/* ── state switcher (outside the mockup) ───────────────────────────────────── */
+.scene-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  align-items: center;
+}
+.scene-label {
+  font-size: 11px;
+  color: var(--ch-400);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin-right: 8px;
+}
+.scene-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--ch-500);
+  background: var(--ch-700);
+  color: var(--ch-300);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 120ms;
+}
+.scene-btn:hover { border-color: var(--linen-500); color: var(--linen-100); }
+.scene-btn.active { background: var(--green-deep); border-color: var(--green-300); color: var(--green-300); }
+
+/* ── VS Code window shell ───────────────────────────────────────────────────── */
+.vscode-window {
+  width: 960px;
+  height: 640px;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 32px 80px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.06);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── title bar ─────────────────────────────────────────────────────────────── */
+.titlebar {
+  height: 28px;
+  background: var(--vsc-titlebar);
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  gap: 8px;
+  border-bottom: 1px solid rgba(255,255,255,.04);
+  flex-shrink: 0;
+  position: relative;
+}
+.traffic { display: flex; gap: 6px; }
+.dot {
+  width: 12px; height: 12px; border-radius: 50%;
+}
+.dot-red   { background: #ff5f57; }
+.dot-yel   { background: #febc2e; }
+.dot-grn   { background: #28c840; }
+.titlebar-text {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  font-size: 11px; color: var(--vsc-fg-dim); white-space: nowrap;
+}
+
+/* ── main area (activity bar + sidebar + editor) ───────────────────────────── */
+.main-area {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── activity bar ───────────────────────────────────────────────────────────── */
+.actbar {
+  width: 48px;
+  background: var(--vsc-actbar);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 4px;
+  gap: 2px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--vsc-border);
+}
+.act-icon {
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px;
+  color: var(--vsc-fg-dim);
+  font-size: 18px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  transition: color 120ms;
+}
+.act-icon:hover { color: var(--vsc-fg); }
+.act-icon.active {
+  color: var(--vsc-fg);
+  border-left-color: var(--vsc-fg);
+}
+.act-spacer { flex: 1; }
+
+/* ── sidebar panel ──────────────────────────────────────────────────────────── */
+.sidebar {
+  width: 280px;
+  background: var(--vsc-panel);
+  border-right: 1px solid var(--vsc-border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+/* section header (collapsed pane) */
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--vsc-fg-dim);
+  cursor: pointer;
+  background: var(--vsc-panel-hdr);
+  border-bottom: 1px solid var(--vsc-border);
+  flex-shrink: 0;
+  user-select: none;
+  min-height: 26px;
+}
+.pane-header:hover { color: var(--vsc-fg); }
+.chevron { font-size: 9px; }
+.pane-title-right {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+.icon-btn {
+  width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--vsc-fg-dim);
+  font-size: 13px;
+  transition: background 100ms, color 100ms;
+}
+.icon-btn:hover { background: rgba(255,255,255,.08); color: var(--vsc-fg); }
+
+/* ── the log view body ──────────────────────────────────────────────────────── */
+.logs-body {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.logs-body::-webkit-scrollbar { width: 6px; }
+.logs-body::-webkit-scrollbar-thumb { background: var(--ch-550); border-radius: 3px; }
+.logs-body::-webkit-scrollbar-track { background: transparent; }
+
+/* log entry rows */
+.log-lines {
+  padding: 6px 0 2px;
+  font-family: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.log-row {
+  display: flex;
+  padding: 1px 10px;
+  gap: 0;
+  align-items: flex-start;
+  min-height: 20px;
+  transition: background 80ms;
+}
+.log-row:hover { background: rgba(255,255,255,.035); }
+.log-ts {
+  color: var(--ch-400);
+  white-space: nowrap;
+  margin-right: 6px;
+  flex-shrink: 0;
+  font-size: 10px;
+  padding-top: 1px;
+}
+.log-level {
+  font-weight: 700;
+  white-space: nowrap;
+  margin-right: 6px;
+  flex-shrink: 0;
+  font-size: 10px;
+  padding-top: 1px;
+  min-width: 32px;
+}
+.lv-info  { color: var(--ch-300); }
+.lv-warn  { color: var(--orange-400); }
+.lv-error { color: var(--red-400); }
+.lv-debug { color: var(--ch-500); }
+.log-msg {
+  color: var(--vsc-fg);
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+.log-msg .key { color: var(--linen-500); }
+.log-msg .val { color: var(--green-300); }
+.log-msg .val-warn { color: var(--orange-400); }
+.log-msg .val-err  { color: var(--red-400); }
+.log-caret { color: var(--ch-500); font-size: 9px; margin-right: 4px; padding-top: 2px; flex-shrink: 0; }
+
+.log-divider {
+  height: 1px;
+  background: var(--vsc-border);
+  margin: 6px 0;
+}
+.log-section-label {
+  padding: 4px 10px 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--ch-500);
+  font-weight: 600;
+}
+
+/* ── diagnostic cards ──────────────────────────────────────────────────────── */
+.diag-section {
+  padding: 6px 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.diag-section-header {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--ch-400);
+  font-weight: 700;
+  padding: 2px 2px 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.diag-count {
+  background: var(--red-deep);
+  color: var(--red-400);
+  border-radius: 8px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.diag-count.warn { background: var(--orange-deep); color: var(--orange-400); }
+.diag-count.ok   { background: var(--green-deep);  color: var(--green-300); }
+
+.diag-card {
+  border-radius: 7px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-left: 3px solid;
+}
+.diag-card.error { background: var(--red-deep); border-color: var(--red-400); }
+.diag-card.warn  { background: var(--orange-deep); border-color: var(--orange-400); }
+.diag-card.ok    { background: var(--green-deep); border-color: var(--green-300); }
+.diag-card.info  { background: var(--blue-deep); border-color: var(--blue-400); }
+
+.diag-title {
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.diag-card.error .diag-title { color: var(--red-400); }
+.diag-card.warn  .diag-title { color: var(--orange-400); }
+.diag-card.ok    .diag-title { color: var(--green-300); }
+.diag-card.info  .diag-title { color: var(--blue-400); }
+
+.diag-hint {
+  font-size: 11px;
+  color: var(--linen-400);
+  line-height: 1.45;
+}
+.diag-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+.diag-cmd {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  background: rgba(0,0,0,.35);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 4px;
+  padding: 2px 7px;
+  color: var(--linen-200);
+  cursor: pointer;
+}
+.diag-cmd:hover { border-color: rgba(255,255,255,.28); }
+.diag-link {
+  font-size: 10px;
+  color: var(--blue-400);
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.diag-link:hover { text-decoration: underline; }
+
+/* ── footer ─────────────────────────────────────────────────────────────────── */
+.logs-footer {
+  padding: 5px 10px;
+  font-size: 10px;
+  color: var(--ch-500);
+  border-top: 1px solid var(--vsc-border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-shrink: 0;
+  background: var(--vsc-panel);
+}
+.logs-footer .refresh-hint { color: var(--ch-400); }
+.logs-footer .dot-live {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--green-300);
+  margin-right: 5px;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+.logs-footer .dot-err {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--red-400);
+  margin-right: 5px;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+
+/* ── CTA / empty state ──────────────────────────────────────────────────────── */
+.cta-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 20px 16px;
+  text-align: center;
+}
+.cta-icon { font-size: 32px; opacity: .35; }
+.cta-title { font-size: 12px; font-weight: 600; color: var(--vsc-fg); }
+.cta-sub { font-size: 11px; color: var(--vsc-fg-dim); line-height: 1.5; max-width: 200px; }
+.cta-btn {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--green-300);
+  background: var(--green-deep);
+  color: var(--green-300);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 120ms;
+}
+.cta-btn:hover { background: #1e4a1e; }
+
+/* ── editor area ─────────────────────────────────────────────────────────────── */
+.editor-area {
+  flex: 1;
+  background: var(--vsc-editor);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.editor-tabs {
+  height: 34px;
+  background: #2d2d2d;
+  display: flex;
+  align-items: flex-end;
+  border-bottom: 1px solid var(--vsc-border);
+  flex-shrink: 0;
+}
+.editor-tab {
+  padding: 0 14px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--vsc-fg-dim);
+  border-right: 1px solid var(--vsc-border);
+  background: #2d2d2d;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.editor-tab.active {
+  background: var(--vsc-editor);
+  color: var(--vsc-fg);
+  border-top: 1px solid var(--blue-400);
+}
+.tab-lang {
+  font-size: 10px;
+  color: var(--vsc-fg-dimmer);
+}
+.editor-content {
+  flex: 1;
+  padding: 14px 0;
+  overflow: hidden;
+  opacity: 0.28;
+}
+.code-line {
+  display: flex;
+  min-height: 19px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 19px;
+}
+.ln { width: 44px; text-align: right; padding-right: 14px; color: var(--ch-500); user-select: none; flex-shrink: 0; }
+.code-body { color: var(--vsc-fg); }
+.kw  { color: #569cd6; }
+.fn  { color: #dcdcaa; }
+.str { color: #ce9178; }
+.cm  { color: #6a9955; }
+.ty  { color: #4ec9b0; }
+.num { color: #b5cea8; }
+.punc { color: #d4d4d4; }
+.editor-gutter-line {
+  background: rgba(0, 120, 212, 0.12);
+}
+
+/* ── status bar ──────────────────────────────────────────────────────────────── */
+.statusbar {
+  height: 22px;
+  background: var(--vsc-statusbar);
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  gap: 14px;
+  flex-shrink: 0;
+}
+.sb-item {
+  font-size: 11px;
+  color: rgba(255,255,255,.85);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sb-item:hover { background: rgba(255,255,255,.15); padding: 0 4px; border-radius: 3px; margin: 0 -4px; }
+.sb-right { margin-left: auto; display: flex; gap: 14px; }
+.sb-travsr {
+  font-size: 11px;
+  color: rgba(255,255,255,.85);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sb-travsr .dot-ok  { width: 6px; height: 6px; border-radius: 50%; background: #86df86; display: inline-block; }
+.sb-travsr .dot-err { width: 6px; height: 6px; border-radius: 50%; background: #ef4444; display: inline-block; }
+
+/* ── collapsed tree (stub placeholders for other views) ─────────────────────── */
+.tree-row {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--vsc-fg-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tree-row:hover { background: rgba(255,255,255,.04); }
+.tree-row .tree-icon { font-size: 13px; flex-shrink: 0; }
+
+/* ── collapsed pane body ─────────────────────────────────────────────────────── */
+.collapsed-body {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--vsc-border);
+}
+
+/* ── scene scenes ────────────────────────────────────────────────────────────── */
+.scene { display: none; }
+.scene.active { display: contents; }
+
+/* ── annotation labels (outside VS Code window) ─────────────────────────────── */
+.annotations {
+  width: 960px;
+  display: grid;
+  grid-template-columns: 48px 280px 1fr;
+  margin-top: 8px;
+  gap: 0;
+  font-size: 10px;
+  color: var(--ch-400);
+}
+.ann-col {
+  padding: 6px 8px;
+  text-align: center;
+  border-top: 1px solid var(--ch-600);
+}
+.ann-col span { color: var(--green-300); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<!-- ── scene switcher ─────────────────────────────────────────────────────── -->
+<div class="scene-bar">
+  <span class="scene-label">View state:</span>
+  <button class="scene-btn active" onclick="setScene('active')">⚠ Active — warnings &amp; errors</button>
+  <button class="scene-btn" onclick="setScene('healthy')">✓ Healthy — all clear</button>
+  <button class="scene-btn" onclick="setScene('offline')">✕ Offline — daemon not started</button>
+</div>
+
+<!-- ── VS Code window ─────────────────────────────────────────────────────── -->
+<div class="vscode-window">
+
+  <!-- title bar -->
+  <div class="titlebar">
+    <div class="traffic">
+      <div class="dot dot-red"></div>
+      <div class="dot dot-yel"></div>
+      <div class="dot dot-grn"></div>
+    </div>
+    <div class="titlebar-text">myapp — Visual Studio Code</div>
+  </div>
+
+  <!-- main area -->
+  <div class="main-area">
+
+    <!-- activity bar -->
+    <div class="actbar">
+      <div class="act-icon" title="Explorer">📄</div>
+      <div class="act-icon" title="Search">🔍</div>
+      <div class="act-icon" title="Source Control">⎇</div>
+      <div class="act-icon" title="Extensions">⧉</div>
+      <div class="act-spacer"></div>
+      <!-- travsr icon: active (highlighted) -->
+      <div class="act-icon active" title="Travsr" style="border-left-color:#86df86;color:#86df86;font-size:14px;margin-bottom:8px;">◈</div>
+      <div class="act-icon" title="Settings" style="margin-bottom:4px;">⚙</div>
+    </div>
+
+    <!-- sidebar -->
+    <div class="sidebar">
+
+      <!-- ── TRAVSR GRAPH pane (collapsed) ────────────────────────────────── -->
+      <div class="pane-header" style="background:#252526;">
+        <span class="chevron">▶</span>
+        TRAVSR GRAPH
+        <div class="pane-title-right">
+          <div class="icon-btn" title="Refresh">↺</div>
+          <div class="icon-btn" title="Show graph">⬡</div>
+          <div class="icon-btn" title="Search">⌕</div>
+        </div>
+      </div>
+
+      <!-- ── REPO FILES pane (collapsed) ──────────────────────────────────── -->
+      <div class="pane-header" style="background:#252526;">
+        <span class="chevron">▶</span>
+        REPO FILES
+        <div class="pane-title-right">
+          <div class="icon-btn" title="Refresh">↺</div>
+          <div class="icon-btn" title="Search files">⌕</div>
+        </div>
+      </div>
+
+      <!-- ── DAEMON LOGS pane (EXPANDED — the new view) ───────────────────── -->
+      <div class="pane-header" style="background:#2d2d2d; color: var(--vsc-fg);">
+        <span class="chevron" style="color:var(--vsc-fg);">▼</span>
+        DAEMON LOGS
+        <div class="pane-title-right">
+          <div class="icon-btn" title="Refresh logs" id="refresh-btn" onclick="triggerRefresh()" style="color:#86df86;">↺</div>
+          <div class="icon-btn" title="Open full log in editor">⤢</div>
+          <div class="icon-btn" title="Clear diagnostics">✕</div>
+        </div>
+      </div>
+
+      <!-- ── scene: ACTIVE (warnings + errors) ────────────────────────────── -->
+      <div class="logs-body" id="scene-active">
+
+        <!-- log lines -->
+        <div class="log-lines">
+          <div class="log-section-label">Latest entries — 2026-06-15</div>
+
+          <div class="log-row">
+            <span class="log-ts">08:22:31</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">travsr daemon started <span class="key">repo=</span><span class="val">"~/myapp"</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">08:22:31</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">control socket bound <span class="key">transport=</span><span class="val">"unix"</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">08:22:31</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">Phase A complete <span class="key">files=</span><span class="val">1247</span> <span class="key">nodes=</span><span class="val">18423</span> <span class="key">edges=</span><span class="val">41207</span></span>
+          </div>
+          <div class="log-row" style="background:rgba(251,146,60,.05);">
+            <span class="log-ts">08:22:32</span>
+            <span class="log-level lv-warn">WARN</span>
+            <span class="log-msg">hash failed, skipping <span class="key">path=</span><span class="val-warn">"src/generated/proto.ts"</span> <span class="key">err=</span><span class="val-warn">"permission denied"</span></span>
+          </div>
+          <div class="log-row" style="background:rgba(251,146,60,.05);">
+            <span class="log-ts">08:22:32</span>
+            <span class="log-level lv-warn">WARN</span>
+            <span class="log-msg">parse error, skipping <span class="key">path=</span><span class="val-warn">"src/legacy.py"</span> <span class="key">err=</span><span class="val-warn">"SyntaxError L42"</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">08:22:33</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">background phase B starting <span class="key">commit=</span><span class="val">a3f1bc9</span></span>
+          </div>
+          <div class="log-row" style="background:rgba(251,146,60,.05);">
+            <span class="log-ts">08:22:33</span>
+            <span class="log-level lv-warn">WARN</span>
+            <span class="log-msg">dart_access() failed — HOME not set in daemon env</span>
+          </div>
+          <div class="log-row" style="background:rgba(239,68,68,.06);">
+            <span class="log-ts">08:22:41</span>
+            <span class="log-level lv-error">ERR</span>
+            <span class="log-msg">phase B crashed <span class="key">lang=</span><span class="val-err">"kotlin"</span> <span class="key">err=</span><span class="val-err">"scip-kotlin: not found"</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">08:22:42</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">Phase B complete — typescript go python <span class="key">edges_added=</span><span class="val">6684</span></span>
+          </div>
+        </div>
+
+        <div class="log-divider"></div>
+
+        <!-- diagnostic cards -->
+        <div class="diag-section">
+          <div class="diag-section-header">
+            Diagnostics
+            <span class="diag-count">1 error</span>
+            <span class="diag-count warn">2 warnings</span>
+          </div>
+
+          <!-- error card: kotlin analyzer missing -->
+          <div class="diag-card error">
+            <div class="diag-title">✕ Kotlin analyzer crashed</div>
+            <div class="diag-hint">
+              <code style="font-size:10px;color:#fb923c;">scip-kotlin</code> was not found.
+              Kotlin call edges are missing from the graph.
+            </div>
+            <div class="diag-actions">
+              <span class="diag-cmd">travsr lang add kotlin</span>
+              <a class="diag-link" href="#">📖 docs</a>
+            </div>
+          </div>
+
+          <!-- warn card: dart HOME -->
+          <div class="diag-card warn">
+            <div class="diag-title">⚠ Dart environment issue</div>
+            <div class="diag-hint">
+              The Dart analyzer could not find <code style="font-size:10px;">~/.pub-cache</code> because
+              <code style="font-size:10px;">HOME</code> is stripped from the daemon environment.
+            </div>
+            <div class="diag-actions">
+              <a class="diag-link" href="#">📖 fix guide</a>
+            </div>
+          </div>
+
+          <!-- warn card: hash failure -->
+          <div class="diag-card warn">
+            <div class="diag-title">⚠ 1 file skipped — permission error</div>
+            <div class="diag-hint">
+              <code style="font-size:10px;color:#fb923c;">src/generated/proto.ts</code> could not be read.
+              Add it to <code style="font-size:10px;">.travsrignore</code> to suppress this warning.
+            </div>
+            <div class="diag-actions">
+              <span class="diag-cmd">echo 'src/generated/' >> .travsrignore</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- footer -->
+        <div class="logs-footer">
+          <span><span class="dot-live"></span>Daemon running · PID 48291</span>
+          <span class="refresh-hint">↺ refreshed 3s ago</span>
+        </div>
+      </div>
+
+      <!-- ── scene: HEALTHY (all clear) ───────────────────────────────────── -->
+      <div class="logs-body" id="scene-healthy" style="display:none;">
+
+        <div class="log-lines">
+          <div class="log-section-label">Latest entries — 2026-06-15</div>
+          <div class="log-row">
+            <span class="log-ts">09:11:04</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">travsr daemon started <span class="key">repo=</span><span class="val">"~/myapp"</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">09:11:04</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">control socket bound <span class="key">transport=</span><span class="val">"unix"</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">09:11:05</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">Phase A complete <span class="key">files=</span><span class="val">1247</span> <span class="key">nodes=</span><span class="val">18423</span> <span class="key">edges=</span><span class="val">41207</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">09:11:05</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">background phase B starting <span class="key">commit=</span><span class="val">d91cc4a</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">09:11:23</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">Phase B complete — typescript go python kotlin dart <span class="key">edges_added=</span><span class="val">9102</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">09:14:38</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">background phase B starting <span class="key">commit=</span><span class="val">7bca891</span></span>
+          </div>
+          <div class="log-row">
+            <span class="log-ts">09:14:59</span>
+            <span class="log-level lv-info">INFO</span>
+            <span class="log-msg">Phase B complete <span class="key">edges_added=</span><span class="val">312</span></span>
+          </div>
+        </div>
+
+        <div class="log-divider"></div>
+
+        <div class="diag-section">
+          <div class="diag-section-header">
+            Diagnostics
+            <span class="diag-count ok">All clear</span>
+          </div>
+          <div class="diag-card ok">
+            <div class="diag-title">✓ No issues detected</div>
+            <div class="diag-hint">
+              All language analyzers ran successfully. The graph is fully indexed
+              with semantic call edges for all 5 active languages.
+            </div>
+          </div>
+        </div>
+
+        <div class="logs-footer">
+          <span><span class="dot-live"></span>Daemon running · PID 48291</span>
+          <span class="refresh-hint">↺ refreshed 1s ago</span>
+        </div>
+      </div>
+
+      <!-- ── scene: OFFLINE (no daemon) ───────────────────────────────────── -->
+      <div class="logs-body" id="scene-offline" style="display:none;">
+        <div class="cta-state">
+          <div class="cta-icon">◈</div>
+          <div class="cta-title">Daemon not running</div>
+          <div class="cta-sub">
+            No <code style="font-size:10px;background:rgba(255,255,255,.07);padding:1px 4px;border-radius:3px;">.travsr/daemon.log</code> found.
+            Start the daemon to see live indexing progress and diagnostics here.
+          </div>
+          <button class="cta-btn">▶ travsr init</button>
+          <div style="font-size:10px;color:var(--ch-500);margin-top:-4px;">
+            or run <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px;">travsr daemon start</code> in the terminal
+          </div>
+        </div>
+
+        <div class="logs-footer" style="border-top:1px solid var(--vsc-border);">
+          <span><span class="dot-err"></span>Daemon offline</span>
+          <span class="refresh-hint">—</span>
+        </div>
+      </div>
+
+    </div><!-- /sidebar -->
+
+    <!-- ── editor area ───────────────────────────────────────────────────── -->
+    <div class="editor-area">
+      <div class="editor-tabs">
+        <div class="editor-tab">
+          <span style="color:#fb923c;font-size:10px;">●</span>
+          PaymentService.ts
+          <span class="tab-lang">TS</span>
+        </div>
+        <div class="editor-tab active">
+          checkoutFlow.ts
+          <span class="tab-lang">TS</span>
+        </div>
+        <div class="editor-tab" style="color:var(--vsc-fg-dimmer);">
+          invoiceService.ts
+          <span class="tab-lang">TS</span>
+        </div>
+      </div>
+      <div class="editor-content">
+        <div class="code-line"><span class="ln">1</span><span class="code-body"><span class="cm">// checkoutFlow.ts — payment orchestration</span></span></div>
+        <div class="code-line"><span class="ln">2</span></div>
+        <div class="code-line"><span class="ln">3</span><span class="code-body"><span class="kw">import</span> <span class="punc">{</span> <span class="ty">PaymentService</span> <span class="punc">}</span> <span class="kw">from</span> <span class="str">"../payment/PaymentService"</span><span class="punc">;</span></span></div>
+        <div class="code-line"><span class="ln">4</span><span class="code-body"><span class="kw">import</span> <span class="punc">{</span> <span class="ty">CartItem</span><span class="punc">,</span> <span class="ty">Order</span> <span class="punc">}</span> <span class="kw">from</span> <span class="str">"../models"</span><span class="punc">;</span></span></div>
+        <div class="code-line"><span class="ln">5</span></div>
+        <div class="code-line"><span class="ln">6</span><span class="code-body"><span class="kw">export async function</span> <span class="fn">processCheckout</span><span class="punc">(</span></span></div>
+        <div class="code-line"><span class="ln">7</span><span class="code-body"><span style="padding-left:8px;"></span>items<span class="punc">:</span> <span class="ty">CartItem</span><span class="punc">[],</span></span></div>
+        <div class="code-line"><span class="ln">8</span><span class="code-body"><span style="padding-left:8px;"></span>userId<span class="punc">:</span> <span class="ty">string</span></span></div>
+        <div class="code-line"><span class="ln">9</span><span class="code-body"><span class="punc">)</span><span class="punc">:</span> <span class="ty">Promise</span><span class="punc">&lt;</span><span class="ty">Order</span><span class="punc">&gt;</span> <span class="punc">{</span></span></div>
+        <div class="code-line"><span class="ln">10</span></div>
+        <div class="code-line"><span class="ln">11</span><span class="code-body"><span style="padding-left:8px;"></span><span class="kw">const</span> total <span class="punc">=</span> items<span class="punc">.</span><span class="fn">reduce</span><span class="punc">(</span><span class="punc">(</span>sum<span class="punc">,</span> i<span class="punc">)</span> <span class="punc">=&gt;</span> sum <span class="punc">+</span> i<span class="punc">.</span>price<span class="punc">,</span> <span class="num">0</span><span class="punc">);</span></span></div>
+        <div class="code-line"><span class="ln">12</span></div>
+        <div class="code-line" style="background:rgba(239,68,68,.08);border-left:2px solid #ef4444;">
+          <span class="ln" style="color:#ef4444;">13</span>
+          <span class="code-body"><span style="padding-left:8px;"></span><span class="kw">const</span> result <span class="punc">=</span> <span class="kw">await</span> PaymentService<span class="punc">.</span><span class="fn">charge</span><span class="punc">(</span>total<span class="punc">);</span> <span class="cm" style="color:#ef4444;">// ← broken: missing currency arg</span></span>
+        </div>
+        <div class="code-line"><span class="ln">14</span></div>
+        <div class="code-line"><span class="ln">15</span><span class="code-body"><span style="padding-left:8px;"></span><span class="kw">return</span> <span class="punc">{</span> orderId<span class="punc">:</span> result<span class="punc">.</span>id<span class="punc">,</span> total<span class="punc">,</span> userId <span class="punc">};</span></span></div>
+        <div class="code-line"><span class="ln">16</span><span class="code-body"><span class="punc">}</span></span></div>
+        <div class="code-line"><span class="ln">17</span></div>
+        <div class="code-line"><span class="ln">18</span><span class="code-body"><span class="kw">async function</span> <span class="fn">sendConfirmationEmail</span><span class="punc">(</span>order<span class="punc">:</span> <span class="ty">Order</span><span class="punc">):</span> <span class="ty">Promise</span><span class="punc">&lt;</span><span class="ty">void</span><span class="punc">&gt;</span> <span class="punc">{</span></span></div>
+        <div class="code-line"><span class="ln">19</span><span class="code-body"><span style="padding-left:8px;"></span><span class="cm">// ... email logic</span></span></div>
+        <div class="code-line"><span class="ln">20</span><span class="code-body"><span class="punc">}</span></span></div>
+      </div>
+    </div><!-- /editor-area -->
+
+  </div><!-- /main-area -->
+
+  <!-- status bar -->
+  <div class="statusbar">
+    <div class="sb-item">⎇ feature/checkout-v2</div>
+    <div class="sb-item">✕ 1 ⚠ 2</div>
+    <div class="sb-item" style="font-size:10px;">TypeScript</div>
+    <div class="sb-right">
+      <!-- travsr status pill -->
+      <div class="sb-travsr" id="sb-travsr-status">
+        <span class="dot-ok" id="sb-dot"></span>
+        ◈ Travsr · 18K nodes
+      </div>
+      <div class="sb-item">Ln 13, Col 45</div>
+      <div class="sb-item">UTF-8</div>
+    </div>
+  </div>
+
+</div><!-- /vscode-window -->
+
+<!-- annotation row -->
+<div class="annotations">
+  <div class="ann-col"><span>Activity Bar</span><br>◈ Travsr icon</div>
+  <div class="ann-col"><span>Daemon Logs</span><br>New 3rd sidebar view<br>(WebviewViewProvider)</div>
+  <div class="ann-col"><span>Editor</span><br>Context — shows why logs matter</div>
+</div>
+
+<!-- legend -->
+<div style="width:960px;margin-top:20px;display:flex;gap:24px;font-size:11px;color:var(--ch-400);padding:0 4px;">
+  <span><span style="color:#cccccc;font-weight:700;">INFO</span> — normal operation</span>
+  <span><span style="color:#fb923c;font-weight:700;">WARN</span> — degraded / partial</span>
+  <span><span style="color:#ef4444;font-weight:700;">ERR</span> — action required</span>
+  <span style="margin-left:auto;color:var(--ch-500);">Mockup — not production code · tokens: travsr-designer canonical</span>
+</div>
+
+<script>
+function setScene(name) {
+  // update buttons
+  document.querySelectorAll('.scene-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+
+  // toggle log bodies
+  document.getElementById('scene-active').style.display  = 'none';
+  document.getElementById('scene-healthy').style.display = 'none';
+  document.getElementById('scene-offline').style.display = 'none';
+  document.getElementById('scene-' + name).style.display = 'flex';
+  document.getElementById('scene-' + name).style.flexDirection = 'column';
+
+  // update status bar dot
+  const dot = document.getElementById('sb-dot');
+  const sbStatus = document.getElementById('sb-travsr-status');
+  if (name === 'offline') {
+    dot.className = 'dot-err';
+    sbStatus.style.opacity = '0.55';
+  } else {
+    dot.className = 'dot-ok';
+    sbStatus.style.opacity = '1';
+  }
+}
+
+function triggerRefresh() {
+  const btn = document.getElementById('refresh-btn');
+  btn.style.transform = 'rotate(180deg)';
+  btn.style.transition = 'transform 400ms ease';
+  setTimeout(() => {
+    btn.style.transform = 'rotate(0deg)';
+  }, 450);
+}
+
+// init: ensure correct scene shown on load
+document.getElementById('scene-active').style.display = 'flex';
+document.getElementById('scene-active').style.flexDirection = 'column';
+</script>
+
+</body>
+</html>

@@ -266,25 +266,20 @@ pub static CATALOG: &[PhaseBEntry] = &[
     PhaseBEntry {
         language: "python",
         npm_package: None,
-        command: "scip-python",
-        args: &[
-            "index",
-            "--project-name",
-            "{corpus}",
-            "--project-version",
-            "0.0.1",
-            "--output",
-            "{output}",
-            "{root}",
-        ],
-        output_format: OutputFormat::Scip,
+        // travsr-lsif-py is bundled with the travsr binary (packages/travsr-lsif-py/).
+        // It is resolved via current_exe walk-up — no PATH install required.
+        // The `command` name is used by `travsr lang list` for display only; the
+        // actual invocation goes through run_lsif_py_emitter() in-process.
+        command: "travsr-lsif-py",
+        args: &["--root", "{root}"],
+        output_format: OutputFormat::Lsif,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "npm install -g @sourcegraph/scip-python",
-        underlying_tool_hint: "npm install -g @sourcegraph/scip-python",
+        install_hint: "bundled — ships with travsr (packages/travsr-lsif-py)",
+        underlying_tool_hint: "",
         provider_binary: None,
         elevated_hosts: &[],
-        scip_install: ScipInstall::Command(&["npm", "install", "-g", "@sourcegraph/scip-python"]),
-        extensions: &[".py"],
+        scip_install: ScipInstall::Command(&["npm", "install", "-g", "@travsr-plugin/python"]),
+        extensions: &[".py", ".pyi"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
         native_phase_b: true,

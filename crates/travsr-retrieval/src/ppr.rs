@@ -79,7 +79,7 @@ use travsr_core::NodeId;
 use travsr_error::TravsrError;
 use travsr_store::Store;
 
-/// Personalized PageRank over the code graph.
+/// Personalized PageRank with uniform seed weights.
 ///
 /// Returns the top-`k` nodes by PPR score, sorted descending.
 ///
@@ -112,13 +112,60 @@ pub fn ppr<S: Store>(
     seeds: &[NodeId],
     k: usize,
 ) -> Result<Vec<(NodeId, f32)>, TravsrError> {
-    ppr_inner(store, seeds, k).map_err(|e| TravsrError::Internal(e.to_string()))
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seed_score = 1.0 / seeds.len() as f32;
+    let personalization: HashMap<NodeId, f32> = seeds.iter().fold(HashMap::new(), |mut m, &id| {
+        *m.entry(id).or_insert(0.0) += seed_score;
+        m
+    });
+    ppr_inner(store, &personalization, k).map_err(|e| TravsrError::Internal(e.to_string()))
 }
 
-fn ppr_inner<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> AnyResult<Vec<(NodeId, f32)>> {
-    let _span = tracing::debug_span!("ppr", seeds = seeds.len(), k = k).entered();
-
+/// Personalized PageRank with KNN-derived cosine-similarity weights on seeds.
+///
+/// Same algorithm as [`ppr`] but the personalisation vector is proportional to
+/// the provided weights rather than uniform.  Seeds with higher cosine similarity
+/// to the query receive more teleportation mass, steering the walk toward their
+/// neighbourhoods.
+///
+/// `seeds` is a slice of `(NodeId, weight)` pairs.  Weights must be positive
+/// and finite; if their sum is ≤ 0 or non-finite the function falls back to
+/// uniform weights (identical to calling [`ppr`]).
+pub fn ppr_weighted<S: Store>(
+    store: &S,
+    seeds: &[(NodeId, f32)],
+    k: usize,
+) -> Result<Vec<(NodeId, f32)>, TravsrError> {
     if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let total: f32 = seeds.iter().map(|(_, w)| w).sum();
+    if !total.is_finite() || total <= 0.0 {
+        // Degenerate weights — fall back to uniform rather than producing NaN scores.
+        let ids: Vec<NodeId> = seeds.iter().map(|(id, _)| *id).collect();
+        return ppr(store, &ids, k);
+    }
+    let mut personalization: HashMap<NodeId, f32> = HashMap::with_capacity(seeds.len());
+    for &(id, w) in seeds {
+        *personalization.entry(id).or_insert(0.0) += w / total;
+    }
+    ppr_inner(store, &personalization, k).map_err(|e| TravsrError::Internal(e.to_string()))
+}
+
+/// Core PPR power-iteration over a pre-normalised personalisation vector.
+///
+/// `personalization` maps seed node IDs to their teleportation probabilities;
+/// values must sum to ~1.0 (callers are responsible for normalisation).
+fn ppr_inner<S: Store>(
+    store: &S,
+    personalization: &HashMap<NodeId, f32>,
+    k: usize,
+) -> AnyResult<Vec<(NodeId, f32)>> {
+    let _span = tracing::debug_span!("ppr", seeds = personalization.len(), k = k).entered();
+
+    if personalization.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -129,12 +176,13 @@ fn ppr_inner<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> AnyResult<Vec<(
     // ── BFS to collect all reachable nodes + their outgoing edges ─────────────
     // We materialise the subgraph once so the inner iteration loop never hits
     // the store — critical for meeting the p95 < 50ms budget.
-    let (adj, reverse_adj) = build_weighted_subgraph(store, seeds)?;
+    let seed_ids: Vec<NodeId> = personalization.keys().copied().collect();
+    let (adj, reverse_adj) = build_weighted_subgraph(store, &seed_ids)?;
 
     if adj.is_empty() {
-        // Seeds not in the graph — return seeds with score 1/n each.
-        let score = 1.0 / seeds.len() as f32;
-        let mut out: Vec<(NodeId, f32)> = seeds.iter().map(|&id| (id, score)).collect();
+        // Seeds not in the graph — return seeds scored by their personalisation weight.
+        let mut out: Vec<(NodeId, f32)> = personalization.iter().map(|(&id, &s)| (id, s)).collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         if k > 0 {
             out.truncate(k);
         }
@@ -142,10 +190,9 @@ fn ppr_inner<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> AnyResult<Vec<(
     }
 
     // ── Personalisation vector r₀ ─────────────────────────────────────────────
-    let seed_score = 1.0 / seeds.len() as f32;
     let mut r: HashMap<NodeId, f32> = HashMap::with_capacity(adj.len());
-    for &s in seeds {
-        *r.entry(s).or_insert(0.0) += seed_score;
+    for (&s, &p) in personalization {
+        *r.entry(s).or_insert(0.0) += p;
     }
 
     // ── Power iteration ───────────────────────────────────────────────────────
@@ -153,9 +200,9 @@ fn ppr_inner<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> AnyResult<Vec<(
     for iter in 0..max_iter {
         let mut r_next: HashMap<NodeId, f32> = HashMap::with_capacity(r.len());
 
-        // Teleportation: (1 − α) · r₀
-        for &s in seeds {
-            *r_next.entry(s).or_insert(0.0) += (1.0 - a) * seed_score;
+        // Teleportation: (1 − α) · p(v)  where p(v) is the personalisation weight.
+        for (&s, &p) in personalization {
+            *r_next.entry(s).or_insert(0.0) += (1.0 - a) * p;
         }
 
         // Propagation: α · Σ w(u→v)/W(u) · r[u]
@@ -206,7 +253,14 @@ fn ppr_inner<S: Store>(store: &S, seeds: &[NodeId], k: usize) -> AnyResult<Vec<(
 
     // ── Top-k extraction ──────────────────────────────────────────────────────
     let mut scores: Vec<(NodeId, f32)> = r.into_iter().collect();
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // RET-H1: secondary sort by NodeId ensures identical queries always return
+    // nodes in the same order even when multiple nodes share the same PPR score.
+    // Without this tie-break, HashMap iteration order makes results non-deterministic.
+    scores.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     if k > 0 {
         scores.truncate(k);
     }
@@ -531,5 +585,75 @@ mod tests {
         // Must terminate — no infinite loop.
         let result = ppr(&store, &[a.id], 10).unwrap();
         assert!(!result.is_empty());
+    }
+
+    // ── ppr_weighted tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn ppr_weighted_empty_seeds_returns_empty() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let result = ppr_weighted(&store, &[], 5).unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// Neighbor of the high-weight seed must score above neighbor of the low-weight seed
+    /// when the graph topology is otherwise symmetric (equal fan-out on both sides).
+    #[test]
+    fn ppr_weighted_higher_weight_seed_neighbor_scores_above_lower() {
+        let a = make_node("fn:a");
+        let b = make_node("fn:b");
+        let x = make_node("fn:x");
+        let y = make_node("fn:y");
+        let store = store_with(
+            &[a.clone(), b.clone(), x.clone(), y.clone()],
+            &[
+                (a.id, x.id, EdgeKind::RefCall),
+                (b.id, y.id, EdgeKind::RefCall),
+            ],
+        );
+        let result = ppr_weighted(&store, &[(a.id, 0.9), (b.id, 0.1)], 10).unwrap();
+        let score_of = |id: NodeId| {
+            result
+                .iter()
+                .find(|&&(n, _)| n == id)
+                .map(|&(_, s)| s)
+                .unwrap_or(0.0)
+        };
+        let x_score = score_of(x.id);
+        let y_score = score_of(y.id);
+        assert!(
+            x_score > y_score,
+            "neighbor of high-weight seed ({x_score:.4}) must outscore neighbor of low-weight seed ({y_score:.4})"
+        );
+    }
+
+    /// Results from ppr_weighted with equal weights must be consistent with ppr (uniform).
+    #[test]
+    fn ppr_weighted_uniform_weights_consistent_with_ppr() {
+        let a = make_node("fn:a");
+        let b = make_node("fn:b");
+        let store = store_with(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let uniform = ppr(&store, &[a.id, b.id], 10).unwrap();
+        let weighted = ppr_weighted(&store, &[(a.id, 1.0), (b.id, 1.0)], 10).unwrap();
+        // Both must return the same set of node IDs in the same order.
+        let ids_uniform: Vec<NodeId> = uniform.iter().map(|&(id, _)| id).collect();
+        let ids_weighted: Vec<NodeId> = weighted.iter().map(|&(id, _)| id).collect();
+        assert_eq!(
+            ids_uniform, ids_weighted,
+            "uniform ppr_weighted must produce same ordering as ppr"
+        );
+    }
+
+    /// Degenerate zero-total weights must not panic; falls back to uniform.
+    #[test]
+    fn ppr_weighted_degenerate_zero_total_falls_back() {
+        let a = make_node("fn:a");
+        let store = store_with(std::slice::from_ref(&a), &[]);
+        let result = ppr_weighted(&store, &[(a.id, 0.0)], 5);
+        assert!(result.is_ok(), "zero-weight seeds must not error");
+        assert!(
+            !result.unwrap().is_empty(),
+            "must still return the seed node"
+        );
     }
 }

@@ -1,5 +1,5 @@
 {
-  "$comment": "A/B eval manifest (#318 O9). Each task is a structural question asked two ways: the GRAPH arm runs one Travsr query and reads only the answer subgraph; the FILES-ONLY arm models an agent without Travsr that must `git grep` the symbol and then read every candidate file to decide the answer. We compare answer correctness (recall/precision) and the context token cost each arm imposes on the LLM. Fixtures are reused from the O8 accuracy suite so ground truth is exact. Thresholds gate the GRAPH arm only: it must be exact (no structural hallucination) and never cost more context tokens than reading files; the headline token-reduction figure is reported, not gated, because in-repo fixtures are deliberately tiny.",
+  "$comment": "A/B eval manifest (#318 O9). Tasks have three classes: 'callers' — structural graph query (travsr graph --direction callers); 'context' — full PPR+knapsack retrieval pipeline (travsr ask --format json), gated on symbol+file recall/precision and token cost; 'ask' — seed resolution quality, gated on rank-1 exact match. The GRAPH arm is held to exact correctness and must never cost more context tokens than the FILES arm. Mean token reduction is reported, not gated, because in-repo fixtures are deliberately tiny.",
   "iterations": 3,
   "thresholds": {
     "graph_recall": 1.0,
@@ -8,22 +8,58 @@
   },
   "tasks": [
     {
+      "class": "callers",
       "name": "callers-of-PaymentService",
       "question": "Which files call PaymentService?",
       "fixture": "fixtures/ts-callers",
       "symbol": "PaymentService",
-      "relation": "callers",
       "self_path": "service.ts",
       "expect_files": ["controller.ts"]
     },
     {
+      "class": "callers",
       "name": "callers-of-Greeter",
       "question": "Which files call Greeter?",
       "fixture": "fixtures/ts-small",
       "symbol": "Greeter",
-      "relation": "callers",
       "self_path": "a.ts",
       "expect_files": ["b.ts"]
+    },
+    {
+      "class": "context",
+      "name": "context-PaymentService",
+      "question": "Give me context for PaymentService",
+      "query": "PaymentService",
+      "fixture": "fixtures/ts-callers",
+      "expect_symbols": ["PaymentService", "charge"],
+      "expect_files": ["service.ts"]
+    },
+    {
+      "class": "context",
+      "name": "context-Greeter",
+      "question": "Give me context for Greeter",
+      "query": "Greeter",
+      "fixture": "fixtures/ts-small",
+      "expect_symbols": ["Greeter", "hello"],
+      "expect_files": ["a.ts"]
+    },
+    {
+      "class": "ask",
+      "name": "ask-seed-PaymentService",
+      "question": "Look up PaymentService",
+      "query": "PaymentService",
+      "fixture": "fixtures/ts-callers",
+      "expect_top_symbol": "PaymentService",
+      "expect_files": ["service.ts"]
+    },
+    {
+      "class": "ask",
+      "name": "ask-seed-Greeter",
+      "question": "Look up Greeter",
+      "query": "Greeter",
+      "fixture": "fixtures/ts-small",
+      "expect_top_symbol": "Greeter",
+      "expect_files": ["a.ts"]
     }
   ]
 }

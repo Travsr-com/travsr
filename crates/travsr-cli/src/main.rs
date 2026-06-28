@@ -6,6 +6,7 @@ mod ask;
 #[cfg(windows)]
 mod autostart;
 mod daemon_client;
+mod embed;
 mod graph;
 mod index;
 mod init;
@@ -88,6 +89,9 @@ enum Command {
     Ask {
         /// Symbol name to search for (partial match supported).
         query: String,
+        /// Output format: table (default) or json.
+        #[arg(long, value_enum, default_value = "table")]
+        format: ask::OutputFormat,
     },
     /// Show the dependency graph for a symbol or file as a tree or DOT.
     Graph {
@@ -161,6 +165,11 @@ enum Command {
     Synonym {
         #[command(subcommand)]
         action: synonym::SynonymCommand,
+    },
+    /// Manage embedding backends for semantic code search (RFC-018).
+    Embed {
+        #[command(subcommand)]
+        action: embed::EmbedCommand,
     },
 }
 
@@ -387,7 +396,26 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DaemonAction::Stop => {
-                    send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown)?;
+                    // M2/L1: if the daemon is not running, tell the user clearly
+                    // and exit 0 — it's not an error to stop something already stopped.
+                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown) {
+                        Ok(_) => {
+                            eprintln!("travsr daemon stopped");
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("No such file")
+                                || msg.contains("Connection refused")
+                                || msg.contains("os error 2")
+                                || msg.contains("os error 111")
+                                || msg.contains("os error 61")
+                            {
+                                eprintln!("travsr daemon is not running");
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
                     // Windows: remove the auto-start task so the daemon stays
                     // stopped after the user logs out and back in.
                     #[cfg(windows)]
@@ -397,11 +425,33 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 DaemonAction::Status => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Status) {
-                        Ok(_) => {
+                        Ok(resp) => {
                             let transport = if cfg!(windows) { "named_pipe" } else { "unix" };
-                            println!("running [transport={transport}]");
+                            println!("daemon: running [transport={transport}]");
+                            if let Some(msg) = resp.message {
+                                println!();
+                                println!("{msg}");
+                            }
                         }
-                        Err(_) => println!("not running"),
+                        Err(_) => {
+                            // Socket not ready yet — check lock file PID.
+                            // On a large repo the watcher initial scan can take
+                            // 10-30 s; the daemon is alive but hasn't bound its
+                            // socket yet.
+                            let lock_path = repo_root.join(".travsr/daemon.lock");
+                            let starting = std::fs::read_to_string(&lock_path)
+                                .ok()
+                                .and_then(|s| s.trim().parse::<u32>().ok())
+                                .map(pid_is_alive)
+                                .unwrap_or(false);
+                            if starting {
+                                println!(
+                                    "daemon: starting (scanning file tree — socket not ready yet)"
+                                );
+                            } else {
+                                println!("daemon: not running");
+                            }
+                        }
                     }
                 }
                 DaemonAction::Restart => {
@@ -436,6 +486,19 @@ async fn run(cli: Cli) -> Result<()> {
                     repo_root.join(".travsr/graph.db")
                 };
                 if !db_path.exists() {
+                    // H2: MCP clients read stdout as a JSON-RPC stream. An abrupt
+                    // exit with no output causes an opaque EOF error on the client.
+                    // Write a notification-style error first so the client can
+                    // show a human-readable message before disconnecting.
+                    let err_msg = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/message",
+                        "params": {
+                            "level": "error",
+                            "data": "travsr: not initialized — run `travsr init` first, then retry"
+                        }
+                    });
+                    println!("{err_msg}");
                     anyhow::bail!("not initialized — run `travsr init` first");
                 }
                 travsr_mcp::serve_stdio(&db_path)?;
@@ -452,7 +515,7 @@ async fn run(cli: Cli) -> Result<()> {
             json,
         } => repos::run(prune, remove.as_deref(), json)?,
         Command::Status => status::run()?,
-        Command::Ask { query } => ask::run(&query)?,
+        Command::Ask { query, format } => ask::run(&query, format)?,
         Command::Graph {
             query,
             all,
@@ -498,8 +561,30 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
+        Command::Embed { action } => embed::run(action)?,
     }
     Ok(())
+}
+
+/// Check whether a process with the given PID is currently alive.
+/// Uses `kill -0` on Unix (no signal sent, just existence check).
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // /proc/<pid> exists on Linux; on macOS use kill -0 via Command.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Connect to the daemon's control transport for `repo_root`.
@@ -513,21 +598,26 @@ fn send_daemon_command(
 
 /// Retry pinging the daemon transport up to `attempts` times with `delay_ms` between tries.
 ///
-/// launchd `KeepAlive: true` restarts the daemon after `daemon stop`, so the
-/// transport may briefly be unavailable during restart. Without retries, a
-/// `daemon start` call immediately after `daemon stop` could incorrectly spawn
-/// a second daemon.
+/// Also checks the lock file PID so that a daemon that is alive but still
+/// doing its initial file-tree scan (socket not bound yet) is not mistaken
+/// for "not running" — which would cause a second daemon to be spawned and
+/// crash immediately with "another daemon already running".
 pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
-            // Blocking sleep is safe: no concurrent async tasks exist at daemon-start time.
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
         if send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status).is_ok() {
             return true;
         }
     }
-    false
+    // Socket not ready — fall back to lock-file PID check.
+    let lock_path = repo_root.join(".travsr/daemon.lock");
+    std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(pid_is_alive)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

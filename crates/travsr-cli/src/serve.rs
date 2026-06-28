@@ -72,9 +72,15 @@ pub async fn run(port: u16, tenants_dir: PathBuf) -> anyhow::Result<()> {
 
     // Bind listener.
     let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot bind to {addr}: {e}"))?;
+    // M8: append a --port hint when the port is already in use so the user
+    // knows exactly what to do rather than seeing a raw EADDRINUSE error.
+    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::anyhow!("cannot bind to {addr}: {e} — try --port <other>")
+        } else {
+            anyhow::anyhow!("cannot bind to {addr}: {e}")
+        }
+    })?;
 
     tracing::info!(port, "SSE MCP server listening");
 

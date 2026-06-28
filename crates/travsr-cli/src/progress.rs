@@ -69,11 +69,12 @@ impl Palette {
     }
 
     /// Orange `#fb923c` — hot / in-progress (`--color-stale`/`--color-edge-hot`).
-    fn orange(self, s: &str) -> String {
+    /// Orange `#fb923c` — hot / in-progress (`--color-stale`/`--color-edge-hot`).
+    pub fn orange(self, s: &str) -> String {
         self.paint("38;2;251;146;60", s)
     }
     /// Fresh green `#86df86` — done / fresh node (`--color-fresh`).
-    fn green(self, s: &str) -> String {
+    pub fn green(self, s: &str) -> String {
         self.paint("38;2;134;223;134", s)
     }
     /// Empty bar track — charcoal `#4d4d4d` (`--color-border`).
@@ -81,7 +82,7 @@ impl Palette {
         self.paint("38;2;77;77;77", s)
     }
     /// Muted secondary text (elapsed/eta/hints).
-    fn dim(self, s: &str) -> String {
+    pub fn dim(self, s: &str) -> String {
         self.paint("2", s)
     }
     /// Bold — the wordmark.
@@ -431,7 +432,7 @@ fn commas(n: u64) -> String {
 }
 
 /// Compact human duration: `45s`, `2m30s`, `1h02m`.
-fn fmt_dur(d: Duration) -> String {
+pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
         format!("{s}s")

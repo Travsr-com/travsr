@@ -39,15 +39,13 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
         return Ok(());
     }
 
-    // Auto-start the daemon when Phase B was deferred so it picks up semantic
-    // indexing immediately without requiring a manual `travsr daemon start`.
+    // Always start the daemon after init in interactive terminals so file
+    // watching, git hooks, Phase B, and post-Phase-B embedding all work
+    // without a manual `travsr daemon start`.
     // Guard with is_terminal so we never spawn a background process in CI,
     // piped contexts, or integration tests (where it would race the DB lock).
     use std::io::IsTerminal as _;
-    if std::io::stdout().is_terminal()
-        && stats.phase_b_report.is_none()
-        && !super::daemon_is_running(&repo_root, 3, 100)
-    {
+    if std::io::stdout().is_terminal() && !super::daemon_is_running(&repo_root, 3, 100) {
         let exe = std::env::current_exe().context("finding current exe path")?;
         let _ = std::process::Command::new(&exe)
             .args(["daemon", "start", "--foreground"])
@@ -73,9 +71,19 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
 
         // Non-fatal: detection errors must not fail `travsr init`.
         let _ = hint_lang_detect(&repo_root);
+        hint_embed_missing();
     }
 
     Ok(())
+}
+
+/// Print a tip when no embed backend is active so users know about semantic search.
+fn hint_embed_missing() {
+    if travsr_plugin_host::active_backend_id().is_none() {
+        println!(
+            "tip: semantic search is not set up — run `travsr embed init` for natural-language queries"
+        );
+    }
 }
 
 /// After indexing, scan for supported languages and suggest `travsr lang detect`

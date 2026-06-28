@@ -17,7 +17,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use travsr_core::{display_label, is_noise_node, NodeId};
-use travsr_retrieval::{context_candidates, knapsack, token_cost};
+
+type KnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
+use travsr_retrieval::{context_candidates, knapsack, ppr_weighted, token_cost, OpenFilter};
 use travsr_store::{SqliteStore, Store, StoreMigratable};
 
 /// Token budget for `travsr ask` and the default for `travsr graph --budget`.
@@ -112,6 +114,8 @@ pub struct AskRow {
     pub kind: String,
     pub signature: String,
     pub path: String,
+    #[serde(default)]
+    pub line: Option<u32>,
     pub score: f32,
 }
 
@@ -123,69 +127,169 @@ pub struct AskPayload {
     pub no_results: bool,
     pub rows: Vec<AskRow>,
     pub total_tokens: usize,
+    /// True when KNN embed seeds drove PPR instead of FTS. Absent in old JSON → false.
+    #[serde(default)]
+    pub embed_used: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusPayload {
     pub nodes: u64,
+    /// L11: number of FTS rows — should equal `nodes`. A mismatch indicates a
+    /// partial write or corrupt FTS index; user should re-run `travsr init`.
+    #[serde(default)]
+    pub fts_nodes: u64,
     pub edges: u64,
     pub schema: u32,
     pub journal: String,
     pub last_commit: Option<String>,
     pub signature_format_version: u8,
+    /// M7: commit at which Phase B last completed successfully. Compare with
+    /// `last_commit` to know if Phase B is pending, complete, or running.
+    pub phase_b_commit: Option<String>,
+    /// H3: warnings from the last Phase B run (crashed/version_mismatch/needs_approval).
+    /// Empty string = no warnings.
+    pub phase_b_warnings: Option<String>,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
 
 pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
+    let nodes = store.node_count()?;
+    // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.
+    // fts_count is the number of rows in nodes_fts (virtual FTS table).
+    let fts_count = store.fts_node_count().unwrap_or(nodes);
     Ok(StatusPayload {
-        nodes: store.node_count()?,
+        nodes,
+        fts_nodes: fts_count,
         edges: store.edge_count()?,
         schema: store.schema_version()?,
         journal: store.journal_mode()?,
         last_commit: store.get_meta("last_commit")?,
         signature_format_version: store.get_signature_format_version()?,
+        phase_b_commit: store.get_meta("phase_b_commit")?,
+        phase_b_warnings: store.get_meta("phase_b_warnings")?,
     })
 }
 
 // ── ask ───────────────────────────────────────────────────────────────────────
 
-pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload> {
-    // Strip a leading `:` so VS Code graph-panel queries (which prefix with `:`
-    // to bypass the colon-delimited command syntax) pass through cleanly.
+/// Run an ask query with unified FTS+KNN seed selection.
+///
+/// Both FTS and KNN always run when embed is available; results are merged with
+/// `max(fts_weight, knn_score)` deduplication so the two sources reinforce shared
+/// nodes rather than competing. Seeds structurally adjacent to a higher-scored seed
+/// are then dropped (`dedup_adjacent_seeds`) to avoid diluting PPR teleportation mass.
+///
+/// KNN is subject to a `KNN_BUDGET_MS` circuit-breaker: if the sidecar takes too long
+/// its results are discarded and only FTS seeds steer PPR.
+pub fn ask_query(
+    store: &SqliteStore,
+    query: &str,
+    knn_fn: Option<KnnFn<'_>>,
+) -> anyhow::Result<AskPayload> {
+    // Strip a leading `:` so VS Code graph-panel queries pass through cleanly.
     let query = query.strip_prefix(':').unwrap_or(query).trim();
+    // CO-C1: normalize once at the top so both FTS and embed see the same
+    // cleaned query — prevents punctuation divergence on the cold/CLI path.
+    let normalized = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let query = normalized.as_str();
 
-    let matches = store.search_nodes_fuzzy(query)?;
-    if matches.is_empty() {
+    // ── Tier-0 seed selection (per-token anchor + BM25 FTS + optional KNN) ──
+    let knn_pairs;
+    let embed_contributed;
+    if let Some(knn) = knn_fn {
+        let (knn_scored, _n_eligible, knn_elapsed_ms) =
+            crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
+        let budget_ms = crate::tools::knn_budget_ms();
+        if knn_elapsed_ms > budget_ms {
+            tracing::warn!(
+                knn_elapsed_ms,
+                threshold_ms = budget_ms,
+                "ask_query knn exceeded circuit-breaker — falling back to FTS seeds"
+            );
+            knn_pairs = vec![];
+            embed_contributed = false;
+        } else {
+            embed_contributed = !knn_scored.is_empty();
+            knn_pairs = knn_scored;
+        }
+    } else {
+        knn_pairs = vec![];
+        embed_contributed = false;
+    }
+
+    let seed_set = crate::seed::build_seed_set(store, query, &OpenFilter, knn_pairs);
+
+    // Abstain when confidence is None — prevents "confident salad" on no-match queries (R1).
+    if seed_set.confidence == crate::seed::Confidence::None {
         return Ok(AskPayload {
             matched: false,
             no_results: false,
             rows: Vec::new(),
             total_tokens: 0,
+            embed_used: false,
         });
     }
 
-    // Prefer structural seeds over file nodes for richer PPR traversal.
-    let preferred = ["class", "function", "method", "file"];
-    let seed_node = preferred
-        .iter()
-        .find_map(|k| matches.iter().find(|n| n.kind == *k))
-        .unwrap_or(&matches[0]);
-    let seed = seed_node.id;
+    let raw_seeds = seed_set.ppr_seeds();
 
-    let ppr_scores = travsr_retrieval::ppr(store, &[seed], context_candidates())?;
+    // Caller enrichment: depth-1 then depth-2 production callers at 0.35× weight per hop.
+    let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 15); // depth-1
+    let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 10); // depth-2
+                                                                                   // Drop seeds whose 1-hop PPR expansion would overlap a higher-scored accepted seed.
+    let seeds = crate::tools::dedup_adjacent_seeds(store, raw_seeds);
+
+    if seeds.is_empty() {
+        return Ok(AskPayload {
+            matched: false,
+            no_results: false,
+            rows: Vec::new(),
+            total_tokens: 0,
+            embed_used: false,
+        });
+    }
+
+    // ── PPR with confidence-weighted personalisation ───────────────────────────
+    let ppr_scores = ppr_weighted(store, &seeds, context_candidates())?;
     if ppr_scores.is_empty() {
         return Ok(AskPayload {
             matched: true,
             no_results: true,
             rows: Vec::new(),
             total_tokens: 0,
+            embed_used: embed_contributed,
         });
     }
 
     let node_ids: Vec<_> = ppr_scores.iter().map(|(id, _)| *id).collect();
-    let score_map: HashMap<_, f32> = ppr_scores.into_iter().collect();
+    let raw_score_map: HashMap<_, f32> = ppr_scores.into_iter().collect();
     let nodes = store.get_nodes(&node_ids)?;
+
+    // Filter structural package nodes — never valid context regardless of language.
+    // Go `go-pkg` nodes are scip-go package identifiers (often 1000+ in-edges).
+    // Go `module` nodes are package declarations; Rust `module` nodes (`mod foo`)
+    // are real code entities and must NOT be filtered.
+    let nodes: Vec<_> = nodes
+        .into_iter()
+        .filter(|n| !(n.kind == "go-pkg" || (n.kind == "module" && n.vname.language == "go")))
+        .collect();
+
+    // Degree damping: penalise hub nodes proportional to their in-degree.
+    // adjusted = ppr_score × 1/(1 + ln(max(1, in_degree)))
+    // A node with 1000 in-edges is damped to ~14% of its raw PPR score;
+    // a node with 5 in-edges retains ~38% — hub nodes are suppressed, not zeroed.
+    let filtered_ids: Vec<_> = nodes.iter().map(|n| n.id).collect();
+    let in_degrees = store.in_degrees(&filtered_ids)?;
+    let score_map: HashMap<NodeId, f32> = raw_score_map
+        .into_iter()
+        .map(|(id, s)| {
+            let degree = in_degrees.get(&id).copied().unwrap_or(0);
+            let damped = s * (1.0 / (1.0 + (degree as f32).max(1.0).ln()));
+            (id, damped)
+        })
+        .collect();
+
     let items: Vec<_> = nodes
         .into_iter()
         .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
@@ -200,6 +304,7 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
             kind: n.kind,
             signature: n.vname.signature,
             path: n.vname.path,
+            line: n.line,
         })
         .collect();
 
@@ -208,6 +313,7 @@ pub fn ask_query(store: &SqliteStore, query: &str) -> anyhow::Result<AskPayload>
         no_results: false,
         rows,
         total_tokens,
+        embed_used: embed_contributed,
     })
 }
 
@@ -401,8 +507,21 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
 
 /// Whole-graph payload for `travsr graph --all`. No traversal: every node at
 /// depth 0, edges verbatim from the store (with true provenance).
+/// L7: threshold above which `graph --all` truncates and warns the user.
+pub const GRAPH_ALL_NODE_LIMIT: usize = 50_000;
+
 pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
-    let all = store.all_nodes()?;
+    let mut all = store.all_nodes()?;
+    // L7: cap at GRAPH_ALL_NODE_LIMIT to prevent OOM on very large repos.
+    if all.len() > GRAPH_ALL_NODE_LIMIT {
+        eprintln!(
+            "warning: graph has {} nodes — showing first {} only. \
+             Use `travsr graph <symbol>` for focused traversal.",
+            all.len(),
+            GRAPH_ALL_NODE_LIMIT
+        );
+        all.truncate(GRAPH_ALL_NODE_LIMIT);
+    }
     let nodes: Vec<NodeEntry> = all.iter().map(|n| node_entry(n, 0)).collect();
     let edges_raw = store.all_edges()?;
     let edges = resolve_edge_sigs(store, &nodes, edges_raw)?;
@@ -622,7 +741,7 @@ mod tests {
     #[test]
     fn ask_query_returns_rows_within_budget() {
         let (store, ..) = seeded_store();
-        let payload = ask_query(&store, "PaymentService").unwrap();
+        let payload = ask_query(&store, "PaymentService", None).unwrap();
         assert!(payload.matched);
         assert!(payload.total_tokens <= DEFAULT_TOKEN_BUDGET);
     }

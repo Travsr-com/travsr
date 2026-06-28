@@ -13,6 +13,7 @@ pub mod auth;
 mod protocol;
 pub mod query;
 mod sanitize;
+mod seed;
 mod server;
 pub mod session;
 pub mod sse;
@@ -42,6 +43,9 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
     // which require `&mut Connection`). Read-only tools auto-reborrow `&mut`→`&`.
     let mut store = SqliteStore::open(db_path)
         .with_context(|| format!("opening graph database at {}", db_path.display()))?;
+    // Inject the embed KNN hook so get_context's semantic seed selection (Step 4)
+    // works in standalone `travsr mcp --stdio` mode, not just daemon mode.
+    inject_embed_hook(&mut store, db_path);
     server::run(&mut store)
 }
 
@@ -51,4 +55,41 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
 /// after startup are picked up live without restarting the server.
 pub fn serve_stdio_global() -> anyhow::Result<()> {
     server::run_global()
+}
+
+/// Wire the active embed backend's KNN hook into `store`.
+/// Silently no-ops when no backend is installed or the sidecar fails to start.
+fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
+    use travsr_plugin_host::{
+        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
+    };
+
+    // Guard: no embed.db → nothing to query; skip to avoid a 30 s KNN timeout from
+    // spawning the sidecar against a non-existent HNSW index.
+    if !db_path.with_file_name("embed.db").exists() {
+        return;
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let backend = active_backend_id()
+        .as_deref()
+        .and_then(lookup_embed_backend)
+        .or_else(|| EMBED_BACKENDS.first())
+        .copied();
+    let Some(backend) = backend else { return };
+
+    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
+    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
+    if !supervisor.is_active() {
+        return;
+    }
+    let Some(model_id) = supervisor.model_id().map(str::to_string) else {
+        return;
+    };
+    if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
+        store.set_embed_knn_hook(hook);
+        tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
+    }
 }

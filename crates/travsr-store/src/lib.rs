@@ -24,6 +24,12 @@ pub use migration_manifest::{compute_manifest_kuzu, migrate_sqlite_to_kuzu};
 pub use migration_manifest::{Manifest, ManifestEntry, MigrationError};
 
 use std::path::Path;
+use std::sync::Arc;
+
+/// Type alias for the RFC-018 Step 4 semantic-ANN callback injected by the daemon.
+/// Returns `(NodeId, cosine_similarity_score)` pairs in descending score order.
+pub type EmbedKnnHook =
+    Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -190,21 +196,32 @@ impl Migration for V11FtsSynonyms {
     }
 }
 
-#[cfg(feature = "embeddings")]
-struct V12Vec0Embeddings;
-#[cfg(feature = "embeddings")]
-impl Migration for V12Vec0Embeddings {
+/// RFC-018: plain blob embedding table — no sqlite-vec extension required in main process.
+/// EmbedPlugin sidecar opens its own DB connection for ANN queries.
+/// Numbered v16 so it runs on DBs already at v15 (kcore-shells branch).
+struct V16NodeEmbeddings;
+impl Migration for V16NodeEmbeddings {
     fn version(&self) -> u32 {
-        12
+        16
     }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
-        // STUB (RFC-012 A2 F2, DEBT travsr-#259): the `embeddings` feature is not
-        // wired yet — the `ort` + `sqlite-vec` deps are unpinned and no extension
-        // loader exists. This DDL requires the `vec0` module to be registered on
-        // the connection first; until the loader lands, enabling `embeddings` will
-        // fail here. There is intentionally NO guard in this stub. Do not enable
-        // the `embeddings` feature in production until F2 is implemented.
-        store.exec_ddl(include_str!("migrations/v12_vec0_embeddings.sql"))
+        // CREATE TABLE / INDEX IF NOT EXISTS — idempotent on re-run.
+        store.exec_ddl(include_str!("migrations/v16_node_embeddings.sql"))
+    }
+}
+
+/// RFC-019: move node_embeddings to embed.db; add CDC tombstone trigger.
+///
+/// graph.db drops node_embeddings (now owned by the embed sidecar in embed.db)
+/// and gains node_tombstones + capture_node_delete trigger so the sidecar can
+/// prune stale embeddings between reindex passes without a full-table scan.
+struct V17NodeTombstones;
+impl Migration for V17NodeTombstones {
+    fn version(&self) -> u32 {
+        17
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl(include_str!("migrations/v17_node_tombstones.sql"))
     }
 }
 
@@ -213,6 +230,11 @@ struct V13PhaseBUnification;
 impl Migration for V13PhaseBUnification {
     fn version(&self) -> u32 {
         13
+    }
+    // VACUUM cannot run inside an explicit transaction; skip the SC-H2
+    // BEGIN/COMMIT wrapping for this migration (see MigrationRunner::run).
+    fn is_transactional(&self) -> bool {
+        false
     }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
         // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite — guard manually.
@@ -279,6 +301,32 @@ impl Migration for V15KcoreShells {
     }
 }
 
+/// V18: embed_text column — pre-computed AST-skeleton embed text per node.
+struct V18EmbedText;
+impl Migration for V18EmbedText {
+    fn version(&self) -> u32 {
+        18
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        if !store.column_exists("nodes", "embed_text")? {
+            store.exec_ddl(include_str!("migrations/v18_embed_text.sql"))?;
+        }
+        Ok(())
+    }
+}
+
+/// V19: index on nodes(signature) — eliminates full-table scan in
+/// `nodes_by_signatures` which is called per UnresolvedCall batch every commit.
+struct V19NodesSignatureIdx;
+impl Migration for V19NodesSignatureIdx {
+    fn version(&self) -> u32 {
+        19
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl("CREATE INDEX IF NOT EXISTS idx_nodes_signature ON nodes(signature)")
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -294,11 +342,13 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V9NodesFts);
     r.register(V10FtsVocab);
     r.register(V11FtsSynonyms);
-    #[cfg(feature = "embeddings")]
-    r.register(V12Vec0Embeddings);
     r.register(V13PhaseBUnification);
     r.register(V14CoveringReverseIdx);
     r.register(V15KcoreShells);
+    r.register(V16NodeEmbeddings);
+    r.register(V17NodeTombstones);
+    r.register(V18EmbedText);
+    r.register(V19NodesSignatureIdx);
     r
 }
 
@@ -362,10 +412,18 @@ pub struct BatchWriteCounts {
 }
 
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
-#[derive(Debug)]
 pub struct SqliteStore {
     conn: Connection,
     staging_active: bool,
+    /// RFC-018 Step 4: optional semantic ANN hook injected by the daemon at
+    /// store-open time. `None` by default — zero cost when no embed plugin is
+    /// running. The store crate has zero knowledge of the plugin system; only the
+    /// daemon injects this via `set_embed_knn_hook`.
+    embed_knn_hook: Option<EmbedKnnHook>,
+    /// RFC-019: sibling embed.db path (e.g. `.travsr/embed.db`). `None` for
+    /// in-memory stores. Used by `embed_progress` to ATTACH embed.db and count
+    /// embedded nodes without polluting the graph.db WAL with embedding BLOBs.
+    embed_db_path: Option<std::path::PathBuf>,
 }
 
 impl Drop for SqliteStore {
@@ -391,6 +449,8 @@ impl SqliteStore {
             let mut store = Self {
                 conn,
                 staging_active: false,
+                embed_knn_hook: None,
+                embed_db_path: Some(path.with_file_name("embed.db")),
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -435,6 +495,10 @@ impl SqliteStore {
             // Read-path pragmas only. journal_mode=WAL is a persisted property
             // of the database file; setting pragmas that write (WAL switch,
             // autocheckpoint) is neither possible nor needed here.
+            // SC-C1: busy timeout prevents SQLITE_BUSY hard-fail when the daemon
+            // write lock is held briefly (e.g. post-commit reindex flush).
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .context("setting busy_timeout (read-only)")?;
             conn.pragma_update(None, "cache_size", -Self::cache_size_kib())
                 .context("setting cache_size (read-only)")?;
             conn.pragma_update(None, "temp_store", "MEMORY")
@@ -446,6 +510,8 @@ impl SqliteStore {
             let store = Self {
                 conn,
                 staging_active: false,
+                embed_knn_hook: None,
+                embed_db_path: Some(path.with_file_name("embed.db")),
             };
             let current = store
                 .schema_version()
@@ -469,6 +535,8 @@ impl SqliteStore {
             let mut store = Self {
                 conn,
                 staging_active: false,
+                embed_knn_hook: None,
+                embed_db_path: None,
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -485,6 +553,57 @@ impl SqliteStore {
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Inject the RFC-018 Step 4 semantic-ANN hook.
+    ///
+    /// Called by the daemon after opening the store, when the embed supervisor
+    /// is active and the stored model_id matches the plugin's model_id. The hook
+    /// fires at the end of `search_nodes_fuzzy` (only when Steps 1–3 all miss).
+    pub fn set_embed_knn_hook(&mut self, hook: EmbedKnnHook) {
+        self.embed_knn_hook = Some(hook);
+    }
+
+    /// Return a callable wrapper around the embed KNN hook, or `None` when no
+    /// hook has been injected (embed plugin not installed or index not built).
+    ///
+    /// The closure owns an `Arc` clone so it can outlive the `SqliteStore`
+    /// borrow. Errors from the underlying hook are swallowed into an empty vec.
+    pub fn embed_knn_fn(&self) -> Option<impl Fn(&str, u32) -> Vec<(NodeId, f32)>> {
+        let hook = self.embed_knn_hook.clone()?;
+        Some(move |query: &str, k: u32| -> Vec<(NodeId, f32)> {
+            hook(query, k).unwrap_or_default()
+        })
+    }
+
+    /// Batch in-degree counts (number of incoming edges) for the given node IDs.
+    ///
+    /// Nodes with no incoming edges are included with a count of 0.
+    /// Chunked at 500 IDs per query to stay within SQLite's parameter limit.
+    pub fn in_degrees(&self, ids: &[NodeId]) -> AnyResult<std::collections::HashMap<NodeId, u32>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut result: std::collections::HashMap<NodeId, u32> =
+            ids.iter().map(|&id| (id, 0u32)).collect();
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT dst, COUNT(*) as cnt FROM edges WHERE dst IN ({placeholders}) GROUP BY dst"
+            );
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let params: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(id.0 as i64))
+                .collect();
+            let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+            while let Some(row) = rows.next()? {
+                let dst: i64 = row.get(0)?;
+                let cnt: u32 = row.get(1)?;
+                result.insert(NodeId(dst as u64), cnt);
+            }
+        }
+        Ok(result)
     }
 
     /// Create the `meta` table if it does not already exist.
@@ -520,6 +639,10 @@ impl SqliteStore {
     }
 
     fn configure(conn: &Connection) -> AnyResult<()> {
+        // SC-C1: 5-second retry on SQLITE_BUSY so a second concurrent writer
+        // (daemon + CLI, or two Phase B workers) retries instead of hard-failing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy_timeout")?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("enabling WAL journal mode")?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -614,6 +737,122 @@ impl SqliteStore {
                 .query_row("SELECT count(*) FROM edges", [], |row| row.get(0))
                 .context("counting edges")?;
             Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// L11: row count in the FTS index. Should match `node_count()`.
+    /// A mismatch indicates partial FTS write — user should re-run `travsr init`.
+    pub fn fts_node_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM nodes_fts", [], |row| row.get(0))
+                .context("counting nodes_fts")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Embedding coverage counts for a given model, split by k-core shell threshold.
+    ///
+    /// Returns `(total_symbols, embedded, phase1_total, phase1_done)` where
+    /// "embeddable" matches the sidecar's kind filter exactly:
+    ///   NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')
+    /// phase1 = embeddable nodes with `shell_number >= threshold` (high-centrality core).
+    /// Phase2 totals can be derived: `phase2_total = total_symbols - phase1_total`.
+    ///
+    /// RFC-019: embedded counts are read from embed.db (sibling of graph.db) via
+    /// ATTACH. Returns (total, 0, phase1_total, 0) when embed.db does not yet
+    /// exist (first run before any reindex completes).
+    pub fn embed_progress(
+        &self,
+        model_id: &str,
+        shell_threshold: u32,
+    ) -> Result<(u64, u64, u64, u64), StoreError> {
+        // Must match travsr-embed sidecar's kind exclusion list exactly.
+        const KIND_FILTER: &str =
+            "kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')";
+
+        (|| -> AnyResult<(u64, u64, u64, u64)> {
+            let total_symbols: i64 = self
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM nodes WHERE {KIND_FILTER}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .context("counting embeddable nodes")?;
+
+            let phase1_total: i64 = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM nodes WHERE {KIND_FILTER} AND shell_number >= ?1"
+                    ),
+                    rusqlite::params![shell_threshold],
+                    |r| r.get(0),
+                )
+                .context("counting phase1 embeddable")?;
+
+            // RFC-019: node_embeddings lives in embed.db. ATTACH it to count
+            // embedded nodes. Return zeros when embed.db does not exist yet
+            // (before first sidecar reindex pass).
+            //
+            // SC-H3: EdbGuard ensures DETACH runs even on query failure, preventing
+            // "database edb already in use" from bricking the connection on next call.
+            struct EdbGuard<'g>(&'g rusqlite::Connection);
+            impl Drop for EdbGuard<'_> {
+                fn drop(&mut self) {
+                    let _ = self.0.execute_batch("DETACH DATABASE edb");
+                }
+            }
+
+            let (embedded, phase1_done) = self
+                .embed_db_path
+                .as_deref()
+                .filter(|p| p.exists())
+                .map(|embed_path| -> AnyResult<(i64, i64)> {
+                    let embed_path_str = embed_path
+                        .to_str()
+                        .context("embed.db path is not valid UTF-8")?;
+                    self.conn
+                        .execute_batch(&format!("ATTACH DATABASE '{embed_path_str}' AS edb"))
+                        .context("attaching embed.db")?;
+                    let _guard = EdbGuard(&self.conn); // DETACH on any early return
+                    let embedded: i64 = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
+                            rusqlite::params![model_id],
+                            |r| r.get(0),
+                        )
+                        .context("counting embedded nodes")?;
+                    let phase1_done: i64 = self
+                        .conn
+                        .query_row(
+                            &format!(
+                                "SELECT COUNT(*) FROM edb.node_embeddings ne \
+                                 JOIN nodes n ON ne.node_id = n.id \
+                                 WHERE ne.model_id = ?1 AND n.{KIND_FILTER} \
+                                 AND n.shell_number >= ?2"
+                            ),
+                            rusqlite::params![model_id, shell_threshold],
+                            |r| r.get(0),
+                        )
+                        .context("counting phase1 embedded")?;
+                    Ok((embedded, phase1_done))
+                    // _guard drops here → DETACH DATABASE edb
+                })
+                .transpose()?
+                .unwrap_or((0, 0));
+
+            Ok((
+                total_symbols as u64,
+                embedded as u64,
+                phase1_total as u64,
+                phase1_done as u64,
+            ))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }
@@ -1102,6 +1341,18 @@ impl SqliteStore {
     + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
            OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
     + (LENGTH(path) / 32)
+    + CASE kind
+        WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
+        WHEN 'class'       THEN 2 WHEN 'interface'   THEN 2 WHEN 'struct'      THEN 2
+        WHEN 'enum'        THEN 2 WHEN 'trait'       THEN 2 WHEN 'union'       THEN 2
+        WHEN 'constant'    THEN 3 WHEN 'static'      THEN 3
+        WHEN 'impl'        THEN 4 WHEN 'type'        THEN 4 WHEN 'module'      THEN 4
+        WHEN 'field'       THEN 6 WHEN 'var'         THEN 6 WHEN 'variable'    THEN 6
+        WHEN 'property'    THEN 6
+        WHEN 'import'      THEN 8 WHEN 'file-module' THEN 8 WHEN 'crate'       THEN 8
+        WHEN 'go-pkg'      THEN 10
+        ELSE 4
+      END
   ) AS rank
 FROM nodes
 WHERE signature LIKE '%' || ?1 || '%'
@@ -1230,6 +1481,48 @@ LIMIT 100",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Bulk-lookup nodes by signature strings. Returns `(id, signature, path)` triples.
+    /// Used by the daemon to resolve `UnresolvedCall`s emitted by Phase B.
+    pub fn nodes_by_signatures(
+        &self,
+        sigs: &[String],
+    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+        if sigs.is_empty() {
+            return Ok(Vec::new());
+        }
+        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+            let placeholders = sigs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, signature, path FROM nodes WHERE signature IN ({placeholders})"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("preparing nodes_by_signatures")?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                sigs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt
+                .query_map(params_vec.as_slice(), |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let sig: String = row.get(1)?;
+                    let path: String = row.get(2)?;
+                    Ok((id, sig, path))
+                })
+                .context("executing nodes_by_signatures")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding nodes_by_signatures row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Return all (src_path, dst_path) pairs via the two-hop import chain:
     /// any_node --[depends]--> import_node --[resolves-to]--> file.
     /// src_path is the path of the node making the import (any kind: file, function, etc.).
@@ -1316,6 +1609,91 @@ LIMIT 100",
     ///
     /// Uses a single prepared statement executed inside one transaction for speed.
     /// O(|shells|) writes — safe to call after every index pass.
+    /// Set `embed_text = NULL` for all nodes.
+    ///
+    /// Called before regenerating embed_text with a new richness tier (model switch).
+    pub fn clear_all_embed_texts(&mut self) -> Result<(), StoreError> {
+        self.conn
+            .execute_batch("UPDATE nodes SET embed_text = NULL")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Batch-update the `embed_text` column for a set of nodes.
+    ///
+    /// Called by the daemon after Phase A indexing to store pre-computed
+    /// AST-skeleton text so the embed sidecar stays a pure embedding machine.
+    pub fn write_embed_texts_batch(
+        &mut self,
+        pairs: &[(NodeId, String)],
+    ) -> Result<(), StoreError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        (|| -> AnyResult<()> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("begin write_embed_texts_batch tx")?;
+            {
+                let mut stmt = tx
+                    .prepare("UPDATE nodes SET embed_text = ?2 WHERE id = ?1")
+                    .context("preparing write_embed_texts_batch stmt")?;
+                for (id, text) in pairs {
+                    stmt.execute(params![node_id_to_i64(*id), text])
+                        .context("executing write_embed_texts_batch update")?;
+                }
+            }
+            tx.commit().context("committing write_embed_texts_batch tx")
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Return all nodes where `embed_text IS NULL` and the kind is embeddable
+    /// (i.e. excludes file/import/module/variable structural noise).
+    ///
+    /// Called by the daemon after Phase A to find nodes that need embed_text
+    /// populated via `skeleton_for_node`.
+    pub fn nodes_missing_embed_text(&self) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line \
+                 FROM nodes \
+                 WHERE embed_text IS NULL \
+                   AND kind NOT IN ('file', 'file-module', 'import', 'module', 'variable')",
+            ).context("preparing nodes_missing_embed_text query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing nodes_missing_embed_text query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding nodes_missing_embed_text row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn write_shell_numbers(&mut self, shells: &[(NodeId, u32)]) -> Result<(), StoreError> {
         if shells.is_empty() {
             return Ok(());
@@ -2237,7 +2615,7 @@ impl SqliteStore {
 
         // Step 3 — L2-A vocabulary-grounded expansion (RFC-012 A1).
         // Only fires on combined Step 1 + Step 2 miss.
-        (|| -> AnyResult<Vec<Node>> {
+        let step3 = (|| -> AnyResult<Vec<Node>> {
             let raw_str = tokenize_identifier(query);
             if raw_str.is_empty() {
                 return Ok(Vec::new());
@@ -2277,7 +2655,24 @@ impl SqliteStore {
             );
             Ok(step3)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        if !step3.is_empty() {
+            return Ok(step3);
+        }
+
+        // Step 4 — semantic ANN (RFC-018). Fires only when Steps 1–3 all return
+        // empty. The hook is injected by the daemon's EmbedSupervisor at store-open
+        // time; it is None by default (zero cost — no embed plugin installed).
+        if let Some(knn_fn) = self.embed_knn_hook.as_ref() {
+            let pairs = knn_fn(query, 20)?;
+            if !pairs.is_empty() {
+                tracing::debug!(layer = "embed_ann", nodes_returned = pairs.len());
+                let ids: Vec<NodeId> = pairs.into_iter().map(|(id, _score)| id).collect();
+                return self.get_nodes(&ids);
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// Execute a raw FTS5 MATCH expression against the nodes index.
@@ -2321,6 +2716,365 @@ impl SqliteStore {
             out.push(row.context("decoding FTS5 row")?);
         }
         Ok(out)
+    }
+
+    /// Language-scoped variant of [`search_nodes_by_name`].
+    /// Appends `AND language = ?2` so only nodes from the requested language
+    /// are returned, before the 100-row LIMIT.
+    fn search_nodes_by_name_with_lang(
+        &self,
+        name: &str,
+        lang: &str,
+    ) -> Result<Vec<Node>, StoreError> {
+        let _span =
+            tracing::debug_span!("store.search_nodes_by_name_with_lang", query = name, lang)
+                .entered();
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line,
+  (
+    CASE
+      WHEN signature = ?1 THEN 0
+      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 THEN 10
+      WHEN signature LIKE ?1 || '%' THEN 20
+      WHEN path = ?1 THEN 5
+      WHEN path LIKE '%/' || ?1 THEN 15
+      ELSE 40
+    END
+    + CASE WHEN path LIKE '%_test.go' OR path LIKE '%test/%'
+           OR path LIKE '%.test.%' OR path LIKE '%_test.%'
+           OR path LIKE 'tests/%' OR path LIKE '%/tests/%' THEN 25 ELSE 0 END
+    + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
+           OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
+    + (LENGTH(path) / 32)
+    + CASE kind
+        WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
+        WHEN 'class'       THEN 2 WHEN 'interface'   THEN 2 WHEN 'struct'      THEN 2
+        WHEN 'enum'        THEN 2 WHEN 'trait'       THEN 2 WHEN 'union'       THEN 2
+        WHEN 'constant'    THEN 3 WHEN 'static'      THEN 3
+        WHEN 'impl'        THEN 4 WHEN 'type'        THEN 4 WHEN 'module'      THEN 4
+        WHEN 'field'       THEN 6 WHEN 'var'         THEN 6 WHEN 'variable'    THEN 6
+        WHEN 'property'    THEN 6
+        WHEN 'import'      THEN 8 WHEN 'file-module' THEN 8 WHEN 'crate'       THEN 8
+        WHEN 'go-pkg'      THEN 10
+        ELSE 4
+      END
+  ) AS rank
+FROM nodes
+WHERE (signature LIKE '%' || ?1 || '%'
+   OR path LIKE '%' || ?1 || '%')
+  AND language = ?2
+ORDER BY rank ASC, id ASC
+LIMIT 100",
+                )
+                .context("preparing lang-filtered search query")?;
+            let rows = stmt
+                .query_map(params![name, lang], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing lang-filtered search query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding search row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// FTS5 query that returns `(Node, bm25_score)` pairs.
+    ///
+    /// SQLite `bm25()` is negated so higher scores mean better matches (positive = good).
+    /// Typical range: 0.05 (weak) to 5.0+ (strong match on a small corpus).
+    fn fts_query_nodes_scored(&self, match_expr: &str) -> AnyResult<Vec<(Node, f32)>> {
+        let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                          n.kind, n.package, n.line, n.end_line, -bm25(nodes_fts) \
+                   FROM nodes_fts \
+                   JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
+                   JOIN nodes n ON n.id = m.node_id \
+                   WHERE nodes_fts MATCH ?1 \
+                   ORDER BY bm25(nodes_fts) \
+                   LIMIT 50";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("preparing scored FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                let bm25: f64 = row.get(10).unwrap_or(0.0);
+                Ok((
+                    Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    },
+                    bm25 as f32,
+                ))
+            })
+            .context("executing scored FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding scored FTS5 row")?);
+        }
+        Ok(out)
+    }
+
+    /// Scored variant of [`search_nodes_fuzzy`]: returns `(Node, score)` pairs where
+    /// score is a positive relevance float (higher = better).
+    ///
+    /// Step 1 (exact substring) assigns descending rank scores [1.0, 0.9, …].
+    /// Step 2 (FTS5 BM25) returns the raw `-bm25()` values.
+    /// Step 3 (L2-A expansion fallback) assigns a fixed floor score of 0.25.
+    pub fn search_nodes_fuzzy_scored(&self, query: &str) -> Result<Vec<(Node, f32)>, StoreError> {
+        let _span = tracing::debug_span!("store.search_nodes_fuzzy_scored", query).entered();
+
+        // Step 1 — exact substring match (never regresses, TL3).
+        let exact = self.search_nodes_by_name(query)?;
+        if !exact.is_empty() {
+            let len = exact.len() as f32;
+            return Ok(exact
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let score = (1.0f32 - (i as f32 / (len + 1.0))).max(0.1);
+                    (n, score)
+                })
+                .collect());
+        }
+
+        // Step 2 — FTS5 BM25.
+        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
+            Some(e) => e,
+            None => {
+                // All tokens < 3 chars — fall through to step3.
+                return Ok(self
+                    .search_nodes_fuzzy(query)?
+                    .into_iter()
+                    .map(|n| (n, 0.25f32))
+                    .collect());
+            }
+        };
+        let step2 = self
+            .fts_query_nodes_scored(&step2_expr)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !step2.is_empty() {
+            return Ok(step2);
+        }
+
+        // Step 3 — L2-A expansion via the existing unscored path; assign floor score.
+        Ok(self
+            .search_nodes_fuzzy(query)?
+            .into_iter()
+            .map(|n| (n, 0.25f32))
+            .collect())
+    }
+
+    /// Returns the count of nodes whose `signature` contains `token` as a substring.
+    ///
+    /// Used as IDF denominator for per-token anchor specificity: high `freq` means
+    /// the token is generic ("get", "run") and should contribute low weight even when
+    /// it matches a real symbol.
+    pub fn symbol_frequency(&self, token: &str) -> Result<usize, StoreError> {
+        (|| -> AnyResult<usize> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT COUNT(*) FROM nodes WHERE signature LIKE '%' || ?1 || '%'")?;
+            let count: i64 = stmt.query_row(params![token], |r| r.get(0))?;
+            Ok(count.max(0) as usize)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Returns the total number of nodes in the graph.
+    ///
+    /// Used as the IDF corpus size N in `idf_weight(freq, N)`.
+    pub fn total_node_count(&self) -> Result<usize, StoreError> {
+        (|| -> AnyResult<usize> {
+            let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM nodes")?;
+            let count: i64 = stmt.query_row([], |r| r.get(0))?;
+            Ok(count.max(0) as usize)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Language-scoped variant of [`fts_query_nodes`].
+    /// Appends `AND n.language = ?2` before the 50-row FTS LIMIT.
+    fn fts_query_nodes_with_lang(&self, match_expr: &str, lang: &str) -> AnyResult<Vec<Node>> {
+        let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                          n.kind, n.package, n.line, n.end_line \
+                   FROM nodes_fts \
+                   JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
+                   JOIN nodes n ON n.id = m.node_id \
+                   WHERE nodes_fts MATCH ?1 \
+                     AND n.language = ?2 \
+                   ORDER BY bm25(nodes_fts) \
+                   LIMIT 50";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("preparing lang-filtered FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr, lang], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                Ok(Node {
+                    id,
+                    vname,
+                    kind,
+                    package,
+                    line: line.and_then(|l| u32::try_from(l).ok()),
+                    end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                })
+            })
+            .context("executing lang-filtered FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding lang-filtered FTS5 row")?);
+        }
+        Ok(out)
+    }
+
+    /// Language-filtered variant of [`search_nodes_fuzzy`].
+    ///
+    /// When `lang_filter` is `None`, delegates to [`search_nodes_fuzzy`] unchanged.
+    /// When `Some(lang)`, each of the 4 search steps applies `AND language = ?`
+    /// at the SQL level — before the 50-result FTS cap — guaranteeing results
+    /// are from the requested language only.
+    pub fn search_nodes_fuzzy_filtered(
+        &self,
+        query: &str,
+        lang_filter: Option<&str>,
+    ) -> Result<Vec<Node>, StoreError> {
+        let lang = match lang_filter {
+            None => return self.search_nodes_fuzzy(query),
+            Some(l) => l,
+        };
+        let _span =
+            tracing::debug_span!("store.search_nodes_fuzzy_filtered", query, lang).entered();
+
+        // Step 1 — exact substring, language-filtered.
+        let exact = self.search_nodes_by_name_with_lang(query, lang)?;
+        if !exact.is_empty() {
+            tracing::debug!(layer = "exact_lang", nodes_returned = exact.len());
+            return Ok(exact);
+        }
+
+        // Step 2 — FTS5, language-filtered.
+        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+        let step2 = self
+            .fts_query_nodes_with_lang(&step2_expr, lang)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !step2.is_empty() {
+            tracing::debug!(layer = "fts5_t0_lang", nodes_returned = step2.len());
+            return Ok(step2);
+        }
+
+        // Step 3 — L2-A expansion, language-filtered.
+        let step3 = (|| -> AnyResult<Vec<Node>> {
+            let raw_str = tokenize_identifier(query);
+            if raw_str.is_empty() {
+                return Ok(Vec::new());
+            }
+            let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
+            let t0_tokens = crate::seed_lexicon::expand_tokens(&raw);
+            let l2a_extra = self.expand_query(&t0_tokens)?;
+            if l2a_extra.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut arms: Vec<String> = t0_tokens;
+            for c in l2a_extra {
+                if arms.len() >= 16 {
+                    break;
+                }
+                if !arms.iter().any(|t| t == &c) {
+                    arms.push(c);
+                }
+            }
+            arms.sort();
+            arms.truncate(16);
+            let match_expr = arms
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            self.fts_query_nodes_with_lang(&match_expr, lang)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !step3.is_empty() {
+            tracing::debug!(layer = "fts5_l2a_lang", nodes_returned = step3.len());
+            return Ok(step3);
+        }
+
+        // Step 4 — embed ANN + post-filter by language.
+        if let Some(knn_fn) = self.embed_knn_hook.as_ref() {
+            let pairs = knn_fn(query, 20)?;
+            if !pairs.is_empty() {
+                let ids: Vec<NodeId> = pairs.into_iter().map(|(id, _score)| id).collect();
+                let nodes = self.get_nodes(&ids)?;
+                let filtered: Vec<Node> = nodes
+                    .into_iter()
+                    .filter(|n| n.vname.language == lang)
+                    .collect();
+                if !filtered.is_empty() {
+                    tracing::debug!(layer = "embed_ann_lang", nodes_returned = filtered.len());
+                    return Ok(filtered);
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// L2-A: vocabulary-grounded token expansion (RFC-012 A1 Step 3).
@@ -2705,6 +3459,55 @@ impl SqliteStore {
         tx.commit()?;
         tracing::info!("RFC-012 A2 F1: fts_synonyms reset to static defaults");
         Ok(())
+    }
+
+    /// SC-H1: cap the `node_tombstones` table so it cannot grow unbounded.
+    ///
+    /// Tombstones are at-least-once: the embed sidecar consumes and acks them
+    /// on each reindex pass. If the sidecar is offline for a long time (or the
+    /// table is never consumed) the table accumulates indefinitely. This GC
+    /// trims in two passes:
+    ///
+    /// 1. Delete rows older than `max_age_secs` (default 7 days). After a
+    ///    full init_repo the sidecar rebuilds all embeddings from scratch, so
+    ///    any tombstone older than one full cycle is redundant.
+    /// 2. If the table still has > `max_rows` rows after the age trim, keep
+    ///    only the newest `max_rows` (the embed sidecar re-derives stale
+    ///    entries on the next full reindex).
+    ///
+    /// Consistency window: tombstones between the GC cut-off and sidecar ack
+    /// may be missed. Acceptable because a full init_repo rebuild covers any
+    /// gap. Document this as "eventual" rather than "guaranteed once".
+    pub fn prune_tombstones(&mut self, max_age_secs: u64, max_rows: u64) -> anyhow::Result<u64> {
+        let tx = self.conn.transaction()?;
+        let cutoff = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64)
+            - max_age_secs as i64;
+        let aged = tx.execute(
+            "DELETE FROM node_tombstones WHERE deleted_at < ?1",
+            rusqlite::params![cutoff],
+        )? as u64;
+
+        // Count remaining rows.
+        let remaining: i64 =
+            tx.query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))?;
+        let size_pruned = if remaining as u64 > max_rows {
+            tx.execute(
+                "DELETE FROM node_tombstones WHERE rowid NOT IN \
+                 (SELECT rowid FROM node_tombstones ORDER BY deleted_at DESC LIMIT ?1)",
+                rusqlite::params![max_rows as i64],
+            )? as u64
+        } else {
+            0
+        };
+        tx.commit()?;
+        let total = aged + size_pruned;
+        if total > 0 {
+            tracing::debug!(aged, size_pruned, "pruned node_tombstones");
+        }
+        Ok(total)
     }
 }
 

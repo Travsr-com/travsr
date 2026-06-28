@@ -11,6 +11,14 @@ use travsr_mcp::query::{self, AskPayload};
 use crate::daemon_client;
 use crate::repo::find_git_root;
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable table (default)
+    Table,
+    /// Machine-readable JSON — emits the full AskPayload
+    Json,
+}
+
 #[derive(Tabled)]
 struct Row {
     #[tabled(rename = "Kind")]
@@ -23,7 +31,10 @@ struct Row {
     score: String,
 }
 
-pub fn run(query_str: &str) -> anyhow::Result<()> {
+pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
+    if query_str.trim().is_empty() {
+        anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
+    }
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
     let db_path = repo_root.join(".travsr/graph.db");
@@ -39,10 +50,22 @@ pub fn run(query_str: &str) -> anyhow::Result<()> {
     ) {
         Some(p) => p,
         None => {
-            let store = daemon_client::open_read_store(&db_path)?;
-            query::ask_query(&store, query_str)?
+            let mut store = daemon_client::open_read_store(&db_path)?;
+            // Best-effort: load HNSW embed hook for cold-path KNN. Falls back to
+            // FTS-only if the sidecar binary is absent or the index is not built.
+            travsr_daemon::try_inject_embed_hook_readonly(&mut store, &db_path);
+            let knn = store.embed_knn_fn();
+            let knn_ref = knn
+                .as_ref()
+                .map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
+            query::ask_query(&store, query_str, knn_ref)?
         }
     };
+
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(());
+    }
 
     // Match the pre-#318 messages exactly (query echoed after `:`-stripping).
     let display_query = query_str.strip_prefix(':').unwrap_or(query_str).trim();
@@ -61,13 +84,21 @@ pub fn run(query_str: &str) -> anyhow::Result<()> {
         .map(|r| Row {
             kind: r.kind,
             signature: r.signature,
-            path: r.path,
+            path: match r.line {
+                Some(l) => format!("{}:{}", r.path, l),
+                None => r.path,
+            },
             score: format!("{:.3}", r.score),
         })
         .collect();
 
     let n = rows.len();
     println!("{}", Table::new(rows));
-    println!("\n{n} nodes · ~{} tokens", payload.total_tokens);
+    let embed_note = if payload.embed_used {
+        " · [embed-enhanced]"
+    } else {
+        ""
+    };
+    println!("\n{n} nodes · ~{} tokens{embed_note}", payload.total_tokens);
     Ok(())
 }

@@ -14,10 +14,6 @@ default = []
 # from source (requires CMake + a C++ toolchain). Off by default so that
 # normal `cargo build/test` is unaffected by the heavy compile step.
 kuzu = ["dep:kuzu"]
-# Opt-in local ONNX embeddings (RFC-012 A2 F2). Adds ~30 MB to the release
-# binary and requires a separate `travsr embed init` model download (~100 MB).
-# The TL2 CI gate enforces zero embedding deps in the default build.
-embeddings = []
 
 [dependencies]
 travsr-error = { workspace = true }
@@ -30,6 +26,7 @@ sha2        = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 kuzu        = { version = "0.11", optional = true }
+fs2         = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -123,6 +123,10 @@ pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
 }
 
 fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::Result<()> {
+    // L12: tell the user their budget is unlimited so they know no truncation will happen.
+    if budget == 0 {
+        eprintln!("token budget: unlimited");
+    }
     // #318 O6: token budget — prefix of BFS order, seed always kept.
     let truncated = query::apply_token_budget(&mut payload, budget);
 

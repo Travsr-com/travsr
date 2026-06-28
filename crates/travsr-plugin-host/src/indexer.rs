@@ -22,9 +22,15 @@ pub struct PhaseBOutcome {
     /// `travsr lang add <lang>`.
     pub skipped_no_analyzer: Vec<String>,
     pub skipped_unregistered: Vec<String>,
+    /// Languages registered as RequiresElevated but lacking a PSE approval
+    /// entry in lang.toml. User-actionable: `travsr lang approve <lang>`.
+    pub skipped_needs_approval: Vec<String>,
     /// Languages whose analyzer was found and spawned but died or errored
     /// mid-invoke.
     pub crashed: Vec<String>,
+    /// Languages whose sidecar binary responded with a mismatched protocol
+    /// version. User-actionable: `travsr lang install <lang>` to upgrade.
+    pub version_mismatch: Vec<(String, u32, u32)>,
 }
 
 /// Inputs for [`PluginIndexer::invoke_phase_b_all`].
@@ -132,6 +138,7 @@ impl PluginIndexer {
         Vec<travsr_core::Node>,
         Vec<travsr_core::Edge>,
         Vec<travsr_core::ScipRef>,
+        Vec<travsr_core::UnresolvedCall>,
         PhaseBOutcome,
     ) {
         let repo_root = inputs.repo_root;
@@ -153,15 +160,22 @@ impl PluginIndexer {
             .map(String::from)
             .collect();
 
+        // H5: collect needs_approval before boxing so we can surface it in outcome.
+        let catalog = crate::resolver::CatalogResolver::new();
+        let needs_approval_langs: Vec<String> = catalog.needs_approval().to_vec();
+
         let resolver = crate::resolver::CompositeResolver::new(vec![
             Box::new(crate::resolver::BuiltinResolver::new(
                 current_exe,
                 builtin_langs,
             )),
-            Box::new(crate::resolver::CatalogResolver::new()),
+            Box::new(catalog),
         ]);
 
-        let mut outcome = PhaseBOutcome::default();
+        let mut outcome = PhaseBOutcome {
+            skipped_needs_approval: needs_approval_langs,
+            ..Default::default()
+        };
 
         let providable = resolver.providable_languages();
         tracing::debug!(
@@ -176,6 +190,13 @@ impl PluginIndexer {
         enum LangWork {
             /// Dart AOT emitter: run in-process (avoids nested-subprocess SIGABRT).
             Dart,
+            /// Rust: run in-process (PATH-independent; avoids daemon PATH stripping
+            /// that silently prevents rust-analyzer from being found via sidecar).
+            NativeRust,
+            /// TypeScript: run in-process for same reason as NativeRust.
+            NativeTypescript,
+            /// Python: run in-process for same reason as NativeRust.
+            NativePython,
             /// All other languages: spawn a sidecar subprocess.
             Sidecar(crate::resolver::PluginSpec),
         }
@@ -253,6 +274,38 @@ impl PluginIndexer {
                 continue;
             }
 
+            // Builtin languages (rust, typescript, javascript, python) ship inside
+            // the travsr binary. Run them in-process so that:
+            // (a) rust-analyzer is found via $HOME/.cargo/bin even when the daemon's
+            //     PATH has been stripped to /usr/bin:/bin (background fork — #XXX).
+            // (b) We avoid spawning a sidecar subprocess whose ENV_ALLOWLIST only
+            //     forwards the already-stripped PATH, silently preventing LSIF
+            //     enrichment for Rust.
+            if lang == "rust" {
+                work_items.push(WorkItem {
+                    lang,
+                    work: LangWork::NativeRust,
+                    files: lang_files("rust"),
+                });
+                continue;
+            }
+            if lang == "typescript" || lang == "javascript" {
+                work_items.push(WorkItem {
+                    lang: lang.clone(),
+                    work: LangWork::NativeTypescript,
+                    files: lang_files(&lang),
+                });
+                continue;
+            }
+            if lang == "python" {
+                work_items.push(WorkItem {
+                    lang,
+                    work: LangWork::NativePython,
+                    files: lang_files("python"),
+                });
+                continue;
+            }
+
             match resolver.resolve(&lang) {
                 Some(spec) => {
                     tracing::debug!(lang = %lang, program = %spec.program, "Phase B: resolved spec");
@@ -276,9 +329,13 @@ impl PluginIndexer {
             nodes: Vec<travsr_core::Node>,
             edges: Vec<travsr_core::Edge>,
             refs: Vec<travsr_core::ScipRef>,
+            unresolved_calls: Vec<travsr_core::UnresolvedCall>,
             ran: bool,
             skipped_no_analyzer: bool,
             crashed: bool,
+            /// Some((expected, got)) when the sidecar binary's protocol version
+            /// does not match the daemon's PROTOCOL_VERSION.
+            version_mismatch: Option<(u32, u32)>,
         }
 
         // P2: fan out per-language work in parallel. Each thread owns its work
@@ -306,9 +363,11 @@ impl PluginIndexer {
                                             nodes,
                                             edges,
                                             refs: Vec::new(),
+                                            unresolved_calls: Vec::new(),
                                             ran: true,
                                             skipped_no_analyzer: false,
                                             crashed: false,
+                                            version_mismatch: None,
                                         }
                                     }
                                     Err(e) => {
@@ -320,14 +379,219 @@ impl PluginIndexer {
                                             nodes: Vec::new(),
                                             edges: Vec::new(),
                                             refs: Vec::new(),
+                                            unresolved_calls: Vec::new(),
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
+                                            version_mismatch: None,
                                         }
                                     }
                                 }
                             }
+                            LangWork::NativeRust => {
+                                use travsr_indexer::sandbox::SandboxConfig;
+                                // Convert pre-walked relative paths to (abs, vname) pairs.
+                                let files_owned: Option<Vec<(std::path::PathBuf, String)>> =
+                                    item.files.as_ref().map(|rel| {
+                                        rel.iter()
+                                            .map(|r| (repo_root.join(r), r.clone()))
+                                            .collect()
+                                    });
+                                let (mut nodes, mut edges, mut unresolved_calls) =
+                                    travsr_indexer::phase_b_native_rust(
+                                        corpus,
+                                        repo_root,
+                                        files_owned.as_deref(),
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("rust native phase_b: {e}");
+                                        (vec![], vec![], vec![])
+                                    });
+                                tracing::debug!(
+                                    nodes = nodes.len(),
+                                    edges = edges.len(),
+                                    unresolved_calls = unresolved_calls.len(),
+                                    "Phase B: native rust complete"
+                                );
+                                // LSIF enrichment via rust-analyzer — uses $HOME/.cargo/bin
+                                // fallback so it works even when daemon PATH is stripped.
+                                let cfg = SandboxConfig {
+                                    repo_root: repo_root.to_path_buf(),
+                                    ..Default::default()
+                                };
+                                match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
+                                    Ok(Some(dump)) => {
+                                        match travsr_indexer::ingest_rust(&dump, corpus) {
+                                            Ok(lsif_out) => {
+                                                tracing::debug!(
+                                                    nodes = lsif_out.nodes.len(),
+                                                    edges = lsif_out.edges.len(),
+                                                    "Phase B: rust lsif enrichment merged"
+                                                );
+                                                nodes.extend(lsif_out.nodes);
+                                                edges.extend(lsif_out.edges);
+                                            }
+                                            Err(e) => tracing::warn!("rust lsif ingest: {e}"),
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        tracing::debug!(
+                                            "rust-analyzer not available — native phase_b only"
+                                        )
+                                    }
+                                    Err(e) => tracing::warn!("rust-analyzer failed: {e}"),
+                                }
+                                nodes.sort_unstable_by_key(|n| n.id);
+                                nodes.dedup_by_key(|n| n.id);
+                                edges.sort_unstable_by_key(|e| (e.src, e.dst));
+                                edges
+                                    .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                unresolved_calls.sort_unstable_by(|a, b| {
+                                    a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig))
+                                });
+                                unresolved_calls
+                                    .dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+                                LangResult {
+                                    lang,
+                                    nodes,
+                                    edges,
+                                    refs: Vec::new(),
+                                    unresolved_calls,
+                                    ran: true,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
+                                }
+                            }
+                            LangWork::NativeTypescript => {
+                                let files_owned: Option<Vec<(std::path::PathBuf, String)>> =
+                                    item.files.as_ref().map(|rel| {
+                                        rel.iter()
+                                            .map(|r| (repo_root.join(r), r.clone()))
+                                            .collect()
+                                    });
+                                let (mut nodes, mut edges) =
+                                    travsr_indexer::phase_b_native_typescript(
+                                        corpus,
+                                        repo_root,
+                                        files_owned.as_deref(),
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("ts native phase_b: {e}");
+                                        (vec![], vec![])
+                                    });
+                                tracing::debug!(
+                                    nodes = nodes.len(),
+                                    edges = edges.len(),
+                                    "Phase B: native typescript complete"
+                                );
+                                // LSIF enrichment via travsr-lsif-ts when tsconfig.json exists.
+                                let tsconfig = repo_root.join("tsconfig.json");
+                                if tsconfig.exists() {
+                                    match travsr_indexer::run_lsif_emitter(&tsconfig) {
+                                        Ok(dump) => {
+                                            match travsr_indexer::ingest_lsif(&dump, corpus) {
+                                                Ok(lsif_out) => {
+                                                    tracing::debug!(
+                                                        nodes = lsif_out.nodes.len(),
+                                                        edges = lsif_out.edges.len(),
+                                                        "Phase B: ts lsif enrichment merged"
+                                                    );
+                                                    nodes.extend(lsif_out.nodes);
+                                                    edges.extend(lsif_out.edges);
+                                                }
+                                                Err(e) => tracing::warn!("ts lsif ingest: {e}"),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!("ts lsif emitter not available: {e}")
+                                        }
+                                    }
+                                }
+                                nodes.sort_unstable_by_key(|n| n.id);
+                                nodes.dedup_by_key(|n| n.id);
+                                edges.sort_unstable_by_key(|e| (e.src, e.dst));
+                                edges
+                                    .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                LangResult {
+                                    lang,
+                                    nodes,
+                                    edges,
+                                    refs: Vec::new(),
+                                    unresolved_calls: Vec::new(),
+                                    ran: true,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
+                                }
+                            }
+                            LangWork::NativePython => {
+                                let files_owned: Option<Vec<(std::path::PathBuf, String)>> =
+                                    item.files.as_ref().map(|rel| {
+                                        rel.iter()
+                                            .map(|r| (repo_root.join(r), r.clone()))
+                                            .collect()
+                                    });
+                                let (mut nodes, mut edges) =
+                                    travsr_indexer::phase_b_native_python(
+                                        corpus,
+                                        repo_root,
+                                        files_owned.as_deref(),
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("python native phase_b: {e}");
+                                        (vec![], vec![])
+                                    });
+                                tracing::debug!(
+                                    nodes = nodes.len(),
+                                    edges = edges.len(),
+                                    "Phase B: native python complete"
+                                );
+                                // LSIF enrichment via travsr-lsif-py (bundled, PATH-independent).
+                                // travsr-lsif-py resolves via current_exe walk-up so it works
+                                // even when the daemon's PATH has been stripped by the OS.
+                                match travsr_indexer::run_lsif_py_emitter(repo_root) {
+                                    Ok(Some(dump)) => {
+                                        match travsr_indexer::ingest_lsif(&dump, corpus) {
+                                            Ok(lsif_out) => {
+                                                tracing::debug!(
+                                                    nodes = lsif_out.nodes.len(),
+                                                    edges = lsif_out.edges.len(),
+                                                    "Phase B: python lsif enrichment merged"
+                                                );
+                                                nodes.extend(lsif_out.nodes);
+                                                edges.extend(lsif_out.edges);
+                                            }
+                                            Err(e) => tracing::warn!("python lsif ingest: {e}"),
+                                        }
+                                    }
+                                    Ok(None) => tracing::debug!(
+                                        "travsr-lsif-py not found — native phase_b tree-sitter edges only"
+                                    ),
+                                    Err(e) => tracing::warn!("travsr-lsif-py failed: {e}"),
+                                }
+                                nodes.sort_unstable_by_key(|n| n.id);
+                                nodes.dedup_by_key(|n| n.id);
+                                edges.sort_unstable_by_key(|e| (e.src, e.dst));
+                                edges
+                                    .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                LangResult {
+                                    lang,
+                                    nodes,
+                                    edges,
+                                    refs: Vec::new(),
+                                    unresolved_calls: Vec::new(),
+                                    ran: true,
+                                    skipped_no_analyzer: false,
+                                    crashed: false,
+                                    version_mismatch: None,
+                                }
+                            }
                             LangWork::Sidecar(spec) => {
+                                // C1: per-language timeout — kill the child if it doesn't
+                                // respond within TIMEOUT_SECS. Prevents KLS/sbt hangs from
+                                // starving the Tokio blocking thread pool indefinitely.
+                                const TIMEOUT_SECS: u64 = 300; // 5 min
                                 let req = travsr_plugin_protocol::InvokeRequest {
                                     root: repo_root.to_path_buf(),
                                     corpus: corpus.to_string(),
@@ -338,7 +602,26 @@ impl PluginIndexer {
                                 };
                                 match crate::transport::Sidecar::spawn(&spec, repo_root) {
                                     Ok(sidecar) => {
-                                        match crate::transport::Transport::invoke_phase_b(
+                                        // Watchdog: kills the child after TIMEOUT_SECS so the
+                                        // blocking thread never hangs indefinitely.
+                                        let pid = sidecar.child_pid();
+                                        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                        let done_wg = std::sync::Arc::clone(&done);
+                                        let lang_wg = lang.clone();
+                                        std::thread::spawn(move || {
+                                            std::thread::sleep(std::time::Duration::from_secs(TIMEOUT_SECS));
+                                            if !done_wg.load(std::sync::atomic::Ordering::SeqCst) {
+                                                tracing::warn!(
+                                                    lang = %lang_wg,
+                                                    timeout_secs = TIMEOUT_SECS,
+                                                    "Phase B timeout — killing sidecar"
+                                                );
+                                                if let Some(p) = pid {
+                                                    sidecar_kill(p);
+                                                }
+                                            }
+                                        });
+                                        let result = match crate::transport::Transport::invoke_phase_b(
                                             &sidecar, req,
                                         ) {
                                             Ok(resp) => {
@@ -347,6 +630,7 @@ impl PluginIndexer {
                                                     nodes = resp.nodes.len(),
                                                     edges = resp.edges.len(),
                                                     refs = resp.refs.len(),
+                                                    unresolved_calls = resp.unresolved_calls.len(),
                                                     "Phase B: invoke complete"
                                                 );
                                                 LangResult {
@@ -354,9 +638,11 @@ impl PluginIndexer {
                                                     nodes: resp.nodes,
                                                     edges: resp.edges,
                                                     refs: resp.refs,
+                                                    unresolved_calls: resp.unresolved_calls,
                                                     ran: true,
                                                     skipped_no_analyzer: false,
                                                     crashed: false,
+                                                    version_mismatch: None,
                                                 }
                                             }
                                             Err(travsr_error::IndexError::PhaseNotSupported) => {
@@ -369,9 +655,36 @@ impl PluginIndexer {
                                                     nodes: Vec::new(),
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
+                                                    unresolved_calls: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: true,
                                                     crashed: false,
+                                                    version_mismatch: None,
+                                                }
+                                            }
+                                            // H4: version mismatch is actionable — surface it
+                                            // separately from generic crashes so the user knows
+                                            // to run `travsr lang install <lang>` to upgrade.
+                                            Err(travsr_error::IndexError::ProtocolVersionMismatch {
+                                                expected,
+                                                got,
+                                            }) => {
+                                                tracing::warn!(
+                                                    lang = %lang,
+                                                    expected,
+                                                    got,
+                                                    "Phase B: protocol version mismatch — run `travsr lang install {lang}` to upgrade"
+                                                );
+                                                LangResult {
+                                                    lang,
+                                                    nodes: Vec::new(),
+                                                    edges: Vec::new(),
+                                                    refs: Vec::new(),
+                                                    unresolved_calls: Vec::new(),
+                                                    ran: false,
+                                                    skipped_no_analyzer: false,
+                                                    crashed: false,
+                                                    version_mismatch: Some((expected, got)),
                                                 }
                                             }
                                             Err(e) => {
@@ -381,12 +694,16 @@ impl PluginIndexer {
                                                     nodes: Vec::new(),
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
+                                                    unresolved_calls: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: false,
                                                     crashed: true,
+                                                    version_mismatch: None,
                                                 }
                                             }
-                                        }
+                                        };
+                                        done.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        result
                                     }
                                     Err(e) => {
                                         // Resolver confirmed the binary exists — spawn failure is a crash.
@@ -396,9 +713,11 @@ impl PluginIndexer {
                                             nodes: Vec::new(),
                                             edges: Vec::new(),
                                             refs: Vec::new(),
+                                            unresolved_calls: Vec::new(),
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
+                                            version_mismatch: None,
                                         }
                                     }
                                 }
@@ -417,9 +736,11 @@ impl PluginIndexer {
                         nodes: Vec::new(),
                         edges: Vec::new(),
                         refs: Vec::new(),
+                        unresolved_calls: Vec::new(),
                         ran: false,
                         skipped_no_analyzer: false,
                         crashed: true,
+                        version_mismatch: None,
                     })
                 })
                 .collect()
@@ -433,10 +754,13 @@ impl PluginIndexer {
         let mut all_nodes: Vec<travsr_core::Node> = Vec::new();
         let mut all_edges: Vec<travsr_core::Edge> = Vec::new();
         let mut all_refs: Vec<travsr_core::ScipRef> = Vec::new();
+        let mut all_unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
 
         for r in lang_results {
             if r.ran {
                 outcome.ran.push(r.lang);
+            } else if let Some((expected, got)) = r.version_mismatch {
+                outcome.version_mismatch.push((r.lang, expected, got));
             } else if r.skipped_no_analyzer {
                 outcome.skipped_no_analyzer.push(r.lang);
             } else if r.crashed {
@@ -445,6 +769,7 @@ impl PluginIndexer {
             all_nodes.extend(r.nodes);
             all_edges.extend(r.edges);
             all_refs.extend(r.refs);
+            all_unresolved.extend(r.unresolved_calls);
         }
 
         // Secondary sort within each language's contribution for full determinism.
@@ -463,7 +788,11 @@ impl PluginIndexer {
                 .then(a.callee_id.0.cmp(&b.callee_id.0))
         });
 
-        (all_nodes, all_edges, all_refs, outcome)
+        all_unresolved
+            .sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
+        all_unresolved.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+
+        (all_nodes, all_edges, all_refs, all_unresolved, outcome)
     }
 
     /// Resolve cross-language FFI edges from accumulated markers.
@@ -474,6 +803,15 @@ impl PluginIndexer {
     ) -> Vec<travsr_core::Edge> {
         travsr_indexer::Indexer::with_corpus(&self.corpus).resolve_ffi_edges(markers)
     }
+}
+
+/// C1: SIGTERM a sidecar process by OS PID when the per-language watchdog fires.
+/// Uses a shell `kill` invocation to avoid adding `libc` as a dependency.
+/// Best-effort — if the process already exited, this is a no-op.
+fn sidecar_kill(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
 }
 
 #[cfg(test)]
@@ -529,10 +867,14 @@ mod tests {
             present_languages: ["__no_such_lang__".to_string()].into_iter().collect(),
             indexable_paths: &[],
         };
-        let (nodes, edges, refs, outcome) = indexer.invoke_phase_b_all(&inputs);
+        let (nodes, edges, refs, unresolved, outcome) = indexer.invoke_phase_b_all(&inputs);
         assert!(nodes.is_empty(), "expected no nodes when all langs absent");
         assert!(edges.is_empty(), "expected no edges when all langs absent");
         assert!(refs.is_empty(), "expected no refs when all langs absent");
+        assert!(
+            unresolved.is_empty(),
+            "expected no unresolved when all langs absent"
+        );
         // skipped_not_in_repo OR skipped_unregistered should account for every lang
         let total_skipped = outcome.skipped_not_in_repo.len() + outcome.skipped_unregistered.len();
         assert!(
@@ -553,8 +895,8 @@ mod tests {
             present_languages: HashSet::new(), // no gating
             indexable_paths: &[],
         };
-        let (_, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
-        let (_, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);
+        let (_, _, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
+        let (_, _, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);
         assert_eq!(
             outcome1.skipped_not_in_repo, outcome2.skipped_not_in_repo,
             "skipped_not_in_repo must be deterministic across runs"

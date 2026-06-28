@@ -137,6 +137,19 @@ impl PhaseBScheduler {
     pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
+
+    /// Whether a Phase B run is currently in flight.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// Whether a Phase B run is armed and waiting for its debounce window.
+    pub fn is_pending(&self) -> bool {
+        self.dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
 }
 
 #[cfg(test)]

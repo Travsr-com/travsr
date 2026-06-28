@@ -34,7 +34,7 @@ pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{ingest_rust, ingest_rust_raw, ingest_scip};
 pub use ra_runner::run_ra_lsif;
-pub use runner::{run_lsif_emitter, run_scip_python};
+pub use runner::{run_lsif_emitter, run_lsif_py_emitter, run_scip_python};
 pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
@@ -82,13 +82,20 @@ pub fn phase_b_native_dart(
 /// Native Phase B for Rust: Cargo.toml dep graph + tree-sitter call edges.
 /// Zero external-tool downloads. LSIF enrichment is merged by the caller.
 ///
+/// Returns `(nodes, edges, unresolved_calls)`. Cross-crate bare calls are in
+/// `unresolved_calls`; the daemon resolves them using Phase A store nodes.
+///
 /// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
 /// Pass `None` to fall back to a local directory walk.
 pub fn phase_b_native_rust(
     corpus: &str,
     root: &std::path::Path,
     files: Option<&[(std::path::PathBuf, String)]>,
-) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+) -> anyhow::Result<(
+    Vec<travsr_core::Node>,
+    Vec<travsr_core::Edge>,
+    Vec<travsr_core::UnresolvedCall>,
+)> {
     phase_b_rust::extract_native_phase_b(corpus, root, files)
 }
 

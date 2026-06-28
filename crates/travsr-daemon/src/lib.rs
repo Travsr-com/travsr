@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
+use travsr_analysis::skeleton::{skeleton_for_node, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
@@ -63,8 +64,15 @@ pub struct PhaseBReport {
     pub skipped_no_analyzer: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
+    /// Languages that are RequiresElevated but have no PSE approval in lang.toml.
+    /// Shown to the user with a `travsr lang approve` call-to-action.
+    pub skipped_needs_approval: Vec<String>,
     /// Languages whose analyzer spawned but died or errored mid-invoke.
     pub crashed: Vec<String>,
+    /// Languages whose sidecar responded with a mismatched protocol version.
+    /// Shown to the user with a `travsr lang install <lang>` call-to-action.
+    /// Tuple: (language, expected_version, got_version).
+    pub version_mismatch: Vec<(String, u32, u32)>,
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -333,8 +341,39 @@ fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Top-level directory names that are well-known source roots, never dep/vendor dirs.
+/// Auto-exclusion never fires for these regardless of file count.
+const KNOWN_SOURCE_DIRS: &[&str] = &[
+    "src",
+    "lib",
+    "pkg",
+    "internal",
+    "cmd",
+    "api",
+    "test",
+    "tests",
+    "app",
+    "apps",
+    "plugins",
+    "modules",
+    "services",
+    "components",
+    "core",
+    "common",
+    "shared",
+    "utils",
+    "crates",
+    "staging",
+    "hack",
+    "cluster",
+    "docs",
+    "examples",
+    "samples",
+];
+
 /// Heuristic: a single directory holding ≥ 1 000 source-language files AND
-/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir".
+/// ≥ 15 % of the total discovered source files is flagged as a "large dep dir",
+/// unless the directory name is in `KNOWN_SOURCE_DIRS`.
 ///
 /// Returns `(dir_name, file_count, total_count)` for the first such directory
 /// that is not already excluded by the walker (SKIP_DIRS or .travsrignore).
@@ -358,6 +397,9 @@ fn detect_large_dep_dir(indexable: &[PathBuf], repo_root: &Path) -> Option<(Stri
     }
 
     for (dir, count) in top_counts {
+        if KNOWN_SOURCE_DIRS.contains(&dir.as_str()) {
+            continue;
+        }
         let pct = count * 100 / total;
         if count >= 1_000 && pct >= 15 {
             return Some((dir, count, total));
@@ -413,6 +455,117 @@ fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -
     exclude
 }
 
+/// Compute and persist `embed_text` for all nodes where it is currently NULL.
+///
+/// `richness` controls how much context is packed per node — derived from the
+/// installed embed model's `params_m` at call time. Pass `EmbedRichness::Compact`
+/// when no model is installed (safe default; regenerated at first reindex).
+fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: EmbedRichness) {
+    let nodes = match store.nodes_missing_embed_text() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("update_embed_texts: failed to query missing nodes: {e}");
+            return;
+        }
+    };
+    if nodes.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        count = nodes.len(),
+        ?richness,
+        "computing embed_text for nodes"
+    );
+    const BATCH: usize = 500;
+    let mut pairs: Vec<(travsr_core::NodeId, String)> = Vec::with_capacity(BATCH);
+    for node in &nodes {
+        if let Some(skel) = skeleton_for_node(node, repo_root) {
+            let text = skel.to_embed_text(
+                &node.kind,
+                &node.vname.signature,
+                &node.vname.path,
+                richness,
+            );
+            pairs.push((node.id, text));
+            if pairs.len() >= BATCH {
+                if let Err(e) = store.write_embed_texts_batch(&pairs) {
+                    tracing::warn!("update_embed_texts: batch write failed: {e}");
+                }
+                pairs.clear();
+            }
+        }
+    }
+    if !pairs.is_empty() {
+        if let Err(e) = store.write_embed_texts_batch(&pairs) {
+            tracing::warn!("update_embed_texts: final batch write failed: {e}");
+        }
+    }
+}
+
+/// Derive the richness tier for the model currently configured in this repo.
+/// Returns `Compact` when no model is configured (safe default).
+fn richness_from_meta(repo_root: &Path) -> EmbedRichness {
+    travsr_plugin_host::repo_backend_id(repo_root)
+        .and_then(|id| travsr_plugin_host::lookup_embed_backend(&id))
+        .map(|b| EmbedRichness::from_params_m(b.params_m))
+        .unwrap_or(EmbedRichness::Compact)
+}
+
+/// If the active embed model differs from what generated the stored `embed_text`,
+/// NULL all embed_text rows, regenerate with the correct richness, and update
+/// the meta key — ensuring the sidecar always sees correctly-tiered text.
+///
+/// The meta key is written AFTER regeneration so a crash mid-way leaves the key
+/// pointing to the old model and triggers a clean retry on the next call.
+///
+/// Returns `true` when regeneration was performed.
+pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
+    let repo_root = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("cannot derive repo_root from db_path"))?;
+    // Use the PER-REPO configured model, not the global active.
+    // If this repo has not been configured via `travsr embed init`, skip silently.
+    let active_id = match travsr_plugin_host::repo_backend_id(repo_root) {
+        Some(id) => id,
+        None => return Ok(false),
+    };
+    let backend = match travsr_plugin_host::lookup_embed_backend(&active_id) {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+
+    let mut store = travsr_store::SqliteStore::open(db_path)
+        .context("opening store for embed_text regeneration")?;
+
+    let stored_id = store.get_meta("embed_text_model_id").ok().flatten();
+    if stored_id.as_deref() == Some(active_id.as_str()) {
+        return Ok(false);
+    }
+
+    let richness = EmbedRichness::from_params_m(backend.params_m);
+    tracing::info!(
+        old = ?stored_id,
+        new = %active_id,
+        ?richness,
+        "embed model changed — regenerating embed_text"
+    );
+
+    // NULL all rows so update_embed_texts picks them all up.
+    store
+        .clear_all_embed_texts()
+        .context("clearing embed_text for model tier change")?;
+
+    update_embed_texts(&mut store, repo_root, richness);
+
+    // Write the new model_id only after successful regeneration.
+    store
+        .set_meta("embed_text_model_id", &active_id)
+        .context("writing embed_text_model_id")?;
+
+    Ok(true)
+}
+
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     init_repo_with_progress(repo_root, None, false, &mut |_| {})
 }
@@ -433,12 +586,40 @@ pub fn init_repo_with_progress(
     semantic: bool,
     on_progress: &mut dyn FnMut(InitProgress),
 ) -> anyhow::Result<InitStats> {
+    // M3: canonicalize so ~/.travsr/registry.json never gets two entries for the
+    // same repo (e.g. `/home/user/proj` vs `/home/user/proj/`).
+    let repo_root = &repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+
     let travsr_dir = repo_root.join(".travsr");
     std::fs::create_dir_all(&travsr_dir).context("creating .travsr directory")?;
 
+    // C2: cross-process init lock — prevents two concurrent `travsr init` runs
+    // (two terminals, CI + local) from writing the same graph.db simultaneously.
+    // Uses an exclusive flock so the second caller blocks until the first
+    // finishes, then proceeds (incremental re-init is idempotent).
+    let init_lock_path = travsr_dir.join("init.lock");
+    let init_lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&init_lock_path)
+        .with_context(|| format!("opening {}", init_lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&init_lock_file)
+        .context("acquiring init.lock — another `travsr init` may be running for this repo")?;
+
     let db_path = travsr_dir.join("graph.db");
-    let mut store =
-        SqliteStore::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    let mut store = SqliteStore::open(&db_path).with_context(|| {
+        // M5: distinguish corruption from other open failures so the user knows
+        // whether to re-run init (corrupt) vs fix disk space (full).
+        let hint = if db_path.exists() {
+            " — if graph.db is corrupted, delete it and re-run `travsr init`"
+        } else {
+            ""
+        };
+        format!("opening {}{hint}", db_path.display())
+    })?;
 
     // SEC: graph.db contains derived IP — restrict to owner only.
     // A silent failure here would leave the file world-readable, so warn loudly.
@@ -521,15 +702,24 @@ pub fn init_repo_with_progress(
         }
     }
 
+    // SC-H1: cap node_tombstones before indexing. Full init rebuilds embeddings
+    // from scratch so tombstones older than 7 days are redundant. Hard ceiling of
+    // 50 k rows prevents the table from growing unbounded if the embed sidecar
+    // has been offline long-term.
+    const TOMBSTONE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+    const TOMBSTONE_MAX_ROWS: u64 = 50_000;
+    if let Err(e) = store.prune_tombstones(TOMBSTONE_MAX_AGE_SECS, TOMBSTONE_MAX_ROWS) {
+        tracing::warn!("tombstone GC failed (non-fatal): {e}");
+    }
+
     // Register in global registry so `travsr mcp --global` can find this repo.
     // TRAVSR_DISABLE_REGISTRY=1 bypasses registration — set in tests and CI to
     // prevent temp-dir paths polluting ~/.travsr/registry.json.
     if std::env::var("TRAVSR_DISABLE_REGISTRY").as_deref() != Ok("1") {
-        let repo_name = repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        if let Err(e) = travsr_store::registry::register(repo_name, &db_path) {
+        // M3: use the canonicalized absolute path as the registry key so
+        // `~/proj` and `/home/user/proj` never create duplicate entries.
+        let registry_key = repo_root.to_string_lossy().into_owned();
+        if let Err(e) = travsr_store::registry::register(&registry_key, &db_path) {
             tracing::warn!("registry update failed (non-fatal): {e}");
         }
     }
@@ -629,6 +819,15 @@ pub fn init_repo_with_progress(
         }
     }
 
+    // L13: warn if a rebase is in progress — init during rebase risks indexing
+    // conflict-marker noise into graph.db; the user should finish rebasing first.
+    if repo_root.join(".git").join("REBASE_HEAD").exists() {
+        eprintln!(
+            "warning: a git rebase is in progress — consider finishing or aborting it \
+             before running `travsr init` to avoid indexing conflict markers"
+        );
+    }
+
     // T4 (1c): detect a large un-excluded dep dir and prompt/auto-exclude it.
     // If the user accepts, re-discover so the excluded files are dropped.
     if let Some((dir, count, total)) = detect_large_dep_dir(&indexable_paths, repo_root) {
@@ -665,6 +864,17 @@ pub fn init_repo_with_progress(
         }
     }
 
+    // M10: warn before spending minutes indexing when the file count is unusually
+    // large — likely a missing .gitignore / .travsrignore entry for generated code.
+    const LARGE_REPO_THRESHOLD: usize = 200_000;
+    if indexable_paths.len() > LARGE_REPO_THRESHOLD {
+        eprintln!(
+            "warning: {} source files found — indexing may take several minutes. \
+             Add large generated directories to .travsrignore to speed up future runs.",
+            indexable_paths.len()
+        );
+    }
+
     // Count source files the walker would have found without any ignore rules so
     // we can surface how many were excluded by .gitignore / .travsrignore in the
     // terminal summary. This walk does no I/O (stat only) so it is fast.
@@ -699,7 +909,8 @@ pub fn init_repo_with_progress(
 
     // Bulk-init mode: skip fsync on WAL writes + expand page cache for the
     // duration of indexing. Safe because `travsr init` is always re-runnable.
-    // Restored unconditionally after indexing (success or error path below).
+    // L10 note: SQLite pragmas (synchronous, cache_size) are connection-scoped —
+    // they reset automatically when `store` drops, so early `?` returns are safe.
     store
         .set_bulk_init_mode(true)
         .context("enabling bulk init mode")?;
@@ -776,7 +987,19 @@ pub fn init_repo_with_progress(
         "TIMING: set_bulk_init_mode(false) + optimize done"
     );
 
-    let (batch_counts, files_skipped_unchanged) = index_result?;
+    // M4: translate SQLITE_FULL into an actionable message so the user knows
+    // exactly what to do rather than seeing a raw SQLite error code.
+    let (batch_counts, files_skipped_unchanged) = index_result.map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("disk I/O error")
+            || msg.contains("database or disk is full")
+            || msg.contains("SQLITE_FULL")
+        {
+            anyhow::anyhow!("disk is full — free space and re-run `travsr init` (original: {e:#})")
+        } else {
+            e
+        }
+    })?;
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
@@ -829,8 +1052,14 @@ pub fn init_repo_with_progress(
                 // skip their own directory walks.
                 indexable_paths: &indexable_paths,
             };
-            let (pb_nodes, pb_edges, pb_refs, pb_outcome) =
+            let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
+            let resolved = resolve_unresolved_calls(&store, &pb_unresolved);
+            tracing::debug!(
+                resolved_cross_crate_edges = resolved.len(),
+                "Phase B UnresolvedCall resolution complete"
+            );
+            pb_edges.extend(resolved);
             write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
         };
         tracing::info!(
@@ -841,13 +1070,7 @@ pub fn init_repo_with_progress(
     } else if phase_b_already_done {
         // Phase B is current for this commit — nothing to do, no message.
         // Return Some(empty) so init.rs skips the daemon spawn.
-        Some(PhaseBReport {
-            ran: vec![],
-            crashed: vec![],
-            skipped_not_in_repo: vec![],
-            skipped_no_analyzer: vec![],
-            skipped_unregistered: vec![],
-        })
+        Some(PhaseBReport::default())
     } else {
         on_progress(InitProgress::PhaseBDeferred);
         None
@@ -888,10 +1111,16 @@ pub fn init_repo_with_progress(
     // suppressed the stamp on clean re-runs (PR #207).
     if let Ok(sha) = read_head_commit_sha(repo_root) {
         let _ = store.set_meta("last_commit", &sha);
-        // phase_b_commit is stamped only when Phase B ran inline. On the
-        // deferred path we leave it absent so the daemon's phase_b_tick
+        // C4: phase_b_commit is stamped only when Phase B ran inline AND no
+        // language crashed. A partial result should not suppress the next
+        // background refresh, which might recover the crashed language.
+        // On the deferred path we leave it absent so the daemon's phase_b_tick
         // auto-arms the scheduler when it opens the store.
-        if run_phase_b_inline {
+        let phase_b_clean = phase_b_report
+            .as_ref()
+            .map(|r| r.crashed.is_empty())
+            .unwrap_or(false);
+        if run_phase_b_inline && phase_b_clean {
             let _ = store.set_meta("phase_b_commit", &sha);
         }
     }
@@ -908,6 +1137,14 @@ pub fn init_repo_with_progress(
         }
         Err(e) => tracing::warn!("kcore: computation failed after init: {e}"),
     }
+
+    // Embed text generation is intentionally omitted here.
+    // `regenerate_embed_texts_if_stale` (called from `travsr embed init` and
+    // `travsr embed reindex`) generates embed_text with the correct richness
+    // tier for the active model just before the sidecar runs — that is the
+    // right place. Running it inline during `travsr init` blocks the terminal
+    // for minutes on large repos and produces Compact-richness text that would
+    // be regenerated immediately anyway.
 
     let total_edges = edges_before + edges_written;
     Ok(InitStats {
@@ -926,6 +1163,85 @@ pub fn init_repo_with_progress(
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
+/// Resolve cross-crate `UnresolvedCall`s emitted by Phase B into real `RefCall` edges.
+///
+/// Phase B cannot anchor callee VNames for cross-crate bare/scoped calls because
+/// it only has the caller file in scope. This function batch-queries the store
+/// (which holds all Phase A nodes) to find the real callee NodeId by signature,
+/// then emits `EdgeKind::RefCall` edges for each resolved pair.
+///
+/// Overconnection is safe: when multiple nodes share a signature (e.g. two crates
+/// both define `fn:new`) all matches are emitted. PPR damping absorbs the noise.
+fn resolve_unresolved_calls(
+    store: &SqliteStore,
+    unresolved: &[travsr_core::UnresolvedCall],
+) -> Vec<travsr_core::Edge> {
+    if unresolved.is_empty() {
+        return Vec::new();
+    }
+
+    let sigs: Vec<String> = {
+        let mut s: Vec<String> = unresolved.iter().map(|u| u.callee_sig.clone()).collect();
+        s.sort_unstable();
+        s.dedup();
+        s
+    };
+
+    let candidates = match store.nodes_by_signatures(&sigs) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("resolve_unresolved_calls: store query failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    // sig → Vec<(NodeId, path)>
+    let mut by_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str)>> =
+        std::collections::HashMap::new();
+    for (id, sig, path) in &candidates {
+        by_sig
+            .entry(sig.as_str())
+            .or_default()
+            .push((*id, path.as_str()));
+    }
+
+    let mut edges: Vec<travsr_core::Edge> = Vec::new();
+    for u in unresolved {
+        let Some(matches) = by_sig.get(u.callee_sig.as_str()) else {
+            continue;
+        };
+        let filtered: Vec<_> = if let Some(hint) = &u.hint_crate {
+            let hint_dash = hint.replace('_', "-");
+            matches
+                .iter()
+                .filter(|(_, path)| path.contains(hint.as_str()) || path.contains(&*hint_dash))
+                .copied()
+                .collect()
+        } else {
+            matches.to_vec()
+        };
+        // CO-A1: bare calls with no crate hint resolve to ALL same-named functions
+        // across all crates → false edges that flood get_callers / blast_radius.
+        // Only emit a RefCall when the match is unambiguous (exactly one candidate).
+        if u.hint_crate.is_none() && filtered.len() != 1 {
+            continue;
+        }
+        for (dst, _) in filtered {
+            if u.src != dst {
+                edges.push(travsr_core::Edge::new(
+                    u.src,
+                    dst,
+                    travsr_core::EdgeKind::RefCall,
+                ));
+            }
+        }
+    }
+
+    edges.sort_unstable_by_key(|e| (e.src.0, e.dst.0));
+    edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
+    edges
+}
+
 /// Factored out of `init_repo_with_progress` so the background refresh
 /// (#318 O3, [`run_background_phase_b`]) writes results through the exact same
 /// unification + attribution path as a full init — there is one and only one
@@ -998,12 +1314,32 @@ fn write_phase_b_results(
             "phase B indexing complete"
         );
     }
+    // H3: stamp phase_b_warnings in the meta table so `travsr status` can surface
+    // actionable issues without the user having to re-read init output.
+    let mut warnings: Vec<String> = Vec::new();
+    for lang in &pb_outcome.crashed {
+        warnings.push(format!("crashed:{lang}"));
+    }
+    for (lang, expected, got) in &pb_outcome.version_mismatch {
+        warnings.push(format!("version_mismatch:{lang}:{expected}:{got}"));
+    }
+    for lang in &pb_outcome.skipped_needs_approval {
+        warnings.push(format!("needs_approval:{lang}"));
+    }
+    if !warnings.is_empty() {
+        let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
+    } else {
+        let _ = store.set_meta("phase_b_warnings", "");
+    }
+
     PhaseBReport {
         ran: pb_outcome.ran,
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
         skipped_unregistered: pb_outcome.skipped_unregistered,
+        skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,
+        version_mismatch: pb_outcome.version_mismatch,
     }
 }
 
@@ -1065,6 +1401,62 @@ fn collect_present_languages_and_paths(
 /// on every 5 s tick would push the 30 s deadline forward forever — Phase B
 /// would never fire. `arm_immediate` is a no-op when a commit-triggered
 /// debounce is already counting down.
+/// Spawn embed Phase 2 if Phase 1 is complete and Phase 2 still has pending nodes.
+///
+/// Called from the daemon's embed_tick (every 60 s). The `phase2_spawned` flag
+/// prevents re-spawning on every tick — it is reset to false whenever the daemon
+/// detects new Phase 1 work (e.g. after a re-init or new Phase B run).
+fn maybe_spawn_embed_phase2(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase2_spawned: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    if phase2_spawned.load(Ordering::Relaxed) {
+        return;
+    }
+    let db_path = repo_root.join(".travsr/graph.db");
+    if !db_path.exists() {
+        return;
+    }
+    // Use per-repo config — do not auto-embed repos that haven't opted in.
+    let backend_id = match travsr_plugin_host::repo_backend_id(repo_root) {
+        Some(id) => id,
+        None => return,
+    };
+    let (total, _embedded, phase1_total, phase1_done) = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        match s.embed_progress(&backend_id, 3) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("embed_tick: embed_progress query failed: {e}");
+                return;
+            }
+        }
+    };
+    let phase2_total = total.saturating_sub(phase1_total);
+    let phase2_remaining = phase2_total.saturating_sub(_embedded.saturating_sub(phase1_done));
+    if phase1_done < phase1_total {
+        tracing::debug!(
+            phase1_done,
+            phase1_total,
+            "embed_tick: Phase 1 still running — deferring Phase 2"
+        );
+        return;
+    }
+    if phase2_remaining == 0 {
+        phase2_spawned.store(true, Ordering::Relaxed);
+        return;
+    }
+    tracing::info!(
+        phase2_remaining,
+        "embed_tick: Phase 1 complete — spawning Phase 2"
+    );
+    if travsr_plugin_host::spawn_background_reindex_phase2(&db_path) {
+        phase2_spawned.store(true, Ordering::Relaxed);
+    }
+}
+
 fn arm_phase_b_if_pending(
     store: &std::sync::Mutex<SqliteStore>,
     sched: &phase_b_sched::PhaseBScheduler,
@@ -1135,10 +1527,18 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         present_languages,
         indexable_paths: &indexable_paths,
     };
-    let (pb_nodes, pb_edges, pb_refs, pb_outcome) = indexer.invoke_phase_b_all(&inputs);
+    let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+        indexer.invoke_phase_b_all(&inputs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+
+    let resolved = resolve_unresolved_calls(&s, &pb_unresolved);
+    tracing::debug!(
+        resolved_cross_crate_edges = resolved.len(),
+        "Phase B UnresolvedCall resolution complete"
+    );
+    pb_edges.extend(resolved);
 
     // Write LSIF edges first (pre-collected lock-free above).
     for edge in &lsif_edges {
@@ -1148,7 +1548,13 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     }
 
     let report = write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
-    let _ = s.set_meta("phase_b_commit", &target_sha);
+
+    // C4: only advance phase_b_commit when no language crashed. A partial result
+    // should not suppress the next background refresh so crashed languages can
+    // be retried once the user installs the missing tool or clears disk space.
+    if report.crashed.is_empty() {
+        let _ = s.set_meta("phase_b_commit", &target_sha);
+    }
 
     let succeeded = !report.ran.is_empty() || !lsif_edges.is_empty() || report.crashed.is_empty();
 
@@ -1159,6 +1565,54 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         crashed = report.crashed.len(),
         "background phase B refresh complete"
     );
+
+    // Re-run k-core while the lock is still held: Phase B edges change the
+    // graph structure so shell numbers computed at init time are stale.
+    // Phase B nodes themselves have shell_number = NULL (k-core ran before
+    // Phase B); recomputing assigns them real shell numbers so Phase 1/2
+    // threshold filters work correctly on the full node set.
+    if succeeded {
+        match compute_kcore(&s) {
+            Ok(shells) => {
+                let pairs: Vec<_> = shells.into_iter().collect();
+                if let Err(e) = s.write_shell_numbers(&pairs) {
+                    tracing::warn!("kcore: failed to update shell numbers after phase B: {e}");
+                } else {
+                    tracing::info!("kcore: shell numbers updated after phase B");
+                }
+            }
+            Err(e) => tracing::warn!("kcore: computation failed after phase B: {e}"),
+        }
+    }
+
+    // Stamp the Phase 1 start time before dropping the lock so `travsr embed
+    // status` can compute actual throughput (nodes/sec) instead of guessing.
+    if succeeded {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = s.set_meta("embed_p1_start", &now_secs.to_string());
+    }
+
+    // Release the store lock before spawning: the embed sidecars read graph.db
+    // for unembed nodes but write embeddings to embed.db — zero WAL contention
+    // with the daemon's graph.db write slot.
+    drop(s);
+
+    // Start Phase 1 embedding only after Phase B and k-core are both complete:
+    //   1. No concurrent writes between Phase B and embed (contention-free).
+    //   2. Phase B nodes have real shell_number values for Phase 1/2 filters.
+    //   3. Phase 1 finishes quickly and builds a usable HNSW index.
+    // Phase 2 is intentionally NOT spawned here — the embed_tick in the daemon
+    // event loop detects when Phase 1 is done and then spawns Phase 2, so the
+    // two phases never write to embed.db concurrently.
+    if succeeded {
+        let db_path = repo_root.join(".travsr/graph.db");
+        if travsr_plugin_host::spawn_background_reindex_phase1(&db_path) {
+            tracing::info!("triggered post-phase-B embed Phase 1");
+        }
+    }
 
     succeeded
 }
@@ -1321,6 +1775,11 @@ pub fn reindex_files(
             }
             Err(e) => tracing::warn!("kcore: computation failed: {e}"),
         }
+
+        // Populate embed_text for newly-indexed nodes (commit-hook path).
+        // Only runs when a model is configured for this repo.
+        let richness = richness_from_meta(repo_root);
+        update_embed_texts(store, repo_root, richness);
     }
 
     // PERF-002: The LSIF semantic pass was running on every `reindex_files`
@@ -1949,6 +2408,40 @@ impl Daemon {
             SqliteStore::open_read_only(&db_path).context("opening graph.db read-only")?,
         ));
 
+        // Wire Step 4 (semantic ANN) into the query store. Must happen after
+        // both stores are open so the sidecar handshake can read the DB.
+        {
+            let mut rs = read_store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ws = store.lock().unwrap_or_else(|e| e.into_inner());
+            try_inject_embed_hook(&mut rs, &mut ws, &db_path);
+        }
+
+        // Migration: repos initialised before per-repo embed config was introduced
+        // have an `embed_text_model_id` meta key in graph.db but no
+        // `<repo>/.travsr/embed.toml`. Write the local config from the meta key so
+        // the user's existing embed setup continues to work without re-running
+        // `travsr embed init`.
+        {
+            let repo_embed_cfg = travsr_dir.join("embed.toml");
+            if !repo_embed_cfg.exists() {
+                let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                if let Ok(Some(model_id)) = s.get_meta("embed_text_model_id") {
+                    if travsr_plugin_host::lookup_embed_backend(&model_id).is_some() {
+                        if let Err(e) =
+                            travsr_plugin_host::write_repo_backend_id(&repo_root, &model_id)
+                        {
+                            tracing::warn!("embed config migration failed: {e}");
+                        } else {
+                            tracing::info!(
+                                model_id = %model_id,
+                                "migrated embed config to per-repo embed.toml"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // #318 O2: LRU result cache for read-only queries served off the warm
         // store. Keyed on (tool, args, last_commit, phase_b_commit), so commits
         // and background Phase B refreshes invalidate it structurally.
@@ -1976,10 +2469,14 @@ impl Daemon {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
 
+        // watcher::spawn() blocks until the initial kqueue/inotify scan is fully
+        // established and .travsr/ is unwatched. Only then is it safe to create
+        // the socket — otherwise kqueue opens the socket file and gets ENOTSUP,
+        // crashing the entire watch setup.
         let _watcher_handle =
             watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
 
-        // Control socket — Unix domain socket at .travsr/daemon-<hex>.sock (Unix only).
+        // Control socket bound AFTER watcher scan completes (see above).
         #[cfg(unix)]
         let listener = UnixListener::bind(&sock_path).context("binding control socket")?;
         #[cfg(unix)]
@@ -1993,6 +2490,10 @@ impl Daemon {
         // window without busy-waiting. The tick is cheap (a single mutex peek);
         // it only spawns work when a re-run is actually due.
         let mut phase_b_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Polls every 60 s to spawn embed Phase 2 once Phase 1 is complete.
+        // Phase 2 must not overlap Phase 1 — both write node_embeddings in embed.db.
+        let mut embed_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let embed_phase2_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
         tracing::info!(repo = %repo_root.display(), "travsr daemon started");
@@ -2183,6 +2684,14 @@ impl Daemon {
                         );
                     }
                     _ = phase_b_tick.tick() => {
+                        // C3: .travsr is in SKIP_DIRS so the file watcher never fires
+                        // for graph.db deletions. Poll every 5 s as the only trigger.
+                        if !db_path.exists() {
+                            eprintln!(
+                                "travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild."
+                            );
+                            std::process::exit(0);
+                        }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
                         // restarted after a crash mid-Phase-B).
                         arm_phase_b_if_pending(&store, &phase_b_scheduler);
@@ -2192,10 +2701,22 @@ impl Daemon {
                             let store_bg = Arc::clone(&store);
                             let repo_bg = Arc::clone(&repo_root_arc);
                             let sched_bg = Arc::clone(&phase_b_scheduler);
+                            let p2_flag = Arc::clone(&embed_phase2_spawned);
+                            // Reset the Phase 2 flag so the embed_tick re-evaluates
+                            // after the new Phase B + Phase 1 run completes.
+                            p2_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             tokio::task::spawn_blocking(move || {
                                 run_background_phase_b(repo_bg.as_path(), &store_bg, &sched_bg);
                             });
                         }
+                    }
+                    _ = embed_tick.tick() => {
+                        let store_bg = Arc::clone(&store);
+                        let repo_bg = Arc::clone(&repo_root_arc);
+                        let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        tokio::task::spawn_blocking(move || {
+                            maybe_spawn_embed_phase2(repo_bg.as_path(), &store_bg, &p2_flag);
+                        });
                     }
                     _ = &mut shutdown => {
                         tracing::info!("travsr daemon shutting down (SIGINT)");
@@ -2225,6 +2746,13 @@ impl Daemon {
                         );
                     }
                     _ = phase_b_tick.tick() => {
+                        // C3: poll every 5 s since .travsr is in SKIP_DIRS.
+                        if !db_path.exists() {
+                            eprintln!(
+                                "travsr daemon: graph.db removed — exiting. Re-run `travsr init` to rebuild."
+                            );
+                            std::process::exit(0);
+                        }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
                         // restarted after a crash mid-Phase-B).
                         arm_phase_b_if_pending(&store, &phase_b_scheduler);
@@ -2234,10 +2762,20 @@ impl Daemon {
                             let store_bg = Arc::clone(&store);
                             let repo_bg = Arc::clone(&repo_root_arc);
                             let sched_bg = Arc::clone(&phase_b_scheduler);
+                            let p2_flag = Arc::clone(&embed_phase2_spawned);
+                            p2_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             tokio::task::spawn_blocking(move || {
                                 run_background_phase_b(repo_bg.as_path(), &store_bg, &sched_bg);
                             });
                         }
+                    }
+                    _ = embed_tick.tick() => {
+                        let store_bg = Arc::clone(&store);
+                        let repo_bg = Arc::clone(&repo_root_arc);
+                        let p2_flag = Arc::clone(&embed_phase2_spawned);
+                        tokio::task::spawn_blocking(move || {
+                            maybe_spawn_embed_phase2(repo_bg.as_path(), &store_bg, &p2_flag);
+                        });
                     }
                     _ = &mut shutdown => {
                         tracing::info!("travsr daemon shutting down");
@@ -2284,6 +2822,7 @@ fn handle_watch_event(
     store: &std::sync::Mutex<SqliteStore>,
 ) {
     use watcher::WatchEvent;
+
     match ev {
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -2305,6 +2844,19 @@ fn handle_watch_event(
     }
 }
 
+/// Normalize the `query` field of NL tool args so punctuation variants like
+/// `"work?"` and `"work ?"` collapse to the same cache key and embedding input.
+/// Only applied to the `"ask"` tool — symbol-name tools are left unchanged.
+fn normalize_nl_query_args(tool: &str, mut args: serde_json::Value) -> serde_json::Value {
+    if tool == "ask" {
+        if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
+            let normalized = travsr_store::fts_tokenize::normalize_nl_query(q);
+            args["query"] = serde_json::Value::String(normalized);
+        }
+    }
+    args
+}
+
 /// Returns `(response, should_shutdown)`.
 ///
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
@@ -2324,7 +2876,13 @@ fn handle_control_message(
     match serde_json::from_str::<ControlMessage>(line) {
         Ok(ControlMessage::ReindexCommit { sha }) => {
             tracing::info!(sha=%sha, "control: reindex-commit");
-            let paths = changed_files_from_git(repo_root).unwrap_or_default();
+            let paths = match changed_files_from_git(repo_root) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(err=%e, "changed_files_from_git failed — reindexing all tracked files");
+                    vec![]
+                }
+            };
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
                 tracing::warn!(err=%e, "control reindex failed");
@@ -2346,7 +2904,60 @@ fn handle_control_message(
             }
             (ControlResponse::ok(None), false)
         }
-        Ok(ControlMessage::Status) => (ControlResponse::ok(Some("running".to_string())), false),
+        Ok(ControlMessage::Status) => {
+            let s = read_store.lock().unwrap_or_else(|e| e.into_inner());
+            let last_commit = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+            let phase_b_commit = s
+                .get_meta("phase_b_commit")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let nodes = s.node_count().unwrap_or(0);
+            let edges = s.edge_count().unwrap_or(0);
+
+            // Live Phase B activity from the scheduler.
+            let phase_b_activity = if phase_b_scheduler.is_running() {
+                "running".to_string()
+            } else if phase_b_scheduler.is_pending() {
+                "pending (debounce)".to_string()
+            } else if last_commit.is_empty() {
+                "not run (no commits yet)".to_string()
+            } else if phase_b_commit.is_empty() {
+                "pending".to_string()
+            } else if phase_b_commit == last_commit {
+                "up-to-date".to_string()
+            } else {
+                "stale (new commits since last run)".to_string()
+            };
+
+            // Embed progress — per-repo configured model only.
+            let embed_line = if let Some(backend_id) =
+                travsr_plugin_host::repo_backend_id(repo_root)
+            {
+                let threshold = 3u32;
+                match s.embed_progress(&backend_id, threshold) {
+                    Ok((total, embedded, phase1_total, phase1_done)) => {
+                        let phase2_done = embedded.saturating_sub(phase1_done);
+                        let phase2_total = total.saturating_sub(phase1_total);
+                        let pct = (embedded * 100).checked_div(total).unwrap_or(100);
+                        format!(
+                            "embedding ({backend_id}): {embedded}/{total} ({pct}%) — \
+                             Phase 1: {phase1_done}/{phase1_total} · Phase 2: {phase2_done}/{phase2_total}"
+                        )
+                    }
+                    Err(_) => format!("embedding ({backend_id}): progress unavailable"),
+                }
+            } else {
+                "embedding: no backend active".to_string()
+            };
+
+            let msg = format!(
+                "nodes: {nodes} | edges: {edges} | last_commit: {last_commit}\n\
+                 phase B : {phase_b_activity}\n\
+                 {embed_line}"
+            );
+            (ControlResponse::ok(Some(msg)), false)
+        }
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
         // #318 O1: read-only CLI queries served from the daemon's warm store —
         // skips the per-command store open that dominates CLI latency.
@@ -2366,6 +2977,11 @@ fn handle_control_message(
                     false,
                 );
             }
+            // Normalize the NL query field before cache lookup and dispatch so
+            // "work?" and "work ?" share the same cache entry and produce
+            // identical embedding vectors. Only applied to NL tools ("ask");
+            // symbol-name tools ("graph") are left as-is.
+            let args = normalize_nl_query_args(&tool, args);
             // R5 (#342): use the dedicated read-only connection so this lock
             // does not block the indexer worker from acquiring the write store.
             let s = read_store.lock().unwrap_or_else(|e| e.into_inner());
@@ -2417,9 +3033,137 @@ fn run_query(
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("ask query missing 'query' arg"))?;
-            Ok(serde_json::to_value(query::ask_query(store, q)?)?)
+            let knn = store.embed_knn_fn();
+            let knn_ref = knn
+                .as_ref()
+                .map(|f| f as &dyn Fn(&str, u32) -> Vec<(travsr_core::NodeId, f32)>);
+            Ok(serde_json::to_value(query::ask_query(store, q, knn_ref)?)?)
         }
         "status" => Ok(serde_json::to_value(query::status_query(store)?)?),
         other => anyhow::bail!("unknown query tool '{other}'"),
+    }
+}
+
+/// Try to start an embed plugin supervisor and inject its KNN hook into `store`.
+///
+/// Wire the embed KNN hook into the daemon stores.
+///
+/// `query_store` is the read-only connection used by MCP query dispatch — the
+/// hook must live here so every `search_nodes_fuzzy` call reaches Step 4.
+/// `write_store` is the write connection used for meta reads and writes.
+///
+/// No-op when the active backend binary is not installed.
+/// Called once at daemon startup AFTER both stores are open and migrated.
+pub fn try_inject_embed_hook(
+    query_store: &mut SqliteStore,
+    write_store: &mut SqliteStore,
+    db_path: &Path,
+) {
+    use travsr_plugin_host::{
+        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
+    };
+
+    let Some(home) = dirs::home_dir() else {
+        tracing::debug!("embed hook: HOME not set — skipping");
+        return;
+    };
+
+    // Prefer the user's active backend from ~/.travsr/embed.toml; fall back to
+    // the catalog default so a fresh install without `travsr embed switch` still works.
+    let backend = active_backend_id()
+        .as_deref()
+        .and_then(lookup_embed_backend)
+        .or_else(|| EMBED_BACKENDS.first())
+        .copied();
+    let Some(backend) = backend else {
+        return;
+    };
+
+    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
+    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
+    if !supervisor.is_active() {
+        return;
+    }
+
+    let model_id = match supervisor.model_id() {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    // Guard: if a model_id was previously recorded it must match the plugin's.
+    // When absent (first run after `travsr embed reindex`) we proceed and write it below.
+    if let Ok(Some(stored)) = write_store.get_meta("current_embed_model") {
+        if stored != model_id {
+            tracing::warn!(
+                stored_model = %stored,
+                plugin_model = %model_id,
+                "embed model_id mismatch — Step 4 disabled. \
+                 Run `travsr embed reindex` to rebuild embeddings with the installed model."
+            );
+            return;
+        }
+    }
+
+    if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
+        query_store.set_embed_knn_hook(hook);
+        // Persist the active model_id so future startups detect backend switches.
+        if let Err(e) = write_store.set_meta("current_embed_model", &model_id) {
+            tracing::warn!("embed: failed to persist current_embed_model: {e}");
+        }
+        tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
+    }
+}
+
+/// Cold-path variant of [`try_inject_embed_hook`] for read-only CLI queries.
+///
+/// Injects the embed KNN hook into a store opened without a write connection,
+/// so `travsr ask` benefits from embedding-enhanced seed selection even when
+/// no daemon is running. The meta write (`current_embed_model`) is skipped
+/// because the store is read-only; the model-id guard still runs to prevent
+/// stale-embedding queries.
+///
+/// No-op when the backend binary is absent, the HNSW index has not been built,
+/// or the stored model id does not match the installed sidecar.
+pub fn try_inject_embed_hook_readonly(store: &mut SqliteStore, db_path: &std::path::Path) {
+    use travsr_plugin_host::{
+        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
+    };
+    let Some(home) = dirs::home_dir() else { return };
+
+    // Guard: if embed.db doesn't exist there is nothing to query — skip to avoid
+    // spawning the sidecar (which would hang 30 s waiting on a non-existent HNSW index
+    // and then be killed by the FT-C2 IO watchdog).
+    let embed_db = db_path.with_file_name("embed.db");
+    if !embed_db.exists() {
+        return;
+    }
+
+    let backend = active_backend_id()
+        .as_deref()
+        .and_then(lookup_embed_backend)
+        .or_else(|| EMBED_BACKENDS.first())
+        .copied();
+    let Some(backend) = backend else { return };
+    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
+    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
+    if !supervisor.is_active() {
+        return;
+    }
+    let Some(model_id) = supervisor.model_id() else {
+        return;
+    };
+    if let Ok(Some(stored)) = store.get_meta("current_embed_model") {
+        if stored != model_id {
+            tracing::debug!(
+                stored_model = %stored,
+                plugin_model = %model_id,
+                "cold-path embed: model_id mismatch — skipping KNN"
+            );
+            return;
+        }
+    }
+    if let Some(hook) = supervisor.knn_hook(model_id.to_string()) {
+        store.set_embed_knn_hook(hook);
+        tracing::debug!(model_id = %model_id, "cold-path embed: KNN hook active");
     }
 }

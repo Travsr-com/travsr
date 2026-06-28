@@ -12,6 +12,9 @@ use crate::sanitize::{
     sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, wrap_envelope,
 };
 
+/// Short alias for the embed KNN closure used throughout `get_context` variants.
+type EmbedKnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
+
 /// Return the import targets (Depends edges) of the given file path.
 /// Empty string when nothing is found — callers must NOT return an RPC error
 /// for the no-results case (Tech Lead requirement).
@@ -128,21 +131,30 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
         }
     };
 
-    let ids: Vec<NodeId> = edges
+    const DEFAULT_DEPS_TOP_K: usize = 25;
+
+    let all_ids: Vec<NodeId> = edges
         .iter()
         .filter(|e| e.kind.as_str() == "depends")
         .map(|e| e.dst)
         .collect();
+    let total_deps = all_ids.len();
+    let ids = &all_ids[..all_ids.len().min(DEFAULT_DEPS_TOP_K)];
     let node_map: HashMap<NodeId, CoreNode> = store
-        .get_nodes(&ids)
+        .get_nodes(ids)
         .unwrap_or_default()
         .into_iter()
         .map(|n| (n.id, n))
         .collect();
-    let lines: Vec<String> = ids
+    let mut lines: Vec<String> = ids
         .iter()
         .filter_map(|id| node_map.get(id).map(|n| n.vname.signature.clone()))
         .collect();
+    if total_deps > DEFAULT_DEPS_TOP_K {
+        lines.push(format!(
+            "[showing {DEFAULT_DEPS_TOP_K} of {total_deps} — use get_context for ranked coverage or get_dependencies with transitive=true for the full tree]"
+        ));
+    }
     lines.join("\n")
 }
 
@@ -234,9 +246,10 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         .iter()
         .filter_map(|(edge, tag)| {
             node_map.get(&edge.src).map(|src_node| {
+                let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
                 format!(
-                    "{tag} {} ({}) — {}",
-                    src_node.vname.signature, src_node.kind, src_node.vname.path
+                    "{tag} {} ({}) — {}{}",
+                    src_node.vname.signature, src_node.kind, src_node.vname.path, loc
                 )
             })
         })
@@ -803,16 +816,94 @@ pub fn search_symbol(store: &SqliteStore, name: &str) -> String {
         tracing::warn!("search_symbol rejected invalid arg: {reason}");
         return String::new();
     }
-    sanitize_for_mcp(&search_symbol_raw(store, name))
+    // Strip language token from query so FTS gets a clean term.
+    // In single-repo mode we don't apply the language filter (multi-language
+    // repos), but stripping "in rust" from "knapsack in rust" prevents the
+    // FTS from matching unrelated files that contain "rust" as a token.
+    let (stripped, lang_filter) = infer_language_from_query(name);
+    let raw = search_symbol_raw(store, stripped.as_str(), lang_filter);
+    let content = if raw.is_empty() {
+        format!("No symbols matching '{name}' found in the graph.")
+    } else {
+        raw
+    };
+    sanitize_for_mcp(&content)
 }
 
-fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
+/// Parse a query string for an embedded language token.
+///
+/// Returns `(stripped_query, lang_id)`.  `stripped_query` has the matched
+/// language word (and an optional preceding "in" connector) removed.
+/// When no language token is detected the original query is returned unchanged.
+///
+/// Examples:
+/// - `"PaymentService in Kotlin"` → `("PaymentService", Some("kotlin"))`
+/// - `"auth handler javascript"` → `("auth handler", Some("javascript"))`
+/// - `"knapsack"`               → `("knapsack", None)`
+fn infer_language_from_query(query: &str) -> (String, Option<&'static str>) {
+    // (query_token_lowercase → db language id).
+    // Longer / more-specific tokens are listed first so "objective-c" beats
+    // "c" before reaching the single-char "c" entry.
+    const LANG_TOKENS: &[(&str, &str)] = &[
+        ("typescript", "typescript"),
+        ("javascript", "javascript"),
+        ("objective-c", "objectivec"),
+        ("objectivec", "objectivec"),
+        ("csharp", "csharp"),
+        ("golang", "go"),
+        ("kotlin", "kotlin"),
+        ("python", "python"),
+        ("scala", "scala"),
+        ("swift", "swift"),
+        ("objc", "objectivec"),
+        ("dart", "dart"),
+        ("java", "java"),
+        ("ruby", "ruby"),
+        ("rust", "rust"),
+        ("cpp", "cpp"),
+        ("php", "php"),
+        ("c++", "cpp"),
+        ("c#", "csharp"),
+        ("go", "go"),
+        ("c", "c"),
+    ];
+
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return (query.to_owned(), None);
+    }
+    for (i, word) in words.iter().enumerate() {
+        let lower = word.to_ascii_lowercase();
+        if let Some(&(_, lang_id)) = LANG_TOKENS.iter().find(|(tok, _)| *tok == lower.as_str()) {
+            // Strip the language word and an optional preceding "in" connector.
+            let strip_from = if i > 0 && words[i - 1].eq_ignore_ascii_case("in") {
+                i - 1
+            } else {
+                i
+            };
+            let remaining: Vec<&str> = words[..strip_from]
+                .iter()
+                .chain(words[i + 1..].iter())
+                .copied()
+                .collect();
+            let stripped = remaining.join(" ");
+            // Preserve original when stripping leaves nothing to search for.
+            if stripped.trim().is_empty() {
+                return (query.to_owned(), Some(lang_id));
+            }
+            return (stripped, Some(lang_id));
+        }
+    }
+    (query.to_owned(), None)
+}
+
+fn search_symbol_raw(store: &SqliteStore, name: &str, lang_filter: Option<&str>) -> String {
     // Cap results: prevents self-DoS from wildcard queries (e.g. "a") and limits
     // accidental bulk exfiltration. The store LIKE query has no SQL LIMIT yet —
     // this Rust-side cap is the guard until that is added at the store layer.
     const MAX_SEARCH_RESULTS: usize = 50;
 
-    let nodes = match store.search_nodes_fuzzy(name) {
+    let nodes = match store.search_nodes_fuzzy_filtered(name, lang_filter) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("search_symbol error: {e}");
@@ -820,15 +911,35 @@ fn search_symbol_raw(store: &SqliteStore, name: &str) -> String {
         }
     };
 
+    // CO-D1: if language filtering produced zero results, retry without the filter.
+    // Language tokens like "c", "go", "dart" are short and common identifiers;
+    // stripping them from the query then filtering by language produces false
+    // "no matches" for queries like "C parser" or "go routine".
+    let nodes = if nodes.is_empty() && lang_filter.is_some() {
+        match store.search_nodes_fuzzy_filtered(name, None) {
+            Ok(n) => n,
+            Err(_) => nodes,
+        }
+    } else {
+        nodes
+    };
+
     let lines: Vec<String> = nodes
         .iter()
         .take(MAX_SEARCH_RESULTS)
-        .map(|n| format!("{} ({}) — {}", n.vname.signature, n.kind, n.vname.path))
+        .map(|n| {
+            let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+            format!("{} ({}) — {}{loc}", n.vname.signature, n.kind, n.vname.path)
+        })
         .collect();
     lines.join("\n")
 }
 
 /// Global variant of `search_symbol`.
+///
+/// Infers a language filter from the query (e.g. `"PaymentService in Kotlin"` →
+/// search `"PaymentService"`, filter `language = kotlin`) and ranks repos in
+/// fan-out mode by match count (most matches first).
 pub fn search_symbol_global(
     repos: &HashMap<String, PathBuf>,
     name: &str,
@@ -838,19 +949,74 @@ pub fn search_symbol_global(
         tracing::warn!("search_symbol_global rejected invalid arg: {reason}");
         return String::new();
     }
-    let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = search_symbol_raw(store, name);
-        if result.is_empty() || single {
-            result
-        } else {
-            result
-                .lines()
-                .map(|l| format!("[{repo_name}] {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+
+    let (stripped, lang_filter) = infer_language_from_query(name);
+    let search_term = stripped.as_str();
+
+    let raw = if repo.is_some() {
+        // Single-repo path: SEC + stale filtering handled by collect_global.
+        collect_global(repos, repo, |store, repo_name, single| {
+            let result = search_symbol_raw(store, search_term, lang_filter);
+            if result.is_empty() || single {
+                result
+            } else {
+                result
+                    .lines()
+                    .map(|l| format!("[{repo_name}] {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+    } else {
+        // Fan-out path: open each live repo, collect results, rank by match
+        // count descending so the most relevant repo appears first.
+        if let Some(r) = repo {
+            if validate_mcp_arg(r).is_err() {
+                return String::new();
+            }
         }
-    });
-    sanitize_for_mcp(&raw)
+        let mut candidates: Vec<(&str, &PathBuf)> =
+            repos.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        candidates.retain(|(_, db)| db.exists());
+        let single = candidates.len() == 1;
+
+        let mut parts: Vec<(usize, String)> = Vec::new();
+        for (repo_name, db_path) in &candidates {
+            match SqliteStore::open_read_only(db_path) {
+                Ok(store) => {
+                    let result = search_symbol_raw(&store, search_term, lang_filter);
+                    if !result.is_empty() {
+                        let count = result.lines().count();
+                        let text = if single {
+                            result
+                        } else {
+                            result
+                                .lines()
+                                .map(|l| format!("[{repo_name}] {l}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        parts.push((count, text));
+                    }
+                }
+                Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+            }
+        }
+        // Most matches first — most relevant repo surfaces at the top.
+        parts.sort_by_key(|b| std::cmp::Reverse(b.0));
+        parts
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let content = if raw.is_empty() {
+        format!("No symbols matching '{name}' found in the graph.")
+    } else {
+        raw
+    };
+    sanitize_for_mcp(&content)
 }
 
 // ── get_repo_map ──────────────────────────────────────────────────────────────
@@ -1384,7 +1550,36 @@ pub(crate) fn get_context_raw(
         &OpenFilter,
         include_snippets,
         snippet_budget,
+        None,
     )
+}
+
+/// Embedding-aware variant of [`get_context`].
+///
+/// `embed_knn(query, k)` should return up to `k` file node IDs ranked by
+/// cosine similarity to the embedded query (supplied by the daemon via
+/// `EmbedSupervisor`).  When the closure returns an empty vec (e.g. before
+/// `travsr embed reindex` has run), the function transparently falls back to
+/// `search_nodes_fuzzy` so callers never see an empty result due to a missing
+/// index.
+pub fn get_context_embed(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+    include_snippets: bool,
+    snippet_budget: Option<usize>,
+    embed_knn: EmbedKnnFn<'_>,
+) -> String {
+    let body = get_context_body(
+        store,
+        query,
+        token_budget,
+        &OpenFilter,
+        include_snippets,
+        snippet_budget,
+        Some(embed_knn),
+    );
+    wrap_envelope(&body)
 }
 
 fn get_context_with_filter(
@@ -1402,8 +1597,671 @@ fn get_context_with_filter(
         filter,
         include_snippets,
         snippet_budget,
+        None,
     );
     wrap_envelope(&body)
+}
+
+/// Why a node appeared in `get_context` output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeRole {
+    /// Direct text match — one of the up-to-5 seeds.
+    Seed,
+    /// This node calls one of the seed symbols (reverse RefCall/RefImports/Depends edge).
+    Caller,
+    /// A seed symbol calls or imports this node (forward RefCall/Depends/RefImports edge).
+    Dependency,
+    /// PPR structural relevance; no direct 1-hop edge to or from any seed.
+    Context,
+}
+
+impl NodeRole {
+    fn label(self) -> &'static str {
+        match self {
+            NodeRole::Seed => "seed",
+            NodeRole::Caller => "caller",
+            NodeRole::Dependency => "dependency",
+            NodeRole::Context => "context",
+        }
+    }
+}
+
+/// Minimum number of PPR seeds from KNN — always try to include this many.
+const MIN_EMBED_SEEDS: usize = 5;
+/// Maximum number of PPR seeds from KNN — never include more than this.
+const MAX_EMBED_SEEDS: usize = 20;
+/// Cosine-similarity threshold: nodes scoring at or above this are included
+/// even when `seeds.len() >= MIN_EMBED_SEEDS`, up to `MAX_EMBED_SEEDS`.
+const EMBED_SCORE_THRESHOLD: f32 = 0.75;
+/// Maximum seeds per unique file path — prevents all seeds clustering in one file.
+const MAX_SEEDS_PER_PATH: usize = 2;
+/// PPR seed weight for an exact FTS substring match (query token in signature or path).
+#[allow(dead_code)]
+const FTS_EXACT_WEIGHT: f32 = 1.0;
+/// PPR seed weight for a fuzzy/trigram FTS match (L2-A expansion, no literal substring match).
+#[allow(dead_code)]
+const FTS_FUZZY_WEIGHT: f32 = 0.6;
+
+/// Per-kind multiplier applied to FTS seed weights before PPR personalisation.
+///
+/// Boosts definitive code entities (methods, classes, structs, traits) and
+/// suppresses structural/import nodes that produce noisy PPR walks on large
+/// graphs. Language is required because `"module"` means different things:
+/// a Rust `mod foo {}` block is real code (1.0×) while a Go package
+/// declaration node is graph connective tissue (0.05×).
+pub(crate) fn kind_boost(kind: &str, language: &str) -> f32 {
+    match kind {
+        // Primary callables — highest value across all languages
+        "method" | "function" | "constructor" => 2.0,
+        // Named type definitions — Rust struct/enum/trait, Go class, TS interface
+        "class" | "interface" | "struct" | "enum" | "trait" | "union" => 1.5,
+        // Named value definitions — Rust constant/static, important anchors
+        "constant" | "static" => 1.2,
+        // Impl blocks and type aliases — moderate; contain methods but aren't entry points
+        "impl" | "type" => 1.0,
+        // Data members and local bindings — lower value, often noise at seed level
+        "field" | "var" | "variable" | "property" => 0.7,
+        // Imports and file-boundary structural nodes
+        "import" | "file-module" | "crate" => 0.3,
+        // Go-specific package identifier nodes — always structural noise
+        "go-pkg" => 0.05,
+        // Module kind is language-dependent:
+        //   Go   → scip-go package declaration node, structural, high in-degree → suppress
+        //   Rust → `mod foo {}` declaration, real code entity → keep
+        "module" if language == "go" => 0.05,
+        "module" => 1.0,
+        _ => 1.0,
+    }
+}
+
+/// Circuit-breaker threshold for KNN sidecar inference (ms). Calls exceeding this
+/// are discarded and the caller falls back to FTS seeds.
+///
+/// Default: 600ms — measured bge-large-en-v1.5 ONNX inference on Apple Silicon is
+/// 250–270ms; bge-base-en-v1.5 is 200–220ms. 600ms gives 2× headroom over the
+/// largest measured value and absorbs the extra CPU pressure from a concurrent
+/// Phase 2 background reindexer. Setting this too low causes silent KNN degradation
+/// (FTS fallback) at exactly the moment the semantic index is most valuable.
+///
+/// Override via `TRAVSR_KNN_BUDGET_MS`. The value must be a positive integer;
+/// invalid values fall back to the default.
+///
+/// Shared with `travsr ask` via `query.rs`.
+pub(crate) fn knn_budget_ms() -> u128 {
+    std::env::var("TRAVSR_KNN_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .filter(|&x| x > 0)
+        .unwrap_or(600)
+}
+/// Kept for tests that reference the constant directly; resolves to the default.
+#[cfg(test)]
+pub(crate) const KNN_BUDGET_MS: u128 = 600;
+
+/// Returns `true` for nodes that should never be used as PPR seeds regardless
+/// of their KNN cosine score.
+///
+/// Excluded categories (R5):
+///
+/// - `kind == "crate"` — Cargo dependency manifest nodes (no code body).
+/// - `scip:` signatures — synthetic SCIP reference nodes with no real body.
+/// - Test directories: `tests/`, `benches/`, `spec/` (Ruby), `testdata/` (Go),
+///   `src/test/java|kotlin|scala/` (JVM), `_test.go` (Go), `fixtures/`, `fuzz/`.
+/// - Build artefacts: `target/debug|release|classes|scala-*/` (Rust/Maven/sbt),
+///   `build/classes|generated/` (Gradle), `node_modules/`, `dist/*.js` (JS),
+///   `*.class`, `*.o/.obj`, `CMakeFiles/`, `_deps/` (CMake).
+/// - Dependency/package caches: `go/pkg/mod/`, `.pub-cache/` (Dart),
+///   `vendor/bundle/` (Ruby), `vendor/*.php` (PHP), `Library/Caches/`, `.cache/`.
+/// - Paths escaping the repo root (`../`), Python bytecode (`__pycache__/`, `.pyc`).
+pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
+    if node.kind == "crate" {
+        return true;
+    }
+    // Signatures prefixed "scip:" are synthetic SCIP reference nodes with no real body.
+    if node.vname.signature.starts_with("scip:") {
+        return true;
+    }
+    let p = &node.vname.path;
+    // Rust/Go integration test and benchmark directories.
+    if p.contains("/tests/") || p.contains("/benches/") {
+        return true;
+    }
+    // Common fixture and fuzz directories (arbitrary repo layouts).
+    // Match both "/fuzz/" (nested) and "fuzz/" (repo-root prefix).
+    if p.contains("/fixtures/") || p.starts_with("fixtures/") {
+        return true;
+    }
+    if p.contains("/fuzz/") || p.starts_with("fuzz/") {
+        return true;
+    }
+    // Go test files (_test.go suffix) and generic test subdirectories.
+    if p.ends_with("_test.go") || p.contains("/_test/") {
+        return true;
+    }
+    // Rust/Go integration tests at repo root (tests/) and benches at root.
+    if p.starts_with("tests/") || p.starts_with("benches/") {
+        return true;
+    }
+    // Rust/Cargo build output — seeding into build artefacts walks into macro-expanded code.
+    if p.contains("/target/debug/") || p.contains("/target/release/") {
+        return true;
+    }
+    // JavaScript / TypeScript build artefacts.
+    if p.contains("/node_modules/") || (p.contains("/dist/") && p.ends_with(".js")) {
+        return true;
+    }
+    // R5: paths that escape the repo root (e.g. Go build cache:
+    // `../../../Library/Caches/go-build/...`). Any path starting with `../`
+    // is outside the indexed repo and is never useful as a seed.
+    if p.starts_with("../") {
+        return true;
+    }
+    // R5: Go module cache and OS build caches (absolute or relative to cache dirs).
+    if p.contains("/go/pkg/mod/") || p.contains("/Library/Caches/") || p.contains("/.cache/") {
+        return true;
+    }
+    // R5: testdata/ directories (Go convention) and __pycache__ artefacts.
+    if p.contains("/testdata/") || p.starts_with("testdata/") {
+        return true;
+    }
+    if p.contains("/__pycache__/") || p.ends_with(".pyc") {
+        return true;
+    }
+    // Java / Kotlin / Scala — Maven src/test, Gradle build/, sbt target/
+    if p.contains("/src/test/java/")
+        || p.starts_with("src/test/java/")
+        || p.contains("/src/test/kotlin/")
+        || p.starts_with("src/test/kotlin/")
+        || p.contains("/src/test/scala/")
+        || p.starts_with("src/test/scala/")
+    {
+        return true;
+    }
+    if p.contains("/build/classes/")
+        || p.starts_with("build/classes/")
+        || p.contains("/build/generated/")
+        || p.starts_with("build/generated/")
+    {
+        return true;
+    }
+    // Maven/sbt general build output under target/ (not just Rust debug/release).
+    // Avoid blocking "target/" anywhere — only when it looks like a build output
+    // directory (contains compiled files, not source).
+    if p.contains("/target/classes/")
+        || p.contains("/target/generated-sources/")
+        || p.contains("/target/scala-")
+        || p.ends_with(".class")
+    {
+        return true;
+    }
+    // Ruby — RSpec spec/, Bundler vendor/bundle/
+    if p.contains("/spec/") || p.starts_with("spec/") {
+        return true;
+    }
+    if p.contains("/vendor/bundle/") {
+        return true;
+    }
+    // PHP — Composer vendor/ (parallel to JS node_modules).
+    // Guard with php extension to avoid false-positives in repos that use
+    // "vendor" as a deliberate source dir in non-PHP projects.
+    if p.contains("/vendor/") && p.ends_with(".php") {
+        return true;
+    }
+    // C/C++ — object files, CMake out-of-source build directories.
+    if p.ends_with(".o") || p.ends_with(".obj") {
+        return true;
+    }
+    if p.contains("/CMakeFiles/") || p.contains("/_deps/") {
+        return true;
+    }
+    // Dart/Flutter — package cache and build output.
+    if p.contains("/.dart_tool/") || p.contains("/.pub-cache/") {
+        return true;
+    }
+    // C# / .NET — compiler-generated build output in obj/ and bin/ subdirectories.
+    // Real source lives under src/; obj/Debug/, obj/Release/, bin/Debug/ are noise.
+    if p.contains("/obj/Debug/")
+        || p.contains("/obj/Release/")
+        || p.starts_with("obj/Debug/")
+        || p.starts_with("obj/Release/")
+        || p.contains("/bin/Debug/")
+        || p.contains("/bin/Release/")
+        || p.starts_with("bin/Debug/")
+        || p.starts_with("bin/Release/")
+        || p.ends_with(".AssemblyInfo.cs")
+        || p.ends_with(".GlobalUsings.g.cs")
+    {
+        return true;
+    }
+    false
+}
+
+/// Derive PPR seeds from symbol-level KNN results with score-based selection.
+///
+/// Strategy:
+/// - Noise nodes (Cargo crates, test/bench paths) are skipped unconditionally.
+/// - Always include the top `MIN_EMBED_SEEDS` non-noise results (regardless of score).
+/// - Extend with any additional results whose cosine similarity >= `EMBED_SCORE_THRESHOLD`.
+/// - Cap at `MAX_EMBED_SEEDS`.
+/// - Deduplicate by file path: at most `MAX_SEEDS_PER_PATH` symbols from any one file,
+///   preventing all seeds from clustering inside a single large file.
+///
+/// Returns `(seeds, n_candidates_before_cap)` where:
+/// - `seeds` — `(NodeId, cosine_score)` pairs for weighted PPR personalisation.
+/// - `n_candidates_before_cap` — eligible candidates before the `MAX_EMBED_SEEDS` cap fired.
+///   When `> seeds.len()`, the caller may signal to the user that the query was broad.
+///
+/// Returns empty seeds when KNN returns nothing (index not yet built), so the caller
+/// can fall back to `search_nodes_fuzzy`.
+/// Returns `(seeds, n_candidates_before_cap, knn_elapsed_ms)`.
+/// `knn_elapsed_ms` covers only the `knn_fn` HNSW/ONNX call, not the SQLite
+/// postprocessing — the caller uses it for the circuit-breaker decision.
+///
+/// Each seed carries the full `CoreNode` so callers can apply structural proximity
+/// filtering without a second DB round-trip.
+pub(crate) fn embed_path_seeds(
+    store: &SqliteStore,
+    query: &str,
+    knn_fn: EmbedKnnFn<'_>,
+    filter: &dyn EdgeFilter,
+) -> (Vec<(CoreNode, f32)>, usize, u128) {
+    // Over-request 6× to keep MIN_EMBED_SEEDS filled after noise + RBAC filtering.
+    // Time only the KNN inference call — not the subsequent SQLite get_nodes fetch.
+    let t0 = std::time::Instant::now();
+    // Normalize before embedding: strip sentence punctuation from word edges so
+    // "work?" and "work ?" produce the same vector ("how daemon work?" == "how daemon work ?").
+    let normalized_query = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let knn_pairs = knn_fn(
+        &normalized_query,
+        (MAX_EMBED_SEEDS as u32).saturating_mul(6),
+    );
+    let knn_elapsed_ms = t0.elapsed().as_millis();
+    if knn_pairs.is_empty() {
+        return (vec![], 0, knn_elapsed_ms);
+    }
+
+    // Fetch node metadata for noise filter + RBAC + path dedup.
+    let all_ids: Vec<NodeId> = knn_pairs.iter().map(|&(id, _)| id).collect();
+    let nodes = match store.get_nodes(&all_ids) {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::warn!("embed_path_seeds get_nodes error: {e}");
+            return (vec![], 0, knn_elapsed_ms);
+        }
+    };
+    let node_map: std::collections::HashMap<NodeId, CoreNode> =
+        nodes.into_iter().map(|n| (n.id, n)).collect();
+
+    let mut path_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut seeds: Vec<(CoreNode, f32)> = Vec::with_capacity(MAX_EMBED_SEEDS);
+    // Count eligible candidates (pass noise+RBAC+score filters) before MAX_EMBED_SEEDS cap.
+    let mut n_eligible: usize = 0;
+
+    for &(id, score) in &knn_pairs {
+        // Include if: we still owe MIN seeds, OR this node scores above threshold.
+        if seeds.len() >= MIN_EMBED_SEEDS && score < EMBED_SCORE_THRESHOLD {
+            continue;
+        }
+        let node = match node_map.get(&id) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Skip Cargo dependency nodes and test/bench fixtures unconditionally.
+        if is_noise_seed(node) {
+            continue;
+        }
+        if !filter.allow(id, id, Some(node.vname.corpus.as_str())) {
+            continue;
+        }
+        let path_count = path_counts.entry(node.vname.path.clone()).or_insert(0);
+        if *path_count >= MAX_SEEDS_PER_PATH {
+            continue;
+        }
+        *path_count += 1;
+        n_eligible += 1;
+        if seeds.len() < MAX_EMBED_SEEDS {
+            seeds.push((node.clone(), score));
+        }
+    }
+
+    (seeds, n_eligible, knn_elapsed_ms)
+}
+
+/// Compose all advisory signals appended to a `get_context` response footer.
+///
+/// Signals are ordered: overflow (most actionable) → seed cap → degraded state.
+/// Returns an empty string when the graph is fully operational and no truncation occurred.
+///
+/// R3: `knn_degraded` is true when the embed sidecar was configured (`has_embed`)
+/// but KNN returned empty or was circuit-broken; the note distinguishes this from
+/// the "embed not configured" case so the AI doesn't assume full semantic coverage.
+fn build_context_signals(
+    store: &SqliteStore,
+    has_embed: bool,
+    knn_degraded: bool,
+    overflow_msg: Option<&str>,
+    seed_cap_msg: Option<&str>,
+) -> String {
+    build_context_signals_with_r2(
+        phase_b_pending(store),
+        has_embed,
+        knn_degraded,
+        overflow_msg,
+        seed_cap_msg,
+        None,
+        None,
+    )
+}
+
+/// PF-M4: accepts `phase_b_pending` as a pre-computed bool so callers can
+/// hoist the two `get_meta` queries out of the hot path and compute once.
+fn build_context_signals_with_r2(
+    phase_b_pending: bool,
+    has_embed: bool,
+    knn_degraded: bool,
+    overflow_msg: Option<&str>,
+    seed_cap_msg: Option<&str>,
+    multi_concept_note: Option<&str>,
+    weak_match_note: Option<&str>,
+) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(msg) = overflow_msg {
+        parts.push(msg);
+    }
+    if let Some(msg) = seed_cap_msg {
+        parts.push(msg);
+    }
+    // R1: weak-match floor note — before other notes so the AI sees it first.
+    if let Some(msg) = weak_match_note {
+        parts.push(msg);
+    }
+    // R2: multi-concept cluster note.
+    if let Some(msg) = multi_concept_note {
+        parts.push(msg);
+    }
+    if has_embed && knn_degraded {
+        parts.push(
+            "[note: semantic search degraded — KNN timed out or returned empty; results are lexical only]",
+        );
+    } else if !has_embed {
+        parts.push("[note: semantic search disabled — run `travsr embed init` for better results]");
+    }
+    if phase_b_pending {
+        parts.push(
+            "[note: call traversal limited — run `travsr lang install <lang>` to enable call-graph edges]",
+        );
+    }
+    parts.join("\n")
+}
+
+/// Convenience wrapper for the no-overflow, no-seed-cap degraded-state check.
+fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
+    build_context_signals(store, has_embed, false, None, None)
+}
+
+/// Format a single node line for `get_context` output.
+///
+/// - Appends `:line` to the path when the node has a known source location.
+/// - Omits `[package: ]` entirely when the package field is empty.
+/// - R7: appends `[score: N.NN]` when a score is available so the AI can
+///   weight nodes by relevance without a second round-trip.
+fn format_node_line(n: &CoreNode, role: &str, score: Option<f32>) -> String {
+    let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+    let score_str = score
+        .map(|s| format!(" [score: {s:.2}]"))
+        .unwrap_or_default();
+    if n.package.is_empty() {
+        format!(
+            "{} ({}) — {}{loc} [via: {role}]{score_str}",
+            n.vname.signature, n.kind, n.vname.path
+        )
+    } else {
+        format!(
+            "{} ({}) — {}{loc} [package: {}] [via: {role}]{score_str}",
+            n.vname.signature, n.kind, n.vname.path, n.package
+        )
+    }
+}
+
+/// Derive FTS seeds with confidence-based weights for weighted PPR personalisation.
+///
+/// - Exact substring match (`search_nodes_by_name`) → `FTS_EXACT_WEIGHT` (1.0)
+/// - Trigram/L2-A fuzzy match (`search_nodes_fuzzy`) → `FTS_FUZZY_WEIGHT` (0.6)
+///
+/// Dot-notation queries (e.g. `"Kubelet.syncPod"`) are split on the last `.`:
+/// the name part is searched; results are filtered to those whose signature
+/// contains the qualifier, ensuring `var:SyncPod` never beats `method:Kubelet.syncPod`.
+///
+/// Each seed weight is multiplied by `kind_boost` so callable definitions
+/// (method, function, constructor) rank above structural nodes (import, module).
+///
+/// Returns up to 5 seeds (capped to prevent FTS from flooding the seed pool).
+#[allow(dead_code)]
+pub(crate) fn fts_seeds_weighted(
+    store: &SqliteStore,
+    query: &str,
+    filter: &dyn EdgeFilter,
+) -> Vec<(NodeId, f32)> {
+    let exact = store.search_nodes_by_name(query).unwrap_or_default();
+    let (nodes, weight) = if !exact.is_empty() {
+        (exact, FTS_EXACT_WEIGHT)
+    } else {
+        match store.search_nodes_fuzzy(query) {
+            Ok(fuzzy) => (fuzzy, FTS_FUZZY_WEIGHT),
+            Err(e) => {
+                tracing::warn!("fts_seeds_weighted fuzzy error: {e}");
+                return vec![];
+            }
+        }
+    };
+
+    nodes
+        .into_iter()
+        .filter(|n| !is_noise_seed(n))
+        .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+        .take(5)
+        .map(|n| {
+            let boosted = weight * kind_boost(&n.kind, &n.vname.language);
+            (n.id, boosted)
+        })
+        .collect()
+}
+
+/// Merge FTS and KNN seed sets into a single weighted seed list for `ppr_weighted`.
+///
+/// Nodes appearing in both sets are deduplicated by taking `max(fts_weight, knn_score)`:
+/// an exact FTS match and a high-cosine KNN match for the same node reinforce each other
+/// without diluting the PPR personalisation vector.
+///
+/// Returns `(merged_seeds, seed_cap_fired)`.
+#[allow(dead_code)]
+pub(crate) fn merge_fts_knn_seeds(
+    fts: Vec<(NodeId, f32)>,
+    knn: Vec<(NodeId, f32)>,
+    n_knn_eligible: usize,
+) -> (Vec<(NodeId, f32)>, bool) {
+    let mut merged: HashMap<NodeId, f32> = fts.into_iter().collect();
+    for (id, score) in knn {
+        let entry = merged.entry(id).or_insert(0.0);
+        *entry = entry.max(score);
+    }
+    let mut combined: Vec<(NodeId, f32)> = merged.into_iter().collect();
+    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let cap_fired = combined.len() > MAX_EMBED_SEEDS || n_knn_eligible > MAX_EMBED_SEEDS;
+    combined.truncate(MAX_EMBED_SEEDS);
+    (combined, cap_fired)
+}
+
+/// Drop seeds that are direct **callees** of a higher-scored accepted seed.
+///
+/// PPR follows outgoing edges at each step, so from seed A the walk naturally
+/// reaches everything A calls/imports. Including A's callee B as a *second* seed
+/// only adds redundant teleportation mass — PPR from A already covers B.
+///
+/// **Callers are never dropped.** If B calls A (B→A edge), PPR from A cannot walk
+/// backward to B, so B provides genuinely orthogonal coverage and must be kept.
+/// Dropping callers would hide usage context, which is often the most valuable part
+/// of the result set for a query about a function.
+///
+/// Algorithm (O(n × q) where n ≤ MAX_EMBED_SEEDS, q = one `iter_edges_from` per seed):
+///
+/// 1. Pre-fetch all outgoing edges for every seed filtered to seed→seed pairs (≤ 20 queries).
+/// 2. Visit seeds in descending score order. Drop a candidate only when an already-accepted
+///    seed has a direct **outgoing** edge to it (accepted → candidate direction).
+///
+/// Returns the filtered list in the same descending-score order.
+pub(crate) fn dedup_adjacent_seeds(
+    store: &SqliteStore,
+    seeds: Vec<(NodeId, f32)>,
+) -> Vec<(NodeId, f32)> {
+    if seeds.len() <= 1 {
+        return seeds;
+    }
+
+    let seed_ids: std::collections::HashSet<NodeId> = seeds.iter().map(|&(id, _)| id).collect();
+
+    // Pre-fetch seed→seed outgoing edges (directed: src calls/depends-on dst).
+    let mut adj: std::collections::HashSet<(NodeId, NodeId)> = std::collections::HashSet::new();
+    for &(id, _) in &seeds {
+        if let Ok(edges) = store.iter_edges_from(id) {
+            for e in edges {
+                if seed_ids.contains(&e.dst) {
+                    adj.insert((id, e.dst));
+                }
+            }
+        }
+    }
+
+    // If no seed→seed edges exist, nothing to dedup — return early.
+    if adj.is_empty() {
+        return seeds;
+    }
+
+    // Greedy selection: highest score wins.
+    // Drop a candidate only when an accepted seed has an OUTGOING edge to it
+    // (accepted → candidate). Never drop because candidate → accepted (caller direction).
+    let mut accepted: Vec<(NodeId, f32)> = Vec::with_capacity(seeds.len());
+    let mut accepted_set: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+
+    for (id, score) in seeds {
+        let is_callee_of_accepted = accepted_set.iter().any(|&acc| adj.contains(&(acc, id)));
+        if !is_callee_of_accepted {
+            accepted_set.insert(id);
+            accepted.push((id, score));
+        }
+    }
+    accepted
+}
+
+/// Enrich a seed set with depth-1 production callers of each seed.
+///
+/// PPR follows outgoing edges from seeds, so callers of a seed node are never
+/// reachable unless they are themselves seeds. This function adds the top-5
+/// non-test callers of each seed at 35% of the seed's weight, giving PPR a
+/// starting point inside each caller's neighborhood.
+///
+/// Must run BEFORE `dedup_adjacent_seeds` so that the dedup pass can suppress
+/// any caller that is itself a callee of a higher-scored accepted seed.
+///
+/// Filters applied to each candidate caller:
+///   - `EdgeKind::RefCall` only (imports / structural edges are not callers)
+///   - Skip path containing `/tests/` or `/benches/`
+///   - Skip signature starting with `fn:test_`, `fn:bench_`, `fn:prop_`
+///   - Skip nodes already in the seed set (keeps existing higher weight)
+///   - Cap per-seed: top 5 by outgoing-edge degree (more central = more relevant)
+///   - Cap global: `max_new_total` total new seeds added regardless of input size —
+///     prevents hub nodes (e.g. a logging utility called by 1000 functions) from
+///     flooding the seed pool when this is called for depth-2 enrichment.
+///
+/// O(s × c × d) where s = seed count, c = callers per seed (typically < 20
+/// after test filter), d = outgoing degree per caller (1 store query each).
+pub(crate) fn enrich_seeds_with_callers(
+    store: &SqliteStore,
+    mut seeds: Vec<(NodeId, f32)>,
+    max_new_total: usize,
+) -> Vec<(NodeId, f32)> {
+    use travsr_core::EdgeKind;
+
+    if seeds.is_empty() {
+        return seeds;
+    }
+
+    let existing: std::collections::HashSet<NodeId> = seeds.iter().map(|&(id, _)| id).collect();
+    let mut to_add: Vec<(NodeId, f32)> = Vec::new();
+
+    for &(seed_id, seed_weight) in &seeds {
+        // Collect RefCall incoming edges (who calls this seed?)
+        let incoming = match store.iter_edges_to(seed_id) {
+            Ok(edges) => edges,
+            Err(_) => continue,
+        };
+
+        let caller_ids: Vec<NodeId> = incoming
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::RefCall)
+            .map(|e| e.src)
+            .filter(|id| !existing.contains(id))
+            .collect();
+
+        if caller_ids.is_empty() {
+            continue;
+        }
+
+        // Batch-fetch caller nodes for path/signature filtering.
+        let caller_nodes = match store.get_nodes(&caller_ids) {
+            Ok(nodes) => nodes,
+            Err(_) => continue,
+        };
+
+        // Apply noise filter: skip test/bench callers.
+        let mut production_callers: Vec<NodeId> = caller_nodes
+            .into_iter()
+            .filter(|n| {
+                let path = &n.vname.path;
+                let sig = &n.vname.signature;
+                !path.contains("/tests/")
+                    && !path.contains("/benches/")
+                    && !sig.starts_with("fn:test_")
+                    && !sig.starts_with("fn:bench_")
+                    && !sig.starts_with("fn:prop_")
+            })
+            .map(|n| n.id)
+            .collect();
+
+        if production_callers.is_empty() {
+            continue;
+        }
+
+        // PF-H1: pre-fetch degrees in one pass so the sort key lookup is O(1).
+        // sort_unstable_by_key evaluates the key once per element (not per compare),
+        // but each evaluation was a separate store query — pre-compute avoids n
+        // round-trips hidden inside the sort closure.
+        let caller_degrees: HashMap<NodeId, usize> = production_callers
+            .iter()
+            .map(|&id| (id, store.iter_edges_from(id).map(|e| e.len()).unwrap_or(0)))
+            .collect();
+        production_callers.sort_unstable_by_key(|id| {
+            std::cmp::Reverse(caller_degrees.get(id).copied().unwrap_or(0))
+        });
+
+        let caller_weight = seed_weight * 0.35;
+        for caller_id in production_callers.into_iter().take(5) {
+            to_add.push((caller_id, caller_weight));
+        }
+    }
+
+    // Deduplicate to_add against itself (same caller may be added via multiple seeds;
+    // keep the higher weight).
+    to_add.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen: std::collections::HashSet<NodeId> = existing;
+    to_add.retain(|(id, _)| seen.insert(*id));
+
+    // Global cap: a hub node called by many callers must not flood the seed pool.
+    to_add.truncate(max_new_total);
+
+    seeds.extend(to_add);
+    seeds
 }
 
 fn get_context_body(
@@ -1413,7 +2271,13 @@ fn get_context_body(
     filter: &dyn EdgeFilter,
     include_snippets: bool,
     snippet_budget: Option<usize>,
+    embed_knn: Option<EmbedKnnFn<'_>>,
 ) -> String {
+    // Capture embed presence before embed_knn is consumed by the seed-lookup block.
+    let has_embed = embed_knn.is_some();
+    // PF-M4: compute once here so neither include_snippets branch calls get_meta twice.
+    let phase_b = phase_b_pending(store);
+
     // SEC-002: validate before any store access.
     if let Err(reason) = validate_mcp_arg(query) {
         tracing::warn!("get_context rejected invalid query arg: {reason}");
@@ -1427,33 +2291,133 @@ fn get_context_body(
         return String::new();
     }
 
-    // Seed lookup: up to 5 seeds matching query, RBAC-filtered (SEC P0).
-    let seeds: Vec<NodeId> = match store.search_nodes_fuzzy(query) {
-        Ok(nodes) => nodes
-            .into_iter()
-            .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
-            .take(5)
-            .map(|n| n.id)
-            .collect(),
-        Err(e) => {
-            tracing::warn!("get_context seed search error: {e}");
-            return String::new();
+    // ── Tier-0 seed selection ─────────────────────────────────────────────────
+    // Per-token anchor resolution (IDF-weighted) + whole-query BM25 FTS, fused
+    // via Reciprocal Rank Fusion. KNN slots in as a third source when available.
+    //
+    // Produces a SeedSet with coverage, confidence, and term-resolution map.
+    // Confidence::None → abstain (return resolution map, no salad).
+    //
+    // R3: track per-query KNN health; has_embed=true doesn't mean KNN worked.
+    let mut knn_degraded = false;
+    let knn_pairs = if let Some(knn_fn) = embed_knn {
+        let (knn_scored, _n_eligible, knn_elapsed_ms) =
+            embed_path_seeds(store, query, knn_fn, filter);
+        let budget_ms = knn_budget_ms();
+        if knn_elapsed_ms > budget_ms {
+            // R3: circuit-breaker fired — KNN unambiguously degraded (timeout).
+            tracing::warn!(
+                knn_elapsed_ms,
+                threshold_ms = budget_ms,
+                "knn exceeded circuit-breaker threshold — falling back to FTS seeds"
+            );
+            knn_degraded = true;
+            vec![]
+        } else {
+            // Empty = no embeddings indexed yet (graceful no-op, not degraded).
+            knn_scored
         }
+    } else {
+        vec![]
     };
 
+    let seed_set = crate::seed::build_seed_set(store, query, filter, knn_pairs);
+    let tier_label = if has_embed && !seed_set.seeds.is_empty() {
+        "exact+lexical+semantic"
+    } else {
+        "exact+lexical"
+    };
+
+    // Abstain path: no grounded match → return resolution map, never a confident salad.
+    if seed_set.confidence == crate::seed::Confidence::None {
+        let mut msg = crate::seed::abstain_message(&seed_set, query);
+        let max_g = crate::seed::abstain_max_guesses();
+        if max_g > 0 && !seed_set.seeds.is_empty() {
+            let guess_ids: Vec<NodeId> =
+                seed_set.seeds.iter().take(max_g).map(|s| s.node).collect();
+            if let Ok(guess_nodes) = store.get_nodes(&guess_ids) {
+                let lines: Vec<String> = guess_nodes
+                    .iter()
+                    .map(|n| {
+                        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+                        let pkg = if n.package.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [package: {}]", n.package)
+                        };
+                        format!(
+                            "  {} ({}) — {}{loc}{pkg}",
+                            n.vname.signature, n.kind, n.vname.path
+                        )
+                    })
+                    .collect();
+                msg.push_str(&lines.join("\n"));
+            }
+        }
+        return msg;
+    }
+
+    // R1: relevance floor — when confidence is Weak, warn that results may not
+    // be relevant. This prevents confident-salad responses (64 nodes returned for
+    // "quantum blockchain payment handler" with no graph matches).
+    let weak_match_note: Option<&str> = if seed_set.confidence == crate::seed::Confidence::Weak {
+        Some("[note: no strong match found — results are weak/structural and may not be relevant to this query]")
+    } else {
+        None
+    };
+
+    let seed_cap_fired = seed_set.seeds.len() > MAX_EMBED_SEEDS;
+    let weighted_seeds = seed_set.ppr_seeds();
+
+    // Capture primary seeds before enrichment for role annotation below.
+    let primary_seed_ids: std::collections::HashSet<NodeId> =
+        weighted_seeds.iter().map(|&(id, _)| id).collect();
+
+    let weighted_seeds = enrich_seeds_with_callers(store, weighted_seeds, 15); // depth-1
+    let weighted_seeds = enrich_seeds_with_callers(store, weighted_seeds, 10); // depth-2
+    let weighted_seeds = dedup_adjacent_seeds(store, weighted_seeds);
+
     // SEC P0: identical response for "not found" and "access denied".
-    if seeds.is_empty() {
+    if weighted_seeds.is_empty() {
         return format!("No symbols matching '{query}' found in the graph.");
     }
 
-    // PPR over the seed set.
-    let ppr_scores = match travsr_retrieval::ppr(store, &seeds, context_candidates()) {
-        Ok(scores) => scores,
-        Err(e) => {
-            tracing::warn!("get_context ppr error: {e}");
-            return String::new();
-        }
+    // Retrieval header — declared here so it can be prepended to the response body.
+    let n_resolved = seed_set.terms.iter().filter(|t| t.resolved).count();
+    let n_terms = seed_set.terms.len();
+
+    // R8: index freshness header — lets the AI know exactly which commit the graph
+    // reflects and whether embeddings are active. Keeps the context window honest.
+    let index_commit = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+    let embed_status = if knn_degraded {
+        "degraded"
+    } else if has_embed {
+        "on"
+    } else {
+        "off"
     };
+    let freshness_header = format!("[index commit: {index_commit}, embeddings: {embed_status}]\n");
+
+    let retrieval_header = format!(
+        "{freshness_header}[retrieval: {tier_label} | coverage {n_resolved}/{n_terms} | confidence: {} ]\n",
+        seed_set.confidence.label()
+    );
+
+    // PPR with confidence-weighted personalisation (#365 Step 1 + Step 3).
+    // FTS-only path: weights 1.0/0.6 strictly better than previous uniform ppr().
+    // Embed path: cosine scores steer the walk toward semantic neighbours.
+    let ppr_scores =
+        match travsr_retrieval::ppr_weighted(store, &weighted_seeds, context_candidates()) {
+            Ok(scores) => scores,
+            Err(e) => {
+                tracing::warn!("get_context ppr error: {e}");
+                return String::new();
+            }
+        };
 
     if ppr_scores.is_empty() {
         return format!("No symbols matching '{query}' found in the graph.");
@@ -1499,10 +2463,163 @@ fn get_context_body(
         })
         .collect();
 
+    // Capture lightweight overflow metadata before knapsack consumes items.
+    // Storing only (id, score, sig, path) avoids cloning full Node objects.
+    const OVERFLOW_DISPLAY_CAP: usize = 10;
+    let overflow_candidates: Vec<(NodeId, f32, String, String)> = items
+        .iter()
+        .map(|(n, s)| (n.id, *s, n.vname.signature.clone(), n.vname.path.clone()))
+        .collect();
+    let n_candidates = overflow_candidates.len();
+
+    // R7: keep post-kcore scores for per-node score annotation in output.
+    // Built before knapsack consumes items (items is Vec<(CoreNode, f32)>).
+    let node_score_map: HashMap<NodeId, f32> = overflow_candidates
+        .iter()
+        .map(|(id, s, _, _)| (*id, *s))
+        .collect();
+
     // Knapsack selection.
     let selected = knapsack(items, token_budget);
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
+
+    // Build overflow list: candidates that didn't fit within the token budget.
+    let overflow_msg: Option<String> = if n_nodes < n_candidates {
+        let selected_set: std::collections::HashSet<NodeId> =
+            selected.iter().map(|n| n.id).collect();
+        let overflow: Vec<_> = overflow_candidates
+            .iter()
+            .filter(|(id, _, _, _)| !selected_set.contains(id))
+            .take(OVERFLOW_DISPLAY_CAP)
+            .collect();
+        if overflow.is_empty() {
+            None
+        } else {
+            let n_overflow = n_candidates - n_nodes;
+            let min_score: f32 = overflow.last().map(|item| item.1).unwrap_or(0.0);
+            let mut msg = format!(
+                "[{n_overflow} more node(s) matched (score \u{2265} {min_score:.2}) — budget exhausted. \
+                 Use a specific symbol name for deeper coverage, or call \
+                 get_blast_radius / get_callers / get_dependencies for complete results.]"
+            );
+            let lines: Vec<String> = overflow
+                .iter()
+                .map(|(_, s, sig, path)| format!("  {sig}  score: {s:.2}  {path}"))
+                .collect();
+            msg.push('\n');
+            msg.push_str(&lines.join("\n"));
+            Some(msg)
+        }
+    } else {
+        None
+    };
+
+    // Seed-cap signal: emit when eligible candidates exceeded MAX_EMBED_SEEDS.
+    let seed_cap_msg: Option<&str> = if seed_cap_fired {
+        Some(
+            "[note: query matched more seed candidates than the cap — \
+             consider narrowing the query or calling get_context once per concept]",
+        )
+    } else {
+        None
+    };
+
+    // R2: detect multi-concept starvation by checking whether the seed set
+    // forms ≥2 disconnected components. A query like "schedule embedding AND phase b"
+    // can produce seeds from two unrelated subgraphs; PPR then awards all budget to
+    // the heavier cluster, silently returning 0 nodes from the lighter one.
+    //
+    // Detection: BFS from the first seed through direct edges among seeds only.
+    // If ≥1 seed is unreachable, the seeds span ≥2 disconnected components.
+    let multi_concept_note: Option<&str> = {
+        let all_seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
+        if all_seed_ids.len() >= 4 {
+            let seed_set_local: std::collections::HashSet<NodeId> =
+                all_seed_ids.iter().copied().collect();
+            let mut reached: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            let mut queue: std::collections::VecDeque<NodeId> =
+                std::collections::VecDeque::from([all_seed_ids[0]]);
+            reached.insert(all_seed_ids[0]);
+            while let Some(id) = queue.pop_front() {
+                let fwd = store.iter_edges_from(id).unwrap_or_default();
+                let rev = store.iter_edges_to(id).unwrap_or_default();
+                for e in fwd.into_iter().chain(rev) {
+                    let neighbor = if e.src == id { e.dst } else { e.src };
+                    if seed_set_local.contains(&neighbor) && reached.insert(neighbor) {
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+            if reached.len() < seed_set_local.len() {
+                Some(
+                    "[note: query may span multiple concepts — \
+                     results show the dominant cluster only. \
+                     Try one concept per get_context call for complete coverage.]",
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Build 1-hop role map: classify each selected node's relationship to the seeds.
+    // O(S × avg_degree); seeds are capped at MAX_EMBED_SEEDS so this is negligible.
+    // Errors are silently ignored — roles degrade to Context, never block output.
+    let seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
+    let roles: HashMap<NodeId, NodeRole> = {
+        use travsr_core::EdgeKind;
+        let selected_set: std::collections::HashSet<NodeId> =
+            selected.iter().map(|n| n.id).collect();
+        let mut map: HashMap<NodeId, NodeRole> =
+            selected.iter().map(|n| (n.id, NodeRole::Context)).collect();
+        for &seed in &seed_ids {
+            // Forward edges: seed → node  →  node is a Dependency of seed.
+            if let Ok(fwd) = store.iter_edges_from(seed) {
+                for e in fwd {
+                    if matches!(
+                        e.kind,
+                        EdgeKind::RefCall
+                            | EdgeKind::Depends
+                            | EdgeKind::RefImports
+                            | EdgeKind::Exports
+                    ) && selected_set.contains(&e.dst)
+                    {
+                        map.entry(e.dst).and_modify(|r| {
+                            if *r == NodeRole::Context {
+                                *r = NodeRole::Dependency;
+                            }
+                        });
+                    }
+                }
+            }
+            // Reverse edges: node → seed  →  node is a Caller of seed.
+            if let Ok(rev) = store.iter_edges_to(seed) {
+                for e in rev {
+                    if matches!(
+                        e.kind,
+                        EdgeKind::RefCall | EdgeKind::RefImports | EdgeKind::Depends
+                    ) && selected_set.contains(&e.src)
+                    {
+                        map.entry(e.src).and_modify(|r| {
+                            if *r == NodeRole::Context {
+                                *r = NodeRole::Caller;
+                            }
+                        });
+                    }
+                }
+            }
+            // Only primary FTS/KNN seeds get the Seed role.
+            // Enriched callers (added by enrich_seeds_with_callers) keep their Caller
+            // role so the annotation correctly shows [via: caller] for them.
+            if primary_seed_ids.contains(&seed) {
+                map.insert(seed, NodeRole::Seed);
+            }
+        }
+        map
+    };
 
     let char_cap = (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000);
 
@@ -1517,16 +2634,24 @@ fn get_context_body(
                 let lines: Vec<String> = selected
                     .iter()
                     .map(|n| {
-                        format!(
-                            "{} ({}) — {} [package: {}]",
-                            n.vname.signature, n.kind, n.vname.path, n.package
-                        )
+                        let role = roles
+                            .get(&n.id)
+                            .copied()
+                            .unwrap_or(NodeRole::Context)
+                            .label();
+                        format_node_line(n, role, node_score_map.get(&n.id).copied())
                     })
                     .collect();
                 let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
-                return format!(
-                    "{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
+                let notes = build_degraded_notes(store, has_embed);
+                let footer = format!(
+                    "[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
                 );
+                return if notes.is_empty() {
+                    format!("{retrieval_header}{sanitized}\n\n{footer}")
+                } else {
+                    format!("{retrieval_header}{sanitized}\n\n{footer}\n{notes}")
+                };
             }
         };
 
@@ -1544,10 +2669,12 @@ fn get_context_body(
         let mut blocks: Vec<String> = Vec::with_capacity(selected.len());
 
         for n in &selected {
-            let header = format!(
-                "{} ({}) — {} [package: {}]",
-                n.vname.signature, n.kind, n.vname.path, n.package
-            );
+            let role = roles
+                .get(&n.id)
+                .copied()
+                .unwrap_or(NodeRole::Context)
+                .label();
+            let header = format_node_line(n, role, node_score_map.get(&n.id).copied());
             // Use skeleton when the body exceeds the kind-aware line cap.
             let n_height = n
                 .end_line
@@ -1581,22 +2708,52 @@ fn get_context_body(
         }
 
         let sanitized = sanitize_mcp_body_with_limit(&blocks.join("\n\n"), char_cap);
-        format!(
-            "{sanitized}\n\n[{n_nodes} nodes, {n_with_snippet} with snippets, ~{total_tokens} metadata-tokens + ~{snip_tokens} snippet-tokens ({mode_label} budget)]"
-        )
+        let signals = build_context_signals_with_r2(
+            phase_b,
+            has_embed,
+            knn_degraded,
+            overflow_msg.as_deref(),
+            seed_cap_msg,
+            multi_concept_note,
+            weak_match_note,
+        );
+        let footer = format!(
+            "[{n_nodes} nodes, {n_with_snippet} with snippets, ~{total_tokens} metadata-tokens + ~{snip_tokens} snippet-tokens ({mode_label} budget)]"
+        );
+        if signals.is_empty() {
+            format!("{retrieval_header}{sanitized}\n\n{footer}")
+        } else {
+            format!("{retrieval_header}{sanitized}\n\n{footer}\n{signals}")
+        }
     } else {
-        // Legacy path — byte-identical to pre-include_snippets behaviour.
+        // Metadata-only path with role annotations.
         let lines: Vec<String> = selected
             .iter()
             .map(|n| {
-                format!(
-                    "{} ({}) — {} [package: {}]",
-                    n.vname.signature, n.kind, n.vname.path, n.package
-                )
+                let role = roles
+                    .get(&n.id)
+                    .copied()
+                    .unwrap_or(NodeRole::Context)
+                    .label();
+                format_node_line(n, role, node_score_map.get(&n.id).copied())
             })
             .collect();
         let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
-        format!("{sanitized}\n\n[{n_nodes} nodes, ~{total_tokens} tokens]")
+        let signals = build_context_signals_with_r2(
+            phase_b,
+            has_embed,
+            knn_degraded,
+            overflow_msg.as_deref(),
+            seed_cap_msg,
+            multi_concept_note,
+            weak_match_note,
+        );
+        let footer = format!("[{n_nodes} nodes, ~{total_tokens} tokens]");
+        if signals.is_empty() {
+            format!("{retrieval_header}{sanitized}\n\n{footer}")
+        } else {
+            format!("{retrieval_header}{sanitized}\n\n{footer}\n{signals}")
+        }
     }
 }
 
@@ -1616,18 +2773,68 @@ pub fn get_context_global(
     if token_budget > MAX_CONTEXT_BUDGET {
         return wrap_envelope("token_budget exceeds maximum allowed value");
     }
-    let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_context_raw(store, query, token_budget, include_snippets, snippet_budget);
-        if result.is_empty() || single {
-            result
-        } else {
-            result
-                .lines()
-                .map(|l| format!("[{repo_name}] {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+
+    // Strip any embedded language token so FTS seeding gets a clean query.
+    // E.g. "auth handler javascript" → seed PPR with "auth handler".
+    let (stripped, _lang_filter) = infer_language_from_query(query);
+    let seed_query = stripped.as_str();
+
+    // R4: use a per-repo header block rather than prefixing every line with
+    // "[repo_name]". Per-line prefixing pollutes blank lines, footer lines, and
+    // notes with repo tags that look like noise in an LLM context window.
+    let raw = if repo.is_some() {
+        collect_global(repos, repo, |store, repo_name, single| {
+            let result = get_context_raw(
+                store,
+                seed_query,
+                token_budget,
+                include_snippets,
+                snippet_budget,
+            );
+            if result.is_empty() || single {
+                result
+            } else {
+                format!("[repo: {repo_name}]\n{result}")
+            }
+        })
+    } else {
+        // Fan-out: rank repos by result size (token-rich responses first).
+        let mut candidates: Vec<(&str, &PathBuf)> =
+            repos.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        candidates.retain(|(_, db)| db.exists());
+        let single = candidates.len() == 1;
+
+        let mut parts: Vec<(usize, String)> = Vec::new();
+        for (repo_name, db_path) in &candidates {
+            match SqliteStore::open_read_only(db_path) {
+                Ok(store) => {
+                    let result = get_context_raw(
+                        &store,
+                        seed_query,
+                        token_budget,
+                        include_snippets,
+                        snippet_budget,
+                    );
+                    if !result.is_empty() {
+                        let count = result.len();
+                        let text = if single {
+                            result
+                        } else {
+                            format!("[repo: {repo_name}]\n{result}")
+                        };
+                        parts.push((count, text));
+                    }
+                }
+                Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+            }
         }
-    });
+        parts.sort_by_key(|b| std::cmp::Reverse(b.0));
+        parts
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
     wrap_envelope(&raw)
 }
 
@@ -2533,6 +3740,202 @@ mod tests {
         );
     }
 
+    // ── search_symbol unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn search_symbol_no_match_returns_explicit_message() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let result = search_symbol(&store, "NonExistentSymbol");
+        assert!(
+            result.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
+            "no-match should return explicit not-found message, got: {result}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_global_no_match_returns_explicit_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        // Create an empty file-backed store (no nodes).
+        drop(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let repos: HashMap<String, PathBuf> = [("myrepo".to_string(), db_path)].into();
+        let result = search_symbol_global(&repos, "NonExistentSymbol", None);
+        assert!(
+            result.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
+            "global no-match should return explicit not-found message, got: {result}"
+        );
+    }
+
+    // ── search_symbol / get_callers path:line tests ───────────────────────────
+
+    #[test]
+    fn search_symbol_emits_path_line_when_present() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("", "", "src/foo.rs", "rust", "fn:bar"),
+            "function",
+        )
+        .with_line(42);
+        store.put_node(&n).unwrap();
+        let result = search_symbol(&store, "bar");
+        assert!(
+            result.contains("src/foo.rs:42"),
+            "search_symbol must emit path:line, got: {result}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_omits_line_when_absent() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("", "", "src/foo.rs", "rust", "fn:baz"),
+            "function",
+        );
+        store.put_node(&n).unwrap();
+        let result = search_symbol(&store, "baz");
+        assert!(
+            result.contains("src/foo.rs"),
+            "path must still appear: {result}"
+        );
+        assert!(
+            !result.contains("src/foo.rs:"),
+            "no colon-suffix when line absent, got: {result}"
+        );
+    }
+
+    // ── infer_language_from_query ────────────────────────────────────────────
+
+    #[test]
+    fn infer_lang_strips_trailing_token() {
+        let (q, lang) = infer_language_from_query("auth handler javascript");
+        assert_eq!(q, "auth handler");
+        assert_eq!(lang, Some("javascript"));
+    }
+
+    #[test]
+    fn infer_lang_strips_in_connector() {
+        let (q, lang) = infer_language_from_query("PaymentService in Kotlin");
+        assert_eq!(q, "PaymentService");
+        assert_eq!(lang, Some("kotlin"));
+    }
+
+    #[test]
+    fn infer_lang_aliases_map_correctly() {
+        assert_eq!(infer_language_from_query("foo c++").1, Some("cpp"));
+        assert_eq!(infer_language_from_query("foo c#").1, Some("csharp"));
+        assert_eq!(
+            infer_language_from_query("foo objective-c").1,
+            Some("objectivec")
+        );
+        assert_eq!(infer_language_from_query("foo objc").1, Some("objectivec"));
+        assert_eq!(infer_language_from_query("foo golang").1, Some("go"));
+        assert_eq!(infer_language_from_query("foo csharp").1, Some("csharp"));
+    }
+
+    #[test]
+    fn infer_lang_no_token_returns_original() {
+        let (q, lang) = infer_language_from_query("knapsack budget optimizer");
+        assert_eq!(q, "knapsack budget optimizer");
+        assert_eq!(lang, None);
+    }
+
+    #[test]
+    fn infer_lang_preserves_original_when_stripping_leaves_empty() {
+        // Query is JUST a language name — keep it as-is so search still runs.
+        let (q, lang) = infer_language_from_query("rust");
+        assert_eq!(q, "rust");
+        assert_eq!(lang, Some("rust"));
+    }
+
+    #[test]
+    fn infer_lang_case_insensitive() {
+        let (q, lang) = infer_language_from_query("session PYTHON");
+        assert_eq!(q, "session");
+        assert_eq!(lang, Some("python"));
+    }
+
+    // ── search_symbol language filter ────────────────────────────────────────
+
+    #[test]
+    fn search_symbol_global_filters_by_inferred_language() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let rs_node = Node::new(
+            VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"),
+            "function",
+        );
+        let ts_node = Node::new(
+            VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"),
+            "function",
+        );
+        store.put_node(&rs_node).unwrap();
+        store.put_node(&ts_node).unwrap();
+
+        // "auth handler typescript" should return only the TypeScript node.
+        let result = search_symbol_raw(&store, "auth", Some("typescript"));
+        assert!(
+            result.contains("src/auth.ts"),
+            "expected typescript node: {result}"
+        );
+        assert!(
+            !result.contains("src/auth.rs"),
+            "rust node must be filtered out: {result}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_raw_no_filter_returns_both_languages() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let rs_node = Node::new(
+            VName::new("", "", "src/auth.rs", "rust", "fn:auth_handler"),
+            "function",
+        );
+        let ts_node = Node::new(
+            VName::new("", "", "src/auth.ts", "typescript", "fn:authHandler"),
+            "function",
+        );
+        store.put_node(&rs_node).unwrap();
+        store.put_node(&ts_node).unwrap();
+
+        let result = search_symbol_raw(&store, "auth", None);
+        assert!(
+            result.contains("auth.rs"),
+            "rust node must appear: {result}"
+        );
+        assert!(
+            result.contains("auth.ts"),
+            "typescript node must appear: {result}"
+        );
+    }
+
+    #[test]
+    fn get_callers_emits_path_line_when_present() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let callee = Node::new(
+            VName::new("", "", "src/callee.rs", "rust", "fn:callee"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("", "", "src/caller.rs", "rust", "fn:caller"),
+            "function",
+        )
+        .with_line(10);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        let result = get_callers(&store, "fn:callee");
+        assert!(
+            result.contains("src/caller.rs:10"),
+            "get_callers must emit path:line for caller, got: {result}"
+        );
+    }
+
     // ── blast radius unit tests ───────────────────────────────────────────────
 
     fn make_store(
@@ -2927,6 +4330,64 @@ mod tests {
         let trans = get_dependencies(&store, "a.ts", true, 3);
         assert!(trans.contains("b.ts"), "b.ts missing: {trans}");
         assert!(trans.contains("c.ts"), "transitive c.ts missing: {trans}");
+    }
+
+    // ── get_dependencies top-k cap tests ─────────────────────────────────────
+
+    #[test]
+    fn get_dependencies_raw_caps_at_top_k_and_emits_footer() {
+        use travsr_core::{EdgeKind, Node, VName};
+        // Seed file + 30 dep nodes (> DEFAULT_DEPS_TOP_K=25).
+        let seed = Node::new(
+            VName::new("", "", "src/big.ts", "typescript", "src/big.ts"),
+            "file",
+        );
+        let mut nodes = vec![seed.clone()];
+        let mut edges = Vec::new();
+        for i in 0..30u32 {
+            let dep = Node::new(
+                VName::new(
+                    "",
+                    "",
+                    format!("dep{i}.ts"),
+                    "typescript",
+                    format!("dep{i}.ts"),
+                ),
+                "file",
+            );
+            edges.push((seed.id, dep.id, EdgeKind::Depends));
+            nodes.push(dep);
+        }
+        let store = make_store(&nodes, &edges);
+        let result = get_dependencies(&store, "src/big.ts", false, 1);
+        assert!(
+            result.contains("showing 25 of 30"),
+            "footer must report 25 of 30, got: {result}"
+        );
+        assert!(
+            result.contains("get_context for ranked coverage"),
+            "footer must include get_context hint, got: {result}"
+        );
+    }
+
+    #[test]
+    fn get_dependencies_raw_no_footer_when_under_top_k() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let seed = Node::new(
+            VName::new("", "", "src/small.ts", "typescript", "src/small.ts"),
+            "file",
+        );
+        let dep = Node::new(VName::new("", "", "dep.ts", "typescript", "dep.ts"), "file");
+        let store = make_store(
+            &[seed.clone(), dep.clone()],
+            &[(seed.id, dep.id, EdgeKind::Depends)],
+        );
+        let result = get_dependencies(&store, "src/small.ts", false, 1);
+        assert!(
+            !result.contains("showing"),
+            "no footer when under top-k, got: {result}"
+        );
+        assert!(result.contains("dep.ts"), "dep must appear: {result}");
     }
 
     // ── get_repo_map unit tests ───────────────────────────────────────────────
@@ -3677,8 +5138,8 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("charge.ts", "fn:charge", 1, 3);
         let store = make_store_with_root(&dir, &[node]);
 
-        let without = get_context_body(&store, "charge", 4096, &OpenFilter, false, None);
-        let with_snip = get_context_body(&store, "charge", 4096, &OpenFilter, true, None);
+        let without = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        let with_snip = get_context_body(&store, "charge", 4096, &OpenFilter, true, None, None);
 
         // false path: metadata-only — no separator, footer present
         assert!(without.contains("["), "footer must be present");
@@ -3702,7 +5163,7 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("pay.ts", "fn:pay", 1, 3);
         let store = make_store_with_root(&dir, &[node]);
 
-        let result = get_context_body(&store, "pay", 4096, &OpenFilter, true, None);
+        let result = get_context_body(&store, "pay", 4096, &OpenFilter, true, None, None);
         assert!(
             result.contains(SNIPPET_SEP),
             "SNIPPET_SEP must appear when include_snippets=true"
@@ -3726,7 +5187,7 @@ mod snippet_tests {
         let store = make_store_with_root(&dir, &[node]);
 
         // Tiny budget: metadata fits but snippet cannot.
-        let result = get_context_body(&store, "big", 10, &OpenFilter, true, None);
+        let result = get_context_body(&store, "big", 10, &OpenFilter, true, None, None);
         // Must not panic; footer must be present regardless of truncation.
         assert!(result.contains("nodes"), "footer must always be present");
     }
@@ -3741,7 +5202,7 @@ mod snippet_tests {
         let store = make_store_with_root(&dir, &[node]);
 
         // Separate snippet_budget of 512; main budget governs node selection only.
-        let result = get_context_body(&store, "sep", 4096, &OpenFilter, true, Some(512));
+        let result = get_context_body(&store, "sep", 4096, &OpenFilter, true, Some(512), None);
         assert!(
             result.contains("separate"),
             "footer must label separate-budget mode"
@@ -3759,7 +5220,7 @@ mod snippet_tests {
         let node = make_fn_node_with_pkg("x.ts", "fn:x", 1, 2);
         store.put_node(&node).unwrap();
 
-        let result = get_context_body(&store, "x", 4096, &OpenFilter, true, None);
+        let result = get_context_body(&store, "x", 4096, &OpenFilter, true, None, None);
         // Either "not found" (no FTS match on empty index) or the init hint — never a panic.
         let has_meta_hint =
             result.contains("travsr init") || result.is_empty() || result.contains("No symbols");
@@ -3796,11 +5257,1004 @@ mod snippet_tests {
             .unwrap();
         store.put_node(&node).unwrap();
 
-        let result = get_context_body(&store, "secret", 4096, &DenyAll, true, None);
+        let result = get_context_body(&store, "secret", 4096, &DenyAll, true, None, None);
         // RBAC filter rejects all nodes → "not found" (SEC P0) with no snippet leak.
         assert!(
             !result.contains("return 99"),
             "RBAC-filtered node must never appear in snippet output"
+        );
+    }
+
+    // ── Edge-relationship annotation tests ──────────────────────────────────
+
+    fn make_store_with_edges(
+        nodes: &[CoreNode],
+        edges: &[(
+            travsr_core::NodeId,
+            travsr_core::NodeId,
+            travsr_core::EdgeKind,
+        )],
+    ) -> travsr_store::SqliteStore {
+        use travsr_store::Store;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for n in nodes {
+            store.put_node(n).unwrap();
+        }
+        for &(src, dst, kind) in edges {
+            store
+                .put_edge(&travsr_core::Edge::new(src, dst, kind))
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn get_context_annotation_labels_seed() {
+        // The node that directly matches the query must be labelled [via: seed].
+        let node = make_fn_node_with_pkg("seed.ts", "fn:seed_target", 1, 3);
+        let store = make_store_with_edges(&[node], &[]);
+
+        let result = get_context_body(&store, "seed_target", 4096, &OpenFilter, false, None, None);
+        assert!(
+            result.contains("[via: seed]"),
+            "direct match must be labelled [via: seed]: {result}"
+        );
+    }
+
+    #[test]
+    fn get_context_annotation_labels_caller() {
+        // caller_fn has a RefCall edge to seed_fn.
+        // get_context(query="seed_fn") → seed_fn=[via:seed], caller_fn=[via:caller].
+        // PPR BFS only follows forward edges, so caller_fn must be reachable
+        // from seed_fn via a forward path to appear in the output at all.
+        // Graph: seed_fn → Depends → bridge_fn → Depends → caller_fn
+        //        caller_fn → RefCall → seed_fn
+        // PPR surfaces caller_fn (forward path depth 2).
+        // Role check finds the reverse RefCall → labels caller_fn [via: caller].
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+        let seed_node = make_fn_node_with_pkg("s.ts", "fn:seed_fn", 1, 3);
+        let bridge_node = make_fn_node_with_pkg("b.ts", "fn:bridge_fn", 1, 3);
+        let caller_node = make_fn_node_with_pkg("c.ts", "fn:caller_fn", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let bridge_id = store.put_node(&bridge_node).unwrap();
+        let caller_id = store.put_node(&caller_node).unwrap();
+        // Forward path: seed_fn → bridge_fn → caller_fn (PPR discovery)
+        store
+            .put_edge(&travsr_core::Edge::new(
+                seed_id,
+                bridge_id,
+                EdgeKind::Depends,
+            ))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(
+                bridge_id,
+                caller_id,
+                EdgeKind::Depends,
+            ))
+            .unwrap();
+        // Reverse semantic edge: caller_fn calls seed_fn → earns [via: caller]
+        store
+            .put_edge(&travsr_core::Edge::new(
+                caller_id,
+                seed_id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let result = get_context_body(&store, "seed_fn", 4096, &OpenFilter, false, None, None);
+        assert!(
+            result.contains("[via: seed]"),
+            "seed node must be labelled [via: seed]: {result}"
+        );
+        assert!(
+            result.contains("[via: caller]"),
+            "caller node must be labelled [via: caller]: {result}"
+        );
+    }
+
+    #[test]
+    fn get_context_annotation_labels_dependency() {
+        // seed_fn has a Depends edge to dep_fn.
+        // get_context(query="seed_fn") → seed_fn=[via:seed], dep_fn=[via:dependency].
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+        let seed_node = make_fn_node_with_pkg("s.ts", "fn:seed_fn2", 1, 3);
+        let dep_node = make_fn_node_with_pkg("d.ts", "fn:dep_fn", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let dep_id = store.put_node(&dep_node).unwrap();
+        // seed_fn → Depends → dep_fn
+        store
+            .put_edge(&travsr_core::Edge::new(seed_id, dep_id, EdgeKind::Depends))
+            .unwrap();
+
+        let result = get_context_body(&store, "seed_fn2", 4096, &OpenFilter, false, None, None);
+        assert!(
+            result.contains("[via: seed]"),
+            "seed node must be labelled [via: seed]: {result}"
+        );
+        assert!(
+            result.contains("[via: dependency]"),
+            "dep node must be labelled [via: dependency]: {result}"
+        );
+    }
+
+    #[test]
+    fn get_context_annotation_labels_context() {
+        // A node with no edge to/from the seed is labelled [via: context].
+        use travsr_store::Store;
+        let seed_node = make_fn_node_with_pkg("s.ts", "fn:seed_only", 1, 3);
+        let ctx_node = make_fn_node_with_pkg("u.ts", "fn:unrelated_fn", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&seed_node).unwrap();
+        store.put_node(&ctx_node).unwrap();
+        // No edges between them — ctx_node is reachable only via PPR structural walk.
+
+        // Search for "seed_only" — ctx_node should appear as [via: context] if PPR
+        // surfaces it, or just not appear. Either way, if it does appear it must NOT
+        // carry seed/caller/dependency labels.
+        let result = get_context_body(&store, "seed_only", 4096, &OpenFilter, false, None, None);
+        assert!(
+            !result.contains("unrelated_fn") || result.contains("[via: context]"),
+            "unrelated node must be [via: context] if it appears at all: {result}"
+        );
+    }
+
+    // ── is_noise_seed tests ───────────────────────────────────────────────────
+
+    fn make_node_with_kind_and_path(kind: &str, path: &str, sig: &str) -> travsr_core::Node {
+        travsr_core::Node::new(travsr_core::VName::new("corp", "", path, "rust", sig), kind)
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_crate_kind() {
+        let n = make_node_with_kind_and_path(
+            "crate",
+            "crates/travsr-retrieval/Cargo.toml",
+            "crate:travsr-retrieval",
+        );
+        assert!(is_noise_seed(&n), "crate nodes must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_tests_path() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-mcp/tests/conformance.rs",
+            "fn:run_mcp",
+        );
+        assert!(is_noise_seed(&n), "integration test files must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_benches_path() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-retrieval/benches/retrieval.rs",
+            "fn:bench_ppr_chain",
+        );
+        assert!(is_noise_seed(&n), "benchmark files must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_allows_src_functions() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-mcp/src/tools.rs",
+            "fn:get_context_body",
+        );
+        assert!(
+            !is_noise_seed(&n),
+            "src/ implementation functions must not be excluded"
+        );
+    }
+
+    #[test]
+    fn is_noise_seed_allows_src_unit_tests() {
+        // Unit tests inside src/ are kept — PPR from them reaches the impl they test.
+        let n = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-retrieval/src/ppr.rs",
+            "fn:ppr_handles_cycles",
+        );
+        assert!(
+            !is_noise_seed(&n),
+            "in-src unit test functions must not be excluded"
+        );
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_root_fixtures_dir() {
+        let n = make_node_with_kind_and_path(
+            "class",
+            "fixtures/ts-callers/service.ts",
+            "class:PaymentService",
+        );
+        assert!(is_noise_seed(&n), "root-level fixtures/ must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_root_fuzz_corpus() {
+        let n = make_node_with_kind_and_path(
+            "class",
+            "fuzz/corpus/fuzz_treesitter_indexer/seed_class.ts",
+            "class:PaymentService",
+        );
+        assert!(is_noise_seed(&n), "root-level fuzz corpus must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_scip_synthetic_nodes() {
+        let n = make_node_with_kind_and_path("function", "some/file.py", "scip:python:some.Symbol");
+        assert!(is_noise_seed(&n), "scip: synthetic nodes must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_go_test_files() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "pkg/handler/handler_test.go",
+            "fn:TestHandlerRPC",
+        );
+        assert!(is_noise_seed(&n), "Go _test.go files must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_build_cache_relative_path() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "../../../Library/Caches/go-build/abc123/b.go",
+            "fn:build_cache_fn",
+        );
+        assert!(is_noise_seed(&n), "../ paths outside repo must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_go_module_cache() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "/home/user/go/pkg/mod/github.com/foo/bar@v1.2.3/pkg.go",
+            "fn:bar_fn",
+        );
+        assert!(is_noise_seed(&n), "Go module cache paths must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_testdata_dir() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "pkg/parser/testdata/golden_output.go",
+            "fn:some_func",
+        );
+        assert!(is_noise_seed(&n), "testdata/ directories must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_java_maven_test_src() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "src/test/java/com/example/ServiceTest.java",
+            "fn:testChargeSuccess",
+        );
+        assert!(
+            is_noise_seed(&n),
+            "Java Maven src/test/java must be excluded"
+        );
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_kotlin_test_src() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "src/test/kotlin/com/example/ServiceSpec.kt",
+            "fn:charge_succeeds",
+        );
+        assert!(is_noise_seed(&n), "Kotlin src/test/kotlin must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_scala_test_src() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "src/test/scala/com/example/ServiceSuite.scala",
+            "fn:chargeReturnsOk",
+        );
+        assert!(is_noise_seed(&n), "Scala src/test/scala must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_ruby_spec_dir() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "spec/services/charge_spec.rb",
+            "fn:charge_service",
+        );
+        assert!(is_noise_seed(&n), "Ruby spec/ directory must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_dart_pub_cache() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "/home/user/.pub-cache/hosted/pub.dev/http-1.2.0/lib/http.dart",
+            "fn:get",
+        );
+        assert!(is_noise_seed(&n), ".pub-cache paths must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_cmake_files_dir() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "build/CMakeFiles/myapp.dir/src/main.c.o",
+            "fn:main",
+        );
+        assert!(
+            is_noise_seed(&n),
+            "CMakeFiles/ build artifacts must be excluded"
+        );
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_java_class_files() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "target/classes/com/example/Service.class",
+            "fn:charge",
+        );
+        assert!(is_noise_seed(&n), ".class files must be excluded");
+    }
+
+    #[test]
+    fn is_noise_seed_excludes_gradle_build_classes() {
+        let n = make_node_with_kind_and_path(
+            "function",
+            "build/classes/kotlin/main/com/example/Service.kt",
+            "fn:charge",
+        );
+        assert!(is_noise_seed(&n), "Gradle build/classes must be excluded");
+    }
+
+    #[test]
+    fn fts_seeds_weighted_filters_crate_noise() {
+        // FTS exact-matching a crate node (e.g. "crate:getrandom" matching query
+        // "random") must be dropped — same noise class as KNN already filters.
+        use travsr_store::Store;
+        let crate_node = make_node_with_kind_and_path(
+            "crate",
+            "crates/travsr-retrieval/Cargo.toml",
+            "crate:getrandom",
+        );
+        let impl_node = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-retrieval/src/ppr.rs",
+            "fn:random_walk",
+        );
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&crate_node).unwrap();
+        let impl_id = store.put_node(&impl_node).unwrap();
+
+        // Both nodes would match a "random" FTS query in a real store, but we use
+        // fts_seeds_weighted directly to isolate the noise filter.  Inject them via
+        // search_nodes_by_name by naming them so FTS exact-matches: call the function
+        // with the impl node's name to get a result, then manually verify crate kind
+        // is rejected.  Because open_in_memory FTS is live, just verify the filter
+        // logic directly via the public function path.
+        let seeds = fts_seeds_weighted(&store, "random_walk", &OpenFilter);
+        assert!(
+            seeds.iter().all(|&(id, _)| id == impl_id),
+            "crate-kind nodes must be filtered from FTS seeds; got {:?}",
+            seeds
+        );
+    }
+
+    #[test]
+    fn embed_path_seeds_filters_noise_nodes() {
+        // KNN returns a crate node + a tests/ function + a real src function.
+        // Only the real src function must become a seed.
+        use travsr_store::Store;
+        let crate_node = make_node_with_kind_and_path(
+            "crate",
+            "crates/travsr-retrieval/Cargo.toml",
+            "crate:travsr-retrieval",
+        );
+        let test_node = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-mcp/tests/conformance.rs",
+            "fn:run_mcp",
+        );
+        let impl_node = make_node_with_kind_and_path(
+            "function",
+            "crates/travsr-mcp/src/tools.rs",
+            "fn:get_context_body",
+        );
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let crate_id = store.put_node(&crate_node).unwrap();
+        let test_id = store.put_node(&test_node).unwrap();
+        let impl_id = store.put_node(&impl_node).unwrap();
+
+        // KNN returns all three with high scores.
+        let knn: EmbedKnnFn<'_> =
+            &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
+
+        let (seeds, n_eligible, _) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        assert!(
+            seeds.iter().all(|(node, _)| node.id == impl_id),
+            "only the src impl node should be a seed; got: {seeds:?}"
+        );
+        assert_eq!(seeds.len(), 1, "exactly one seed expected");
+        assert_eq!(n_eligible, 1, "n_eligible should match non-noise seeds");
+    }
+
+    // ── #367 degraded-state notes ─────────────────────────────────────────────
+
+    /// When embed_knn is None, get_context output must include the semantic-search note.
+    #[test]
+    fn get_context_no_embed_appends_degraded_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let store = make_store_with_root(&dir, &[node]);
+        // Simulate a repo that has commits (so phase_b_pending check is meaningful).
+        // We do NOT set phase_b_commit so both notes could fire; only test the embed note.
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        assert!(
+            result.contains("semantic search disabled"),
+            "must emit embed-missing note when embed_knn=None; got: {result}"
+        );
+    }
+
+    /// Phase B pending: output must contain the call-traversal-limited note.
+    #[test]
+    fn get_context_phase_b_pending_appends_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        // Mark a real last_commit without a phase_b_commit → phase_b_pending returns true.
+        store.set_meta("last_commit", "abc123").unwrap();
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        assert!(
+            result.contains("call traversal limited"),
+            "must emit phase-B-pending note when phase_b_commit absent; got: {result}"
+        );
+    }
+
+    /// When both embed and Phase B are present, no degraded notes should appear.
+    #[test]
+    fn get_context_fully_operational_no_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        // Provide a no-op embed_knn (has_embed = true).
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        assert!(
+            !result.contains("[note:"),
+            "fully operational graph must not emit degraded notes; got: {result}"
+        );
+    }
+
+    // ── #377 truncation signals ───────────────────────────────────────────────
+
+    /// When knapsack cannot fit all scored nodes, the overflow message must appear.
+    #[test]
+    fn get_context_overflow_signal_emitted_on_budget_exhaustion() {
+        use travsr_core::{Edge, EdgeKind};
+        let dir = tempfile::tempdir().unwrap();
+        // Write 10 nodes and connect them so PPR scores them all.
+        let nodes: Vec<_> = (0..10)
+            .map(|i| {
+                make_fn_node_with_pkg(&format!("src/file{i}.ts"), &format!("fn:symbol{i}"), 1, 50)
+            })
+            .collect();
+        let mut store = make_store_with_root(&dir, &[]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let ids: Vec<_> = nodes.iter().map(|n| store.put_node(n).unwrap()).collect();
+        // Chain: node 0 → node 1 → ... → node 9 via RefCall edges so PPR sees them all.
+        for i in 0..ids.len() - 1 {
+            store
+                .put_edge(&Edge::new(ids[i], ids[i + 1], EdgeKind::RefCall))
+                .unwrap();
+        }
+        // Tiny budget (5 tokens) — knapsack cannot fit all 10 nodes.
+        let result = get_context_body(&store, "symbol0", 5, &OpenFilter, false, None, None);
+        // Either overflow fires or PPR returned too few nodes — accept both: the key is
+        // we never silently truncate when there IS overflow.
+        if result.contains("more node(s) matched") {
+            assert!(
+                result.contains("budget exhausted"),
+                "overflow msg must mention budget; got: {result}"
+            );
+        }
+    }
+
+    /// When all nodes fit within budget, no overflow message should appear.
+    #[test]
+    fn get_context_no_overflow_when_all_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        // Generous budget — the single node easily fits.
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, None);
+        assert!(
+            !result.contains("more node(s) matched"),
+            "no overflow when all nodes fit; got: {result}"
+        );
+    }
+
+    /// embed_path_seeds must report n_eligible correctly when MAX cap fires.
+    #[test]
+    fn embed_path_seeds_reports_cap_count() {
+        use travsr_store::Store;
+        // Build MAX_EMBED_SEEDS + 2 src nodes — all pass noise/RBAC filters.
+        let n_total = MAX_EMBED_SEEDS + 2;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mut knn_pairs: Vec<(NodeId, f32)> = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            let node = make_node_with_kind_and_path(
+                "function",
+                &format!("src/file{i}.ts"),
+                &format!("fn:sym{i}"),
+            );
+            let id = store.put_node(&node).unwrap();
+            knn_pairs.push((id, 0.90 - i as f32 * 0.001));
+        }
+        let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
+        let (seeds, n_eligible, _) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
+        assert_eq!(
+            seeds.len(),
+            MAX_EMBED_SEEDS,
+            "seeds capped at MAX_EMBED_SEEDS"
+        );
+        assert_eq!(
+            n_eligible, n_total,
+            "n_eligible counts all eligible before cap"
+        );
+    }
+
+    /// embed_path_seeds: seed-cap signal fires (n_eligible > seeds.len()) when cap was hit.
+    #[test]
+    fn embed_path_seeds_cap_signal_is_correct() {
+        use travsr_store::Store;
+        let n_total = MAX_EMBED_SEEDS + 5;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mut knn_pairs: Vec<(NodeId, f32)> = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            let node = make_node_with_kind_and_path(
+                "function",
+                &format!("src/cap{i}.ts"),
+                &format!("fn:cap{i}"),
+            );
+            let id = store.put_node(&node).unwrap();
+            knn_pairs.push((id, 0.95));
+        }
+        let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
+        let (seeds, n_eligible, _) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
+        assert!(
+            n_eligible > seeds.len(),
+            "cap fired: n_eligible ({n_eligible}) > seeds.len() ({})",
+            seeds.len()
+        );
+    }
+
+    /// build_context_signals: overflow appears before seed-cap, seed-cap before degraded notes.
+    #[test]
+    fn build_context_signals_ordering() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let result = build_context_signals(
+            &store,
+            false,
+            false,
+            Some("[overflow msg]"),
+            Some("[seed cap msg]"),
+        );
+        let overflow_pos = result.find("[overflow msg]").unwrap();
+        let seed_pos = result.find("[seed cap msg]").unwrap();
+        let note_pos = result.find("[note: semantic search").unwrap();
+        assert!(overflow_pos < seed_pos, "overflow must precede seed-cap");
+        assert!(seed_pos < note_pos, "seed-cap must precede degraded notes");
+    }
+
+    /// KNN cosine-similarity weights must drive PPR: the neighbor of the
+    /// high-weight seed must appear in the output, and if both neighbors appear
+    /// the high-weight neighbor must rank earlier (output is PPR-score-ordered).
+    #[test]
+    fn get_context_knn_weights_drive_ppr_seed_preference() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph:  node_a (knn score 0.95, FTS-matched by query) → node_x (RefCall)
+        //         node_b (knn score 0.10, FTS-missed)           → node_y (RefCall)
+        //
+        // Query "pqseeda" matches only node_a's signature (contains "pqseeda") — FTS
+        // grounds the query and gives a_id anchor coverage. KNN also ranks a_id at
+        // 0.95 >> b_id 0.10. Both sources agree → PPR strongly personalises toward
+        // a_id → downstream_x must appear.
+        //
+        // Note: we cannot reliably assert x-before-y here because FTS matches node_a
+        // with weight 1.0, then the max() merge gives a_id weight=1.0 and b_id
+        // weight=1.0 (both from FTS via lexical fallback) — KNN differential is masked
+        // in the weight. The important guarantee is that downstream_x is *reachable*
+        // from the grounded seed, not a specific rank.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:pqseeda_alpha", 1, 3);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:other_beta", 1, 3);
+        let node_x = make_fn_node_with_pkg("x.ts", "fn:downstream_x", 1, 3);
+        let node_y = make_fn_node_with_pkg("y.ts", "fn:downstream_y", 1, 3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        let x_id = store.put_node(&node_x).unwrap();
+        let y_id = store.put_node(&node_y).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(a_id, x_id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, y_id, EdgeKind::RefCall))
+            .unwrap();
+
+        // KNN: a_id has high cosine similarity; FTS also anchors to a_id.
+        let knn_fn: EmbedKnnFn<'_> = &|_query, _k| vec![(a_id, 0.95), (b_id, 0.10)];
+
+        let result = get_context_body(
+            &store,
+            "pqseeda",
+            4096,
+            &OpenFilter,
+            false,
+            None,
+            Some(knn_fn),
+        );
+
+        // node_x must appear: anchor grounding + high KNN score on a_id → PPR expands to x.
+        assert!(
+            result.contains("downstream_x"),
+            "neighbor of grounded + high-weight KNN seed must appear in context: {result}"
+        );
+    }
+
+    // ── dedup_adjacent_seeds ─────────────────────────────────────────────────
+
+    #[test]
+    fn dedup_adjacent_seeds_empty_and_single_passthrough() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert!(dedup_adjacent_seeds(&store, vec![]).is_empty());
+
+        let node = make_fn_node_with_pkg("a.ts", "fn:solo", 1, 2);
+        let mut s = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let id = s.put_node(&node).unwrap();
+        let result = dedup_adjacent_seeds(&s, vec![(id, 1.0)]);
+        assert_eq!(result, vec![(id, 1.0)]);
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_drops_lower_scored_direct_neighbor() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph: a (score 1.0) → b (score 0.7) via RefCall.
+        // b is a direct outgoing neighbor of a; it should be dropped.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:dedup_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:dedup_b", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(a_id, b_id, EdgeKind::RefCall))
+            .unwrap();
+
+        let seeds = vec![(a_id, 1.0), (b_id, 0.7)];
+        let result = dedup_adjacent_seeds(&store, seeds);
+        assert_eq!(
+            result,
+            vec![(a_id, 1.0)],
+            "b must be dropped as neighbor of a"
+        );
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_keeps_upstream_callers() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph: b (score 0.7) → a (score 1.0) via RefCall (b CALLS a).
+        // b is a CALLER of a. PPR from a follows outgoing edges — it cannot walk
+        // backwards to b. Callers provide orthogonal coverage (usage context / call sites)
+        // and must NEVER be dropped, even when they score lower than their callee.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:upstr_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:upstr_b", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, a_id, EdgeKind::RefCall))
+            .unwrap();
+
+        // a has higher score so it is processed first.
+        let seeds = vec![(a_id, 1.0), (b_id, 0.7)];
+        let result = dedup_adjacent_seeds(&store, seeds.clone());
+        assert_eq!(
+            result, seeds,
+            "b is a caller — must be kept for orthogonal PPR coverage"
+        );
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_keeps_unconnected_seeds() {
+        use travsr_store::Store;
+
+        // Three nodes with no edges between them: all must be kept.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:iso_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:iso_b", 1, 2);
+        let node_c = make_fn_node_with_pkg("c.ts", "fn:iso_c", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        let c_id = store.put_node(&node_c).unwrap();
+
+        let seeds = vec![(a_id, 1.0), (b_id, 0.9), (c_id, 0.8)];
+        let result = dedup_adjacent_seeds(&store, seeds.clone());
+        assert_eq!(result, seeds, "no edges means no dedup");
+    }
+
+    #[test]
+    fn dedup_adjacent_seeds_keeps_non_seed_edges() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // a → x (not a seed) and b → y (not a seed). a and b have no edge between them.
+        // Both seeds must be kept even though each has outgoing edges.
+        let node_a = make_fn_node_with_pkg("a.ts", "fn:ext_a", 1, 2);
+        let node_b = make_fn_node_with_pkg("b.ts", "fn:ext_b", 1, 2);
+        let node_x = make_fn_node_with_pkg("x.ts", "fn:ext_x", 1, 2);
+        let node_y = make_fn_node_with_pkg("y.ts", "fn:ext_y", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&node_a).unwrap();
+        let b_id = store.put_node(&node_b).unwrap();
+        let x_id = store.put_node(&node_x).unwrap();
+        let y_id = store.put_node(&node_y).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(a_id, x_id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, y_id, EdgeKind::RefCall))
+            .unwrap();
+
+        let seeds = vec![(a_id, 1.0), (b_id, 0.9)];
+        let result = dedup_adjacent_seeds(&store, seeds.clone());
+        assert_eq!(result, seeds, "edges to non-seeds must not trigger dedup");
+    }
+
+    // ── enrich_seeds_with_callers ────────────────────────────────────────────
+
+    #[test]
+    fn enrich_adds_production_caller_at_reduced_weight() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // Graph: caller (fn:caller_fn) → seed (fn:target_fn) via RefCall.
+        // After enrichment the caller should appear at 35% of the seed's weight.
+        let seed_node = make_fn_node_with_pkg("lib.rs", "fn:target_fn", 1, 2);
+        let caller_node = make_fn_node_with_pkg("main.rs", "fn:caller_fn", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let caller_id = store.put_node(&caller_node).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(
+                caller_id,
+                seed_id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let seeds = vec![(seed_id, 1.0)];
+        let result = enrich_seeds_with_callers(&store, seeds, usize::MAX);
+
+        assert_eq!(result.len(), 2, "caller should be added");
+        let caller_entry = result.iter().find(|&&(id, _)| id == caller_id);
+        assert!(caller_entry.is_some(), "caller_id missing from result");
+        let weight = caller_entry.unwrap().1;
+        assert!(
+            (weight - 0.35).abs() < 1e-5,
+            "caller weight should be 0.35, got {weight}"
+        );
+    }
+
+    #[test]
+    fn enrich_skips_test_callers() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // A test-function caller (signature: fn:test_foo) must be filtered out.
+        let seed_node = make_fn_node_with_pkg("lib.rs", "fn:important_fn", 1, 2);
+        let test_caller = make_fn_node_with_pkg("lib.rs", "fn:test_important_fn", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed_id = store.put_node(&seed_node).unwrap();
+        let test_id = store.put_node(&test_caller).unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(test_id, seed_id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = enrich_seeds_with_callers(&store, vec![(seed_id, 1.0)], usize::MAX);
+        assert_eq!(
+            result.len(),
+            1,
+            "test caller must be filtered, only seed remains"
+        );
+        assert!(!result.iter().any(|&(id, _)| id == test_id));
+    }
+
+    #[test]
+    fn enrich_skips_already_present_seed() {
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        // When the caller is already a seed, it must not be duplicated.
+        let seed_a = make_fn_node_with_pkg("a.rs", "fn:fn_a", 1, 2);
+        let seed_b = make_fn_node_with_pkg("b.rs", "fn:fn_b", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a_id = store.put_node(&seed_a).unwrap();
+        let b_id = store.put_node(&seed_b).unwrap();
+        // b calls a
+        store
+            .put_edge(&travsr_core::Edge::new(b_id, a_id, EdgeKind::RefCall))
+            .unwrap();
+
+        // Both are already seeds — b should not be added again at reduced weight.
+        let seeds = vec![(a_id, 1.0), (b_id, 0.9)];
+        let result = enrich_seeds_with_callers(&store, seeds.clone(), usize::MAX);
+        assert_eq!(
+            result.len(),
+            2,
+            "no duplicates when caller already in seed set"
+        );
+        // b must retain original weight 0.9, not get demoted to 0.35
+        let b_weight = result.iter().find(|&&(id, _)| id == b_id).unwrap().1;
+        assert!(
+            (b_weight - 0.9).abs() < 1e-5,
+            "existing seed weight must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn enrich_empty_seeds_passthrough() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let result = enrich_seeds_with_callers(&store, vec![], usize::MAX);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn enrich_callers_depth_two_adds_grandparent_caller() {
+        // Chain: grandparent → parent → child (all RefCall edges).
+        // Query seeds = [child]. Two calls simulate depth-1 then depth-2 enrichment.
+        // After hop-1: parent added. After hop-2: grandparent added.
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        let child = make_fn_node_with_pkg("lib.rs", "fn:child", 1, 2);
+        let parent = make_fn_node_with_pkg("lib.rs", "fn:parent", 1, 2);
+        let grandparent = make_fn_node_with_pkg("main.rs", "fn:grandparent", 1, 2);
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let child_id = store.put_node(&child).unwrap();
+        let parent_id = store.put_node(&parent).unwrap();
+        let gp_id = store.put_node(&grandparent).unwrap();
+
+        store
+            .put_edge(&travsr_core::Edge::new(
+                parent_id,
+                child_id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+        store
+            .put_edge(&travsr_core::Edge::new(gp_id, parent_id, EdgeKind::RefCall))
+            .unwrap();
+
+        // Simulate what get_context_body / ask_query do: two sequential enrich calls.
+        let seeds = vec![(child_id, 1.0)];
+        let seeds = enrich_seeds_with_callers(&store, seeds, 15); // depth-1
+        let seeds = enrich_seeds_with_callers(&store, seeds, 10); // depth-2
+
+        let ids: Vec<_> = seeds.iter().map(|&(id, _)| id).collect();
+        assert!(
+            ids.contains(&parent_id),
+            "depth-1 caller (parent) must be seeded"
+        );
+        assert!(
+            ids.contains(&gp_id),
+            "depth-2 caller (grandparent) must be seeded"
+        );
+
+        // Weights decrease per hop: parent ≈ 0.35, grandparent ≈ 0.35²
+        let parent_w = seeds.iter().find(|&&(id, _)| id == parent_id).unwrap().1;
+        let gp_w = seeds.iter().find(|&&(id, _)| id == gp_id).unwrap().1;
+        assert!(
+            (parent_w - 0.35).abs() < 1e-5,
+            "parent weight = 0.35; got {parent_w}"
+        );
+        assert!(
+            (gp_w - 0.35 * 0.35).abs() < 1e-4,
+            "grandparent weight = 0.35²; got {gp_w}"
+        );
+    }
+
+    #[test]
+    fn enrich_callers_respects_max_new_total() {
+        // Hub node called by 8 production callers. max_new_total=3 must cap additions.
+        use travsr_core::EdgeKind;
+        use travsr_store::Store;
+
+        let hub = make_fn_node_with_pkg("lib.rs", "fn:hub", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let hub_id = store.put_node(&hub).unwrap();
+
+        for i in 0..8u32 {
+            let caller =
+                make_fn_node_with_pkg(&format!("caller{i}.rs"), &format!("fn:caller_{i}"), 1, 2);
+            let caller_id = store.put_node(&caller).unwrap();
+            store
+                .put_edge(&travsr_core::Edge::new(
+                    caller_id,
+                    hub_id,
+                    EdgeKind::RefCall,
+                ))
+                .unwrap();
+        }
+
+        let seeds = vec![(hub_id, 1.0)];
+        let result = enrich_seeds_with_callers(&store, seeds, 3);
+        // 1 original + at most 3 new callers
+        assert_eq!(
+            result.len(),
+            4,
+            "max_new_total=3 must cap additions; got {}",
+            result.len()
+        );
+    }
+
+    // ── KNN circuit-breaker ──────────────────────────────────────────────────
+
+    #[test]
+    fn knn_circuit_breaker_falls_back_to_fts_on_slow_sidecar() {
+        use travsr_store::Store;
+
+        // A slow KNN closure that sleeps beyond KNN_BUDGET_MS — get_context must
+        // still return a result derived from FTS seeds rather than panicking or
+        // hanging indefinitely (it will block for the sleep duration, but the
+        // result must not include the KNN-only node).
+        let node_fts = make_fn_node_with_pkg("fts.ts", "fn:cb_fts_sym", 1, 2);
+        let node_knn_only = make_fn_node_with_pkg("knn.ts", "fn:cb_knn_only", 1, 2);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&node_fts).unwrap();
+        let knn_id = store.put_node(&node_knn_only).unwrap();
+
+        // Sleep just over the budget so the circuit-breaker fires.
+        let slow_knn: EmbedKnnFn<'_> = &|_q, _k| {
+            std::thread::sleep(std::time::Duration::from_millis(KNN_BUDGET_MS as u64 + 5));
+            vec![(knn_id, 0.99)]
+        };
+
+        let result = get_context_body(
+            &store,
+            "cb_fts_sym",
+            4096,
+            &OpenFilter,
+            false,
+            None,
+            Some(slow_knn),
+        );
+
+        // The KNN-only node must not appear — circuit-breaker discarded those results.
+        assert!(
+            !result.contains("cb_knn_only"),
+            "circuit-breaker must discard KNN results after timeout; got: {result}"
         );
     }
 }

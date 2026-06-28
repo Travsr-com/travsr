@@ -161,7 +161,22 @@ fn handle_tool_call(
             let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
             let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
             let snippet_budget = args["snippet_budget"].as_u64().map(|v| v as usize);
-            tools::get_context(store, query, token_budget, include_snippets, snippet_budget)
+            // Use the embed-aware path when the daemon has injected a KNN hook
+            // (i.e. `travsr embed init` + `travsr embed reindex` have been run).
+            // Falls back to fuzzy text search automatically when the hook is absent.
+            match store.embed_knn_fn() {
+                Some(knn) => tools::get_context_embed(
+                    store,
+                    query,
+                    token_budget,
+                    include_snippets,
+                    snippet_budget,
+                    &knn,
+                ),
+                None => {
+                    tools::get_context(store, query, token_budget, include_snippets, snippet_budget)
+                }
+            }
         }
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
@@ -456,7 +471,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "repos_list",
-                "description": "List globally registered repos as TSV (name, db_path, exists). Stdio (single-repo) sessions only.",
+                "description": "List all globally registered repos as TSV: name, db_path, exists. Call this first to discover available repo names before supplying the `repo` parameter on other tools.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -725,11 +740,14 @@ fn handle_tool_call_global(
                 "synonym tools require a single-repo (stdio) session".into(),
             );
         }
-        "repos_list" | "repos_prune" | "repos_remove" => {
+        // repos_list is read-only: safe to expose in global mode so agents can
+        // discover which repos are indexed before supplying the `repo` param.
+        "repos_list" => tools::repos_list(),
+        "repos_prune" | "repos_remove" => {
             return error_response(
                 id,
                 INVALID_PARAMS,
-                "repos tools require a single-repo (stdio) session".into(),
+                "repos_prune and repos_remove require a single-repo (stdio) session".into(),
             );
         }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
@@ -753,13 +771,22 @@ fn tools_list_global() -> serde_json::Value {
         "_schemaVersion": "1.1.0",
         "tools": [
             {
+                "name": "repos_list",
+                "description": "List all globally registered repos as TSV: name, db_path, exists. Call this first to discover available repo names before supplying the `repo` parameter on other tools.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
                 "name": "get_dependencies",
-                "description": "Return the files and modules that a given file imports.",
+                "description": "Return the files and modules that a given file imports. Supply `repo` to scope to a single codebase; omit only for explicit cross-repo queries.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to look up" },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -767,12 +794,12 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_callers",
-                "description": "Return all graph nodes that have an incoming edge to the given symbol.",
+                "description": "Return all graph nodes that have an incoming edge to the given symbol. Supply `repo` to scope results; omit only if the symbol may exist in multiple repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "symbol": { "type": "string", "description": "Symbol name to find callers of (partial match supported)" },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["symbol"],
                     "additionalProperties": false
@@ -780,13 +807,13 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_blast_radius",
-                "description": "Return the set of files transitively affected if the given file changes.",
+                "description": "Return the set of files transitively affected if the given file changes. Supply `repo` to scope results; omit only if the symbol may exist in multiple repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
                         "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (RefCall only, requires Phase B)." },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -799,7 +826,7 @@ fn tools_list_global() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to detect language for" },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -807,12 +834,12 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "search_symbol",
-                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation'). No model or API key required.",
+                "description": "Find symbol definitions matching a name across the indexed graph. Accepts exact symbol names, partial matches, and natural-language queries (e.g. 'auth session validation'). No model or API key required. IMPORTANT: always supply `repo` to avoid cross-repo noise — omit only when explicitly searching across multiple repos. Run repos_list to discover available repo names.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars). Partial and NL queries are supported." },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply to avoid cross-repo noise; omit only when explicitly searching across multiple repos." }
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -820,24 +847,24 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_repo_map",
-                "description": "Return a structural overview of the indexed repository.",
+                "description": "Return a structural overview of the indexed repository. IMPORTANT: always supply `repo` — omitting fans out across all indexed repos and produces a very large, hard-to-read response. Run repos_list to discover available repo names.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Uses current repo if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). IMPORTANT: always supply — omitting fans out across all indexed repos." }
                     },
                     "additionalProperties": false
                 }
             },
             {
                 "name": "get_execution_path",
-                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST.",
+                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Supply `repo` to scope to a single codebase.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "source": { "type": "string", "description": "Source symbol name (partial match supported)" },
                         "sink": { "type": "string", "description": "Sink symbol name (partial match supported)" },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["source", "sink"],
                     "additionalProperties": false
@@ -849,20 +876,20 @@ fn tools_list_global() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Sums all repos if omitted." }
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Sums all repos if omitted." }
                     },
                     "additionalProperties": false
                 }
             },
             {
                 "name": "get_context",
-                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). T0 + L2-A heuristic normaliser translates NL to FTS seeds deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata.",
+                "description": "Retrieve the most relevant context for a query within a token budget using PPR + 0-1 knapsack. Accepts symbol names and natural-language queries (e.g. 'where is the auth session validated?'). T0 + L2-A heuristic normaliser translates NL to FTS seeds deterministically — no model or API key required. Set include_snippets=true to get actual source code inline alongside the structural metadata. Supply `repo` to scope to a single codebase; omit only for cross-repo queries.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Symbol name or natural-language query (1–200 chars)" },
                         "token_budget": { "type": "integer", "description": "Hard token budget (100–32000). Defaults to 4096 if omitted." },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." },
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." },
                         "include_snippets": { "type": "boolean", "description": "When true, appends the actual source body of each selected symbol (kind-aware, docblock-stripped). Defaults to false." },
                         "snippet_budget": { "type": "integer", "description": "Optional separate token budget for the appended snippets. When omitted, snippets share the main token_budget (best-effort, stops before overflow). When provided, snippet retrieval uses this independent ceiling and does not affect node selection." }
                     },
@@ -880,7 +907,7 @@ fn tools_list_global() -> serde_json::Value {
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
-                        "repo": { "type": "string", "description": "Repo name from `travsr repos`. Searches all repos if omitted." },
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." },
                         "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns synthetic package-level tile nodes sized by file count plus cross-package import edges." },
                         "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix. Returns file nodes inside the prefix plus ghost-port package nodes for cross-boundary deps." }
                     },
@@ -904,7 +931,7 @@ fn tools_list_global() -> serde_json::Value {
                         },
                         "repo": {
                             "type": "string",
-                            "description": "Restrict to a specific registered repo by name."
+                            "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos."
                         }
                     },
                     "required": ["symbols"],
@@ -977,9 +1004,9 @@ mod tests {
     ];
 
     /// Tools exposed only on the stdio (single-repo) server — never in the global
-    /// registry path. Synonyms (RFC-012 A2 F1) target one repo's table; repos
-    /// management (VSCODE-247) mutates the global registry and is meaningless to
-    /// duplicate across the per-repo global fan-out.
+    /// registry path. Synonyms (RFC-012 A2 F1) target one repo's table; repos_prune
+    /// and repos_remove mutate the registry and must not be exposed in global mode.
+    /// repos_list is read-only and IS available in global mode — see #374.
     const STDIO_ONLY_TOOLS: &[&str] = &[
         "synonym_list",
         "synonym_add",
@@ -987,7 +1014,6 @@ mod tests {
         "synonym_remove",
         "synonym_remove_term",
         "synonym_reset",
-        "repos_list",
         "repos_prune",
         "repos_remove",
     ];
@@ -1062,6 +1088,25 @@ mod tests {
                 "tools_list_global missing: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn global_tools_list_exposes_repos_list() {
+        let list = tools_list_global();
+        let tools = list["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(
+            names.contains(&"repos_list"),
+            "tools_list_global must expose repos_list in global mode (#374)"
+        );
+        assert!(
+            !names.contains(&"repos_prune"),
+            "tools_list_global must not expose repos_prune"
+        );
+        assert!(
+            !names.contains(&"repos_remove"),
+            "tools_list_global must not expose repos_remove"
+        );
     }
 
     #[test]

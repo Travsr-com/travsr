@@ -56,7 +56,7 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
         // skip their own directory walks.
         indexable_paths: &files,
     };
-    let (phase_b_nodes, phase_b_edges, _phase_b_refs, _phase_b_outcome) =
+    let (phase_b_nodes, phase_b_edges, _phase_b_refs, _phase_b_unresolved, _phase_b_outcome) =
         indexer.invoke_phase_b_all(&phase_b_inputs);
     for node in phase_b_nodes {
         all_nodes.insert(node.id, node);

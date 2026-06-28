@@ -21,7 +21,9 @@ pub fn registry_path() -> PathBuf {
 /// Non-fatal: callers should log and continue on error.
 pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
     let reg_path = registry_path();
-    let travsr_home = reg_path.parent().expect("registry path has parent");
+    let travsr_home = reg_path
+        .parent()
+        .context("registry path has no parent directory")?;
     std::fs::create_dir_all(travsr_home).context("creating ~/.travsr directory")?;
 
     // SEC: ~/.travsr/ and registry.json contain repo paths — restrict to owner only.
@@ -40,9 +42,24 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
         }
     }
 
+    // M1: serialize concurrent `travsr init` registry writes with an exclusive
+    // flock on registry.lock. The atomic rename protects against crash-corruption
+    // but not against concurrent read-modify-write by two processes.
+    let lock_path = travsr_home.join("registry.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .context("opening registry.lock")?;
+    fs2::FileExt::lock_exclusive(&lock_file).context("acquiring registry.lock")?;
+
     let mut repos = read_registry(&reg_path).unwrap_or_default();
     repos.insert(repo_name.to_string(), db_path.to_path_buf());
-    write_registry_atomic(&reg_path, &repos)
+    write_registry_atomic(&reg_path, &repos)?;
+
+    // Explicit unlock is not needed — lock_file drops at end of scope.
+    Ok(())
 }
 
 /// Return all entries from the global registry.

@@ -8,19 +8,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bm25;
 pub mod kcore;
 pub mod knapsack;
 pub mod pcst;
 pub mod ppr;
 pub mod rbac;
 
+pub use bm25::bm25_rank_symbols;
 pub use kcore::compute_kcore;
 pub use knapsack::{
     context_candidates, knapsack, token_cost, DP_CELL_LIMIT, MAX_CONTEXT_BUDGET, SCORE_SCALE,
     TOKEN_CHARS_PER_TOKEN,
 };
 pub use pcst::pcst_path;
-pub use ppr::ppr;
+pub use ppr::{ppr, ppr_weighted};
 pub use rbac::{EdgeFilter, OpenFilter, RbacFilter};
 
 use std::collections::{HashSet, VecDeque};

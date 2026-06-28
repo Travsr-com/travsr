@@ -3067,6 +3067,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dirs",
+ "fs2",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -3108,6 +3109,7 @@ name = "travsr-daemon"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "fs2",
  "ignore",
  "libc",
@@ -3120,6 +3122,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "travsr-analysis",
  "travsr-core",
  "travsr-indexer",
  "travsr-ipc",
@@ -3183,6 +3186,7 @@ dependencies = [
  "base64",
  "blake3",
  "dashmap",
+ "dirs",
  "getrandom 0.2.17",
  "hmac",
  "reqwest",
@@ -3199,6 +3203,7 @@ dependencies = [
  "tracing",
  "travsr-analysis",
  "travsr-core",
+ "travsr-plugin-host",
  "travsr-retrieval",
  "travsr-store",
  "uuid",
@@ -3210,6 +3215,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "rusqlite",
  "serde",
  "serde_json",
  "streaming-iterator",
@@ -3230,6 +3236,7 @@ dependencies = [
 name = "travsr-plugin-protocol"
 version = "0.7.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3267,6 +3274,7 @@ name = "travsr-store"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "fs2",
  "kuzu",
  "rusqlite",
  "serde",

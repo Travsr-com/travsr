@@ -52,6 +52,15 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
         let existing = std::fs::read_to_string(&hook_path).context("reading existing hook")?;
         if existing.contains(TRAVSR_MARKER_SH) {
             HOOK_BODY
+        } else if bak_path.exists() {
+            // L6: a backup already exists — the user may have manually restored their
+            // original hook over ours. Don't silently overwrite the backup.
+            tracing::info!(
+                "post-commit hook modified since last install and {} already exists — \
+                 overwriting hook only (not re-backing up)",
+                bak_path.display()
+            );
+            CHAIN_HOOK_BODY
         } else {
             std::fs::rename(&hook_path, &bak_path).context("backing up existing hook")?;
             tracing::info!(

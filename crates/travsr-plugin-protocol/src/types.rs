@@ -1,7 +1,7 @@
 use crate::ffi_marker::FfiMarker;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use travsr_core::{Edge, Node, ScipRef};
+use travsr_core::{Edge, Node, ScipRef, UnresolvedCall};
 
 /// Current protocol version. Bump on any breaking wire change.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -59,6 +59,11 @@ pub struct InvokeResponse {
     /// Old sidecar binaries omit this field; `#[serde(default)]` provides `[]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refs: Vec<ScipRef>,
+    /// Cross-crate calls that Phase B could not resolve to a concrete NodeId.
+    /// The daemon resolves these after Phase B using Phase A nodes in the store.
+    /// Old sidecar binaries omit this field; `#[serde(default)]` provides `[]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_calls: Vec<UnresolvedCall>,
 }
 
 impl InvokeResponse {
