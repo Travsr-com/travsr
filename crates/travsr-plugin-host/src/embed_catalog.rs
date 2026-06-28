@@ -10,12 +10,30 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Hard ceiling on parallel reader threads inside the sidecar.
 /// Override with TRAVSR_EMBED_WORKERS env var.
 pub const MAX_EMBED_WORKERS: usize = 8;
+
+/// FT-H2: maximum wall-clock time for one reindex pass.
+/// A large repo with 100 k nodes × 384-dim embeddings at ~500 nodes/s takes
+/// ~3 min; 30 min gives 6× headroom. Override with TRAVSR_REINDEX_TIMEOUT_SECS.
+fn reindex_timeout_secs() -> u64 {
+    std::env::var("TRAVSR_REINDEX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &u64| x > 0)
+        .unwrap_or(30 * 60)
+}
+
+/// FT-H1: process-level single-flight guard.
+/// Prevents Phase1/Phase2/post-commit from launching ≥2 reindex sidecars that
+/// write to the same embed.db concurrently (no temp-db isolation in RFC-021).
+static REINDEX_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// RAM budget for the whole reindex run (single model + caches + overhead).
 /// Used by derive_num_workers() to cap the reader-thread count only, not
@@ -37,7 +55,7 @@ pub struct EmbedModelFile {
     pub name: &'static str,
     /// Path component after the HuggingFace base URL, e.g. `"onnx/model_int8.onnx"`.
     pub url_path: &'static str,
-    /// HuggingFace repo slug, e.g. `"nomic-ai/nomic-embed-text-v1.5"`.
+    /// HuggingFace repo slug, e.g. `"BAAI/bge-small-en-v1.5"`.
     pub hf_repo: &'static str,
     /// Approximate download size in MiB — shown in `travsr embed init` progress.
     pub size_hint_mb: u32,
@@ -358,18 +376,43 @@ fn run_parallel_reindex(
         n
     );
 
-    match cmd.status() {
-        Ok(s) if s.success() => {
-            tracing::info!(n, "embed: reindex completed");
-            Ok(())
-        }
-        Ok(s) => {
-            tracing::warn!(exit = ?s.code(), "embed: sidecar exited with failure");
-            anyhow::bail!("embed sidecar exited with code {:?}", s.code())
-        }
+    // FT-H2: spawn + deadline poll so unkillable/hung sidecars don't orphan
+    // the background reindex thread indefinitely. cmd.status() blocks forever
+    // when the sidecar stalls; try_wait() lets us enforce a hard deadline.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "embed: failed to spawn sidecar");
-            Err(anyhow::Error::from(e).context("failed to spawn embed sidecar"))
+            return Err(anyhow::Error::from(e).context("failed to spawn embed sidecar"));
+        }
+    };
+    let timeout = reindex_timeout_secs();
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) if s.success() => {
+                tracing::info!(n, "embed: reindex completed");
+                return Ok(());
+            }
+            Ok(Some(s)) => {
+                tracing::warn!(exit = ?s.code(), "embed: sidecar exited with failure");
+                anyhow::bail!("embed sidecar exited with code {:?}", s.code());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        timeout_secs = timeout,
+                        "embed: reindex sidecar timed out — killing"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("embed sidecar reindex timed out after {timeout}s");
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                anyhow::bail!("embed sidecar wait error: {e}");
+            }
         }
     }
 }
@@ -384,10 +427,20 @@ fn run_parallel_reindex(
 /// centrality. This ensures Phase 1 completes in a few minutes regardless of
 /// repo size while always embedding the structurally most important nodes first.
 pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
+    // FT-H1: single-flight guard — skip if another reindex is already running.
+    if REINDEX_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::debug!("embed Phase 1: reindex already in-flight — skipping");
+        return false;
+    }
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
+        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         return false;
     };
     let Some(threshold) = derive_phase1_threshold(db_path, PHASE1_COVERAGE_FRACTION) else {
+        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         tracing::warn!(
             db = %db_path.display(),
             "embed Phase 1: k-core data not ready — skipping (will retry after next Phase B)"
@@ -409,6 +462,7 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
             ) {
                 tracing::warn!("embed Phase 1 failed: {e:#}");
             }
+            REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         })
         .is_ok()
 }
@@ -419,7 +473,16 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
 /// Uses the same threshold derivation as Phase 1 so the two phases are
 /// complementary and together cover all symbol nodes.
 pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
+    // FT-H1: single-flight guard.
+    if REINDEX_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::debug!("embed Phase 2: reindex already in-flight — skipping");
+        return false;
+    }
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
+        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         return false;
     };
     // Derive same threshold as Phase 1 for complementary coverage.
@@ -443,6 +506,7 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
             {
                 tracing::warn!("embed Phase 2 failed: {e:#}");
             }
+            REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         })
         .is_ok()
 }
@@ -450,7 +514,16 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
 /// Spawn reindex for all pending nodes (used after Phase B completes)
 /// as a detached background thread. Returns true if launched.
 pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
+    // FT-H1: single-flight guard.
+    if REINDEX_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::debug!("embed reindex-all: reindex already in-flight — skipping");
+        return false;
+    }
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
+        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         return false;
     };
     let db_path = db_path.to_path_buf();
@@ -467,6 +540,7 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
             ) {
                 tracing::warn!("embed reindex-all failed: {e:#}");
             }
+            REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         })
         .is_ok()
 }

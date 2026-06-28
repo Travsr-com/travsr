@@ -702,6 +702,16 @@ pub fn init_repo_with_progress(
         }
     }
 
+    // SC-H1: cap node_tombstones before indexing. Full init rebuilds embeddings
+    // from scratch so tombstones older than 7 days are redundant. Hard ceiling of
+    // 50 k rows prevents the table from growing unbounded if the embed sidecar
+    // has been offline long-term.
+    const TOMBSTONE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+    const TOMBSTONE_MAX_ROWS: u64 = 50_000;
+    if let Err(e) = store.prune_tombstones(TOMBSTONE_MAX_AGE_SECS, TOMBSTONE_MAX_ROWS) {
+        tracing::warn!("tombstone GC failed (non-fatal): {e}");
+    }
+
     // Register in global registry so `travsr mcp --global` can find this repo.
     // TRAVSR_DISABLE_REGISTRY=1 bypasses registration — set in tests and CI to
     // prevent temp-dir paths polluting ~/.travsr/registry.json.
@@ -1210,6 +1220,12 @@ fn resolve_unresolved_calls(
         } else {
             matches.to_vec()
         };
+        // CO-A1: bare calls with no crate hint resolve to ALL same-named functions
+        // across all crates → false edges that flood get_callers / blast_radius.
+        // Only emit a RefCall when the match is unambiguous (exactly one candidate).
+        if u.hint_crate.is_none() && filtered.len() != 1 {
+            continue;
+        }
         for (dst, _) in filtered {
             if u.src != dst {
                 edges.push(travsr_core::Edge::new(
@@ -2860,7 +2876,13 @@ fn handle_control_message(
     match serde_json::from_str::<ControlMessage>(line) {
         Ok(ControlMessage::ReindexCommit { sha }) => {
             tracing::info!(sha=%sha, "control: reindex-commit");
-            let paths = changed_files_from_git(repo_root).unwrap_or_default();
+            let paths = match changed_files_from_git(repo_root) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(err=%e, "changed_files_from_git failed — reindexing all tracked files");
+                    vec![]
+                }
+            };
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
                 tracing::warn!(err=%e, "control reindex failed");
@@ -3107,6 +3129,15 @@ pub fn try_inject_embed_hook_readonly(store: &mut SqliteStore, db_path: &std::pa
         active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
     };
     let Some(home) = dirs::home_dir() else { return };
+
+    // Guard: if embed.db doesn't exist there is nothing to query — skip to avoid
+    // spawning the sidecar (which would hang 30 s waiting on a non-existent HNSW index
+    // and then be killed by the FT-C2 IO watchdog).
+    let embed_db = db_path.with_file_name("embed.db");
+    if !embed_db.exists() {
+        return;
+    }
+
     let backend = active_backend_id()
         .as_deref()
         .and_then(lookup_embed_backend)

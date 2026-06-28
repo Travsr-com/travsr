@@ -64,6 +64,14 @@ pub trait Migration: Send + Sync {
     /// **Must be idempotent** — see the trait-level documentation on the
     /// atomicity gap between DDL application and version recording.
     fn up(&self, store: &mut dyn StoreMigratable) -> Result<()>;
+
+    /// Return `false` when `up()` calls statements that cannot run inside an
+    /// explicit transaction (e.g. VACUUM). The runner skips the BEGIN/COMMIT
+    /// wrapping for these migrations. All individual DDL statements in `up()`
+    /// must remain idempotent since re-runs cannot be rolled back atomically.
+    fn is_transactional(&self) -> bool {
+        true
+    }
 }
 
 /// Extends [`Store`] with the DDL execution and version-tracking capabilities
@@ -180,12 +188,40 @@ impl MigrationRunner {
 
         for migration in pending {
             let v = migration.version();
-            migration
-                .up(store)
-                .with_context(|| format!("applying migration v{v}"))?;
-            store
-                .set_schema_version(v)
-                .with_context(|| format!("recording migration v{v}"))?;
+            // SC-H2: wrap each migration's DDL + version bump in a single
+            // transaction so a crash between `up()` and `set_schema_version()`
+            // doesn't leave the schema version stale.
+            // Exception: migrations that call VACUUM or other statements that
+            // cannot run inside an explicit transaction override
+            // `is_transactional()` to return `false`; the runner skips the
+            // BEGIN/COMMIT for those and relies on per-statement idempotency.
+            if migration.is_transactional() {
+                store
+                    .exec_ddl("BEGIN")
+                    .with_context(|| format!("begin transaction for migration v{v}"))?;
+                let apply_result = migration
+                    .up(store)
+                    .with_context(|| format!("applying migration v{v}"))
+                    .and_then(|()| {
+                        store
+                            .set_schema_version(v)
+                            .with_context(|| format!("recording migration v{v}"))
+                    });
+                if let Err(e) = apply_result {
+                    let _ = store.exec_ddl("ROLLBACK");
+                    return Err(e);
+                }
+                store
+                    .exec_ddl("COMMIT")
+                    .with_context(|| format!("commit transaction for migration v{v}"))?;
+            } else {
+                migration
+                    .up(store)
+                    .with_context(|| format!("applying migration v{v}"))?;
+                store
+                    .set_schema_version(v)
+                    .with_context(|| format!("recording migration v{v}"))?;
+            }
         }
 
         Ok(())
@@ -288,9 +324,17 @@ mod tests {
         runner.run(&mut store).unwrap();
 
         assert_eq!(store.version, 2);
+        // SC-H2: each migration is wrapped in BEGIN / COMMIT.
         assert_eq!(
             store.ddl_log,
-            ["CREATE TABLE v1", "ALTER TABLE v1 ADD COLUMN v2"]
+            [
+                "BEGIN",
+                "CREATE TABLE v1",
+                "COMMIT",
+                "BEGIN",
+                "ALTER TABLE v1 ADD COLUMN v2",
+                "COMMIT",
+            ]
         );
     }
 
@@ -324,8 +368,11 @@ mod tests {
         runner.run(&mut store).unwrap();
 
         assert_eq!(store.version, 2);
-        // Only V2 DDL must have been executed.
-        assert_eq!(store.ddl_log, ["ALTER TABLE v1 ADD COLUMN v2"]);
+        // Only V2 DDL must have been executed, wrapped in BEGIN / COMMIT.
+        assert_eq!(
+            store.ddl_log,
+            ["BEGIN", "ALTER TABLE v1 ADD COLUMN v2", "COMMIT"]
+        );
     }
 
     #[test]
@@ -340,7 +387,14 @@ mod tests {
         // Must be applied V1 → V2 regardless of registration order.
         assert_eq!(
             store.ddl_log,
-            ["CREATE TABLE v1", "ALTER TABLE v1 ADD COLUMN v2"]
+            [
+                "BEGIN",
+                "CREATE TABLE v1",
+                "COMMIT",
+                "BEGIN",
+                "ALTER TABLE v1 ADD COLUMN v2",
+                "COMMIT",
+            ]
         );
     }
 
@@ -395,12 +449,12 @@ mod tests {
 
         // Version must be set once per migration, in order.
         assert_eq!(store.versions_at_set, [1, 2]);
-        // Verify DDL was applied *before* the version was recorded — the
-        // DDL log must be non-empty at the point each version number was set.
+        // Verify DDL was applied *before* the version was recorded.
+        // SC-H2: each migration adds BEGIN + DDL + COMMIT = 3 entries per migration.
         assert_eq!(
             store.inner.ddl_log.len(),
-            2,
-            "both DDL statements must have run"
+            6,
+            "BEGIN, DDL, COMMIT for each of 2 migrations = 6 entries"
         );
     }
 
@@ -428,9 +482,12 @@ mod tests {
             store.version, 0,
             "schema version must not advance when up() fails"
         );
-        assert!(
-            store.ddl_log.is_empty(),
-            "no DDL must be recorded on failure"
+        // SC-H2: BEGIN is executed before up(); ROLLBACK is issued on failure.
+        // The FailingMigration.up() bails before any exec_ddl, so log = [BEGIN, ROLLBACK].
+        assert_eq!(
+            store.ddl_log,
+            ["BEGIN", "ROLLBACK"],
+            "BEGIN + ROLLBACK recorded but no migration DDL"
         );
     }
 }

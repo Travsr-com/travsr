@@ -4,7 +4,7 @@
 // Option<Arc<Mutex<EmbedSidecar>>> = None and all methods are no-ops.
 // The SqliteStore embed_knn_hook is never injected in that case.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use travsr_core::NodeId;
@@ -15,15 +15,22 @@ use crate::embed_sidecar::{EmbedCapabilities, EmbedSidecar};
 /// Callback type for Step 4 — matches `travsr_store::EmbedKnnHook`.
 type KnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
+/// FT-H3: maximum respawn attempts before permanently disabling the supervisor.
+const MAX_RESPAWN_ATTEMPTS: u32 = 3;
+
 /// Manages the embed plugin subprocess for one daemon session.
 ///
 /// Created once at daemon startup. If the binary is not installed or the
 /// handshake fails, the supervisor is inactive and all methods are no-ops.
 /// The daemon checks `is_active()` before injecting the knn hook into the store.
 pub struct EmbedSupervisor {
-    /// None when no plugin installed or handshake failed.
+    /// None when no plugin installed or handshake permanently failed.
     inner: Option<Arc<Mutex<EmbedSidecar>>>,
     model_id: Option<String>,
+    // FT-H3: respawn state — stored for `maybe_respawn`.
+    binary: Option<PathBuf>,
+    db_path: Option<PathBuf>,
+    respawn_count: u32,
 }
 
 impl EmbedSupervisor {
@@ -45,6 +52,9 @@ impl EmbedSupervisor {
             return Self {
                 inner: None,
                 model_id: None,
+                binary: None,
+                db_path: None,
+                respawn_count: 0,
             };
         }
 
@@ -60,6 +70,9 @@ impl EmbedSupervisor {
                 Self {
                     model_id: Some(model_id),
                     inner: Some(Arc::new(Mutex::new(sidecar))),
+                    binary: Some(binary.to_path_buf()),
+                    db_path: Some(db_path.to_path_buf()),
+                    respawn_count: 0,
                 }
             }
             Err(e) => {
@@ -67,6 +80,9 @@ impl EmbedSupervisor {
                 Self {
                     inner: None,
                     model_id: None,
+                    binary: None,
+                    db_path: None,
+                    respawn_count: 0,
                 }
             }
         }
@@ -128,5 +144,61 @@ impl EmbedSupervisor {
     /// The model_id negotiated at handshake, or `None` when inactive.
     pub fn model_id(&self) -> Option<&str> {
         self.model_id.as_deref()
+    }
+
+    /// FT-H3: attempt to respawn the sidecar after a crash.
+    ///
+    /// Bounded by MAX_RESPAWN_ATTEMPTS. Each call uses exponential back-off
+    /// (2^n seconds, capped at 30s) before trying to spawn. Returns `true` if
+    /// the respawn succeeded and the supervisor is now active again.
+    ///
+    /// Safe to call even when the supervisor was never active (returns `false`
+    /// immediately). Callers should check `is_active()` afterward.
+    pub fn maybe_respawn(&mut self) -> bool {
+        if self.binary.is_none() || self.db_path.is_none() {
+            return false;
+        }
+        if self.is_active() {
+            return true;
+        }
+        if self.respawn_count >= MAX_RESPAWN_ATTEMPTS {
+            tracing::warn!(
+                attempts = MAX_RESPAWN_ATTEMPTS,
+                "embed sidecar exceeded max respawn attempts — Step 4 permanently disabled"
+            );
+            return false;
+        }
+
+        let backoff_secs = (1u64 << self.respawn_count).min(30);
+        tracing::info!(
+            attempt = self.respawn_count + 1,
+            max = MAX_RESPAWN_ATTEMPTS,
+            backoff_secs,
+            "respawning embed sidecar"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+        self.respawn_count += 1;
+
+        let binary = self.binary.as_deref().unwrap();
+        let db_path = self.db_path.as_deref().unwrap();
+        let model_id = self.model_id.as_deref().unwrap_or("");
+
+        match EmbedSidecar::spawn(binary, db_path, model_id) {
+            Ok(sidecar) => {
+                let mid = sidecar.caps.model_id.clone();
+                tracing::info!(model_id = %mid, attempt = self.respawn_count, "embed sidecar respawned");
+                self.model_id = Some(mid);
+                self.inner = Some(Arc::new(Mutex::new(sidecar)));
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempt = self.respawn_count,
+                    "embed sidecar respawn failed: {e}"
+                );
+                self.inner = None;
+                false
+            }
+        }
     }
 }

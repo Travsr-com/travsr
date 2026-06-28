@@ -1,6 +1,6 @@
 # RFC-020: Parallel Reindex Workers
 
-**Status:** Draft  
+**Status:** Superseded by RFC-021 (parallel indexing shipped in issue #295 init-at-scale)  
 **Author:** Tech Lead / SWE / QA  
 **Date:** 2026-06-24  
 **Crates affected:** `travsr-plugin-host`, `travsr-daemon`, `travsr-cli`  

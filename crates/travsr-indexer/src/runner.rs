@@ -316,8 +316,14 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
     };
 
     // Drain stdout/stderr on background threads to prevent OS pipe-buffer deadlock.
-    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("travsr-lsif-py child has no piped stdout"))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("travsr-lsif-py child has no piped stderr"))?;
     let stdout_thread = std::thread::spawn(move || -> String {
         let mut buf = String::new();
         let _ = stdout_pipe.read_to_string(&mut buf);

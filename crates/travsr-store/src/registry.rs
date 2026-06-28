@@ -21,7 +21,9 @@ pub fn registry_path() -> PathBuf {
 /// Non-fatal: callers should log and continue on error.
 pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
     let reg_path = registry_path();
-    let travsr_home = reg_path.parent().expect("registry path has parent");
+    let travsr_home = reg_path
+        .parent()
+        .context("registry path has no parent directory")?;
     std::fs::create_dir_all(travsr_home).context("creating ~/.travsr directory")?;
 
     // SEC: ~/.travsr/ and registry.json contain repo paths — restrict to owner only.

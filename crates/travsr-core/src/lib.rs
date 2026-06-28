@@ -286,7 +286,9 @@ impl VName {
 ///
 /// `NodeId` is a stable BLAKE3-derived hash of a `VName` (see
 /// [`VName::id`]). It is the SQLite primary key for the `nodes` table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 pub struct NodeId(pub u64);
 
 /// The kinds of edges supported in the Travsr multiplex graph.

@@ -33,8 +33,26 @@ const CALL_QUERY: &str = "
 /// provide no meaningful cross-crate signal. Drop them entirely — no edge, no
 /// UnresolvedCall.
 const NOISE_NAMES: &[&str] = &[
-    "new", "from", "into", "clone", "default", "fmt", "drop", "iter", "next", "unwrap",
-    "expect", "ok", "err", "map", "and_then", "unwrap_or", "collect", "push", "len", "is_empty",
+    "new",
+    "from",
+    "into",
+    "clone",
+    "default",
+    "fmt",
+    "drop",
+    "iter",
+    "next",
+    "unwrap",
+    "expect",
+    "ok",
+    "err",
+    "map",
+    "and_then",
+    "unwrap_or",
+    "collect",
+    "push",
+    "len",
+    "is_empty",
 ];
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -354,16 +372,17 @@ fn extract_file_call_edges(
                         }
                     }
                 }
-                _ /* call.fn */ => {
-                    // Bare identifier — cannot anchor callee to a file; emit UnresolvedCall
-                    if !NOISE_NAMES.contains(&callee_name) {
-                        unresolved.push(UnresolvedCall {
-                            src: caller_id,
-                            callee_sig: format!("fn:{callee_name}"),
-                            hint_crate: None,
-                        });
-                    }
+                // Bare identifier — cannot anchor callee to a file; emit UnresolvedCall.
+                // Note: travsr-analysis does not have daemon plumbing, so UnresolvedCalls
+                // are returned to the caller but NOT resolved against the store here.
+                "call.fn" if !NOISE_NAMES.contains(&callee_name) => {
+                    unresolved.push(UnresolvedCall {
+                        src: caller_id,
+                        callee_sig: format!("fn:{callee_name}"),
+                        hint_crate: None,
+                    });
                 }
+                _ => {}
             }
         }
     }

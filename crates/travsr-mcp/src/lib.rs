@@ -13,6 +13,7 @@ pub mod auth;
 mod protocol;
 pub mod query;
 mod sanitize;
+mod seed;
 mod server;
 pub mod session;
 pub mod sse;
@@ -62,6 +63,12 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     use travsr_plugin_host::{
         active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
     };
+
+    // Guard: no embed.db → nothing to query; skip to avoid a 30 s KNN timeout from
+    // spawning the sidecar against a non-existent HNSW index.
+    if !db_path.with_file_name("embed.db").exists() {
+        return;
+    }
 
     let Some(home) = dirs::home_dir() else {
         return;

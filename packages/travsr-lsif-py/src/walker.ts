@@ -143,6 +143,10 @@ export function walk(rootDir: string, emitter: Emitter): void {
 
 function collectPyFiles(rootDir: string): string[] {
   const results: string[] = [];
+  // PY-C1: track resolved real-paths of directories we have already visited.
+  // Without this, a cyclic symlink (dir → parent) causes infinite recursion
+  // and eventual stack-overflow DoS on any untrusted repo.
+  const visitedDirs = new Set<string>();
 
   function recurse(dir: string): void {
     let entries: fs.Dirent[];
@@ -158,7 +162,7 @@ function collectPyFiles(rootDir: string): string[] {
       const fullPath = path.join(dir, entry.name);
 
       if (entry.isSymbolicLink()) {
-        // Follow symlinks once — assertPathsContained catches escapees later.
+        // PY-C1 + PY-H1: resolve to real path for both cycle-detection and I/O.
         let resolved: string;
         try {
           resolved = fs.realpathSync(fullPath);
@@ -168,9 +172,14 @@ function collectPyFiles(rootDir: string): string[] {
         try {
           const stat = fs.statSync(resolved);
           if (stat.isDirectory() && !SKIP_DIRS.has(path.basename(resolved))) {
+            // PY-C1: skip if we have already visited this real directory.
+            if (visitedDirs.has(resolved)) continue;
+            visitedDirs.add(resolved);
             recurse(resolved);
           } else if (stat.isFile() && isPyFile(entry.name)) {
-            results.push(fullPath);
+            // PY-H1: push the realpath so reads use the validated path,
+            // eliminating the TOCTOU gap between the containment check and read.
+            results.push(resolved);
           }
         } catch {
           continue;
@@ -205,10 +214,14 @@ function visitDefs(
   docId: number,
   defMap: DefMap,
   emitter: Emitter,
-  defRangeIds: number[]
+  defRangeIds: number[],
+  depth = 0
 ): void {
+  // PY-H2: guard against pathologically nested Python ASTs (e.g. deeply nested
+  // class definitions in generated code) that could overflow the JS call stack.
+  if (depth >= MAX_AST_DEPTH) return;
   for (const child of node.namedChildren) {
-    visitDefsNode(child, relPath, enclosingClass, docId, defMap, emitter, defRangeIds);
+    visitDefsNode(child, relPath, enclosingClass, docId, defMap, emitter, defRangeIds, depth + 1);
   }
 }
 
@@ -219,14 +232,15 @@ function visitDefsNode(
   docId: number,
   defMap: DefMap,
   emitter: Emitter,
-  defRangeIds: number[]
+  defRangeIds: number[],
+  depth = 0
 ): void {
   switch (node.type) {
     case 'decorated_definition': {
       // A decorator wraps a class or function — unwrap to the inner definition.
       const inner = node.lastNamedChild;
       if (inner) {
-        visitDefsNode(inner, relPath, enclosingClass, docId, defMap, emitter, defRangeIds);
+        visitDefsNode(inner, relPath, enclosingClass, docId, defMap, emitter, defRangeIds, depth);
       }
       break;
     }
@@ -240,7 +254,7 @@ function visitDefsNode(
       // Recurse into the class body at the next nesting level.
       const bodyNode = node.childForFieldName('body');
       if (bodyNode) {
-        visitDefs(bodyNode, relPath, className, docId, defMap, emitter, defRangeIds);
+        visitDefs(bodyNode, relPath, className, docId, defMap, emitter, defRangeIds, depth + 1);
       }
       break;
     }
@@ -429,14 +443,21 @@ function lookupInDefMap(
 
 // ── Pass 2: reference visitor ──────────────────────────────────────────────────
 
+/** PY-H2: maximum AST recursion depth for visitRefs / visitDefs. */
+const MAX_AST_DEPTH = 2000;
+
 function visitRefs(
   node: SyntaxNode,
   docId: number,
   importTable: Map<string, ImportEntry>,
   defMap: DefMap,
   emitter: Emitter,
-  refRangeIds: number[]
+  refRangeIds: number[],
+  depth = 0
 ): void {
+  // PY-H2: bail out before the JS call stack overflows on deeply nested ASTs.
+  if (depth >= MAX_AST_DEPTH) return;
+
   if (node.type === 'call') {
     const funcNode = node.childForFieldName('function');
     if (funcNode) {
@@ -451,7 +472,7 @@ function visitRefs(
   }
 
   for (const child of node.namedChildren) {
-    visitRefs(child, docId, importTable, defMap, emitter, refRangeIds);
+    visitRefs(child, docId, importTable, defMap, emitter, refRangeIds, depth + 1);
   }
 }
 
@@ -551,10 +572,21 @@ function toRelPath(absPath: string, repoRoot: string): string {
   return path.relative(repoRoot, absPath).replace(/\\/g, '/');
 }
 
+/** PY-H3: maximum file size we will read. Files larger than this are skipped. */
+const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
+
 function safeReadFile(absPath: string): string | null {
   try {
+    // PY-H3: size cap before readFileSync to prevent OOM on huge generated files.
+    const stat = fs.statSync(absPath);
+    if (stat.size > MAX_FILE_BYTES) {
+      return null;
+    }
     return fs.readFileSync(absPath, 'utf-8');
-  } catch {
+  } catch (err) {
+    // PY-M1: log per-file errors to stderr so they appear in sidecar output
+    // rather than being silently swallowed. Non-fatal: continue with other files.
+    process.stderr.write(`[travsr-lsif-py] skipping ${absPath}: ${String(err)}\n`);
     return null;
   }
 }

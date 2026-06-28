@@ -253,7 +253,14 @@ fn ppr_inner<S: Store>(
 
     // ── Top-k extraction ──────────────────────────────────────────────────────
     let mut scores: Vec<(NodeId, f32)> = r.into_iter().collect();
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // RET-H1: secondary sort by NodeId ensures identical queries always return
+    // nodes in the same order even when multiple nodes share the same PPR score.
+    // Without this tie-break, HashMap iteration order makes results non-deterministic.
+    scores.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     if k > 0 {
         scores.truncate(k);
     }

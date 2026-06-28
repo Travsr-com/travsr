@@ -17,8 +17,8 @@ pub use embed::{
 pub use ffi_marker::{FfiMarker, FfiMarkerKind};
 pub use language_map::{language_from_proto_str, language_to_proto_str};
 pub use plugin::Plugin;
+pub use travsr_core::UnresolvedCall;
 pub use types::{
     HandshakeRequest, HandshakeResponse, InvokeRequest, InvokeResponse, ParseRequest,
     ParseResponse, PluginError, PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };
-pub use travsr_core::UnresolvedCall;

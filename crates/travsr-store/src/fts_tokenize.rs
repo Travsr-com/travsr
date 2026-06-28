@@ -151,13 +151,20 @@ pub fn build_fuzzy_match_expr_db(
 
 /// Normalize a natural-language query before embedding.
 ///
-/// Strips sentence-ending punctuation from word boundaries and collapses
-/// internal whitespace so that `"how daemon work?"` and `"how daemon work ?"`
-/// produce identical text — and therefore identical embedding vectors.
+/// Strips only curated sentence-ending punctuation (`?!.,;:`) from the trailing
+/// edge of each whitespace-token, and collapses internal whitespace so that
+/// `"how daemon work?"` and `"how daemon work ?"` produce identical text and
+/// therefore identical embedding vectors.
+///
+/// CO-C2: previous version stripped ALL non-alphanumeric chars from both ends,
+/// which corrupted language names and symbols:
+///   `"C++"` → `"C"`, `"c#"` → `"c"`, `"_private"` → `"private"`, `"->ptr"` → `"ptr"`.
+/// Now only trailing `?!.,;:` are stripped; leading characters (including `_`, `->`)
+/// are preserved so language-filter inference and symbol lookup remain correct.
 ///
 /// Rules:
 /// - Split on whitespace.
-/// - For each token, strip leading and trailing non-alphanumeric characters.
+/// - For each token, strip trailing occurrences of `?`, `!`, `.`, `,`, `;`, `:`.
 /// - Drop tokens that become empty after stripping (e.g. a bare `?`).
 /// - Rejoin with single spaces.
 ///
@@ -167,12 +174,15 @@ pub fn build_fuzzy_match_expr_db(
 /// assert_eq!(normalize_nl_query("how daemon work?"),  "how daemon work");
 /// assert_eq!(normalize_nl_query("how daemon work ?"), "how daemon work");
 /// assert_eq!(normalize_nl_query("  what is PaymentService?  "), "what is PaymentService");
+/// assert_eq!(normalize_nl_query("C++"), "C++");
+/// assert_eq!(normalize_nl_query("_private"), "_private");
 /// ```
 pub fn normalize_nl_query(query: &str) -> String {
+    const TRAILING_PUNCT: &[char] = &['?', '!', '.', ',', ';', ':'];
     query
         .split_whitespace()
         .filter_map(|word| {
-            let stripped = word.trim_matches(|c: char| !c.is_alphanumeric());
+            let stripped = word.trim_end_matches(TRAILING_PUNCT);
             if stripped.is_empty() {
                 None
             } else {
@@ -371,6 +381,7 @@ mod tests {
 
     #[test]
     fn normalize_multiple_punctuation_types() {
+        // Only trailing punctuation is stripped per word; "what!?" → "what" (! then ? stripped).
         assert_eq!(normalize_nl_query("what!? is this."), "what is this");
     }
 
@@ -381,6 +392,37 @@ mod tests {
             normalize_nl_query("find PaymentService.charge"),
             "find PaymentService.charge"
         );
+    }
+
+    // ── CO-C2 regression: preserve language/symbol chars ─────────────────────
+
+    #[test]
+    fn normalize_cpp_preserved() {
+        assert_eq!(normalize_nl_query("C++"), "C++");
+        assert_eq!(normalize_nl_query("C++ generics"), "C++ generics");
+    }
+
+    #[test]
+    fn normalize_csharp_preserved() {
+        assert_eq!(normalize_nl_query("c#"), "c#");
+    }
+
+    #[test]
+    fn normalize_leading_underscore_preserved() {
+        assert_eq!(normalize_nl_query("_private"), "_private");
+    }
+
+    #[test]
+    fn normalize_arrow_preserved() {
+        assert_eq!(normalize_nl_query("->ptr"), "->ptr");
+    }
+
+    #[test]
+    fn normalize_trailing_question_only() {
+        // Only trailing sentence-ending chars are removed.
+        assert_eq!(normalize_nl_query("hello?"), "hello");
+        assert_eq!(normalize_nl_query("hello!"), "hello");
+        assert_eq!(normalize_nl_query("hello."), "hello");
     }
 
     #[test]

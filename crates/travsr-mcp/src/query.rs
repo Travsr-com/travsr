@@ -190,13 +190,16 @@ pub fn ask_query(
 ) -> anyhow::Result<AskPayload> {
     // Strip a leading `:` so VS Code graph-panel queries pass through cleanly.
     let query = query.strip_prefix(':').unwrap_or(query).trim();
+    // CO-C1: normalize once at the top so both FTS and embed see the same
+    // cleaned query — prevents punctuation divergence on the cold/CLI path.
+    let normalized = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let query = normalized.as_str();
 
-    // ── Unified seed selection (FTS always + KNN when available) ──────────────
-    let fts_weighted = crate::tools::fts_seeds_weighted(store, query, &OpenFilter);
-
+    // ── Tier-0 seed selection (per-token anchor + BM25 FTS + optional KNN) ──
+    let knn_pairs;
     let embed_contributed;
-    let raw_seeds = if let Some(knn) = knn_fn {
-        let (knn_seeds, n_eligible, knn_elapsed_ms) =
+    if let Some(knn) = knn_fn {
+        let (knn_scored, _n_eligible, knn_elapsed_ms) =
             crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
         let budget_ms = crate::tools::knn_budget_ms();
         if knn_elapsed_ms > budget_ms {
@@ -205,18 +208,31 @@ pub fn ask_query(
                 threshold_ms = budget_ms,
                 "ask_query knn exceeded circuit-breaker — falling back to FTS seeds"
             );
+            knn_pairs = vec![];
             embed_contributed = false;
-            fts_weighted
         } else {
-            embed_contributed = !knn_seeds.is_empty();
-            let (merged, _) =
-                crate::tools::merge_fts_knn_seeds(fts_weighted, knn_seeds, n_eligible);
-            merged
+            embed_contributed = !knn_scored.is_empty();
+            knn_pairs = knn_scored;
         }
     } else {
+        knn_pairs = vec![];
         embed_contributed = false;
-        fts_weighted
-    };
+    }
+
+    let seed_set = crate::seed::build_seed_set(store, query, &OpenFilter, knn_pairs);
+
+    // Abstain when confidence is None — prevents "confident salad" on no-match queries (R1).
+    if seed_set.confidence == crate::seed::Confidence::None {
+        return Ok(AskPayload {
+            matched: false,
+            no_results: false,
+            rows: Vec::new(),
+            total_tokens: 0,
+            embed_used: false,
+        });
+    }
+
+    let raw_seeds = seed_set.ppr_seeds();
 
     // Caller enrichment: depth-1 then depth-2 production callers at 0.35× weight per hop.
     let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 15); // depth-1
@@ -267,10 +283,10 @@ pub fn ask_query(
     let in_degrees = store.in_degrees(&filtered_ids)?;
     let score_map: HashMap<NodeId, f32> = raw_score_map
         .into_iter()
-        .filter_map(|(id, s)| {
+        .map(|(id, s)| {
             let degree = in_degrees.get(&id).copied().unwrap_or(0);
             let damped = s * (1.0 / (1.0 + (degree as f32).max(1.0).ln()));
-            Some((id, damped))
+            (id, damped)
         })
         .collect();
 

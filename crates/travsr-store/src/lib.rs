@@ -231,6 +231,11 @@ impl Migration for V13PhaseBUnification {
     fn version(&self) -> u32 {
         13
     }
+    // VACUUM cannot run inside an explicit transaction; skip the SC-H2
+    // BEGIN/COMMIT wrapping for this migration (see MigrationRunner::run).
+    fn is_transactional(&self) -> bool {
+        false
+    }
     fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
         // ALTER TABLE … ADD COLUMN has no IF NOT EXISTS in SQLite — guard manually.
         if !store.column_exists("nodes", "end_line")? {
@@ -310,6 +315,18 @@ impl Migration for V18EmbedText {
     }
 }
 
+/// V19: index on nodes(signature) — eliminates full-table scan in
+/// `nodes_by_signatures` which is called per UnresolvedCall batch every commit.
+struct V19NodesSignatureIdx;
+impl Migration for V19NodesSignatureIdx {
+    fn version(&self) -> u32 {
+        19
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl("CREATE INDEX IF NOT EXISTS idx_nodes_signature ON nodes(signature)")
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -331,6 +348,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V16NodeEmbeddings);
     r.register(V17NodeTombstones);
     r.register(V18EmbedText);
+    r.register(V19NodesSignatureIdx);
     r
 }
 
@@ -477,6 +495,10 @@ impl SqliteStore {
             // Read-path pragmas only. journal_mode=WAL is a persisted property
             // of the database file; setting pragmas that write (WAL switch,
             // autocheckpoint) is neither possible nor needed here.
+            // SC-C1: busy timeout prevents SQLITE_BUSY hard-fail when the daemon
+            // write lock is held briefly (e.g. post-commit reindex flush).
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .context("setting busy_timeout (read-only)")?;
             conn.pragma_update(None, "cache_size", -Self::cache_size_kib())
                 .context("setting cache_size (read-only)")?;
             conn.pragma_update(None, "temp_store", "MEMORY")
@@ -617,6 +639,10 @@ impl SqliteStore {
     }
 
     fn configure(conn: &Connection) -> AnyResult<()> {
+        // SC-C1: 5-second retry on SQLITE_BUSY so a second concurrent writer
+        // (daemon + CLI, or two Phase B workers) retries instead of hard-failing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy_timeout")?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("enabling WAL journal mode")?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -772,6 +798,16 @@ impl SqliteStore {
             // RFC-019: node_embeddings lives in embed.db. ATTACH it to count
             // embedded nodes. Return zeros when embed.db does not exist yet
             // (before first sidecar reindex pass).
+            //
+            // SC-H3: EdbGuard ensures DETACH runs even on query failure, preventing
+            // "database edb already in use" from bricking the connection on next call.
+            struct EdbGuard<'g>(&'g rusqlite::Connection);
+            impl Drop for EdbGuard<'_> {
+                fn drop(&mut self) {
+                    let _ = self.0.execute_batch("DETACH DATABASE edb");
+                }
+            }
+
             let (embedded, phase1_done) = self
                 .embed_db_path
                 .as_deref()
@@ -783,6 +819,7 @@ impl SqliteStore {
                     self.conn
                         .execute_batch(&format!("ATTACH DATABASE '{embed_path_str}' AS edb"))
                         .context("attaching embed.db")?;
+                    let _guard = EdbGuard(&self.conn); // DETACH on any early return
                     let embedded: i64 = self
                         .conn
                         .query_row(
@@ -804,10 +841,8 @@ impl SqliteStore {
                             |r| r.get(0),
                         )
                         .context("counting phase1 embedded")?;
-                    self.conn
-                        .execute_batch("DETACH DATABASE edb")
-                        .context("detaching embed.db")?;
                     Ok((embedded, phase1_done))
+                    // _guard drops here → DETACH DATABASE edb
                 })
                 .transpose()?
                 .unwrap_or((0, 0));
@@ -2768,6 +2803,138 @@ LIMIT 100",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// FTS5 query that returns `(Node, bm25_score)` pairs.
+    ///
+    /// SQLite `bm25()` is negated so higher scores mean better matches (positive = good).
+    /// Typical range: 0.05 (weak) to 5.0+ (strong match on a small corpus).
+    fn fts_query_nodes_scored(&self, match_expr: &str) -> AnyResult<Vec<(Node, f32)>> {
+        let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                          n.kind, n.package, n.line, n.end_line, -bm25(nodes_fts) \
+                   FROM nodes_fts \
+                   JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
+                   JOIN nodes n ON n.id = m.node_id \
+                   WHERE nodes_fts MATCH ?1 \
+                   ORDER BY bm25(nodes_fts) \
+                   LIMIT 50";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("preparing scored FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                let bm25: f64 = row.get(10).unwrap_or(0.0);
+                Ok((
+                    Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    },
+                    bm25 as f32,
+                ))
+            })
+            .context("executing scored FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding scored FTS5 row")?);
+        }
+        Ok(out)
+    }
+
+    /// Scored variant of [`search_nodes_fuzzy`]: returns `(Node, score)` pairs where
+    /// score is a positive relevance float (higher = better).
+    ///
+    /// Step 1 (exact substring) assigns descending rank scores [1.0, 0.9, …].
+    /// Step 2 (FTS5 BM25) returns the raw `-bm25()` values.
+    /// Step 3 (L2-A expansion fallback) assigns a fixed floor score of 0.25.
+    pub fn search_nodes_fuzzy_scored(&self, query: &str) -> Result<Vec<(Node, f32)>, StoreError> {
+        let _span = tracing::debug_span!("store.search_nodes_fuzzy_scored", query).entered();
+
+        // Step 1 — exact substring match (never regresses, TL3).
+        let exact = self.search_nodes_by_name(query)?;
+        if !exact.is_empty() {
+            let len = exact.len() as f32;
+            return Ok(exact
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let score = (1.0f32 - (i as f32 / (len + 1.0))).max(0.1);
+                    (n, score)
+                })
+                .collect());
+        }
+
+        // Step 2 — FTS5 BM25.
+        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
+            Some(e) => e,
+            None => {
+                // All tokens < 3 chars — fall through to step3.
+                return Ok(self
+                    .search_nodes_fuzzy(query)?
+                    .into_iter()
+                    .map(|n| (n, 0.25f32))
+                    .collect());
+            }
+        };
+        let step2 = self
+            .fts_query_nodes_scored(&step2_expr)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !step2.is_empty() {
+            return Ok(step2);
+        }
+
+        // Step 3 — L2-A expansion via the existing unscored path; assign floor score.
+        Ok(self
+            .search_nodes_fuzzy(query)?
+            .into_iter()
+            .map(|n| (n, 0.25f32))
+            .collect())
+    }
+
+    /// Returns the count of nodes whose `signature` contains `token` as a substring.
+    ///
+    /// Used as IDF denominator for per-token anchor specificity: high `freq` means
+    /// the token is generic ("get", "run") and should contribute low weight even when
+    /// it matches a real symbol.
+    pub fn symbol_frequency(&self, token: &str) -> Result<usize, StoreError> {
+        (|| -> AnyResult<usize> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT COUNT(*) FROM nodes WHERE signature LIKE '%' || ?1 || '%'")?;
+            let count: i64 = stmt.query_row(params![token], |r| r.get(0))?;
+            Ok(count.max(0) as usize)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Returns the total number of nodes in the graph.
+    ///
+    /// Used as the IDF corpus size N in `idf_weight(freq, N)`.
+    pub fn total_node_count(&self) -> Result<usize, StoreError> {
+        (|| -> AnyResult<usize> {
+            let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM nodes")?;
+            let count: i64 = stmt.query_row([], |r| r.get(0))?;
+            Ok(count.max(0) as usize)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Language-scoped variant of [`fts_query_nodes`].
     /// Appends `AND n.language = ?2` before the 50-row FTS LIMIT.
     fn fts_query_nodes_with_lang(&self, match_expr: &str, lang: &str) -> AnyResult<Vec<Node>> {
@@ -3292,6 +3459,55 @@ LIMIT 100",
         tx.commit()?;
         tracing::info!("RFC-012 A2 F1: fts_synonyms reset to static defaults");
         Ok(())
+    }
+
+    /// SC-H1: cap the `node_tombstones` table so it cannot grow unbounded.
+    ///
+    /// Tombstones are at-least-once: the embed sidecar consumes and acks them
+    /// on each reindex pass. If the sidecar is offline for a long time (or the
+    /// table is never consumed) the table accumulates indefinitely. This GC
+    /// trims in two passes:
+    ///
+    /// 1. Delete rows older than `max_age_secs` (default 7 days). After a
+    ///    full init_repo the sidecar rebuilds all embeddings from scratch, so
+    ///    any tombstone older than one full cycle is redundant.
+    /// 2. If the table still has > `max_rows` rows after the age trim, keep
+    ///    only the newest `max_rows` (the embed sidecar re-derives stale
+    ///    entries on the next full reindex).
+    ///
+    /// Consistency window: tombstones between the GC cut-off and sidecar ack
+    /// may be missed. Acceptable because a full init_repo rebuild covers any
+    /// gap. Document this as "eventual" rather than "guaranteed once".
+    pub fn prune_tombstones(&mut self, max_age_secs: u64, max_rows: u64) -> anyhow::Result<u64> {
+        let tx = self.conn.transaction()?;
+        let cutoff = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64)
+            - max_age_secs as i64;
+        let aged = tx.execute(
+            "DELETE FROM node_tombstones WHERE deleted_at < ?1",
+            rusqlite::params![cutoff],
+        )? as u64;
+
+        // Count remaining rows.
+        let remaining: i64 =
+            tx.query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))?;
+        let size_pruned = if remaining as u64 > max_rows {
+            tx.execute(
+                "DELETE FROM node_tombstones WHERE rowid NOT IN \
+                 (SELECT rowid FROM node_tombstones ORDER BY deleted_at DESC LIMIT ?1)",
+                rusqlite::params![max_rows as i64],
+            )? as u64
+        } else {
+            0
+        };
+        tx.commit()?;
+        let total = aged + size_pruned;
+        if total > 0 {
+            tracing::debug!(aged, size_pruned, "pruned node_tombstones");
+        }
+        Ok(total)
     }
 }
 

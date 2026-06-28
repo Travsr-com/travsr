@@ -34,7 +34,7 @@ pub enum EmbedCommand {
     /// Activates the backend on success.
     Init {
         /// Backend ID to install (run `travsr embed list` to see options).
-        /// Defaults to the first catalog entry (currently nomic-v1.5-int8).
+        /// Defaults to the first catalog entry (currently bge-small-en-v1.5).
         #[arg(long)]
         backend: Option<String>,
         /// Re-download even if already installed.

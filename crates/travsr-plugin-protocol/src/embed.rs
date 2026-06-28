@@ -22,14 +22,14 @@ pub const EMBED_PROTOCOL_VERSION: u32 = 1;
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
-/// Implemented once per embed backend (e.g. nomic-v1.5, bge-small-en-v1.5).
+/// Implemented once per embed backend (e.g. bge-small-en-v1.5, bge-base-en-v1.5).
 /// Stateless and Send+Sync — one instance drives the whole sidecar loop.
 ///
 /// embed_batch and knn are the only two operations the host ever calls.
 /// The sidecar binary entry-point is `run_embed_plugin` in travsr-plugin-sdk.
 pub trait EmbedPlugin: Send + Sync {
     /// Opaque backend tag — matches the `model_id` column in `node_embeddings`.
-    /// Example: `"nomic-v1.5-int8"`, `"bge-small-en-v1.5"`.
+    /// Example: `"bge-small-en-v1.5"`, `"bge-base-en-v1.5"`.
     fn model_id(&self) -> &str;
 
     /// Number of floats per embedding (before any quantisation).
@@ -69,7 +69,7 @@ pub struct EmbedHandshakeResponse {
     pub model_id: String,
     /// Dimensionality of the raw (pre-quantised) embedding vector.
     pub embedding_dim: u32,
-    /// Human-readable backend label (e.g. "nomic-embed-text-v1.5 int8 MRL-256").
+    /// Human-readable backend label (e.g. "BGE-Small-EN-v1.5 ONNX 384-dim").
     pub backend: String,
     /// Maximum texts per EmbedRequest. Old plugin binaries that pre-date this
     /// field get the safe default of 100 via serde(default).
@@ -92,7 +92,7 @@ pub struct EmbedRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbedResponse {
     /// One BLOB per input text, same order as EmbedRequest.texts.
-    /// Layout is backend-defined (e.g. 256 × f32 little-endian for nomic int8).
+    /// Layout is backend-defined (e.g. 384 × f32 little-endian for bge-small).
     /// The daemon stores these bytes opaquely in node_embeddings.embedding.
     #[serde(with = "embeddings_serde")]
     pub embeddings: Vec<Vec<u8>>,
@@ -216,7 +216,7 @@ mod tests {
         let req = EmbedPluginRequest::Knn(KnnRequest {
             db_path: std::path::PathBuf::from("/tmp/graph.db"),
             query_text: "payment service".into(),
-            model_id: "nomic-v1.5-int8".into(),
+            model_id: "bge-small-en-v1.5".into(),
             k: 10,
         });
         let encoded = encode_message(&req).unwrap();
@@ -230,9 +230,9 @@ mod tests {
         let resp = EmbedPluginResponse::Handshake(EmbedHandshakeResponse {
             protocol_version: EMBED_PROTOCOL_VERSION,
             plugin_version: "0.7.0".into(),
-            model_id: "nomic-v1.5-int8".into(),
-            embedding_dim: 256,
-            backend: "nomic-embed-text-v1.5 int8 MRL-256".into(),
+            model_id: "bge-small-en-v1.5".into(),
+            embedding_dim: 384,
+            backend: "BGE-Small-EN-v1.5 ONNX 384-dim".into(),
             max_batch: 100,
         });
         let encoded = encode_message(&resp).unwrap();
