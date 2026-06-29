@@ -35,10 +35,17 @@ fn reindex_timeout_secs() -> u64 {
 /// write to the same embed.db concurrently (no temp-db isolation in RFC-021).
 static REINDEX_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// RAM budget for the whole reindex run (single model + caches + overhead).
-/// Used by derive_num_workers() to cap the reader-thread count only, not
-/// the number of sidecar processes (which is always 1).
-const WORKER_RAM_BUDGET_MB: u64 = 500;
+/// Memory overhead per reader thread inside the sidecar (batch buffers, tokenizer state).
+/// The model weights are loaded ONCE by the single sidecar (RFC-021), so only this
+/// per-thread cost scales with worker count.
+const PER_READER_THREAD_MB: u64 = 50;
+
+/// Reserved headroom for the OS, daemon, and SQLite page cache.
+const OS_RESERVE_MB: u64 = 256;
+
+/// Conservative per-slot estimate used when the model's RAM cost is unknown.
+/// Preserves the old behaviour for future or unrecognised model ids.
+const FALLBACK_RAM_PER_SLOT_MB: u64 = 500;
 
 /// Fraction of symbol nodes targeted by Phase 1 (eager) embedding.
 /// The shell_number threshold is derived so that nodes with
@@ -197,34 +204,216 @@ impl PhaseFilter {
 
 // ── C-01: thread count ────────────────────────────────────────────────────────
 
+/// Best-effort performance-core count — excludes efficiency cores and hyperthreads
+/// so the inference loop isn't time-sliced onto slower silicon.
+///
+/// macOS (Apple Silicon):  `sysctl hw.perflevel0.logicalcpu`
+///                         Falls back to `available_parallelism()` on Intel Macs
+///                         (no perf-level split → sysctl returns an error).
+///
+/// Linux (hybrid CPUs):    reads `/sys/devices/system/cpu/cpu{N}/cpufreq/cpuinfo_max_freq`
+///                         and counts cores at the highest frequency group (P-cores).
+///                         Falls back to `available_parallelism()` when sysfs is absent
+///                         (containers, VMs, OCI A1 Ampere Altra — homogeneous anyway).
+///
+/// Windows:                uses `GetLogicalProcessorInformationEx(RelationProcessorCore)`
+///                         and counts cores whose `EfficiencyClass` equals the maximum
+///                         observed value (= P-cores on hybrid, all cores on homogeneous).
+///                         Falls back to `available_parallelism()` on API failure.
+fn p_core_count() -> usize {
+    let fallback = || {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = Command::new("sysctl")
+            .args(["-n", "hw.perflevel0.logicalcpu"])
+            .output()
+        {
+            if let Ok(n) = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<usize>()
+            {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(n) = linux_p_core_count() {
+            return n;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(n) = windows_p_core_count() {
+            return n;
+        }
+    }
+
+    fallback()
+}
+
+/// Parse `/sys/devices/system/cpu/cpu{N}/cpufreq/cpuinfo_max_freq` entries and
+/// return the count of CPUs at the highest observed frequency (= P-cores).
+/// Returns `None` when sysfs is absent or no frequency data is readable.
+#[cfg(target_os = "linux")]
+fn linux_p_core_count() -> Option<usize> {
+    let cpu_dir = std::path::Path::new("/sys/devices/system/cpu");
+    let entries = std::fs::read_dir(cpu_dir).ok()?;
+
+    let mut max_freq: u64 = 0;
+    // (freq_khz, count) pairs — avoids HashMap allocation on hot path.
+    let mut freq_slots: Vec<(u64, usize)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Match "cpu0", "cpu1", … — skip "cpufreq", "cpuidle", "cpuN/…" etc.
+        if !name.starts_with("cpu") {
+            continue;
+        }
+        if name[3..].parse::<u32>().is_err() {
+            continue;
+        }
+        let freq_path = entry.path().join("cpufreq/cpuinfo_max_freq");
+        if let Ok(content) = std::fs::read_to_string(&freq_path) {
+            if let Ok(freq) = content.trim().parse::<u64>() {
+                if freq > max_freq {
+                    max_freq = freq;
+                }
+                match freq_slots.iter_mut().find(|(f, _)| *f == freq) {
+                    Some((_, c)) => *c += 1,
+                    None => freq_slots.push((freq, 1)),
+                }
+            }
+        }
+    }
+
+    if max_freq == 0 {
+        return None;
+    }
+    let p_count = freq_slots
+        .iter()
+        .find(|(f, _)| *f == max_freq)
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    if p_count > 0 { Some(p_count) } else { None }
+}
+
+/// Walk the `GetLogicalProcessorInformationEx(RelationProcessorCore)` buffer and
+/// count processor cores whose `EfficiencyClass` equals the maximum observed value.
+/// On homogeneous systems every core has the same class → returns total physical cores.
+/// On Intel hybrid (12th gen+) P-cores have a higher class than E-cores.
+#[cfg(windows)]
+fn windows_p_core_count() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+
+    // First call: discover required buffer size.
+    let mut buf_size: u32 = 0;
+    // SAFETY: passing null buffer is the documented way to query size.
+    unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut buf_size);
+    }
+    if buf_size == 0 {
+        return None;
+    }
+
+    let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
+    // SAFETY: buf is correctly sized from the previous call.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+            &mut buf_size,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    // Walk the variable-length buffer.  Each entry starts with a `Size` field
+    // that gives its own byte length (entries are not fixed-size).
+    let mut offset = 0usize;
+    let mut max_class: u8 = 0;
+    let mut class_counts: Vec<(u8, usize)> = Vec::new();
+
+    while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= buf_size as usize {
+        // SAFETY: we bounds-check before casting.
+        let entry = unsafe {
+            &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+        };
+        let entry_size = entry.Size as usize;
+        if entry_size == 0 || offset + entry_size > buf_size as usize {
+            break;
+        }
+        // SAFETY: Relationship == RelationProcessorCore, so the union field is Processor.
+        let efficiency_class = unsafe { entry.Anonymous.Processor.EfficiencyClass };
+        if efficiency_class > max_class {
+            max_class = efficiency_class;
+        }
+        match class_counts.iter_mut().find(|(c, _)| *c == efficiency_class) {
+            Some((_, n)) => *n += 1,
+            None => class_counts.push((efficiency_class, 1)),
+        }
+        offset += entry_size;
+    }
+
+    let p_count = class_counts
+        .iter()
+        .find(|(c, _)| *c == max_class)
+        .map(|(_, n)| *n)
+        .unwrap_or(0);
+    if p_count > 0 { Some(p_count) } else { None }
+}
+
 /// Derive the number of parallel reader threads for the sidecar (C-01).
 ///
 /// Priority: TRAVSR_EMBED_WORKERS env var → P-core count (clamped) → RAM guard.
-/// Note: this controls reader threads INSIDE one sidecar, not process count.
-fn derive_num_workers() -> usize {
+/// `model_ram_mb` is the fixed RAM cost of loading the model once (from the catalog).
+/// Pass 0 when the model is unknown — falls back to the conservative slot estimate.
+fn derive_num_workers(model_ram_mb: u64) -> usize {
     let env_override = std::env::var("TRAVSR_EMBED_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
-
-    let logical = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-
-    derive_num_workers_inner(logical, available_memory_mb(), env_override)
+    derive_num_workers_inner(p_core_count(), available_memory_mb(), model_ram_mb, env_override)
 }
 
-/// Pure inner function — takes all inputs explicitly so tests never touch env vars.
+/// Pure inner function — takes all inputs explicitly so tests never touch env/syscalls.
+///
+/// RAM formula (RFC-021 single-sidecar):
+///   headroom = available_ram − model_fixed_ram − OS_RESERVE_MB
+///   workers  = headroom / PER_READER_THREAD_MB   (clamped to [1, MAX_EMBED_WORKERS])
+///
+/// When `model_ram_mb == 0` (unknown model) falls back to the coarser
+/// `available / FALLBACK_RAM_PER_SLOT_MB` estimate that was used before this change.
 fn derive_num_workers_inner(
-    logical_cpus: usize,
-    ram_mb: u64,
+    p_cores: usize,
+    available_ram_mb: u64,
+    model_ram_mb: u64,
     env_override: Option<usize>,
 ) -> usize {
     if let Some(n) = env_override {
         return n.clamp(1, MAX_EMBED_WORKERS);
     }
-    let cpu_bound = logical_cpus.min(MAX_EMBED_WORKERS);
-    if ram_mb > 0 {
-        let ram_bound = ((ram_mb / WORKER_RAM_BUDGET_MB) as usize).max(1);
+    let cpu_bound = p_cores.min(MAX_EMBED_WORKERS);
+    if available_ram_mb > 0 {
+        let ram_bound = if model_ram_mb > 0 {
+            let headroom = available_ram_mb.saturating_sub(model_ram_mb + OS_RESERVE_MB);
+            ((headroom / PER_READER_THREAD_MB) as usize).max(1)
+        } else {
+            ((available_ram_mb / FALLBACK_RAM_PER_SLOT_MB) as usize).max(1)
+        };
         cpu_bound.min(ram_bound)
     } else {
         cpu_bound
@@ -233,9 +422,9 @@ fn derive_num_workers_inner(
 
 /// Best-effort AVAILABLE RAM in MiB (not total physical RAM).
 ///
-/// macOS: parses `vm_stat` for free + inactive pages × page_size.
-///        This reflects what's actually available, not just installed.
-/// Linux: reads MemAvailable from /proc/meminfo (already available-based).
+/// macOS:   parses `vm_stat` for free + inactive pages × page_size.
+/// Linux:   reads `MemAvailable` from `/proc/meminfo`.
+/// Windows: calls `GlobalMemoryStatusEx` → `ullAvailPhys`.
 /// Returns 0 when unavailable — caller skips the RAM guard.
 fn available_memory_mb() -> u64 {
     #[cfg(target_os = "macos")]
@@ -282,14 +471,44 @@ fn available_memory_mb() -> u64 {
             }
         }
     }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut mem = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            dwMemoryLoad: 0,
+            ullTotalPhys: 0,
+            ullAvailPhys: 0,
+            ullTotalPageFile: 0,
+            ullAvailPageFile: 0,
+            ullTotalVirtual: 0,
+            ullAvailVirtual: 0,
+            ullAvailExtendedVirtual: 0,
+        };
+        // SAFETY: mem is zero-initialised with dwLength correctly set.
+        if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 {
+            return mem.ullAvailPhys / (1024 * 1024);
+        }
+    }
     0
 }
 
 // ── Per-repo threshold derivation ────────────────────────────────────────────
 
 /// Public re-export for `travsr embed reindex` so it can show the resolved worker count.
-pub fn derive_num_workers_for_cli() -> usize {
-    derive_num_workers()
+///
+/// Looks up the per-repo model id from `<db_path>/../embed.toml` so the RAM guard
+/// uses the correct model's fixed RAM cost. Pass any `.travsr/graph.db` path.
+/// Falls back to the conservative slot estimate when the model is unconfigured.
+pub fn derive_num_workers_for_cli(db_path: &Path) -> usize {
+    let model_ram_mb = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|root| repo_backend_id(root))
+        .and_then(|id| lookup(&id))
+        .map(|b| b.ram_mb as u64)
+        .unwrap_or(0);
+    derive_num_workers(model_ram_mb)
 }
 
 /// Public re-export for `travsr embed status` so it shows the real threshold label.
@@ -342,15 +561,16 @@ fn run_parallel_reindex(
     bin_path: &Path,
     db_path: &Path,
     embed_db_path: &Path,
-    _model_id: &str,
+    model_id: &str,
     phase: PhaseFilter,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    let n = derive_num_workers();
+    let model_ram_mb = lookup(model_id).map(|b| b.ram_mb as u64).unwrap_or(0);
+    let n = derive_num_workers(model_ram_mb);
 
     let mut cmd = Command::new(bin_path);
     cmd.arg("--model-id")
-        .arg(_model_id)
+        .arg(model_id)
         .arg("--reindex")
         .arg(db_path)
         .arg("--embed-db")
@@ -415,6 +635,14 @@ fn run_parallel_reindex(
             }
         }
     }
+}
+
+/// Returns true when a background reindex sidecar is currently running.
+///
+/// Used by the daemon's embed_tick to skip Phase 1 catch-up when a reindex
+/// is already in progress (avoids double-spawning after a daemon restart).
+pub fn embed_reindex_in_flight() -> bool {
+    REINDEX_IN_FLIGHT.load(Ordering::SeqCst)
 }
 
 // ── Public spawn functions ────────────────────────────────────────────────────
@@ -679,47 +907,83 @@ mod tests {
         assert!(lookup("__nonexistent__").is_none());
     }
 
-    // ── TC-01: worker count clamping ──────────────────────────────────────────
+    // ── TC-01: worker count ───────────────────────────────────────────────────
+    //
+    // Signature: derive_num_workers_inner(p_cores, available_ram_mb, model_ram_mb, env_override)
+    //
+    // RAM formula (when model_ram_mb > 0):
+    //   headroom = available_ram − model_ram − OS_RESERVE_MB(256)
+    //   ram_bound = max(1, headroom / PER_READER_THREAD_MB(50))
+    //   result = min(p_cores, MAX_EMBED_WORKERS, ram_bound)
+    //
+    // When model_ram_mb == 0 (unknown):
+    //   ram_bound = max(1, available_ram / FALLBACK_RAM_PER_SLOT_MB(500))
 
     #[test]
     fn worker_count_env_override_is_clamped() {
         assert_eq!(
-            derive_num_workers_inner(2, 16_000, Some(0)),
+            derive_num_workers_inner(2, 16_000, 200, Some(0)),
             1,
             "0 should clamp to 1"
         );
         assert_eq!(
-            derive_num_workers_inner(16, 64_000, Some(100)),
+            derive_num_workers_inner(16, 64_000, 200, Some(100)),
             MAX_EMBED_WORKERS,
             "100 should clamp to MAX_EMBED_WORKERS"
         );
-        assert_eq!(derive_num_workers_inner(8, 16_000, Some(3)), 3);
+        assert_eq!(derive_num_workers_inner(8, 16_000, 200, Some(3)), 3);
     }
 
     #[test]
     fn worker_count_cpu_bound() {
-        assert_eq!(derive_num_workers_inner(2, 16_000, None), 2);
+        // 2 P-cores, ample RAM → capped by CPU, not RAM
+        // headroom = 16000 - 200 - 256 = 15544 → ram_bound = 310 → min(2, 310) = 2
+        assert_eq!(derive_num_workers_inner(2, 16_000, 200, None), 2);
+        // 12 P-cores → capped at MAX_EMBED_WORKERS
         assert_eq!(
-            derive_num_workers_inner(12, 64_000, None),
+            derive_num_workers_inner(12, 64_000, 200, None),
             MAX_EMBED_WORKERS
         );
     }
 
     #[test]
-    fn worker_count_ram_guard() {
-        // 8 cores, 2 000 MB available → floor(2000 / 500) = 4
-        assert_eq!(derive_num_workers_inner(8, 2_000, None), 4);
-        // 8 cores, 300 MB available → max(floor(300/500), 1) = 1
-        assert_eq!(derive_num_workers_inner(8, 300, None), 1);
-        // ram_mb = 0 means "unknown" → skip RAM guard, use cpu_bound
-        assert_eq!(derive_num_workers_inner(4, 0, None), 4);
+    fn worker_count_ram_guard_model_aware() {
+        // bge-small (200 MB) on a machine with 1 000 MB available:
+        //   headroom = 1000 - 200 - 256 = 544 → 544/50 = 10 → min(8, 10) = 8
+        // Previously: 1000/500 = 2  ← the original bug
+        assert_eq!(derive_num_workers_inner(8, 1_000, 200, None), 8);
+
+        // bge-base (450 MB), 1 500 MB available:
+        //   headroom = 1500 - 450 - 256 = 794 → 794/50 = 15 → min(8, 15) = 8
+        assert_eq!(derive_num_workers_inner(8, 1_500, 450, None), 8);
+
+        // bge-large (1 400 MB), 1 500 MB available — very tight:
+        //   headroom = 1500 - 1400 - 256 = -156 → saturating_sub = 0 → max(1) = 1
+        assert_eq!(derive_num_workers_inner(8, 1_500, 1_400, None), 1);
+
+        // bge-large (1 400 MB), 2 000 MB available:
+        //   headroom = 2000 - 1400 - 256 = 344 → 344/50 = 6 → min(8, 6) = 6
+        assert_eq!(derive_num_workers_inner(8, 2_000, 1_400, None), 6);
+
+        // ram_mb = 0 means "unavailable" → skip RAM guard entirely, use p_cores
+        assert_eq!(derive_num_workers_inner(4, 0, 200, None), 4);
     }
 
     #[test]
-    fn worker_count_8gb_machine_with_2gb_available() {
-        // Simulates an 8 GB machine (like the dev machine) with ~2.2 GB available.
-        // With the old hw.memsize approach: 8192 / 500 = 16 → capped at 8 → OOM.
-        // With the new vm_stat approach: 2259 / 500 = 4 → safe.
-        assert_eq!(derive_num_workers_inner(8, 2_259, None), 4);
+    fn worker_count_unknown_model_uses_fallback() {
+        // model_ram_mb = 0 → fallback: available / FALLBACK_RAM_PER_SLOT_MB(500)
+        // 8 cores, 2 000 MB → 2000/500 = 4
+        assert_eq!(derive_num_workers_inner(8, 2_000, 0, None), 4);
+        // 8 cores, 300 MB → max(1, 300/500) = 1
+        assert_eq!(derive_num_workers_inner(8, 300, 0, None), 1);
+    }
+
+    #[test]
+    fn worker_count_4p_cores_1gb_bge_small() {
+        // Reproduces the original reported scenario:
+        //   4 P-cores, ~1 000 MB available, bge-small (200 MB)
+        //   headroom = 1000 - 200 - 256 = 544 → 544/50 = 10 → min(4, 10) = 4
+        // Previously: 1000/500 = 2
+        assert_eq!(derive_num_workers_inner(4, 1_000, 200, None), 4);
     }
 }
