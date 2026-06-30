@@ -375,11 +375,42 @@ fn classify_confidence(
         .iter()
         .any(|t| t.resolved && t.idf_w >= idf_min && embed_agrees(t));
 
+    // Strict embedding confirmation: the oracle is confident AND actively places a
+    // *specific* anchor near the query (present in the over-fetch with cos ≥ floor).
+    // Unlike `embed_agrees`, this is NOT vacuously true when the oracle is cold/absent
+    // — it is positive evidence used to rescue a query whose lexical coverage is
+    // diluted by typos or generic filler but whose anchor the model confirms.
+    let embed_confirmed_specific = oracle_confident
+        && terms.iter().any(|t| {
+            t.resolved
+                && t.idf_w >= idf_min
+                && t.top_node
+                    .and_then(|n| knn_oracle.get(&n).copied())
+                    .is_some_and(|c| c >= floor)
+        });
+
     if has_rare_anchor && coverage >= cov_strong {
         Confidence::Exact
+    } else if has_specific_anchor && coverage >= cov_strong {
+        // A specific (high-IDF) anchor the embedding AGREES with — or that has no
+        // embedding opinion to contradict it — at high coverage is a Strong match.
+        // e.g. "type Tweak" → type:Tweak (idf ~0.81, cosine ~1.0): not rare enough
+        // for Exact (the symbol recurs across packages) but unmistakably the right
+        // anchor. `embed_agrees` is baked into `has_specific_anchor`, so a confident
+        // oracle that DISAGREES (the NL-salad case — "literal"/"semantic" matching a
+        // symbol by coincidence) never reaches here and correctly stays Weak below.
+        Confidence::Strong
+    } else if embed_confirmed_specific && coverage >= cov_weak {
+        // Embedding-confirmed specific anchor at low token-coverage. The query's other
+        // tokens are typos or generic filler (e.g. "Load mutationg manifests" → coverage
+        // 1/3: "mutationg" is a typo, "load" is generic), but the confident oracle places
+        // the specific anchor ("manifests", cos 0.71 ≥ floor 0.643) near the query — a
+        // real match, Strong not Weak. Requires a CONFIDENT oracle that AGREES, so salad
+        // queries whose anchor is absent from the over-fetch (cos < floor) never reach here.
+        Confidence::Strong
     } else if !oracle_confident && top_bm25 >= bm25_floor && coverage >= cov_strong {
         // Pure-lexical Strong is only honest when there is NO embedding opinion.
-        // When the oracle IS confident yet no embed-agreed *rare* anchor exists,
+        // When the oracle IS confident yet no embed-agreed *specific* anchor exists,
         // the high BM25/coverage came from NL words matching symbols by
         // coincidence — the result is embedding-driven, which is Weak-grade.
         Confidence::Strong
@@ -416,6 +447,10 @@ fn package_root(path: &str) -> Option<&str> {
 /// embedding found nothing strongly relevant, so lexical seeds are left untouched
 /// (avoids cutting good FTS results on queries the model is weak on).
 const SEMANTIC_ORACLE_MIN: f32 = 0.58;
+/// Multiplier applied to the strongest non-exact seed weight to set the floor for
+/// exact-anchor seeds — guarantees a literal symbol match anchors the PPR walk above
+/// any KNN neighbour whose cosine×kind_boost would otherwise dominate.
+const EXACT_SEED_PRIORITY: f32 = 1.5;
 /// Keep seeds whose cosine is within this band of the top oracle score …
 const SEMANTIC_REL_DELTA: f32 = 0.13;
 /// … but never below this absolute cosine floor.
@@ -698,7 +733,29 @@ pub(crate) fn build_seed_set(
     // coincidence ("literal", "semantic") resolve to confident FTS anchors that
     // are semantically unrelated to intent; the whole-query embedding is the only
     // signal that detects this. No-op when embeddings are absent/degraded.
-    let seeds = semantic_validate(seeds, knn_oracle);
+    let mut seeds = semantic_validate(seeds, knn_oracle);
+
+    // Exact-name priority: a node reached via an exact anchor hit is the symbol the
+    // user literally named. It must anchor the PPR walk above any semantically-near
+    // KNN neighbour — otherwise a high cosine×kind_boost weight (e.g. method:TestJig.Run
+    // for query "type:Tweak") outweighs the exact match in the personalisation vector
+    // and PPR ranks the neighbour first. Float every Exact seed's weight just above the
+    // strongest non-exact seed so PPR concentrates mass on the named symbol and pulls
+    // ITS neighbours in as context. No-op when there is no exact match (pure-NL queries).
+    let max_non_exact = seeds
+        .iter()
+        .filter(|s| s.source != SeedSource::Exact)
+        .map(|s| s.weight)
+        .fold(0.0_f32, f32::max);
+    if max_non_exact > 0.0 {
+        let floor = max_non_exact * EXACT_SEED_PRIORITY;
+        for s in seeds.iter_mut() {
+            if s.source == SeedSource::Exact {
+                s.weight = s.weight.max(floor);
+            }
+        }
+    }
+
     let confidence = classify_confidence(
         &terms,
         coverage,
@@ -927,6 +984,136 @@ mod tests {
         }];
         let c = classify_confidence(&terms, 0.8, 2.0, true, false, &HashMap::new());
         assert_eq!(c, Confidence::Strong);
+    }
+
+    #[test]
+    fn confidence_strong_on_embed_agreed_specific_anchor() {
+        // Regression: "type Tweak" → type:Tweak. The anchor recurs across packages
+        // (symbol_freq > rare_max, so NOT Exact) but is high-IDF and the confident
+        // embed oracle places it right at the query. A confident oracle must PROMOTE
+        // an agreed specific anchor to Strong, not demote it to Weak (the pre-fix bug
+        // where the only Strong path was gated on `!oracle_confident`).
+        let tweak = NodeId(100);
+        let terms = vec![
+            ResolvedTerm {
+                token: "tweak".into(),
+                resolved: true,
+                symbol_freq: 8, // > rare_max(3) → not a rare anchor
+                idf_w: 0.81,    // >= idf_coverage_min(0.55) → specific anchor
+                top_node: Some(tweak),
+            },
+            ResolvedTerm {
+                token: "type".into(),
+                resolved: true,
+                symbol_freq: 5000,
+                idf_w: 0.2,
+                top_node: Some(NodeId(200)),
+            },
+        ];
+        // Confident oracle that AGREES the anchor is near the query (cosine 0.95).
+        let oracle = HashMap::from([(tweak, 0.95_f32)]);
+        let c = classify_confidence(&terms, 1.0, 0.4, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::Strong,
+            "embed-agreed specific anchor at high coverage must be Strong, not Weak"
+        );
+    }
+
+    #[test]
+    fn confidence_weak_on_embed_disagreed_specific_anchor() {
+        // Salad guard: a high-IDF anchor the confident oracle places FAR from the
+        // query (cosine 0.0 → absent from oracle) must NOT be promoted to Strong.
+        // This is the "find code by semantic meaning" → is_semantic_edge case.
+        let anchor = NodeId(100);
+        let terms = vec![ResolvedTerm {
+            token: "semantic".into(),
+            resolved: true,
+            symbol_freq: 2,
+            idf_w: 0.9,
+            top_node: Some(anchor),
+        }];
+        // Confident oracle whose top hit is a DIFFERENT node — anchor absent (cosine 0).
+        let oracle = HashMap::from([(NodeId(999), 0.88_f32)]);
+        let c = classify_confidence(&terms, 1.0, 0.4, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::Weak,
+            "embed-disagreed anchor must stay Weak even at high coverage"
+        );
+    }
+
+    #[test]
+    fn confidence_strong_on_embed_confirmed_low_coverage() {
+        // Measured "Load mutationg manifests" shape: a typo ("mutationg") and a generic
+        // token ("load", idf 0.42) drag classifier coverage to 1/3, but the confident
+        // oracle places the specific anchor ("manifests", idf 0.66, cos 0.71 ≥ floor) near
+        // the query. A real, embedding-confirmed match must be Strong, not Weak.
+        let manifests = NodeId(50);
+        let terms = vec![
+            ResolvedTerm {
+                token: "load".into(),
+                resolved: true,
+                symbol_freq: 1361,
+                idf_w: 0.42, // generic — does not count toward coverage/specific anchor
+                top_node: Some(NodeId(1)),
+            },
+            ResolvedTerm {
+                token: "mutationg".into(),
+                resolved: false, // typo — unresolved
+                symbol_freq: 0,
+                idf_w: 1.0,
+                top_node: None,
+            },
+            ResolvedTerm {
+                token: "manifests".into(),
+                resolved: true,
+                symbol_freq: 71,
+                idf_w: 0.66,
+                top_node: Some(manifests),
+            },
+        ];
+        // Confident oracle (top 0.773) that AGREES the anchor is near (cos 0.71 ≥ floor 0.643).
+        let oracle = HashMap::from([(manifests, 0.71_f32), (NodeId(99), 0.773_f32)]);
+        let c = classify_confidence(&terms, 0.333, 19.0, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::Strong,
+            "embed-confirmed specific anchor must be Strong even at low token coverage"
+        );
+    }
+
+    #[test]
+    fn confidence_weak_on_embed_unconfirmed_low_coverage_salad() {
+        // Measured salad shape ("find code by semantic meaning"): a specific-ish anchor
+        // ("semantic", idf 0.63) but the confident oracle does NOT place it near the query
+        // (absent from the over-fetch → cos treated as 0). Must stay Weak — the embedding
+        // confirmation gate is what separates this from "Load mutationg manifests".
+        let semantic = NodeId(60);
+        let terms = vec![
+            ResolvedTerm {
+                token: "semantic".into(),
+                resolved: true,
+                symbol_freq: 100,
+                idf_w: 0.63,
+                top_node: Some(semantic), // NOT in the oracle below → unconfirmed
+            },
+            ResolvedTerm {
+                token: "code".into(),
+                resolved: true,
+                symbol_freq: 2260,
+                idf_w: 0.38,
+                top_node: Some(NodeId(2)),
+            },
+        ];
+        // Confident oracle (top 0.659) whose neighbours do NOT include the anchor.
+        let oracle = HashMap::from([(NodeId(99), 0.659_f32)]);
+        let c = classify_confidence(&terms, 0.25, 15.0, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::Weak,
+            "embed-unconfirmed anchor (salad) must stay Weak at low coverage"
+        );
     }
 
     #[test]
