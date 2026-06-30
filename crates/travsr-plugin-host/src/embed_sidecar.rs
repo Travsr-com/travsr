@@ -8,10 +8,7 @@
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Condvar, Mutex,
-};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use travsr_plugin_protocol::{
@@ -116,6 +113,37 @@ fn embed_sidecar_kill(pid: u32) {
         .status();
 }
 
+/// Run a blocking sidecar I/O step guarded by a watchdog that SIGKILLs the
+/// sidecar (`pid`) if it does not complete within `timeout`.
+///
+/// Returns as soon as `io` completes — the watchdog waits on a `Condvar` and is
+/// woken the instant we finish, so `join()` returns immediately. A bare
+/// `thread::sleep(timeout)` + `join()` is NOT interruptible: it would block the
+/// full `timeout` on *every* call (the FT-C2/FT-H5 stall — 30 s per KNN, 60 s
+/// per handshake) even when the response arrived in milliseconds.
+fn with_io_watchdog<T>(pid: u32, timeout: Duration, io: impl FnOnce() -> T) -> T {
+    let state = Arc::new((Mutex::new(false), Condvar::new()));
+    let state_wg = Arc::clone(&state);
+    let watchdog = std::thread::spawn(move || {
+        let (lock, cv) = &*state_wg;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, res) = cv
+            .wait_timeout_while(guard, timeout, |d| !*d)
+            .unwrap_or_else(|e| e.into_inner());
+        if res.timed_out() && !*done {
+            embed_sidecar_kill(pid);
+        }
+    });
+
+    let out = io();
+
+    let (lock, cv) = &*state;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cv.notify_all();
+    drop(watchdog.join());
+    out
+}
+
 impl EmbedSidecar {
     /// Spawn the embed plugin binary and perform the capabilities handshake.
     ///
@@ -154,30 +182,10 @@ impl EmbedSidecar {
         // FT-H5: guard the handshake with a watchdog so a slow/hung model load
         // doesn't block daemon startup indefinitely. A 60-second window covers
         // first-run model download + GPU init; subsequent starts are faster.
-        //
-        // The watchdog waits on a Condvar rather than a bare `thread::sleep`, so a
-        // successful handshake can wake it *immediately*. A plain `sleep(60s)` is
-        // not interruptible: setting a cancel flag does not return the sleep early,
-        // so `join()` would block the full 60 s on every spawn even when the
-        // handshake completed in milliseconds. `wait_timeout_while` returns as soon
-        // as we flip the flag and `notify_all`, so `spawn()` returns right after the
-        // handshake; only a genuine hang waits out the 60 s and kills the child.
+        // `with_io_watchdog` returns the instant the handshake decodes, so a
+        // healthy spawn is not penalised the full 60 s (see helper).
         let hs_pid = child.id();
-        let hs_state = Arc::new((Mutex::new(false), Condvar::new()));
-        let hs_state_wg = Arc::clone(&hs_state);
-        let hs_watchdog = std::thread::spawn(move || {
-            let (lock, cv) = &*hs_state_wg;
-            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let (cancelled, res) = cv
-                .wait_timeout_while(guard, Duration::from_secs(60), |done| !*done)
-                .unwrap_or_else(|e| e.into_inner());
-            if res.timed_out() && !*cancelled {
-                embed_sidecar_kill(hs_pid);
-            }
-        });
-
-        // Handshake — send EmbedHandshakeRequest, receive EmbedHandshakeResponse.
-        let handshake_result = (|| {
+        let handshake_result = with_io_watchdog(hs_pid, Duration::from_secs(60), || {
             write_message(
                 &mut writer,
                 &EmbedPluginRequest::Handshake(EmbedHandshakeRequest {
@@ -187,15 +195,7 @@ impl EmbedSidecar {
             .map_err(|e| EmbedError::Handshake(e.to_string()))?;
             decode_message::<EmbedPluginResponse>(&mut reader)
                 .map_err(|e| EmbedError::Handshake(e.to_string()))
-        })();
-
-        // Cancel the watchdog and wake it immediately so `join()` returns now.
-        {
-            let (lock, cv) = &*hs_state;
-            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
-            cv.notify_all();
-        }
-        let _ = hs_watchdog.join();
+        });
 
         let hs = handshake_result?;
 
@@ -297,31 +297,23 @@ impl EmbedSidecar {
                 EmbedError::Io(e.to_string())
             })?;
 
-            // FT-C2: watchdog — kill sidecar if read stalls beyond timeout.
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let cancelled_wg = Arc::clone(&cancelled);
-            let watchdog = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(EMBED_IO_TIMEOUT_SECS));
-                if !cancelled_wg.load(Ordering::SeqCst) {
-                    embed_sidecar_kill(pid);
-                }
-            });
-
-            let chunk_result = match decode_message::<EmbedPluginResponse>(reader) {
-                Ok(EmbedPluginResponse::Embed(resp)) => Ok(resp.embeddings),
-                Ok(EmbedPluginResponse::Error(e)) => Err(EmbedError::Io(format!(
-                    "plugin returned error: {}",
-                    e.message
-                ))),
-                Ok(_) => Err(EmbedError::Io("unexpected response type for embed".into())),
-                Err(e) => {
-                    self.mark_crashed();
-                    Err(EmbedError::Io(e.to_string()))
-                }
-            };
-
-            cancelled.store(true, Ordering::SeqCst);
-            let _ = watchdog.join();
+            // FT-C2: watchdog — kill sidecar if the read stalls beyond timeout,
+            // but return the instant the response decodes (interruptible).
+            let chunk_result =
+                with_io_watchdog(pid, Duration::from_secs(EMBED_IO_TIMEOUT_SECS), || {
+                    match decode_message::<EmbedPluginResponse>(reader) {
+                        Ok(EmbedPluginResponse::Embed(resp)) => Ok(resp.embeddings),
+                        Ok(EmbedPluginResponse::Error(e)) => Err(EmbedError::Io(format!(
+                            "plugin returned error: {}",
+                            e.message
+                        ))),
+                        Ok(_) => Err(EmbedError::Io("unexpected response type for embed".into())),
+                        Err(e) => {
+                            self.mark_crashed();
+                            Err(EmbedError::Io(e.to_string()))
+                        }
+                    }
+                });
 
             all_embeddings.extend(chunk_result?);
         }
@@ -357,33 +349,25 @@ impl EmbedSidecar {
             EmbedError::Io(e.to_string())
         })?;
 
-        // FT-C2: watchdog — kill sidecar if read stalls beyond timeout.
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_wg = Arc::clone(&cancelled);
-        let watchdog = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(EMBED_IO_TIMEOUT_SECS));
-            if !cancelled_wg.load(Ordering::SeqCst) {
-                embed_sidecar_kill(pid);
-            }
-        });
-
-        let result = match decode_message::<EmbedPluginResponse>(reader) {
-            Ok(EmbedPluginResponse::Knn(resp)) => {
-                Ok(resp.node_ids.into_iter().zip(resp.scores).collect())
-            }
-            Ok(EmbedPluginResponse::Error(e)) => Err(EmbedError::Io(format!(
-                "plugin returned error: {}",
-                e.message
-            ))),
-            Ok(_) => Err(EmbedError::Io("unexpected response type for knn".into())),
-            Err(e) => {
-                self.mark_crashed();
-                Err(EmbedError::Io(e.to_string()))
-            }
-        };
-
-        cancelled.store(true, Ordering::SeqCst);
-        let _ = watchdog.join();
-        result
+        // FT-C2: watchdog — kill sidecar if the read stalls beyond timeout, but
+        // return the instant the response decodes (interruptible — see helper).
+        with_io_watchdog(
+            pid,
+            Duration::from_secs(EMBED_IO_TIMEOUT_SECS),
+            || match decode_message::<EmbedPluginResponse>(reader) {
+                Ok(EmbedPluginResponse::Knn(resp)) => {
+                    Ok(resp.node_ids.into_iter().zip(resp.scores).collect())
+                }
+                Ok(EmbedPluginResponse::Error(e)) => Err(EmbedError::Io(format!(
+                    "plugin returned error: {}",
+                    e.message
+                ))),
+                Ok(_) => Err(EmbedError::Io("unexpected response type for knn".into())),
+                Err(e) => {
+                    self.mark_crashed();
+                    Err(EmbedError::Io(e.to_string()))
+                }
+            },
+        )
     }
 }
