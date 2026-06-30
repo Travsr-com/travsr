@@ -80,6 +80,41 @@ fn rrf_k() -> f32 {
         .unwrap_or(60.0)
 }
 
+/// Oracle top-cosine at/above which a confident embedding cluster *alone* (no
+/// lexical anchor) is a Strong match. Sits in the measured gap between
+/// answerable (oracle_top ≥ 0.77) and nonsense (≤ 0.64) queries on bge-small.
+/// Override via `TRAVSR_SEMANTIC_PROMOTE_STRONG`.
+fn semantic_promote_strong() -> f32 {
+    std::env::var("TRAVSR_SEMANTIC_PROMOTE_STRONG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| x > 0.0 && x <= 1.0)
+        .unwrap_or(0.72)
+}
+
+/// Minimum over-fetched candidates within the cosine floor band required for
+/// semantic promotion — guards against a single fluke neighbour grounding a
+/// query. Override via `TRAVSR_SEMANTIC_PROMOTE_MIN_NEAR`.
+fn semantic_promote_min_near() -> usize {
+    std::env::var("TRAVSR_SEMANTIC_PROMOTE_MIN_NEAR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
+/// Oracle top-cosine below which the embedding is confident *nothing* in the
+/// corpus is near the query. A Weak resting only on coincidental lexical
+/// coverage is then vetoed to None (unless a rare exact anchor was named).
+/// Default 0.55 sits above the measured nonsense leak (0.49) and far below the
+/// answerable floor (0.77). Override via `TRAVSR_SEMANTIC_VETO_FLOOR`.
+fn semantic_veto_floor() -> f32 {
+    std::env::var("TRAVSR_SEMANTIC_VETO_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| (0.0..=1.0).contains(&x))
+        .unwrap_or(0.55)
+}
+
 // ── Core types ────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -389,6 +424,27 @@ fn classify_confidence(
                     .is_some_and(|c| c >= floor)
         });
 
+    // Fix 1+3a: semantic grounding. A confident oracle whose neighbours form a
+    // coherent near cluster (≥ N candidates within the floor band) is a Strong
+    // match even with NO lexical anchor. This is the conceptual-query path —
+    // "how does the kubelet sync pod status", every token too common to be a
+    // specific anchor on a 261 k-node corpus — that the lexical gates can't reach.
+    // `oracle_top` separates answerable (≥ 0.77) from nonsense (≤ 0.64); the
+    // promote threshold sits in that gap, so salads never reach Strong here.
+    let oracle_present = !knn_oracle.is_empty();
+    let n_oracle_near = knn_oracle.values().filter(|&&c| c >= floor).count();
+    let semantic_strong = has_any_seeds
+        && oracle_top >= semantic_promote_strong()
+        && n_oracle_near >= semantic_promote_min_near();
+
+    // Fix 1c: semantic veto. Embeddings ran and are confident nothing in the
+    // corpus is near the query (oracle_top below the veto floor). A Weak that
+    // rests on coincidental lexical coverage ("the cat sat on the warm
+    // windowsill" → 0.49) is then a false positive → abstain. A rare exact anchor
+    // is exempt: a precise symbol the user literally typed is honoured even when
+    // the model is weak on it.
+    let semantic_veto = oracle_present && oracle_top < semantic_veto_floor() && !has_rare_anchor;
+
     if has_rare_anchor && coverage >= cov_strong {
         Confidence::Exact
     } else if has_specific_anchor && coverage >= cov_strong {
@@ -408,12 +464,24 @@ fn classify_confidence(
         // real match, Strong not Weak. Requires a CONFIDENT oracle that AGREES, so salad
         // queries whose anchor is absent from the over-fetch (cos < floor) never reach here.
         Confidence::Strong
+    } else if semantic_strong {
+        // Fix 1+3a: oracle-grounded Strong (no lexical anchor required). See the
+        // `semantic_strong` derivation above — gated on oracle_top in the
+        // answerable band plus a coherent near cluster, so nonsense (low
+        // oracle_top) and flukes (sparse cluster) never reach here.
+        Confidence::Strong
     } else if !oracle_confident && top_bm25 >= bm25_floor && coverage >= cov_strong {
         // Pure-lexical Strong is only honest when there is NO embedding opinion.
         // When the oracle IS confident yet no embed-agreed *specific* anchor exists,
         // the high BM25/coverage came from NL words matching symbols by
         // coincidence — the result is embedding-driven, which is Weak-grade.
         Confidence::Strong
+    } else if semantic_veto {
+        // Fix 1c: embeddings are confident nothing matches — abstain rather than
+        // surface coincidental lexical coverage. Reaches here only after the
+        // lexical-Strong path above declined, so genuinely strong lexical evidence
+        // (high coverage + BM25) still survives a weak oracle.
+        Confidence::None
     } else if has_any_seeds && (coverage >= cov_weak || has_specific_anchor) {
         // KNN seeds enhance grounded queries but never substitute for lexical evidence.
         // has_knn_seeds alone (zero coverage, no anchor) → abstain; KNN always returns K
@@ -428,7 +496,7 @@ fn classify_confidence(
 
 /// First two slash-delimited path segments, e.g. "crates/travsr-retrieval" from
 /// "crates/travsr-retrieval/src/ppr.rs".  Returns `None` for flat or single-segment paths.
-fn package_root(path: &str) -> Option<&str> {
+pub(crate) fn package_root(path: &str) -> Option<&str> {
     let mut slashes = 0u8;
     for (i, c) in path.char_indices() {
         if c == '/' {
@@ -749,9 +817,22 @@ pub(crate) fn build_seed_set(
         .fold(0.0_f32, f32::max);
     if max_non_exact > 0.0 {
         let floor = max_non_exact * EXACT_SEED_PRIORITY;
+        // Fix 2: when the oracle is confident, only float an exact anchor the
+        // embedding ALSO places near the query. A generic English word that
+        // happens to be an exact symbol name (e.g. the kubelet `RECONCILE`
+        // constant matched for "HorizontalPodAutoscaler reconcile loop") must not
+        // outrank the semantically-correct neighbour (`reconcileAutoscaler`).
+        // No-op when the oracle is cold/absent — `agrees` is vacuously true.
+        let oracle_top = knn_oracle.values().copied().fold(0.0_f32, f32::max);
+        let oracle_confident = oracle_top >= SEMANTIC_ORACLE_MIN;
+        let cos_floor = (oracle_top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
         for s in seeds.iter_mut() {
             if s.source == SeedSource::Exact {
-                s.weight = s.weight.max(floor);
+                let agrees = !oracle_confident
+                    || knn_oracle.get(&s.node).copied().unwrap_or(0.0) >= cos_floor;
+                if agrees {
+                    s.weight = s.weight.max(floor);
+                }
             }
         }
     }
@@ -1185,6 +1266,128 @@ mod tests {
             c,
             Confidence::None,
             "KNN-only (zero coverage, no anchor) must abstain"
+        );
+    }
+
+    // ── Fix 1+3a / 1c: semantic promotion + veto ──────────────────────────────
+
+    /// A confident oracle with a coherent near cluster grounds a conceptual query
+    /// to Strong even with zero lexical coverage / no anchor — the "how does the
+    /// kubelet sync pod status" case (oracle_top 0.83, every word too common).
+    #[test]
+    fn confidence_semantic_strong_promotes_conceptual_query() {
+        let terms = vec![ResolvedTerm {
+            token: "pod".into(),
+            resolved: true,
+            symbol_freq: 14_000, // generic → not rare, not specific
+            idf_w: 0.30,
+            top_node: None,
+        }];
+        // oracle_top 0.83 → floor 0.70; 5 candidates ≥ floor → coherent cluster.
+        let oracle: HashMap<NodeId, f32> = [
+            (NodeId(1), 0.83),
+            (NodeId(2), 0.80),
+            (NodeId(3), 0.78),
+            (NodeId(4), 0.74),
+            (NodeId(5), 0.71),
+        ]
+        .into_iter()
+        .collect();
+        let c = classify_confidence(&terms, 0.0, 0.0, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::Strong,
+            "confident oracle + near cluster must promote to Strong without a lexical anchor"
+        );
+    }
+
+    /// Nonsense whose oracle_top sits below the promote threshold (≤0.64 measured)
+    /// must NOT be promoted — it abstains.
+    #[test]
+    fn confidence_semantic_strong_not_fired_for_nonsense() {
+        let terms = vec![ResolvedTerm {
+            token: "quux".into(),
+            resolved: false,
+            symbol_freq: 0,
+            idf_w: 0.0,
+            top_node: None,
+        }];
+        // oracle_top 0.64 < promote(0.72), and > veto(0.55) → neither promote nor veto.
+        let oracle: HashMap<NodeId, f32> =
+            [(NodeId(1), 0.64), (NodeId(2), 0.62), (NodeId(3), 0.60)]
+                .into_iter()
+                .collect();
+        let c = classify_confidence(&terms, 0.0, 0.0, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::None,
+            "sub-threshold oracle (nonsense) must not reach Strong"
+        );
+    }
+
+    /// Embeddings confident NOTHING matches (oracle_top below veto floor) + only
+    /// coincidental lexical coverage → abstain, not Weak. The "cat sat on the warm
+    /// windowsill" leak (oracle_top 0.49).
+    #[test]
+    fn confidence_semantic_veto_abstains_on_coincidental_coverage() {
+        let anchor = NodeId(7);
+        let terms = vec![ResolvedTerm {
+            token: "windowsill".into(),
+            resolved: true,
+            symbol_freq: 40, // specific (high idf) but not rare
+            idf_w: 0.62,
+            top_node: Some(anchor),
+        }];
+        // oracle present but far (top 0.49 < veto 0.55); anchor absent from oracle.
+        let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
+        let c = classify_confidence(&terms, 0.5, 12.0, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::None,
+            "confidently-far oracle must veto coincidental lexical coverage"
+        );
+    }
+
+    /// The veto exempts a rare exact anchor: a precise symbol the user literally
+    /// typed is honoured (Weak) even when the model is weak on it.
+    #[test]
+    fn confidence_semantic_veto_exempts_rare_anchor() {
+        let anchor = NodeId(7);
+        let terms = vec![ResolvedTerm {
+            token: "PaymentService".into(),
+            resolved: true,
+            symbol_freq: 2, // rare → exact anchor the user named
+            idf_w: 0.93,
+            top_node: Some(anchor),
+        }];
+        let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
+        // Low coverage so it doesn't hit the Exact branch; must land on Weak, not None.
+        let c = classify_confidence(&terms, 0.3, 0.1, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::Weak,
+            "rare exact anchor must be exempt from the semantic veto"
+        );
+    }
+
+    /// Strong lexical evidence (high coverage + BM25) survives a weak oracle —
+    /// the veto only suppresses Weak-grade coincidences, never a real lexical hit.
+    #[test]
+    fn confidence_lexical_strong_survives_weak_oracle() {
+        let terms = vec![ResolvedTerm {
+            token: "ppr".into(),
+            resolved: false, // no anchor — pure whole-query BM25 evidence
+            symbol_freq: 50,
+            idf_w: 0.0,
+            top_node: None,
+        }];
+        // Oracle present but weak (0.50 < veto 0.55) — would veto if lexical were weak.
+        let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.50)].into_iter().collect();
+        let c = classify_confidence(&terms, 0.8, 2.0, true, true, &oracle);
+        assert_eq!(
+            c,
+            Confidence::Strong,
+            "strong lexical evidence must beat the veto (lexical-Strong path is checked first)"
         );
     }
 

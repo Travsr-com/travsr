@@ -74,7 +74,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     use travsr_plugin_host::{
         active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
     };
-    use travsr_store::EmbedKnnHook;
+    use travsr_store::{EmbedKnnHook, EmbedReadiness};
 
     // Guard: no embed.db → nothing to query; skip to avoid spawning a sidecar
     // against a non-existent HNSW index.
@@ -105,6 +105,13 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     let slot: Arc<Mutex<Option<EmbedKnnHook>>> = Arc::new(Mutex::new(None));
     let slot_bg = Arc::clone(&slot);
 
+    // Arm-state shared with the query path: the background thread marks it ready
+    // the instant the sidecar is warm, so the first get_context can briefly wait
+    // (and the header reports `warming` honestly) instead of silently degrading
+    // to lexical-only during the ~3 s startup window.
+    let readiness = EmbedReadiness::new();
+    let readiness_bg = Arc::clone(&readiness);
+
     std::thread::Builder::new()
         .name("embed-hook-init".into())
         .spawn(move || {
@@ -121,6 +128,9 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
                         if let Ok(mut guard) = slot_bg.lock() {
                             *guard = Some(hook);
                         }
+                        // Signal arm-complete AFTER the slot is populated so any
+                        // thread woken by `mark_ready` sees `Some(hook)`.
+                        readiness_bg.mark_ready();
                         tracing::info!(
                             model_id = %mid,
                             "embed plugin active — Step 4 (semantic ANN) enabled"
@@ -143,6 +153,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             Some(hook) => hook(query, k),
         }
     });
+    store.set_embed_readiness(readiness);
     store.set_embed_knn_hook(meta);
     tracing::info!("embed plugin hook installed (lazy — sidecar starting in background)");
 }

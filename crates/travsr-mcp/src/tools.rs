@@ -1704,6 +1704,21 @@ pub(crate) fn knn_budget_ms() -> u128 {
         .filter(|&x| x > 0)
         .unwrap_or(600)
 }
+
+/// Max time the first `get_context` call blocks for the embed sidecar to arm, so
+/// the opening query of a session uses embeddings instead of silently degrading
+/// to lexical-only during the ~3 s startup window. The wait happens OUTSIDE the
+/// KNN circuit-breaker timing, so this one-time arm cost is never misread as a
+/// slow KNN round-trip. Override via `TRAVSR_EMBED_ARM_WAIT_MS`. Default 5000 —
+/// headroom over the measured ~3.2 s (store-open dominates and scales with graph
+/// size). Subsequent queries see the armed hook and never wait.
+pub(crate) fn embed_arm_wait_ms() -> u64 {
+    std::env::var("TRAVSR_EMBED_ARM_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&x| x > 0)
+        .unwrap_or(5000)
+}
 /// Kept for tests that reference the constant directly; resolves to the default.
 #[cfg(test)]
 pub(crate) const KNN_BUDGET_MS: u128 = 600;
@@ -1959,6 +1974,7 @@ pub(crate) fn embed_path_seeds(
 fn build_context_signals(
     store: &SqliteStore,
     has_embed: bool,
+    embed_warming: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
     seed_cap_msg: Option<&str>,
@@ -1966,6 +1982,7 @@ fn build_context_signals(
     build_context_signals_with_r2(
         phase_b_pending(store),
         has_embed,
+        embed_warming,
         store.has_embed_db(),
         knn_degraded,
         overflow_msg,
@@ -1981,9 +1998,11 @@ fn build_context_signals(
 /// `embed_initialized` = embed.db exists (Phase 1 has run at some point).
 /// When `!has_embed && embed_initialized` the daemon hasn't injected the KNN hook yet
 /// (e.g. Phase 1 just completed, daemon restarting) — show "in progress" instead of "init needed".
+#[allow(clippy::too_many_arguments)]
 fn build_context_signals_with_r2(
     phase_b_pending: bool,
     has_embed: bool,
+    embed_warming: bool,
     embed_initialized: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
@@ -2006,7 +2025,11 @@ fn build_context_signals_with_r2(
     if let Some(msg) = multi_concept_note {
         parts.push(msg);
     }
-    if has_embed && knn_degraded {
+    if embed_warming {
+        parts.push(
+            "[note: semantic embeddings still warming up (sidecar starting) — this result is lexical-only; retry in a few seconds for full semantic ranking]",
+        );
+    } else if has_embed && knn_degraded {
         parts.push(
             "[note: semantic search degraded — KNN timed out or returned empty; results are lexical only]",
         );
@@ -2027,8 +2050,8 @@ fn build_context_signals_with_r2(
 }
 
 /// Convenience wrapper for the no-overflow, no-seed-cap degraded-state check.
-fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
-    build_context_signals(store, has_embed, false, None, None)
+fn build_degraded_notes(store: &SqliteStore, has_embed: bool, embed_warming: bool) -> String {
+    build_context_signals(store, has_embed, embed_warming, false, None, None)
 }
 
 /// Format a single node line for `get_context` output.
@@ -2331,6 +2354,18 @@ fn get_context_body(
     // Produces a SeedSet with coverage, confidence, and term-resolution map.
     // Confidence::None → abstain (return resolution map, no salad).
     //
+    // A: first-call warmup. If embeddings are configured but the sidecar hasn't
+    // armed yet, block briefly so the opening query uses semantic seeds instead
+    // of silently degrading to lexical-only. Done OUTSIDE the KNN breaker timing
+    // below so the one-time arm cost is never misread as a slow KNN round-trip.
+    if has_embed && !store.embed_ready() {
+        store.wait_embed_ready(std::time::Duration::from_millis(embed_arm_wait_ms()));
+    }
+    // B: honest warming signal — true only when the cap was exceeded and the
+    // sidecar is still cold. Distinguishes "warming up" from "embeddings off"
+    // so the header/notes never silently claim full semantic coverage.
+    let embed_warming = has_embed && !store.embed_ready();
+
     // R3: track per-query KNN health; has_embed=true doesn't mean KNN worked.
     let mut knn_degraded = false;
     let (knn_pairs, knn_oracle) = if let Some(knn_fn) = embed_knn {
@@ -2428,6 +2463,8 @@ fn get_context_body(
         .unwrap_or_else(|| "unknown".to_string());
     let embed_status = if knn_degraded {
         "degraded"
+    } else if embed_warming {
+        "warming"
     } else if has_embed {
         "on"
     } else {
@@ -2581,25 +2618,40 @@ fn get_context_body(
     // Detection: BFS from the first seed through direct edges among seeds only.
     // If ≥1 seed is unreachable, the seeds span ≥2 disconnected components.
     let multi_concept_note: Option<&str> = {
-        let all_seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
-        if all_seed_ids.len() >= 4 {
-            let seed_set_local: std::collections::HashSet<NodeId> =
-                all_seed_ids.iter().copied().collect();
-            let mut reached: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-            let mut queue: std::collections::VecDeque<NodeId> =
-                std::collections::VecDeque::from([all_seed_ids[0]]);
-            reached.insert(all_seed_ids[0]);
-            while let Some(id) = queue.pop_front() {
-                let fwd = store.iter_edges_from(id).unwrap_or_default();
-                let rev = store.iter_edges_to(id).unwrap_or_default();
-                for e in fwd.into_iter().chain(rev) {
-                    let neighbor = if e.src == id { e.dst } else { e.src };
-                    if seed_set_local.contains(&neighbor) && reached.insert(neighbor) {
-                        queue.push_back(neighbor);
+        // Fix 3b: warn only when the PRIMARY seeds (pre-enrichment) split into ≥2
+        // SUBSTANTIAL disconnected clusters (≥2 seeds each). The old check —
+        // "any seed unreachable from seed[0]" over the *enriched* set — fired on
+        // nearly every query: enrichment spans many packages, and a lone
+        // edge-island primary seed (e.g. a generated conversion fn for the same
+        // concept) looks disconnected. Counting substantial clusters among
+        // primary seeds isolates the genuine R2 case (e.g. "scheduler AND
+        // kubelet") from one concept that merely has a stray seed.
+        const MIN_CLUSTER: usize = 2;
+        let seed_set_local: std::collections::HashSet<NodeId> = primary_seed_ids.clone();
+        if seed_set_local.len() >= 4 {
+            let mut unvisited = seed_set_local.clone();
+            let mut substantial_clusters = 0usize;
+            while let Some(&start) = unvisited.iter().next() {
+                unvisited.remove(&start);
+                let mut size = 1usize;
+                let mut queue: std::collections::VecDeque<NodeId> =
+                    std::collections::VecDeque::from([start]);
+                while let Some(id) = queue.pop_front() {
+                    let fwd = store.iter_edges_from(id).unwrap_or_default();
+                    let rev = store.iter_edges_to(id).unwrap_or_default();
+                    for e in fwd.into_iter().chain(rev) {
+                        let neighbor = if e.src == id { e.dst } else { e.src };
+                        if seed_set_local.contains(&neighbor) && unvisited.remove(&neighbor) {
+                            size += 1;
+                            queue.push_back(neighbor);
+                        }
                     }
                 }
+                if size >= MIN_CLUSTER {
+                    substantial_clusters += 1;
+                }
             }
-            if reached.len() < seed_set_local.len() {
+            if substantial_clusters >= 2 {
                 Some(
                     "[note: query may span multiple concepts — \
                      results show the dominant cluster only. \
@@ -2691,7 +2743,7 @@ fn get_context_body(
                     })
                     .collect();
                 let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
-                let notes = build_degraded_notes(store, has_embed);
+                let notes = build_degraded_notes(store, has_embed, embed_warming);
                 let footer = format!(
                     "[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
                 );
@@ -2759,6 +2811,7 @@ fn get_context_body(
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,
+            embed_warming,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -2791,6 +2844,7 @@ fn get_context_body(
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,
+            embed_warming,
             embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
@@ -5788,6 +5842,56 @@ mod snippet_tests {
         );
     }
 
+    /// A0/B: embed configured but sidecar not yet armed → header reads `warming`
+    /// and a warming note is emitted (never a silent lexical-only degrade).
+    #[test]
+    fn get_context_warming_reports_warming_header_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        // Register an un-armed readiness → embed_ready() == false → warming.
+        store.set_embed_readiness(travsr_store::EmbedReadiness::new());
+        // Keep the arm-wait short so the test times out fast rather than waiting 5 s.
+        std::env::set_var("TRAVSR_EMBED_ARM_WAIT_MS", "40");
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        std::env::remove_var("TRAVSR_EMBED_ARM_WAIT_MS");
+        assert!(
+            result.contains("embeddings: warming"),
+            "header must report warming while sidecar is cold; got: {result}"
+        );
+        assert!(
+            result.contains("still warming up"),
+            "must emit warming note; got: {result}"
+        );
+    }
+
+    /// B: once the readiness handle is armed, the same configuration reports
+    /// `embeddings: on` with no warming note.
+    #[test]
+    fn get_context_armed_reports_on_no_warming_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let readiness = travsr_store::EmbedReadiness::new();
+        readiness.mark_ready();
+        store.set_embed_readiness(readiness);
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        assert!(
+            result.contains("embeddings: on"),
+            "armed readiness must report on; got: {result}"
+        );
+        assert!(
+            !result.contains("warming"),
+            "armed readiness must not emit warming note; got: {result}"
+        );
+    }
+
     // ── #377 truncation signals ───────────────────────────────────────────────
 
     /// When knapsack cannot fit all scored nodes, the overflow message must appear.
@@ -5900,6 +6004,7 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let result = build_context_signals(
             &store,
+            false,
             false,
             false,
             Some("[overflow msg]"),

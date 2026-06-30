@@ -31,6 +31,60 @@ use std::sync::Arc;
 pub type EmbedKnnHook =
     Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
+/// Shared arm-state for the embed KNN hook. The injector (MCP/daemon) marks it
+/// ready once the sidecar is warm; the query path reads it to decide whether to
+/// briefly wait (so the first query uses embeddings) and whether to report
+/// `embeddings: warming` honestly instead of a silent lexical-only degrade.
+///
+/// Without this, the lazily-injected hook returns an empty seed set during the
+/// ~3 s sidecar startup window, which the query path can't distinguish from
+/// "embeddings off" — so the opening query of a session silently runs lexical-only.
+pub struct EmbedReadiness {
+    armed: std::sync::atomic::AtomicBool,
+    waiters: (std::sync::Mutex<()>, std::sync::Condvar),
+}
+
+impl EmbedReadiness {
+    /// Create a new, un-armed readiness handle.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            waiters: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
+        })
+    }
+
+    /// Mark the hook armed and wake every waiter. Called by the injector's
+    /// background init thread the instant the sidecar is warm.
+    pub fn mark_ready(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+        let _g = self.waiters.0.lock().unwrap();
+        self.waiters.1.notify_all();
+    }
+
+    /// True once `mark_ready` has fired.
+    pub fn is_ready(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Block up to `timeout` for arming; returns the final ready state.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        if self.is_ready() {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut g = self.waiters.0.lock().unwrap();
+        while !self.is_ready() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (ng, _) = self.waiters.1.wait_timeout(g, remaining).unwrap();
+            g = ng;
+        }
+        self.is_ready()
+    }
+}
+
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
@@ -386,6 +440,18 @@ pub trait Store {
     /// Batch-fetch nodes by id. Unknown ids are silently skipped.
     /// Output order is not guaranteed to match input order.
     fn get_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>, StoreError>;
+    /// Return all outgoing edges for every node in `srcs` in a single operation.
+    ///
+    /// Output order is undefined — edges are not grouped by source.
+    /// The default implementation loops over [`Store::iter_edges_from`]; backends
+    /// with an indexed `src` column should override with a batch `IN (…)` query.
+    fn iter_edges_from_batch(&self, srcs: &[NodeId]) -> Result<Vec<Edge>, StoreError> {
+        let mut out = Vec::new();
+        for &src in srcs {
+            out.extend(self.iter_edges_from(src)?);
+        }
+        Ok(out)
+    }
 }
 
 /// One file's worth of parsed graph data, ready to write in a batch transaction.
@@ -420,6 +486,10 @@ pub struct SqliteStore {
     /// running. The store crate has zero knowledge of the plugin system; only the
     /// daemon injects this via `set_embed_knn_hook`.
     embed_knn_hook: Option<EmbedKnnHook>,
+    /// Arm-state for the embed hook (set alongside `embed_knn_hook` by injectors
+    /// that support warm-up signalling). `None` for legacy/test injectors and
+    /// in-memory stores — in that case `embed_ready` falls back to hook presence.
+    embed_readiness: Option<Arc<EmbedReadiness>>,
     /// RFC-019: sibling embed.db path (e.g. `.travsr/embed.db`). `None` for
     /// in-memory stores. Used by `embed_progress` to ATTACH embed.db and count
     /// embedded nodes without polluting the graph.db WAL with embedding BLOBs.
@@ -450,6 +520,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
             };
             sqlite_migration_runner()
@@ -511,6 +582,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
             };
             let current = store
@@ -536,6 +608,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_readiness: None,
                 embed_db_path: None,
             };
             sqlite_migration_runner()
@@ -564,6 +637,38 @@ impl SqliteStore {
         self.embed_knn_hook = Some(hook);
     }
 
+    /// Register the arm-state handle shared with the injector's background init
+    /// thread. Enables `embed_ready` / `wait_embed_ready` to reflect true warm-up
+    /// state rather than mere hook presence.
+    pub fn set_embed_readiness(&mut self, readiness: Arc<EmbedReadiness>) {
+        self.embed_readiness = Some(readiness);
+    }
+
+    /// Whether the embed hook is armed and ready to answer KNN queries.
+    ///
+    /// When an injector registered readiness (the MCP stdio path), reflects its
+    /// armed state. When no readiness was registered (legacy daemon path, the
+    /// `travsr ask` path, tests), returns `true` — those callers opt out of
+    /// warm-up tracking, so the "warming" state never applies and behaviour is
+    /// unchanged. Only consulted when `has_embed` is true at the call site.
+    pub fn embed_ready(&self) -> bool {
+        match &self.embed_readiness {
+            Some(r) => r.is_ready(),
+            None => true,
+        }
+    }
+
+    /// Block up to `timeout` for the embed hook to arm, returning the final ready
+    /// state. Lets the opening query of a session use embeddings instead of
+    /// silently degrading to lexical-only during sidecar startup. Returns `true`
+    /// immediately when no readiness was registered (same opt-out as `embed_ready`).
+    pub fn wait_embed_ready(&self, timeout: std::time::Duration) -> bool {
+        match &self.embed_readiness {
+            Some(r) => r.wait(timeout),
+            None => true,
+        }
+    }
+
     /// Return a callable wrapper around the embed KNN hook, or `None` when no
     /// hook has been injected (embed plugin not installed or index not built).
     ///
@@ -574,6 +679,16 @@ impl SqliteStore {
         Some(move |query: &str, k: u32| -> Vec<(NodeId, f32)> {
             hook(query, k).unwrap_or_default()
         })
+    }
+
+    /// Returns `true` when an embed.db sibling file exists for this store.
+    /// Used to differentiate "embedding in progress / Phase 1 done but hook not active yet"
+    /// from "embedding never initialized — user must run `travsr embed init`".
+    pub fn has_embed_db(&self) -> bool {
+        self.embed_db_path
+            .as_deref()
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     /// Batch in-degree counts (number of incoming edges) for the given node IDs.
@@ -3616,7 +3731,7 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT dst, kind, confidence FROM edges WHERE src = ?1")
+                .prepare_cached("SELECT dst, kind, confidence FROM edges WHERE src = ?1")
                 .context("preparing iter_edges_from query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(src)], |row| {
@@ -3666,6 +3781,49 @@ impl Store for SqliteStore {
             for row in rows {
                 let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
                 out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+            }
+            tracing::debug!(edges_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn iter_edges_from_batch(&self, srcs: &[NodeId]) -> Result<Vec<Edge>, StoreError> {
+        if srcs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _span =
+            tracing::debug_span!("store.iter_edges_from_batch", count = srcs.len()).entered();
+        (|| -> AnyResult<Vec<Edge>> {
+            let placeholders = srcs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT src, dst, kind, confidence FROM edges WHERE src IN ({placeholders})"
+            );
+            let mut stmt = self
+                .conn
+                .prepare_cached(&sql)
+                .context("preparing iter_edges_from_batch")?;
+            let params: Vec<i64> = srcs.iter().map(|&id| node_id_to_i64(id)).collect();
+            let rows = stmt
+                .query_map(params_from_iter(params.iter()), |row| {
+                    let src_i64: i64 = row.get(0)?;
+                    let dst_i64: i64 = row.get(1)?;
+                    let kind_str: String = row.get(2)?;
+                    let confidence: Option<i64> = row.get(3)?;
+                    Ok((src_i64, dst_i64, kind_str, confidence))
+                })
+                .context("executing iter_edges_from_batch")?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (src_i64, dst_i64, kind_str, confidence) = row.context("decoding edge row")?;
+                let kind = EdgeKind::from_str(&kind_str)
+                    .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
+                out.push(Edge {
+                    src: i64_to_node_id(src_i64),
+                    dst: i64_to_node_id(dst_i64),
+                    kind,
+                    confidence: confidence.map(|c| c as u8),
+                });
             }
             tracing::debug!(edges_returned = out.len());
             Ok(out)
@@ -3889,6 +4047,64 @@ mod tests {
             VName::new("test-corpus", "main", "src/foo.ts", "typescript", sig),
             "function",
         )
+    }
+
+    #[test]
+    fn embed_readiness_wait_returns_on_mark() {
+        let r = EmbedReadiness::new();
+        assert!(!r.is_ready());
+        let r_bg = Arc::clone(&r);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            r_bg.mark_ready();
+        });
+        // Should wake promptly once marked, well within the 2 s cap.
+        let start = std::time::Instant::now();
+        assert!(r.wait(std::time::Duration::from_secs(2)));
+        assert!(r.is_ready());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "wait must wake promptly on mark, not spin to the cap"
+        );
+    }
+
+    #[test]
+    fn embed_readiness_wait_times_out_when_never_armed() {
+        let r = EmbedReadiness::new();
+        assert!(!r.wait(std::time::Duration::from_millis(50)));
+        assert!(!r.is_ready());
+    }
+
+    #[test]
+    fn embed_ready_opt_out_when_no_readiness_registered() {
+        // Callers that don't register readiness (legacy daemon path, `travsr ask`,
+        // tests) opt out of warm-up tracking → always ready, so the "warming"
+        // state never applies and pre-change behaviour is preserved.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            store.embed_ready(),
+            "no readiness registered → ready (opt-out)"
+        );
+        store.set_embed_knn_hook(Arc::new(|_q, _k| Ok(vec![])));
+        assert!(
+            store.embed_ready(),
+            "hook present, no readiness → still ready"
+        );
+        assert!(store.wait_embed_ready(std::time::Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn embed_ready_reflects_registered_readiness() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let r = EmbedReadiness::new();
+        store.set_embed_knn_hook(Arc::new(|_q, _k| Ok(vec![])));
+        store.set_embed_readiness(Arc::clone(&r));
+        assert!(
+            !store.embed_ready(),
+            "readiness registered but un-armed → not ready even with hook present"
+        );
+        r.mark_ready();
+        assert!(store.embed_ready(), "armed readiness → ready");
     }
 
     #[test]
