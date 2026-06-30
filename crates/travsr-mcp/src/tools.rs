@@ -1626,6 +1626,16 @@ impl NodeRole {
     }
 }
 
+/// Return of [`embed_path_seeds`]: `(selected_seeds, n_eligible_before_cap,
+/// knn_elapsed_ms, cosine_oracle)`. The oracle maps every over-fetched candidate
+/// to its query cosine — a superset of the (capped) selected seeds.
+type EmbedSeedResult = (
+    Vec<(CoreNode, f32)>,
+    usize,
+    u128,
+    std::collections::HashMap<NodeId, f32>,
+);
+
 /// Minimum number of PPR seeds from KNN — always try to include this many.
 const MIN_EMBED_SEEDS: usize = 5;
 /// Maximum number of PPR seeds from KNN — never include more than this.
@@ -1853,9 +1863,15 @@ pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
 ///
 /// Returns empty seeds when KNN returns nothing (index not yet built), so the caller
 /// can fall back to `search_nodes_fuzzy`.
-/// Returns `(seeds, n_candidates_before_cap, knn_elapsed_ms)`.
+/// Returns `(seeds, n_candidates_before_cap, knn_elapsed_ms, cosine_oracle)`.
 /// `knn_elapsed_ms` covers only the `knn_fn` HNSW/ONNX call, not the SQLite
 /// postprocessing — the caller uses it for the circuit-breaker decision.
+///
+/// `cosine_oracle` maps every over-fetched candidate `NodeId` to its query
+/// cosine — a superset of `seeds` (which is capped/filtered). `build_seed_set`
+/// uses it to validate lexical anchors: an NL query word that is rare-by-
+/// coincidence (e.g. "literal") resolves to a confident FTS anchor that the
+/// embedding places far from the query intent; the oracle lets us demote it.
 ///
 /// Each seed carries the full `CoreNode` so callers can apply structural proximity
 /// filtering without a second DB round-trip.
@@ -1864,7 +1880,7 @@ pub(crate) fn embed_path_seeds(
     query: &str,
     knn_fn: EmbedKnnFn<'_>,
     filter: &dyn EdgeFilter,
-) -> (Vec<(CoreNode, f32)>, usize, u128) {
+) -> EmbedSeedResult {
     // Over-request 6× to keep MIN_EMBED_SEEDS filled after noise + RBAC filtering.
     // Time only the KNN inference call — not the subsequent SQLite get_nodes fetch.
     let t0 = std::time::Instant::now();
@@ -1877,8 +1893,12 @@ pub(crate) fn embed_path_seeds(
     );
     let knn_elapsed_ms = t0.elapsed().as_millis();
     if knn_pairs.is_empty() {
-        return (vec![], 0, knn_elapsed_ms);
+        return (vec![], 0, knn_elapsed_ms, std::collections::HashMap::new());
     }
+    // Cosine oracle: every over-fetched candidate, used downstream to validate
+    // lexical anchors against the embedding's notion of relevance.
+    let cosine_oracle: std::collections::HashMap<NodeId, f32> =
+        knn_pairs.iter().map(|&(id, s)| (id, s)).collect();
 
     // Fetch node metadata for noise filter + RBAC + path dedup.
     let all_ids: Vec<NodeId> = knn_pairs.iter().map(|&(id, _)| id).collect();
@@ -1886,7 +1906,7 @@ pub(crate) fn embed_path_seeds(
         Ok(ns) => ns,
         Err(e) => {
             tracing::warn!("embed_path_seeds get_nodes error: {e}");
-            return (vec![], 0, knn_elapsed_ms);
+            return (vec![], 0, knn_elapsed_ms, cosine_oracle);
         }
     };
     let node_map: std::collections::HashMap<NodeId, CoreNode> =
@@ -1925,7 +1945,7 @@ pub(crate) fn embed_path_seeds(
         }
     }
 
-    (seeds, n_eligible, knn_elapsed_ms)
+    (seeds, n_eligible, knn_elapsed_ms, cosine_oracle)
 }
 
 /// Compose all advisory signals appended to a `get_context` response footer.
@@ -1946,6 +1966,7 @@ fn build_context_signals(
     build_context_signals_with_r2(
         phase_b_pending(store),
         has_embed,
+        store.has_embed_db(),
         knn_degraded,
         overflow_msg,
         seed_cap_msg,
@@ -1956,9 +1977,14 @@ fn build_context_signals(
 
 /// PF-M4: accepts `phase_b_pending` as a pre-computed bool so callers can
 /// hoist the two `get_meta` queries out of the hot path and compute once.
+///
+/// `embed_initialized` = embed.db exists (Phase 1 has run at some point).
+/// When `!has_embed && embed_initialized` the daemon hasn't injected the KNN hook yet
+/// (e.g. Phase 1 just completed, daemon restarting) — show "in progress" instead of "init needed".
 fn build_context_signals_with_r2(
     phase_b_pending: bool,
     has_embed: bool,
+    embed_initialized: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
     seed_cap_msg: Option<&str>,
@@ -1983,6 +2009,11 @@ fn build_context_signals_with_r2(
     if has_embed && knn_degraded {
         parts.push(
             "[note: semantic search degraded — KNN timed out or returned empty; results are lexical only]",
+        );
+    } else if !has_embed && embed_initialized {
+        // Phase 1 has run (embed.db exists) but KNN hook not yet active.
+        parts.push(
+            "[note: embedding in progress — run `travsr embed status` to check; results improve as index builds]",
         );
     } else if !has_embed {
         parts.push("[note: semantic search disabled — run `travsr embed init` for better results]");
@@ -2275,6 +2306,8 @@ fn get_context_body(
 ) -> String {
     // Capture embed presence before embed_knn is consumed by the seed-lookup block.
     let has_embed = embed_knn.is_some();
+    // Distinguish "Phase 1 done, hook not yet active" from "embed never initialized".
+    let embed_initialized = store.has_embed_db();
     // PF-M4: compute once here so neither include_snippets branch calls get_meta twice.
     let phase_b = phase_b_pending(store);
 
@@ -2300,8 +2333,8 @@ fn get_context_body(
     //
     // R3: track per-query KNN health; has_embed=true doesn't mean KNN worked.
     let mut knn_degraded = false;
-    let knn_pairs = if let Some(knn_fn) = embed_knn {
-        let (knn_scored, _n_eligible, knn_elapsed_ms) =
+    let (knn_pairs, knn_oracle) = if let Some(knn_fn) = embed_knn {
+        let (knn_scored, _n_eligible, knn_elapsed_ms, oracle) =
             embed_path_seeds(store, query, knn_fn, filter);
         let budget_ms = knn_budget_ms();
         if knn_elapsed_ms > budget_ms {
@@ -2312,16 +2345,16 @@ fn get_context_body(
                 "knn exceeded circuit-breaker threshold — falling back to FTS seeds"
             );
             knn_degraded = true;
-            vec![]
+            (vec![], std::collections::HashMap::new())
         } else {
             // Empty = no embeddings indexed yet (graceful no-op, not degraded).
-            knn_scored
+            (knn_scored, oracle)
         }
     } else {
-        vec![]
+        (vec![], std::collections::HashMap::new())
     };
 
-    let seed_set = crate::seed::build_seed_set(store, query, filter, knn_pairs);
+    let seed_set = crate::seed::build_seed_set(store, query, filter, knn_pairs, &knn_oracle);
     let tier_label = if has_embed && !seed_set.seeds.is_empty() {
         "exact+lexical+semantic"
     } else {
@@ -2462,6 +2495,21 @@ fn get_context_body(
             (n, s * (1.0 + KCORE_ALPHA * shell as f32))
         })
         .collect();
+
+    // Normalize PPR+kcore scores to [0, 1] within this candidate set before display.
+    // Raw PPR distributes probability mass across the full graph (100k+ nodes), making
+    // absolute scores tiny (~0.01–0.05). Normalization makes score bars meaningful:
+    // the top result always shows at 100%, others proportional to it.
+    // Monotone transform — does not change relative ordering, so knapsack is unaffected.
+    let max_raw_score = items.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
+    let items: Vec<(CoreNode, f32)> = if max_raw_score > 0.0 {
+        items
+            .into_iter()
+            .map(|(n, s)| (n, s / max_raw_score))
+            .collect()
+    } else {
+        items
+    };
 
     // Capture lightweight overflow metadata before knapsack consumes items.
     // Storing only (id, score, sig, path) avoids cloning full Node objects.
@@ -2711,6 +2759,7 @@ fn get_context_body(
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,
+            embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
             seed_cap_msg,
@@ -2742,6 +2791,7 @@ fn get_context_body(
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,
+            embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
             seed_cap_msg,
@@ -5680,7 +5730,7 @@ mod snippet_tests {
         let knn: EmbedKnnFn<'_> =
             &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
 
-        let (seeds, n_eligible, _) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        let (seeds, n_eligible, _, _) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
         assert!(
             seeds.iter().all(|(node, _)| node.id == impl_id),
             "only the src impl node should be a seed; got: {seeds:?}"
@@ -5807,7 +5857,7 @@ mod snippet_tests {
             knn_pairs.push((id, 0.90 - i as f32 * 0.001));
         }
         let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
-        let (seeds, n_eligible, _) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
+        let (seeds, n_eligible, _, _) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
         assert_eq!(
             seeds.len(),
             MAX_EMBED_SEEDS,
@@ -5836,7 +5886,7 @@ mod snippet_tests {
             knn_pairs.push((id, 0.95));
         }
         let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
-        let (seeds, n_eligible, _) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
+        let (seeds, n_eligible, _, _) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
         assert!(
             n_eligible > seeds.len(),
             "cap fired: n_eligible ({n_eligible}) > seeds.len() ({})",

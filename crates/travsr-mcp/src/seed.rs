@@ -339,25 +339,49 @@ fn classify_confidence(
     top_bm25: f32,
     has_any_seeds: bool,
     #[allow(unused_variables)] has_knn_seeds: bool,
+    knn_oracle: &HashMap<NodeId, f32>,
 ) -> Confidence {
     let rare_max = rare_anchor_max();
     let cov_strong = coverage_strong();
     let cov_weak = coverage_weak();
     let bm25_floor = bm25_strong_floor();
+    let idf_min = idf_coverage_min();
 
-    // Only count anchors whose IDF weight is high enough to be meaningful signals.
-    // Generic tokens like "map", "get", "list" (high frequency → low IDF) match
-    // hundreds of unrelated nodes and must not fake coverage or the anchor escape.
+    // Embed oracle as a confidence check: when the embedding is confident, a
+    // lexical anchor only counts toward confidence if the model agrees it is near
+    // the query. This stops NL query words that are rare-by-coincidence ("literal"
+    // → 1 node, "matching" → 3) from claiming Exact/Strong over a semantic salad.
+    // When the oracle is absent or weak we have no embedding opinion and trust
+    // lexical evidence unchanged — the FTS-only path is identical to before.
+    let oracle_top = knn_oracle.values().copied().fold(0.0_f32, f32::max);
+    let oracle_confident = oracle_top >= SEMANTIC_ORACLE_MIN;
+    let floor = (oracle_top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
+    let embed_agrees = |t: &ResolvedTerm| -> bool {
+        !oracle_confident
+            || t.top_node
+                .map(|n| knn_oracle.get(&n).copied().unwrap_or(0.0) >= floor)
+                .unwrap_or(false)
+    };
+
+    // Only count anchors whose IDF weight is high enough to be meaningful signals
+    // (generic tokens like "map"/"get" match hundreds of nodes), AND — when the
+    // oracle is confident — that the embedding agrees are relevant. This drops
+    // the rare-by-coincidence NL anchor ("literal" → c1_raw_literal) that drove
+    // the false Exact, while keeping a genuinely named symbol ("build_seed_set").
     let has_rare_anchor = terms
         .iter()
-        .any(|t| t.resolved && t.symbol_freq <= rare_max);
+        .any(|t| t.resolved && t.symbol_freq <= rare_max && embed_agrees(t));
     let has_specific_anchor = terms
         .iter()
-        .any(|t| t.resolved && t.idf_w >= idf_coverage_min());
+        .any(|t| t.resolved && t.idf_w >= idf_min && embed_agrees(t));
 
     if has_rare_anchor && coverage >= cov_strong {
         Confidence::Exact
-    } else if top_bm25 >= bm25_floor && coverage >= cov_strong {
+    } else if !oracle_confident && top_bm25 >= bm25_floor && coverage >= cov_strong {
+        // Pure-lexical Strong is only honest when there is NO embedding opinion.
+        // When the oracle IS confident yet no embed-agreed *rare* anchor exists,
+        // the high BM25/coverage came from NL words matching symbols by
+        // coincidence — the result is embedding-driven, which is Weak-grade.
         Confidence::Strong
     } else if has_any_seeds && (coverage >= cov_weak || has_specific_anchor) {
         // KNN seeds enhance grounded queries but never substitute for lexical evidence.
@@ -386,15 +410,72 @@ fn package_root(path: &str) -> Option<&str> {
     None
 }
 
+// ── Tier-1 semantic validation thresholds ─────────────────────────────────────
+
+/// Minimum top cosine for the embed oracle to be trusted at all.  Below this the
+/// embedding found nothing strongly relevant, so lexical seeds are left untouched
+/// (avoids cutting good FTS results on queries the model is weak on).
+const SEMANTIC_ORACLE_MIN: f32 = 0.58;
+/// Keep seeds whose cosine is within this band of the top oracle score …
+const SEMANTIC_REL_DELTA: f32 = 0.13;
+/// … but never below this absolute cosine floor.
+const SEMANTIC_ABS_FLOOR: f32 = 0.55;
+/// Never cut below this many seeds — a grounded result must not be emptied by
+/// validation even when the oracle is harsh.
+const SEMANTIC_MIN_KEEP: usize = 5;
+
+/// Demote seeds the embed oracle places far from the query, then reshuffle the
+/// survivors by cosine.  A seed absent from the oracle (not among the over-fetched
+/// nearest neighbours) is treated as semantically distant (cosine 0.0) — this is
+/// what cuts a spurious lexical anchor like `c1_raw_literal` (FTS-matched the NL
+/// word "literal", cosine far below the genuine semantic neighbours).
+///
+/// No-op when the oracle is empty (embeddings off/degraded) or not confident
+/// (top cosine < `SEMANTIC_ORACLE_MIN`) — lexical evidence then stands unchanged.
+fn semantic_validate(seeds: Vec<Seed>, oracle: &HashMap<NodeId, f32>) -> Vec<Seed> {
+    if oracle.is_empty() || seeds.is_empty() {
+        return seeds;
+    }
+    let top = oracle.values().copied().fold(0.0_f32, f32::max);
+    if top < SEMANTIC_ORACLE_MIN {
+        return seeds; // oracle not confident — trust lexical evidence
+    }
+    let floor = (top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
+
+    let mut scored: Vec<(Seed, f32)> = seeds
+        .into_iter()
+        .map(|s| {
+            let cos = oracle.get(&s.node).copied().unwrap_or(0.0);
+            (s, cos)
+        })
+        .collect();
+
+    let n_above = scored.iter().filter(|(_, c)| *c >= floor).count();
+    if n_above < SEMANTIC_MIN_KEEP {
+        // Graceful: too few clear the floor — keep the top-N by cosine so a
+        // grounded result is never emptied by an over-harsh oracle.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(SEMANTIC_MIN_KEEP);
+    } else {
+        scored.retain(|(_, c)| *c >= floor);
+        // Reshuffle: most semantically-relevant first.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    scored.into_iter().map(|(s, _)| s).collect()
+}
+
 /// Build a `SeedSet` for `query` using per-token anchor resolution + whole-query
 /// lexical FTS, fused via RRF.
 ///
 /// When `knn_pairs` is non-empty (Tier 1 — embed sidecar contributed), those pairs
-/// are included as a third source in `rrf_fuse` — but only after structural proximity
-/// filtering: a KNN node is admitted only if its package root (first two path segments)
-/// matches at least one anchor or lexical seed's root.  This blocks cross-domain
-/// contamination (e.g. VS Code extension nodes seeded for a Rust algorithm query)
-/// while still letting KNN reinforce nodes in the same crate.
+/// are included as a third source in `rrf_fuse`, weighted `cosine × kind_boost`.
+/// KNN is score-gated (in `embed_path_seeds`), not structure-gated, so it can
+/// surface semantically relevant nodes in different crates than the FTS/anchor
+/// scope.  After fusion, `semantic_validate` consults the `knn_oracle` (query
+/// cosine for every over-fetched candidate) to demote lexical anchors the
+/// embedding disagrees with — fixing the "confident salad" on NL queries whose
+/// words resolve to rare-by-coincidence symbols.
 ///
 /// Filters applied before RRF:
 /// - `is_noise_seed` — excludes crates, test/bench fixtures, build artefacts
@@ -405,6 +486,7 @@ pub(crate) fn build_seed_set(
     query: &str,
     filter: &dyn EdgeFilter,
     knn_pairs: Vec<(CoreNode, f32)>,
+    knn_oracle: &HashMap<NodeId, f32>,
 ) -> SeedSet {
     const MAX_SEEDS_PER_PATH: usize = 2;
 
@@ -548,12 +630,23 @@ pub(crate) fn build_seed_set(
     // anchored to security test functions, or surfacing VS Code extension code
     // when FTS anchored to Rust crates for a "typescript extension" query).
     //
-    // Quality is enforced upstream by the cosine-score threshold (≥ 0.75) in
-    // embed_path_seeds — only high-confidence neighbours reach this point.
     // Nodes that appear in both KNN and anchor/FTS naturally rank higher via
     // RRF multi-source fusion, so semantically-correct nodes beat noise even
     // when noise-adjacent neighbours slip through.
-    let knn_raw: Vec<(NodeId, f32)> = knn_pairs.iter().map(|(n, s)| (n.id, *s)).collect();
+    //
+    // Weight = cosine × kind_boost, mirroring the anchor/lexical weighting so a
+    // KNN seed competes fairly in the PPR personalisation vector. Raw cosine
+    // (~0.65–0.80) would otherwise lose to a normalised FTS match × kind_boost
+    // (up to ~3.0), systematically under-weighting semantic seeds.
+    let knn_raw: Vec<(NodeId, f32)> = knn_pairs
+        .iter()
+        .map(|(n, s)| {
+            (
+                n.id,
+                *s * crate::tools::kind_boost(&n.kind, &n.vname.language),
+            )
+        })
+        .collect();
 
     // ── RRF fusion ────────────────────────────────────────────────────────────
     let k = rrf_k();
@@ -598,7 +691,22 @@ pub(crate) fn build_seed_set(
         .collect();
 
     let has_knn = !knn_raw.is_empty();
-    let confidence = classify_confidence(&terms, coverage, top_bm25, !seeds.is_empty(), has_knn);
+
+    // ── Tier-1 semantic validation ────────────────────────────────────────────
+    // When the embed oracle is confident, use the query cosine to demote lexical
+    // anchors the embedding disagrees with. NL query words that are rare-by-
+    // coincidence ("literal", "semantic") resolve to confident FTS anchors that
+    // are semantically unrelated to intent; the whole-query embedding is the only
+    // signal that detects this. No-op when embeddings are absent/degraded.
+    let seeds = semantic_validate(seeds, knn_oracle);
+    let confidence = classify_confidence(
+        &terms,
+        coverage,
+        top_bm25,
+        !seeds.is_empty(),
+        has_knn,
+        knn_oracle,
+    );
 
     SeedSet {
         intent,
@@ -791,7 +899,7 @@ mod tests {
     #[test]
     fn confidence_none_on_empty() {
         let terms: Vec<ResolvedTerm> = vec![];
-        let c = classify_confidence(&terms, 0.0, 0.0, false, false);
+        let c = classify_confidence(&terms, 0.0, 0.0, false, false, &HashMap::new());
         assert_eq!(c, Confidence::None);
     }
 
@@ -804,7 +912,7 @@ mod tests {
             idf_w: 0.98, // very rare → specific anchor
             top_node: Some(NodeId(42)),
         }];
-        let c = classify_confidence(&terms, 1.0, 0.0, true, false);
+        let c = classify_confidence(&terms, 1.0, 0.0, true, false, &HashMap::new());
         assert_eq!(c, Confidence::Exact);
     }
 
@@ -817,7 +925,7 @@ mod tests {
             idf_w: 0.0, // not resolved — idf_w irrelevant
             top_node: None,
         }];
-        let c = classify_confidence(&terms, 0.8, 2.0, true, false);
+        let c = classify_confidence(&terms, 0.8, 2.0, true, false, &HashMap::new());
         assert_eq!(c, Confidence::Strong);
     }
 
@@ -831,7 +939,7 @@ mod tests {
             idf_w: 0.40, // too generic to count as specific anchor
             top_node: Some(NodeId(7)),
         }];
-        let c = classify_confidence(&terms, 0.3, 0.1, true, false);
+        let c = classify_confidence(&terms, 0.3, 0.1, true, false, &HashMap::new());
         assert_eq!(c, Confidence::Weak);
     }
 
@@ -846,7 +954,7 @@ mod tests {
             idf_w: 0.93, // rare → counts as specific anchor
             top_node: Some(NodeId(9)),
         }];
-        let c = classify_confidence(&terms, 0.1, 0.0, true, false);
+        let c = classify_confidence(&terms, 0.1, 0.0, true, false, &HashMap::new());
         assert_eq!(
             c,
             Confidence::Weak,
@@ -866,7 +974,7 @@ mod tests {
             idf_w: 0.526, // real idf for "map" in a 6940-node corpus
             top_node: Some(NodeId(5)),
         }];
-        let c = classify_confidence(&terms, 0.0, 0.1, true, false);
+        let c = classify_confidence(&terms, 0.0, 0.1, true, false, &HashMap::new());
         assert_eq!(
             c,
             Confidence::None,
@@ -885,11 +993,87 @@ mod tests {
             idf_w: 0.0,
             top_node: None,
         }];
-        let c = classify_confidence(&terms, 0.0, 0.0, true, true);
+        let c = classify_confidence(&terms, 0.0, 0.0, true, true, &HashMap::new());
         assert_eq!(
             c,
             Confidence::None,
             "KNN-only (zero coverage, no anchor) must abstain"
+        );
+    }
+
+    // ── semantic_validate (Tier-1 cosine oracle) ──────────────────────────────
+
+    fn seed(id: u64, source: SeedSource) -> Seed {
+        Seed {
+            node: NodeId(id),
+            weight: 1.0,
+            source,
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn semantic_validate_noop_when_oracle_empty() {
+        // Embeddings off/degraded → oracle empty → lexical seeds untouched.
+        let seeds = vec![seed(1, SeedSource::Lexical), seed(2, SeedSource::Exact)];
+        let out = semantic_validate(seeds.clone(), &HashMap::new());
+        assert_eq!(out.len(), 2, "empty oracle must be a no-op");
+    }
+
+    #[test]
+    fn semantic_validate_noop_when_oracle_not_confident() {
+        // Top cosine below ORACLE_MIN → embedding found nothing strong → keep all.
+        let seeds = vec![seed(1, SeedSource::Lexical), seed(2, SeedSource::Knn)];
+        let oracle: HashMap<NodeId, f32> = [(NodeId(2), 0.50)].into_iter().collect();
+        let out = semantic_validate(seeds, &oracle);
+        assert_eq!(out.len(), 2, "weak oracle must not cut lexical seeds");
+    }
+
+    #[test]
+    fn semantic_validate_cuts_salad_keeps_relevant() {
+        // The confident-oracle case: NodeId(10..13) are genuine semantic seeds
+        // (cosine ~0.68); NodeId(1..6) are spurious FTS anchors absent from the
+        // oracle (cosine 0.0). Validation must drop the salad and keep the seeds.
+        let mut seeds: Vec<Seed> = (1..=6).map(|i| seed(i, SeedSource::Exact)).collect();
+        seeds.extend((10..=15).map(|i| seed(i, SeedSource::Knn)));
+        let oracle: HashMap<NodeId, f32> = (10..=15)
+            .map(|i| (NodeId(i), 0.68 - (i as f32 - 10.0) * 0.01))
+            .collect();
+        let out = semantic_validate(seeds, &oracle);
+        let kept: std::collections::HashSet<u64> = out.iter().map(|s| s.node.0).collect();
+        assert!(
+            kept.iter().all(|&id| id >= 10),
+            "spurious FTS anchors (cosine 0) must be cut; got {kept:?}"
+        );
+        assert_eq!(out.len(), 6, "all 6 genuine semantic seeds must survive");
+        // Reshuffled by cosine: highest-cosine seed first.
+        assert_eq!(
+            out[0].node,
+            NodeId(10),
+            "survivors reshuffled by cosine desc"
+        );
+    }
+
+    #[test]
+    fn semantic_validate_never_empties_grounded_result() {
+        // Confident oracle but only 2 seeds clear the floor — MIN_KEEP guarantees
+        // we still return SEMANTIC_MIN_KEEP rather than emptying the result.
+        let mut seeds: Vec<Seed> = (1..=6).map(|i| seed(i, SeedSource::Lexical)).collect();
+        seeds.push(seed(10, SeedSource::Knn));
+        seeds.push(seed(11, SeedSource::Knn));
+        let oracle: HashMap<NodeId, f32> = [
+            (NodeId(10), 0.70),
+            (NodeId(11), 0.69),
+            (NodeId(1), 0.40),
+            (NodeId(2), 0.35),
+        ]
+        .into_iter()
+        .collect();
+        let out = semantic_validate(seeds, &oracle);
+        assert_eq!(
+            out.len(),
+            SEMANTIC_MIN_KEEP,
+            "must keep top-{SEMANTIC_MIN_KEEP} by cosine, never empty"
         );
     }
 }
