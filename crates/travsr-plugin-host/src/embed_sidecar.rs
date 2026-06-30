@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::time::Duration;
 
@@ -154,12 +154,24 @@ impl EmbedSidecar {
         // FT-H5: guard the handshake with a watchdog so a slow/hung model load
         // doesn't block daemon startup indefinitely. A 60-second window covers
         // first-run model download + GPU init; subsequent starts are faster.
+        //
+        // The watchdog waits on a Condvar rather than a bare `thread::sleep`, so a
+        // successful handshake can wake it *immediately*. A plain `sleep(60s)` is
+        // not interruptible: setting a cancel flag does not return the sleep early,
+        // so `join()` would block the full 60 s on every spawn even when the
+        // handshake completed in milliseconds. `wait_timeout_while` returns as soon
+        // as we flip the flag and `notify_all`, so `spawn()` returns right after the
+        // handshake; only a genuine hang waits out the 60 s and kills the child.
         let hs_pid = child.id();
-        let hs_cancelled = Arc::new(AtomicBool::new(false));
-        let hs_cancelled_wg = Arc::clone(&hs_cancelled);
+        let hs_state = Arc::new((Mutex::new(false), Condvar::new()));
+        let hs_state_wg = Arc::clone(&hs_state);
         let hs_watchdog = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(60));
-            if !hs_cancelled_wg.load(Ordering::SeqCst) {
+            let (lock, cv) = &*hs_state_wg;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (cancelled, res) = cv
+                .wait_timeout_while(guard, Duration::from_secs(60), |done| !*done)
+                .unwrap_or_else(|e| e.into_inner());
+            if res.timed_out() && !*cancelled {
                 embed_sidecar_kill(hs_pid);
             }
         });
@@ -177,7 +189,12 @@ impl EmbedSidecar {
                 .map_err(|e| EmbedError::Handshake(e.to_string()))
         })();
 
-        hs_cancelled.store(true, Ordering::SeqCst);
+        // Cancel the watchdog and wake it immediately so `join()` returns now.
+        {
+            let (lock, cv) = &*hs_state;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cv.notify_all();
+        }
         let _ = hs_watchdog.join();
 
         let hs = handshake_result?;

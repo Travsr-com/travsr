@@ -58,21 +58,31 @@ pub fn serve_stdio_global() -> anyhow::Result<()> {
 }
 
 /// Wire the active embed backend's KNN hook into `store`.
-/// Silently no-ops when no backend is installed or the sidecar fails to start.
+///
+/// The sidecar loads a 200–1400 MB ONNX model at startup — this takes 15–25 s
+/// on a cold start. To keep `serve_stdio` (and the extension's `initialize`
+/// handshake) responsive, sidecar startup is moved to a background thread.
+///
+/// A lazy meta-hook is injected immediately: it returns `Ok(vec![])` while the
+/// sidecar is still loading, and delegates to the real KNN hook once it is ready.
+/// This produces "embedding in progress" signals in `get_context` responses rather
+/// than blank results or a 15–25 s connect stall.
 fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
+    use std::sync::{Arc, Mutex};
+
+    use travsr_error::StoreError;
     use travsr_plugin_host::{
         active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
     };
+    use travsr_store::EmbedKnnHook;
 
-    // Guard: no embed.db → nothing to query; skip to avoid a 30 s KNN timeout from
-    // spawning the sidecar against a non-existent HNSW index.
+    // Guard: no embed.db → nothing to query; skip to avoid spawning a sidecar
+    // against a non-existent HNSW index.
     if !db_path.with_file_name("embed.db").exists() {
         return;
     }
 
-    let Some(home) = dirs::home_dir() else {
-        return;
-    };
+    let Some(home) = dirs::home_dir() else { return };
     let backend = active_backend_id()
         .as_deref()
         .and_then(lookup_embed_backend)
@@ -81,15 +91,58 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     let Some(backend) = backend else { return };
 
     let binary = home.join(".travsr").join("bin").join(backend.binary_name);
-    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
-    if !supervisor.is_active() {
+    // Fast path: if the binary isn't installed there's nothing to do.
+    if !binary.exists() {
         return;
     }
-    let Some(model_id) = supervisor.model_id().map(str::to_string) else {
-        return;
-    };
-    if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
-        store.set_embed_knn_hook(hook);
-        tracing::info!(model_id = %model_id, "embed plugin active — Step 4 (semantic ANN) enabled");
-    }
+
+    let db_path_bg = db_path.to_path_buf();
+    let model_id_bg = backend.id.to_string();
+
+    // Shared hook slot: None = sidecar starting; Some = ready to call.
+    // `knn_hook()` clones the inner Arc<Mutex<EmbedSidecar>> so the sidecar
+    // process stays alive after `EmbedSupervisor` itself is dropped on the thread.
+    let slot: Arc<Mutex<Option<EmbedKnnHook>>> = Arc::new(Mutex::new(None));
+    let slot_bg = Arc::clone(&slot);
+
+    std::thread::Builder::new()
+        .name("embed-hook-init".into())
+        .spawn(move || {
+            let supervisor = EmbedSupervisor::try_start(&binary, &db_path_bg, &model_id_bg);
+            if supervisor.is_active() {
+                if let Some(mid) = supervisor.model_id().map(str::to_string) {
+                    if let Some(hook) = supervisor.knn_hook(mid.clone()) {
+                        // Warm the sidecar (ONNX + HNSW load) BEFORE arming the
+                        // hook, so the first real query never pays the cold-start
+                        // cost that would trip the host's 600 ms KNN breaker and
+                        // silently degrade to FTS. Blocking — we are already on a
+                        // background init thread, so this delays nothing visible.
+                        supervisor.prewarm();
+                        if let Ok(mut guard) = slot_bg.lock() {
+                            *guard = Some(hook);
+                        }
+                        tracing::info!(
+                            model_id = %mid,
+                            "embed plugin active — Step 4 (semantic ANN) enabled"
+                        );
+                    }
+                }
+            }
+            // supervisor drops here; sidecar stays alive via the hook's Arc.
+        })
+        .ok();
+
+    // Inject the meta-hook immediately so `serve_stdio` can respond to
+    // `initialize` without waiting for the sidecar to finish loading its model.
+    let meta: EmbedKnnHook = Arc::new(move |query: &str, k: u32| {
+        let guard = slot
+            .lock()
+            .map_err(|_| StoreError::Database("embed hook slot poisoned".into()))?;
+        match guard.as_ref() {
+            None => Ok(vec![]), // sidecar still warming up — return no seeds
+            Some(hook) => hook(query, k),
+        }
+    });
+    store.set_embed_knn_hook(meta);
+    tracing::info!("embed plugin hook installed (lazy — sidecar starting in background)");
 }
