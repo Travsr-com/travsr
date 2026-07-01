@@ -10,6 +10,11 @@
  *   "blast: N files"  → command: travsr.showBlastRadius
  *   Omit lens when count = 0 or daemon unavailable.
  *   Use "99+" when count > 99.
+ *
+ * ITEM 3 (parity plan §ITEM 3 part 2): passive high-blast marker. When the
+ * dependent count reaches `travsr.blastRiskThreshold` (default 20), the lens
+ * escalates to a "⚠️ high blast … review before editing" warning so the dev
+ * *sees* risk before touching a high-impact file — no rename hook required.
  */
 
 import * as vscode from "vscode";
@@ -40,6 +45,30 @@ function formatBlastCount(n: number): string {
   return n > 99 ? "99+" : String(n);
 }
 
+/** Default risk threshold when the setting is absent (mirrors package.json). */
+const DEFAULT_BLAST_RISK_THRESHOLD = 20;
+
+/** Read the (validated) high-blast threshold from settings. */
+function blastRiskThreshold(): number {
+  const raw = vscode.workspace
+    .getConfiguration("travsr")
+    .get<number>("blastRiskThreshold", DEFAULT_BLAST_RISK_THRESHOLD);
+  // Guard against a user setting a non-positive/NaN value in settings.json;
+  // package.json enforces minimum 1 in the UI but raw JSON can bypass that.
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : DEFAULT_BLAST_RISK_THRESHOLD;
+}
+
+/** Build the lens command for a resolved blast count against the given threshold. */
+export function blastCommand(file: string, files: string[], threshold: number): vscode.Command {
+  const count = files.length;
+  const plural = count !== 1 ? "s" : "";
+  const title =
+    count >= threshold
+      ? `⚠️ high blast: ${formatBlastCount(count)} file${plural} — review before editing`
+      : `🩻 blast: ${formatBlastCount(count)} file${plural}`;
+  return { title, command: "travsr.showBlastRadius", arguments: [file, files] };
+}
+
 // Carries the document's relative path so resolveCodeLens doesn't depend on
 // activeTextEditor (which may point to a different document when lenses are
 // resolved in the background or in a side-by-side view).
@@ -53,8 +82,15 @@ class BlastRadiusLens extends vscode.CodeLens {
 }
 
 export class BlastRadiusCodeLensProvider implements vscode.CodeLensProvider {
-  // null = resolved to 0 files (lens omitted). undefined = not yet cached.
-  private readonly cache = new Map<string, vscode.CodeLens | null>();
+  // Cache the resolved dependent-file list per document, not the built lens, so
+  // a threshold change can re-title without re-querying the daemon.
+  //   null      = resolved to 0 files (lens omitted)
+  //   undefined = not yet cached
+  private readonly cache = new Map<string, string[] | null>();
+
+  // Fired to make VS Code re-request lenses (on graph refresh or threshold change).
+  private readonly _onDidChange = new vscode.EventEmitter<void>();
+  readonly onDidChangeCodeLenses = this._onDidChange.event;
 
   constructor(private readonly mcp: McpClient) {}
 
@@ -72,29 +108,29 @@ export class BlastRadiusCodeLensProvider implements vscode.CodeLensProvider {
     if (!(lens instanceof BlastRadiusLens)) return undefined;
 
     const { file } = lens;
+    const threshold = blastRiskThreshold();
 
     const cached = this.cache.get(file);
     if (cached === null) return undefined; // known-empty
-    if (cached !== undefined) return cached; // cache hit
+    if (cached !== undefined) {
+      // Rebuild the title against the current threshold — cheap, no I/O.
+      lens.command = blastCommand(file, cached, threshold);
+      return lens;
+    }
 
     try {
       const raw = await this.mcp.callTool("get_blast_radius", { file });
       if (token.isCancellationRequested) return undefined;
 
       const files = parseEnvelope(raw);
-      const count = files.length;
 
-      if (count === 0) {
+      if (files.length === 0) {
         this.cache.set(file, null);
         return undefined;
       }
 
-      lens.command = {
-        title: `🩻 blast: ${formatBlastCount(count)} file${count !== 1 ? "s" : ""}`,
-        command: "travsr.showBlastRadius",
-        arguments: [file, files],
-      };
-      this.cache.set(file, lens);
+      this.cache.set(file, files);
+      lens.command = blastCommand(file, files, threshold);
     } catch {
       return undefined;
     }
@@ -102,7 +138,18 @@ export class BlastRadiusCodeLensProvider implements vscode.CodeLensProvider {
     return lens;
   }
 
+  /** Drop cached counts (graph changed) and force a re-render. */
   clearCache(): void {
     this.cache.clear();
+    this._onDidChange.fire();
+  }
+
+  /** Re-render titles without dropping counts (e.g. threshold setting changed). */
+  refresh(): void {
+    this._onDidChange.fire();
+  }
+
+  dispose(): void {
+    this._onDidChange.dispose();
   }
 }

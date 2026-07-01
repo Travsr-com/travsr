@@ -21,9 +21,9 @@ export class MutableMcpClientProxy implements McpClient {
     this.onInvoke = cb;
   }
 
-  callTool(name: string, args?: Record<string, string>): Promise<string> {
+  callTool(name: string, args?: Record<string, string>, signal?: AbortSignal): Promise<string> {
     try { this.onInvoke?.(name); } catch { /* telemetry hook must not abort tool calls */ }
-    return this.inner.callTool(name, args);
+    return this.inner.callTool(name, args, signal);
   }
 
   isConnected(): boolean {

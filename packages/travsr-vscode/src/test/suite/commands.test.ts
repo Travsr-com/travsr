@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import {
   stripEnvelope,
+  stripLangTokens,
   kindCodicon,
   parseGraphSymbols,
   parseSynonymList,
@@ -215,5 +216,27 @@ suite("VSCODE-247: parseAvailableLanguages", () => {
   test("tolerates empty / malformed input", () => {
     assert.deepStrictEqual(parseAvailableLanguages(""), []);
     assert.deepStrictEqual(parseAvailableLanguages("not json"), []);
+  });
+});
+
+suite("ITEM 4: stripLangTokens", () => {
+  test("strips leading language keywords", () => {
+    assert.strictEqual(stripLangTokens("fn PaymentService"), "PaymentService");
+    assert.strictEqual(stripLangTokens("function foo"), "foo");
+    assert.strictEqual(stripLangTokens("class Baz"), "Baz");
+    assert.strictEqual(stripLangTokens("def processPayment"), "processPayment");
+  });
+  test("leaves non-keyword queries intact", () => {
+    assert.strictEqual(stripLangTokens("PaymentService"), "PaymentService");
+    assert.strictEqual(stripLangTokens("foo bar"), "foo bar");
+  });
+  test("preserves all words when all are keywords (safety fallback)", () => {
+    // Should not return empty — fall back to original words
+    const result = stripLangTokens("fn class");
+    assert.ok(result.length > 0);
+  });
+  test("case-insensitive keyword matching", () => {
+    assert.strictEqual(stripLangTokens("FN PaymentService"), "PaymentService");
+    assert.strictEqual(stripLangTokens("Class Baz"), "Baz");
   });
 });

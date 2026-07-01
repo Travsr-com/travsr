@@ -71,11 +71,7 @@ export class TravsrTreeDataProvider
   private depCache: EntryNode[] | undefined;
   private callerCache: EntryNode[] | undefined;
   private selectionDebounce: ReturnType<typeof setTimeout> | undefined;
-  // Incremented on every new selection; guards against stale in-flight loadCallers
-  // resolving after a newer symbol was already selected.
-  // DEBT(travsr-322): add true cancellation via JSON-RPC $/cancelRequest once
-  // StdioMcpClient exposes an AbortSignal-aware callTool overload.
-  private callerGen = 0;
+  private selectionAbortController: AbortController | undefined;
 
   constructor(
     private readonly mcp: McpClient,
@@ -108,14 +104,15 @@ export class TravsrTreeDataProvider
         if (!sym || sym === this.activeSymbol) return;
         this.activeSymbol = sym;
         this.callerCache = undefined;
-        this.callerGen++;
+        this.selectionAbortController?.abort();
+        this.selectionAbortController = new AbortController();
         if (this.selectionDebounce) clearTimeout(this.selectionDebounce);
         this.selectionDebounce = setTimeout(() => {
           this._onDidChangeTreeData.fire();
         }, 500);
       }),
 
-      { dispose: () => { clearTimeout(this.selectionDebounce); this._onDidChangeTreeData.dispose(); } }
+      { dispose: () => { clearTimeout(this.selectionDebounce); this.selectionAbortController?.abort(); this._onDidChangeTreeData.dispose(); } }
     );
   }
 
@@ -123,7 +120,8 @@ export class TravsrTreeDataProvider
   refresh(): void {
     this.depCache = undefined;
     this.callerCache = undefined;
-    this.callerGen++;
+    this.selectionAbortController?.abort();
+    this.selectionAbortController = undefined;
     this._onDidChangeTreeData.fire();
   }
 
@@ -151,11 +149,9 @@ export class TravsrTreeDataProvider
       return [new PlaceholderNode("Move cursor to a symbol")];
     }
     if (!this.callerCache) {
-      const gen = this.callerGen;
-      const fresh = await this.loadCallers(this.activeSymbol);
-      // A newer selection superseded this in-flight fetch — discard the stale
-      // result. VS Code will call getChildren again after the next fire().
-      if (gen !== this.callerGen) return [];
+      const ctrl = this.selectionAbortController;
+      const fresh = await this.loadCallers(this.activeSymbol, ctrl?.signal);
+      if (ctrl?.signal.aborted) return [];
       this.callerCache = fresh;
     }
     return this.callerCache.length > 0
@@ -184,9 +180,10 @@ export class TravsrTreeDataProvider
     }
   }
 
-  private async loadCallers(symbol: string): Promise<EntryNode[]> {
+  private async loadCallers(symbol: string, signal?: AbortSignal): Promise<EntryNode[]> {
     try {
-      const raw = await this.mcp.callTool("get_callers", { symbol });
+      const raw = await this.mcp.callTool("get_callers", { symbol }, signal);
+      if (signal?.aborted) return [];
       const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
       return lines.map((line) => {
         // Format: "[call] fn:bar (function) — src/bar.ts"

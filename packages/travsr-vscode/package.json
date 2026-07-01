@@ -38,7 +38,6 @@
     "AI",
     "Other"
   ],
-  "enabledApiProposals": ["chatContextProvider"],
   "main": "./out/extension.js",
   "activationEvents": [
     "onStartupFinished"
@@ -150,6 +149,23 @@
         "command": "travsr.searchRepoFile",
         "title": "Travsr: Search Files",
         "icon": "$(search)"
+      },
+      {
+        "command": "travsr.openContextExplorer",
+        "title": "Travsr: Open Context Explorer",
+        "icon": "$(symbol-keyword)"
+      },
+      {
+        "command": "travsr.registerMcpServer",
+        "title": "Travsr: Register MCP Server in Agent"
+      },
+      {
+        "command": "travsr.blastBeforeEdit",
+        "title": "Travsr: Check Blast Radius Before Edit"
+      },
+      {
+        "command": "travsr.copyContextForChat",
+        "title": "Travsr: Copy Graph Context for Chat"
       }
     ],
     "keybindings": [
@@ -163,6 +179,12 @@
         "command": "travsr.askSymbol",
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a",
+        "when": "editorFocus"
+      },
+      {
+        "command": "travsr.openContextExplorer",
+        "key": "ctrl+shift+k",
+        "mac": "cmd+shift+k",
         "when": "editorFocus"
       }
     ],
@@ -232,6 +254,28 @@
           "command": "travsr.showLanguages",
           "when": "view == travsrGraph",
           "group": "2_travsr@3"
+        },
+        {
+          "command": "travsr.openContextExplorer",
+          "when": "view == travsrGraph",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "travsr.blastBeforeEdit",
+          "when": "editorFocus",
+          "group": "travsr@1"
+        },
+        {
+          "command": "travsr.openContextExplorer",
+          "when": "editorFocus",
+          "group": "travsr@2"
+        },
+        {
+          "command": "travsr.copyContextForChat",
+          "when": "editorFocus",
+          "group": "travsr@3"
         }
       ]
     },
@@ -292,17 +336,23 @@
           "description": "Send anonymous usage events to Travsr (extension activated, MCP tool invoked, daemon connection failures). No file paths, symbol names, or graph data are ever sent.",
           "markdownDescription": "Send anonymous usage events to Travsr.\n\n**What is sent:** extension activation, MCP tool names, daemon connection failures.\n\n**What is never sent:** file paths, symbol names, code content, or graph data.\n\nDefault: `false` (opt-in)."
         },
-        "travsr.autoContextEnabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Inject graph context automatically into every Copilot Chat turn. Travsr detects the symbol under your cursor and your question, queries the graph, and silently prepends relevant nodes to Copilot's context window."
-        },
         "travsr.contextTokenBudget": {
           "type": "number",
           "default": 2000,
           "minimum": 500,
           "maximum": 8000,
-          "description": "Token budget for automatic context injection per chat turn. At 2000 tokens, a typical context is 8–15 graph nodes."
+          "description": "Token budget for \"Copy Graph Context for Chat\" pulls. At 2000 tokens, a typical context is 8–15 graph nodes."
+        },
+        "travsr.suggestSynonyms": {
+          "type": "boolean",
+          "default": true,
+          "description": "When you select a symbol in Ask Symbol whose name differs from your typed query, offer to teach Travsr the synonym so future searches find it faster."
+        },
+        "travsr.blastRiskThreshold": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "description": "Dependent-file count at which the blast-radius code lens escalates to a high-risk warning. When a file has this many or more dependents, the lens reads \"⚠️ high blast: N files — review before editing\" so you see risk before touching a high-impact file."
         }
       }
     }
