@@ -721,6 +721,11 @@ pub fn ingest_scip(bytes: &[u8], corpus: &str) -> anyhow::Result<ParseOutput> {
                 if let Some(el) = end_line {
                     node = node.with_end_line(el);
                 }
+                // Noise-path guard: reject OS/build-cache nodes before they enter
+                // the graph (durable fix — prevents hub-node PPR contamination).
+                if travsr_core::is_noise_node(&node) {
+                    continue;
+                }
                 defs.insert(occ.symbol.clone(), id);
                 nodes.push(node);
             }
@@ -814,6 +819,10 @@ pub fn ingest_scip_g2(
             }
             if let Some(el) = end_line {
                 node = node.with_end_line(el);
+            }
+            // Noise-path guard: mirror the ingest_scip G3 extension to g2 path.
+            if travsr_core::is_noise_node(&node) {
+                continue;
             }
             out.symbol_map.insert(occ.symbol.clone(), id);
             out.nodes.push(node);

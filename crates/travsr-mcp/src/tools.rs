@@ -9,7 +9,8 @@ use travsr_retrieval::{
 use travsr_store::{SqliteStore, Store};
 
 use crate::sanitize::{
-    sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, wrap_envelope,
+    sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, validate_mcp_list_arg,
+    wrap_envelope,
 };
 
 /// Short alias for the embed KNN closure used throughout `get_context` variants.
@@ -1739,6 +1740,11 @@ pub(crate) const KNN_BUDGET_MS: u128 = 600;
 ///   `vendor/bundle/` (Ruby), `vendor/*.php` (PHP), `Library/Caches/`, `.cache/`.
 /// - Paths escaping the repo root (`../`), Python bytecode (`__pycache__/`, `.pyc`).
 pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
+    // Core structural noise (vendored, OS caches, repo-escaping paths, SCIP locals).
+    // Enforced identically at ingest and query time via is_noise_node.
+    if travsr_core::is_noise_node(node) {
+        return true;
+    }
     if node.kind == "crate" {
         return true;
     }
@@ -2060,19 +2066,34 @@ fn build_degraded_notes(store: &SqliteStore, has_embed: bool, embed_warming: boo
 /// - Omits `[package: ]` entirely when the package field is empty.
 /// - R7: appends `[score: N.NN]` when a score is available so the AI can
 ///   weight nodes by relevance without a second round-trip.
-fn format_node_line(n: &CoreNode, role: &str, score: Option<f32>) -> String {
+fn format_node_line(
+    n: &CoreNode,
+    role: &str,
+    score: Option<f32>,
+    via_source: Option<&str>,
+) -> String {
     let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
     let score_str = score
         .map(|s| format!(" [score: {s:.2}]"))
         .unwrap_or_default();
+    // RFC-019: name the source seed for caller/dependency roles so seed
+    // contamination is diagnosable — a caller of a good seed and a caller of a
+    // false seed no longer print the identical `[via: caller]`. Seed/context roles
+    // have no single source, so they render unchanged.
+    let via = match via_source {
+        Some(src) if role == "caller" || role == "dependency" => {
+            format!("[via: {role} of {src}]")
+        }
+        _ => format!("[via: {role}]"),
+    };
     if n.package.is_empty() {
         format!(
-            "{} ({}) — {}{loc} [via: {role}]{score_str}",
+            "{} ({}) — {}{loc} {via}{score_str}",
             n.vname.signature, n.kind, n.vname.path
         )
     } else {
         format!(
-            "{} ({}) — {}{loc} [package: {}] [via: {role}]{score_str}",
+            "{} ({}) — {}{loc} [package: {}] {via}{score_str}",
             n.vname.signature, n.kind, n.vname.path, n.package
         )
     }
@@ -2268,15 +2289,17 @@ pub(crate) fn enrich_seeds_with_callers(
             Err(_) => continue,
         };
 
-        // Apply noise filter: skip test/bench callers.
+        // Apply noise filter: skip test/bench callers and structural noise nodes.
+        // is_noise_seed covers path-level noise (tests/, benches/, caches, etc.);
+        // the sig-prefix check catches test functions in files not in test dirs.
         let mut production_callers: Vec<NodeId> = caller_nodes
             .into_iter()
             .filter(|n| {
-                let path = &n.vname.path;
+                if is_noise_seed(n) {
+                    return false;
+                }
                 let sig = &n.vname.signature;
-                !path.contains("/tests/")
-                    && !path.contains("/benches/")
-                    && !sig.starts_with("fn:test_")
+                !sig.starts_with("fn:test_")
                     && !sig.starts_with("fn:bench_")
                     && !sig.starts_with("fn:prop_")
             })
@@ -2389,7 +2412,14 @@ fn get_context_body(
         (vec![], std::collections::HashMap::new())
     };
 
-    let seed_set = crate::seed::build_seed_set(store, query, filter, knn_pairs, &knn_oracle);
+    // RFC-019: direct-cosine oracle hook (None when embeddings off/warming → the
+    // FTS-only path is unchanged).
+    let score_fn = store.embed_score_fn();
+    let score_ref = score_fn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>);
+    let seed_set =
+        crate::seed::build_seed_set(store, query, filter, knn_pairs, &knn_oracle, score_ref);
     let tier_label = if has_embed && !seed_set.seeds.is_empty() {
         "exact+lexical+semantic"
     } else {
@@ -2509,9 +2539,12 @@ fn get_context_body(
     // Post-filter fetched nodes through RBAC and join with scores.
     // SEC P0: `selected` is the authoritative RBAC-filtered list; snippets are
     // only ever read for nodes already in this set (never re-queried separately).
+    // Issue A.3: also apply structural noise filter so build-cache/OS-cache hub nodes
+    // cannot inject irrelevant neighbours into the PPR-expanded result.
     let items: Vec<(CoreNode, f32)> = fetched
         .into_iter()
         .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+        .filter(|n| !travsr_core::is_noise_node(n))
         .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
         .collect();
 
@@ -2546,6 +2579,28 @@ fn get_context_body(
             .collect()
     } else {
         items
+    };
+
+    // Issue B: relevance floor — drop score-0 tail before knapsack so zero-signal nodes
+    // cannot consume token budget and push genuinely relevant nodes into overflow.
+    // Safety valve: always keep the top MIN_KEEP items so thin-but-legitimate results
+    // are never emptied. Floor is env-overridable for tuning without a rebuild.
+    const REL_FLOOR_DEFAULT: f32 = 0.01;
+    const MIN_KEEP: usize = 8;
+    let rel_floor = std::env::var("TRAVSR_CONTEXT_REL_FLOOR")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(REL_FLOOR_DEFAULT);
+    let items = {
+        let mut sorted = items;
+        sorted.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let keep_floor = sorted.len().min(MIN_KEEP);
+        sorted
+            .into_iter()
+            .enumerate()
+            .filter(|(i, (_, s))| *i < keep_floor || *s >= rel_floor)
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>()
     };
 
     // Capture lightweight overflow metadata before knapsack consumes items.
@@ -2669,12 +2724,16 @@ fn get_context_body(
     // O(S × avg_degree); seeds are capped at MAX_EMBED_SEEDS so this is negligible.
     // Errors are silently ignored — roles degrade to Context, never block output.
     let seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
-    let roles: HashMap<NodeId, NodeRole> = {
+    // RFC-019: alongside the role, record WHICH seed assigned a caller/dependency
+    // role (the first seed to do so, deterministic in seed_ids order), so `via:`
+    // can name the source and make seed contamination diagnosable.
+    let (roles, role_source): (HashMap<NodeId, NodeRole>, HashMap<NodeId, NodeId>) = {
         use travsr_core::EdgeKind;
         let selected_set: std::collections::HashSet<NodeId> =
             selected.iter().map(|n| n.id).collect();
         let mut map: HashMap<NodeId, NodeRole> =
             selected.iter().map(|n| (n.id, NodeRole::Context)).collect();
+        let mut src: HashMap<NodeId, NodeId> = HashMap::new();
         for &seed in &seed_ids {
             // Forward edges: seed → node  →  node is a Dependency of seed.
             if let Ok(fwd) = store.iter_edges_from(seed) {
@@ -2687,11 +2746,12 @@ fn get_context_body(
                             | EdgeKind::Exports
                     ) && selected_set.contains(&e.dst)
                     {
-                        map.entry(e.dst).and_modify(|r| {
+                        if let Some(r) = map.get_mut(&e.dst) {
                             if *r == NodeRole::Context {
                                 *r = NodeRole::Dependency;
+                                src.insert(e.dst, seed);
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -2703,11 +2763,12 @@ fn get_context_body(
                         EdgeKind::RefCall | EdgeKind::RefImports | EdgeKind::Depends
                     ) && selected_set.contains(&e.src)
                     {
-                        map.entry(e.src).and_modify(|r| {
+                        if let Some(r) = map.get_mut(&e.src) {
                             if *r == NodeRole::Context {
                                 *r = NodeRole::Caller;
+                                src.insert(e.src, seed);
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -2718,8 +2779,13 @@ fn get_context_body(
                 map.insert(seed, NodeRole::Seed);
             }
         }
-        map
+        (map, src)
     };
+    // Seed signatures for `via: <role> of <seed>` rendering. Cheap — seeds ≤ ~40.
+    let seed_sig: HashMap<NodeId, String> = store
+        .get_nodes(&seed_ids)
+        .map(|ns| ns.into_iter().map(|n| (n.id, n.vname.signature)).collect())
+        .unwrap_or_default();
 
     let char_cap = (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000);
 
@@ -2739,7 +2805,15 @@ fn get_context_body(
                             .copied()
                             .unwrap_or(NodeRole::Context)
                             .label();
-                        format_node_line(n, role, node_score_map.get(&n.id).copied())
+                        format_node_line(
+                            n,
+                            role,
+                            node_score_map.get(&n.id).copied(),
+                            role_source
+                                .get(&n.id)
+                                .and_then(|s| seed_sig.get(s))
+                                .map(String::as_str),
+                        )
                     })
                     .collect();
                 let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
@@ -2774,7 +2848,15 @@ fn get_context_body(
                 .copied()
                 .unwrap_or(NodeRole::Context)
                 .label();
-            let header = format_node_line(n, role, node_score_map.get(&n.id).copied());
+            let header = format_node_line(
+                n,
+                role,
+                node_score_map.get(&n.id).copied(),
+                role_source
+                    .get(&n.id)
+                    .and_then(|s| seed_sig.get(s))
+                    .map(String::as_str),
+            );
             // Use skeleton when the body exceeds the kind-aware line cap.
             let n_height = n
                 .end_line
@@ -2837,7 +2919,15 @@ fn get_context_body(
                     .copied()
                     .unwrap_or(NodeRole::Context)
                     .label();
-                format_node_line(n, role, node_score_map.get(&n.id).copied())
+                format_node_line(
+                    n,
+                    role,
+                    node_score_map.get(&n.id).copied(),
+                    role_source
+                        .get(&n.id)
+                        .and_then(|s| seed_sig.get(s))
+                        .map(String::as_str),
+                )
             })
             .collect();
         let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
@@ -4886,14 +4976,51 @@ mod tests {
 
 use travsr_analysis::skeleton::skeleton_for_node as skeleton_for_node_inner;
 pub use travsr_analysis::snippet::SNIPPET_DEFAULT_BUDGET;
-use travsr_analysis::snippet::{snippet_for_node, snippet_line_cap, SNIPPET_SEP};
+use travsr_analysis::snippet::{
+    snippet_for_node, snippet_for_node_full, snippet_line_cap, SNIPPET_SEP,
+};
+
+/// How `get_snippets` renders each symbol's body.
+///
+/// The default (`Auto`) preserves the historical behaviour: raw source when the
+/// definition fits its kind line-cap, AST skeleton when it overflows. The other
+/// two let a caller (e.g. the VS Code Context Explorer pinning a node into the
+/// AI context) force one representation regardless of size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnippetMode {
+    /// Raw body if within the kind line-cap, else AST skeleton. Default.
+    #[default]
+    Auto,
+    /// Full source of `line..=end_line`, no line cap. Falls back to skeleton if unreadable.
+    Full,
+    /// AST skeleton always, even for a small definition. Falls back to raw body if unavailable.
+    Skeleton,
+}
+
+impl SnippetMode {
+    /// Parse the MCP `mode` argument. Unknown / absent → [`SnippetMode::Auto`].
+    pub fn from_arg(s: &str) -> Self {
+        match s {
+            "full" => Self::Full,
+            "skeleton" => Self::Skeleton,
+            _ => Self::Auto,
+        }
+    }
+}
 
 /// Core snippet assembly: resolves symbols, fetches snippets, enforces budget.
 ///
 /// `symbols_arg` is a newline- or comma-separated list of symbol names.
 /// Symbols are processed in order; truncation happens at symbol granularity
-/// (no partial symbol output) once the token budget is exhausted.
-fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize) -> String {
+/// (no partial symbol output) once the token budget is exhausted — except the
+/// first resolved symbol is always included so a single large `Full` definition
+/// never returns empty.
+fn get_snippets_body(
+    store: &SqliteStore,
+    symbols_arg: &str,
+    token_budget: usize,
+    mode: SnippetMode,
+) -> String {
     // Read repo_root from meta — written by init_repo_with_progress.
     // Absent on indexes created before this feature; degrade gracefully.
     let repo_root = match store.get_meta("repo_root") {
@@ -4946,25 +5073,35 @@ fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize
             "{} ({}) — {} [package: {}]",
             node.vname.signature, node.kind, node.vname.path, node.package
         );
-        // Use skeleton when the body exceeds the kind-aware line cap (truncated
-        // snippets are half-implementations — skeleton gives a complete summary).
-        let node_height = node
-            .end_line
-            .unwrap_or_else(|| node.line.unwrap_or(0))
-            .saturating_sub(node.line.unwrap_or(0)) as usize;
-        let body_text: Option<String> = if node_height > snippet_line_cap(&node.kind) {
-            skeleton_for_node_inner(node, &repo_root)
-                .map(|s| s.render())
-                .or_else(|| snippet_for_node(node, &repo_root))
-        } else {
-            snippet_for_node(node, &repo_root)
-                .or_else(|| skeleton_for_node_inner(node, &repo_root).map(|s| s.render()))
+        let skeleton = |n| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
+        let body_text: Option<String> = match mode {
+            // Full source of the definition, no line cap. Skeleton is the fallback
+            // only when the file can't be read.
+            SnippetMode::Full => snippet_for_node_full(node, &repo_root).or_else(|| skeleton(node)),
+            // AST skeleton always; raw body only if the skeleton can't be built.
+            SnippetMode::Skeleton => skeleton(node).or_else(|| snippet_for_node(node, &repo_root)),
+            // Auto: raw when it fits the kind line-cap, skeleton when it overflows
+            // (a truncated raw snippet is a half-implementation; skeleton summarises).
+            SnippetMode::Auto => {
+                let node_height =
+                    node.end_line
+                        .unwrap_or_else(|| node.line.unwrap_or(0))
+                        .saturating_sub(node.line.unwrap_or(0)) as usize;
+                if node_height > snippet_line_cap(&node.kind) {
+                    skeleton(node).or_else(|| snippet_for_node(node, &repo_root))
+                } else {
+                    snippet_for_node(node, &repo_root).or_else(|| skeleton(node))
+                }
+            }
         };
 
         let snippet_chars = body_text.as_deref().map(str::len).unwrap_or(0);
         let block_cost = (header.len() + snippet_chars) / TOKEN_CHARS_PER_TOKEN + 1;
 
-        if tokens_used + block_cost > token_budget {
+        // Always include the first resolved symbol even if it alone exceeds the
+        // budget — otherwise a single large Full definition (the pin-into-context
+        // case) would return empty. Subsequent symbols respect the budget.
+        if !parts.is_empty() && tokens_used + block_cost > token_budget {
             break;
         }
         tokens_used += block_cost;
@@ -4996,20 +5133,36 @@ fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize
 /// Return tailored code snippets for one or more named symbols.
 ///
 /// Accepts the symbol names returned by `get_context`, `get_callers`, and
-/// `search_symbol`. Kind-aware extraction: functions → ≤40 lines, classes →
-/// ≤15 lines (header + fields), interfaces/traits/enums → ≤60 lines.
-/// Leading docblocks are stripped so the AI sees real code immediately.
-pub fn get_snippets(store: &SqliteStore, symbols: &str, token_budget: usize) -> String {
-    if let Err(reason) = validate_mcp_arg(symbols) {
+/// `search_symbol`. `mode` selects the representation ([`SnippetMode`]): `Auto`
+/// (kind-aware raw-or-skeleton, the default), `Full` (whole definition, no cap),
+/// or `Skeleton` (AST summary always). Leading docblocks are stripped so the AI
+/// sees real code immediately.
+pub fn get_snippets(
+    store: &SqliteStore,
+    symbols: &str,
+    token_budget: usize,
+    mode: SnippetMode,
+) -> String {
+    if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets rejected invalid arg: {reason}");
         return String::new();
     }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
-    sanitize_for_mcp(&get_snippets_raw(store, symbols, budget))
+    // `get_snippets_body` already sanitizes its body with a budget-derived limit
+    // (control-char stripping + tag escaping) and appends the plain-ASCII footer.
+    // Wrap-only here — like `get_context` — so the response honours `token_budget`
+    // instead of being re-truncated to the 4 KiB scalar-output cap (which silently
+    // dropped everything past ~6 symbols and cut off the summary footer).
+    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode))
 }
 
-pub(crate) fn get_snippets_raw(store: &SqliteStore, symbols: &str, token_budget: usize) -> String {
-    get_snippets_body(store, symbols, token_budget)
+pub(crate) fn get_snippets_raw(
+    store: &SqliteStore,
+    symbols: &str,
+    token_budget: usize,
+    mode: SnippetMode,
+) -> String {
+    get_snippets_body(store, symbols, token_budget, mode)
 }
 
 /// Global variant: searches across all registered repos (or a named one).
@@ -5018,14 +5171,15 @@ pub fn get_snippets_global(
     symbols: &str,
     token_budget: usize,
     repo: Option<&str>,
+    mode: SnippetMode,
 ) -> String {
-    if let Err(reason) = validate_mcp_arg(symbols) {
+    if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets_global rejected invalid arg: {reason}");
         return String::new();
     }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_snippets_raw(store, symbols, budget);
+        let result = get_snippets_raw(store, symbols, budget, mode);
         if result.is_empty() || single {
             result
         } else {
@@ -5087,7 +5241,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
         assert!(result.contains("function hello()"), "snippet body missing");
         assert!(result.contains("return 'hi'"), "snippet content missing");
         assert!(
@@ -5097,12 +5251,68 @@ mod snippet_tests {
     }
 
     #[test]
+    fn full_mode_returns_whole_body_past_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // A "class" node: Auto caps at 15 lines and falls back to skeleton; Full
+        // must return the complete 30-line body including the last line.
+        let mut src = String::from("class Big {\n");
+        for i in 0..28 {
+            src.push_str(&format!("  field{i} = {i};\n"));
+        }
+        src.push_str("  last = true;\n}\n");
+        std::fs::write(dir.path().join("big.ts"), &src).unwrap();
+
+        // A class node spanning > 15 lines (Auto's class line-cap).
+        let class_node = CoreNode::new(
+            VName::new("corpus", "", "big.ts", "typescript", "class:Big"),
+            "class",
+        )
+        .with_line(1)
+        .with_end_line(31);
+        let store = make_store_with_meta(&[class_node], dir.path());
+
+        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full);
+        assert!(
+            full.contains("last = true"),
+            "full mode must include last line: {full}"
+        );
+        assert!(
+            !full.contains("[skeleton:"),
+            "full mode must not be a skeleton: {full}"
+        );
+
+        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto);
+        assert!(
+            auto.contains("[skeleton:") || !auto.contains("last = true"),
+            "auto mode caps/skeletonises the oversized class: {auto}"
+        );
+    }
+
+    #[test]
+    fn skeleton_mode_forces_ast_for_small_fn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("s.ts"),
+            "function small() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("s.ts", "fn:small", 1, 3);
+        let store = make_store_with_meta(&[node], dir.path());
+
+        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton);
+        assert!(
+            skel.contains("[skeleton:"),
+            "skeleton mode must render the AST summary even for a small fn: {skel}"
+        );
+    }
+
+    #[test]
     fn get_snippets_body_no_repo_root_returns_hint() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
         let store = SqliteStore::open(&db_path).unwrap();
         // No set_meta("repo_root") — simulates an old index.
-        let result = get_snippets_body(&store, "anything", 2000);
+        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto);
         assert!(
             result.contains("travsr init"),
             "must prompt user to re-init: {result}"
@@ -5126,17 +5336,23 @@ mod snippet_tests {
         ];
         let store = make_store_with_meta(&nodes, dir.path());
 
-        // Tight budget (5 tokens) — neither symbol fits; expect the hint.
-        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5);
+        // Tight budget (5 tokens) — the first resolved symbol is always included
+        // (so a single large definition is never dropped), but the second respects
+        // the exhausted budget and must not appear.
+        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto);
         assert!(
-            tight.contains("Token budget too small"),
-            "5-token budget must return the hint: {tight}"
+            tight.contains("aaa"),
+            "first symbol must always be included even under a tiny budget: {tight}"
+        );
+        assert!(
+            !tight.contains("bbb"),
+            "second symbol must be excluded when budget exhausted: {tight}"
         );
 
         // Ordering budget (20 tokens) — enough for one symbol (header ~9 tokens +
         // 3-line snippet ~8 tokens = ~17 tokens) but not both. The first symbol
         // in request order ("aaa") must appear; the second ("bbb") must not.
-        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20);
+        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto);
         assert!(
             ordered.contains("aaa"),
             "first symbol must be included within budget: {ordered}"
@@ -5154,7 +5370,7 @@ mod snippet_tests {
         let node = make_fn_node("missing.ts", "fn:ghost", 1, 5);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:ghost", 2000);
+        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto);
         // Should return metadata line without panic.
         assert!(
             result.contains("fn:ghost"),
@@ -5453,9 +5669,10 @@ mod snippet_tests {
             result.contains("[via: seed]"),
             "seed node must be labelled [via: seed]: {result}"
         );
+        // RFC-019: caller/dependency roles now name their source seed.
         assert!(
-            result.contains("[via: caller]"),
-            "caller node must be labelled [via: caller]: {result}"
+            result.contains("[via: caller of fn:seed_fn]"),
+            "caller node must be labelled with its source seed: {result}"
         );
     }
 
@@ -5480,9 +5697,10 @@ mod snippet_tests {
             result.contains("[via: seed]"),
             "seed node must be labelled [via: seed]: {result}"
         );
+        // RFC-019: caller/dependency roles now name their source seed.
         assert!(
-            result.contains("[via: dependency]"),
-            "dep node must be labelled [via: dependency]: {result}"
+            result.contains("[via: dependency of fn:seed_fn2]"),
+            "dep node must be labelled with its source seed: {result}"
         );
     }
 

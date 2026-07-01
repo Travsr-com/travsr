@@ -7,9 +7,9 @@
 /// KNN (Tier 1) slots into the same rrf_fuse call when the embed sidecar is present.
 use std::collections::HashMap;
 
-use travsr_core::{Node as CoreNode, NodeId};
+use travsr_core::{EdgeKind, Node as CoreNode, NodeId};
 use travsr_retrieval::EdgeFilter;
-use travsr_store::SqliteStore;
+use travsr_store::{SqliteStore, Store};
 
 use crate::tools::{is_noise_seed, kind_boost};
 
@@ -100,6 +100,21 @@ fn semantic_promote_min_near() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3)
+}
+
+/// Minimum anchor cosine for the low-coverage `embed_confirmed_specific` rescue
+/// (RFC-019). A specific anchor confirms a diluted-coverage query to Strong only
+/// when it sits in the measured *answerable* band, not merely above the weak
+/// `SEMANTIC_ABS_FLOOR` (0.55). Separates a genuine low-coverage query ("Load
+/// mutationg manifests" → "manifests" ≈0.71) from a salad whose lone resolved word
+/// is also literally in the query ("find code by semantic meaning" → "semantic"
+/// ≈0.615). Override via `TRAVSR_CONFIRM_ANCHOR_FLOOR`.
+fn confirm_anchor_floor() -> f32 {
+    std::env::var("TRAVSR_CONFIRM_ANCHOR_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| (0.0..=1.0).contains(&x))
+        .unwrap_or(0.66)
 }
 
 /// Oracle top-cosine below which the embedding is confident *nothing* in the
@@ -368,13 +383,22 @@ pub(crate) fn rrf_fuse(sources: &[&[(NodeId, f32)]], k: f32) -> Vec<(NodeId, f32
 
 // ── Confidence classifier ─────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn classify_confidence(
     terms: &[ResolvedTerm],
     coverage: f32,
     top_bm25: f32,
     has_any_seeds: bool,
     #[allow(unused_variables)] has_knn_seeds: bool,
+    // Cluster oracle = the KNN nearest-neighbour cosines ONLY. Drives the
+    // cluster-level signals (oracle_top, semantic promote/veto) that were
+    // calibrated on neighbour density — must NOT be polluted with anchor
+    // self-cosines, which would spuriously inflate oracle_top on symbol queries.
     knn_oracle: &HashMap<NodeId, f32>,
+    // RFC-019: per-anchor cosines (KNN neighbours ∪ directly-scored anchors). Used
+    // only for the per-anchor `embed_agrees` / `embed_confirmed_specific` lookups.
+    anchor_oracle: &HashMap<NodeId, f32>,
+    scored_ids: &std::collections::HashSet<NodeId>,
 ) -> Confidence {
     let rare_max = rare_anchor_max();
     let cov_strong = coverage_strong();
@@ -391,11 +415,26 @@ fn classify_confidence(
     let oracle_top = knn_oracle.values().copied().fold(0.0_f32, f32::max);
     let oracle_confident = oracle_top >= SEMANTIC_ORACLE_MIN;
     let floor = (oracle_top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
+    // RFC-019: absence is no longer disagreement. With the direct-cosine oracle we
+    // MEASURE every specific anchor; an anchor's node that is absent from the oracle
+    // *after* we tried to score it (`scored_ids`) is genuinely unscoreable
+    // (no stored vector / degraded) → "unknown", not "the model rejects it" → we
+    // fall back to lexical evidence (agrees). Only an anchor that is present and
+    // below floor counts as disagreement. When no score hook ran (`scored_ids`
+    // empty — the FTS-only path), the old `unwrap_or(0.0)` semantics are preserved
+    // exactly, so behaviour is byte-for-byte identical without embeddings.
     let embed_agrees = |t: &ResolvedTerm| -> bool {
-        !oracle_confident
-            || t.top_node
-                .map(|n| knn_oracle.get(&n).copied().unwrap_or(0.0) >= floor)
-                .unwrap_or(false)
+        if !oracle_confident {
+            return true;
+        }
+        match t.top_node {
+            Some(n) => match anchor_oracle.get(&n).copied() {
+                Some(c) => c >= floor,                   // measured → trust the model
+                None if scored_ids.contains(&n) => true, // scored but unscoreable → unknown
+                None => false,                           // never scored → old absent⇒disagree
+            },
+            None => false,
+        }
     };
 
     // Only count anchors whose IDF weight is high enough to be meaningful signals
@@ -415,13 +454,24 @@ fn classify_confidence(
     // Unlike `embed_agrees`, this is NOT vacuously true when the oracle is cold/absent
     // — it is positive evidence used to rescue a query whose lexical coverage is
     // diluted by typos or generic filler but whose anchor the model confirms.
+    //
+    // RFC-019: with the direct-cosine oracle every specific anchor is now MEASURED, so
+    // a single query-word that is also a symbol name ("semantic" in "find code by
+    // semantic meaning") scores a real, lexical-overlap-inflated cosine (~0.615) that
+    // clears the weak `floor` (bottoms out at ABS_FLOOR 0.55) and would falsely confirm
+    // a salad. A LOW-coverage query is therefore only confirmed when its anchor sits in
+    // the *answerable* band (`confirm_anchor_floor`, ~0.66) — which a genuine
+    // low-coverage query clears ("Load mutationg manifests" → "manifests" ≈0.71) but
+    // the salad word does not. High-coverage exact queries are unaffected: they pass
+    // through `has_specific_anchor` (coverage ≥ cov_strong) regardless.
+    let confirm_floor = floor.max(confirm_anchor_floor());
     let embed_confirmed_specific = oracle_confident
         && terms.iter().any(|t| {
             t.resolved
                 && t.idf_w >= idf_min
                 && t.top_node
-                    .and_then(|n| knn_oracle.get(&n).copied())
-                    .is_some_and(|c| c >= floor)
+                    .and_then(|n| anchor_oracle.get(&n).copied())
+                    .is_some_and(|c| c >= confirm_floor)
         });
 
     // Fix 1+3a: semantic grounding. A confident oracle whose neighbours form a
@@ -568,6 +618,133 @@ fn semantic_validate(seeds: Vec<Seed>, oracle: &HashMap<NodeId, f32>) -> Vec<See
     scored.into_iter().map(|(s, _)| s).collect()
 }
 
+// ── RFC-019 seed re-rank helpers ──────────────────────────────────────────────
+
+/// Cosine at/above which a **structurally disjoint** non-exact seed is rescued from
+/// the contamination gate — i.e. treated as a genuine cross-package semantic match
+/// the graph missed rather than a token-collision false positive. Set near-duplicate
+/// high: measured token-collision seeds (`RemovePod` ≈0.751 for `GetWarningsForPod`)
+/// sit below it, so they are dropped, while a true near-duplicate (≈0.9) survives.
+/// Override via `TRAVSR_DISJOINT_RESCUE_COS`.
+fn disjoint_rescue_cos() -> f32 {
+    std::env::var("TRAVSR_DISJOINT_RESCUE_COS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| (0.0..=1.0).contains(&x))
+        .unwrap_or(0.85)
+}
+
+/// Max node-visits when expanding the exact anchors' structural neighbourhood —
+/// guards against a pathological high-degree hub blowing up the BFS.
+const ANCHOR_NEIGHBORHOOD_CAP: usize = 2_000;
+/// Hop radius for the structural-disjointness test in the contamination gate.
+const ANCHOR_NEIGHBORHOOD_HOPS: usize = 2;
+/// Max forward callees seeded per query from the exact anchors (ranked by
+/// `kind_boost`), so anchor-callee seeding cannot flood the personalisation vector.
+const MAX_ANCHOR_CALLEE_SEEDS: usize = 8;
+/// Base weight for an anchor-callee seed before `kind_boost`. High enough that the
+/// delegated function body ranks as a real dependency, below an exact anchor's
+/// floated weight so it never outranks the named symbol itself.
+const ANCHOR_CALLEE_WEIGHT_BASE: f32 = 0.8;
+
+/// Bounded ≤`ANCHOR_NEIGHBORHOOD_HOPS`-hop neighbourhood of `anchors` over
+/// structural edges in **both** directions. Used only to distinguish a
+/// contaminated seed (no path to any exact anchor) from a genuine dependency.
+/// O(visited·avg_degree); capped at `ANCHOR_NEIGHBORHOOD_CAP` visits. Edge-read
+/// errors degrade gracefully (that frontier simply doesn't expand).
+fn anchor_neighborhood(
+    store: &SqliteStore,
+    anchors: &std::collections::HashSet<NodeId>,
+) -> std::collections::HashSet<NodeId> {
+    let mut visited: std::collections::HashSet<NodeId> = anchors.iter().copied().collect();
+    let mut frontier: Vec<NodeId> = anchors.iter().copied().collect();
+    for _ in 0..ANCHOR_NEIGHBORHOOD_HOPS {
+        if frontier.is_empty() || visited.len() >= ANCHOR_NEIGHBORHOOD_CAP {
+            break;
+        }
+        let mut next: Vec<NodeId> = Vec::new();
+        for node in frontier.drain(..) {
+            if let Ok(fwd) = store.iter_edges_from(node) {
+                for e in fwd {
+                    if visited.insert(e.dst) {
+                        next.push(e.dst);
+                    }
+                }
+            }
+            if let Ok(rev) = store.iter_edges_to(node) {
+                for e in rev {
+                    if visited.insert(e.src) {
+                        next.push(e.src);
+                    }
+                }
+            }
+            if visited.len() >= ANCHOR_NEIGHBORHOOD_CAP {
+                break;
+            }
+        }
+        frontier = next;
+    }
+    visited
+}
+
+/// Forward `RefCall`/`Depends` callees of the exact `anchors`, as new PPR seeds.
+/// Filters build/test noise and RBAC-denied nodes, skips ids already seeded, and
+/// keeps the top `MAX_ANCHOR_CALLEE_SEEDS` by `kind_boost` (deterministic tie-break
+/// on NodeId). Weight = `ANCHOR_CALLEE_WEIGHT_BASE × kind_boost`.
+fn anchor_callee_seeds(
+    store: &SqliteStore,
+    filter: &dyn EdgeFilter,
+    anchors: &std::collections::HashSet<NodeId>,
+    existing: &std::collections::HashSet<NodeId>,
+) -> Vec<Seed> {
+    let mut callee_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for &anchor in anchors {
+        if let Ok(fwd) = store.iter_edges_from(anchor) {
+            for e in fwd {
+                if matches!(e.kind, EdgeKind::RefCall | EdgeKind::Depends)
+                    && !existing.contains(&e.dst)
+                    && !anchors.contains(&e.dst)
+                {
+                    callee_ids.insert(e.dst);
+                }
+            }
+        }
+    }
+    if callee_ids.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<NodeId> = callee_ids.into_iter().collect();
+    let nodes = match store.get_nodes(&ids) {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    let mut scored: Vec<(NodeId, f32)> = nodes
+        .into_iter()
+        .filter(|n| !is_noise_seed(n))
+        .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+        .map(|n| {
+            let w = ANCHOR_CALLEE_WEIGHT_BASE * kind_boost(&n.kind, &n.vname.language);
+            (n.id, w)
+        })
+        .collect();
+    // Highest kind_boost first; deterministic tie-break on NodeId ascending.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored.truncate(MAX_ANCHOR_CALLEE_SEEDS);
+    scored
+        .into_iter()
+        .map(|(node, weight)| Seed {
+            node,
+            weight,
+            source: SeedSource::Lexical,
+            score: weight,
+        })
+        .collect()
+}
+
 /// Build a `SeedSet` for `query` using per-token anchor resolution + whole-query
 /// lexical FTS, fused via RRF.
 ///
@@ -584,12 +761,14 @@ fn semantic_validate(seeds: Vec<Seed>, oracle: &HashMap<NodeId, f32>) -> Vec<See
 /// - `is_noise_seed` — excludes crates, test/bench fixtures, build artefacts
 /// - RBAC via `filter`
 /// - `MAX_SEEDS_PER_PATH` dedup (2 per file) to prevent all seeds clustering in one file
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn build_seed_set(
     store: &SqliteStore,
     query: &str,
     filter: &dyn EdgeFilter,
     knn_pairs: Vec<(CoreNode, f32)>,
     knn_oracle: &HashMap<NodeId, f32>,
+    score_fn: Option<&dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>>,
 ) -> SeedSet {
     const MAX_SEEDS_PER_PATH: usize = 2;
 
@@ -741,8 +920,11 @@ pub(crate) fn build_seed_set(
     // KNN seed competes fairly in the PPR personalisation vector. Raw cosine
     // (~0.65–0.80) would otherwise lose to a normalised FTS match × kind_boost
     // (up to ~3.0), systematically under-weighting semantic seeds.
+    // Filter KNN results through is_noise_seed before weighting: build-cache nodes,
+    // test paths, and OS caches must not enter the PPR personalisation vector.
     let knn_raw: Vec<(NodeId, f32)> = knn_pairs
         .iter()
+        .filter(|(n, _)| !is_noise_seed(n))
         .map(|(n, s)| {
             (
                 n.id,
@@ -795,13 +977,98 @@ pub(crate) fn build_seed_set(
 
     let has_knn = !knn_raw.is_empty();
 
+    // ── RFC-019: direct-cosine oracle augmentation ─────────────────────────────
+    // The KNN oracle only holds cosines for nodes the KNN over-fetch happened to
+    // surface. MEASURE the specific anchors (and exact-anchor nodes) it missed, so
+    // the classifier/ranker use a true query↔candidate cosine instead of inferring
+    // "relevance by membership". `scored_ids` records every id we submitted so the
+    // classifier can tell "scored but unscoreable → unknown" from "never scored".
+    // No-op when `score_fn` is None: `augmented_oracle == *knn_oracle`, `scored_ids`
+    // empty → every downstream path is byte-for-byte identical to the FTS-only path.
+    let mut augmented_oracle: HashMap<NodeId, f32> = knn_oracle.clone();
+    let mut scored_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    if let Some(score) = score_fn {
+        let mut to_score: Vec<NodeId> = Vec::new();
+        let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        for t in &terms {
+            if let Some(n) = t.top_node {
+                if !knn_oracle.contains_key(&n) && seen.insert(n) {
+                    to_score.push(n);
+                }
+            }
+        }
+        for &(id, _) in &anchor_raw {
+            if !knn_oracle.contains_key(&id) && seen.insert(id) {
+                to_score.push(id);
+            }
+        }
+        if !to_score.is_empty() {
+            scored_ids.extend(to_score.iter().copied());
+            for (id, cos) in score(query, &to_score) {
+                augmented_oracle.insert(id, cos);
+            }
+        }
+    }
+
     // ── Tier-1 semantic validation ────────────────────────────────────────────
     // When the embed oracle is confident, use the query cosine to demote lexical
     // anchors the embedding disagrees with. NL query words that are rare-by-
     // coincidence ("literal", "semantic") resolve to confident FTS anchors that
     // are semantically unrelated to intent; the whole-query embedding is the only
     // signal that detects this. No-op when embeddings are absent/degraded.
-    let mut seeds = semantic_validate(seeds, knn_oracle);
+    let mut seeds = semantic_validate(seeds, &augmented_oracle);
+
+    // ── RFC-019: seed re-rank (contamination gate + anchor-callee seeding) ─────
+    // Only when the query named an exact symbol (an exact anchor exists) — never on
+    // pure-NL queries, which have no anchor and must be left to the semantic path.
+    let exact_anchor_ids: std::collections::HashSet<NodeId> = seeds
+        .iter()
+        .filter(|s| s.source == SeedSource::Exact)
+        .map(|s| s.node)
+        .collect();
+    if !exact_anchor_ids.is_empty() {
+        // Bounded ≤2-hop structural neighbourhood of the exact anchors (both
+        // directions). Computed once; a non-exact seed OUTSIDE it is structurally
+        // disjoint from the named symbol.
+        let neighborhood = anchor_neighborhood(store, &exact_anchor_ids);
+
+        // Contamination gate. When the user names an exact symbol, its relevant
+        // context is its STRUCTURAL neighbourhood, and a token-collision embedding
+        // false positive is not distinguishable by cosine: measured on the live
+        // k8s index, `InterPodAffinity.RemovePod` scores cosine **0.751** to query
+        // `GetWarningsForPod` purely on the shared "Pod"/method tokens (BGE is
+        // NL-trained and cannot disambiguate code identifiers) — well above any
+        // sane floor. The reliable signal is structure: drop a non-exact seed that
+        // is structurally DISJOINT from every exact anchor, UNLESS its cosine is
+        // near-duplicate-high (a genuine cross-package semantic match the graph
+        // missed). Structurally-connected seeds and un-scoreable seeds are always
+        // kept, and the gate never fires on pure-NL queries (no exact anchor), so
+        // conceptual retrieval is untouched.
+        let rescue = disjoint_rescue_cos();
+        seeds.retain(|s| {
+            if s.source == SeedSource::Exact {
+                return true;
+            }
+            let disjoint = !neighborhood.contains(&s.node);
+            // Drop only a disjoint seed whose (known) cosine is below the
+            // near-duplicate rescue bar. Connected or un-scoreable → keep.
+            !disjoint
+                || augmented_oracle
+                    .get(&s.node)
+                    .map(|&c| c >= rescue)
+                    .unwrap_or(true)
+        });
+
+        // Anchor-callee seeding: add the exact anchors' own 1-hop RefCall/Depends
+        // callees as seeds, so the function body it delegates to
+        // (`warningsForPodSpecAndMeta` for `GetWarningsForPod` — private/lowercase,
+        // never lexically seeded) is scored as the dependency it is instead of
+        // being buried below a tangential seed. `enrich_seeds_with_callers` adds
+        // reverse (caller) edges; this adds the complementary forward callees.
+        let existing: std::collections::HashSet<NodeId> = seeds.iter().map(|s| s.node).collect();
+        let callees = anchor_callee_seeds(store, filter, &exact_anchor_ids, &existing);
+        seeds.extend(callees);
+    }
 
     // Exact-name priority: a node reached via an exact anchor hit is the symbol the
     // user literally named. It must anchor the PPR walk above any semantically-near
@@ -810,6 +1077,25 @@ pub(crate) fn build_seed_set(
     // and PPR ranks the neighbour first. Float every Exact seed's weight just above the
     // strongest non-exact seed so PPR concentrates mass on the named symbol and pulls
     // ITS neighbours in as context. No-op when there is no exact match (pure-NL queries).
+    // RFC-019 cosine-scaled teleportation: when the oracle is confident, scale each
+    // non-exact seed's PPR weight by its true cosine so teleportation mass tracks
+    // semantic proximity. A 0.46-cosine seed can no longer hand itself a PPR restart
+    // floor above a strong structural dependency of the 1.00 exact anchor (see the
+    // `GetWarningsForPod` evidence). Absent-from-oracle → cosine unknown → weight
+    // left unchanged (structural seeds like anchor callees keep their justification).
+    // No-op when the oracle is cold/absent.
+    let oracle_top = augmented_oracle.values().copied().fold(0.0_f32, f32::max);
+    let oracle_confident = oracle_top >= SEMANTIC_ORACLE_MIN;
+    if oracle_confident {
+        for s in seeds.iter_mut() {
+            if s.source != SeedSource::Exact {
+                if let Some(&cos) = augmented_oracle.get(&s.node) {
+                    s.weight *= cos.clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
+
     let max_non_exact = seeds
         .iter()
         .filter(|s| s.source != SeedSource::Exact)
@@ -823,13 +1109,11 @@ pub(crate) fn build_seed_set(
         // constant matched for "HorizontalPodAutoscaler reconcile loop") must not
         // outrank the semantically-correct neighbour (`reconcileAutoscaler`).
         // No-op when the oracle is cold/absent — `agrees` is vacuously true.
-        let oracle_top = knn_oracle.values().copied().fold(0.0_f32, f32::max);
-        let oracle_confident = oracle_top >= SEMANTIC_ORACLE_MIN;
         let cos_floor = (oracle_top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
         for s in seeds.iter_mut() {
             if s.source == SeedSource::Exact {
                 let agrees = !oracle_confident
-                    || knn_oracle.get(&s.node).copied().unwrap_or(0.0) >= cos_floor;
+                    || augmented_oracle.get(&s.node).copied().unwrap_or(0.0) >= cos_floor;
                 if agrees {
                     s.weight = s.weight.max(floor);
                 }
@@ -843,7 +1127,9 @@ pub(crate) fn build_seed_set(
         top_bm25,
         !seeds.is_empty(),
         has_knn,
-        knn_oracle,
+        knn_oracle,        // cluster signals: KNN neighbours only
+        &augmented_oracle, // per-anchor agreement: neighbours ∪ scored anchors
+        &scored_ids,
     );
 
     SeedSet {
@@ -1037,7 +1323,16 @@ mod tests {
     #[test]
     fn confidence_none_on_empty() {
         let terms: Vec<ResolvedTerm> = vec![];
-        let c = classify_confidence(&terms, 0.0, 0.0, false, false, &HashMap::new());
+        let c = classify_confidence(
+            &terms,
+            0.0,
+            0.0,
+            false,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(c, Confidence::None);
     }
 
@@ -1050,7 +1345,16 @@ mod tests {
             idf_w: 0.98, // very rare → specific anchor
             top_node: Some(NodeId(42)),
         }];
-        let c = classify_confidence(&terms, 1.0, 0.0, true, false, &HashMap::new());
+        let c = classify_confidence(
+            &terms,
+            1.0,
+            0.0,
+            true,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(c, Confidence::Exact);
     }
 
@@ -1063,7 +1367,16 @@ mod tests {
             idf_w: 0.0, // not resolved — idf_w irrelevant
             top_node: None,
         }];
-        let c = classify_confidence(&terms, 0.8, 2.0, true, false, &HashMap::new());
+        let c = classify_confidence(
+            &terms,
+            0.8,
+            2.0,
+            true,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(c, Confidence::Strong);
     }
 
@@ -1093,7 +1406,16 @@ mod tests {
         ];
         // Confident oracle that AGREES the anchor is near the query (cosine 0.95).
         let oracle = HashMap::from([(tweak, 0.95_f32)]);
-        let c = classify_confidence(&terms, 1.0, 0.4, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            1.0,
+            0.4,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Strong,
@@ -1116,11 +1438,133 @@ mod tests {
         }];
         // Confident oracle whose top hit is a DIFFERENT node — anchor absent (cosine 0).
         let oracle = HashMap::from([(NodeId(999), 0.88_f32)]);
-        let c = classify_confidence(&terms, 1.0, 0.4, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            1.0,
+            0.4,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Weak,
             "embed-disagreed anchor must stay Weak even at high coverage"
+        );
+    }
+
+    #[test]
+    fn confidence_rfc019_absent_but_scored_anchor_is_strong() {
+        // RFC-019 core case: `PodSpec` resolves `class:PodSpec` (specific, high-IDF)
+        // but that node lands OUTSIDE the KNN over-fetch → absent from the oracle.
+        // The direct-cosine oracle DID score it (it's in `scored_ids`) and found no
+        // stored vector / it's just absent — "unknown", NOT disagreement. Absence
+        // must no longer read as cosine 0 → weak; a measured specific anchor at high
+        // coverage is Strong.
+        let anchor = NodeId(100);
+        let terms = vec![ResolvedTerm {
+            token: "podspec".into(),
+            resolved: true,
+            symbol_freq: 8, // recurs across packages → not rare (not Exact)
+            idf_w: 0.58,    // >= idf_coverage_min → specific anchor
+            top_node: Some(anchor),
+        }];
+        // Confident oracle (top 0.79) whose near cluster does NOT contain the anchor,
+        // and only one node clears the floor (so semantic_strong can't fire — this
+        // Strong must come from the anchor path).
+        let oracle = HashMap::from([(NodeId(999), 0.79_f32)]);
+        let scored: std::collections::HashSet<NodeId> = [anchor].into_iter().collect();
+        let c = classify_confidence(&terms, 1.0, 0.4, true, true, &oracle, &oracle, &scored);
+        assert_eq!(
+            c,
+            Confidence::Strong,
+            "scored-but-absent specific anchor (unknown) must not be penalised → Strong"
+        );
+    }
+
+    #[test]
+    fn confidence_rfc019_absent_and_unscored_preserves_old_weak() {
+        // Load-bearing safety property: with NO score hook (`scored_ids` empty — the
+        // FTS-only path), an anchor absent from the confident oracle keeps the OLD
+        // absent⇒disagree semantics → Weak, byte-for-byte identical to pre-RFC-019.
+        // Identical inputs to the test above, only `scored_ids` differs.
+        let anchor = NodeId(100);
+        let terms = vec![ResolvedTerm {
+            token: "podspec".into(),
+            resolved: true,
+            symbol_freq: 8,
+            idf_w: 0.58,
+            top_node: Some(anchor),
+        }];
+        let oracle = HashMap::from([(NodeId(999), 0.79_f32)]);
+        let c = classify_confidence(
+            &terms,
+            1.0,
+            0.4,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            c,
+            Confidence::Weak,
+            "without a score hook, absent anchor keeps old absent⇒disagree → Weak"
+        );
+    }
+
+    #[test]
+    fn confidence_rfc019_low_coverage_answerable_band_gates_confirm() {
+        // Measured "find code by semantic meaning" shape: the lone resolved word
+        // "semantic" is also a symbol name, so the direct-cosine oracle MEASURES it
+        // at ≈0.615 — a lexical-overlap-inflated cosine that clears the weak floor
+        // (0.55) but sits in the nonsense band, below the answerable confirm floor
+        // (0.66). At low coverage (0.25) it must NOT confirm to Strong; the same
+        // shape with a genuine answerable-band anchor (0.71, "Load mutationg
+        // manifests") MUST. This is the salad-regression guard for the absent⇒
+        // unknown change.
+        let sem = NodeId(60);
+        let terms = vec![ResolvedTerm {
+            token: "semantic".into(),
+            resolved: true,
+            symbol_freq: 100,
+            idf_w: 0.63,
+            top_node: Some(sem),
+        }];
+        // Cluster oracle_top 0.659 (confident, but below promote 0.72 → no
+        // semantic_strong). Anchor oracle scores "semantic" at 0.615 (present, but
+        // below confirm floor 0.66). scored → we measured it.
+        let cluster = HashMap::from([(NodeId(999), 0.659_f32)]);
+        let anchor_oracle = HashMap::from([(sem, 0.615_f32)]);
+        let scored: std::collections::HashSet<NodeId> = [sem].into_iter().collect();
+        let c = classify_confidence(
+            &terms,
+            0.25,
+            15.0,
+            true,
+            true,
+            &cluster,
+            &anchor_oracle,
+            &scored,
+        );
+        assert_eq!(
+            c,
+            Confidence::Weak,
+            "answerable-band gate: a below-0.66 anchor must not confirm a low-coverage salad"
+        );
+
+        // Same shape, anchor now in the answerable band (0.71) → Strong.
+        let anchor_ok = HashMap::from([(sem, 0.71_f32)]);
+        let c2 = classify_confidence(
+            &terms, 0.25, 15.0, true, true, &cluster, &anchor_ok, &scored,
+        );
+        assert_eq!(
+            c2,
+            Confidence::Strong,
+            "answerable-band anchor (≥0.66) confirms a genuine low-coverage query"
         );
     }
 
@@ -1156,7 +1600,16 @@ mod tests {
         ];
         // Confident oracle (top 0.773) that AGREES the anchor is near (cos 0.71 ≥ floor 0.643).
         let oracle = HashMap::from([(manifests, 0.71_f32), (NodeId(99), 0.773_f32)]);
-        let c = classify_confidence(&terms, 0.333, 19.0, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            0.333,
+            19.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Strong,
@@ -1189,7 +1642,16 @@ mod tests {
         ];
         // Confident oracle (top 0.659) whose neighbours do NOT include the anchor.
         let oracle = HashMap::from([(NodeId(99), 0.659_f32)]);
-        let c = classify_confidence(&terms, 0.25, 15.0, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            0.25,
+            15.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Weak,
@@ -1207,7 +1669,16 @@ mod tests {
             idf_w: 0.40, // too generic to count as specific anchor
             top_node: Some(NodeId(7)),
         }];
-        let c = classify_confidence(&terms, 0.3, 0.1, true, false, &HashMap::new());
+        let c = classify_confidence(
+            &terms,
+            0.3,
+            0.1,
+            true,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(c, Confidence::Weak);
     }
 
@@ -1222,7 +1693,16 @@ mod tests {
             idf_w: 0.93, // rare → counts as specific anchor
             top_node: Some(NodeId(9)),
         }];
-        let c = classify_confidence(&terms, 0.1, 0.0, true, false, &HashMap::new());
+        let c = classify_confidence(
+            &terms,
+            0.1,
+            0.0,
+            true,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Weak,
@@ -1242,7 +1722,16 @@ mod tests {
             idf_w: 0.526, // real idf for "map" in a 6940-node corpus
             top_node: Some(NodeId(5)),
         }];
-        let c = classify_confidence(&terms, 0.0, 0.1, true, false, &HashMap::new());
+        let c = classify_confidence(
+            &terms,
+            0.0,
+            0.1,
+            true,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::None,
@@ -1261,7 +1750,16 @@ mod tests {
             idf_w: 0.0,
             top_node: None,
         }];
-        let c = classify_confidence(&terms, 0.0, 0.0, true, true, &HashMap::new());
+        let c = classify_confidence(
+            &terms,
+            0.0,
+            0.0,
+            true,
+            true,
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::None,
@@ -1293,7 +1791,16 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let c = classify_confidence(&terms, 0.0, 0.0, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            0.0,
+            0.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Strong,
@@ -1317,7 +1824,16 @@ mod tests {
             [(NodeId(1), 0.64), (NodeId(2), 0.62), (NodeId(3), 0.60)]
                 .into_iter()
                 .collect();
-        let c = classify_confidence(&terms, 0.0, 0.0, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            0.0,
+            0.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::None,
@@ -1340,7 +1856,16 @@ mod tests {
         }];
         // oracle present but far (top 0.49 < veto 0.55); anchor absent from oracle.
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
-        let c = classify_confidence(&terms, 0.5, 12.0, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            0.5,
+            12.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::None,
@@ -1362,7 +1887,16 @@ mod tests {
         }];
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
         // Low coverage so it doesn't hit the Exact branch; must land on Weak, not None.
-        let c = classify_confidence(&terms, 0.3, 0.1, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            0.3,
+            0.1,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Weak,
@@ -1383,7 +1917,16 @@ mod tests {
         }];
         // Oracle present but weak (0.50 < veto 0.55) — would veto if lexical were weak.
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.50)].into_iter().collect();
-        let c = classify_confidence(&terms, 0.8, 2.0, true, true, &oracle);
+        let c = classify_confidence(
+            &terms,
+            0.8,
+            2.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             c,
             Confidence::Strong,

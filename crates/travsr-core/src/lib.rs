@@ -498,14 +498,34 @@ pub fn display_label(node: &Node) -> &str {
 }
 
 /// Returns `true` for nodes that carry no developer-facing signal:
-/// vendored paths and SCIP anonymous locals.
+/// vendored paths, OS/build caches, repo-escaping paths, and SCIP anonymous locals.
+///
+/// This is the single source of truth for structural noise. `is_noise_seed`
+/// (travsr-mcp) calls this first and then adds MCP-layer policy on top.
 pub fn is_noise_node(node: &Node) -> bool {
     let p = &node.vname.path;
-    p.starts_with("third_party/")
+    // Vendored / package-manager directories.
+    if p.starts_with("third_party/")
         || p.starts_with("vendor/")
         || p.starts_with("node_modules/")
         || p.contains("/node_modules/")
-        || is_scip_anonymous_local(&node.vname.signature)
+    {
+        return true;
+    }
+    // Paths that escape the repo root are never real source nodes
+    // (e.g. Go build-cache: `../../../Library/Caches/go-build/…`).
+    if p.starts_with("../") {
+        return true;
+    }
+    // OS-level build and package caches.
+    if p.contains("/Library/Caches/")
+        || p.contains("/.cache/")
+        || p.contains("/go-build/")
+        || p.contains("/go/pkg/mod/")
+    {
+        return true;
+    }
+    is_scip_anonymous_local(&node.vname.signature)
 }
 
 /// Returns `true` if `sig` is a SCIP anonymous-local symbol (`local N` suffix).
@@ -1282,5 +1302,77 @@ mod tests {
             "function",
         );
         assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_repo_escaping_path() {
+        let n = Node::new(
+            VName::new(
+                "",
+                "",
+                "../../../Library/Caches/go-build/80/abc-d",
+                "go",
+                "file",
+            ),
+            "file",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_library_caches() {
+        let n = Node::new(
+            VName::new("", "", "a/b/Library/Caches/go-build/x", "go", "fn:foo"),
+            "function",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_dot_cache() {
+        let n = Node::new(
+            VName::new("", "", "x/.cache/yarn/v6/blah", "typescript", "fn:bar"),
+            "function",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_go_build_cache() {
+        let n = Node::new(
+            VName::new("", "", "home/user/.cache/go-build/ab/abcdef", "go", "fn:f"),
+            "function",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_go_pkg_mod() {
+        let n = Node::new(
+            VName::new(
+                "",
+                "",
+                "a/go/pkg/mod/github.com/foo/bar@v1.0.0/baz.go",
+                "go",
+                "fn:Baz",
+            ),
+            "function",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_keeps_real_source_node() {
+        let n = Node::new(
+            VName::new(
+                "",
+                "",
+                "pkg/api/servicecidr/servicecidr.go",
+                "go",
+                "fn:OverlapsPrefix",
+            ),
+            "function",
+        );
+        assert!(!is_noise_node(&n));
     }
 }
