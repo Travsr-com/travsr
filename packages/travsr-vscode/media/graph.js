@@ -172,6 +172,11 @@ let edgeKinds  = { calls: true, imports: true };
 let blastOn      = false;
 let blastPreNodes = null; // positions/classes to restore
 let currentReqId = 0;
+
+// When a query matches multiple symbol implementations (e.g. two files both
+// define fn:ContainsPrefix), _disambigRoot holds the selected root node ID to
+// isolate in the canvas. null = show all roots together (default).
+let _disambigRoot = null;
 let peekDefLine  = 0;
 let peekDefPath  = '';
 
@@ -256,17 +261,24 @@ function assignSignedHops(nodes, edges) {
   const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
   nodes.forEach(n => { n.hop = undefined; });
 
-  const root = nodes.find(n => n.root);
+  // Seed BFS from ALL root nodes simultaneously so that multi-implementation
+  // queries (e.g. "ContainsPrefix" matching two files) correctly place every
+  // root at hop=0 and assign signs to their distinct neighbourhoods.
+  const roots = nodes.filter(n => n.root);
 
   // BFS to assign SIGN only: outgoing structural edge = dep (+), incoming = caller (−).
   // We deliberately do NOT use BFS hop-counts as magnitude: in dense subgraphs
   // (k8s depth=4 returns 300 nodes with many cross-edges) the shortest subgraph
   // path is often 1 hop, collapsing all nodes into hop=±1.
   // Magnitude comes from score (score ≈ 0.7^|hop|, calculated on the global graph).
-  if (root) {
-    root.hop = 0;
-    const sign = { [root.id]: 0 }; // 0=root, 1=dep, -1=caller
-    const queue = [root.id];
+  if (roots.length) {
+    const sign = {};
+    const queue = [];
+    for (const r of roots) {
+      r.hop = 0;
+      sign[r.id] = 0; // 0=root, 1=dep, -1=caller
+      queue.push(r.id);
+    }
     while (queue.length) {
       const curId = queue.shift();
       const curSign = sign[curId];
@@ -287,7 +299,7 @@ function assignSignedHops(nodes, edges) {
 
     // Assign hops: sign from BFS, magnitude from score (global graph distance).
     nodes.forEach(n => {
-      if (n === root) return;
+      if (n.root) return; // all roots stay at hop 0
       const s = Math.min(0.99, Math.max(0.001, n.score || 0.3));
       const absHop = Math.max(1, Math.round(Math.log(s) / Math.log(0.7)));
       const sg = sign[n.id];
@@ -316,9 +328,50 @@ function assignSignedHops(nodes, edges) {
   });
 }
 
+// ── Disambiguation bar ─────────────────────────────────────────────────────────
+// Appears when the query returns ≥2 root nodes (same symbol name, different files).
+// Each chip isolates that implementation's subgraph; "all" restores the combined view.
+function renderDisambigBar() {
+  const bar = document.getElementById('disambig-bar');
+  if (!bar) return;
+  const roots = allNodes.filter(n => n.root);
+  if (roots.length <= 1) {
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+
+  function chipLabel(r) {
+    const base = shortLabel(r.label, r.id);
+    const parts = (r.path || '').split('/');
+    const sub   = parts.length >= 2 ? parts.slice(-2).join('/') : (parts[0] || '');
+    return sub ? base + ' · ' + sub : base;
+  }
+
+  const allActive = _disambigRoot === null;
+  const chipsHtml = [
+    `<span class="db-chip db-all${allActive ? ' active' : ''}" data-root="" title="Show all implementations">all</span>`,
+    ...roots.map(r => {
+      const lbl = escHtml(chipLabel(r));
+      const active = _disambigRoot === r.id ? ' active' : '';
+      return `<span class="db-chip${active}" data-root="${escHtml(r.id)}" title="${escHtml(r.id)}">${lbl}</span>`;
+    }),
+  ].join('');
+
+  bar.innerHTML = `<span class="db-label">implementations</span><div class="db-chips">${chipsHtml}</div>`;
+
+  bar.querySelectorAll('.db-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      _disambigRoot = chip.dataset.root || null;
+      renderDisambigBar();
+      renderGraph(_disambigRoot || undefined);
+    });
+  });
+}
+
 // ── Build Cytoscape elements from filtered data ────────────────────────────────
 function buildElements() {
-  const visNodes = allNodes.filter(n => {
+  let visNodes = allNodes.filter(n => {
     if (!varsOn && n.kind === 'var') return false;
     if (noiseOn && isNoise(n.path)) return false;
     if (Math.abs(n.hop || 0) > depth) return false;
@@ -327,6 +380,22 @@ function buildElements() {
     if (direction === 'deps'    && (n.hop || 0) < 0) return false;
     return true;
   });
+
+  // Disambig mode: isolate the selected root's subgraph by bidirectional BFS
+  // through visible edges, then hide the other roots from this view.
+  if (_disambigRoot !== null) {
+    const reachable = new Set([_disambigRoot]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      allEdges.forEach(e => {
+        if (reachable.has(e.source) && !reachable.has(e.target)) { reachable.add(e.target); changed = true; }
+        if (reachable.has(e.target) && !reachable.has(e.source)) { reachable.add(e.source); changed = true; }
+      });
+    }
+    visNodes = visNodes.filter(n => reachable.has(n.id));
+  }
+
   const visIds = new Set(visNodes.map(n => n.id));
   const visById = Object.fromEntries(visNodes.map(n => [n.id, n]));
 
@@ -348,14 +417,28 @@ function buildElements() {
     });
   }
 
-  // Nodes
+  // Nodes — detect duplicate base labels so same-name symbols from different
+  // files get a disambiguating path subtitle (e.g. "v1alpha1/types.go").
+  const _labelCount = {};
+  visNodes.forEach(n => {
+    if (n.kind !== 'file') _labelCount[n.label] = (_labelCount[n.label] || 0) + 1;
+  });
+  function disambigLabel(n) {
+    const base = shortLabel(n.label, n.id);
+    if (_labelCount[n.label] > 1 && n.path) {
+      const parts = n.path.split('/');
+      const subtitle = parts.length >= 2 ? parts.slice(-2).join('/') : parts[0];
+      return base + '\n' + subtitle;
+    }
+    return base;
+  }
   visNodes.forEach(n => {
     const d = deg[n.id] || 0;
     const sz = n.root ? 52 : Math.min(52, 26 + d * 5);
     const isHidden = n.kind === 'var' && !varsOn;
     els.push({
       data: {
-        id: n.id, label: shortLabel(n.label, n.id), kind: n.kind, path: n.path || '',
+        id: n.id, label: disambigLabel(n), kind: n.kind, path: n.path || '',
         pkg: n.package || '', score: n.score || 0, line: n.line || 0,
         hop: n.hop || 0, root: !!n.root, degree: d,
         w: n.kind === 'var' ? 42 : sz, h: n.kind === 'var' ? 18 : sz,
@@ -520,7 +603,7 @@ function renderGraph(bloomOriginId) {
     // Use a zoom level that keeps nodes legible regardless of graph size.
     // For small graphs (≤25 nodes) fit is fine; for larger ones lock to a
     // readable zoom and centre on the root node so the user can pan to explore.
-    const rootId = (allNodes.find(nd => nd.root) || {}).id;
+    const rootId = _disambigRoot || (allNodes.find(nd => nd.root) || {}).id;
     const rootEl = rootId ? cy.getElementById(rootId) : null;
     if (n <= 25) {
       cy.fit(cy.elements(), 55);
@@ -621,8 +704,10 @@ window.addEventListener('message', event => {
     allEdges = (data.edges || []);
     loadedDepth = depth;
     loadedDirection = direction;
+    _disambigRoot = null; // reset on every new query
 
     assignSignedHops(allNodes, allEdges);
+    renderDisambigBar();
     renderGraph(allNodes.find(n => n.root)?.id);
     renderBreadcrumb();
 
@@ -655,6 +740,8 @@ function submitQuery(forceFetch) {
   const depthOk = depth <= loadedDepth;
   const dirOk = direction === loadedDirection || loadedDirection === 'both';
   if (!forceFetch && !_overviewActive && allNodes.length > 0 && depthOk && dirOk) {
+    _disambigRoot = null;
+    renderDisambigBar();
     renderGraph();
     return;
   }

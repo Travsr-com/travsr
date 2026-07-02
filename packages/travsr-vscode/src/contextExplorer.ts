@@ -431,9 +431,10 @@ body{background:var(--bg);color:var(--fg);font-family:var(--font-sans);
   margin-top:2px;cursor:pointer;display:inline-block}
 .node .loc:hover{color:var(--node);text-decoration:underline}
 .via{
-  display:inline-flex;align-items:center;gap:4px;font-size:9.5px;font-weight:700;
-  text-transform:uppercase;letter-spacing:.05em;padding:3px 8px;
-  border-radius:var(--r-full);flex-shrink:0}
+  display:inline-block;vertical-align:middle;font-size:8px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;
+  border-radius:var(--r-full);flex-shrink:0;
+  max-width:220px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .via.seed{color:var(--via-seed);background:var(--via-seed-bg)}
 .via.caller{color:var(--via-caller);background:var(--via-caller-bg)}
 .via.dependency{color:var(--via-dependency);background:var(--via-dependency-bg)}
@@ -596,6 +597,13 @@ function viaClass(via){
   if(v==='caller') return 'caller';
   if(v.includes('dep')) return 'dependency';
   return 'context';
+}
+
+// Strip structural type prefixes (fn:, method:, class:, etc.) so the badge
+// shows "CALLER OF CONTAINSPREFIX" instead of "CALLER OF FN:CONTAINSPREFIX".
+// Full string is still shown in the title tooltip.
+function shortVia(via) {
+  return String(via).replace(/\b(fn|class|method|interface|var|import):/gi, '');
 }
 
 function confPillClass(conf){
@@ -815,7 +823,7 @@ function renderNodeList(){
       <span class="loc" data-path="\${esc(n.path)}" data-line="\${n.line??''}">\${pathLine}</span>
     </div>
     \${pinBadge}\${snipBadge}
-    <span class="via \${viaClass(n.via)}">\${esc(n.via)}</span>
+    <span class="via \${viaClass(n.via)}" title="\${esc(n.via)}">\${esc(shortVia(n.via))}</span>
     \${scoreHtml}
     <span class="chev">▸</span>
   </div>

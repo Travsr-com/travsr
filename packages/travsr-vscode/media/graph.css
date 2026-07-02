@@ -191,6 +191,28 @@ input[type=range] { width: 72px; accent-color: var(--green-300); cursor: pointer
 #blastExit { margin-left: auto; border: 1px solid rgba(251,146,60,.42); color: var(--orange-300); }
 #blastExit:hover { background: rgba(251,146,60,.12); color: #ffd9b3; }
 
+/* ── Disambiguation bar ──────────────────────────────────────────────────── */
+#disambig-bar {
+  display: none; align-items: center; gap: 8px; padding: 6px 14px;
+  background: linear-gradient(180deg,rgba(10,22,10,.97),rgba(6,16,6,.97));
+  border-bottom: 1px solid rgba(134,223,134,.18); font-size: 11px;
+  color: var(--fg-muted); flex-shrink: 0;
+}
+#disambig-bar .db-label {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--fg-muted); flex-shrink: 0;
+}
+#disambig-bar .db-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.db-chip {
+  padding: 3px 10px; border-radius: var(--r-full); border: 1px solid var(--border-mid);
+  cursor: pointer; font-size: 10px; font-weight: 600; color: var(--fg-muted);
+  user-select: none; transition: all var(--dur-fast) var(--ease);
+  white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+}
+.db-chip:hover { border-color: var(--ch-400); color: var(--ch-200); }
+.db-chip.active { border-color: var(--line-green); color: var(--green-300); background: var(--tint-green); }
+.db-chip.db-all { border-style: dashed; }
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 #main {
   flex: 1; display: flex; min-height: 0; position: relative;
