@@ -45,14 +45,11 @@ pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyh
     // Guard with is_terminal so we never spawn a background process in CI,
     // piped contexts, or integration tests (where it would race the DB lock).
     use std::io::IsTerminal as _;
-    if std::io::stdout().is_terminal() && !super::daemon_is_running(&repo_root, 3, 100) {
+    if std::io::stdout().is_terminal() {
+        // Race-free: spawns only if no daemon holds the lock, so a re-`init` over
+        // an already-running daemon never forks a doomed child.
         let exe = std::env::current_exe().context("finding current exe path")?;
-        let _ = std::process::Command::new(&exe)
-            .args(["daemon", "start", "--foreground"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let _ = crate::daemon_client::spawn_background_daemon(&repo_root, &exe);
     }
 
     crate::progress::print_summary(&stats, elapsed, quiet);

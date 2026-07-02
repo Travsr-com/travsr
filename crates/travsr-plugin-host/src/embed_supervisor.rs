@@ -16,6 +16,12 @@ use crate::embed_sidecar::{EmbedCapabilities, EmbedSidecar};
 /// Callback type for Step 4 — matches `travsr_store::EmbedKnnHook`.
 type KnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
+/// RFC-019: callback that embeds one query and returns its raw vector BLOB
+/// (backend-defined layout, same as stored `node_embeddings.embedding`). The
+/// injection site decodes it and reads candidate vectors via `travsr_store`.
+/// Kept SQLite-free so the plugin-host crate gains no storage dependency.
+pub type EmbedQueryHook = Arc<dyn Fn(&str) -> Result<Vec<u8>, StoreError> + Send + Sync>;
+
 /// FT-H3: maximum respawn attempts before permanently disabling the supervisor.
 const MAX_RESPAWN_ATTEMPTS: u32 = 3;
 
@@ -165,6 +171,46 @@ impl EmbedSupervisor {
 
             // Return whatever arrived within the budget. `unwrap_or_default`
             // covers both timeout (Disconnected or Timeout) and spawn failure.
+            Ok(rx
+                .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
+                .unwrap_or_default())
+        }))
+    }
+
+    /// Build the RFC-019 query-embedding hook: embeds one short query text and
+    /// returns its raw vector BLOB. `None` when the supervisor is inactive.
+    ///
+    /// Same cold-start protection as [`Self::knn_hook`]: a worker thread does the
+    /// blocking `embed_batch` I/O while the calling thread waits at most
+    /// `KNN_CALL_TIMEOUT_MS`. On timeout or error the hook returns an **empty**
+    /// BLOB — the caller's `decode_embedding` then fails and no candidates are
+    /// scored (unknown), so a slow/cold sidecar can never stall `get_context` or
+    /// fabricate a false cosine. Warm `embed_batch` of one short text is ~tens of ms.
+    pub fn embed_query_hook(&self) -> Option<EmbedQueryHook> {
+        let arc = self.inner.as_ref()?.clone();
+        Some(Arc::new(move |query: &str| {
+            let arc2 = Arc::clone(&arc);
+            let query_owned = query.to_string();
+
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            std::thread::Builder::new()
+                .name("embed-query-worker".into())
+                .spawn(move || {
+                    let Ok(sidecar) = arc2.lock() else { return };
+                    if !sidecar.is_alive() {
+                        return;
+                    }
+                    match sidecar.embed_batch(std::slice::from_ref(&query_owned)) {
+                        Ok(mut blobs) if !blobs.is_empty() => {
+                            let _ = tx.send(blobs.swap_remove(0));
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("embed query failed (non-fatal): {e}"),
+                    }
+                })
+                .ok();
+
+            // Empty vec on timeout / spawn failure → decode fails → no scoring.
             Ok(rx
                 .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
                 .unwrap_or_default())

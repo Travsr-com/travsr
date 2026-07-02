@@ -3203,6 +3203,7 @@ dependencies = [
  "tracing",
  "travsr-analysis",
  "travsr-core",
+ "travsr-error",
  "travsr-plugin-host",
  "travsr-retrieval",
  "travsr-store",

@@ -2616,10 +2616,14 @@ impl Daemon {
 
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");
+        // NB: intentionally NO `.truncate(true)`. O_TRUNC would leave the file
+        // observably empty between this open and the PID write below, during which
+        // the CLI's lock-PID fallback reads nothing and wrongly concludes "no
+        // daemon" — spawning a doomed child. We overwrite + trim after acquiring
+        // the lock instead (below), so the file is never empty while it is held.
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
             .open(&lock_path)
             .context("opening daemon.lock")?;
         lock_file.try_lock_exclusive().map_err(|_| {
@@ -2631,9 +2635,13 @@ impl Daemon {
                 .unwrap_or_default();
             anyhow::anyhow!("another travsr daemon is already running{pid}")
         })?;
-        // Write our PID into the lockfile for `daemon status`.
-        use std::io::Write as _;
-        write!(&lock_file, "{}", std::process::id())?;
+        // Write our PID into the lockfile for `daemon status`. Overwrite from the
+        // start and trim any older, longer PID (we did not truncate on open).
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let pid = std::process::id().to_string();
+        (&lock_file).seek(SeekFrom::Start(0))?;
+        (&lock_file).write_all(pid.as_bytes())?;
+        lock_file.set_len(pid.len() as u64)?;
 
         let db_path = travsr_dir.join("graph.db");
         let store = Arc::new(Mutex::new(
@@ -3348,6 +3356,23 @@ pub fn try_inject_embed_hook(
         // once at startup before the daemon serves any request.
         supervisor.prewarm();
         query_store.set_embed_knn_hook(hook);
+        // RFC-019: inject the direct-cosine oracle beside the KNN hook. Reuses the
+        // same warm sidecar for the query embedding; candidate vectors are read from
+        // embed.db by travsr-store. `None` query-hook → no score hook → the FTS-only
+        // path is unchanged.
+        if let Some(qhook) = supervisor.embed_query_hook() {
+            let embed_db = db_path.with_file_name("embed.db");
+            let model = model_id.clone();
+            let score: travsr_store::EmbedScoreHook =
+                std::sync::Arc::new(move |q: &str, ids: &[travsr_core::NodeId]| {
+                    let blob = qhook(q)?;
+                    match travsr_store::decode_embedding(&blob) {
+                        Some(qv) => travsr_store::score_candidates(&qv, &embed_db, &model, ids),
+                        None => Ok(vec![]),
+                    }
+                });
+            query_store.set_embed_score_hook(score);
+        }
         // Persist the active model_id so future startups detect backend switches.
         if let Err(e) = write_store.set_meta("current_embed_model", &model_id) {
             tracing::warn!("embed: failed to persist current_embed_model: {e}");

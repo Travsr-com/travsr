@@ -223,7 +223,13 @@ pub fn ask_query(
         embed_contributed = false;
     }
 
-    let seed_set = crate::seed::build_seed_set(store, query, &OpenFilter, knn_pairs, &knn_oracle);
+    // RFC-019: direct-cosine oracle hook (None when embeddings off → FTS-only path).
+    let score_fn = store.embed_score_fn();
+    let score_ref = score_fn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, &[travsr_core::NodeId]) -> Vec<(travsr_core::NodeId, f32)>);
+    let seed_set =
+        crate::seed::build_seed_set(store, query, &OpenFilter, knn_pairs, &knn_oracle, score_ref);
 
     // Abstain when confidence is None — prevents "confident salad" on no-match queries (R1).
     if seed_set.confidence == crate::seed::Confidence::None {

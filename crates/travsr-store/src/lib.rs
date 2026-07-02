@@ -31,6 +31,18 @@ use std::sync::Arc;
 pub type EmbedKnnHook =
     Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
+/// Type alias for the RFC-019 direct-cosine oracle callback injected beside
+/// [`EmbedKnnHook`]. Given the query text and a set of candidate node ids, it
+/// returns the true query↔candidate cosine for **every candidate it can score**.
+///
+/// Contract (load-bearing): ids the embedding layer cannot score (no stored
+/// vector, degraded sidecar) are **omitted** from the result — the caller must
+/// treat omission as "unknown", never as cosine 0. A `None` hook is byte-for-byte
+/// identical to `EmbedKnnHook = None`: the whole re-rank path collapses to the
+/// FTS-only behaviour.
+pub type EmbedScoreHook =
+    Arc<dyn Fn(&str, &[NodeId]) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
+
 /// Shared arm-state for the embed KNN hook. The injector (MCP/daemon) marks it
 /// ready once the sidecar is warm; the query path reads it to decide whether to
 /// briefly wait (so the first query uses embeddings) and whether to report
@@ -91,6 +103,115 @@ use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 use travsr_error::StoreError;
 
 use crate::fts_tokenize::{build_fuzzy_match_expr_db, tokenize_identifier};
+
+// ── RFC-019 direct-cosine oracle helpers ──────────────────────────────────────
+
+/// Decode a stored embedding BLOB into an `f32` vector.
+///
+/// All shipping backends write dense little-endian `f32` (BGE 384/768/1024-dim,
+/// pre-normalised at index time). Returns `None` for an empty blob or a length
+/// that is not a whole number of `f32` lanes — the caller then treats the id as
+/// unscoreable (omitted), never as cosine 0.
+pub fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// Cosine similarity between two equal-length vectors. Returns 0.0 when either
+/// side is degenerate (zero norm) or the lengths differ — a defensive, never-NaN
+/// result. Vectors are pre-normalised at index time so this is ≈ a dot product,
+/// but we normalise anyway so a non-normalising future backend stays correct.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom <= 0.0 || !denom.is_finite() {
+        0.0
+    } else {
+        (dot / denom).clamp(-1.0, 1.0)
+    }
+}
+
+/// RFC-019 Option A: score `ids` against a pre-embedded `query_vec` by reading the
+/// stored candidate vectors from `embed.db` and computing the true cosine.
+///
+/// Opens `embed_db_path` read-only (the sidecar owns writes) and reads the blobs
+/// for `model_id`. Ids with no stored row or an undecodable blob are **omitted**
+/// from the result (contract: omission = "unknown"). Chunked at 500 ids to stay
+/// within SQLite's bound-parameter limit.
+///
+/// O(N·d), N = #ids (≤ ~40 in practice), d = vector dim → microseconds after the
+/// local read. Errors from opening/reading `embed.db` surface as `StoreError` so
+/// the caller (via `embed_score_fn`) degrades to the FTS-only path.
+pub fn score_candidates(
+    query_vec: &[f32],
+    embed_db_path: &Path,
+    model_id: &str,
+    ids: &[NodeId],
+) -> Result<Vec<(NodeId, f32)>, StoreError> {
+    if ids.is_empty() || query_vec.is_empty() || !embed_db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        embed_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    let mut out: Vec<(NodeId, f32)> = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT node_id, embedding FROM node_embeddings \
+             WHERE model_id = ? AND node_id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        // Bind model_id first, then the chunk's node ids (i64, matching storage).
+        let mut binds: Vec<i64> = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            binds.push(id.0 as i64);
+        }
+        let rows = stmt
+            .query_map(
+                params_from_iter(
+                    std::iter::once(rusqlite::types::Value::Text(model_id.to_string()))
+                        .chain(binds.into_iter().map(rusqlite::types::Value::Integer)),
+                ),
+                |r| {
+                    let id: i64 = r.get(0)?;
+                    let blob: Vec<u8> = r.get(1)?;
+                    Ok((id, blob))
+                },
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        for row in rows {
+            let (id, blob) = row.map_err(|e| StoreError::Database(e.to_string()))?;
+            if let Some(v) = decode_embedding(&blob) {
+                out.push((NodeId(id as u64), cosine(query_vec, &v)));
+            }
+        }
+    }
+    Ok(out)
+}
 
 // ── SQLite migration structs (T2) ─────────────────────────────────────────────
 // Each SQL file becomes a concrete Migration so the runner can apply them
@@ -486,6 +607,10 @@ pub struct SqliteStore {
     /// running. The store crate has zero knowledge of the plugin system; only the
     /// daemon injects this via `set_embed_knn_hook`.
     embed_knn_hook: Option<EmbedKnnHook>,
+    /// RFC-019: optional direct-cosine oracle hook injected beside `embed_knn_hook`
+    /// by the same injector (daemon / MCP). `None` by default — the FTS-only path
+    /// is identical when absent.
+    embed_score_hook: Option<EmbedScoreHook>,
     /// Arm-state for the embed hook (set alongside `embed_knn_hook` by injectors
     /// that support warm-up signalling). `None` for legacy/test injectors and
     /// in-memory stores — in that case `embed_ready` falls back to hook presence.
@@ -520,6 +645,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
             };
@@ -582,6 +708,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
             };
@@ -608,6 +735,7 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: None,
             };
@@ -678,6 +806,26 @@ impl SqliteStore {
         let hook = self.embed_knn_hook.clone()?;
         Some(move |query: &str, k: u32| -> Vec<(NodeId, f32)> {
             hook(query, k).unwrap_or_default()
+        })
+    }
+
+    /// Inject the RFC-019 direct-cosine oracle hook. Injected beside
+    /// `set_embed_knn_hook` by the same injector (daemon / MCP) once the sidecar
+    /// is warm.
+    pub fn set_embed_score_hook(&mut self, hook: EmbedScoreHook) {
+        self.embed_score_hook = Some(hook);
+    }
+
+    /// Return a callable wrapper around the RFC-019 score hook, or `None` when no
+    /// hook has been injected. Mirrors [`Self::embed_knn_fn`]: the closure owns an
+    /// `Arc` clone so it outlives the borrow, and a hook error is swallowed into an
+    /// empty vec — a degraded score reads as "no candidates scored" (unknown),
+    /// never as a hard failure or a false cosine 0.
+    #[allow(clippy::type_complexity)]
+    pub fn embed_score_fn(&self) -> Option<impl Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>> {
+        let hook = self.embed_score_hook.clone()?;
+        Some(move |query: &str, ids: &[NodeId]| -> Vec<(NodeId, f32)> {
+            hook(query, ids).unwrap_or_default()
         })
     }
 
@@ -4047,6 +4195,85 @@ mod tests {
             VName::new("test-corpus", "main", "src/foo.ts", "typescript", sig),
             "function",
         )
+    }
+
+    // ── RFC-019 direct-cosine oracle helpers ──────────────────────────────
+
+    fn blob_of(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn decode_embedding_round_trips_f32_le() {
+        let v = vec![0.1_f32, -0.25, 0.5, 1.0];
+        let decoded = decode_embedding(&blob_of(&v)).expect("valid blob");
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn decode_embedding_rejects_ragged_and_empty() {
+        assert!(decode_embedding(&[]).is_none(), "empty blob → None");
+        assert!(decode_embedding(&[1, 2, 3]).is_none(), "len%4≠0 → None");
+    }
+
+    #[test]
+    fn cosine_is_defensive_on_degenerate_input() {
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0, "zero norm → 0");
+        assert_eq!(cosine(&[1.0], &[1.0, 0.0]), 0.0, "length mismatch → 0");
+        // Identical unit vectors → 1.0.
+        let a = [0.6_f32, 0.8];
+        assert!((cosine(&a, &a) - 1.0).abs() < 1e-6);
+    }
+
+    /// Build a minimal embed.db with a `node_embeddings` table and score against it.
+    #[test]
+    fn score_candidates_reads_and_omits_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let embed_db = tmp.path().join("embed.db");
+        let conn = Connection::open(&embed_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (node_id INTEGER NOT NULL, model_id TEXT NOT NULL, \
+             embedding BLOB NOT NULL, PRIMARY KEY (node_id, model_id));",
+        )
+        .unwrap();
+        // Node 1: identical to query → cosine 1. Node 2: orthogonal → cosine 0.
+        // Node 3: wrong model_id → not scored. Node 4: no row → omitted.
+        let q = [1.0_f32, 0.0];
+        conn.execute(
+            "INSERT INTO node_embeddings VALUES (?1, 'm', ?2)",
+            params![1_i64, blob_of(&[1.0, 0.0])],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_embeddings VALUES (?1, 'm', ?2)",
+            params![2_i64, blob_of(&[0.0, 1.0])],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_embeddings VALUES (?1, 'other', ?2)",
+            params![3_i64, blob_of(&[1.0, 0.0])],
+        )
+        .unwrap();
+        drop(conn);
+
+        let ids = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let scored = score_candidates(&q, &embed_db, "m", &ids).unwrap();
+        let map: std::collections::HashMap<NodeId, f32> = scored.into_iter().collect();
+        assert!((map[&NodeId(1)] - 1.0).abs() < 1e-6, "identical → cosine 1");
+        assert!(map[&NodeId(2)].abs() < 1e-6, "orthogonal → cosine 0");
+        assert!(!map.contains_key(&NodeId(3)), "wrong model_id omitted");
+        assert!(
+            !map.contains_key(&NodeId(4)),
+            "missing row omitted (unknown)"
+        );
+    }
+
+    #[test]
+    fn score_candidates_missing_db_is_empty_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let embed_db = tmp.path().join("nope.db");
+        let out = score_candidates(&[1.0, 0.0], &embed_db, "m", &[NodeId(1)]).unwrap();
+        assert!(out.is_empty(), "absent embed.db → empty, degrades to FTS");
     }
 
     #[test]

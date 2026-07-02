@@ -18,8 +18,20 @@
 /// Maximum byte length of a sanitized MCP output item (per item, not per call).
 const MAX_OUTPUT_BYTES: usize = 4_096;
 
-/// Maximum byte length of an incoming MCP argument string.
+/// Maximum byte length of a scalar incoming MCP argument (e.g. `query`, `file`,
+/// `symbol`). Kept deliberately small — a single identifier or NL query.
 const MAX_ARG_BYTES: usize = 512;
+
+/// Maximum byte length of a batch/list MCP argument — a newline- or comma-
+/// delimited set of names, e.g. the `symbols` argument to `get_snippets`.
+///
+/// Larger than [`MAX_ARG_BYTES`] because the argument legitimately carries many
+/// symbol names (the tool documents exactly this), and the scalar 512-byte cap
+/// silently truncated realistic batches (~14 symbols). Still bounded so an
+/// oversized payload cannot exhaust memory or FTS work; the tool's own output is
+/// independently capped by its token budget (≤ `MAX_CONTEXT_BUDGET`), so this only
+/// widens the *input* ceiling, not the response size.
+const MAX_LIST_ARG_BYTES: usize = 4_096;
 
 // ── SEC-001: output sanitizer ─────────────────────────────────────────────────
 
@@ -136,7 +148,22 @@ pub(crate) fn wrap_envelope(content: &str) -> String {
 /// On failure, callers must log a `tracing::warn!` and return `String::new()`.
 /// The error string must **not** be forwarded to the MCP client.
 pub fn validate_mcp_arg(arg: &str) -> Result<(), &'static str> {
-    if arg.len() > MAX_ARG_BYTES {
+    validate_mcp_arg_with_limit(arg, MAX_ARG_BYTES)
+}
+
+/// Batch/list variant of [`validate_mcp_arg`] for arguments that carry many
+/// names (newline- or comma-delimited), such as `get_snippets`' `symbols`.
+///
+/// Applies every guard [`validate_mcp_arg`] does — null bytes, percent-encoding,
+/// path traversal, absolute paths — but permits up to [`MAX_LIST_ARG_BYTES`] so a
+/// realistic multi-symbol request is not silently rejected. Each name is still
+/// resolved independently through parameterized store lookups downstream.
+pub fn validate_mcp_list_arg(arg: &str) -> Result<(), &'static str> {
+    validate_mcp_arg_with_limit(arg, MAX_LIST_ARG_BYTES)
+}
+
+fn validate_mcp_arg_with_limit(arg: &str, max_bytes: usize) -> Result<(), &'static str> {
+    if arg.len() > max_bytes {
         return Err("argument exceeds maximum length");
     }
     if arg.contains('\0') {
@@ -276,6 +303,47 @@ mod tests {
     fn validate_rejects_null_byte() {
         assert!(validate_mcp_arg("foo\0bar").is_err());
         assert!(validate_mcp_arg("\0").is_err());
+    }
+
+    #[test]
+    fn list_arg_permits_batch_beyond_scalar_limit() {
+        // A realistic get_snippets batch (~20 symbols) exceeds the scalar 512-byte
+        // cap but must be accepted by the list validator. Regression for the silent
+        // snippet-drop at token_budget > 2000.
+        let batch = "fn:some_reasonably_long_symbol_name".to_string()
+            + &"\nfn:another_reasonably_long_symbol_name".repeat(20);
+        assert!(
+            batch.len() > MAX_ARG_BYTES,
+            "test fixture must exceed scalar cap"
+        );
+        assert!(
+            validate_mcp_arg(&batch).is_err(),
+            "scalar validator still rejects"
+        );
+        assert!(
+            validate_mcp_list_arg(&batch).is_ok(),
+            "list validator accepts batch"
+        );
+    }
+
+    #[test]
+    fn list_arg_still_enforces_other_guards() {
+        // The larger ceiling must not relax the security checks.
+        assert!(
+            validate_mcp_list_arg("fn:a\n../secret").is_err(),
+            "path traversal"
+        );
+        assert!(validate_mcp_list_arg("fn:a\0fn:b").is_err(), "null byte");
+        assert!(
+            validate_mcp_list_arg("%2e%2e%2f").is_err(),
+            "percent-encoding"
+        );
+        assert!(
+            validate_mcp_list_arg("/etc/passwd").is_err(),
+            "absolute path"
+        );
+        // And its own ceiling still applies.
+        assert!(validate_mcp_list_arg(&"a".repeat(MAX_LIST_ARG_BYTES + 1)).is_err());
     }
 
     #[test]

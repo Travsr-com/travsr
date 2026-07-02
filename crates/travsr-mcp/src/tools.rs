@@ -3344,14 +3344,17 @@ fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
 /// File nodes all share `signature == "file"`, so we use `path` (prefixed with
 /// corpus when non-empty) to keep Cytoscape ids distinct across repos.
 fn node_json_id(node: &CoreNode) -> String {
-    if node.kind == "file" {
+    if node.kind == "file" || node.vname.path.is_empty() {
         if node.vname.corpus.is_empty() {
             node.vname.path.clone()
         } else {
             format!("{}:{}", node.vname.corpus, node.vname.path)
         }
     } else {
-        node.vname.signature.clone()
+        // Include path so same-signature symbols from different files (e.g.
+        // fn:ContainsPrefix in staging/ and pkg/) get distinct Cytoscape IDs
+        // instead of the second being silently dropped by the dedup guard.
+        format!("{}:{}", node.vname.path, node.vname.signature)
     }
 }
 

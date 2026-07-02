@@ -72,9 +72,9 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
 
     use travsr_error::StoreError;
     use travsr_plugin_host::{
-        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
+        active_backend_id, lookup_embed_backend, EmbedQueryHook, EmbedSupervisor, EMBED_BACKENDS,
     };
-    use travsr_store::{EmbedKnnHook, EmbedReadiness};
+    use travsr_store::{EmbedKnnHook, EmbedReadiness, EmbedScoreHook};
 
     // Guard: no embed.db → nothing to query; skip to avoid spawning a sidecar
     // against a non-existent HNSW index.
@@ -105,6 +105,12 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     let slot: Arc<Mutex<Option<EmbedKnnHook>>> = Arc::new(Mutex::new(None));
     let slot_bg = Arc::clone(&slot);
 
+    // RFC-019: parallel slot for the query-embedding hook, armed by the same
+    // background init thread. None = sidecar still warming (no direct-cosine
+    // scoring yet, so the classifier/ranker use the FTS-only path).
+    let score_slot: Arc<Mutex<Option<EmbedQueryHook>>> = Arc::new(Mutex::new(None));
+    let score_slot_bg = Arc::clone(&score_slot);
+
     // Arm-state shared with the query path: the background thread marks it ready
     // the instant the sidecar is warm, so the first get_context can briefly wait
     // (and the header reports `warming` honestly) instead of silently degrading
@@ -125,6 +131,14 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
                         // silently degrade to FTS. Blocking — we are already on a
                         // background init thread, so this delays nothing visible.
                         supervisor.prewarm();
+                        // RFC-019: arm the query-embedding hook before the KNN slot
+                        // so a query that observes `Some(knn)` also observes the
+                        // score hook (never a half-armed state).
+                        if let Some(qhook) = supervisor.embed_query_hook() {
+                            if let Ok(mut guard) = score_slot_bg.lock() {
+                                *guard = Some(qhook);
+                            }
+                        }
                         if let Ok(mut guard) = slot_bg.lock() {
                             *guard = Some(hook);
                         }
@@ -155,5 +169,25 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     });
     store.set_embed_readiness(readiness);
     store.set_embed_knn_hook(meta);
+
+    // RFC-019: meta direct-cosine oracle hook. Reads the lazily-armed query hook;
+    // while the sidecar warms (slot None) it scores nothing, so the classifier and
+    // ranker use the FTS-only path — identical to the pre-RFC behaviour.
+    let embed_db = db_path.with_file_name("embed.db");
+    let score_model = backend.id.to_string();
+    let meta_score: EmbedScoreHook = Arc::new(move |query: &str, ids: &[travsr_core::NodeId]| {
+        let guard = score_slot
+            .lock()
+            .map_err(|_| StoreError::Database("embed score slot poisoned".into()))?;
+        let Some(qhook) = guard.as_ref() else {
+            return Ok(vec![]); // sidecar still warming — no scoring yet
+        };
+        let blob = qhook(query)?;
+        match travsr_store::decode_embedding(&blob) {
+            Some(qv) => travsr_store::score_candidates(&qv, &embed_db, &score_model, ids),
+            None => Ok(vec![]),
+        }
+    });
+    store.set_embed_score_hook(meta_score);
     tracing::info!("embed plugin hook installed (lazy — sidecar starting in background)");
 }

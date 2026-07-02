@@ -158,9 +158,25 @@ fn handle_tool_call(
         }
         "get_context" => {
             let query = args["query"].as_str().unwrap_or("");
-            let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
+            // McpClient sends Record<string,string> so numeric args arrive as JSON strings.
+            // Try numeric first (direct callers) then string fallback (VS Code extension path).
+            let token_budget = args["token_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["token_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .unwrap_or(4096) as usize;
             let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
-            let snippet_budget = args["snippet_budget"].as_u64().map(|v| v as usize);
+            let snippet_budget = args["snippet_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["snippet_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .map(|v| v as usize);
             // Use the embed-aware path when the daemon has injected a KNN hook
             // (i.e. `travsr embed init` + `travsr embed reindex` have been run).
             // Falls back to fuzzy text search automatically when the hook is absent.
@@ -245,11 +261,19 @@ fn handle_tool_call(
         "repo_languages" => tools::repo_languages(store),
         "get_snippets" => {
             let symbols = args["symbols"].as_str().unwrap_or("");
+            // McpClient (VS Code) sends args as JSON strings, so token_budget
+            // arrives as "6000"; try numeric first, then string.
             let token_budget = args["token_budget"]
                 .as_u64()
+                .or_else(|| {
+                    args["token_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
                 .unwrap_or(tools::SNIPPET_DEFAULT_BUDGET as u64)
                 as usize;
-            tools::get_snippets(store, symbols, token_budget)
+            let mode = tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto"));
+            tools::get_snippets(store, symbols, token_budget, mode)
         }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
@@ -510,7 +534,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction: functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached. Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to an AST skeleton. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the AST summary only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -521,6 +545,11 @@ fn tools_list() -> serde_json::Value {
                         "token_budget": {
                             "type": "integer",
                             "description": "Hard token cap across all returned snippets. Default: 2000. Higher values return more symbols."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["auto", "full", "skeleton"],
+                            "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else AST skeleton. 'full': complete definition, no line cap. 'skeleton': AST summary only."
                         },
                         "repo": {
                             "type": "string",
@@ -680,9 +709,23 @@ fn handle_tool_call_global(
         }
         "get_context" => {
             let query = args["query"].as_str().unwrap_or("");
-            let token_budget = args["token_budget"].as_u64().unwrap_or(4096) as usize;
+            let token_budget = args["token_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["token_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .unwrap_or(4096) as usize;
             let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
-            let snippet_budget = args["snippet_budget"].as_u64().map(|v| v as usize);
+            let snippet_budget = args["snippet_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["snippet_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .map(|v| v as usize);
             tools::get_context_global(
                 repos,
                 query,
@@ -724,9 +767,15 @@ fn handle_tool_call_global(
             let symbols = args["symbols"].as_str().unwrap_or("");
             let token_budget = args["token_budget"]
                 .as_u64()
+                .or_else(|| {
+                    args["token_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
                 .unwrap_or(tools::SNIPPET_DEFAULT_BUDGET as u64)
                 as usize;
-            tools::get_snippets_global(repos, symbols, token_budget, repo_arg)
+            let mode = tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto"));
+            tools::get_snippets_global(repos, symbols, token_budget, repo_arg, mode)
         }
         "synonym_add"
         | "synonym_set"
@@ -917,7 +966,7 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_snippets",
-                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction: functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached. Use this after any graph-navigation tool to read the actual code without opening files.",
+                "description": "Return tailored code snippets for one or more symbols by name. Accepts the symbol names returned by get_context, get_callers, and search_symbol. Kind-aware extraction (mode='auto'): functions/methods → up to 40 lines; classes/structs/impls → up to 15 lines (header + fields only); interfaces/traits/enums → up to 60 lines; overflowing definitions fall back to an AST skeleton. mode='full' returns the complete definition with no line cap; mode='skeleton' returns the AST summary only. Leading docblocks are stripped. Respects a token budget — symbols are included in request order until the budget is reached (the first symbol is always included). Use this after any graph-navigation tool to read the actual code without opening files.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -928,6 +977,11 @@ fn tools_list_global() -> serde_json::Value {
                         "token_budget": {
                             "type": "integer",
                             "description": "Hard token cap across all returned snippets. Default: 2000. Higher values return more symbols."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["auto", "full", "skeleton"],
+                            "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else AST skeleton. 'full': complete definition, no line cap. 'skeleton': AST summary only."
                         },
                         "repo": {
                             "type": "string",

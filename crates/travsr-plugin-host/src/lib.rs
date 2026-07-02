@@ -22,13 +22,14 @@ pub mod trust;
 pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
     active_backend_id, derive_num_workers_for_cli, derive_phase1_threshold_for_status,
-    lookup as lookup_embed_backend, repo_backend_id, run_parallel_reindex_blocking,
-    run_parallel_reindex_blocking_quiet, spawn_background_reindex_all,
-    spawn_background_reindex_phase1, spawn_background_reindex_phase2, write_repo_backend_id,
-    EmbedBackend, EmbedModelFile, BACKENDS as EMBED_BACKENDS, MAX_EMBED_WORKERS,
+    embed_reindex_in_flight, lookup as lookup_embed_backend, repo_backend_id,
+    run_parallel_reindex_blocking, run_parallel_reindex_blocking_quiet,
+    spawn_background_reindex_all, spawn_background_reindex_phase1, spawn_background_reindex_phase2,
+    write_repo_backend_id, EmbedBackend, EmbedModelFile, BACKENDS as EMBED_BACKENDS,
+    MAX_EMBED_WORKERS,
 };
 pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
-pub use embed_supervisor::EmbedSupervisor;
+pub use embed_supervisor::{EmbedQueryHook, EmbedSupervisor};
 pub use indexer::{PhaseBInputs, PhaseBOutcome, PluginIndexer};
 pub use phase_b::{
     lookup as lookup_phase_b, OutputFormat, PhaseBEntry, SandboxRequirement,

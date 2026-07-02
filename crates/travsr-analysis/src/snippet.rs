@@ -66,6 +66,23 @@ pub fn skip_leading_comments<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
 /// stored by Tree-sitter/LSIF.  On Windows `Path::join` accepts both `/` and
 /// `\`, so no pre-normalisation is required.
 pub fn snippet_for_node(node: &Node, repo_root: &Path) -> Option<String> {
+    snippet_for_node_capped(node, repo_root, snippet_line_cap(&node.kind))
+}
+
+/// Read the *entire* definition body for `node` (`line..=end_line`) with no
+/// per-kind line cap. Used by `get_snippets(mode="full")` when a caller pins a
+/// node into the AI context and wants the complete source regardless of size.
+///
+/// Same SEC path guard and leading-docblock stripping as [`snippet_for_node`];
+/// only the line ceiling differs.
+pub fn snippet_for_node_full(node: &Node, repo_root: &Path) -> Option<String> {
+    snippet_for_node_capped(node, repo_root, usize::MAX)
+}
+
+/// Shared implementation for [`snippet_for_node`] (kind-capped) and
+/// [`snippet_for_node_full`] (uncapped). `cap` bounds how many lines past the
+/// declaration are read; `usize::MAX` reads the whole `line..=end_line` range.
+pub fn snippet_for_node_capped(node: &Node, repo_root: &Path, cap: usize) -> Option<String> {
     let start_1based = node.line? as usize; // 1-based, None → bail
     let end_1based = node.end_line.unwrap_or(node.line.unwrap()) as usize;
 
@@ -114,9 +131,10 @@ pub fn snippet_for_node(node: &Node, repo_root: &Path) -> Option<String> {
         return None;
     }
 
-    let cap = snippet_line_cap(&node.kind);
     // end_line is inclusive and 1-based; clamp to cap and file length.
-    let to = (end_1based.min(from + cap)).min(all_lines.len());
+    // `cap == usize::MAX` (full mode) means "no line ceiling" — `from + cap`
+    // saturates so only end_line / file length bound the window.
+    let to = (end_1based.min(from.saturating_add(cap))).min(all_lines.len());
     // Guard against a corrupt DB entry where end_line < line — the slice
     // would panic with "range start > end". Degrade gracefully instead.
     if to < from {

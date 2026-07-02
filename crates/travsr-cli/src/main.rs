@@ -367,25 +367,24 @@ async fn run(cli: Cli) -> Result<()> {
                     if foreground {
                         travsr_daemon::Daemon::run(repo_root, foreground).await?;
                     } else {
-                        // Guard: if a daemon is already responding on the transport,
-                        // don't spawn another one. Each `daemon start` call was
-                        // otherwise spawning a new background child (visible,
-                        // 700 MB each) because the check happened *inside* the
-                        // child after it was already running.
-                        if daemon_is_running(&repo_root, 3, 300) {
-                            eprintln!("travsr daemon is already running");
-                            return Ok(());
-                        }
-                        // Spawn background child: re-exec with --foreground.
+                        // Race-free guard: consult the flock the daemon itself
+                        // holds (not a socket probe), and only spawn a child when
+                        // no daemon owns the lock — so we never fork a doomed
+                        // ~700 MB process that pays full startup then dies.
                         let exe = std::env::current_exe().context("finding current exe")?;
-                        std::process::Command::new(&exe)
-                            .args(["daemon", "start", "--foreground"])
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn()
-                            .context("spawning background daemon")?;
-                        eprintln!("travsr daemon started in background");
+                        match daemon_client::spawn_background_daemon(&repo_root, &exe) {
+                            daemon_client::SpawnOutcome::AlreadyRunning => {
+                                eprintln!("travsr daemon is already running");
+                                return Ok(());
+                            }
+                            daemon_client::SpawnOutcome::Started => {
+                                eprintln!("travsr daemon started in background");
+                            }
+                            daemon_client::SpawnOutcome::Failed => {
+                                eprintln!("travsr daemon failed to start (see .travsr/daemon.log)");
+                                return Ok(());
+                            }
+                        }
                         // Windows: register a Task Scheduler ONLOGON task so the
                         // daemon auto-starts after reboot. Non-fatal — the daemon
                         // is already running; auto-start just won't persist.
@@ -457,16 +456,22 @@ async fn run(cli: Cli) -> Result<()> {
                 DaemonAction::Restart => {
                     // Best-effort stop — ignore errors if daemon not running.
                     let _ = send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // Wait for the old daemon to actually release its lock (≤2 s)
+                    // instead of a fixed sleep, so the new one never races the old
+                    // one's shutdown and fails to acquire the lock.
+                    for _ in 0..40 {
+                        if !daemon_client::daemon_lock_held(&repo_root) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                     let exe = std::env::current_exe().context("finding current exe")?;
-                    std::process::Command::new(exe)
-                        .args(["daemon", "start", "--foreground"])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .context("respawning daemon")?;
-                    eprintln!("travsr daemon restarted in background");
+                    match daemon_client::spawn_background_daemon(&repo_root, &exe) {
+                        daemon_client::SpawnOutcome::Failed => {
+                            eprintln!("travsr daemon failed to restart (see .travsr/daemon.log)");
+                        }
+                        _ => eprintln!("travsr daemon restarted in background"),
+                    }
                 }
             }
         }
