@@ -314,6 +314,7 @@ fn linux_p_core_count() -> Option<usize> {
 /// On homogeneous systems every core has the same class → returns total physical cores.
 /// On Intel hybrid (12th gen+) P-cores have a higher class than E-cores.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn windows_p_core_count() -> Option<usize> {
     use windows_sys::Win32::System::SystemInformation::{
         GetLogicalProcessorInformationEx, RelationProcessorCore,
@@ -445,6 +446,7 @@ fn derive_num_workers_inner(
 /// Linux:   reads `MemAvailable` from `/proc/meminfo`.
 /// Windows: calls `GlobalMemoryStatusEx` → `ullAvailPhys`.
 /// Returns 0 when unavailable — caller skips the RAM guard.
+#[allow(unsafe_code)]
 fn available_memory_mb() -> u64 {
     #[cfg(target_os = "macos")]
     {

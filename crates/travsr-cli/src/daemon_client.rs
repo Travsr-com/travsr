@@ -35,6 +35,7 @@ pub(crate) fn daemon_lock_held(repo_root: &Path) -> bool {
     use fs2::FileExt as _;
     let lock_path = repo_root.join(".travsr").join("daemon.lock");
     // NB: no `.truncate(true)` — never clobber a running daemon's PID content.
+    #[allow(clippy::suspicious_open_options)]
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -133,6 +134,16 @@ pub fn try_query<T: DeserializeOwned>(
     serde_json::from_value(resp.result?).ok()
 }
 
+/// Direct-open fallback: read-only fast open (skips migrations and FTS/vocab/
+/// synonym backfills), degrading to a full writable open when the store has
+/// pending migrations or the read-only open is not possible.
+pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
+    match SqliteStore::open_read_only(db_path) {
+        Ok(s) => Ok(s),
+        Err(_) => Ok(SqliteStore::open(db_path)?),
+    }
+}
+
 #[cfg(test)]
 mod lock_tests {
     use super::*;
@@ -171,15 +182,5 @@ mod lock_tests {
             !daemon_lock_held(tmp.path()),
             "must report free once released"
         );
-    }
-}
-
-/// Direct-open fallback: read-only fast open (skips migrations and FTS/vocab/
-/// synonym backfills), degrading to a full writable open when the store has
-/// pending migrations or the read-only open is not possible.
-pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
-    match SqliteStore::open_read_only(db_path) {
-        Ok(s) => Ok(s),
-        Err(_) => Ok(SqliteStore::open(db_path)?),
     }
 }
