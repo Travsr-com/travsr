@@ -3947,9 +3947,14 @@ impl Store for SqliteStore {
             let sql = format!(
                 "SELECT src, dst, kind, confidence FROM edges WHERE src IN ({placeholders})"
             );
+            // prepare() not prepare_cached(): the SQL string varies per chunk length
+            // (different number of '?' placeholders), so prepare_cached would create a
+            // new cache entry for every distinct chunk size and never actually hit the
+            // cache — defeating its purpose and polluting the LRU with O(EDGE_BATCH_SIZE)
+            // distinct compiled statements.
             let mut stmt = self
                 .conn
-                .prepare_cached(&sql)
+                .prepare(&sql)
                 .context("preparing iter_edges_from_batch")?;
             let params: Vec<i64> = srcs.iter().map(|&id| node_id_to_i64(id)).collect();
             let rows = stmt

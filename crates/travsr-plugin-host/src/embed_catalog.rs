@@ -523,7 +523,7 @@ pub fn derive_num_workers_for_cli(db_path: &Path) -> usize {
     let model_ram_mb = db_path
         .parent()
         .and_then(|p| p.parent())
-        .and_then(|root| repo_backend_id(root))
+        .and_then(repo_backend_id)
         .and_then(|id| lookup(&id))
         .map(|b| b.ram_mb as u64)
         .unwrap_or(0);

@@ -76,7 +76,7 @@ function parseHeader(line1: string, line2: string): ContextHeader | null {
   if (!m1 || !m2) return null;
   return {
     indexCommit: m1[1].trim(),
-    embeddings: m1[2] as "on" | "off",
+    embeddings: m1[2] as "on" | "off" | "degraded",
     tier: m2[1].trim(),
     coverage: [parseInt(m2[2], 10), parseInt(m2[3], 10)],
     confidence: m2[4].trim(),

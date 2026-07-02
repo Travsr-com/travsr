@@ -337,6 +337,18 @@ fn build_weighted_subgraph<S: Store>(
             for &src in chunk {
                 adj.entry(src).or_default();
             }
+            // Per-chunk ceiling: a single hub node in this chunk can add thousands
+            // of neighbours before the depth-level check below fires. Break early so
+            // the overshoot is bounded to one chunk's worth of new nodes, not the
+            // entire remaining frontier × fan-out.
+            if visited.len() > MAX_SUBGRAPH_NODES {
+                tracing::warn!(
+                    visited = visited.len(),
+                    limit = MAX_SUBGRAPH_NODES,
+                    "PPR subgraph exceeded node ceiling mid-chunk — truncating BFS"
+                );
+                break;
+            }
         }
 
         if visited.len() > MAX_SUBGRAPH_NODES {
