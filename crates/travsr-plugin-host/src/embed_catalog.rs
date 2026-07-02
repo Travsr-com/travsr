@@ -233,10 +233,7 @@ fn p_core_count() -> usize {
             .args(["-n", "hw.perflevel0.logicalcpu"])
             .output()
         {
-            if let Ok(n) = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<usize>()
-            {
+            if let Ok(n) = String::from_utf8_lossy(&out.stdout).trim().parse::<usize>() {
                 if n > 0 {
                     return n;
                 }
@@ -305,7 +302,11 @@ fn linux_p_core_count() -> Option<usize> {
         .find(|(f, _)| *f == max_freq)
         .map(|(_, c)| *c)
         .unwrap_or(0);
-    if p_count > 0 { Some(p_count) } else { None }
+    if p_count > 0 {
+        Some(p_count)
+    } else {
+        None
+    }
 }
 
 /// Walk the `GetLogicalProcessorInformationEx(RelationProcessorCore)` buffer and
@@ -323,7 +324,11 @@ fn windows_p_core_count() -> Option<usize> {
     let mut buf_size: u32 = 0;
     // SAFETY: passing null buffer is the documented way to query size.
     unsafe {
-        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut buf_size);
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            std::ptr::null_mut(),
+            &mut buf_size,
+        );
     }
     if buf_size == 0 {
         return None;
@@ -348,7 +353,9 @@ fn windows_p_core_count() -> Option<usize> {
     let mut max_class: u8 = 0;
     let mut class_counts: Vec<(u8, usize)> = Vec::new();
 
-    while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= buf_size as usize {
+    while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+        <= buf_size as usize
+    {
         // SAFETY: we bounds-check before casting.
         let entry = unsafe {
             &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
@@ -362,7 +369,10 @@ fn windows_p_core_count() -> Option<usize> {
         if efficiency_class > max_class {
             max_class = efficiency_class;
         }
-        match class_counts.iter_mut().find(|(c, _)| *c == efficiency_class) {
+        match class_counts
+            .iter_mut()
+            .find(|(c, _)| *c == efficiency_class)
+        {
             Some((_, n)) => *n += 1,
             None => class_counts.push((efficiency_class, 1)),
         }
@@ -374,7 +384,11 @@ fn windows_p_core_count() -> Option<usize> {
         .find(|(c, _)| *c == max_class)
         .map(|(_, n)| *n)
         .unwrap_or(0);
-    if p_count > 0 { Some(p_count) } else { None }
+    if p_count > 0 {
+        Some(p_count)
+    } else {
+        None
+    }
 }
 
 /// Derive the number of parallel reader threads for the sidecar (C-01).
@@ -386,7 +400,12 @@ fn derive_num_workers(model_ram_mb: u64) -> usize {
     let env_override = std::env::var("TRAVSR_EMBED_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
-    derive_num_workers_inner(p_core_count(), available_memory_mb(), model_ram_mb, env_override)
+    derive_num_workers_inner(
+        p_core_count(),
+        available_memory_mb(),
+        model_ram_mb,
+        env_override,
+    )
 }
 
 /// Pure inner function — takes all inputs explicitly so tests never touch env/syscalls.
