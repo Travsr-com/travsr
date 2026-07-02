@@ -197,9 +197,10 @@ pub fn ask_query(
 
     // ── Tier-0 seed selection (per-token anchor + BM25 FTS + optional KNN) ──
     let knn_pairs;
+    let knn_oracle;
     let embed_contributed;
     if let Some(knn) = knn_fn {
-        let (knn_scored, _n_eligible, knn_elapsed_ms) =
+        let (knn_scored, _n_eligible, knn_elapsed_ms, oracle) =
             crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
         let budget_ms = crate::tools::knn_budget_ms();
         if knn_elapsed_ms > budget_ms {
@@ -209,17 +210,26 @@ pub fn ask_query(
                 "ask_query knn exceeded circuit-breaker — falling back to FTS seeds"
             );
             knn_pairs = vec![];
+            knn_oracle = std::collections::HashMap::new();
             embed_contributed = false;
         } else {
             embed_contributed = !knn_scored.is_empty();
             knn_pairs = knn_scored;
+            knn_oracle = oracle;
         }
     } else {
         knn_pairs = vec![];
+        knn_oracle = std::collections::HashMap::new();
         embed_contributed = false;
     }
 
-    let seed_set = crate::seed::build_seed_set(store, query, &OpenFilter, knn_pairs);
+    // RFC-019: direct-cosine oracle hook (None when embeddings off → FTS-only path).
+    let score_fn = store.embed_score_fn();
+    let score_ref = score_fn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, &[travsr_core::NodeId]) -> Vec<(travsr_core::NodeId, f32)>);
+    let seed_set =
+        crate::seed::build_seed_set(store, query, &OpenFilter, knn_pairs, &knn_oracle, score_ref);
 
     // Abstain when confidence is None — prevents "confident salad" on no-match queries (R1).
     if seed_set.confidence == crate::seed::Confidence::None {

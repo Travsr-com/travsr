@@ -483,6 +483,9 @@ export function buildHtmlContent(
   <!-- Populated by graph.js renderBreadcrumb() -->
 </nav>
 
+<!-- ── Disambiguation bar (multiple implementations of same symbol) ─────── -->
+<div id="disambig-bar" role="navigation" aria-label="Implementation selector"></div>
+
 <!-- ── Blast bar ────────────────────────────────────────────────────────── -->
 <div id="blastbar" style="display:none" role="status" aria-live="polite">
   <div class="blast-icon" aria-hidden="true">⊗</div>

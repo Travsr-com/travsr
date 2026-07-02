@@ -9,7 +9,8 @@ use travsr_retrieval::{
 use travsr_store::{SqliteStore, Store};
 
 use crate::sanitize::{
-    sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, wrap_envelope,
+    sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, validate_mcp_list_arg,
+    wrap_envelope,
 };
 
 /// Short alias for the embed KNN closure used throughout `get_context` variants.
@@ -1626,6 +1627,16 @@ impl NodeRole {
     }
 }
 
+/// Return of [`embed_path_seeds`]: `(selected_seeds, n_eligible_before_cap,
+/// knn_elapsed_ms, cosine_oracle)`. The oracle maps every over-fetched candidate
+/// to its query cosine — a superset of the (capped) selected seeds.
+type EmbedSeedResult = (
+    Vec<(CoreNode, f32)>,
+    usize,
+    u128,
+    std::collections::HashMap<NodeId, f32>,
+);
+
 /// Minimum number of PPR seeds from KNN — always try to include this many.
 const MIN_EMBED_SEEDS: usize = 5;
 /// Maximum number of PPR seeds from KNN — never include more than this.
@@ -1694,6 +1705,21 @@ pub(crate) fn knn_budget_ms() -> u128 {
         .filter(|&x| x > 0)
         .unwrap_or(600)
 }
+
+/// Max time the first `get_context` call blocks for the embed sidecar to arm, so
+/// the opening query of a session uses embeddings instead of silently degrading
+/// to lexical-only during the ~3 s startup window. The wait happens OUTSIDE the
+/// KNN circuit-breaker timing, so this one-time arm cost is never misread as a
+/// slow KNN round-trip. Override via `TRAVSR_EMBED_ARM_WAIT_MS`. Default 5000 —
+/// headroom over the measured ~3.2 s (store-open dominates and scales with graph
+/// size). Subsequent queries see the armed hook and never wait.
+pub(crate) fn embed_arm_wait_ms() -> u64 {
+    std::env::var("TRAVSR_EMBED_ARM_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&x| x > 0)
+        .unwrap_or(5000)
+}
 /// Kept for tests that reference the constant directly; resolves to the default.
 #[cfg(test)]
 pub(crate) const KNN_BUDGET_MS: u128 = 600;
@@ -1714,6 +1740,11 @@ pub(crate) const KNN_BUDGET_MS: u128 = 600;
 ///   `vendor/bundle/` (Ruby), `vendor/*.php` (PHP), `Library/Caches/`, `.cache/`.
 /// - Paths escaping the repo root (`../`), Python bytecode (`__pycache__/`, `.pyc`).
 pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
+    // Core structural noise (vendored, OS caches, repo-escaping paths, SCIP locals).
+    // Enforced identically at ingest and query time via is_noise_node.
+    if travsr_core::is_noise_node(node) {
+        return true;
+    }
     if node.kind == "crate" {
         return true;
     }
@@ -1853,9 +1884,15 @@ pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
 ///
 /// Returns empty seeds when KNN returns nothing (index not yet built), so the caller
 /// can fall back to `search_nodes_fuzzy`.
-/// Returns `(seeds, n_candidates_before_cap, knn_elapsed_ms)`.
+/// Returns `(seeds, n_candidates_before_cap, knn_elapsed_ms, cosine_oracle)`.
 /// `knn_elapsed_ms` covers only the `knn_fn` HNSW/ONNX call, not the SQLite
 /// postprocessing — the caller uses it for the circuit-breaker decision.
+///
+/// `cosine_oracle` maps every over-fetched candidate `NodeId` to its query
+/// cosine — a superset of `seeds` (which is capped/filtered). `build_seed_set`
+/// uses it to validate lexical anchors: an NL query word that is rare-by-
+/// coincidence (e.g. "literal") resolves to a confident FTS anchor that the
+/// embedding places far from the query intent; the oracle lets us demote it.
 ///
 /// Each seed carries the full `CoreNode` so callers can apply structural proximity
 /// filtering without a second DB round-trip.
@@ -1864,7 +1901,7 @@ pub(crate) fn embed_path_seeds(
     query: &str,
     knn_fn: EmbedKnnFn<'_>,
     filter: &dyn EdgeFilter,
-) -> (Vec<(CoreNode, f32)>, usize, u128) {
+) -> EmbedSeedResult {
     // Over-request 6× to keep MIN_EMBED_SEEDS filled after noise + RBAC filtering.
     // Time only the KNN inference call — not the subsequent SQLite get_nodes fetch.
     let t0 = std::time::Instant::now();
@@ -1877,8 +1914,12 @@ pub(crate) fn embed_path_seeds(
     );
     let knn_elapsed_ms = t0.elapsed().as_millis();
     if knn_pairs.is_empty() {
-        return (vec![], 0, knn_elapsed_ms);
+        return (vec![], 0, knn_elapsed_ms, std::collections::HashMap::new());
     }
+    // Cosine oracle: every over-fetched candidate, used downstream to validate
+    // lexical anchors against the embedding's notion of relevance.
+    let cosine_oracle: std::collections::HashMap<NodeId, f32> =
+        knn_pairs.iter().map(|&(id, s)| (id, s)).collect();
 
     // Fetch node metadata for noise filter + RBAC + path dedup.
     let all_ids: Vec<NodeId> = knn_pairs.iter().map(|&(id, _)| id).collect();
@@ -1886,7 +1927,7 @@ pub(crate) fn embed_path_seeds(
         Ok(ns) => ns,
         Err(e) => {
             tracing::warn!("embed_path_seeds get_nodes error: {e}");
-            return (vec![], 0, knn_elapsed_ms);
+            return (vec![], 0, knn_elapsed_ms, cosine_oracle);
         }
     };
     let node_map: std::collections::HashMap<NodeId, CoreNode> =
@@ -1925,7 +1966,7 @@ pub(crate) fn embed_path_seeds(
         }
     }
 
-    (seeds, n_eligible, knn_elapsed_ms)
+    (seeds, n_eligible, knn_elapsed_ms, cosine_oracle)
 }
 
 /// Compose all advisory signals appended to a `get_context` response footer.
@@ -1939,6 +1980,7 @@ pub(crate) fn embed_path_seeds(
 fn build_context_signals(
     store: &SqliteStore,
     has_embed: bool,
+    embed_warming: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
     seed_cap_msg: Option<&str>,
@@ -1946,6 +1988,8 @@ fn build_context_signals(
     build_context_signals_with_r2(
         phase_b_pending(store),
         has_embed,
+        embed_warming,
+        store.has_embed_db(),
         knn_degraded,
         overflow_msg,
         seed_cap_msg,
@@ -1956,9 +2000,16 @@ fn build_context_signals(
 
 /// PF-M4: accepts `phase_b_pending` as a pre-computed bool so callers can
 /// hoist the two `get_meta` queries out of the hot path and compute once.
+///
+/// `embed_initialized` = embed.db exists (Phase 1 has run at some point).
+/// When `!has_embed && embed_initialized` the daemon hasn't injected the KNN hook yet
+/// (e.g. Phase 1 just completed, daemon restarting) — show "in progress" instead of "init needed".
+#[allow(clippy::too_many_arguments)]
 fn build_context_signals_with_r2(
     phase_b_pending: bool,
     has_embed: bool,
+    embed_warming: bool,
+    embed_initialized: bool,
     knn_degraded: bool,
     overflow_msg: Option<&str>,
     seed_cap_msg: Option<&str>,
@@ -1980,9 +2031,18 @@ fn build_context_signals_with_r2(
     if let Some(msg) = multi_concept_note {
         parts.push(msg);
     }
-    if has_embed && knn_degraded {
+    if embed_warming {
+        parts.push(
+            "[note: semantic embeddings still warming up (sidecar starting) — this result is lexical-only; retry in a few seconds for full semantic ranking]",
+        );
+    } else if has_embed && knn_degraded {
         parts.push(
             "[note: semantic search degraded — KNN timed out or returned empty; results are lexical only]",
+        );
+    } else if !has_embed && embed_initialized {
+        // Phase 1 has run (embed.db exists) but KNN hook not yet active.
+        parts.push(
+            "[note: embedding in progress — run `travsr embed status` to check; results improve as index builds]",
         );
     } else if !has_embed {
         parts.push("[note: semantic search disabled — run `travsr embed init` for better results]");
@@ -1996,8 +2056,8 @@ fn build_context_signals_with_r2(
 }
 
 /// Convenience wrapper for the no-overflow, no-seed-cap degraded-state check.
-fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
-    build_context_signals(store, has_embed, false, None, None)
+fn build_degraded_notes(store: &SqliteStore, has_embed: bool, embed_warming: bool) -> String {
+    build_context_signals(store, has_embed, embed_warming, false, None, None)
 }
 
 /// Format a single node line for `get_context` output.
@@ -2006,19 +2066,34 @@ fn build_degraded_notes(store: &SqliteStore, has_embed: bool) -> String {
 /// - Omits `[package: ]` entirely when the package field is empty.
 /// - R7: appends `[score: N.NN]` when a score is available so the AI can
 ///   weight nodes by relevance without a second round-trip.
-fn format_node_line(n: &CoreNode, role: &str, score: Option<f32>) -> String {
+fn format_node_line(
+    n: &CoreNode,
+    role: &str,
+    score: Option<f32>,
+    via_source: Option<&str>,
+) -> String {
     let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
     let score_str = score
         .map(|s| format!(" [score: {s:.2}]"))
         .unwrap_or_default();
+    // RFC-019: name the source seed for caller/dependency roles so seed
+    // contamination is diagnosable — a caller of a good seed and a caller of a
+    // false seed no longer print the identical `[via: caller]`. Seed/context roles
+    // have no single source, so they render unchanged.
+    let via = match via_source {
+        Some(src) if role == "caller" || role == "dependency" => {
+            format!("[via: {role} of {src}]")
+        }
+        _ => format!("[via: {role}]"),
+    };
     if n.package.is_empty() {
         format!(
-            "{} ({}) — {}{loc} [via: {role}]{score_str}",
+            "{} ({}) — {}{loc} {via}{score_str}",
             n.vname.signature, n.kind, n.vname.path
         )
     } else {
         format!(
-            "{} ({}) — {}{loc} [package: {}] [via: {role}]{score_str}",
+            "{} ({}) — {}{loc} [package: {}] {via}{score_str}",
             n.vname.signature, n.kind, n.vname.path, n.package
         )
     }
@@ -2214,15 +2289,17 @@ pub(crate) fn enrich_seeds_with_callers(
             Err(_) => continue,
         };
 
-        // Apply noise filter: skip test/bench callers.
+        // Apply noise filter: skip test/bench callers and structural noise nodes.
+        // is_noise_seed covers path-level noise (tests/, benches/, caches, etc.);
+        // the sig-prefix check catches test functions in files not in test dirs.
         let mut production_callers: Vec<NodeId> = caller_nodes
             .into_iter()
             .filter(|n| {
-                let path = &n.vname.path;
+                if is_noise_seed(n) {
+                    return false;
+                }
                 let sig = &n.vname.signature;
-                !path.contains("/tests/")
-                    && !path.contains("/benches/")
-                    && !sig.starts_with("fn:test_")
+                !sig.starts_with("fn:test_")
                     && !sig.starts_with("fn:bench_")
                     && !sig.starts_with("fn:prop_")
             })
@@ -2275,6 +2352,8 @@ fn get_context_body(
 ) -> String {
     // Capture embed presence before embed_knn is consumed by the seed-lookup block.
     let has_embed = embed_knn.is_some();
+    // Distinguish "Phase 1 done, hook not yet active" from "embed never initialized".
+    let embed_initialized = store.has_embed_db();
     // PF-M4: compute once here so neither include_snippets branch calls get_meta twice.
     let phase_b = phase_b_pending(store);
 
@@ -2298,10 +2377,22 @@ fn get_context_body(
     // Produces a SeedSet with coverage, confidence, and term-resolution map.
     // Confidence::None → abstain (return resolution map, no salad).
     //
+    // A: first-call warmup. If embeddings are configured but the sidecar hasn't
+    // armed yet, block briefly so the opening query uses semantic seeds instead
+    // of silently degrading to lexical-only. Done OUTSIDE the KNN breaker timing
+    // below so the one-time arm cost is never misread as a slow KNN round-trip.
+    if has_embed && !store.embed_ready() {
+        store.wait_embed_ready(std::time::Duration::from_millis(embed_arm_wait_ms()));
+    }
+    // B: honest warming signal — true only when the cap was exceeded and the
+    // sidecar is still cold. Distinguishes "warming up" from "embeddings off"
+    // so the header/notes never silently claim full semantic coverage.
+    let embed_warming = has_embed && !store.embed_ready();
+
     // R3: track per-query KNN health; has_embed=true doesn't mean KNN worked.
     let mut knn_degraded = false;
-    let knn_pairs = if let Some(knn_fn) = embed_knn {
-        let (knn_scored, _n_eligible, knn_elapsed_ms) =
+    let (knn_pairs, knn_oracle) = if let Some(knn_fn) = embed_knn {
+        let (knn_scored, _n_eligible, knn_elapsed_ms, oracle) =
             embed_path_seeds(store, query, knn_fn, filter);
         let budget_ms = knn_budget_ms();
         if knn_elapsed_ms > budget_ms {
@@ -2312,16 +2403,23 @@ fn get_context_body(
                 "knn exceeded circuit-breaker threshold — falling back to FTS seeds"
             );
             knn_degraded = true;
-            vec![]
+            (vec![], std::collections::HashMap::new())
         } else {
             // Empty = no embeddings indexed yet (graceful no-op, not degraded).
-            knn_scored
+            (knn_scored, oracle)
         }
     } else {
-        vec![]
+        (vec![], std::collections::HashMap::new())
     };
 
-    let seed_set = crate::seed::build_seed_set(store, query, filter, knn_pairs);
+    // RFC-019: direct-cosine oracle hook (None when embeddings off/warming → the
+    // FTS-only path is unchanged).
+    let score_fn = store.embed_score_fn();
+    let score_ref = score_fn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>);
+    let seed_set =
+        crate::seed::build_seed_set(store, query, filter, knn_pairs, &knn_oracle, score_ref);
     let tier_label = if has_embed && !seed_set.seeds.is_empty() {
         "exact+lexical+semantic"
     } else {
@@ -2395,6 +2493,8 @@ fn get_context_body(
         .unwrap_or_else(|| "unknown".to_string());
     let embed_status = if knn_degraded {
         "degraded"
+    } else if embed_warming {
+        "warming"
     } else if has_embed {
         "on"
     } else {
@@ -2439,9 +2539,13 @@ fn get_context_body(
     // Post-filter fetched nodes through RBAC and join with scores.
     // SEC P0: `selected` is the authoritative RBAC-filtered list; snippets are
     // only ever read for nodes already in this set (never re-queried separately).
+    // Issue A.3: apply the full noise policy (is_noise_seed, which is a strict
+    // superset of is_noise_node) so scip: reference nodes, _test.go nodes, and
+    // build-cache hub nodes cannot appear in the emitted context result.
     let items: Vec<(CoreNode, f32)> = fetched
         .into_iter()
         .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
+        .filter(|n| !is_noise_seed(n))
         .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
         .collect();
 
@@ -2462,6 +2566,43 @@ fn get_context_body(
             (n, s * (1.0 + KCORE_ALPHA * shell as f32))
         })
         .collect();
+
+    // Normalize PPR+kcore scores to [0, 1] within this candidate set before display.
+    // Raw PPR distributes probability mass across the full graph (100k+ nodes), making
+    // absolute scores tiny (~0.01–0.05). Normalization makes score bars meaningful:
+    // the top result always shows at 100%, others proportional to it.
+    // Monotone transform — does not change relative ordering, so knapsack is unaffected.
+    let max_raw_score = items.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
+    let items: Vec<(CoreNode, f32)> = if max_raw_score > 0.0 {
+        items
+            .into_iter()
+            .map(|(n, s)| (n, s / max_raw_score))
+            .collect()
+    } else {
+        items
+    };
+
+    // Issue B: relevance floor — drop score-0 tail before knapsack so zero-signal nodes
+    // cannot consume token budget and push genuinely relevant nodes into overflow.
+    // Safety valve: always keep the top MIN_KEEP items so thin-but-legitimate results
+    // are never emptied. Floor is env-overridable for tuning without a rebuild.
+    const REL_FLOOR_DEFAULT: f32 = 0.01;
+    const MIN_KEEP: usize = 8;
+    let rel_floor = std::env::var("TRAVSR_CONTEXT_REL_FLOOR")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(REL_FLOOR_DEFAULT);
+    let items = {
+        let mut sorted = items;
+        sorted.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let keep_floor = sorted.len().min(MIN_KEEP);
+        sorted
+            .into_iter()
+            .enumerate()
+            .filter(|(i, (_, s))| *i < keep_floor || *s >= rel_floor)
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>()
+    };
 
     // Capture lightweight overflow metadata before knapsack consumes items.
     // Storing only (id, score, sig, path) avoids cloning full Node objects.
@@ -2533,25 +2674,40 @@ fn get_context_body(
     // Detection: BFS from the first seed through direct edges among seeds only.
     // If ≥1 seed is unreachable, the seeds span ≥2 disconnected components.
     let multi_concept_note: Option<&str> = {
-        let all_seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
-        if all_seed_ids.len() >= 4 {
-            let seed_set_local: std::collections::HashSet<NodeId> =
-                all_seed_ids.iter().copied().collect();
-            let mut reached: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-            let mut queue: std::collections::VecDeque<NodeId> =
-                std::collections::VecDeque::from([all_seed_ids[0]]);
-            reached.insert(all_seed_ids[0]);
-            while let Some(id) = queue.pop_front() {
-                let fwd = store.iter_edges_from(id).unwrap_or_default();
-                let rev = store.iter_edges_to(id).unwrap_or_default();
-                for e in fwd.into_iter().chain(rev) {
-                    let neighbor = if e.src == id { e.dst } else { e.src };
-                    if seed_set_local.contains(&neighbor) && reached.insert(neighbor) {
-                        queue.push_back(neighbor);
+        // Fix 3b: warn only when the PRIMARY seeds (pre-enrichment) split into ≥2
+        // SUBSTANTIAL disconnected clusters (≥2 seeds each). The old check —
+        // "any seed unreachable from seed[0]" over the *enriched* set — fired on
+        // nearly every query: enrichment spans many packages, and a lone
+        // edge-island primary seed (e.g. a generated conversion fn for the same
+        // concept) looks disconnected. Counting substantial clusters among
+        // primary seeds isolates the genuine R2 case (e.g. "scheduler AND
+        // kubelet") from one concept that merely has a stray seed.
+        const MIN_CLUSTER: usize = 2;
+        let seed_set_local: std::collections::HashSet<NodeId> = primary_seed_ids.clone();
+        if seed_set_local.len() >= 4 {
+            let mut unvisited = seed_set_local.clone();
+            let mut substantial_clusters = 0usize;
+            while let Some(&start) = unvisited.iter().next() {
+                unvisited.remove(&start);
+                let mut size = 1usize;
+                let mut queue: std::collections::VecDeque<NodeId> =
+                    std::collections::VecDeque::from([start]);
+                while let Some(id) = queue.pop_front() {
+                    let fwd = store.iter_edges_from(id).unwrap_or_default();
+                    let rev = store.iter_edges_to(id).unwrap_or_default();
+                    for e in fwd.into_iter().chain(rev) {
+                        let neighbor = if e.src == id { e.dst } else { e.src };
+                        if seed_set_local.contains(&neighbor) && unvisited.remove(&neighbor) {
+                            size += 1;
+                            queue.push_back(neighbor);
+                        }
                     }
                 }
+                if size >= MIN_CLUSTER {
+                    substantial_clusters += 1;
+                }
             }
-            if reached.len() < seed_set_local.len() {
+            if substantial_clusters >= 2 {
                 Some(
                     "[note: query may span multiple concepts — \
                      results show the dominant cluster only. \
@@ -2569,12 +2725,16 @@ fn get_context_body(
     // O(S × avg_degree); seeds are capped at MAX_EMBED_SEEDS so this is negligible.
     // Errors are silently ignored — roles degrade to Context, never block output.
     let seed_ids: Vec<NodeId> = weighted_seeds.iter().map(|&(id, _)| id).collect();
-    let roles: HashMap<NodeId, NodeRole> = {
+    // RFC-019: alongside the role, record WHICH seed assigned a caller/dependency
+    // role (the first seed to do so, deterministic in seed_ids order), so `via:`
+    // can name the source and make seed contamination diagnosable.
+    let (roles, role_source): (HashMap<NodeId, NodeRole>, HashMap<NodeId, NodeId>) = {
         use travsr_core::EdgeKind;
         let selected_set: std::collections::HashSet<NodeId> =
             selected.iter().map(|n| n.id).collect();
         let mut map: HashMap<NodeId, NodeRole> =
             selected.iter().map(|n| (n.id, NodeRole::Context)).collect();
+        let mut src: HashMap<NodeId, NodeId> = HashMap::new();
         for &seed in &seed_ids {
             // Forward edges: seed → node  →  node is a Dependency of seed.
             if let Ok(fwd) = store.iter_edges_from(seed) {
@@ -2587,11 +2747,12 @@ fn get_context_body(
                             | EdgeKind::Exports
                     ) && selected_set.contains(&e.dst)
                     {
-                        map.entry(e.dst).and_modify(|r| {
+                        if let Some(r) = map.get_mut(&e.dst) {
                             if *r == NodeRole::Context {
                                 *r = NodeRole::Dependency;
+                                src.insert(e.dst, seed);
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -2603,11 +2764,12 @@ fn get_context_body(
                         EdgeKind::RefCall | EdgeKind::RefImports | EdgeKind::Depends
                     ) && selected_set.contains(&e.src)
                     {
-                        map.entry(e.src).and_modify(|r| {
+                        if let Some(r) = map.get_mut(&e.src) {
                             if *r == NodeRole::Context {
                                 *r = NodeRole::Caller;
+                                src.insert(e.src, seed);
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -2618,8 +2780,13 @@ fn get_context_body(
                 map.insert(seed, NodeRole::Seed);
             }
         }
-        map
+        (map, src)
     };
+    // Seed signatures for `via: <role> of <seed>` rendering. Cheap — seeds ≤ ~40.
+    let seed_sig: HashMap<NodeId, String> = store
+        .get_nodes(&seed_ids)
+        .map(|ns| ns.into_iter().map(|n| (n.id, n.vname.signature)).collect())
+        .unwrap_or_default();
 
     let char_cap = (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000);
 
@@ -2639,11 +2806,19 @@ fn get_context_body(
                             .copied()
                             .unwrap_or(NodeRole::Context)
                             .label();
-                        format_node_line(n, role, node_score_map.get(&n.id).copied())
+                        format_node_line(
+                            n,
+                            role,
+                            node_score_map.get(&n.id).copied(),
+                            role_source
+                                .get(&n.id)
+                                .and_then(|s| seed_sig.get(s))
+                                .map(String::as_str),
+                        )
                     })
                     .collect();
                 let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
-                let notes = build_degraded_notes(store, has_embed);
+                let notes = build_degraded_notes(store, has_embed, embed_warming);
                 let footer = format!(
                     "[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
                 );
@@ -2674,7 +2849,15 @@ fn get_context_body(
                 .copied()
                 .unwrap_or(NodeRole::Context)
                 .label();
-            let header = format_node_line(n, role, node_score_map.get(&n.id).copied());
+            let header = format_node_line(
+                n,
+                role,
+                node_score_map.get(&n.id).copied(),
+                role_source
+                    .get(&n.id)
+                    .and_then(|s| seed_sig.get(s))
+                    .map(String::as_str),
+            );
             // Use skeleton when the body exceeds the kind-aware line cap.
             let n_height = n
                 .end_line
@@ -2711,6 +2894,8 @@ fn get_context_body(
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,
+            embed_warming,
+            embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
             seed_cap_msg,
@@ -2735,13 +2920,23 @@ fn get_context_body(
                     .copied()
                     .unwrap_or(NodeRole::Context)
                     .label();
-                format_node_line(n, role, node_score_map.get(&n.id).copied())
+                format_node_line(
+                    n,
+                    role,
+                    node_score_map.get(&n.id).copied(),
+                    role_source
+                        .get(&n.id)
+                        .and_then(|s| seed_sig.get(s))
+                        .map(String::as_str),
+                )
             })
             .collect();
         let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,
+            embed_warming,
+            embed_initialized,
             knn_degraded,
             overflow_msg.as_deref(),
             seed_cap_msg,
@@ -3150,14 +3345,17 @@ fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
 /// File nodes all share `signature == "file"`, so we use `path` (prefixed with
 /// corpus when non-empty) to keep Cytoscape ids distinct across repos.
 fn node_json_id(node: &CoreNode) -> String {
-    if node.kind == "file" {
+    if node.kind == "file" || node.vname.path.is_empty() {
         if node.vname.corpus.is_empty() {
             node.vname.path.clone()
         } else {
             format!("{}:{}", node.vname.corpus, node.vname.path)
         }
     } else {
-        node.vname.signature.clone()
+        // Include path so same-signature symbols from different files (e.g.
+        // fn:ContainsPrefix in staging/ and pkg/) get distinct Cytoscape IDs
+        // instead of the second being silently dropped by the dedup guard.
+        format!("{}:{}", node.vname.path, node.vname.signature)
     }
 }
 
@@ -4782,14 +4980,51 @@ mod tests {
 
 use travsr_analysis::skeleton::skeleton_for_node as skeleton_for_node_inner;
 pub use travsr_analysis::snippet::SNIPPET_DEFAULT_BUDGET;
-use travsr_analysis::snippet::{snippet_for_node, snippet_line_cap, SNIPPET_SEP};
+use travsr_analysis::snippet::{
+    snippet_for_node, snippet_for_node_full, snippet_line_cap, SNIPPET_SEP,
+};
+
+/// How `get_snippets` renders each symbol's body.
+///
+/// The default (`Auto`) preserves the historical behaviour: raw source when the
+/// definition fits its kind line-cap, AST skeleton when it overflows. The other
+/// two let a caller (e.g. the VS Code Context Explorer pinning a node into the
+/// AI context) force one representation regardless of size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnippetMode {
+    /// Raw body if within the kind line-cap, else AST skeleton. Default.
+    #[default]
+    Auto,
+    /// Full source of `line..=end_line`, no line cap. Falls back to skeleton if unreadable.
+    Full,
+    /// AST skeleton always, even for a small definition. Falls back to raw body if unavailable.
+    Skeleton,
+}
+
+impl SnippetMode {
+    /// Parse the MCP `mode` argument. Unknown / absent → [`SnippetMode::Auto`].
+    pub fn from_arg(s: &str) -> Self {
+        match s {
+            "full" => Self::Full,
+            "skeleton" => Self::Skeleton,
+            _ => Self::Auto,
+        }
+    }
+}
 
 /// Core snippet assembly: resolves symbols, fetches snippets, enforces budget.
 ///
 /// `symbols_arg` is a newline- or comma-separated list of symbol names.
 /// Symbols are processed in order; truncation happens at symbol granularity
-/// (no partial symbol output) once the token budget is exhausted.
-fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize) -> String {
+/// (no partial symbol output) once the token budget is exhausted — except the
+/// first resolved symbol is always included so a single large `Full` definition
+/// never returns empty.
+fn get_snippets_body(
+    store: &SqliteStore,
+    symbols_arg: &str,
+    token_budget: usize,
+    mode: SnippetMode,
+) -> String {
     // Read repo_root from meta — written by init_repo_with_progress.
     // Absent on indexes created before this feature; degrade gracefully.
     let repo_root = match store.get_meta("repo_root") {
@@ -4842,25 +5077,35 @@ fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize
             "{} ({}) — {} [package: {}]",
             node.vname.signature, node.kind, node.vname.path, node.package
         );
-        // Use skeleton when the body exceeds the kind-aware line cap (truncated
-        // snippets are half-implementations — skeleton gives a complete summary).
-        let node_height = node
-            .end_line
-            .unwrap_or_else(|| node.line.unwrap_or(0))
-            .saturating_sub(node.line.unwrap_or(0)) as usize;
-        let body_text: Option<String> = if node_height > snippet_line_cap(&node.kind) {
-            skeleton_for_node_inner(node, &repo_root)
-                .map(|s| s.render())
-                .or_else(|| snippet_for_node(node, &repo_root))
-        } else {
-            snippet_for_node(node, &repo_root)
-                .or_else(|| skeleton_for_node_inner(node, &repo_root).map(|s| s.render()))
+        let skeleton = |n| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
+        let body_text: Option<String> = match mode {
+            // Full source of the definition, no line cap. Skeleton is the fallback
+            // only when the file can't be read.
+            SnippetMode::Full => snippet_for_node_full(node, &repo_root).or_else(|| skeleton(node)),
+            // AST skeleton always; raw body only if the skeleton can't be built.
+            SnippetMode::Skeleton => skeleton(node).or_else(|| snippet_for_node(node, &repo_root)),
+            // Auto: raw when it fits the kind line-cap, skeleton when it overflows
+            // (a truncated raw snippet is a half-implementation; skeleton summarises).
+            SnippetMode::Auto => {
+                let node_height =
+                    node.end_line
+                        .unwrap_or_else(|| node.line.unwrap_or(0))
+                        .saturating_sub(node.line.unwrap_or(0)) as usize;
+                if node_height > snippet_line_cap(&node.kind) {
+                    skeleton(node).or_else(|| snippet_for_node(node, &repo_root))
+                } else {
+                    snippet_for_node(node, &repo_root).or_else(|| skeleton(node))
+                }
+            }
         };
 
         let snippet_chars = body_text.as_deref().map(str::len).unwrap_or(0);
         let block_cost = (header.len() + snippet_chars) / TOKEN_CHARS_PER_TOKEN + 1;
 
-        if tokens_used + block_cost > token_budget {
+        // Always include the first resolved symbol even if it alone exceeds the
+        // budget — otherwise a single large Full definition (the pin-into-context
+        // case) would return empty. Subsequent symbols respect the budget.
+        if !parts.is_empty() && tokens_used + block_cost > token_budget {
             break;
         }
         tokens_used += block_cost;
@@ -4892,20 +5137,36 @@ fn get_snippets_body(store: &SqliteStore, symbols_arg: &str, token_budget: usize
 /// Return tailored code snippets for one or more named symbols.
 ///
 /// Accepts the symbol names returned by `get_context`, `get_callers`, and
-/// `search_symbol`. Kind-aware extraction: functions → ≤40 lines, classes →
-/// ≤15 lines (header + fields), interfaces/traits/enums → ≤60 lines.
-/// Leading docblocks are stripped so the AI sees real code immediately.
-pub fn get_snippets(store: &SqliteStore, symbols: &str, token_budget: usize) -> String {
-    if let Err(reason) = validate_mcp_arg(symbols) {
+/// `search_symbol`. `mode` selects the representation ([`SnippetMode`]): `Auto`
+/// (kind-aware raw-or-skeleton, the default), `Full` (whole definition, no cap),
+/// or `Skeleton` (AST summary always). Leading docblocks are stripped so the AI
+/// sees real code immediately.
+pub fn get_snippets(
+    store: &SqliteStore,
+    symbols: &str,
+    token_budget: usize,
+    mode: SnippetMode,
+) -> String {
+    if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets rejected invalid arg: {reason}");
         return String::new();
     }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
-    sanitize_for_mcp(&get_snippets_raw(store, symbols, budget))
+    // `get_snippets_body` already sanitizes its body with a budget-derived limit
+    // (control-char stripping + tag escaping) and appends the plain-ASCII footer.
+    // Wrap-only here — like `get_context` — so the response honours `token_budget`
+    // instead of being re-truncated to the 4 KiB scalar-output cap (which silently
+    // dropped everything past ~6 symbols and cut off the summary footer).
+    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode))
 }
 
-pub(crate) fn get_snippets_raw(store: &SqliteStore, symbols: &str, token_budget: usize) -> String {
-    get_snippets_body(store, symbols, token_budget)
+pub(crate) fn get_snippets_raw(
+    store: &SqliteStore,
+    symbols: &str,
+    token_budget: usize,
+    mode: SnippetMode,
+) -> String {
+    get_snippets_body(store, symbols, token_budget, mode)
 }
 
 /// Global variant: searches across all registered repos (or a named one).
@@ -4914,14 +5175,15 @@ pub fn get_snippets_global(
     symbols: &str,
     token_budget: usize,
     repo: Option<&str>,
+    mode: SnippetMode,
 ) -> String {
-    if let Err(reason) = validate_mcp_arg(symbols) {
+    if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets_global rejected invalid arg: {reason}");
         return String::new();
     }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_snippets_raw(store, symbols, budget);
+        let result = get_snippets_raw(store, symbols, budget, mode);
         if result.is_empty() || single {
             result
         } else {
@@ -4983,7 +5245,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
         assert!(result.contains("function hello()"), "snippet body missing");
         assert!(result.contains("return 'hi'"), "snippet content missing");
         assert!(
@@ -4993,12 +5255,68 @@ mod snippet_tests {
     }
 
     #[test]
+    fn full_mode_returns_whole_body_past_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // A "class" node: Auto caps at 15 lines and falls back to skeleton; Full
+        // must return the complete 30-line body including the last line.
+        let mut src = String::from("class Big {\n");
+        for i in 0..28 {
+            src.push_str(&format!("  field{i} = {i};\n"));
+        }
+        src.push_str("  last = true;\n}\n");
+        std::fs::write(dir.path().join("big.ts"), &src).unwrap();
+
+        // A class node spanning > 15 lines (Auto's class line-cap).
+        let class_node = CoreNode::new(
+            VName::new("corpus", "", "big.ts", "typescript", "class:Big"),
+            "class",
+        )
+        .with_line(1)
+        .with_end_line(31);
+        let store = make_store_with_meta(&[class_node], dir.path());
+
+        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full);
+        assert!(
+            full.contains("last = true"),
+            "full mode must include last line: {full}"
+        );
+        assert!(
+            !full.contains("[skeleton:"),
+            "full mode must not be a skeleton: {full}"
+        );
+
+        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto);
+        assert!(
+            auto.contains("[skeleton:") || !auto.contains("last = true"),
+            "auto mode caps/skeletonises the oversized class: {auto}"
+        );
+    }
+
+    #[test]
+    fn skeleton_mode_forces_ast_for_small_fn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("s.ts"),
+            "function small() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("s.ts", "fn:small", 1, 3);
+        let store = make_store_with_meta(&[node], dir.path());
+
+        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton);
+        assert!(
+            skel.contains("[skeleton:"),
+            "skeleton mode must render the AST summary even for a small fn: {skel}"
+        );
+    }
+
+    #[test]
     fn get_snippets_body_no_repo_root_returns_hint() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
         let store = SqliteStore::open(&db_path).unwrap();
         // No set_meta("repo_root") — simulates an old index.
-        let result = get_snippets_body(&store, "anything", 2000);
+        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto);
         assert!(
             result.contains("travsr init"),
             "must prompt user to re-init: {result}"
@@ -5022,17 +5340,23 @@ mod snippet_tests {
         ];
         let store = make_store_with_meta(&nodes, dir.path());
 
-        // Tight budget (5 tokens) — neither symbol fits; expect the hint.
-        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5);
+        // Tight budget (5 tokens) — the first resolved symbol is always included
+        // (so a single large definition is never dropped), but the second respects
+        // the exhausted budget and must not appear.
+        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto);
         assert!(
-            tight.contains("Token budget too small"),
-            "5-token budget must return the hint: {tight}"
+            tight.contains("aaa"),
+            "first symbol must always be included even under a tiny budget: {tight}"
+        );
+        assert!(
+            !tight.contains("bbb"),
+            "second symbol must be excluded when budget exhausted: {tight}"
         );
 
         // Ordering budget (20 tokens) — enough for one symbol (header ~9 tokens +
         // 3-line snippet ~8 tokens = ~17 tokens) but not both. The first symbol
         // in request order ("aaa") must appear; the second ("bbb") must not.
-        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20);
+        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto);
         assert!(
             ordered.contains("aaa"),
             "first symbol must be included within budget: {ordered}"
@@ -5050,7 +5374,7 @@ mod snippet_tests {
         let node = make_fn_node("missing.ts", "fn:ghost", 1, 5);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:ghost", 2000);
+        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto);
         // Should return metadata line without panic.
         assert!(
             result.contains("fn:ghost"),
@@ -5349,9 +5673,10 @@ mod snippet_tests {
             result.contains("[via: seed]"),
             "seed node must be labelled [via: seed]: {result}"
         );
+        // RFC-019: caller/dependency roles now name their source seed.
         assert!(
-            result.contains("[via: caller]"),
-            "caller node must be labelled [via: caller]: {result}"
+            result.contains("[via: caller of fn:seed_fn]"),
+            "caller node must be labelled with its source seed: {result}"
         );
     }
 
@@ -5376,9 +5701,10 @@ mod snippet_tests {
             result.contains("[via: seed]"),
             "seed node must be labelled [via: seed]: {result}"
         );
+        // RFC-019: caller/dependency roles now name their source seed.
         assert!(
-            result.contains("[via: dependency]"),
-            "dep node must be labelled [via: dependency]: {result}"
+            result.contains("[via: dependency of fn:seed_fn2]"),
+            "dep node must be labelled with its source seed: {result}"
         );
     }
 
@@ -5680,7 +6006,7 @@ mod snippet_tests {
         let knn: EmbedKnnFn<'_> =
             &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
 
-        let (seeds, n_eligible, _) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        let (seeds, n_eligible, _, _) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
         assert!(
             seeds.iter().all(|(node, _)| node.id == impl_id),
             "only the src impl node should be a seed; got: {seeds:?}"
@@ -5735,6 +6061,56 @@ mod snippet_tests {
         assert!(
             !result.contains("[note:"),
             "fully operational graph must not emit degraded notes; got: {result}"
+        );
+    }
+
+    /// A0/B: embed configured but sidecar not yet armed → header reads `warming`
+    /// and a warming note is emitted (never a silent lexical-only degrade).
+    #[test]
+    fn get_context_warming_reports_warming_header_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        // Register an un-armed readiness → embed_ready() == false → warming.
+        store.set_embed_readiness(travsr_store::EmbedReadiness::new());
+        // Keep the arm-wait short so the test times out fast rather than waiting 5 s.
+        std::env::set_var("TRAVSR_EMBED_ARM_WAIT_MS", "40");
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        std::env::remove_var("TRAVSR_EMBED_ARM_WAIT_MS");
+        assert!(
+            result.contains("embeddings: warming"),
+            "header must report warming while sidecar is cold; got: {result}"
+        );
+        assert!(
+            result.contains("still warming up"),
+            "must emit warming note; got: {result}"
+        );
+    }
+
+    /// B: once the readiness handle is armed, the same configuration reports
+    /// `embeddings: on` with no warming note.
+    #[test]
+    fn get_context_armed_reports_on_no_warming_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/payment.ts", "fn:charge", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let readiness = travsr_store::EmbedReadiness::new();
+        readiness.mark_ready();
+        store.set_embed_readiness(readiness);
+        let knn: EmbedKnnFn<'_> = &|_q, _k| vec![];
+        let result = get_context_body(&store, "charge", 4096, &OpenFilter, false, None, Some(knn));
+        assert!(
+            result.contains("embeddings: on"),
+            "armed readiness must report on; got: {result}"
+        );
+        assert!(
+            !result.contains("warming"),
+            "armed readiness must not emit warming note; got: {result}"
         );
     }
 
@@ -5807,7 +6183,7 @@ mod snippet_tests {
             knn_pairs.push((id, 0.90 - i as f32 * 0.001));
         }
         let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
-        let (seeds, n_eligible, _) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
+        let (seeds, n_eligible, _, _) = embed_path_seeds(&store, "sym", knn, &OpenFilter);
         assert_eq!(
             seeds.len(),
             MAX_EMBED_SEEDS,
@@ -5836,7 +6212,7 @@ mod snippet_tests {
             knn_pairs.push((id, 0.95));
         }
         let knn: EmbedKnnFn<'_> = &|_q, _k| knn_pairs.clone();
-        let (seeds, n_eligible, _) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
+        let (seeds, n_eligible, _, _) = embed_path_seeds(&store, "cap", knn, &OpenFilter);
         assert!(
             n_eligible > seeds.len(),
             "cap fired: n_eligible ({n_eligible}) > seeds.len() ({})",
@@ -5850,6 +6226,7 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let result = build_context_signals(
             &store,
+            false,
             false,
             false,
             Some("[overflow msg]"),

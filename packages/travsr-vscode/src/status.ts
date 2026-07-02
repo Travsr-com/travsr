@@ -1,7 +1,7 @@
 /**
  * VSCODE-201: Always-fresh status bar indicator.
  *
- * Polls get_repo_map every 30 s and derives a freshness state.
+ * Polls get_graph_stats every 30 s and derives a freshness state.
  * Switches to "indexing" on file save, then re-queries after 2 s.
  *
  * Design tokens (design/CONCEPT_UI.md §4):
@@ -130,9 +130,14 @@ export function createStatusBarItem(
         lastUpdated = new Date();
         staleAt = null;
         state = "fresh";
-      } else {
+      } else if (!client.isConnected()) {
+        // Process exited — genuine disconnect.
         if (state !== "stale" && state !== "error") staleAt = new Date();
-        state = "stale";
+        state = "error";
+      } else {
+        // Empty from a live server = poll timed out because the server stdin
+        // queue is backed up with other in-flight queries. Keep current state.
+        return;
       }
     } catch {
       if (state !== "stale" && state !== "error") staleAt = new Date();

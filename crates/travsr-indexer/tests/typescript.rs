@@ -226,13 +226,14 @@ fn link_imports_skips_package_imports() {
         "package imports must not produce resolves-to edges"
     );
 
-    // 13 relative imports (./mcp, ./status, ./codelens, ./hover, ./tree, ./repoFileTree,
-    // ./welcome, ./clientProxy, ./installer, ./telemetry, ./graph, ./contextProvider,
-    // ./commands) × 2 candidates each (.ts + .tsx probe) = 26 edges.
+    // 15 relative imports (./mcp, ./clientProxy, ./status, ./codelens, ./hover, ./tree,
+    // ./repoFileTree, ./welcome, ./graph, ./installer, ./telemetry, ./commands,
+    // ./contextExplorer, ./mcpRegister, ./contextCodeAction) × 2 candidates each
+    // (.ts + .tsx probe) = 30 edges.  (contextProvider removed, 3 new panels added.)
     assert_eq!(
         edges.len(),
-        26,
-        "13 relative imports × 2 extension candidates = 26 resolves-to edges"
+        30,
+        "15 relative imports × 2 extension candidates = 30 resolves-to edges"
     );
 }
 

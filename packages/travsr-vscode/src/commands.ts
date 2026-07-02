@@ -390,10 +390,33 @@ ${transitiveBlock}
 
 // ── Command registrations ───────────────────────────────────────────────────
 
+// Language tokens to strip from symbol queries so `fn foo` → `foo` matches backend inference.
+// Mirrors the set in travsr-mcp's infer_language_from_query (tools.rs).
+const LANG_TOKENS = new Set([
+  "fn","func","function","def","class","struct","trait","impl","interface",
+  "type","const","let","var","mod","module","pub","pub(crate)","async","static",
+]);
+
+/** Strip leading language tokens from a query string (client-side ranking parity). */
+export function stripLangTokens(query: string): string {
+  const words = query.trim().split(/\s+/);
+  const stripped = words.filter((w) => !LANG_TOKENS.has(w.toLowerCase()));
+  return (stripped.length > 0 ? stripped : words).join(" ");
+}
+
+// Session-level rate-limit for synonym suggestions: one per (query, symbolName) pair.
+const synonymPromptedPairs = new Set<string>();
+
 /**
  * travsr.askSymbol — live ranked symbol search. Reuses `get_graph_json` (its
  * nodes already carry path + line), debounced 250ms, with a stale-response
  * guard so out-of-order daemon replies never clobber newer input.
+ *
+ * Applies client-side language-token stripping (ITEM 4) before the query so
+ * `fn foo` ranks the same as `foo` (mirrors travsr-mcp's infer_language_from_query).
+ *
+ * On accept: if the typed token differs from the selected symbol name, offers
+ * a one-click synonym add (ITEM 5) gated by travsr.suggestSynonyms.
  */
 export function registerAskSymbol(client: McpClient): vscode.Disposable {
   return vscode.commands.registerCommand("travsr.askSymbol", () => {
@@ -401,22 +424,26 @@ export function registerAskSymbol(client: McpClient): vscode.Disposable {
     qp.placeholder = "Search symbols by name or natural language…";
     qp.matchOnDescription = true;
     let debounce: ReturnType<typeof setTimeout> | undefined;
+    let queryAbort: AbortController | undefined;
 
     const run = (value: string): void => {
       if (!value.trim()) {
         qp.items = [];
         return;
       }
+      queryAbort?.abort();
+      queryAbort = new AbortController();
+      const signal = queryAbort.signal;
+      const normalised = stripLangTokens(value);
       qp.busy = true;
       void client
-        .callTool("get_graph_json", {
-          query: value,
-          direction: "both",
-          depth: "1",
-          kind_filter: "",
-        })
+        .callTool(
+          "get_graph_json",
+          { query: normalised, direction: "both", depth: "1", kind_filter: "" },
+          signal
+        )
         .then((raw) => {
-          if (qp.value !== value) return;
+          if (signal.aborted || qp.value !== value) return;
           qp.items = parseGraphSymbols(raw);
           qp.busy = false;
         });
@@ -426,13 +453,39 @@ export function registerAskSymbol(client: McpClient): vscode.Disposable {
       clearTimeout(debounce);
       debounce = setTimeout(() => run(value), 250);
     });
+
     qp.onDidAccept(() => {
       const sel = qp.selectedItems[0];
-      if (sel) void openAtLine(sel.path, sel.line);
+      if (!sel) { qp.hide(); return; }
+      void openAtLine(sel.path, sel.line);
       qp.hide();
+
+      // ITEM 5: synonym learning — offer to teach the backend when query ≠ selected name.
+      const cfg = vscode.workspace.getConfiguration("travsr");
+      if (!cfg.get<boolean>("suggestSynonyms", true)) return;
+      const typedToken = stripLangTokens(qp.value).split(/\s+/)[0] ?? "";
+      // Strip codicon prefix from label (e.g. "$(symbol-method) barFn" → "barFn")
+      const selectedName = sel.label.replace(/^\$\([^)]+\)\s*/, "").trim();
+      if (!typedToken || typedToken === selectedName) return;
+      const pairKey = `${typedToken}\x00${selectedName}`;
+      if (synonymPromptedPairs.has(pairKey)) return;
+      synonymPromptedPairs.add(pairKey);
+      void vscode.window
+        .showInformationMessage(
+          `Add synonym: "${typedToken}" → "${selectedName}"?`,
+          "Add",
+          "Skip"
+        )
+        .then((choice) => {
+          if (choice === "Add") {
+            void client.callTool("synonym_add", { term: typedToken, alias: selectedName });
+          }
+        });
     });
+
     qp.onDidHide(() => {
       clearTimeout(debounce);
+      queryAbort?.abort();
       qp.dispose();
     });
     qp.show();
@@ -536,14 +589,8 @@ export function registerManageSynonyms(client: McpClient): vscode.Disposable {
         warnIfError(await client.callTool("synonym_add", { term: msg.term, alias: msg.alias }));
         break;
       case "addBatch":
-        for (const alias of msg.aliases) {
-          const result = await client.callTool("synonym_add", { term: msg.term, alias });
-          const trimmed = result.trim();
-          if (trimmed && trimmed !== "ok") {
-            void vscode.window.showWarningMessage(`Travsr synonyms: ${trimmed} (alias "${alias}" and later aliases skipped)`);
-            break;
-          }
-        }
+        // synonym_set is atomic: replaces all aliases for the term in one write.
+        warnIfError(await client.callTool("synonym_set", { term: msg.term, aliases: msg.aliases.join(",") }));
         break;
       case "removePair":
         await client.callTool("synonym_remove", { term: msg.term, alias: msg.alias });

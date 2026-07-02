@@ -4,6 +4,8 @@ import Mocha from "mocha";
 
 export function run(): Promise<void> {
   const mocha = new Mocha({ ui: "tdd", color: true, timeout: 10_000 });
+  // Optional focused run: MOCHA_GREP="codelens" npm test — filters by suite/test name.
+  if (process.env.MOCHA_GREP) mocha.grep(process.env.MOCHA_GREP);
   const testsRoot = __dirname;
 
   const files = fs

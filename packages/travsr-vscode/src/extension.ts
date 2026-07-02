@@ -35,8 +35,10 @@ import {
   EVT_MCP_INVOKED,
   EVT_DAEMON_FAILED,
 } from "./telemetry";
-import { registerContextProvider } from "./contextProvider";
 import { registerParityCommands, refreshOpenPanels } from "./commands";
+import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
+import { registerMcpServerCommand } from "./mcpRegister";
+import { registerContextCodeAction } from "./contextCodeAction";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -113,13 +115,10 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(dbWatcher);
   }
 
-  // RFC-012 A2 F4: ambient context provider — fires before every Copilot Chat turn.
-  // Wrapped in try/catch: a crash here must never block command registration below.
-  try {
-    registerContextProvider(proxy, context, channel);
-  } catch (e) {
-    channel.appendLine(`[WARN] context provider registration failed: ${e}`);
-  }
+  // ITEM 2: the chatContextProvider proposed API is gone. Graph context now
+  // reaches agents via the Context Explorer (ITEM 1), MCP registration
+  // (travsr.registerMcpServer), and the copy-to-chat CodeAction (part 3) —
+  // none of which require a proposed API at runtime.
 
   // Status bar (VSCODE-201) — reconnect-aware
   createStatusBarItem(context, proxy, (cb) => proxy.onReconnect(cb), statusBarPosition);
@@ -127,7 +126,14 @@ export function activate(context: vscode.ExtensionContext): void {
   // Code lens (VSCODE-202)
   const codeLensProvider = new BlastRadiusCodeLensProvider(proxy);
   context.subscriptions.push(
+    codeLensProvider,
     vscode.languages.registerCodeLensProvider(BLAST_RADIUS_SELECTOR, codeLensProvider)
+  );
+  // ITEM 3: re-title high-blast lenses immediately when the risk threshold changes.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("travsr.blastRiskThreshold")) codeLensProvider.refresh();
+    })
   );
 
   // Hover (VSCODE-203)
@@ -441,6 +447,73 @@ export function activate(context: vscode.ExtensionContext): void {
     hoverProvider.clearCache();
     treeProvider.refresh();
   });
+
+  // ITEM 1: Context Explorer — first-class surface for get_context.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.openContextExplorer", () => {
+      const panel = ContextExplorerPanel.show(proxy, context);
+      const editor = vscode.window.activeTextEditor;
+      if (editor) {
+        const sym = getSymbolAtCursor(editor);
+        // Approximate token count of the active file (chars / 4) for the token-saved bar.
+        const fileTok = Math.round(editor.document.getText().length / 4);
+        if (sym) panel.seedQuery(sym, fileTok);
+      }
+    })
+  );
+
+  // ITEM 2: MCP server registration for external agents.
+  context.subscriptions.push(registerMcpServerCommand(binary));
+
+  // ITEM 2 (part 3): pull graph context onto the clipboard for chat agents that
+  // can't take the MCP-register route (Copilot). Lightbulb CodeAction + palette.
+  context.subscriptions.push(registerContextCodeAction(proxy));
+
+  // ITEM 3: Explicit blast-before-edit command (context menu on a symbol).
+  context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.blastBeforeEdit", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        void vscode.window.showInformationMessage("Open a file to check blast radius.");
+        return;
+      }
+      const file = vscode.workspace.asRelativePath(editor.document.uri, false);
+      const raw = await proxy.callTool("get_blast_radius", { file });
+      const files = parseEnvelope(raw);
+      const count = files.length;
+      if (count === 0) {
+        void vscode.window.showInformationMessage(`Travsr: ${file} has no dependents — safe to edit.`);
+        return;
+      }
+      const label = `${file}: ${count} file${count !== 1 ? "s" : ""} depend on this`;
+      const action = await vscode.window.showWarningMessage(label, "Show Details", "OK");
+      if (action === "Show Details") {
+        await vscode.commands.executeCommand("travsr.showBlastRadius", file, files);
+      }
+    })
+  );
+
+  // ITEM 3: File-rename safety — warn when renaming a high-dependency file.
+  context.subscriptions.push(
+    vscode.workspace.onWillRenameFiles(async (e) => {
+      const checks = e.files.map(async ({ oldUri }) => {
+        const rel = vscode.workspace.asRelativePath(oldUri, false);
+        const raw = await proxy.callTool("get_blast_radius", { file: rel });
+        const deps = parseEnvelope(raw);
+        if (deps.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Travsr: renaming ${rel} may break ${deps.length} dependent file${deps.length !== 1 ? "s" : ""}.`,
+            "Show Details"
+          ).then((action) => {
+            if (action === "Show Details") {
+              void vscode.commands.executeCommand("travsr.showBlastRadius", rel, deps);
+            }
+          });
+        }
+      });
+      await Promise.all(checks);
+    })
+  );
 
   // Re-index command — also reachable from the status Quick Pick. Lives here
   // (not commands.ts) because it needs the output channel + workspace root.

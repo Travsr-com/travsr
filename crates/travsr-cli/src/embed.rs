@@ -598,7 +598,7 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
     fs2::FileExt::lock_exclusive(&embed_lock)
         .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
 
-    let workers = travsr_plugin_host::derive_num_workers_for_cli();
+    let workers = travsr_plugin_host::derive_num_workers_for_cli(&db_path);
     println!(
         "Reindexing {} ({} parallel worker{})...",
         db_path.display(),

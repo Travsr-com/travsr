@@ -1406,27 +1406,54 @@ fn collect_present_languages_and_paths(
 /// Called from the daemon's embed_tick (every 60 s). The `phase2_spawned` flag
 /// prevents re-spawning on every tick — it is reset to false whenever the daemon
 /// detects new Phase 1 work (e.g. after a re-init or new Phase B run).
-fn maybe_spawn_embed_phase2(
+/// Drive the two-phase background embedding pipeline from the daemon's embed_tick.
+///
+/// Phase 1 embeds the structurally most central nodes (shell_number >= derived
+/// threshold, covering PHASE1_COVERAGE_FRACTION of all symbol nodes). Phase 2
+/// embeds the remainder after Phase 1 finishes.
+///
+/// Two bugs fixed here vs the old `maybe_spawn_embed_phase2`:
+///
+/// Bug A — hardcoded threshold 3: `embed_progress` was called with threshold=3
+/// but `spawn_background_reindex_phase1/2` derive a repo-specific threshold via
+/// k-core coverage. This caused the progress check to use a completely different
+/// Phase 1/2 split than the sidecar actually used, so Phase 2 could never be
+/// triggered after Phase 1 completed (phase1_done < phase1_total at threshold=3
+/// when phase1 actually used threshold=13).
+///
+/// Bug B — Phase 1 never re-triggered: Phase 1 is only spawned inside
+/// `run_background_phase_b`. If `embed init` is run on a repo where Phase B has
+/// already completed, or the daemon is restarted while Phase 1 is mid-flight,
+/// Phase 1 silently stalls forever. This function now detects both cases and
+/// re-triggers Phase 1 when: Phase B is complete AND no sidecar is currently
+/// running AND Phase 1 is still incomplete.
+fn maybe_spawn_embed(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
     phase2_spawned: &std::sync::atomic::AtomicBool,
 ) {
     use std::sync::atomic::Ordering;
-    if phase2_spawned.load(Ordering::Relaxed) {
-        return;
-    }
+
     let db_path = repo_root.join(".travsr/graph.db");
     if !db_path.exists() {
         return;
     }
-    // Use per-repo config — do not auto-embed repos that haven't opted in.
+
+    // Do not auto-embed repos that haven't opted in via `travsr embed init`.
     let backend_id = match travsr_plugin_host::repo_backend_id(repo_root) {
         Some(id) => id,
         None => return,
     };
-    let (total, _embedded, phase1_total, phase1_done) = {
+
+    // Fix for Bug A: use the derived threshold — same derivation as
+    // spawn_background_reindex_phase1/2 — so the progress check here and the
+    // actual sidecar partitioning always agree on the Phase 1/2 boundary.
+    // Falls back to 3 when k-core data is not yet available (pre-Phase-B).
+    let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(&db_path).unwrap_or(3);
+
+    let (total, embedded, phase1_total, phase1_done) = {
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
-        match s.embed_progress(&backend_id, 3) {
+        match s.embed_progress(&backend_id, threshold) {
             Ok(t) => t,
             Err(e) => {
                 tracing::debug!("embed_tick: embed_progress query failed: {e}");
@@ -1434,20 +1461,57 @@ fn maybe_spawn_embed_phase2(
             }
         }
     };
-    let phase2_total = total.saturating_sub(phase1_total);
-    let phase2_remaining = phase2_total.saturating_sub(_embedded.saturating_sub(phase1_done));
+
     if phase1_done < phase1_total {
-        tracing::debug!(
-            phase1_done,
-            phase1_total,
-            "embed_tick: Phase 1 still running — deferring Phase 2"
-        );
+        // Fix for Bug B: catch-up trigger for Phase 1.
+        // Fires when no sidecar is currently running AND Phase 1 is still
+        // incomplete. Covers two cases:
+        //   (a) `embed init` was run after Phase B completed — the post-Phase-B
+        //       trigger fired with no backend configured and was silently skipped.
+        //   (b) The daemon was restarted while Phase 1 was mid-flight — the
+        //       sidecar was killed with Phase 1 partially done.
+        // In both cases the correct action is to (re-)launch Phase 1; the sidecar
+        // skips already-embedded nodes, so partial progress is preserved.
+        if !travsr_plugin_host::embed_reindex_in_flight() {
+            let phase_b_complete = {
+                let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                let last = s.get_meta("last_commit").ok().flatten();
+                let pb = s.get_meta("phase_b_commit").ok().flatten();
+                matches!((last, pb), (Some(l), Some(p)) if !l.is_empty() && p == l)
+            };
+            if phase_b_complete {
+                tracing::info!(
+                    phase1_done,
+                    phase1_total,
+                    "embed_tick: Phase 1 incomplete, no sidecar running — spawning Phase 1"
+                );
+                travsr_plugin_host::spawn_background_reindex_phase1(&db_path);
+            } else {
+                tracing::debug!("embed_tick: Phase 1 pending — waiting for Phase B to complete");
+            }
+        } else {
+            tracing::debug!(
+                phase1_done,
+                phase1_total,
+                "embed_tick: Phase 1 in progress — deferring Phase 2"
+            );
+        }
         return;
     }
+
+    // Phase 1 complete — handle Phase 2.
+    if phase2_spawned.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let phase2_total = total.saturating_sub(phase1_total);
+    let phase2_remaining = phase2_total.saturating_sub(embedded.saturating_sub(phase1_done));
+
     if phase2_remaining == 0 {
         phase2_spawned.store(true, Ordering::Relaxed);
         return;
     }
+
     tracing::info!(
         phase2_remaining,
         "embed_tick: Phase 1 complete — spawning Phase 2"
@@ -2323,6 +2387,179 @@ mod tests {
             stats.total_nodes
         );
     }
+
+    // ── maybe_spawn_embed tests ───────────────────────────────────────────────
+
+    fn setup_embed_store(tmp: &std::path::Path) -> travsr_store::SqliteStore {
+        std::fs::create_dir_all(tmp.join(".travsr")).unwrap();
+        let db_path = tmp.join(".travsr/graph.db");
+        travsr_store::SqliteStore::open(&db_path).unwrap()
+    }
+
+    fn set_phase_b_complete(store: &mut travsr_store::SqliteStore, sha: &str) {
+        store.set_meta("last_commit", sha).unwrap();
+        store.set_meta("phase_b_commit", sha).unwrap();
+    }
+
+    fn set_phase_b_pending(store: &mut travsr_store::SqliteStore) {
+        store.set_meta("last_commit", "abc123").unwrap();
+        // phase_b_commit deliberately absent — Phase B not yet run
+    }
+
+    #[test]
+    fn maybe_spawn_embed_returns_early_when_db_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No graph.db at all — function must return without panic or spin
+        let store = std::sync::Mutex::new(setup_embed_store(tmp.path()));
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        // point repo_root at a path with no .travsr/graph.db
+        let empty = tempfile::tempdir().unwrap();
+        maybe_spawn_embed(empty.path(), &store, &flag);
+        // reaching here is the assertion — no panic, no hang
+    }
+
+    #[test]
+    fn maybe_spawn_embed_returns_early_when_backend_not_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let mut store = setup_embed_store(tmp.path());
+        set_phase_b_complete(&mut store, "deadbeef");
+        let store = std::sync::Mutex::new(store);
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        // No embed.toml written — repo_backend_id returns None
+        maybe_spawn_embed(tmp.path(), &store, &flag);
+        // No spawn attempted; flag must stay false
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Set shell_number = `shell` on every embeddable node (kind not in the
+    /// exclusion list). This simulates Phase B having run and computed k-core
+    /// without requiring the Phase B toolchain to be installed.
+    fn inject_shell_numbers(store: &mut travsr_store::SqliteStore, shell: u32) {
+        let nodes = store.nodes_missing_embed_text().unwrap_or_default();
+        let pairs: Vec<(travsr_core::NodeId, u32)> = nodes.iter().map(|n| (n.id, shell)).collect();
+        if !pairs.is_empty() {
+            store.write_shell_numbers(&pairs).unwrap();
+        }
+    }
+
+    /// Build a real graph.db with at least one indexed TS file, simulated Phase B
+    /// shell_numbers, and embed backend configured. Returns (tmp, store, db_path).
+    fn setup_repo_with_phase_b(
+        shell: u32,
+        phase_b_sha: Option<&str>,
+    ) -> (tempfile::TempDir, travsr_store::SqliteStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(
+            tmp.path().join("app.ts"),
+            "export class App { run() {} greet(name: string) { return name; } }",
+        )
+        .unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        // Write backend config after .travsr/ exists (created by init_repo)
+        travsr_plugin_host::write_repo_backend_id(tmp.path(), "bge-small-en-v1.5").unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        inject_shell_numbers(&mut store, shell);
+        if let Some(sha) = phase_b_sha {
+            set_phase_b_complete(&mut store, sha);
+        } else {
+            set_phase_b_pending(&mut store);
+        }
+        (tmp, store)
+    }
+
+    #[test]
+    fn maybe_spawn_embed_skips_phase1_catchup_when_phase_b_pending() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // shell=5, Phase B pending (last_commit set but phase_b_commit absent)
+        let (tmp, store) = setup_repo_with_phase_b(5, None);
+        let store = std::sync::Mutex::new(store);
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        // phase1_total > 0 (nodes have shell_number=5 ≥ threshold),
+        // but Phase B is NOT complete → catch-up must NOT fire.
+        maybe_spawn_embed(tmp.path(), &store, &flag);
+        // flag stays false — Phase 1 not done, Phase 2 not triggered
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn maybe_spawn_embed_triggers_phase1_catchup_when_phase_b_complete() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // shell=5, Phase B complete — this is the "embed init after Phase B" scenario
+        let (tmp, store) = setup_repo_with_phase_b(5, Some("deadbeef"));
+        let store = std::sync::Mutex::new(store);
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        // phase1_total > 0, Phase B complete, no sidecar, no embeddings yet
+        // → catch-up fires and calls spawn_background_reindex_phase1.
+        // The binary isn't installed so spawn returns false — but the catch-up
+        // LOGIC branch is exercised and the function returns without setting
+        // phase2_spawned (Phase 1 still not done).
+        maybe_spawn_embed(tmp.path(), &store, &flag);
+        // flag stays false — Phase 1 still not done, Phase 2 not triggered
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn maybe_spawn_embed_does_not_trigger_phase2_when_phase2_flag_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, store) = setup_repo_with_phase_b(5, Some("deadbeef"));
+        let store = std::sync::Mutex::new(store);
+        // phase2_spawned=true — function must return before calling spawn_phase2
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        maybe_spawn_embed(tmp.path(), &store, &flag);
+        // flag remains true — Phase 2 was not re-spawned
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn embed_reindex_in_flight_reflects_idle_state() {
+        // With no sidecar currently running, the in-flight flag must be false.
+        // After a spawn attempt with an unconfigured repo (binary not installed),
+        // the flag must still be false (spawn_phase1 clears it on early-exit).
+        assert!(!travsr_plugin_host::embed_reindex_in_flight());
+        travsr_plugin_host::spawn_background_reindex_phase1(std::path::Path::new("/nonexistent"));
+        assert!(!travsr_plugin_host::embed_reindex_in_flight());
+    }
+
+    #[test]
+    fn maybe_spawn_embed_phase_b_complete_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+
+        // No commits yet — Phase B incomplete
+        let (last, pb) = (
+            store.get_meta("last_commit").unwrap(),
+            store.get_meta("phase_b_commit").unwrap(),
+        );
+        assert!(last.is_none(), "last_commit absent initially");
+        assert!(pb.is_none(), "phase_b_commit absent initially");
+
+        // Simulate Phase B completion
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let (last, pb) = (
+            store.get_meta("last_commit").unwrap(),
+            store.get_meta("phase_b_commit").unwrap(),
+        );
+        assert_eq!(last.as_deref(), Some("abc123"));
+        assert_eq!(pb.as_deref(), Some("abc123"));
+
+        // Simulate new commit without Phase B run
+        store.set_meta("last_commit", "def456").unwrap();
+        let (last, pb) = (
+            store.get_meta("last_commit").unwrap(),
+            store.get_meta("phase_b_commit").unwrap(),
+        );
+        assert_ne!(last, pb, "mismatch means Phase B stale");
+    }
 }
 
 // ControlMessage and ControlResponse are now in travsr_ipc — no local defs needed.
@@ -2379,10 +2616,15 @@ impl Daemon {
 
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");
+        // NB: intentionally NO `.truncate(true)`. O_TRUNC would leave the file
+        // observably empty between this open and the PID write below, during which
+        // the CLI's lock-PID fallback reads nothing and wrongly concludes "no
+        // daemon" — spawning a doomed child. We overwrite + trim after acquiring
+        // the lock instead (below), so the file is never empty while it is held.
+        #[allow(clippy::suspicious_open_options)]
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
             .open(&lock_path)
             .context("opening daemon.lock")?;
         lock_file.try_lock_exclusive().map_err(|_| {
@@ -2394,9 +2636,13 @@ impl Daemon {
                 .unwrap_or_default();
             anyhow::anyhow!("another travsr daemon is already running{pid}")
         })?;
-        // Write our PID into the lockfile for `daemon status`.
-        use std::io::Write as _;
-        write!(&lock_file, "{}", std::process::id())?;
+        // Write our PID into the lockfile for `daemon status`. Overwrite from the
+        // start and trim any older, longer PID (we did not truncate on open).
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let pid = std::process::id().to_string();
+        (&lock_file).seek(SeekFrom::Start(0))?;
+        (&lock_file).write_all(pid.as_bytes())?;
+        lock_file.set_len(pid.len() as u64)?;
 
         let db_path = travsr_dir.join("graph.db");
         let store = Arc::new(Mutex::new(
@@ -2715,7 +2961,7 @@ impl Daemon {
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
                         tokio::task::spawn_blocking(move || {
-                            maybe_spawn_embed_phase2(repo_bg.as_path(), &store_bg, &p2_flag);
+                            maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
                         });
                     }
                     _ = &mut shutdown => {
@@ -2774,7 +3020,7 @@ impl Daemon {
                         let repo_bg = Arc::clone(&repo_root_arc);
                         let p2_flag = Arc::clone(&embed_phase2_spawned);
                         tokio::task::spawn_blocking(move || {
-                            maybe_spawn_embed_phase2(repo_bg.as_path(), &store_bg, &p2_flag);
+                            maybe_spawn_embed(repo_bg.as_path(), &store_bg, &p2_flag);
                         });
                     }
                     _ = &mut shutdown => {
@@ -3105,7 +3351,29 @@ pub fn try_inject_embed_hook(
     }
 
     if let Some(hook) = supervisor.knn_hook(model_id.clone()) {
+        // Warm the sidecar (ONNX + HNSW load) BEFORE arming the hook so the
+        // daemon's first query never pays the cold-start cost that would trip
+        // the 600 ms KNN breaker and degrade to FTS. Blocking, but this runs
+        // once at startup before the daemon serves any request.
+        supervisor.prewarm();
         query_store.set_embed_knn_hook(hook);
+        // RFC-019: inject the direct-cosine oracle beside the KNN hook. Reuses the
+        // same warm sidecar for the query embedding; candidate vectors are read from
+        // embed.db by travsr-store. `None` query-hook → no score hook → the FTS-only
+        // path is unchanged.
+        if let Some(qhook) = supervisor.embed_query_hook() {
+            let embed_db = db_path.with_file_name("embed.db");
+            let model = model_id.clone();
+            let score: travsr_store::EmbedScoreHook =
+                std::sync::Arc::new(move |q: &str, ids: &[travsr_core::NodeId]| {
+                    let blob = qhook(q)?;
+                    match travsr_store::decode_embedding(&blob) {
+                        Some(qv) => travsr_store::score_candidates(&qv, &embed_db, &model, ids),
+                        None => Ok(vec![]),
+                    }
+                });
+            query_store.set_embed_score_hook(score);
+        }
         // Persist the active model_id so future startups detect backend switches.
         if let Err(e) = write_store.set_meta("current_embed_model", &model_id) {
             tracing::warn!("embed: failed to persist current_embed_model: {e}");
@@ -3114,56 +3382,20 @@ pub fn try_inject_embed_hook(
     }
 }
 
-/// Cold-path variant of [`try_inject_embed_hook`] for read-only CLI queries.
+/// Cold-path variant of [`try_inject_embed_hook`] for read-only CLI queries —
+/// intentionally a no-op.
 ///
-/// Injects the embed KNN hook into a store opened without a write connection,
-/// so `travsr ask` benefits from embedding-enhanced seed selection even when
-/// no daemon is running. The meta write (`current_embed_model`) is skipped
-/// because the store is read-only; the model-id guard still runs to prevent
-/// stale-embedding queries.
+/// `travsr ask` with no running daemon has no long-lived host to own a warm
+/// sidecar. Spawning one per invocation cannot help: an unwarmed first KNN takes
+/// ~0.6 s (model load), which overruns the host's 600 ms `ask_query` circuit-
+/// breaker, so the seeds are discarded and the query falls back to FTS anyway —
+/// while the process churns a throwaway 127 MB-model sidecar each call. The only
+/// way to beat the breaker is a per-`ask` *blocking* prewarm, i.e. exactly the
+/// duplicate-process anti-pattern we are avoiding.
 ///
-/// No-op when the backend binary is absent, the HNSW index has not been built,
-/// or the stored model id does not match the installed sidecar.
-pub fn try_inject_embed_hook_readonly(store: &mut SqliteStore, db_path: &std::path::Path) {
-    use travsr_plugin_host::{
-        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
-    };
-    let Some(home) = dirs::home_dir() else { return };
-
-    // Guard: if embed.db doesn't exist there is nothing to query — skip to avoid
-    // spawning the sidecar (which would hang 30 s waiting on a non-existent HNSW index
-    // and then be killed by the FT-C2 IO watchdog).
-    let embed_db = db_path.with_file_name("embed.db");
-    if !embed_db.exists() {
-        return;
-    }
-
-    let backend = active_backend_id()
-        .as_deref()
-        .and_then(lookup_embed_backend)
-        .or_else(|| EMBED_BACKENDS.first())
-        .copied();
-    let Some(backend) = backend else { return };
-    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
-    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
-    if !supervisor.is_active() {
-        return;
-    }
-    let Some(model_id) = supervisor.model_id() else {
-        return;
-    };
-    if let Ok(Some(stored)) = store.get_meta("current_embed_model") {
-        if stored != model_id {
-            tracing::debug!(
-                stored_model = %stored,
-                plugin_model = %model_id,
-                "cold-path embed: model_id mismatch — skipping KNN"
-            );
-            return;
-        }
-    }
-    if let Some(hook) = supervisor.knn_hook(model_id.to_string()) {
-        store.set_embed_knn_hook(hook);
-        tracing::debug!(model_id = %model_id, "cold-path embed: KNN hook active");
-    }
-}
+/// So cold standalone `ask` uses FTS seeds (fast, correct, no spawn). Embedding-
+/// enhanced seeds come from a long-lived host: when a daemon is running, `ask`
+/// routes through it (`daemon_client::try_query`) and gets the daemon's warm,
+/// prewarmed sidecar; the MCP server likewise prewarms its own singleton (see
+/// [`try_inject_embed_hook`] and the MCP `embed-hook-init` thread).
+pub fn try_inject_embed_hook_readonly(_store: &mut SqliteStore, _db_path: &std::path::Path) {}

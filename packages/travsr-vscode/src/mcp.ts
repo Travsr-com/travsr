@@ -11,7 +11,7 @@ import * as cp from "child_process";
 import { assertExecutableBinary } from "./installer";
 
 export interface McpClient {
-  callTool(name: string, args?: Record<string, string>): Promise<string>;
+  callTool(name: string, args?: Record<string, string>, signal?: AbortSignal, timeoutMs?: number): Promise<string>;
   isConnected(): boolean;
   dispose(): void;
 }
@@ -68,11 +68,12 @@ export class StdioMcpClient implements McpClient {
     this.proc.on("exit", onExit);
     this.proc.on("error", onExit);
 
+    // Allow 30 s: sidecar startup (loading HNSW index) can take 15-25 s on large repos.
     await this.rpc("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "travsr-vscode", version: this.version },
-    });
+    }, undefined, 30_000);
     if (!this.proc) throw new Error("travsr process exited during initialization");
     this.connected = true;
   }
@@ -83,28 +84,56 @@ export class StdioMcpClient implements McpClient {
 
   async callTool(
     name: string,
-    args: Record<string, string> = {}
+    args: Record<string, string> = {},
+    signal?: AbortSignal,
+    timeoutMs?: number
   ): Promise<string> {
     if (!this.proc) return "";
-    return this.rpc("tools/call", { name, arguments: args });
+    return this.rpc("tools/call", { name, arguments: args }, signal, timeoutMs ?? 10_000);
   }
 
-  private rpc(method: string, params: unknown): Promise<string> {
+  private rpc(method: string, params: unknown, signal?: AbortSignal, timeoutMs = 10_000): Promise<string> {
     return new Promise((resolve) => {
+      if (signal?.aborted) { resolve(""); return; }
+
       const id = this.nextId++;
       const line =
         JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-      this.pending.set(id, resolve);
+
+      // Wrap resolve so the abort listener is removed when the response arrives first.
+      const wrappedResolve = (text: string): void => {
+        if (onAbort) signal?.removeEventListener("abort", onAbort);
+        resolve(text);
+      };
+
+      // eslint-disable-next-line prefer-const
+      let onAbort: (() => void) | undefined;
+      if (signal) {
+        onAbort = (): void => {
+          if (!this.pending.has(id)) return;
+          this.pending.delete(id);
+          clearTimeout(this.pendingTimers.get(id));
+          this.pendingTimers.delete(id);
+          const cancel = JSON.stringify({ jsonrpc: "2.0", method: "$/cancelRequest", params: { id } }) + "\n";
+          try { this.proc?.stdin?.write(cancel); } catch { /* daemon may ignore */ }
+          resolve("");
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      this.pending.set(id, wrappedResolve);
       this.proc?.stdin?.write(line);
-      // Guard against a hung daemon: resolve with "" after 10 s so callers
+
+      // Guard against a hung daemon: resolve with "" after timeoutMs so callers
       // never wait indefinitely and the pending entry is cleaned up.
       const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
           this.pendingTimers.delete(id);
+          if (onAbort) signal?.removeEventListener("abort", onAbort);
           resolve("");
         }
-      }, 10_000);
+      }, timeoutMs);
       this.pendingTimers.set(id, timer);
     });
   }

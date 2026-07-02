@@ -31,12 +31,187 @@ use std::sync::Arc;
 pub type EmbedKnnHook =
     Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
+/// Type alias for the RFC-019 direct-cosine oracle callback injected beside
+/// [`EmbedKnnHook`]. Given the query text and a set of candidate node ids, it
+/// returns the true query↔candidate cosine for **every candidate it can score**.
+///
+/// Contract (load-bearing): ids the embedding layer cannot score (no stored
+/// vector, degraded sidecar) are **omitted** from the result — the caller must
+/// treat omission as "unknown", never as cosine 0. A `None` hook is byte-for-byte
+/// identical to `EmbedKnnHook = None`: the whole re-rank path collapses to the
+/// FTS-only behaviour.
+pub type EmbedScoreHook =
+    Arc<dyn Fn(&str, &[NodeId]) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
+
+/// Shared arm-state for the embed KNN hook. The injector (MCP/daemon) marks it
+/// ready once the sidecar is warm; the query path reads it to decide whether to
+/// briefly wait (so the first query uses embeddings) and whether to report
+/// `embeddings: warming` honestly instead of a silent lexical-only degrade.
+///
+/// Without this, the lazily-injected hook returns an empty seed set during the
+/// ~3 s sidecar startup window, which the query path can't distinguish from
+/// "embeddings off" — so the opening query of a session silently runs lexical-only.
+pub struct EmbedReadiness {
+    armed: std::sync::atomic::AtomicBool,
+    waiters: (std::sync::Mutex<()>, std::sync::Condvar),
+}
+
+impl EmbedReadiness {
+    /// Create a new, un-armed readiness handle.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            waiters: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
+        })
+    }
+
+    /// Mark the hook armed and wake every waiter. Called by the injector's
+    /// background init thread the instant the sidecar is warm.
+    pub fn mark_ready(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+        let _g = self.waiters.0.lock().unwrap();
+        self.waiters.1.notify_all();
+    }
+
+    /// True once `mark_ready` has fired.
+    pub fn is_ready(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Block up to `timeout` for arming; returns the final ready state.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        if self.is_ready() {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut g = self.waiters.0.lock().unwrap();
+        while !self.is_ready() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (ng, _) = self.waiters.1.wait_timeout(g, remaining).unwrap();
+            g = ng;
+        }
+        self.is_ready()
+    }
+}
+
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
 use travsr_error::StoreError;
 
 use crate::fts_tokenize::{build_fuzzy_match_expr_db, tokenize_identifier};
+
+// ── RFC-019 direct-cosine oracle helpers ──────────────────────────────────────
+
+/// Decode a stored embedding BLOB into an `f32` vector.
+///
+/// All shipping backends write dense little-endian `f32` (BGE 384/768/1024-dim,
+/// pre-normalised at index time). Returns `None` for an empty blob or a length
+/// that is not a whole number of `f32` lanes — the caller then treats the id as
+/// unscoreable (omitted), never as cosine 0.
+pub fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// Cosine similarity between two equal-length vectors. Returns 0.0 when either
+/// side is degenerate (zero norm) or the lengths differ — a defensive, never-NaN
+/// result. Vectors are pre-normalised at index time so this is ≈ a dot product,
+/// but we normalise anyway so a non-normalising future backend stays correct.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom <= 0.0 || !denom.is_finite() {
+        0.0
+    } else {
+        (dot / denom).clamp(-1.0, 1.0)
+    }
+}
+
+/// RFC-019 Option A: score `ids` against a pre-embedded `query_vec` by reading the
+/// stored candidate vectors from `embed.db` and computing the true cosine.
+///
+/// Opens `embed_db_path` read-only (the sidecar owns writes) and reads the blobs
+/// for `model_id`. Ids with no stored row or an undecodable blob are **omitted**
+/// from the result (contract: omission = "unknown"). Chunked at 500 ids to stay
+/// within SQLite's bound-parameter limit.
+///
+/// O(N·d), N = #ids (≤ ~40 in practice), d = vector dim → microseconds after the
+/// local read. Errors from opening/reading `embed.db` surface as `StoreError` so
+/// the caller (via `embed_score_fn`) degrades to the FTS-only path.
+pub fn score_candidates(
+    query_vec: &[f32],
+    embed_db_path: &Path,
+    model_id: &str,
+    ids: &[NodeId],
+) -> Result<Vec<(NodeId, f32)>, StoreError> {
+    if ids.is_empty() || query_vec.is_empty() || !embed_db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        embed_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    let mut out: Vec<(NodeId, f32)> = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT node_id, embedding FROM node_embeddings \
+             WHERE model_id = ? AND node_id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        // Bind model_id first, then the chunk's node ids (i64, matching storage).
+        let mut binds: Vec<i64> = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            binds.push(id.0 as i64);
+        }
+        let rows = stmt
+            .query_map(
+                params_from_iter(
+                    std::iter::once(rusqlite::types::Value::Text(model_id.to_string()))
+                        .chain(binds.into_iter().map(rusqlite::types::Value::Integer)),
+                ),
+                |r| {
+                    let id: i64 = r.get(0)?;
+                    let blob: Vec<u8> = r.get(1)?;
+                    Ok((id, blob))
+                },
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        for row in rows {
+            let (id, blob) = row.map_err(|e| StoreError::Database(e.to_string()))?;
+            if let Some(v) = decode_embedding(&blob) {
+                out.push((NodeId(id as u64), cosine(query_vec, &v)));
+            }
+        }
+    }
+    Ok(out)
+}
 
 // ── SQLite migration structs (T2) ─────────────────────────────────────────────
 // Each SQL file becomes a concrete Migration so the runner can apply them
@@ -386,6 +561,18 @@ pub trait Store {
     /// Batch-fetch nodes by id. Unknown ids are silently skipped.
     /// Output order is not guaranteed to match input order.
     fn get_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>, StoreError>;
+    /// Return all outgoing edges for every node in `srcs` in a single operation.
+    ///
+    /// Output order is undefined — edges are not grouped by source.
+    /// The default implementation loops over [`Store::iter_edges_from`]; backends
+    /// with an indexed `src` column should override with a batch `IN (…)` query.
+    fn iter_edges_from_batch(&self, srcs: &[NodeId]) -> Result<Vec<Edge>, StoreError> {
+        let mut out = Vec::new();
+        for &src in srcs {
+            out.extend(self.iter_edges_from(src)?);
+        }
+        Ok(out)
+    }
 }
 
 /// One file's worth of parsed graph data, ready to write in a batch transaction.
@@ -420,6 +607,14 @@ pub struct SqliteStore {
     /// running. The store crate has zero knowledge of the plugin system; only the
     /// daemon injects this via `set_embed_knn_hook`.
     embed_knn_hook: Option<EmbedKnnHook>,
+    /// RFC-019: optional direct-cosine oracle hook injected beside `embed_knn_hook`
+    /// by the same injector (daemon / MCP). `None` by default — the FTS-only path
+    /// is identical when absent.
+    embed_score_hook: Option<EmbedScoreHook>,
+    /// Arm-state for the embed hook (set alongside `embed_knn_hook` by injectors
+    /// that support warm-up signalling). `None` for legacy/test injectors and
+    /// in-memory stores — in that case `embed_ready` falls back to hook presence.
+    embed_readiness: Option<Arc<EmbedReadiness>>,
     /// RFC-019: sibling embed.db path (e.g. `.travsr/embed.db`). `None` for
     /// in-memory stores. Used by `embed_progress` to ATTACH embed.db and count
     /// embedded nodes without polluting the graph.db WAL with embedding BLOBs.
@@ -450,6 +645,8 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_score_hook: None,
+                embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
             };
             sqlite_migration_runner()
@@ -511,6 +708,8 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_score_hook: None,
+                embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
             };
             let current = store
@@ -536,6 +735,8 @@ impl SqliteStore {
                 conn,
                 staging_active: false,
                 embed_knn_hook: None,
+                embed_score_hook: None,
+                embed_readiness: None,
                 embed_db_path: None,
             };
             sqlite_migration_runner()
@@ -564,6 +765,38 @@ impl SqliteStore {
         self.embed_knn_hook = Some(hook);
     }
 
+    /// Register the arm-state handle shared with the injector's background init
+    /// thread. Enables `embed_ready` / `wait_embed_ready` to reflect true warm-up
+    /// state rather than mere hook presence.
+    pub fn set_embed_readiness(&mut self, readiness: Arc<EmbedReadiness>) {
+        self.embed_readiness = Some(readiness);
+    }
+
+    /// Whether the embed hook is armed and ready to answer KNN queries.
+    ///
+    /// When an injector registered readiness (the MCP stdio path), reflects its
+    /// armed state. When no readiness was registered (legacy daemon path, the
+    /// `travsr ask` path, tests), returns `true` — those callers opt out of
+    /// warm-up tracking, so the "warming" state never applies and behaviour is
+    /// unchanged. Only consulted when `has_embed` is true at the call site.
+    pub fn embed_ready(&self) -> bool {
+        match &self.embed_readiness {
+            Some(r) => r.is_ready(),
+            None => true,
+        }
+    }
+
+    /// Block up to `timeout` for the embed hook to arm, returning the final ready
+    /// state. Lets the opening query of a session use embeddings instead of
+    /// silently degrading to lexical-only during sidecar startup. Returns `true`
+    /// immediately when no readiness was registered (same opt-out as `embed_ready`).
+    pub fn wait_embed_ready(&self, timeout: std::time::Duration) -> bool {
+        match &self.embed_readiness {
+            Some(r) => r.wait(timeout),
+            None => true,
+        }
+    }
+
     /// Return a callable wrapper around the embed KNN hook, or `None` when no
     /// hook has been injected (embed plugin not installed or index not built).
     ///
@@ -574,6 +807,36 @@ impl SqliteStore {
         Some(move |query: &str, k: u32| -> Vec<(NodeId, f32)> {
             hook(query, k).unwrap_or_default()
         })
+    }
+
+    /// Inject the RFC-019 direct-cosine oracle hook. Injected beside
+    /// `set_embed_knn_hook` by the same injector (daemon / MCP) once the sidecar
+    /// is warm.
+    pub fn set_embed_score_hook(&mut self, hook: EmbedScoreHook) {
+        self.embed_score_hook = Some(hook);
+    }
+
+    /// Return a callable wrapper around the RFC-019 score hook, or `None` when no
+    /// hook has been injected. Mirrors [`Self::embed_knn_fn`]: the closure owns an
+    /// `Arc` clone so it outlives the borrow, and a hook error is swallowed into an
+    /// empty vec — a degraded score reads as "no candidates scored" (unknown),
+    /// never as a hard failure or a false cosine 0.
+    #[allow(clippy::type_complexity)]
+    pub fn embed_score_fn(&self) -> Option<impl Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>> {
+        let hook = self.embed_score_hook.clone()?;
+        Some(move |query: &str, ids: &[NodeId]| -> Vec<(NodeId, f32)> {
+            hook(query, ids).unwrap_or_default()
+        })
+    }
+
+    /// Returns `true` when an embed.db sibling file exists for this store.
+    /// Used to differentiate "embedding in progress / Phase 1 done but hook not active yet"
+    /// from "embedding never initialized — user must run `travsr embed init`".
+    pub fn has_embed_db(&self) -> bool {
+        self.embed_db_path
+            .as_deref()
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     /// Batch in-degree counts (number of incoming edges) for the given node IDs.
@@ -3616,7 +3879,7 @@ impl Store for SqliteStore {
         (|| -> AnyResult<Vec<Edge>> {
             let mut stmt = self
                 .conn
-                .prepare("SELECT dst, kind, confidence FROM edges WHERE src = ?1")
+                .prepare_cached("SELECT dst, kind, confidence FROM edges WHERE src = ?1")
                 .context("preparing iter_edges_from query")?;
             let rows = stmt
                 .query_map(params![node_id_to_i64(src)], |row| {
@@ -3666,6 +3929,54 @@ impl Store for SqliteStore {
             for row in rows {
                 let dst_i64 = row.context("decoding iter_edges_from_kind row")?;
                 out.push(Edge::new(src, i64_to_node_id(dst_i64), kind));
+            }
+            tracing::debug!(edges_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn iter_edges_from_batch(&self, srcs: &[NodeId]) -> Result<Vec<Edge>, StoreError> {
+        if srcs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _span =
+            tracing::debug_span!("store.iter_edges_from_batch", count = srcs.len()).entered();
+        (|| -> AnyResult<Vec<Edge>> {
+            let placeholders = srcs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT src, dst, kind, confidence FROM edges WHERE src IN ({placeholders})"
+            );
+            // prepare() not prepare_cached(): the SQL string varies per chunk length
+            // (different number of '?' placeholders), so prepare_cached would create a
+            // new cache entry for every distinct chunk size and never actually hit the
+            // cache — defeating its purpose and polluting the LRU with O(EDGE_BATCH_SIZE)
+            // distinct compiled statements.
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("preparing iter_edges_from_batch")?;
+            let params: Vec<i64> = srcs.iter().map(|&id| node_id_to_i64(id)).collect();
+            let rows = stmt
+                .query_map(params_from_iter(params.iter()), |row| {
+                    let src_i64: i64 = row.get(0)?;
+                    let dst_i64: i64 = row.get(1)?;
+                    let kind_str: String = row.get(2)?;
+                    let confidence: Option<i64> = row.get(3)?;
+                    Ok((src_i64, dst_i64, kind_str, confidence))
+                })
+                .context("executing iter_edges_from_batch")?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (src_i64, dst_i64, kind_str, confidence) = row.context("decoding edge row")?;
+                let kind = EdgeKind::from_str(&kind_str)
+                    .with_context(|| format!("unknown edge kind in storage: {kind_str}"))?;
+                out.push(Edge {
+                    src: i64_to_node_id(src_i64),
+                    dst: i64_to_node_id(dst_i64),
+                    kind,
+                    confidence: confidence.map(|c| c as u8),
+                });
             }
             tracing::debug!(edges_returned = out.len());
             Ok(out)
@@ -3889,6 +4200,143 @@ mod tests {
             VName::new("test-corpus", "main", "src/foo.ts", "typescript", sig),
             "function",
         )
+    }
+
+    // ── RFC-019 direct-cosine oracle helpers ──────────────────────────────
+
+    fn blob_of(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn decode_embedding_round_trips_f32_le() {
+        let v = vec![0.1_f32, -0.25, 0.5, 1.0];
+        let decoded = decode_embedding(&blob_of(&v)).expect("valid blob");
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn decode_embedding_rejects_ragged_and_empty() {
+        assert!(decode_embedding(&[]).is_none(), "empty blob → None");
+        assert!(decode_embedding(&[1, 2, 3]).is_none(), "len%4≠0 → None");
+    }
+
+    #[test]
+    fn cosine_is_defensive_on_degenerate_input() {
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0, "zero norm → 0");
+        assert_eq!(cosine(&[1.0], &[1.0, 0.0]), 0.0, "length mismatch → 0");
+        // Identical unit vectors → 1.0.
+        let a = [0.6_f32, 0.8];
+        assert!((cosine(&a, &a) - 1.0).abs() < 1e-6);
+    }
+
+    /// Build a minimal embed.db with a `node_embeddings` table and score against it.
+    #[test]
+    fn score_candidates_reads_and_omits_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let embed_db = tmp.path().join("embed.db");
+        let conn = Connection::open(&embed_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (node_id INTEGER NOT NULL, model_id TEXT NOT NULL, \
+             embedding BLOB NOT NULL, PRIMARY KEY (node_id, model_id));",
+        )
+        .unwrap();
+        // Node 1: identical to query → cosine 1. Node 2: orthogonal → cosine 0.
+        // Node 3: wrong model_id → not scored. Node 4: no row → omitted.
+        let q = [1.0_f32, 0.0];
+        conn.execute(
+            "INSERT INTO node_embeddings VALUES (?1, 'm', ?2)",
+            params![1_i64, blob_of(&[1.0, 0.0])],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_embeddings VALUES (?1, 'm', ?2)",
+            params![2_i64, blob_of(&[0.0, 1.0])],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_embeddings VALUES (?1, 'other', ?2)",
+            params![3_i64, blob_of(&[1.0, 0.0])],
+        )
+        .unwrap();
+        drop(conn);
+
+        let ids = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let scored = score_candidates(&q, &embed_db, "m", &ids).unwrap();
+        let map: std::collections::HashMap<NodeId, f32> = scored.into_iter().collect();
+        assert!((map[&NodeId(1)] - 1.0).abs() < 1e-6, "identical → cosine 1");
+        assert!(map[&NodeId(2)].abs() < 1e-6, "orthogonal → cosine 0");
+        assert!(!map.contains_key(&NodeId(3)), "wrong model_id omitted");
+        assert!(
+            !map.contains_key(&NodeId(4)),
+            "missing row omitted (unknown)"
+        );
+    }
+
+    #[test]
+    fn score_candidates_missing_db_is_empty_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let embed_db = tmp.path().join("nope.db");
+        let out = score_candidates(&[1.0, 0.0], &embed_db, "m", &[NodeId(1)]).unwrap();
+        assert!(out.is_empty(), "absent embed.db → empty, degrades to FTS");
+    }
+
+    #[test]
+    fn embed_readiness_wait_returns_on_mark() {
+        let r = EmbedReadiness::new();
+        assert!(!r.is_ready());
+        let r_bg = Arc::clone(&r);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            r_bg.mark_ready();
+        });
+        // Should wake promptly once marked, well within the 2 s cap.
+        let start = std::time::Instant::now();
+        assert!(r.wait(std::time::Duration::from_secs(2)));
+        assert!(r.is_ready());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "wait must wake promptly on mark, not spin to the cap"
+        );
+    }
+
+    #[test]
+    fn embed_readiness_wait_times_out_when_never_armed() {
+        let r = EmbedReadiness::new();
+        assert!(!r.wait(std::time::Duration::from_millis(50)));
+        assert!(!r.is_ready());
+    }
+
+    #[test]
+    fn embed_ready_opt_out_when_no_readiness_registered() {
+        // Callers that don't register readiness (legacy daemon path, `travsr ask`,
+        // tests) opt out of warm-up tracking → always ready, so the "warming"
+        // state never applies and pre-change behaviour is preserved.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            store.embed_ready(),
+            "no readiness registered → ready (opt-out)"
+        );
+        store.set_embed_knn_hook(Arc::new(|_q, _k| Ok(vec![])));
+        assert!(
+            store.embed_ready(),
+            "hook present, no readiness → still ready"
+        );
+        assert!(store.wait_embed_ready(std::time::Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn embed_ready_reflects_registered_readiness() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let r = EmbedReadiness::new();
+        store.set_embed_knn_hook(Arc::new(|_q, _k| Ok(vec![])));
+        store.set_embed_readiness(Arc::clone(&r));
+        assert!(
+            !store.embed_ready(),
+            "readiness registered but un-armed → not ready even with hook present"
+        );
+        r.mark_ready();
+        assert!(store.embed_ready(), "armed readiness → ready");
     }
 
     #[test]

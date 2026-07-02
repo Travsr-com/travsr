@@ -281,7 +281,7 @@ fn build_weighted_subgraph<S: Store>(
     store: &S,
     seeds: &[NodeId],
 ) -> AnyResult<(WeightedAdj, HashMap<NodeId, ()>)> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::HashSet;
     let _span = tracing::debug_span!("ppr.bfs_expand", seeds = seeds.len()).entered();
 
     const PPR_BFS_DEPTH: u8 = 6;
@@ -296,20 +296,61 @@ fn build_weighted_subgraph<S: Store>(
     /// quality is unaffected for normal codebases.
     const MAX_SUBGRAPH_NODES: usize = 250_000;
 
+    /// Chunk size for batch edge queries.
+    ///
+    /// Stays well under SQLite's 999-parameter limit while collapsing the
+    /// per-node query loop (~131k round-trips on kubernetes) into ≤ 500 batch
+    /// queries. Fixed constant — does not depend on repo size.
+    const EDGE_BATCH_SIZE: usize = 500;
+
     let mut adj: HashMap<NodeId, Vec<(NodeId, f32)>> = HashMap::new();
     let mut reverse_adj: HashMap<NodeId, ()> = HashMap::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
-    // Accumulated inside the BFS loop (same pass) — no extra O(V) post-BFS sum.
     let mut total_edges_seen: usize = 0;
 
-    for &s in seeds {
-        if visited.insert(s) {
-            queue.push_back((s, 0));
-        }
-    }
+    let mut frontier: Vec<NodeId> = seeds
+        .iter()
+        .filter(|&&s| visited.insert(s))
+        .copied()
+        .collect();
 
-    while let Some((node, depth)) = queue.pop_front() {
+    for _depth in 0..PPR_BFS_DEPTH {
+        if frontier.is_empty() || visited.len() >= MAX_SUBGRAPH_NODES {
+            break;
+        }
+
+        let mut next_frontier: Vec<NodeId> = Vec::new();
+
+        for chunk in frontier.chunks(EDGE_BATCH_SIZE) {
+            let edges = store.iter_edges_from_batch(chunk)?;
+            for edge in &edges {
+                let w = edge.kind.ppr_weight();
+                adj.entry(edge.src).or_default().push((edge.dst, w));
+                reverse_adj.entry(edge.dst).or_insert(());
+                total_edges_seen += 1;
+                if visited.insert(edge.dst) {
+                    next_frontier.push(edge.dst);
+                }
+            }
+            // Nodes with no outgoing edges won't appear in edge results — ensure
+            // they still have an adj entry so the PPR propagation loop sees them.
+            for &src in chunk {
+                adj.entry(src).or_default();
+            }
+            // Per-chunk ceiling: a single hub node in this chunk can add thousands
+            // of neighbours before the depth-level check below fires. Break early so
+            // the overshoot is bounded to one chunk's worth of new nodes, not the
+            // entire remaining frontier × fan-out.
+            if visited.len() > MAX_SUBGRAPH_NODES {
+                tracing::warn!(
+                    visited = visited.len(),
+                    limit = MAX_SUBGRAPH_NODES,
+                    "PPR subgraph exceeded node ceiling mid-chunk — truncating BFS"
+                );
+                break;
+            }
+        }
+
         if visited.len() > MAX_SUBGRAPH_NODES {
             tracing::warn!(
                 visited = visited.len(),
@@ -319,21 +360,7 @@ fn build_weighted_subgraph<S: Store>(
             break;
         }
 
-        let edges = store.iter_edges_from(node)?;
-        let mut outgoing: Vec<(NodeId, f32)> = Vec::with_capacity(edges.len());
-
-        for edge in edges {
-            let w = edge.kind.ppr_weight();
-            outgoing.push((edge.dst, w));
-            reverse_adj.entry(edge.dst).or_insert(());
-            total_edges_seen += 1;
-
-            if depth < PPR_BFS_DEPTH && visited.insert(edge.dst) {
-                queue.push_back((edge.dst, depth + 1));
-            }
-        }
-
-        adj.insert(node, outgoing);
+        frontier = next_frontier;
     }
 
     tracing::debug!(

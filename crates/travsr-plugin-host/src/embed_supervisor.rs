@@ -5,7 +5,8 @@
 // The SqliteStore embed_knn_hook is never injected in that case.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use travsr_core::NodeId;
 use travsr_error::StoreError;
@@ -15,8 +16,21 @@ use crate::embed_sidecar::{EmbedCapabilities, EmbedSidecar};
 /// Callback type for Step 4 — matches `travsr_store::EmbedKnnHook`.
 type KnnHook = Arc<dyn Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError> + Send + Sync>;
 
+/// RFC-019: callback that embeds one query and returns its raw vector BLOB
+/// (backend-defined layout, same as stored `node_embeddings.embedding`). The
+/// injection site decodes it and reads candidate vectors via `travsr_store`.
+/// Kept SQLite-free so the plugin-host crate gains no storage dependency.
+pub type EmbedQueryHook = Arc<dyn Fn(&str) -> Result<Vec<u8>, StoreError> + Send + Sync>;
+
 /// FT-H3: maximum respawn attempts before permanently disabling the supervisor.
 const MAX_RESPAWN_ATTEMPTS: u32 = 3;
+
+/// Wall-clock budget for a single KNN round-trip. If the sidecar does not
+/// respond within this window (model still loading ONNX + HNSW), the hook
+/// returns an empty seed set immediately so the query falls back to FTS.
+/// The sidecar thread continues loading in the background; subsequent calls
+/// after warm-up complete in <200 ms and always beat this threshold.
+const KNN_CALL_TIMEOUT_MS: u64 = 600;
 
 /// Manages the embed plugin subprocess for one daemon session.
 ///
@@ -111,39 +125,125 @@ impl EmbedSupervisor {
     ///
     /// `model_id` — must match the negotiated `caps.model_id` and the value
     /// stored in `meta.current_embed_model`. Forwarded in every KnnRequest.
+    ///
+    /// ## Cold-start timeout
+    ///
+    /// The embed sidecar responds to the handshake before loading ONNX weights
+    /// or the HNSW index, so the first real KNN call would otherwise block the
+    /// calling thread for the full load time (~30 s on kubernetes).
+    ///
+    /// Each hook invocation spawns a worker thread that acquires the sidecar
+    /// lock and does the blocking KNN I/O. The calling thread waits at most
+    /// `KNN_CALL_TIMEOUT_MS` (600 ms) via `recv_timeout`. If the sidecar has
+    /// not responded by then, the hook returns an empty set immediately and the
+    /// query falls back to FTS seeds. The worker thread continues running in
+    /// the background; once the model is loaded subsequent calls are fast.
     pub fn knn_hook(&self, model_id: String) -> Option<KnnHook> {
         let arc = self.inner.as_ref()?.clone();
         Some(Arc::new(move |query: &str, k: u32| {
-            let sidecar = arc
-                .lock()
-                .map_err(|_| StoreError::Database("embed sidecar mutex poisoned".into()))?;
-            if !sidecar.is_alive() {
-                return Ok(vec![]);
-            }
-            match sidecar.knn(query, k, &model_id) {
-                Ok(pairs) => {
-                    // Kythe VName hashes are signed i64 and can be negative; usearch
-                    // stores them as u64 via bit-reinterpretation and returns the same
-                    // bit pattern. Both NodeId(positive_as_u64) and NodeId(neg_as_u64)
-                    // are valid — SQLite stores the original i64 and the cast roundtrips.
-                    let nodes: Vec<(NodeId, f32)> = pairs
-                        .into_iter()
-                        .map(|(id, score)| (NodeId(id as u64), score))
-                        .collect();
-                    Ok(nodes)
-                }
-                Err(e) => {
-                    // Non-fatal: log and return empty rather than failing the query.
-                    tracing::warn!("embed knn failed (non-fatal): {e}");
-                    Ok(vec![])
-                }
-            }
+            let arc2 = Arc::clone(&arc);
+            let query_owned = query.to_string();
+            let model_id2 = model_id.clone();
+
+            let (tx, rx) = mpsc::channel::<Vec<(NodeId, f32)>>();
+            std::thread::Builder::new()
+                .name("embed-knn-worker".into())
+                .spawn(move || {
+                    let Ok(sidecar) = arc2.lock() else { return };
+                    if !sidecar.is_alive() {
+                        return;
+                    }
+                    match sidecar.knn(&query_owned, k, &model_id2) {
+                        Ok(pairs) => {
+                            // Kythe VName hashes are signed i64 and can be negative;
+                            // usearch stores them as u64 via bit-reinterpretation and
+                            // returns the same bit pattern. Cast roundtrips correctly.
+                            let nodes: Vec<(NodeId, f32)> = pairs
+                                .into_iter()
+                                .map(|(id, score)| (NodeId(id as u64), score))
+                                .collect();
+                            let _ = tx.send(nodes);
+                        }
+                        Err(e) => tracing::warn!("embed knn failed (non-fatal): {e}"),
+                    }
+                })
+                .ok();
+
+            // Return whatever arrived within the budget. `unwrap_or_default`
+            // covers both timeout (Disconnected or Timeout) and spawn failure.
+            Ok(rx
+                .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
+                .unwrap_or_default())
+        }))
+    }
+
+    /// Build the RFC-019 query-embedding hook: embeds one short query text and
+    /// returns its raw vector BLOB. `None` when the supervisor is inactive.
+    ///
+    /// Same cold-start protection as [`Self::knn_hook`]: a worker thread does the
+    /// blocking `embed_batch` I/O while the calling thread waits at most
+    /// `KNN_CALL_TIMEOUT_MS`. On timeout or error the hook returns an **empty**
+    /// BLOB — the caller's `decode_embedding` then fails and no candidates are
+    /// scored (unknown), so a slow/cold sidecar can never stall `get_context` or
+    /// fabricate a false cosine. Warm `embed_batch` of one short text is ~tens of ms.
+    pub fn embed_query_hook(&self) -> Option<EmbedQueryHook> {
+        let arc = self.inner.as_ref()?.clone();
+        Some(Arc::new(move |query: &str| {
+            let arc2 = Arc::clone(&arc);
+            let query_owned = query.to_string();
+
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            std::thread::Builder::new()
+                .name("embed-query-worker".into())
+                .spawn(move || {
+                    let Ok(sidecar) = arc2.lock() else { return };
+                    if !sidecar.is_alive() {
+                        return;
+                    }
+                    match sidecar.embed_batch(std::slice::from_ref(&query_owned)) {
+                        Ok(mut blobs) if !blobs.is_empty() => {
+                            let _ = tx.send(blobs.swap_remove(0));
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("embed query failed (non-fatal): {e}"),
+                    }
+                })
+                .ok();
+
+            // Empty vec on timeout / spawn failure → decode fails → no scoring.
+            Ok(rx
+                .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
+                .unwrap_or_default())
         }))
     }
 
     /// The model_id negotiated at handshake, or `None` when inactive.
     pub fn model_id(&self) -> Option<&str> {
         self.model_id.as_deref()
+    }
+
+    /// Eagerly load the ONNX model + HNSW index by firing one dummy KNN.
+    ///
+    /// The sidecar answers the handshake *before* loading any weights or index
+    /// data, so the first real KNN call would otherwise pay the full cold-start
+    /// cost (model load ~0.6 s) — long enough to trip the host's 600 ms KNN
+    /// circuit-breaker and degrade that first query to FTS (`embed_used=false`).
+    ///
+    /// Blocking by design: callers run this on a long-lived host's background
+    /// init thread (MCP `embed-hook-init`, daemon startup) and arm the KNN hook
+    /// only *after* it returns, so the hook never goes live cold. Holds the
+    /// sidecar lock for the duration of the load. No-op when inactive.
+    pub fn prewarm(&self) {
+        let Some(arc) = self.inner.as_ref() else {
+            return;
+        };
+        let Some(model_id) = self.model_id.as_deref() else {
+            return;
+        };
+        if let Ok(sidecar) = arc.lock() {
+            let _ = sidecar.knn("_prewarm_", 1, model_id);
+            tracing::info!("embed sidecar prewarm complete — KNN ready for queries");
+        }
     }
 
     /// FT-H3: attempt to respawn the sidecar after a crash.
