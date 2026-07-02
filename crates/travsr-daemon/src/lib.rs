@@ -2621,6 +2621,7 @@ impl Daemon {
         // the CLI's lock-PID fallback reads nothing and wrongly concludes "no
         // daemon" — spawning a doomed child. We overwrite + trim after acquiring
         // the lock instead (below), so the file is never empty while it is held.
+        #[allow(clippy::suspicious_open_options)]
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
