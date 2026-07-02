@@ -2539,12 +2539,13 @@ fn get_context_body(
     // Post-filter fetched nodes through RBAC and join with scores.
     // SEC P0: `selected` is the authoritative RBAC-filtered list; snippets are
     // only ever read for nodes already in this set (never re-queried separately).
-    // Issue A.3: also apply structural noise filter so build-cache/OS-cache hub nodes
-    // cannot inject irrelevant neighbours into the PPR-expanded result.
+    // Issue A.3: apply the full noise policy (is_noise_seed, which is a strict
+    // superset of is_noise_node) so scip: reference nodes, _test.go nodes, and
+    // build-cache hub nodes cannot appear in the emitted context result.
     let items: Vec<(CoreNode, f32)> = fetched
         .into_iter()
         .filter(|n| filter.allow(n.id, n.id, Some(n.vname.corpus.as_str())))
-        .filter(|n| !travsr_core::is_noise_node(n))
+        .filter(|n| !is_noise_seed(n))
         .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
         .collect();
 
