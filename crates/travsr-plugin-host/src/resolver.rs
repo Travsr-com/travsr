@@ -352,7 +352,7 @@ impl PluginResolver for CompositeResolver {
 /// `~/.travsr/bin` is always prepended to the search path so that binaries
 /// installed by `travsr lang install` (e.g. `travsr-lang-java`) are found even
 /// when the daemon was launched with a stripped PATH (launchd, GUI launch, etc.).
-fn which_binary(name: &str) -> Option<String> {
+pub(crate) fn which_binary(name: &str) -> Option<String> {
     let host_path = std::env::var_os("PATH").unwrap_or_default();
     let travsr_bin = dirs::home_dir().map(|h| h.join(".travsr").join("bin"));
 

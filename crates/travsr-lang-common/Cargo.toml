@@ -1,0 +1,18 @@
+[package]
+name = "travsr-lang-common"
+description = "Shared runtime for travsr-lang-* sidecar plugin binaries (RFC-013 Direction A)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+travsr-plugin-sdk      = { path = "../travsr-plugin-sdk" }
+travsr-plugin-protocol = { path = "../travsr-plugin-protocol" }
+travsr-analysis        = { workspace = true }
+travsr-indexer         = { path = "../travsr-indexer" }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

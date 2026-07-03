@@ -1,10 +1,11 @@
-//! travsr-lang-kotlin — Kotlin language sidecar (RFC-013 Direction A).
+//! travsr-lang-java — Java language sidecar (RFC-013 Direction A).
 //!
-//! Phase A: delegates to `travsr_analysis::kotlin::parse` — the exact code the
-//! host ran when parsing was in-process, so graph output is identical.
-//! Phase B: wraps `scip-java index` (scip-java indexes Kotlin via its
-//! Gradle/Maven integration) and ingests the SCIP index. Requires an elevated
-//! sandbox approval (build tools need network) — see lang.toml.
+//! Phase A: delegates to `travsr_analysis::java::parse` — the exact code the
+//! host ran when parsing was in-process (DefinesBinding edges, enclosing-type
+//! attribution), so graph output is identical.
+//! Phase B: wraps `scip-java index` and ingests the SCIP index. Requires
+//! `scip-java` in ~/.travsr/bin or on PATH (`travsr lang install java`) and an
+//! elevated sandbox approval (Maven/Gradle need network) — see lang.toml.
 
 use std::path::Path;
 
@@ -16,7 +17,7 @@ fn run_scip_java(root: &Path, scratch: &Path) -> anyhow::Result<Option<Vec<u8>>>
         return Ok(None);
     };
 
-    let output = scip_output_path(scratch, "kotlin");
+    let output = scip_output_path(scratch, "java");
     let bytes = run_scip_tool(
         &tool,
         &["index".as_ref(), "--output".as_ref(), output.as_os_str()],
@@ -28,9 +29,9 @@ fn run_scip_java(root: &Path, scratch: &Path) -> anyhow::Result<Option<Vec<u8>>>
 
 fn main() {
     run(LangSidecar {
-        language: Language::Kotlin,
-        extensions: travsr_analysis::kotlin::CONFIG.extensions,
-        parse: travsr_analysis::kotlin::parse,
+        language: Language::Java,
+        extensions: travsr_analysis::java::EXTENSIONS,
+        parse: travsr_analysis::java::parse,
         phase_b: Some(run_scip_java),
     });
 }
@@ -50,9 +51,9 @@ mod tests {
             files: None,
         };
         let resp = LangSidecar {
-            language: Language::Kotlin,
-            extensions: travsr_analysis::kotlin::CONFIG.extensions,
-            parse: travsr_analysis::kotlin::parse,
+            language: Language::Java,
+            extensions: travsr_analysis::java::EXTENSIONS,
+            parse: travsr_analysis::java::parse,
             phase_b: Some(run_scip_java),
         }
         .invoke_phase_b(&req);

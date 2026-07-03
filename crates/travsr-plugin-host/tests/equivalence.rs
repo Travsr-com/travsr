@@ -30,6 +30,29 @@ fn new_parse(abs_path: &Path, vname_path: &str) -> travsr_indexer::ParseOutput {
         .expect("PluginIndexer parse failed")
 }
 
+/// Like `new_parse` but with Phase A sidecars registered — required for
+/// non-builtin languages (go, java, …) whose parsing moved out of process
+/// (RFC-013 Direction A). Callers must gate on `sidecar_on_path` first.
+fn new_parse_sidecar(abs_path: &Path, vname_path: &str) -> travsr_indexer::ParseOutput {
+    let repo_root = abs_path.parent().unwrap().to_path_buf();
+    let mut indexer = PluginIndexer::new(CORPUS);
+    indexer.register_phase_a_sidecars(&repo_root);
+    indexer
+        .parse_file_with_vname(abs_path, vname_path)
+        .expect("PluginIndexer sidecar parse failed")
+}
+
+/// True when `binary` is on PATH; prints a SKIP notice otherwise. Sidecar
+/// equivalence tests skip in CI environments that don't build the sidecars.
+fn sidecar_on_path(binary: &str) -> bool {
+    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join(binary).is_file());
+    if !found {
+        eprintln!("SKIP: {binary} not on PATH — build it first to run this test");
+    }
+    found
+}
+
 /// Write `source` to a NamedTempFile with the given extension and return it.
 /// The file must stay alive for the duration of parsing.
 fn write_fixture(source: &str, ext: &str) -> NamedTempFile {
@@ -51,8 +74,23 @@ fn normalize(out: &mut travsr_indexer::ParseOutput) {
 /// Assert that old and new paths produce identical nodes and edges.
 /// FfiMarkers are compared by count only (kind mapping is validated separately).
 fn assert_equivalent(lang: &str, abs_path: &Path, vname_path: &str) {
+    assert_equivalent_with(lang, abs_path, vname_path, new_parse)
+}
+
+/// Sidecar variant of [`assert_equivalent`] — routes the "new" side through
+/// the registered Phase A sidecars.
+fn assert_equivalent_sidecar(lang: &str, abs_path: &Path, vname_path: &str) {
+    assert_equivalent_with(lang, abs_path, vname_path, new_parse_sidecar)
+}
+
+fn assert_equivalent_with(
+    lang: &str,
+    abs_path: &Path,
+    vname_path: &str,
+    new_fn: fn(&Path, &str) -> travsr_indexer::ParseOutput,
+) {
     let mut old = old_parse(abs_path, vname_path);
-    let mut new = new_parse(abs_path, vname_path);
+    let mut new = new_fn(abs_path, vname_path);
 
     normalize(&mut old);
     normalize(&mut new);
@@ -220,8 +258,11 @@ func Process(service *PaymentService, amount float64) bool {
     return service.Charge(amount)
 }
 "#;
+    if !sidecar_on_path("travsr-lang-go") {
+        return;
+    }
     let f = write_fixture(src, "go");
-    assert_equivalent("go/struct_func", f.path(), "src/payment.go");
+    assert_equivalent_sidecar("go/struct_func", f.path(), "src/payment.go");
 }
 
 #[test]
@@ -242,8 +283,11 @@ const (
     StatusFailed
 )
 "#;
+    if !sidecar_on_path("travsr-lang-go") {
+        return;
+    }
     let f = write_fixture(src, "go");
-    assert_equivalent("go/interface", f.path(), "src/types.go");
+    assert_equivalent_sidecar("go/interface", f.path(), "src/types.go");
 }
 
 // ── Cache hit produces identical output ───────────────────────────────────────
@@ -278,11 +322,14 @@ fn cache_hit_produces_identical_output() {
 
 #[test]
 fn java_golden_fixture_produces_expected_nodes() {
+    if !sidecar_on_path("travsr-lang-java") {
+        return;
+    }
     let fixture = std::path::Path::new("tests/fixtures/Hello.java");
     if !fixture.exists() {
         panic!("fixture missing: tests/fixtures/Hello.java");
     }
-    let out = new_parse(fixture, "src/PaymentService.java");
+    let out = new_parse_sidecar(fixture, "src/PaymentService.java");
 
     // Must have a file node
     assert!(

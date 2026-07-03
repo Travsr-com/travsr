@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-kotlin"
-description = "Travsr Phase B sidecar for Kotlin — wraps scip-java (ADR-017 sandboxed provider)"
+description = "Travsr language sidecar for Kotlin — Phase A parsing + Phase B scip-java wrapper (RFC-013 Direction A)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,9 +13,11 @@ name = "travsr-lang-kotlin"
 path = "src/main.rs"
 
 [dependencies]
-travsr-plugin-sdk  = { path = "../travsr-plugin-sdk" }
-travsr-indexer     = { path = "../travsr-indexer" }
-anyhow             = { workspace = true }
-tempfile           = { workspace = true }
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
+travsr-lang-common     = { path = "../travsr-lang-common" }
+travsr-analysis        = { workspace = true }
+travsr-plugin-sdk      = { path = "../travsr-plugin-sdk" }
+travsr-plugin-protocol = { path = "../travsr-plugin-protocol" }
+anyhow                 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

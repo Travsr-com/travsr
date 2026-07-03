@@ -10,6 +10,9 @@ use travsr_plugin_host::PluginIndexer;
 /// graph JSON to `output`.  Used by the cross-lang precision gate CI workflow.
 pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
     let mut indexer = PluginIndexer::new(corpus);
+    // RFC-013 Direction A: non-builtin languages parse via travsr-lang-*
+    // sidecars, spawned lazily on the first file of each language.
+    indexer.register_phase_a_sidecars(dir);
 
     let mut all_nodes: HashMap<NodeId, Node> = HashMap::new();
     let mut all_markers: Vec<FfiMarker> = Vec::new();

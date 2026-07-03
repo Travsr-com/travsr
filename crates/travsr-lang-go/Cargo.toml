@@ -1,6 +1,6 @@
 [package]
-name = "travsr-lang-cpp"
-description = "Travsr language sidecar for C++ — Phase A parsing + Phase B scip-clang wrapper (RFC-013 Direction A)"
+name = "travsr-lang-go"
+description = "Travsr language sidecar for Go — Phase A parsing + Phase B scip-go wrapper (RFC-013 Direction A)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "travsr-lang-cpp"
+name = "travsr-lang-go"
 path = "src/main.rs"
 
 [dependencies]

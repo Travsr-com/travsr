@@ -1,0 +1,18 @@
+[package]
+name = "travsr-lang-php"
+description = "Travsr language sidecar for Php — Phase A parsing (RFC-013 Direction A)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "travsr-lang-php"
+path = "src/main.rs"
+
+[dependencies]
+travsr-lang-common = { path = "../travsr-lang-common" }
+travsr-analysis    = { workspace = true }
+travsr-plugin-sdk  = { path = "../travsr-plugin-sdk" }

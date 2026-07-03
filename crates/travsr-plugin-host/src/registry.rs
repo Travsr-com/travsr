@@ -1,32 +1,21 @@
 use crate::dispatcher::Dispatcher;
-use crate::plugins::generic::GenericTreeSitterPlugin;
-use crate::plugins::go::GoPlugin;
-use crate::plugins::java::JavaPlugin;
 use crate::plugins::python::PythonPlugin;
 use crate::plugins::rust::RustPlugin;
 use crate::plugins::typescript::TypeScriptPlugin;
-use crate::transport::InProcess;
+use crate::resolver::{which_binary, PluginSpec};
+use crate::sandbox::policy::SandboxPolicy;
+use crate::transport::{InProcess, LazySidecar};
 use std::sync::Arc;
 use travsr_plugin_protocol::{HandshakeResponse, PROTOCOL_VERSION};
 
 /// Maps canonical language name → expected fuzz target filename under fuzz/fuzz_targets/.
 /// ADR-017 Rule 4: in-process grammars MUST have a fuzz target.
+/// Sidecar languages are covered by their `travsr-lang-*` crates' own tests
+/// plus the shared `travsr-analysis` fixtures — not listed here.
 const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("typescript", "fuzz_treesitter_indexer.rs"),
     ("rust", "fuzz_treesitter_indexer.rs"), // shared indexer target covers Rust
     ("python", "fuzz_pyright_lsif_parser.rs"),
-    ("go", "fuzz_go_parser.rs"),
-    ("java", "fuzz_java_parser.rs"), // TODO: create this fuzz target
-    ("kotlin", "fuzz_kotlin_parser.rs"), // TODO: create this fuzz target
-    ("ruby", "fuzz_ruby_parser.rs"), // TODO: create this fuzz target
-    ("csharp", "fuzz_csharp_parser.rs"), // TODO: create this fuzz target
-    ("php", "fuzz_php_parser.rs"),   // TODO: create this fuzz target
-    ("scala", "fuzz_scala_parser.rs"), // TODO: create this fuzz target
-    ("cpp", "fuzz_cpp_parser.rs"),   // TODO: create this fuzz target
-    ("c", "fuzz_c_parser.rs"),       // TODO: create this fuzz target
-    ("swift", "fuzz_swift_parser.rs"),
-    ("dart", "fuzz_dart_parser.rs"),
-    ("objectivec", "fuzz_objc_parser.rs"), // TODO(#345): create this fuzz target
 ];
 
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process
@@ -56,50 +45,52 @@ fn check_fuzz_target(language: &str) {
 static SANDBOX_PROBED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// Probe OS sandbox availability and log the result at startup.
-/// ADR-017 Rule 2: if the sandbox is unavailable, Sidecar Phase B is disabled.
-/// Phase A (in-process) is always unaffected.
+/// ADR-017 Rule 2: if the sandbox is unavailable, sidecar spawn is disabled.
+/// In-process Phase A (ts/js/rust/python) is always unaffected.
 pub fn probe_sandbox() {
     SANDBOX_PROBED.get_or_init(|| {
-        #[cfg(target_os = "linux")]
-        {
-            let available = std::process::Command::new("bwrap")
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok();
-            if available {
-                tracing::info!("sandbox: bubblewrap available — Phase B sidecar spawn enabled");
-            } else {
-                tracing::warn!(
-                    "sandbox: bubblewrap (bwrap) not found on PATH — \
-                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
-                     Install with: sudo apt-get install bubblewrap"
-                );
-            }
+        if sandbox_available() {
+            tracing::info!("sandbox: available — sidecar plugin spawn enabled");
+        } else {
+            #[cfg(target_os = "linux")]
+            tracing::warn!(
+                "sandbox: bubblewrap (bwrap) not found on PATH — \
+                 sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
+                 Install with: sudo apt-get install bubblewrap"
+            );
+            #[cfg(not(target_os = "linux"))]
+            tracing::warn!(
+                "sandbox: not available on this platform — \
+                 sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+            );
         }
-        #[cfg(target_os = "macos")]
-        {
-            let available = std::path::Path::new("/usr/bin/sandbox-exec").exists();
-            if available {
-                tracing::info!("sandbox: sandbox-exec available — Phase B sidecar spawn enabled");
-            } else {
-                tracing::warn!(
-                    "sandbox: sandbox-exec not found — \
-                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
-                );
-            }
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        tracing::warn!(
-            "sandbox: no sandbox implementation for this platform — \
-             Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
-        );
     });
 }
 
-/// Register all first-party in-process plugins into `dispatcher`.
-/// Called once when PluginIndexer is created.
+/// Cheap sandbox availability check (no subprocess spawned on macOS; one
+/// cached probe on Linux).
+fn sandbox_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::sandbox::linux::bwrap_is_on_path()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new("/usr/bin/sandbox-exec").exists()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        true // AppContainer (RFC-014 WS4) needs no external binary
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+/// Register the in-process builtin plugins (RFC-013 D-3: ts/js, rust, python).
+/// Called once when PluginIndexer is created. Every other language's Phase A
+/// is served by a `travsr-lang-*` sidecar — see [`register_phase_a_sidecars`].
 pub fn register_builtins(dispatcher: &mut Dispatcher) {
     // ADR-017 Rule 2: probe sandbox at startup so the user sees the status immediately.
     probe_sandbox();
@@ -124,7 +115,6 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         }};
     }
 
-    // Languages with specialised Phase A logic or Phase B support
     register!(
         TypeScriptPlugin,
         "typescript",
@@ -133,43 +123,223 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
     );
     register!(RustPlugin, "rust", &["rs"], true);
     register!(PythonPlugin, "python", &["py", "pyi"], true);
-    register!(GoPlugin, "go", &["go"], false);
-    register!(JavaPlugin, "java", &["java"], false);
+}
 
-    // Languages driven entirely by GenericTreeSitterPlugin (config-only, no special logic).
-    // Grammar is obtained via config.get_grammar() inside GenericTreeSitterPlugin::new().
-    for config in &[
-        &crate::plugins::kotlin::CONFIG,
-        &crate::plugins::ruby::CONFIG,
-        &crate::plugins::csharp::CONFIG,
-        &crate::plugins::php::CONFIG,
-        &crate::plugins::scala::CONFIG,
-        &crate::plugins::cpp::CONFIG,
-        &crate::plugins::c::CONFIG,
-        &crate::plugins::swift::CONFIG,
-        &crate::plugins::dart::CONFIG,
-        &crate::plugins::objc::CONFIG,
-    ] {
-        check_fuzz_target(config.language.as_str());
-        register_generic(dispatcher, &version, config);
+// ── Phase A sidecar catalog (RFC-013 Direction A, D-3) ────────────────────────
+
+/// One Phase A sidecar language: which binary provides it and which file
+/// extensions route to it.
+///
+/// `extensions` MUST stay in sync with `travsr_core::Language::from_extension`
+/// — the daemon's file walk only feeds files whose extension maps to a
+/// `Language`. Enforced by the `catalog_extensions_match_core` test below.
+///
+/// Binary names match the Phase B catalog's `provider_binary` — one plugin
+/// binary per language serves both phases (Phase B only where the binary's
+/// handshake declares support).
+pub struct PhaseASidecar {
+    pub language: &'static str,
+    pub binary: &'static str,
+    pub extensions: &'static [&'static str],
+}
+
+/// All Phase A sidecar languages (everything except the ts/js/rust/python
+/// builtins). Grammar blobs for parsing live in the sidecar binaries; the
+/// host retains grammars only for retrieval-time skeletonization (RFC-017).
+pub const PHASE_A_SIDECARS: &[PhaseASidecar] = &[
+    PhaseASidecar {
+        language: "go",
+        binary: "travsr-lang-go",
+        extensions: &["go"],
+    },
+    PhaseASidecar {
+        language: "java",
+        binary: "travsr-lang-java",
+        extensions: &["java"],
+    },
+    PhaseASidecar {
+        language: "kotlin",
+        binary: "travsr-lang-kotlin",
+        extensions: &["kt", "kts"],
+    },
+    PhaseASidecar {
+        language: "ruby",
+        binary: "travsr-lang-ruby",
+        extensions: &["rb", "rake", "gemspec"],
+    },
+    PhaseASidecar {
+        language: "csharp",
+        binary: "travsr-lang-csharp",
+        extensions: &["cs"],
+    },
+    PhaseASidecar {
+        language: "php",
+        binary: "travsr-lang-php",
+        extensions: &["php", "phtml", "php8"],
+    },
+    PhaseASidecar {
+        language: "scala",
+        binary: "travsr-lang-scala",
+        extensions: &["scala", "sc"],
+    },
+    PhaseASidecar {
+        language: "cpp",
+        binary: "travsr-lang-cpp",
+        extensions: &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+    },
+    PhaseASidecar {
+        language: "c",
+        binary: "travsr-lang-c",
+        extensions: &["c", "h"],
+    },
+    PhaseASidecar {
+        language: "swift",
+        binary: "travsr-lang-swift",
+        extensions: &["swift"],
+    },
+    PhaseASidecar {
+        language: "dart",
+        binary: "travsr-lang-dart",
+        extensions: &["dart"],
+    },
+    PhaseASidecar {
+        language: "objectivec",
+        binary: "travsr-lang-objectivec",
+        extensions: &["m", "mm"],
+    },
+];
+
+/// Register all Phase A sidecar plugins from [`PHASE_A_SIDECARS`].
+///
+/// Called once per PluginIndexer with the repo root so the sandbox can grant
+/// read access to the source tree being parsed.
+///
+/// Registration is cheap: a PATH lookup per language plus a handshake struct.
+/// The actual subprocess spawn is deferred to the first parse request for
+/// that language ([`LazySidecar`]) — a repo with no Ruby files never spawns
+/// travsr-lang-ruby, and the daemon's parallel workers only spawn sidecars
+/// for languages present in their shard.
+///
+/// Phase A spawns always use `SandboxPolicy::Standard` — grammar parsing
+/// needs no network and no writes outside the scratch dir. Phase B goes
+/// through the resolver with the catalog's per-language sandbox requirement
+/// (Standard vs RequiresElevated + approved hosts) — a separate spawn.
+///
+/// Fail-closed per ADR-017 Rule 2:
+/// - binary not on PATH → language not registered, logged at info.
+/// - sandbox unavailable → nothing registered, logged once.
+/// - spawn failure at first use → cached failure, no respawn storm.
+pub fn register_phase_a_sidecars(dispatcher: &mut Dispatcher, repo_root: &std::path::Path) {
+    if !sandbox_available() {
+        tracing::warn!(
+            "sandbox unavailable — Phase A sidecar languages disabled \
+             (ADR-017 Rule 2 fail-closed); ts/js/rust/python remain in-process"
+        );
+        return;
+    }
+
+    let version = env!("CARGO_PKG_VERSION").to_string();
+
+    for entry in PHASE_A_SIDECARS {
+        let Some(program) = which_binary(entry.binary) else {
+            tracing::info!(
+                "{} not found on PATH — {} Phase A indexing disabled \
+                 (install the sidecar binary or run `travsr lang install {}`)",
+                entry.binary,
+                entry.language,
+                entry.language
+            );
+            continue;
+        };
+
+        // Handshake synthesised from the catalog. supports_phase_b stays
+        // false here: Phase B for sidecar languages routes through the
+        // resolver + Phase B catalog (with its sandbox policy), never
+        // through this Phase A dispatcher registration.
+        let hs = HandshakeResponse {
+            protocol_version: PROTOCOL_VERSION,
+            plugin_version: version.clone(),
+            language: entry.language.to_string(),
+            extensions: entry.extensions.iter().map(|s| s.to_string()).collect(),
+            supports_phase_b: false,
+        };
+
+        let spec = PluginSpec {
+            language: entry.language.to_string(),
+            program,
+            args: vec![],
+            policy: SandboxPolicy::Standard,
+        };
+
+        let transport = Arc::new(LazySidecar::new(spec, repo_root));
+        if let Err(e) = dispatcher.register(hs, transport) {
+            tracing::warn!(
+                lang = entry.language,
+                err = %e,
+                "Phase A sidecar registration failed"
+            );
+        } else {
+            tracing::debug!(
+                lang = entry.language,
+                binary = entry.binary,
+                "Phase A sidecar registered (lazy spawn)"
+            );
+        }
     }
 }
 
-fn register_generic(
-    dispatcher: &mut Dispatcher,
-    version: &str,
-    config: &'static crate::plugins::generic::LanguageConfig,
-) {
-    let plugin = GenericTreeSitterPlugin::new(config);
-    let hs = HandshakeResponse {
-        protocol_version: PROTOCOL_VERSION,
-        plugin_version: version.to_string(),
-        language: config.language.as_str().to_string(),
-        extensions: config.extensions.iter().map(|s| s.to_string()).collect(),
-        supports_phase_b: false,
-    };
-    let t = Arc::new(InProcess::new(plugin));
-    dispatcher
-        .register(hs, t)
-        .expect("generic plugin registration failed");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use travsr_core::Language;
+
+    /// Every catalog extension must route to the catalog's language in
+    /// travsr-core, and the language string must be a valid proto string.
+    /// A mismatch means the daemon walk and the dispatcher disagree about
+    /// which files belong to which plugin.
+    #[test]
+    fn catalog_extensions_match_core() {
+        for entry in PHASE_A_SIDECARS {
+            let expected = travsr_plugin_protocol::language_from_proto_str(entry.language)
+                .unwrap_or_else(|| panic!("unknown proto language: {}", entry.language));
+            for ext in entry.extensions {
+                assert_eq!(
+                    Language::from_extension(ext),
+                    Some(expected),
+                    "extension {ext:?} does not map to {} in travsr-core",
+                    entry.language
+                );
+            }
+        }
+    }
+
+    /// Sidecar languages must not overlap the in-process builtins.
+    #[test]
+    fn catalog_does_not_overlap_builtins() {
+        const BUILTINS: &[&str] = &["typescript", "rust", "python"];
+        for entry in PHASE_A_SIDECARS {
+            assert!(
+                !BUILTINS.contains(&entry.language),
+                "{} is both a builtin and a sidecar",
+                entry.language
+            );
+        }
+    }
+
+    /// Every Phase A sidecar binary name must match the Phase B catalog's
+    /// provider_binary for the same language — one binary serves both phases.
+    #[test]
+    fn sidecar_binaries_match_phase_b_catalog() {
+        for entry in PHASE_A_SIDECARS {
+            if let Some(cat) = crate::phase_b::catalog::lookup(entry.language) {
+                if let Some(provider) = cat.provider_binary {
+                    assert_eq!(
+                        entry.binary, provider,
+                        "{}: Phase A binary != Phase B provider_binary",
+                        entry.language
+                    );
+                }
+            }
+        }
+    }
 }

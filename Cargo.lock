@@ -3219,14 +3219,81 @@ dependencies = [
 ]
 
 [[package]]
+name = "travsr-lang-c"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-protocol",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-common"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "tracing-subscriber",
+ "travsr-analysis",
+ "travsr-indexer",
+ "travsr-plugin-protocol",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
 name = "travsr-lang-cpp"
 version = "0.7.0"
 dependencies = [
  "anyhow",
  "tempfile",
- "tracing",
- "tracing-subscriber",
- "travsr-indexer",
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-protocol",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-csharp"
+version = "0.7.0"
+dependencies = [
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-dart"
+version = "0.7.0"
+dependencies = [
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-go"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-protocol",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-java"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-protocol",
  "travsr-plugin-sdk",
 ]
 
@@ -3236,9 +3303,54 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "tempfile",
- "tracing",
- "tracing-subscriber",
- "travsr-indexer",
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-protocol",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-objectivec"
+version = "0.7.0"
+dependencies = [
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-php"
+version = "0.7.0"
+dependencies = [
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-ruby"
+version = "0.7.0"
+dependencies = [
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-scala"
+version = "0.7.0"
+dependencies = [
+ "travsr-analysis",
+ "travsr-lang-common",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-swift"
+version = "0.7.0"
+dependencies = [
+ "travsr-analysis",
+ "travsr-lang-common",
  "travsr-plugin-sdk",
 ]
 

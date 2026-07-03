@@ -70,6 +70,16 @@ impl PluginIndexer {
         }
     }
 
+    /// Register Phase A sidecar plugins for all non-builtin languages
+    /// (RFC-013 Direction A, D-3). Registration is cheap (PATH lookups); the
+    /// sandboxed subprocess spawn is deferred to the first file of each
+    /// language. Callers that parse files (daemon workers, reindex, CLI
+    /// index) MUST call this after construction — without it only the
+    /// ts/js/rust/python builtins dispatch.
+    pub fn register_phase_a_sidecars(&mut self, repo_root: &std::path::Path) {
+        crate::registry::register_phase_a_sidecars(&mut self.dispatcher, repo_root);
+    }
+
     /// Parse a file. Caches by (CARGO_PKG_VERSION, sha256). Returns ParseOutput
     /// so the daemon's existing call sites need no changes.
     pub fn parse_file_with_vname(

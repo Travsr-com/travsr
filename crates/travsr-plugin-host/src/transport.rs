@@ -346,6 +346,91 @@ impl Transport for Sidecar {
     }
 }
 
+// ── LazySidecar ───────────────────────────────────────────────────────────────
+
+/// Sidecar transport that defers the subprocess spawn until the first parse
+/// request for its language (RFC-013 Direction A, Phase A dispatch).
+///
+/// With twelve Phase A sidecar languages, eagerly spawning every registered
+/// sidecar at `PluginIndexer` construction would cost ~12 sandboxed spawns per
+/// indexer — and the daemon's parallel init creates one indexer per worker
+/// thread. `LazySidecar` registers extensions from the static catalog and only
+/// pays the spawn + handshake cost when a file of that language is actually
+/// dispatched.
+///
+/// Fail-closed per ADR-017 Rule 2: a failed spawn is cached (no respawn storm)
+/// and every subsequent parse returns `PluginCrashed` for the caller to log.
+pub struct LazySidecar {
+    spec: crate::resolver::PluginSpec,
+    repo_root: std::path::PathBuf,
+    cell: std::sync::OnceLock<Option<Sidecar>>,
+}
+
+impl LazySidecar {
+    pub fn new(spec: crate::resolver::PluginSpec, repo_root: &std::path::Path) -> Self {
+        Self {
+            spec,
+            repo_root: repo_root.to_path_buf(),
+            cell: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Spawn on first use; cache the outcome (success or failure) forever.
+    fn instance(&self) -> Option<&Sidecar> {
+        self.cell
+            .get_or_init(|| match Sidecar::spawn(&self.spec, &self.repo_root) {
+                Ok(sidecar) => {
+                    tracing::info!(
+                        lang = %self.spec.language,
+                        binary = %self.spec.program,
+                        "Phase A sidecar spawned on first use"
+                    );
+                    Some(sidecar)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        lang = %self.spec.language,
+                        binary = %self.spec.program,
+                        err = %e,
+                        "Phase A sidecar spawn failed — language disabled for this run \
+                         (ADR-017 Rule 2 fail-closed)"
+                    );
+                    None
+                }
+            })
+            .as_ref()
+    }
+}
+
+impl Transport for LazySidecar {
+    fn parse(&self, req: ParseRequest) -> Result<ParseResponse, IndexError> {
+        match self.instance() {
+            Some(sidecar) => sidecar.parse(req),
+            None => Err(IndexError::PluginCrashed {
+                language: self.spec.language.clone(),
+            }),
+        }
+    }
+
+    /// Phase B for sidecar languages routes through the resolver + Phase B
+    /// catalog (with its per-language sandbox policy), never through the
+    /// Phase A dispatcher registration.
+    fn invoke_phase_b(&self, _req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+        Err(IndexError::PhaseNotSupported)
+    }
+
+    fn health(&self) -> PluginHealth {
+        match self.cell.get() {
+            None => PluginHealth::Ok, // not yet spawned — healthy by default
+            Some(Some(sidecar)) => sidecar.health(),
+            Some(None) => PluginHealth::Disabled(format!(
+                "sidecar spawn failed for {}",
+                self.spec.language
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +474,32 @@ mod tests {
     fn sidecar_stub_is_disabled() {
         let s = Sidecar::stub("kotlin");
         assert!(matches!(s.health(), PluginHealth::Disabled(_)));
+    }
+
+    #[test]
+    fn lazy_sidecar_fails_closed_when_binary_missing() {
+        let spec = crate::resolver::PluginSpec {
+            language: "cpp".into(),
+            program: "/nonexistent/travsr-lang-cpp".into(),
+            args: vec![],
+            policy: crate::sandbox::policy::SandboxPolicy::Standard,
+        };
+        let lazy = LazySidecar::new(spec, std::path::Path::new("."));
+
+        // Healthy before first use — spawn has not been attempted.
+        assert!(matches!(lazy.health(), PluginHealth::Ok));
+
+        let req = ParseRequest {
+            path: std::path::PathBuf::from("a.cpp"),
+            vname_path: "a.cpp".into(),
+            corpus: String::new(),
+            package: String::new(),
+            source: None,
+        };
+        // First parse triggers the spawn attempt, which fails (missing binary).
+        assert!(lazy.parse(req.clone()).is_err());
+        // Failure is cached: disabled from now on, no respawn attempts.
+        assert!(matches!(lazy.health(), PluginHealth::Disabled(_)));
+        assert!(lazy.parse(req).is_err());
     }
 }

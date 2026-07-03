@@ -159,6 +159,10 @@ fn index_paths_parallel(
 
             scope.spawn(move || {
                 let mut indexer = PluginIndexer::new(&corpus);
+                // RFC-013 Direction A: non-builtin languages parse via
+                // travsr-lang-* sidecars, spawned lazily on the first file of
+                // each language in this worker's shard.
+                indexer.register_phase_a_sidecars(&repo);
                 for abs_path in shard {
                     let vname_path = abs_path
                         .strip_prefix(&repo)
@@ -1219,6 +1223,9 @@ pub fn reindex_files(
     };
 
     let mut indexer = PluginIndexer::new(&corpus);
+    // RFC-013 Direction A: non-builtin languages parse via travsr-lang-*
+    // sidecars, spawned lazily on the first file of each language.
+    indexer.register_phase_a_sidecars(repo_root);
     // Accumulate FFI markers across all files for repo-level cross-language
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.
