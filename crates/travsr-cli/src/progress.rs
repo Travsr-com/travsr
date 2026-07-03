@@ -398,6 +398,126 @@ fn bar(pal: Palette, pct: u64) -> String {
     format!("{}{}", pal.orange(&filled), pal.track(&"░".repeat(empty)))
 }
 
+/// Static orange progress bar of a given cell `width`, eighth-precision, for
+/// snapshot displays like `travsr embed status`. Same look as the live init bar
+/// (orange fill over a dim track) but bracket-free and width-configurable.
+pub fn bar_of_width(pal: Palette, done: u64, total: u64, width: usize) -> String {
+    let pct = ((done.min(total) as usize) * 100)
+        .checked_div(total as usize)
+        .unwrap_or(0)
+        .min(100);
+    let eighths = (pct * width * 8) / 100;
+    let full = (eighths / 8).min(width);
+    let rem = if full < width { eighths % 8 } else { 0 };
+    let partial = usize::from(rem > 0);
+    let empty = width - full - partial;
+    let mut filled = "█".repeat(full);
+    if partial == 1 {
+        filled.push(PARTIAL[rem]);
+    }
+    format!("{}{}", pal.orange(&filled), pal.track(&"░".repeat(empty)))
+}
+
+/// Reusable live progress line matching the `travsr init` look — a pulsing
+/// graph-node spinner, the orange eighth-precision bar, `done/total`, percent,
+/// and elapsed time. Renders in place on **stderr** for a TTY (stdout stays
+/// clean for the final summary); emits throttled newline lines otherwise.
+///
+/// Used by `travsr embed reindex`/`embed init` so a multi-minute embed shows the
+/// same progress UI as indexing, instead of going silent.
+pub struct LiveBar {
+    pal: Palette,
+    label: String,
+    start: Instant,
+    last_paint: Instant,
+    frame: usize,
+    is_tty: bool,
+    last_width: usize,
+}
+
+impl LiveBar {
+    /// Create a bar rendering to stderr. `label` is a short verb, e.g. "embedding".
+    pub fn new(label: impl Into<String>) -> Self {
+        let is_tty = std::io::stderr().is_terminal();
+        Self {
+            pal: Palette::for_stream(is_tty),
+            label: label.into(),
+            start: Instant::now(),
+            // Force an immediate first paint.
+            last_paint: Instant::now() - TTY_TICK - TTY_TICK,
+            frame: 0,
+            is_tty,
+            last_width: 0,
+        }
+    }
+
+    /// Update progress. Throttled to ~10 fps on a TTY, ~every 2 s otherwise.
+    pub fn tick(&mut self, done: u64, total: u64) {
+        let now = Instant::now();
+        let gap = if self.is_tty { TTY_TICK } else { LINE_TICK };
+        if now.duration_since(self.last_paint) < gap {
+            return;
+        }
+        self.last_paint = now;
+        self.render(done, total, false);
+    }
+
+    /// Final paint: green node, 100 %, trailing newline. Call once when done.
+    pub fn finish(&mut self, done: u64, total: u64) {
+        self.render(done, total.max(done), true);
+    }
+
+    fn render(&mut self, done: u64, total: u64, done_state: bool) {
+        let pct = (done.min(total) * 100)
+            .checked_div(total)
+            .unwrap_or(if done_state { 100 } else { 0 })
+            .min(100);
+        let elapsed = fmt_dur(self.start.elapsed());
+        if self.is_tty {
+            let node = if done_state {
+                self.pal.green("\u{25cf}")
+            } else {
+                let f = self.pal.orange(&NODE[self.frame % NODE.len()].to_string());
+                self.frame += 1;
+                f
+            };
+            let line = format!(
+                "  {} {} {} {}/{}  {:>3}%  {}",
+                node,
+                self.label,
+                bar(self.pal, if done_state { 100 } else { pct }),
+                commas(done),
+                commas(total),
+                pct,
+                elapsed,
+            );
+            let pad = self.last_width.saturating_sub(visible_width(&line));
+            eprint!("\r{}{}", line, " ".repeat(pad));
+            self.last_width = visible_width(&line);
+            if done_state {
+                eprintln!();
+            }
+            let _ = std::io::stderr().flush();
+        } else if done_state {
+            eprintln!(
+                "  {} complete — {} embedded in {}",
+                self.label,
+                commas(done),
+                elapsed
+            );
+        } else {
+            eprintln!(
+                "  {} {}/{} ({}%) {}",
+                self.label,
+                commas(done),
+                commas(total),
+                pct,
+                elapsed
+            );
+        }
+    }
+}
+
 /// Display width ignoring ANSI SGR escapes, so in-place redraws pad correctly.
 fn visible_width(s: &str) -> usize {
     let mut n = 0;
