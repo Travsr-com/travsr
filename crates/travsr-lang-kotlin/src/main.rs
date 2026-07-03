@@ -1,50 +1,33 @@
-//! travsr-lang-kotlin — Phase A sidecar for Kotlin.
+//! travsr-lang-kotlin — Phase B sidecar for Kotlin.
 //!
-//! Carries the tree-sitter-kotlin grammar blob so it does NOT live in the main
-//! travsr binary (RFC-013 Direction A, §4). Spawned by travsr-plugin-host via
-//! Sidecar::spawn; communicates over stdin/stdout using the plugin wire protocol.
+//! Phase A (tree-sitter structural indexing) is in-process in the host — see
+//! `travsr-plugin-host::plugins::kotlin`. This binary is the Phase B provider
+//! from the catalog (`phase_b::catalog`, `provider_binary`): spawned sandboxed
+//! by the host via `Sidecar::spawn`, it wraps `scip-java` (which indexes
+//! Kotlin via its Gradle/Maven integration), converts the SCIP index into
+//! graph nodes/edges, and returns them over the wire protocol.
+//!
+//! Requires:
+//! - `scip-java` in `~/.travsr/bin` or on PATH (`travsr lang install kotlin`)
+//! - Elevated sandbox approval (Maven/Gradle need network) — see lang.toml
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use travsr_plugin_sdk::{
-    run_plugin, InvokeRequest, InvokeResponse, Language, Node, ParseRequest, ParseResponse, Plugin,
-    VName,
+    run_plugin, InvokeRequest, InvokeResponse, Language, ParseRequest, ParseResponse, Plugin,
 };
-use tree_sitter::{Parser, Query, QueryCursor};
 
+/// Informational — Phase A routing happens in the host, not here.
 const EXTENSIONS: &[&str] = &["kt", "kts"];
 
-const QUERIES: &str = r#"
-(class_declaration (type_identifier) @class.name)
-(object_declaration (type_identifier) @object.name)
-(function_declaration (simple_identifier) @fn.name)
-(import_header) @import
-"#;
+const SCIP_TOOL: &str = "scip-java";
+const SCIP_TIMEOUT: Duration = Duration::from_secs(600);
 
-const CAPTURE_KINDS: &[(&str, &str, &str)] = &[
-    ("class.name", "class", "class"),
-    ("object.name", "object", "class"),
-    ("fn.name", "function", "fn"),
-    ("import", "import", "import"),
-];
+struct KotlinPhaseB;
 
-const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
-const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
-
-struct KotlinPlugin {
-    grammar: tree_sitter::Language,
-    query: Query,
-}
-
-impl KotlinPlugin {
-    fn new() -> Self {
-        let grammar = tree_sitter_kotlin::language();
-        let query = Query::new(&grammar, QUERIES)
-            .expect("invalid Kotlin tree-sitter query — this is a bug in travsr-lang-kotlin");
-        Self { grammar, query }
-    }
-}
-
-impl Plugin for KotlinPlugin {
+impl Plugin for KotlinPhaseB {
     fn language(&self) -> Language {
         Language::Kotlin
     }
@@ -54,90 +37,109 @@ impl Plugin for KotlinPlugin {
     }
 
     fn supports_phase_b(&self) -> bool {
-        false
+        true
     }
 
-    fn parse(&self, req: &ParseRequest) -> ParseResponse {
-        parse_kotlin(&self.grammar, &self.query, req).unwrap_or_else(|e| {
-            tracing::warn!("kotlin parse {}: {e}", req.path.display());
-            ParseResponse::default()
-        })
+    /// Phase A is in-process in the host; this provider is Phase B only.
+    fn parse(&self, _req: &ParseRequest) -> ParseResponse {
+        ParseResponse::default()
     }
 
-    fn invoke_phase_b(&self, _req: &InvokeRequest) -> InvokeResponse {
-        InvokeResponse::default()
+    fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
+        match run_scip_java(&req.root) {
+            Ok(Some(bytes)) => match travsr_indexer::ingest_scip(&bytes, &req.corpus) {
+                Ok(out) => InvokeResponse {
+                    nodes: out.nodes,
+                    edges: out.edges,
+                },
+                Err(e) => {
+                    tracing::warn!("kotlin scip ingest: {e}");
+                    InvokeResponse::default()
+                }
+            },
+            Ok(None) => {
+                tracing::info!("scip-java not available — Kotlin Phase B skipped");
+                InvokeResponse::default()
+            }
+            Err(e) => {
+                tracing::warn!("scip-java failed: {e}");
+                InvokeResponse::default()
+            }
+        }
     }
 }
 
-fn parse_kotlin(
-    grammar: &tree_sitter::Language,
-    query: &Query,
-    req: &ParseRequest,
-) -> anyhow::Result<ParseResponse> {
-    let size = std::fs::metadata(&req.path)
-        .with_context(|| format!("stat {}", req.path.display()))?
-        .len();
-    anyhow::ensure!(
-        size <= MAX_FILE_BYTES,
-        "file too large: {} bytes",
-        size
-    );
-
-    let source =
-        std::fs::read(&req.path).with_context(|| format!("reading {}", req.path.display()))?;
-
-    let mut parser = Parser::new();
-    parser.set_language(grammar).context("set Kotlin grammar")?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
-
-    let tree = parser
-        .parse(&source, None)
-        .context("parse timed out or returned None")?;
-
-    let file_vname = VName::new(&req.corpus, "", &req.vname_path, "kotlin", "file");
-    let mut nodes = vec![Node::new(file_vname, "file")];
-
-    let capture_names = query.capture_names();
-    let mut cursor = QueryCursor::new();
-
-    for m in cursor.matches(query, tree.root_node(), source.as_slice()) {
-        for cap in m.captures {
-            let cap_name = *capture_names.get(cap.index as usize).unwrap_or(&"");
-            let Some(&(_, node_kind, sig_prefix)) = CAPTURE_KINDS
-                .iter()
-                .find(|(name, _, _)| *name == cap_name)
-            else {
-                continue;
-            };
-
-            let text = cap.node.utf8_text(&source).unwrap_or("").trim();
-            if text.is_empty() {
-                continue;
-            }
-            let line = cap.node.start_position().row as u32 + 1;
-
-            let sig = if sig_prefix == "import" {
-                // Strip the leading `import ` keyword and trailing semicolon
-                // to produce a stable `import:<fully.qualified.Name>` signature.
-                let cleaned = text
-                    .trim_start_matches("import ")
-                    .trim_end_matches(';')
-                    .trim();
-                format!("import:{cleaned}")
-            } else {
-                format!("{sig_prefix}:{text}")
-            };
-
-            let vname = VName::new(&req.corpus, "", &req.vname_path, "kotlin", &sig);
-            nodes.push(Node::new(vname, node_kind).with_line(line));
+/// Locate a tool in `~/.travsr/bin` first (where `travsr lang install` puts
+/// binaries), then on PATH.
+fn find_tool(name: &str) -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        let installed = Path::new(&home).join(".travsr").join("bin").join(name);
+        if installed.is_file() {
+            return Some(installed);
         }
     }
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
 
-    Ok(ParseResponse {
-        nodes,
-        edges: vec![],
-        ffi_markers: vec![],
-    })
+/// Run `scip-java index` on `root` and return the raw SCIP protobuf bytes.
+/// `Ok(None)` = tool not installed (graceful skip).
+fn run_scip_java(root: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(tool) = find_tool(SCIP_TOOL) else {
+        return Ok(None);
+    };
+
+    let scratch = tempfile::Builder::new()
+        .prefix("travsr-scip-kotlin-")
+        .tempdir()
+        .context("create scip-java scratch dir")?;
+    let output = scratch.path().join("index.scip");
+
+    let mut child = std::process::Command::new(&tool)
+        .arg("index")
+        .arg("--output")
+        .arg(&output)
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {SCIP_TOOL} for {}", root.display()))?;
+
+    wait_with_timeout(&mut child, SCIP_TIMEOUT, SCIP_TOOL)?;
+
+    let bytes = std::fs::read(&output)
+        .with_context(|| format!("reading SCIP output {}", output.display()))?;
+    Ok(Some(bytes))
+}
+
+/// Poll `child` until exit or `timeout`; kill on timeout. Returns Err on
+/// non-zero exit with captured stderr for diagnosis.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    tool: &str,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("polling child")? {
+            if !status.success() {
+                let mut stderr = String::new();
+                if let Some(ref mut err) = child.stderr {
+                    use std::io::Read as _;
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                anyhow::bail!("{tool} exited with {status}: {}", stderr.trim());
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{tool} timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn main() {
@@ -148,5 +150,37 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
         )
         .init();
-    run_plugin(KotlinPlugin::new());
+    run_plugin(KotlinPhaseB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without scip-java installed, Phase B must degrade to an empty response
+    /// — never panic or error the wire.
+    #[test]
+    fn phase_b_degrades_gracefully_without_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = InvokeRequest {
+            root: tmp.path().to_path_buf(),
+            corpus: "github.com/travsr/test".into(),
+        };
+        let resp = KotlinPhaseB.invoke_phase_b(&req);
+        assert!(resp.nodes.is_empty());
+        assert!(resp.edges.is_empty());
+    }
+
+    /// Phase A must be a no-op — it lives in-process in the host.
+    #[test]
+    fn parse_returns_empty() {
+        let req = ParseRequest {
+            path: PathBuf::from("x.kt"),
+            vname_path: "x.kt".into(),
+            corpus: String::new(),
+            package: String::new(),
+            source: None,
+        };
+        assert!(KotlinPhaseB.parse(&req).nodes.is_empty());
+    }
 }

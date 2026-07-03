@@ -301,7 +301,6 @@ fn reindex_files_inner(
     };
 
     let mut indexer = PluginIndexer::new(&corpus);
-    indexer.register_phase_a_sidecars(repo_root);
     // Accumulate FFI markers across all files for repo-level cross-language
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.

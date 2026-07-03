@@ -1,5 +1,4 @@
-//! Phase A golden fixtures for the grammars that register as in-process builtins:
-//! Scala and C.
+//! Phase A golden fixtures for the grammars that register as in-process builtins.
 //!
 //! These prove two things at once:
 //!   1. `register_builtins` compiles each grammar's tree-sitter query (a bad
@@ -8,10 +7,8 @@
 //!      nodes — the ADR-017 Rule 4 "fixture-gated" condition for an in-process
 //!      grammar.
 //!
-//! C++ and Kotlin are no longer in-process grammars (RFC-013 Direction A). Their
-//! Phase A parsers live in sidecar binaries (`travsr-lang-cpp`, `travsr-lang-kotlin`).
-//! The sidecar tests below run only when those binaries are on PATH so CI without
-//! them still passes.
+//! Phase A is fully in-process. The `travsr-lang-<lang>` sidecar binaries are
+//! Phase B providers only (SCIP tool wrappers) — see `phase_b::catalog`.
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -74,104 +71,44 @@ int add(int a, int b) { return a + b; }
     }
 }
 
-/// Integration test for the travsr-lang-kotlin Phase A sidecar (RFC-013 Direction A).
-///
-/// Skipped automatically when `travsr-lang-kotlin` is not on PATH so standard CI
-/// (which builds the workspace but does not install sidecar binaries) still passes.
-/// To run: `cargo build -p travsr-lang-kotlin && cargo test -p travsr-plugin-host kotlin_sidecar`
 #[test]
-fn kotlin_phase_a_sidecar_extracts_structure() {
-    let sidecar_on_path = std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )
-    .any(|dir| dir.join("travsr-lang-kotlin").is_file());
-
-    if !sidecar_on_path {
-        eprintln!("SKIP: travsr-lang-kotlin not on PATH — build it first to run this test");
-        return;
-    }
-
-    let fixture = std::path::Path::new("tests/fixtures/Hello.kt");
-    if !fixture.exists() {
-        panic!("fixture missing: tests/fixtures/Hello.kt");
-    }
-
-    let repo_root = fixture.parent().unwrap();
-    let mut indexer = PluginIndexer::new(CORPUS);
-    indexer.register_phase_a_sidecars(repo_root);
-
-    let nodes = indexer
-        .parse_file_with_vname(fixture, "src/PaymentService.kt")
-        .expect("parse")
-        .nodes;
-    let k: HashSet<String> = nodes.iter().map(|n| n.kind.clone()).collect();
-
-    for expected in ["file", "class", "function", "import"] {
-        assert!(
-            k.contains(expected),
-            "kotlin sidecar: missing {expected:?} node — got {k:?}"
-        );
-    }
-
-    assert!(
-        nodes
-            .iter()
-            .any(|n| n.kind == "class" && n.vname.signature.contains("PaymentService")),
-        "kotlin sidecar: missing PaymentService class\nnodes: {:?}",
-        nodes
-            .iter()
-            .map(|n| (&n.kind, &n.vname.signature))
-            .collect::<Vec<_>>()
-    );
-}
-
-/// Integration test for the travsr-lang-cpp Phase A sidecar (RFC-013 Direction A).
-///
-/// Skipped automatically when `travsr-lang-cpp` is not on PATH so standard CI
-/// (which builds the workspace but does not install sidecar binaries) still passes.
-/// To run: `cargo build -p travsr-lang-cpp && cargo test -p travsr-plugin-host cpp_sidecar`
-#[test]
-fn cpp_phase_a_sidecar_extracts_structure() {
-    // Skip if the sidecar binary is not installed.
-    let sidecar_on_path = std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )
-    .any(|dir| dir.join("travsr-lang-cpp").is_file());
-
-    if !sidecar_on_path {
-        eprintln!("SKIP: travsr-lang-cpp not on PATH — build it first to run this test");
-        return;
-    }
-
+fn cpp_phase_a_extracts_structure() {
     let src = r#"
 #include <vector>
 namespace app {
 class Widget { public: void draw(); };
 struct Pod { int n; };
+enum Mode { A, B };
 int compute(int x) { return x * 2; }
 }
 "#;
-    let mut f = tempfile::Builder::new()
-        .suffix(".cpp")
-        .tempfile()
-        .expect("tempfile");
-    f.write_all(src.as_bytes()).expect("write fixture");
-    f.flush().expect("flush fixture");
-
-    let repo_root = f.path().parent().unwrap();
-    let mut indexer = PluginIndexer::new(CORPUS);
-    indexer.register_phase_a_sidecars(repo_root);
-
-    let nodes = indexer
-        .parse_file_with_vname(f.path(), "fixture.cpp")
-        .expect("parse")
-        .nodes;
-    let k: HashSet<String> = nodes.into_iter().map(|n| n.kind).collect();
-
-    for expected in ["class", "struct", "namespace", "function", "import"] {
+    let k = kinds(src, "cpp");
+    for expected in ["class", "struct", "namespace", "enum", "function", "import"] {
         assert!(
             k.contains(expected),
-            "cpp sidecar: missing {expected:?} node — got {k:?}"
+            "cpp: missing {expected:?} node — got {k:?}"
+        );
+    }
+}
+
+#[test]
+fn kotlin_phase_a_extracts_structure() {
+    let src = r#"
+import java.time.Instant
+
+class PaymentService {
+    fun charge(amount: Int): Boolean = amount > 0
+}
+
+object Registry {
+    fun lookup(name: String): String = name
+}
+"#;
+    let k = kinds(src, "kt");
+    for expected in ["class", "object", "function", "import"] {
+        assert!(
+            k.contains(expected),
+            "kotlin: missing {expected:?} node — got {k:?}"
         );
     }
 }

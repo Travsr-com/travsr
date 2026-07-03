@@ -1,69 +1,32 @@
-//! travsr-lang-cpp — Phase A sidecar for C++.
+//! travsr-lang-cpp — Phase B sidecar for C++.
 //!
-//! Carries the tree-sitter-cpp grammar blob so it does NOT live in the main
-//! travsr binary (RFC-013 Direction A, §4). Spawned by travsr-plugin-host via
-//! Sidecar::spawn; communicates over stdin/stdout using the plugin wire protocol.
+//! Phase A (tree-sitter structural indexing) is in-process in the host — see
+//! `travsr-plugin-host::plugins::cpp`. This binary is the Phase B provider
+//! from the catalog (`phase_b::catalog`, `provider_binary`): spawned sandboxed
+//! by the host via `Sidecar::spawn`, it wraps `scip-clang`, converts the SCIP
+//! index into graph nodes/edges, and returns them over the wire protocol.
+//!
+//! Requires:
+//! - `scip-clang` in `~/.travsr/bin` or on PATH (`travsr lang install cpp`)
+//! - `compile_commands.json` at the repo root
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use std::sync::Mutex;
 use travsr_plugin_sdk::{
-    run_plugin, InvokeRequest, InvokeResponse, Language, Node, ParseRequest, ParseResponse, Plugin,
-    VName,
+    run_plugin, InvokeRequest, InvokeResponse, Language, ParseRequest, ParseResponse, Plugin,
 };
-use tree_sitter::{Parser, Query, QueryCursor};
 
+/// Informational — Phase A routing happens in the host, not here.
 const EXTENSIONS: &[&str] = &["cpp", "cc", "cxx", "hpp", "hh", "hxx"];
 
-const QUERIES: &str = r#"
-(class_specifier name: (type_identifier) @class.name)
-(struct_specifier name: (type_identifier) @struct.name)
-(union_specifier name: (type_identifier) @union.name)
-(enum_specifier name: (type_identifier) @enum.name)
-(namespace_definition name: (namespace_identifier) @namespace.name)
-(function_declarator declarator: (identifier) @fn.name)
-(function_declarator declarator: (field_identifier) @fn.name)
-(preproc_include path: (_) @import)
-"#;
+const SCIP_TOOL: &str = "scip-clang";
+const SCIP_TIMEOUT: Duration = Duration::from_secs(600);
 
-const CAPTURE_KINDS: &[(&str, &str, &str)] = &[
-    ("class.name", "class", "class"),
-    ("struct.name", "struct", "struct"),
-    ("union.name", "union", "struct"),
-    ("enum.name", "enum", "enum"),
-    ("namespace.name", "namespace", "namespace"),
-    ("fn.name", "function", "fn"),
-    ("import", "import", "import"),
-];
+struct CppPhaseB;
 
-const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
-const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
-
-struct CppPlugin {
-    grammar: tree_sitter::Language,
-    query: Query,
-    // Reused across files — avoids Parser::new() + set_language() per file.
-    // Mutex because Plugin: Send + Sync; never actually contended (single-threaded sidecar).
-    parser: Mutex<Parser>,
-}
-
-impl CppPlugin {
-    fn new() -> Self {
-        let grammar = tree_sitter_cpp::language();
-        let query = Query::new(&grammar, QUERIES)
-            .expect("invalid C++ tree-sitter query — this is a bug in travsr-lang-cpp");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .expect("failed to set C++ grammar on parser");
-        Self {
-            grammar,
-            query,
-            parser: Mutex::new(parser),
-        }
-    }
-}
-
-impl Plugin for CppPlugin {
+impl Plugin for CppPhaseB {
     fn language(&self) -> Language {
         Language::Cpp
     }
@@ -73,103 +36,118 @@ impl Plugin for CppPlugin {
     }
 
     fn supports_phase_b(&self) -> bool {
-        false
+        true
     }
 
-    fn parse(&self, req: &ParseRequest) -> ParseResponse {
-        parse_cpp(&self.grammar, &self.query, &self.parser, req).unwrap_or_else(|e| {
-            tracing::warn!("cpp parse {}: {e}", req.path.display());
-            ParseResponse::default()
-        })
+    /// Phase A is in-process in the host; this provider is Phase B only.
+    fn parse(&self, _req: &ParseRequest) -> ParseResponse {
+        ParseResponse::default()
     }
 
-    fn invoke_phase_b(&self, _req: &InvokeRequest) -> InvokeResponse {
-        InvokeResponse::default()
+    fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
+        match run_scip_clang(&req.root) {
+            Ok(Some(bytes)) => match travsr_indexer::ingest_scip(&bytes, &req.corpus) {
+                Ok(out) => InvokeResponse {
+                    nodes: out.nodes,
+                    edges: out.edges,
+                },
+                Err(e) => {
+                    tracing::warn!("cpp scip ingest: {e}");
+                    InvokeResponse::default()
+                }
+            },
+            Ok(None) => {
+                tracing::info!("scip-clang not available — C++ Phase B skipped");
+                InvokeResponse::default()
+            }
+            Err(e) => {
+                tracing::warn!("scip-clang failed: {e}");
+                InvokeResponse::default()
+            }
+        }
     }
 }
 
-fn parse_cpp(
-    _grammar: &tree_sitter::Language,
-    query: &Query,
-    parser_mutex: &Mutex<Parser>,
-    req: &ParseRequest,
-) -> anyhow::Result<ParseResponse> {
-    // Use source bytes sent by the host if available (avoids re-reading the
-    // file from inside the bwrap sandbox). Fall back to a direct read for
-    // callers that don't supply source (e.g. tests, future CLI tools).
-    let source: Vec<u8> = if let Some(s) = req.source.clone() {
-        s
-    } else {
-        let size = std::fs::metadata(&req.path)
-            .with_context(|| format!("stat {}", req.path.display()))?
-            .len();
-        anyhow::ensure!(size <= MAX_FILE_BYTES, "file too large: {} bytes", size);
-        std::fs::read(&req.path).with_context(|| format!("reading {}", req.path.display()))?
-    };
-
-    anyhow::ensure!(
-        source.len() as u64 <= MAX_FILE_BYTES,
-        "file too large: {} bytes",
-        source.len()
-    );
-
-    let tree = {
-        let mut parser = parser_mutex.lock().expect("parser mutex poisoned");
-        // reset() clears incremental-parse state from the previous file so
-        // the parser starts fresh. Far cheaper than Parser::new() each call.
-        parser.reset();
-        parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
-        parser
-            .parse(&source, None)
-            .context("parse timed out or returned None")?
-    };
-
-    let file_vname = VName::new(&req.corpus, "", &req.vname_path, "cpp", "file");
-    let mut nodes = vec![Node::new(file_vname, "file")];
-
-    let capture_names = query.capture_names();
-    let mut cursor = QueryCursor::new();
-
-    for m in cursor.matches(query, tree.root_node(), source.as_slice()) {
-        for cap in m.captures {
-            let cap_name = *capture_names.get(cap.index as usize).unwrap_or(&"");
-            let Some(&(_, node_kind, sig_prefix)) = CAPTURE_KINDS
-                .iter()
-                .find(|(name, _, _)| *name == cap_name)
-            else {
-                continue;
-            };
-
-            let text = cap.node.utf8_text(&source).unwrap_or("").trim();
-            if text.is_empty() {
-                continue;
-            }
-            let line = cap.node.start_position().row as u32 + 1;
-
-            let sig = if sig_prefix == "import" {
-                // Strip leading `#include` keyword, quotes, and angle brackets
-                // to produce a stable `import:<header>` signature.
-                let cleaned = text
-                    .trim_start_matches('#')
-                    .trim_start_matches("include")
-                    .trim()
-                    .trim_matches(|c| c == '<' || c == '>' || c == '"')
-                    .trim();
-                format!("import:{cleaned}")
-            } else {
-                format!("{sig_prefix}:{text}")
-            };
-
-            let vname = VName::new(&req.corpus, "", &req.vname_path, "cpp", &sig);
-            nodes.push(Node::new(vname, node_kind).with_line(line));
+/// Locate a tool in `~/.travsr/bin` first (where `travsr lang install` puts
+/// binaries), then on PATH.
+fn find_tool(name: &str) -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        let installed = Path::new(&home).join(".travsr").join("bin").join(name);
+        if installed.is_file() {
+            return Some(installed);
         }
     }
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
 
-    Ok(ParseResponse {
-        nodes,
-        edges: vec![],
-        ffi_markers: vec![],
-    })
+/// Run `scip-clang` against the repo's compile_commands.json and return the
+/// raw SCIP protobuf bytes. `Ok(None)` = tool not installed (graceful skip).
+fn run_scip_clang(root: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(tool) = find_tool(SCIP_TOOL) else {
+        return Ok(None);
+    };
+
+    let compdb = root.join("compile_commands.json");
+    anyhow::ensure!(
+        compdb.exists(),
+        "compile_commands.json not found at {} — generate it first \
+         (e.g. cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON, or bear -- make)",
+        root.display()
+    );
+
+    let scratch = tempfile::Builder::new()
+        .prefix("travsr-scip-cpp-")
+        .tempdir()
+        .context("create scip-clang scratch dir")?;
+    let output = scratch.path().join("index.scip");
+
+    let mut child = std::process::Command::new(&tool)
+        .arg("--compdb-path")
+        .arg(&compdb)
+        .arg("--output")
+        .arg(&output)
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {SCIP_TOOL} for {}", root.display()))?;
+
+    wait_with_timeout(&mut child, SCIP_TIMEOUT, SCIP_TOOL)?;
+
+    let bytes = std::fs::read(&output)
+        .with_context(|| format!("reading SCIP output {}", output.display()))?;
+    Ok(Some(bytes))
+}
+
+/// Poll `child` until exit or `timeout`; kill on timeout. Returns Err on
+/// non-zero exit with captured stderr for diagnosis.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    tool: &str,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("polling child")? {
+            if !status.success() {
+                let mut stderr = String::new();
+                if let Some(ref mut err) = child.stderr {
+                    use std::io::Read as _;
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                anyhow::bail!("{tool} exited with {status}: {}", stderr.trim());
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{tool} timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn main() {
@@ -180,5 +158,37 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
         )
         .init();
-    run_plugin(CppPlugin::new());
+    run_plugin(CppPhaseB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without scip-clang installed (or without compile_commands.json), Phase B
+    /// must degrade to an empty response — never panic or error the wire.
+    #[test]
+    fn phase_b_degrades_gracefully_without_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = InvokeRequest {
+            root: tmp.path().to_path_buf(),
+            corpus: "github.com/travsr/test".into(),
+        };
+        let resp = CppPhaseB.invoke_phase_b(&req);
+        assert!(resp.nodes.is_empty());
+        assert!(resp.edges.is_empty());
+    }
+
+    /// Phase A must be a no-op — it lives in-process in the host.
+    #[test]
+    fn parse_returns_empty() {
+        let req = ParseRequest {
+            path: PathBuf::from("x.cpp"),
+            vname_path: "x.cpp".into(),
+            corpus: String::new(),
+            package: String::new(),
+            source: None,
+        };
+        assert!(CppPhaseB.parse(&req).nodes.is_empty());
+    }
 }

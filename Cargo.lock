@@ -3169,11 +3169,11 @@ name = "travsr-lang-cpp"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
+ "travsr-indexer",
  "travsr-plugin-sdk",
- "tree-sitter",
- "tree-sitter-cpp",
 ]
 
 [[package]]
@@ -3181,11 +3181,11 @@ name = "travsr-lang-kotlin"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
+ "travsr-indexer",
  "travsr-plugin-sdk",
- "tree-sitter",
- "tree-sitter-kotlin",
 ]
 
 [[package]]
@@ -3237,7 +3237,9 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
  "tree-sitter-java",
+ "tree-sitter-kotlin",
  "tree-sitter-php",
  "tree-sitter-ruby",
  "tree-sitter-scala",

@@ -6,6 +6,7 @@
 //! require zero new Rust code — only a `LanguageConfig` constant.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::Context as _;
 use travsr_core::{Language, Node, VName};
@@ -37,6 +38,11 @@ pub struct GenericTreeSitterPlugin {
     config: &'static LanguageConfig,
     grammar: tree_sitter::Language,
     compiled_query: Query,
+    // Reused across files — avoids Parser::new() + set_language() per file,
+    // the dominant per-file overhead on large repos. Mutex because
+    // Plugin: Send + Sync; never actually contended (one plugin instance per
+    // PluginIndexer, called from a single thread).
+    parser: Mutex<Parser>,
 }
 
 impl GenericTreeSitterPlugin {
@@ -50,10 +56,15 @@ impl GenericTreeSitterPlugin {
                 config.language.as_str()
             )
         });
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar)
+            .expect("failed to set language on parser");
         Self {
             config,
             grammar,
             compiled_query,
+            parser: Mutex::new(parser),
         }
     }
 }
@@ -70,7 +81,9 @@ impl Plugin for GenericTreeSitterPlugin {
     }
 
     fn parse(&self, req: &ParseRequest) -> ParseResponse {
+        let mut parser = self.parser.lock().expect("parser mutex poisoned");
         parse_generic(
+            &mut parser,
             &self.grammar,
             &self.compiled_query,
             self.config,
@@ -96,7 +109,8 @@ impl Plugin for GenericTreeSitterPlugin {
 // ── Core parsing logic ────────────────────────────────────────────────────────
 
 fn parse_generic(
-    grammar: &tree_sitter::Language,
+    parser: &mut Parser,
+    _grammar: &tree_sitter::Language,
     query: &Query,
     config: &LanguageConfig,
     corpus: &str,
@@ -111,8 +125,9 @@ fn parse_generic(
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
-    let mut parser = Parser::new();
-    parser.set_language(grammar).context("set language")?;
+    // reset() clears incremental-parse state from the previous file while
+    // keeping the language set — far cheaper than Parser::new() each call.
+    parser.reset();
     parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
 
     let tree = parser.parse(&source, None).context("parse timeout")?;
