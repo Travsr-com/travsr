@@ -1,0 +1,394 @@
+{
+  "model": "bge-small-en-v1.5",
+  "generatedAt": "2026-07-01T10:14:46.269Z",
+  "coldMs": 407,
+  "perf": {
+    "correctnessSummary": {
+      "answerable": 16,
+      "nonsense": 3,
+      "hit@1": 0.688,
+      "hit@3": 0.813,
+      "hit@5": 0.813,
+      "hit@10": 0.938,
+      "mrr": 0.756,
+      "abstainAccuracy": 0
+    }
+  },
+  "correctness": [
+    {
+      "id": "L1",
+      "category": "literal",
+      "query": "get_context_body",
+      "expect": [
+        "get_context_body"
+      ],
+      "medianMs": 19,
+      "nodes": 34,
+      "confidence": "exact",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:get_context_body",
+      "tokens": 948
+    },
+    {
+      "id": "L2",
+      "category": "literal",
+      "query": "SnippetMode enum full skeleton auto",
+      "expect": [
+        "SnippetMode",
+        "snippet_for_node_full"
+      ],
+      "medianMs": 38,
+      "nodes": 20,
+      "confidence": "exact",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "impl:SnippetMode",
+      "tokens": 473
+    },
+    {
+      "id": "L3",
+      "category": "literal",
+      "query": "validate_mcp_list_arg",
+      "expect": [
+        "validate_mcp_list_arg",
+        "validate_mcp_arg"
+      ],
+      "medianMs": 18,
+      "nodes": 5,
+      "confidence": "exact",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:validate_mcp_list_arg",
+      "tokens": 161
+    },
+    {
+      "id": "L4",
+      "category": "literal",
+      "query": "parseSnippetsResult",
+      "expect": [
+        "parseSnippetsResult",
+        "parse.ts"
+      ],
+      "medianMs": 20,
+      "nodes": 5,
+      "confidence": "exact",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:parseSnippetsResult",
+      "tokens": 167
+    },
+    {
+      "id": "L5",
+      "category": "literal",
+      "query": "snippet_line_cap kind aware line ceiling",
+      "expect": [
+        "snippet_line_cap"
+      ],
+      "medianMs": 35,
+      "nodes": 6,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:snippet_line_cap",
+      "tokens": 200
+    },
+    {
+      "id": "L6",
+      "category": "literal",
+      "query": "ContextExplorerPanel",
+      "expect": [
+        "ContextExplorerPanel",
+        "contextExplorer"
+      ],
+      "medianMs": 18,
+      "nodes": 17,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "class:ContextExplorerPanel",
+      "tokens": 606
+    },
+    {
+      "id": "C1",
+      "category": "conceptual",
+      "query": "how are code snippets truncated to fit a token budget",
+      "expect": [
+        "get_snippets_body",
+        "token_budget",
+        "block_cost"
+      ],
+      "medianMs": 57,
+      "nodes": 74,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:token_budget_keeps_bfs_prefix_and_reports_cut",
+      "tokens": 1836
+    },
+    {
+      "id": "C2",
+      "category": "conceptual",
+      "query": "where is prompt injection defended in MCP output",
+      "expect": [
+        "sanitize",
+        "escape_tags",
+        "strip_control_chars",
+        "wrap_envelope"
+      ],
+      "medianMs": 37,
+      "nodes": 55,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 8,
+      "topSig": "fn:inline_approval_prompt",
+      "tokens": 1340
+    },
+    {
+      "id": "C3",
+      "category": "conceptual",
+      "query": "how does the extension add a definition into the AI context",
+      "expect": [
+        "pin",
+        "fetchSingleSnippet",
+        "contextExplorer"
+      ],
+      "medianMs": 42,
+      "nodes": 12,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 7,
+      "topSig": "fn:language_from_extension_covers_all_variants",
+      "tokens": 351
+    },
+    {
+      "id": "C4",
+      "category": "conceptual",
+      "query": "personalized pagerank seed selection from embeddings",
+      "expect": [
+        "ppr",
+        "embed_path_seeds",
+        "seed"
+      ],
+      "medianMs": 39,
+      "nodes": 55,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:ppr",
+      "tokens": 1467
+    },
+    {
+      "id": "C5",
+      "category": "conceptual",
+      "query": "avoid re-embedding nodes on every query cold start",
+      "expect": [
+        "embed",
+        "lazy",
+        "knn",
+        "reindex"
+      ],
+      "medianMs": 58,
+      "nodes": 64,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 3,
+      "topSig": "fn:normalize_nl_query",
+      "tokens": 1620
+    },
+    {
+      "id": "C6",
+      "category": "conceptual",
+      "query": "build an AST skeleton summary for a large function",
+      "expect": [
+        "skeleton",
+        "AstSkeleton",
+        "render"
+      ],
+      "medianMs": 57,
+      "nodes": 82,
+      "confidence": "exact",
+      "abstain": false,
+      "hitRank": 2,
+      "topSig": "fn:print_summary",
+      "tokens": 2113
+    },
+    {
+      "id": "C7",
+      "category": "conceptual",
+      "query": "knapsack token budget optimization for context selection",
+      "expect": [
+        "knapsack",
+        "context_candidates"
+      ],
+      "medianMs": 42,
+      "nodes": 59,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:knapsack",
+      "tokens": 1576
+    },
+    {
+      "id": "C8",
+      "category": "conceptual",
+      "query": "reject arguments that are too long or contain path traversal",
+      "expect": [
+        "validate_mcp_arg",
+        "MAX_ARG_BYTES",
+        "path traversal"
+      ],
+      "medianMs": 51,
+      "nodes": 101,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:try_new_rejects_too_long",
+      "tokens": 2552
+    },
+    {
+      "id": "X1",
+      "category": "cross",
+      "query": "how does a get_context query flow from the vscode panel to snippets",
+      "expect": [
+        "contextExplorer",
+        "get_context",
+        "get_snippets",
+        "drainQueryQueue"
+      ],
+      "medianMs": 46,
+      "nodes": 11,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:get_context",
+      "tokens": 353
+    },
+    {
+      "id": "X2",
+      "category": "cross",
+      "query": "kind aware extraction functions classes interfaces line limits",
+      "expect": [
+        "snippet_line_cap",
+        "snippet_for_node"
+      ],
+      "medianMs": 45,
+      "nodes": 14,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:snippet_line_cap",
+      "tokens": 376
+    },
+    {
+      "id": "N1",
+      "category": "nonsense",
+      "query": "quantum blockchain payment gateway subscription billing",
+      "expect": [],
+      "medianMs": 35,
+      "nodes": 28,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:extract_bearer",
+      "tokens": 760
+    },
+    {
+      "id": "N2",
+      "category": "nonsense",
+      "query": "recursive neural network crypto miner GPU scheduler",
+      "expect": [],
+      "medianMs": 50,
+      "nodes": 64,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:pcst_is_deterministic_on_tied_cost_topology",
+      "tokens": 1670
+    },
+    {
+      "id": "N3",
+      "category": "nonsense",
+      "query": "kubernetes pod autoscaler horizontal replica controller",
+      "expect": [],
+      "medianMs": 39,
+      "nodes": 20,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:Daemon.run",
+      "tokens": 588
+    }
+  ],
+  "perfSweep": {
+    "500": {
+      "medianMs": 42,
+      "p95Ms": 44
+    },
+    "2000": {
+      "medianMs": 41,
+      "p95Ms": 42
+    },
+    "4000": {
+      "medianMs": 42,
+      "p95Ms": 42
+    },
+    "8000": {
+      "medianMs": 41,
+      "p95Ms": 42
+    }
+  },
+  "snippetModes": {
+    "small_fn": {
+      "auto": {
+        "medianMs": 2,
+        "bytes": 1400,
+        "tokens": 350
+      },
+      "full": {
+        "medianMs": 2,
+        "bytes": 1400,
+        "tokens": 350
+      },
+      "skeleton": {
+        "medianMs": 28,
+        "bytes": 1324,
+        "tokens": 331
+      }
+    },
+    "large_fn": {
+      "auto": {
+        "medianMs": 28,
+        "bytes": 2079,
+        "tokens": 520
+      },
+      "full": {
+        "medianMs": 2,
+        "bytes": 23856,
+        "tokens": 5964
+      },
+      "skeleton": {
+        "medianMs": 29,
+        "bytes": 2079,
+        "tokens": 520
+      }
+    },
+    "class": {
+      "auto": {
+        "medianMs": 4,
+        "bytes": 643,
+        "tokens": 161
+      },
+      "full": {
+        "medianMs": 2,
+        "bytes": 9262,
+        "tokens": 2316
+      },
+      "skeleton": {
+        "medianMs": 4,
+        "bytes": 643,
+        "tokens": 161
+      }
+    }
+  }
+}

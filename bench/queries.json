@@ -1,0 +1,27 @@
+{
+  "_comment": "Labeled query set for get_context correctness/usefulness benchmarking on the Travsr repo itself. category: literal (exact symbol exists), conceptual (NL, no literal symbol match), cross (spans files), nonsense (should abstain). expect: substrings; a result HITS if any returned node sig OR path contains any expect entry (case-insensitive).",
+  "queries": [
+    { "id": "L1", "category": "literal", "query": "get_context_body", "expect": ["get_context_body"], "note": "core retrieval assembler" },
+    { "id": "L2", "category": "literal", "query": "SnippetMode enum full skeleton auto", "expect": ["SnippetMode", "snippet_for_node_full"], "note": "the new mode feature" },
+    { "id": "L3", "category": "literal", "query": "validate_mcp_list_arg", "expect": ["validate_mcp_list_arg", "validate_mcp_arg"], "note": "list-arg validator we added" },
+    { "id": "L4", "category": "literal", "query": "parseSnippetsResult", "expect": ["parseSnippetsResult", "parse.ts"], "note": "TS parser with the skeleton bug fix" },
+    { "id": "L5", "category": "literal", "query": "snippet_line_cap kind aware line ceiling", "expect": ["snippet_line_cap"], "note": "per-kind cap" },
+    { "id": "L6", "category": "literal", "query": "ContextExplorerPanel", "expect": ["ContextExplorerPanel", "contextExplorer"], "note": "vscode webview panel" },
+
+    { "id": "C1", "category": "conceptual", "query": "how are code snippets truncated to fit a token budget", "expect": ["get_snippets_body", "token_budget", "block_cost"], "note": "budget accumulation loop" },
+    { "id": "C2", "category": "conceptual", "query": "where is prompt injection defended in MCP output", "expect": ["sanitize", "escape_tags", "strip_control_chars", "wrap_envelope"], "note": "SEC-001 sanitizer" },
+    { "id": "C3", "category": "conceptual", "query": "how does the extension add a definition into the AI context", "expect": ["pin", "fetchSingleSnippet", "contextExplorer"], "note": "the pin feature" },
+    { "id": "C4", "category": "conceptual", "query": "personalized pagerank seed selection from embeddings", "expect": ["ppr", "embed_path_seeds", "seed"], "note": "PPR + KNN seeds" },
+    { "id": "C5", "category": "conceptual", "query": "avoid re-embedding nodes on every query cold start", "expect": ["embed", "lazy", "knn", "reindex"], "note": "embed KNN latency fix area" },
+    { "id": "C6", "category": "conceptual", "query": "build an AST skeleton summary for a large function", "expect": ["skeleton", "AstSkeleton", "render"], "note": "skeleton generation" },
+    { "id": "C7", "category": "conceptual", "query": "knapsack token budget optimization for context selection", "expect": ["knapsack", "context_candidates"], "note": "retrieval knapsack" },
+    { "id": "C8", "category": "conceptual", "query": "reject arguments that are too long or contain path traversal", "expect": ["validate_mcp_arg", "MAX_ARG_BYTES", "path traversal"], "note": "SEC-002 validator" },
+
+    { "id": "X1", "category": "cross", "query": "how does a get_context query flow from the vscode panel to snippets", "expect": ["contextExplorer", "get_context", "get_snippets", "drainQueryQueue"], "note": "cross-file data flow" },
+    { "id": "X2", "category": "cross", "query": "kind aware extraction functions classes interfaces line limits", "expect": ["snippet_line_cap", "snippet_for_node"], "note": "cross snippet.rs" },
+
+    { "id": "N1", "category": "nonsense", "query": "quantum blockchain payment gateway subscription billing", "expect": [], "note": "must abstain — no such domain here" },
+    { "id": "N2", "category": "nonsense", "query": "recursive neural network crypto miner GPU scheduler", "expect": [], "note": "must abstain" },
+    { "id": "N3", "category": "nonsense", "query": "kubernetes pod autoscaler horizontal replica controller", "expect": [], "note": "must abstain — not this repo's domain" }
+  ]
+}
