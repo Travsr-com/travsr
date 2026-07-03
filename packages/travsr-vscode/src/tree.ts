@@ -71,6 +71,11 @@ export class TravsrTreeDataProvider
   private depCache: EntryNode[] | undefined;
   private callerCache: EntryNode[] | undefined;
   private selectionDebounce: ReturnType<typeof setTimeout> | undefined;
+  // Incremented on every new selection; guards against stale in-flight loadCallers
+  // resolving after a newer symbol was already selected.
+  // DEBT(travsr-322): add true cancellation via JSON-RPC $/cancelRequest once
+  // StdioMcpClient exposes an AbortSignal-aware callTool overload.
+  private callerGen = 0;
 
   constructor(
     private readonly mcp: McpClient,
@@ -103,10 +108,11 @@ export class TravsrTreeDataProvider
         if (!sym || sym === this.activeSymbol) return;
         this.activeSymbol = sym;
         this.callerCache = undefined;
+        this.callerGen++;
         if (this.selectionDebounce) clearTimeout(this.selectionDebounce);
         this.selectionDebounce = setTimeout(() => {
           this._onDidChangeTreeData.fire();
-        }, 300);
+        }, 500);
       }),
 
       { dispose: () => { clearTimeout(this.selectionDebounce); this._onDidChangeTreeData.dispose(); } }
@@ -117,6 +123,7 @@ export class TravsrTreeDataProvider
   refresh(): void {
     this.depCache = undefined;
     this.callerCache = undefined;
+    this.callerGen++;
     this._onDidChangeTreeData.fire();
   }
 
@@ -144,7 +151,12 @@ export class TravsrTreeDataProvider
       return [new PlaceholderNode("Move cursor to a symbol")];
     }
     if (!this.callerCache) {
-      this.callerCache = await this.loadCallers(this.activeSymbol);
+      const gen = this.callerGen;
+      const fresh = await this.loadCallers(this.activeSymbol);
+      // A newer selection superseded this in-flight fetch — discard the stale
+      // result. VS Code will call getChildren again after the next fire().
+      if (gen !== this.callerGen) return [];
+      this.callerCache = fresh;
     }
     return this.callerCache.length > 0
       ? this.callerCache

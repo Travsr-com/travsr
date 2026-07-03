@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use petgraph::algo::dijkstra;
+use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{DiGraph, NodeIndex};
 use travsr_core::{Node, NodeId};
 use travsr_store::{SqliteStore, Store};
@@ -30,9 +30,6 @@ use crate::rbac::EdgeFilter;
 
 /// PCST penalty parameter λ (ADR-007). Controls node-exclusion penalty weight.
 const PCST_LAMBDA: f32 = 0.5;
-
-/// Hard wall-clock timeout for the PCST pass. On expiry, falls back to BFS.
-const PCST_TIMEOUT_MS: u128 = 80;
 
 /// Maximum nodes in the local subgraph built by the bidirectional BFS expansion.
 const MAX_LOCAL_NODES: usize = 2_000;
@@ -72,17 +69,17 @@ pub fn pcst_path(
         return Ok(vec![source_node]);
     }
 
-    // Build local subgraph via bidirectional BFS expansion.
+    // Build local subgraph via bidirectional BFS expansion. Expansion is
+    // self-bounded: `expand_local_subgraph` stops at `MAX_LOCAL_NODES` node
+    // pops, so the cost of everything below is bounded regardless of fan-out.
+    // We deliberately do NOT gate the rest of the function on a wall-clock
+    // budget here: such a check can only fire *after* expansion has already
+    // completed (it cannot interrupt the work it nominally guards), so its sole
+    // effect would be to discard a complete, bounded subgraph and fall back to
+    // a strictly-less-informative BFS whenever the machine is briefly loaded —
+    // making the result nondeterministic. dijkstra/astar over a ≤2000-node
+    // subgraph is microsecond-scale and needs no separate time budget.
     let local = expand_local_subgraph(store, source, sink, filter, EXPAND_DEPTH);
-
-    if start.elapsed().as_millis() > PCST_TIMEOUT_MS {
-        tracing::warn!(
-            src = source.0,
-            sink = sink.0,
-            "pcst: local expansion timed out — falling back to BFS"
-        );
-        return bfs_fallback(store, source, filter, token_budget);
-    }
 
     // Build petgraph from local subgraph.
     let (graph, node_to_idx, idx_to_node) = build_graph(&local.nodes, &local.edges);
@@ -95,9 +92,25 @@ pub fn pcst_path(
     };
 
     // Dijkstra from source: cost = 1.0 - ppr_weight (lower = more traversable).
-    let costs = dijkstra(&graph, src_idx, Some(dst_idx), |e| *e.weight());
+    // Determinism: pass `None` as the goal so the FULL local component settles.
+    // With an early-exit goal, zero-cost ref/call edges leave many nodes tied
+    // at cost 0 and WHICH of them settle before the sink varies with HashMap
+    // iteration order run-to-run. The component is capped at MAX_LOCAL_NODES
+    // (2000), so settling the full component is cheap.
+    let costs = dijkstra(&graph, src_idx, None, |e| *e.weight());
 
-    let Some(&total_cost) = costs.get(&dst_idx) else {
+    // Reconstruct the actual source→sink route. The route must LEAD the result:
+    // downstream consumers truncate (token budget here, 4 KiB sanitizer at the
+    // MCP boundary), and ref/call edges cost 0 (ppr_weight 1.0) so the λ
+    // threshold can admit the source's whole zero-cost component — a sink
+    // appended after that blob would be cut off every time.
+    let Some((total_cost, route)) = astar(
+        &graph,
+        src_idx,
+        |idx| idx == dst_idx,
+        |e| *e.weight(),
+        |_| 0.0,
+    ) else {
         tracing::debug!(
             src = source.0,
             sink = sink.0,
@@ -106,27 +119,24 @@ pub fn pcst_path(
         return bfs_fallback(store, source, filter, token_budget);
     };
 
-    if start.elapsed().as_millis() > PCST_TIMEOUT_MS {
-        tracing::warn!(
-            src = source.0,
-            sink = sink.0,
-            "pcst: Dijkstra timed out — falling back to BFS"
-        );
-        return bfs_fallback(store, source, filter, token_budget);
-    }
+    // Route nodes first, in traversal order (source → … → sink).
+    let mut result_ids: Vec<NodeId> = route
+        .iter()
+        .filter_map(|idx| idx_to_node.get(idx).copied())
+        .collect();
+    let on_route: HashSet<NodeId> = result_ids.iter().copied().collect();
 
-    // Include nodes whose cheapest-path cost is within λ × total_cost of optimal.
+    // Then context: nodes whose cheapest-path cost is within λ × total_cost of
+    // optimal, cheapest first (deterministic — `costs` is a HashMap).
     let threshold = total_cost * (1.0 + PCST_LAMBDA);
-    let mut result_ids: Vec<NodeId> = costs
+    let mut context: Vec<(f32, NodeId)> = costs
         .iter()
         .filter(|(_, &c)| c <= threshold)
-        .filter_map(|(idx, _)| idx_to_node.get(idx).copied())
+        .filter_map(|(idx, &c)| idx_to_node.get(idx).map(|&id| (c, id)))
+        .filter(|(_, id)| !on_route.contains(id))
         .collect();
-
-    // Always include sink if reachable.
-    if !result_ids.contains(&sink) {
-        result_ids.push(sink);
-    }
+    context.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
+    result_ids.extend(context.into_iter().map(|(_, id)| id));
 
     // Retrieve nodes, apply token budget.
     let mut result = Vec::new();
@@ -193,9 +203,25 @@ fn expand_local_subgraph(
     rev_queue.push_back((sink, 0));
     rev_visited.insert(sink);
 
+    // Seed both endpoints upfront: on high-fanout graphs the forward pass can
+    // exhaust the node budget before the reverse pass runs, and the sink must
+    // never be starved out of the local graph (it would force a BFS fallback
+    // even when a direct edge exists).
+    for endpoint in [source, sink] {
+        if let Ok(Some(node)) = store.get_node(endpoint) {
+            if filter.allow(endpoint, endpoint, Some(node.vname.corpus.as_str())) {
+                nodes.entry(endpoint).or_insert(node);
+            }
+        }
+    }
+
+    // The forward pass may consume at most half the node budget so the
+    // reverse pass always has room to connect the sink side.
+    let fwd_cap = MAX_LOCAL_NODES / 2;
+
     // Forward BFS from source: follow outgoing edges.
     while let Some((current, depth)) = fwd_queue.pop_front() {
-        if nodes.len() >= MAX_LOCAL_NODES {
+        if nodes.len() >= fwd_cap {
             break;
         }
         if let Ok(Some(node)) = store.get_node(current) {
@@ -295,7 +321,13 @@ fn build_graph(
     let mut node_to_idx: HashMap<NodeId, NodeIndex> = HashMap::new();
     let mut idx_to_node: HashMap<NodeIndex, NodeId> = HashMap::new();
 
-    for &id in nodes.keys() {
+    // Determinism: insert nodes in sorted NodeId order. HashMap key order
+    // varies run-to-run, and NodeIndex assignment order is astar's implicit
+    // tie-breaker among equal-cost routes — unsorted insertion makes the
+    // chosen route nondeterministic on tied-cost topologies.
+    let mut ids: Vec<NodeId> = nodes.keys().copied().collect();
+    ids.sort_by_key(|id| id.0);
+    for id in ids {
         let idx = graph.add_node(id);
         node_to_idx.insert(id, idx);
         idx_to_node.insert(idx, id);
@@ -438,6 +470,41 @@ mod tests {
     }
 
     #[test]
+    fn pcst_high_fanout_source_does_not_starve_sink() {
+        // Regression (#317): source with fanout larger than the local-node
+        // budget plus a direct edge to the sink. The forward pass used to
+        // consume the whole budget, the sink never entered the local graph,
+        // and PCST silently fell back to BFS instead of returning the
+        // one-hop path.
+        let src = node("src.rs", "fn:src");
+        let sink = node("sink.rs", "fn:sink");
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&src).unwrap();
+        store.put_node(&sink).unwrap();
+        for i in 0..(MAX_LOCAL_NODES + 10) {
+            let filler = node(&format!("filler{i}.rs"), &format!("fn:filler{i}"));
+            store.put_node(&filler).unwrap();
+            store
+                .put_edge(&Edge::new(src.id, filler.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        store
+            .put_edge(&Edge::new(src.id, sink.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let result = pcst_path(&store, src.id, sink.id, &OpenFilter, 1 << 20).unwrap();
+        let ids: Vec<_> = result.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&src.id), "source must be in path");
+        assert!(ids.contains(&sink.id), "sink must be in path");
+        // Regression (#317): ref/call edges cost 0, so the λ threshold admits
+        // the entire zero-cost component. The route must lead the result —
+        // consumers truncate output, and a sink buried after thousands of
+        // context nodes is as bad as no sink at all.
+        assert_eq!(ids[0], src.id, "route must start at source");
+        assert_eq!(ids[1], sink.id, "direct route must place sink second");
+    }
+
+    #[test]
     fn pcst_respects_rbac_filter() {
         use crate::rbac::RbacFilter;
 
@@ -489,5 +556,45 @@ mod tests {
         // but they would produce non-simple graphs that violate the PCST model).
         let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), unique_ids.len(), "no duplicate nodes in result");
+    }
+
+    #[test]
+    fn pcst_is_deterministic_on_tied_cost_topology() {
+        // Diamond with zero-cost ref/call edges: A→B→D and A→C→D both cost 0,
+        // so route selection ties and the λ threshold admits the whole
+        // component. Before sorting node insertion in build_graph and settling
+        // the full component in Dijkstra (no early-exit goal), the output
+        // order varied run-to-run with HashMap iteration order.
+        let a = node("a.rs", "fn:a");
+        let b = node("b.rs", "fn:b");
+        let c = node("c.rs", "fn:c");
+        let d = node("d.rs", "fn:d");
+        let nodes = [a.clone(), b.clone(), c.clone(), d.clone()];
+        let edges = [
+            (a.id, b.id, EdgeKind::RefCall),
+            (a.id, c.id, EdgeKind::RefCall),
+            (b.id, d.id, EdgeKind::RefCall),
+            (c.id, d.id, EdgeKind::RefCall),
+        ];
+
+        // Fresh store per run: rebuilds all in-memory state so any
+        // HashMap-iteration-order nondeterminism gets a chance to surface.
+        let run = || {
+            let store = store_with(&nodes, &edges);
+            pcst_path(&store, a.id, d.id, &OpenFilter, 4096)
+                .unwrap()
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>()
+        };
+
+        let first = run();
+        let second = run();
+        assert_eq!(
+            first, second,
+            "pcst_path must return identical node order across runs"
+        );
+        assert_eq!(first[0], a.id, "route must start at source");
+        assert!(first.contains(&d.id), "sink must be in result");
     }
 }

@@ -16,11 +16,14 @@ import {
 } from "./codelens";
 import { CallersHoverProvider, HOVER_SELECTOR } from "./hover";
 import { TravsrTreeDataProvider } from "./tree";
+import { TravsrRepoFileTreeProvider } from "./repoFileTree";
 import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
 import { GraphPanel } from "./graph";
 import {
   installBinary,
   checkOnPath,
+  hasCmdShimOnPath,
+  assertExecutableBinary,
   resolveInstallDir,
   resolveInstallPath,
   DOWNLOAD_VERSION,
@@ -33,7 +36,7 @@ import {
   EVT_DAEMON_FAILED,
 } from "./telemetry";
 import { registerContextProvider } from "./contextProvider";
-import { registerParityCommands } from "./commands";
+import { registerParityCommands, refreshOpenPanels } from "./commands";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -97,7 +100,15 @@ export function activate(context: vscode.ExtensionContext): void {
       void doRestart(proxy, context, workspaceRoot, version, channel, onDaemonFailed).then(() => {
         restartInProgress = false;
         void vscode.window.showInformationMessage("Travsr: graph initialized — daemon reconnected.");
+        refreshOpenPanels();
       });
+    });
+    // External `travsr init` updates graph.db in-place — refresh panels without restarting.
+    dbWatcher.onDidChange(() => {
+      codeLensProvider.clearCache();
+      hoverProvider.clearCache();
+      treeProvider.refresh();
+      refreshOpenPanels();
     });
     context.subscriptions.push(dbWatcher);
   }
@@ -134,12 +145,53 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  // Repo Files tree view — sidebar file browser; click → open Travsr Graph
+  const repoFileTreeProvider = new TravsrRepoFileTreeProvider(proxy);
+  context.subscriptions.push(
+    vscode.window.createTreeView("travsrRepoFiles", {
+      treeDataProvider: repoFileTreeProvider,
+      showCollapseAll: true,
+    })
+  );
+
+  const openFileGraph = (relPath: string) => {
+    const panel = GraphPanel.show(proxy, context);
+    void panel.query(relPath);
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("travsr.refreshRepoFiles", () => {
+      repoFileTreeProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand(
+      "travsr.openFileGraph",
+      (relPath: string) => openFileGraph(relPath)
+    ),
+
+    vscode.commands.registerCommand("travsr.searchRepoFile", () => {
+      void repoFileTreeProvider.search(openFileGraph);
+    })
+  );
+
   // Clear caches on save so providers re-query fresh data
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(() => {
       codeLensProvider.clearCache();
       hoverProvider.clearCache();
       treeProvider.refresh();
+      repoFileTreeProvider.refresh();
+    })
+  );
+
+  // Clear caches after daemon reconnect (binary install, restart, graph.db swap)
+  // so the code lens and hover counts reflect the new graph immediately.
+  context.subscriptions.push(
+    proxy.onReconnect(() => {
+      codeLensProvider.clearCache();
+      hoverProvider.clearCache();
+      treeProvider.refresh();
+      repoFileTreeProvider.refresh();
     })
   );
 
@@ -240,19 +292,99 @@ export function activate(context: vscode.ExtensionContext): void {
           "travsrBlastRadius",
           `Blast radius — ${file}`,
           vscode.ViewColumn.Beside,
-          { localResourceRoots: [] }
+          { localResourceRoots: [], enableScripts: true }
         );
-        panel.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:16px">Loading…</body></html>`;
-        const actualFiles =
-          files ??
-          (await proxy.callTool("get_blast_radius", { file }))
-            .split("\n")
-            .map((l) => l.trim())
-            .filter(Boolean);
-        if (!panel.visible && files === undefined) return;
+
         panel.webview.html = buildFileListHtml(
           `Blast radius for <code>${escHtml(file)}</code>`,
-          actualFiles
+          [],
+          { mode: "tree-sitter", semanticAvailable: false, installHint: "", loading: true }
+        );
+
+        // Fetch lang status and initial blast radius in parallel.
+        const [langStatusRaw, initialFiles] = await Promise.all([
+          proxy.callTool("get_lang_status", { file }).catch(() => null as string | null),
+          files
+            ? Promise.resolve(files)
+            : proxy
+                .callTool("get_blast_radius", { file, analysis: "tree-sitter" })
+                .then((r) => parseEnvelope(r))
+                .catch(() => [] as string[]),
+        ]);
+
+        if (!panel.visible && files === undefined) return;
+
+        interface LangStatus {
+          language: string;
+          builtin: boolean;
+          semantic_available: boolean;
+          install_hint: string;
+        }
+        let langStatus: LangStatus = {
+          language: "unknown",
+          builtin: false,
+          semantic_available: false,
+          install_hint: "",
+        };
+        try {
+          if (langStatusRaw) {
+            langStatus = JSON.parse(langStatusRaw) as LangStatus;
+          }
+        } catch {
+          // malformed JSON: keep safe defaults
+        }
+
+        type AnalysisMode = "tree-sitter" | "semantic";
+        let currentMode: AnalysisMode = "tree-sitter";
+        let currentFiles = initialFiles;
+
+        function render(): void {
+          panel.webview.html = buildFileListHtml(
+            `Blast radius for <code>${escHtml(file)}</code>`,
+            currentFiles,
+            {
+              mode: currentMode,
+              semanticAvailable: langStatus.semantic_available,
+              installHint: langStatus.install_hint,
+              loading: false,
+            }
+          );
+        }
+
+        render();
+
+        panel.webview.onDidReceiveMessage(
+          async (msg: { command: string; mode?: AnalysisMode }) => {
+            if (msg.command !== "setMode" || !msg.mode) return;
+            if (msg.mode === currentMode) return;
+            if (msg.mode === "semantic" && !langStatus.semantic_available) return;
+
+            currentMode = msg.mode;
+            panel.webview.html = buildFileListHtml(
+              `Blast radius for <code>${escHtml(file)}</code>`,
+              currentFiles,
+              {
+                mode: currentMode,
+                semanticAvailable: langStatus.semantic_available,
+                installHint: langStatus.install_hint,
+                loading: true,
+              }
+            );
+
+            try {
+              const raw = await proxy.callTool("get_blast_radius", {
+                file,
+                analysis: currentMode,
+              });
+              currentFiles = parseEnvelope(raw);
+            } catch {
+              currentFiles = [];
+            }
+
+            if (panel.visible) render();
+          },
+          undefined,
+          context.subscriptions
         );
       }
     )
@@ -263,10 +395,7 @@ export function activate(context: vscode.ExtensionContext): void {
       "travsr.showCallers",
       async (symbol: string) => {
         const raw = await proxy.callTool("get_callers", { symbol });
-        const lines = raw
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
+        const lines = parseEnvelope(raw);
         const panel = vscode.window.createWebviewPanel(
           "travsrCallers",
           `Callers — ${symbol}`,
@@ -307,14 +436,23 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // CLI↔UI parity commands (VSCODE-247): askSymbol, manageSynonyms,
   // showDependencies, showExecutionPath, showRepos, showGraphStats, showLanguages.
-  registerParityCommands(proxy, context, binary);
+  registerParityCommands(proxy, context, binary, () => {
+    codeLensProvider.clearCache();
+    hoverProvider.clearCache();
+    treeProvider.refresh();
+  });
 
   // Re-index command — also reachable from the status Quick Pick. Lives here
   // (not commands.ts) because it needs the output channel + workspace root.
   context.subscriptions.push(
-    vscode.commands.registerCommand("travsr.reindexNow", () =>
-      reindexNow(workspaceRoot, channel)
-    )
+    vscode.commands.registerCommand("travsr.reindexNow", async () => {
+      await reindexNow(workspaceRoot, channel);
+      // Graph has changed — evict stale counts and refresh all open panels.
+      codeLensProvider.clearCache();
+      hoverProvider.clearCache();
+      treeProvider.refresh();
+      refreshOpenPanels();
+    })
   );
 
   // Manual download command — also reachable from the command palette
@@ -366,8 +504,12 @@ async function checkBinaryAndPrompt(
   if (checkOnPath("travsr")) return;
 
   // 4. Binary not found anywhere — prompt once.
+  const isCmdOnly = process.platform === "win32" && hasCmdShimOnPath("travsr");
+  const promptMsg = isCmdOnly
+    ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary — Download v${DOWNLOAD_VERSION}?`
+    : `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`;
   const choice = await vscode.window.showInformationMessage(
-    `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`,
+    promptMsg,
     "Download",
     "Dismiss"
   );
@@ -480,10 +622,11 @@ function wireDisconnectHandler(
 // here because it needs the output channel + workspace root.
 
 /**
- * VSCODE-247 #8: trigger a re-index. The MCP server cannot reindex itself
- * without inverting the `travsr-mcp → travsr-retrieval` crate dependency rule
- * (indexing lives in travsr-daemon), so we spawn the binary's `hook-run` — the
- * same code path the git hook uses — as a one-shot child process.
+ * VSCODE-247 #8: trigger a full re-index including Phase B semantic analysis.
+ * Runs `travsr init` which walks all files, runs LSIF, and invokes any
+ * registered Phase B language plugins — identical to what the user gets from
+ * the terminal. This is required after installing a new language plugin so the
+ * new semantic edges appear in the graph.
  */
 async function reindexNow(
   workspaceRoot: string | undefined,
@@ -497,6 +640,15 @@ async function reindexNow(
     vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
   const binary = configured || "travsr";
 
+  if (configured) {
+    try {
+      assertExecutableBinary(configured);
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Travsr: invalid binaryPath — ${(e as Error).message}`);
+      return;
+    }
+  }
+
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -505,7 +657,10 @@ async function reindexNow(
     },
     () =>
       new Promise<void>((resolve) => {
-        const proc = cp.spawn(binary, ["hook-run", "--from-hook"], { cwd: workspaceRoot });
+        const proc = cp.spawn(binary, ["init"], {
+          cwd: workspaceRoot,
+          env: { ...process.env, TERM: "dumb", NO_COLOR: "1" },
+        });
         proc.stdout?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
         proc.stderr?.on("data", (d: Buffer) => channel.appendLine(d.toString().trimEnd()));
         const fail = (msg: string): void => {
@@ -529,16 +684,118 @@ async function reindexNow(
   );
 }
 
-function buildFileListHtml(title: string, items: string[]): string {
-  const rows = items
-    .map(
-      (f) =>
-        `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`
-    )
-    .join("\n");
-  return `<!DOCTYPE html><html><body style="padding:16px">
+interface FileListOpts {
+  mode: "tree-sitter" | "semantic";
+  semanticAvailable: boolean;
+  installHint: string;
+  loading?: boolean;
+}
+
+/** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
+export function parseEnvelope(raw: string): string[] {
+  const inner = raw
+    .replace(/^<travsr-data>\n?/, "")
+    .replace(/\n?<\/travsr-data>$/, "");
+  return inner.split("\n").map((l) => l.trim()).filter(Boolean);
+}
+
+export function buildFileListHtml(
+  title: string,
+  items: string[],
+  opts?: FileListOpts
+): string {
+  // When opts is absent (showCallers / legacy callers) render a plain list —
+  // no toggle bar, no scripts. This keeps every existing caller working unchanged.
+  if (!opts) {
+    const rows = items
+      .map((f) => `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`)
+      .join("\n");
+    return `<!DOCTYPE html><html><body style="padding:16px">
 <h3>${title}</h3>
 <ul style="margin:0;padding-left:20px">${rows || "<li><em>none</em></li>"}</ul>
+</body></html>`;
+  }
+
+  const { mode, semanticAvailable, installHint, loading = false } = opts;
+
+  const pillBase =
+    "display:inline-block;padding:4px 14px;border-radius:20px;font-size:12px;" +
+    "font-family:var(--vscode-font-family,'Segoe UI',system-ui,sans-serif);" +
+    "cursor:pointer;border:none;transition:background 120ms;";
+  const activeStyle   = `${pillBase}background:#0078d4;color:#fff;font-weight:600;`;
+  const inactiveStyle = `${pillBase}background:#3c3c3c;color:#ccc;`;
+  const disabledStyle = `${pillBase}background:#555;color:#888;cursor:not-allowed;opacity:0.6;`;
+
+  const tsPill = `<button id="pill-ts"
+    style="${mode === "tree-sitter" ? activeStyle : inactiveStyle}"
+    onclick="setMode('tree-sitter')"
+    title="Structural analysis — Tree-sitter import/call edges (always available)"
+    aria-pressed="${mode === "tree-sitter"}"
+  >Tree-sitter</button>`;
+
+  const semTooltip = semanticAvailable
+    ? "Semantic analysis — precise RefCall edges from SCIP/LSIF (Phase B)"
+    : installHint
+      ? `Semantic analysis not yet available. ${installHint}`
+      : "Semantic analysis not yet available for this language.";
+
+  const semPill = semanticAvailable
+    ? `<button id="pill-sem"
+        style="${mode === "semantic" ? activeStyle : inactiveStyle}"
+        onclick="setMode('semantic')"
+        title="${escHtml(semTooltip)}"
+        aria-pressed="${mode === "semantic"}"
+      >Semantic</button>`
+    : `<button id="pill-sem"
+        style="${disabledStyle}"
+        disabled
+        title="${escHtml(semTooltip)}"
+        aria-pressed="false"
+        onclick="showInstallHint()"
+      >Semantic ▾</button>`;
+
+  const installHintHtml = installHint
+    ? `<div id="install-hint" style="display:none;margin-top:8px;padding:8px 12px;` +
+      `background:#2d2d00;border:1px solid #888600;border-radius:6px;` +
+      `font-size:12px;color:#e0c060;font-family:monospace;">${escHtml(installHint)}</div>`
+    : "";
+
+  const toggleBar = `
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+  <span style="font-size:11px;color:#999;margin-right:4px;">Analysis:</span>
+  ${tsPill}
+  ${semPill}
+</div>
+${installHintHtml}`;
+
+  const bodyHtml = loading
+    ? `<p style="color:#aaa;font-style:italic;">Loading…</p>`
+    : `<ul style="margin:0;padding-left:20px">${
+        items
+          .map((f) => `<li style="font-family:monospace;padding:2px 0">${escHtml(f)}</li>`)
+          .join("\n") || "<li><em>none</em></li>"
+      }</ul>`;
+
+  const script = `<script>
+    const vscode = acquireVsCodeApi();
+    function setMode(m) { vscode.postMessage({ command: 'setMode', mode: m }); }
+    function showInstallHint() {
+      const el = document.getElementById('install-hint');
+      if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    }
+  </script>`;
+
+  return `<!DOCTYPE html><html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+</head>
+<body style="background:#1e1e1e;color:#d4d4d4;font-family:var(--vscode-font-family,'Segoe UI',system-ui,sans-serif);padding:16px;font-size:13px">
+  <h3 style="margin:0 0 12px">${title}</h3>
+  ${toggleBar}
+  ${bodyHtml}
+  ${script}
 </body></html>`;
 }
 

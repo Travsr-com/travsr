@@ -147,6 +147,17 @@ impl MigrationRunner {
         self.migrations.push(Box::new(migration));
     }
 
+    /// The highest registered migration version — i.e. the schema version a
+    /// fully migrated store reports. Used by read-only opens to verify
+    /// compatibility without running the (write-path) runner.
+    pub fn latest_version(&self) -> u32 {
+        self.migrations
+            .iter()
+            .map(|m| m.version())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Apply all pending migrations to `store`.
     ///
     /// Migrations whose `version()` is already recorded in meta are skipped.

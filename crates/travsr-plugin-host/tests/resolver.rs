@@ -236,6 +236,7 @@ fn plugin_spec_standard_policy_is_deny_network() {
             repo.path(),
             scratch.path(),
             &spec.policy,
+            "rust",
         );
 
         match result {
@@ -261,6 +262,7 @@ fn plugin_spec_standard_policy_is_deny_network() {
             repo.path(),
             scratch.path(),
             &spec.policy,
+            "rust",
         );
         assert!(
             result.is_err(),
@@ -289,6 +291,15 @@ fn catalog_all_external_entries_have_provider_binary() {
                 assert!(
                     entry.provider_binary.is_some(),
                     "Standard external language '{}' must have a provider_binary. \
+                     Add `provider_binary: Some(\"travsr-lang-{}\")` to its CATALOG entry.",
+                    entry.language,
+                    entry.language,
+                );
+            }
+            SandboxRequirement::NativeIpc => {
+                assert!(
+                    entry.provider_binary.is_some(),
+                    "NativeIpc external language '{}' must have a provider_binary. \
                      Add `provider_binary: Some(\"travsr-lang-{}\")` to its CATALOG entry.",
                     entry.language,
                     entry.language,
@@ -354,6 +365,8 @@ fn corpus_flows_into_invoke_request() {
     let req = InvokeRequest {
         root: repo_root.path().to_path_buf(),
         corpus: indexer.corpus.clone(),
+        scratch: std::path::PathBuf::default(),
+        files: None,
     };
 
     assert_eq!(

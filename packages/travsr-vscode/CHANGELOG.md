@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.8.0] — 2026-06-11
+
+### Added
+
+- JavaScript and C# language selectors for codelens and hover providers.
+- Tree-sitter vs Semantic toggle in the blast radius webview.
+- Codelens and hover extended to all 13 indexed languages.
+
+### Fixed
+
+- Re-index triggering, Activity Bar panel refresh, and test regressions.
+- Stale language list after adding or removing a language.
+- Status bar `.travsr` file watcher picking up noise from terminal output.
+- MCP envelope object leaking into file path lists.
+- Blast radius depth slider and corpus auto-trust.
+- Update bundled binary reference to v0.9.0.
+
+## [0.7.0] — 2026-06-06
+
+### Added
+
+- Windows: `.exe`-only binary spawn with `assertExecutableBinary` path validation (WS1, PSE R5).
+
+### Fixed
+
+- `assertExecutableBinary` metacharacter regex incorrectly rejecting valid Windows paths.
+- Stale download URLs and `assertExecutableBinary` not called in `reindexNow`.
+- `showLanguages` using a binary path captured at activation time instead of the current resolved path.
+- Update bundled binary reference to v0.8.0.
+
+## [0.6.0] — 2026-06-04
+
+### Added
+
+- Visual graph UI panel (Cytoscape.js WebviewPanel) showing an interactive call graph for the active file (#245).
+- File graph view with kind filter, two-hop import traversal, and stable unique file node IDs.
+- Brand logo in graph panel titlebar.
+- Go-to-definition support: line numbers are now stored on graph nodes and returned by `get_callers` (#249).
+- Context provider (F4): push model with EventEmitter, KEYWORDS filter, and structured logging.
+- Builtin semantic badge shown for all built-in-indexed languages; init button and auto-reconnect added.
+
 ## [0.4.0] — 2026-05-27
 
 ### Added

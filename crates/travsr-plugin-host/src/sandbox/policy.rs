@@ -5,6 +5,11 @@ use thiserror::Error;
 pub enum SandboxPolicy {
     /// Default — applied to every Sidecar spawn.
     Standard,
+    /// For tools that require POSIX IPC (shm_open/mq_open) but not network access.
+    /// On macOS, sandbox-exec Seatbelt has no valid operation to permit mq_open, so
+    /// this policy skips sandbox-exec entirely and relies on ulimit resource caps.
+    /// On Linux, bwrap is used with --unshare-ipc omitted. No PSE approval required.
+    NativeIpc,
     /// Exception variant — requires PSE sign-off before implementation PR merges.
     Elevated {
         /// Explicit allowlist of hosts. No wildcards. No CIDR ranges.
@@ -20,6 +25,9 @@ pub enum SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn validate(&self) -> Result<(), SandboxUnavailable> {
+        if let Self::NativeIpc = self {
+            return Ok(());
+        }
         if let Self::Elevated {
             permitted_hosts,
             reason,

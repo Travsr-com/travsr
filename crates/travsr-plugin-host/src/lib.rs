@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // overridden only in sandbox/windows/ffi.rs (RFC-014 approved)
 //! travsr-plugin-host — owns the trust boundary between the daemon and plugins.
 //!
 //! The ONLY crate in the indexer tier that depends on travsr-plugin-protocol.
@@ -17,7 +17,7 @@ pub mod transport;
 pub mod trust;
 
 pub use dispatcher::Dispatcher;
-pub use indexer::PluginIndexer;
+pub use indexer::{PhaseBInputs, PhaseBOutcome, PluginIndexer};
 pub use phase_b::{
     lookup as lookup_phase_b, OutputFormat, PhaseBEntry, SandboxRequirement,
     CATALOG as PHASE_B_CATALOG,

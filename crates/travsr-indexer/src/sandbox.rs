@@ -166,6 +166,35 @@ fn build_sandboxed_command_impl(
     cmd.args(["--ro-bind-try", &rustup_dir, &rustup_dir]);
     cmd.args(["--ro-bind-try", &cargo_home, &cargo_home]);
 
+    // Python site-packages — needed by scip-python to find installed packages.
+    // `--ro-bind-try` silently skips paths that don't exist (Python not installed).
+    {
+        let py_path = |query: &str| {
+            std::process::Command::new("python3")
+                .args(["-c", query])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
+        };
+        for path in [
+            py_path("import sysconfig; print(sysconfig.get_path('purelib'))"),
+            py_path("import sysconfig; print(sysconfig.get_path('platlib'))"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            cmd.args(["--ro-bind-try", &path, &path]);
+        }
+    }
+
     // Kernel interfaces.
     cmd.args(["--proc", "/proc"]);
     cmd.args(["--dev", "/dev"]);
@@ -278,12 +307,14 @@ fn fallback(program: &str, args: &[&str], reason: &str) -> (Command, SandboxStat
 
 /// Produce a POSIX-shell-safe `'program' 'arg1' 'arg2'` string.
 /// Each token is wrapped in single quotes; embedded `'` is escaped as `'\''`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn shell_command(program: &str, args: &[&str]) -> String {
     let mut parts = vec![shell_quote(program)];
     parts.extend(args.iter().map(|a| shell_quote(a)));
     parts.join(" ")
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -330,6 +361,7 @@ mod tests {
         assert_eq!(cfg.mem_limit_bytes, 4 * 1024 * 1024 * 1024);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn shell_quote_handles_special_characters() {
         assert_eq!(shell_quote("hello"), "'hello'");
@@ -338,6 +370,7 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn shell_command_produces_valid_string() {
         let s = shell_command("echo", &["hello world", "it's fine"]);

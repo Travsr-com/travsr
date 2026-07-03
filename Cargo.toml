@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/travsr-error",
     "crates/travsr-core",
+    "crates/travsr-analysis",
+    "crates/travsr-ipc",
     "crates/travsr-plugin-protocol",
     "crates/travsr-plugin-sdk",
     "crates/travsr-plugin-host",
@@ -26,6 +28,8 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 travsr-error           = { path = "crates/travsr-error" }
+travsr-analysis        = { path = "crates/travsr-analysis" }
+travsr-ipc             = { path = "crates/travsr-ipc" }
 travsr-plugin-protocol = { path = "crates/travsr-plugin-protocol" }
 travsr-plugin-sdk      = { path = "crates/travsr-plugin-sdk" }
 travsr-plugin-host     = { path = "crates/travsr-plugin-host" }
@@ -47,26 +51,28 @@ sha2 = "0.11"
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 tempfile = "3"
-tree-sitter = "0.22"
-tree-sitter-typescript = "0.21"
-tree-sitter-rust = "0.21"
-tree-sitter-python = "0.21"
-tree-sitter-go = "0.21"
-tree-sitter-java   = "0.21"
-tree-sitter-kotlin = "0.3"
-tree-sitter-ruby    = "0.21"
-tree-sitter-c-sharp = "0.21"
-tree-sitter-php     = "0.22"
-tree-sitter-scala   = "0.22"
-tree-sitter-cpp     = "0.22"
-tree-sitter-c       = "0.21"
-# tree-sitter-swift: all available crates require tree-sitter ^0.21, conflicts with
-# workspace tree-sitter = "0.22". Blocked until a 0.22-compatible Swift grammar ships.
+streaming-iterator = "0.1"
+tree-sitter            = "0.26"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust       = "0.24"
+tree-sitter-python     = "0.25"
+tree-sitter-go         = "0.25"
+tree-sitter-java       = "0.23"
+tree-sitter-kotlin-ng  = "1.1"
+tree-sitter-ruby       = "0.23"
+tree-sitter-c-sharp    = "0.23"
+tree-sitter-php        = "0.24"
+tree-sitter-scala      = "0.26"
+tree-sitter-cpp        = "0.23"
+tree-sitter-c          = "0.24"
+tree-sitter-swift      = "0.7"
+tree-sitter-dart       = "0.2"
+tree-sitter-objc       = "3.0.2"
 walkdir = "2"
 ignore = "0.4"
 assert_cmd = "2"
 notify = "8"
-tabled = "0.20"
+tabled = "0.21"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
 petgraph = "0.6"
@@ -91,6 +97,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 indicatif = "0.17"
 dirs = "5"
 toml = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 scip      = "0.7"
 protobuf  = "3"
 

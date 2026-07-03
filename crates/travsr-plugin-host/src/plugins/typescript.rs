@@ -9,7 +9,7 @@ impl Plugin for TypeScriptPlugin {
         Language::TypeScript
     }
     fn extensions(&self) -> &[&str] {
-        &["ts", "tsx", "mts", "cts"]
+        &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]
     }
     fn supports_phase_b(&self) -> bool {
         true
@@ -54,27 +54,58 @@ impl Plugin for TypeScriptPlugin {
         }
     }
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        // travsr-lsif-ts must be on PATH (npm install -g travsr-lsif-ts)
+        // Convert pre-walked relative paths (P6 — #329) to (abs, vname) pairs for the extractor.
+        let files_owned: Option<Vec<(std::path::PathBuf, String)>> = req
+            .files
+            .as_ref()
+            .map(|rel| rel.iter().map(|r| (req.root.join(r), r.clone())).collect());
+
+        // Native Phase B: always runs, zero external-tool requirements.
+        let (mut nodes, mut edges) = travsr_indexer::phase_b_native_typescript(
+            &req.corpus,
+            &req.root,
+            files_owned.as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("ts native phase_b: {e}");
+            (vec![], vec![])
+        });
+        tracing::debug!(
+            nodes = nodes.len(),
+            edges = edges.len(),
+            "ts native phase_b complete"
+        );
+
+        // LSIF enrichment: merge higher-fidelity edges when travsr-lsif-ts is available.
         let tsconfig = req.root.join("tsconfig.json");
-        if !tsconfig.exists() {
-            tracing::info!("ts phase_b: no tsconfig.json in {}", req.root.display());
-            return InvokeResponse::default();
-        }
-        match travsr_indexer::run_lsif_emitter(&tsconfig) {
-            Ok(dump) => match travsr_indexer::ingest_lsif(&dump, &req.corpus) {
-                Ok(lsif_out) => InvokeResponse {
-                    nodes: lsif_out.nodes,
-                    edges: lsif_out.edges,
+        if tsconfig.exists() {
+            match travsr_indexer::run_lsif_emitter(&tsconfig) {
+                Ok(dump) => match travsr_indexer::ingest_lsif(&dump, &req.corpus) {
+                    Ok(lsif_out) => {
+                        tracing::debug!(
+                            nodes = lsif_out.nodes.len(),
+                            edges = lsif_out.edges.len(),
+                            "ts lsif enrichment merged"
+                        );
+                        nodes.extend(lsif_out.nodes);
+                        edges.extend(lsif_out.edges);
+                    }
+                    Err(e) => tracing::warn!("ts lsif ingest: {e}"),
                 },
-                Err(e) => {
-                    tracing::warn!("ts lsif ingest: {e}");
-                    InvokeResponse::default()
-                }
-            },
-            Err(e) => {
-                tracing::warn!("ts lsif emitter: {e}");
-                InvokeResponse::default()
+                Err(e) => tracing::debug!("ts lsif emitter not available: {e}"),
             }
+        }
+
+        // Dedup merged output
+        nodes.sort_unstable_by_key(|n| n.id);
+        nodes.dedup_by_key(|n| n.id);
+        edges.sort_unstable_by_key(|e| (e.src, e.dst));
+        edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+
+        InvokeResponse {
+            nodes,
+            edges,
+            ..Default::default()
         }
     }
 }

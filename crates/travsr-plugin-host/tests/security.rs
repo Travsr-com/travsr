@@ -8,11 +8,14 @@ use travsr_plugin_host::sandbox::policy::SandboxPolicy;
 use travsr_plugin_host::sandbox::policy::SandboxUnavailable;
 use travsr_plugin_host::trust::TrustConfig;
 
-// 1. Egress blocked — Standard sandbox denies network
+// 1. Egress allowed — Standard sandbox permits network (build tools need it)
+//
+// ADR-017 intentionally allows network for Standard/NativeIpc policies so that
+// build tools (go mod, npm, pip, …) can fetch dependencies. FS confinement via
+// bwrap still applies; only network namespace isolation is skipped.
 #[test]
 #[cfg(target_os = "linux")]
-fn sandbox_standard_denies_network() {
-    // Only meaningful on Linux with bwrap. Skip gracefully without it.
+fn sandbox_standard_allows_network() {
     use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
 
     let repo = tempfile::tempdir().expect("tempdir");
@@ -27,27 +30,33 @@ fn sandbox_standard_denies_network() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
         Err(SandboxUnavailable(ref msg)) => {
-            // In CI, bwrap must be installed AND functional. Panic loud whenever
-            // build_sandboxed_command returns Err — whether because bwrap is absent,
-            // cannot namespace, or cannot isolate the network. A skipped network-egress
-            // test in CI is a blind spot that defeats ADR-017 Rule 2.
-            // Only skip on developer machines where bwrap is genuinely absent.
             if std::env::var("CI").is_ok() {
                 panic!("sandbox unavailable in CI: {msg}");
             }
             eprintln!("SKIP: {msg}");
         }
-        Ok(mut cmd) => {
-            let output = cmd.output().expect("spawn");
+        Ok(spawner) => {
+            let output = spawner.output().expect("spawn");
             let exit_code = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // curl should fail (non-zero) or be absent; either way network is blocked
+            // The shell command is `sh -c "curl ...; echo $?"` — sh always exits 0
+            // when bwrap runs successfully, so output.status.success() is always true
+            // for a live sandbox. We inspect exit_code directly:
+            //   "0"   → curl ran and network succeeded (expected: network is allowed)
+            //   "127" → curl not found inside bwrap (acceptable: no curl in namespace)
+            //   "126" → curl not executable (acceptable)
+            //   other → curl found but network blocked → test FAILS
+            let bwrap_failed = !output.status.success();
+            let curl_succeeded = exit_code == "0";
+            let curl_absent = exit_code == "127" || exit_code == "126";
             assert!(
-                !output.status.success() || exit_code != "0",
-                "network egress was NOT blocked by sandbox"
+                bwrap_failed || curl_absent || curl_succeeded,
+                "Standard sandbox blocked network but ADR-017 Amendment A1 intentionally \
+                 allows it for build tools; exit_code={exit_code}"
             );
         }
     }
@@ -93,6 +102,7 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
             repo.path(),
             scratch.path(),
             &SandboxPolicy::Standard,
+            "",
         );
         assert!(
             result.is_err(),
@@ -112,7 +122,8 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
             &[],
             repo.path(),
             scratch.path(),
-            &SandboxPolicy::Standard
+            &SandboxPolicy::Standard,
+            "",
         )
         .is_err());
         assert!(macos_build(
@@ -178,6 +189,7 @@ fn sandbox_repo_root_is_read_only() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
@@ -187,8 +199,8 @@ fn sandbox_repo_root_is_read_only() {
             }
             eprintln!("SKIP: {msg}");
         }
-        Ok(mut cmd) => {
-            let _ = cmd.output();
+        Ok(spawner) => {
+            let _ = spawner.output();
             assert!(
                 !breach_path.exists(),
                 "sandbox allowed write to repo root — FS confinement broken"
@@ -213,14 +225,15 @@ fn sandbox_scratch_dir_is_writable() {
         repo.path(),
         scratch.path(),
         &SandboxPolicy::Standard,
+        "",
     );
 
     match cmd {
         Err(_) => {
             eprintln!("SKIP: bwrap not available");
         }
-        Ok(mut cmd) => {
-            let status = cmd.status().expect("spawn");
+        Ok(spawner) => {
+            let status = spawner.status().expect("spawn");
             assert!(
                 status.success(),
                 "sandbox blocked write to /travsr-scratch — should be writable"
@@ -428,6 +441,8 @@ fn sidecar_stub_disabled_health_is_isolated() {
     let invoke_req = InvokeRequest {
         corpus: String::new(),
         root: PathBuf::from("."),
+        scratch: PathBuf::default(),
+        files: None,
     };
     let invoke_result = sidecar.invoke_phase_b(invoke_req);
     assert!(

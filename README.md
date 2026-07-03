@@ -7,9 +7,9 @@
 > instead of guessing from vector chunks. 80% fewer tokens, zero structural
 > hallucinations.
 
-[![CI](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/ci.yml)
-[![Bench](https://github.com/raj-rkv/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/bench.yml)
-[![Phase 2 Exit](https://github.com/raj-rkv/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/raj-rkv/travsr/actions/workflows/phase2-exit.yml)
+[![CI](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
+[![Bench](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml)
+[![Phase 2 Exit](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml)
 [![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -415,7 +415,7 @@ license policy, banned crates). A nightly OSV scan checks for new CVEs against
 ## Build from Source
 
 ```bash
-git clone https://github.com/raj-rkv/travsr
+git clone https://github.com/Travsr-com/travsr
 cd travsr
 
 # Default build (SQLite backend only)
@@ -431,7 +431,7 @@ export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 ```
 
 **Platform support:** macOS (x86\_64 + arm64), Linux (x86\_64 + aarch64), Windows (x86\_64).
-Pre-built binaries are available on the [Releases](https://github.com/raj-rkv/travsr/releases) page.
+Pre-built binaries are available on the [Releases](https://github.com/Travsr-com/travsr/releases) page.
 
 **MSRV:** Rust 1.75 (verified in CI on every commit).
 
@@ -465,6 +465,69 @@ Pre-built binaries are available on the [Releases](https://github.com/raj-rkv/tr
 
 - **Corporate proxy blocks the postinstall download?**
   Same: set `TRAVSR_BINARY` to skip the remote fetch.
+
+---
+
+## Changelog
+
+### v0.9.0 (2026-06-11)
+
+**travsr binary (npm: v0.9.0)**
+
+- Add native Phase B semantic indexing for Rust, TypeScript, and Python (no external SCIP tools required)
+- Add Phase B support for Kotlin via Kotlin Language Server with ZipBinary install
+- Add Phase B support for Swift and Dart: Phase A tree-sitter configs and GithubBinary install
+- Add Phase B support for Java: sandbox, resolver, and edge wiring end-to-end
+- Add Phase B support for C#: dotnet tools PATH check and toolchain grants
+- Add Phase B support for Scala: sbt catalog
+- Add .travsrignore support for excluding paths during `travsr init`
+- Add live progress UI during `travsr init` with parallel batched indexing
+- Add branded `--help` logo
+- Add blast radius Phase 2 and 3: ImportResolver for 14 languages and Go intra-package co-file edges
+- Add Tree-sitter vs Semantic toggle for the blast radius view
+- Add native_phase_b flag for per-language configuration
+- Allow network access in Phase B sandboxes; display live schema version in `travsr status`
+- Fix Dart Phase B: bypass sidecar, call emitter directly
+- Fix bwrap network isolation enforcement on Linux NativeIpc sandbox
+- Fix bulk_init: create _bulk_fts_pending table before write_file_graphs_batch
+- Fix generalized co-package pass and Phase B batch writes
+- Fix JS/TS file extension handling, Dart sandbox, and Phase B edge writes
+
+**VS Code extension (vscode-v0.8.0)**
+
+- Add JavaScript and C# to codelens and hover selectors
+- Add Tree-sitter vs Semantic toggle in blast radius webview
+- Extend hover and codelens selectors to all 13 indexed languages
+- Fix re-index triggering, panel refresh, and test regressions
+- Fix stale language list refresh and status bar .travsr watcher
+- Fix MCP envelope leaking into file lists
+- Fix blast radius depth slider and corpus auto-trust
+- Update bundled binary reference to v0.9.0
+
+---
+
+### v0.8.0 (2026-06-06)
+
+**travsr binary (npm: v0.8.0)**
+
+- Add `travsr-ipc` crate: platform-agnostic control plane (Unix socket on macOS/Linux, Named Pipe on Windows)
+- Add Windows Named Pipe daemon control: `travsr daemon start/stop/status` now works on Windows (WS2)
+- Add dual-write post-commit hook on Windows: installs both `post-commit` and `post-commit.cmd` so the hook fires from CMD, PowerShell, and Git Bash (WS3)
+- Add Windows Task Scheduler auto-start via `travsr autostart` and `travsr daemon start --autostart` (WS5/WS6)
+- Add AppContainer + Job Object sandbox for plugin host processes on Windows, matching the macOS sandbox posture (RFC-014, WS4)
+- Add full `CreateProcessW` spawn inside AppContainer for plugin indexers on Windows (P5-S3)
+- Add CI matrix for elevated AppContainer sandbox tests on Windows (T1-T5)
+- Fix `lang list` incorrectly showing built-in indexers as disabled on Windows
+- Fix `travsr unregister` treating task-not-found as an error instead of a no-op
+- Fix graph.db file permissions on Windows (restricted via `icacls`)
+
+**VS Code extension (vscode-v0.7.0)**
+
+- Add `.exe`-only binary spawn on Windows with `assertExecutableBinary` path validation (WS1, PSE R5)
+- Fix `showLanguages` using a stale binary path captured at activation time
+- Fix stale download URLs and `assertExecutableBinary` not being called in `reindexNow`
+- Fix `assertExecutableBinary` metacharacter regex on Windows paths
+- Update bundled binary reference to v0.8.0
 
 ---
 

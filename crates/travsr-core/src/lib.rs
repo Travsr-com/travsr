@@ -20,8 +20,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// Version history:
 ///   0 — legacy (no version byte; all pre-RFC-002 databases)
-///   1 — current: Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
-pub const SIGNATURE_FORMAT_VERSION: u8 = 1;
+///   1 — Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
+///   2 — current: RFC-014 Phase B graph unification. Phase A now captures
+///       type-definition nodes and `end_line` spans that the G1/G2 unification
+///       passes depend on, so v1 databases lack the tree-sitter nodes that
+///       SCIP symbols unify onto. Bumping intentionally invalidates every
+///       existing `.travsr/graph.db` so the daemon skew check and the
+///       `travsr status` warning force a full re-index (RFC-014 "Re-index
+///       Policy").
+pub const SIGNATURE_FORMAT_VERSION: u8 = 2;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 
@@ -126,7 +133,9 @@ pub enum Language {
     Scala,
     Cpp,
     C,
-    // Swift: grammar crate blocked on tree-sitter version conflict; variant reserved.
+    Swift,
+    Dart,
+    ObjectiveC,
 }
 
 impl Language {
@@ -135,7 +144,7 @@ impl Language {
     /// Returns `None` for unrecognised extensions — callers skip those files.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
-            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::TypeScript),
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
             "go" => Some(Self::Go),
@@ -147,6 +156,9 @@ impl Language {
             "scala" | "sc" => Some(Self::Scala),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
             "c" | "h" => Some(Self::C),
+            "swift" => Some(Self::Swift),
+            "dart" => Some(Self::Dart),
+            "m" | "mm" => Some(Self::ObjectiveC),
             _ => None,
         }
     }
@@ -166,6 +178,9 @@ impl Language {
             Self::Scala => "scala",
             Self::Cpp => "cpp",
             Self::C => "c",
+            Self::Swift => "swift",
+            Self::Dart => "dart",
+            Self::ObjectiveC => "objectivec",
         }
     }
 
@@ -185,6 +200,12 @@ impl Language {
             "scala" => Some(Self::Scala),
             "cpp" => Some(Self::Cpp),
             "c" => Some(Self::C),
+            "swift" => Some(Self::Swift),
+            "dart" => Some(Self::Dart),
+            // "objc" alias is accepted at the protocol layer (language_map.rs in
+            // travsr-plugin-protocol) for external API callers; core uses the
+            // canonical form only.
+            "objectivec" => Some(Self::ObjectiveC),
             _ => None,
         }
     }
@@ -399,6 +420,10 @@ pub struct Node {
     /// 1-based source line of the symbol's definition site.
     /// `None` for file-kind nodes and synthetic import nodes.
     pub line: Option<u32>,
+    /// 1-based last source line of the symbol's body (inclusive).
+    /// Used by G2 span attribution to find the enclosing function for a SCIP
+    /// reference occurrence. `None` until migration v13 backfills the column.
+    pub end_line: Option<u32>,
 }
 
 impl Node {
@@ -406,7 +431,7 @@ impl Node {
     ///
     /// The `id` is derived deterministically from the VName. `package`
     /// defaults to an empty string; use [`Node::with_package`] to set it.
-    /// `line` defaults to `None`; use [`Node::with_line`] to set it.
+    /// `line` / `end_line` default to `None`; use the builder methods to set them.
     pub fn new(vname: VName, kind: impl Into<String>) -> Self {
         let id = vname.id();
         Self {
@@ -415,6 +440,7 @@ impl Node {
             kind: kind.into(),
             package: String::new(),
             line: None,
+            end_line: None,
         }
     }
 
@@ -435,6 +461,60 @@ impl Node {
     pub fn with_line(mut self, line: u32) -> Self {
         self.line = Some(line);
         self
+    }
+
+    /// Set the `end_line` field (1-based, inclusive) and return `self` (builder pattern).
+    pub fn with_end_line(mut self, end_line: u32) -> Self {
+        self.end_line = Some(end_line);
+        self
+    }
+}
+
+/// A raw SCIP reference occurrence used for G2 call-site attribution.
+///
+/// The store's `write_scip_attributed_batch` takes a slice of these and emits
+/// `ref/call` edges from the enclosing function node (or the file node as fallback)
+/// to `callee_id`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScipRef {
+    /// Repo-relative path of the file containing the reference (e.g. `pkg/foo/bar.go`).
+    pub caller_path: String,
+    /// 1-based source line of the reference occurrence.
+    pub caller_line: u32,
+    /// `NodeId` of the called symbol (from `symbol_map` or `symbol_aliases`).
+    pub callee_id: NodeId,
+}
+
+/// Human-readable label: path for file nodes (whose `signature` is the
+/// literal `"file"`), signature for everything else.
+pub fn display_label(node: &Node) -> &str {
+    if node.kind == "file" && !node.vname.path.is_empty() {
+        &node.vname.path
+    } else {
+        &node.vname.signature
+    }
+}
+
+/// Returns `true` for nodes that carry no developer-facing signal:
+/// vendored paths and SCIP anonymous locals.
+pub fn is_noise_node(node: &Node) -> bool {
+    let p = &node.vname.path;
+    p.starts_with("third_party/")
+        || p.starts_with("vendor/")
+        || p.starts_with("node_modules/")
+        || p.contains("/node_modules/")
+        || is_scip_anonymous_local(&node.vname.signature)
+}
+
+/// Returns `true` if `sig` is a SCIP anonymous-local symbol (`local N` suffix).
+/// Used by G3 ingest filter in `travsr-indexer` and by `is_noise_node`.
+pub fn is_scip_anonymous_local(sig: &str) -> bool {
+    // SCIP local symbols end with "local <digits>", e.g. "local 27".
+    if let Some(pos) = sig.rfind("local ") {
+        let suffix = &sig[pos + 6..];
+        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+    } else {
+        false
     }
 }
 
@@ -474,6 +554,284 @@ impl Edge {
             kind: EdgeKind::FFICall,
             confidence: Some(confidence),
         }
+    }
+}
+
+// ── Import Resolution ────────────────────────────────────────────────────────
+//
+// Query-time bridge over missing `ResolvesTo` edges.
+// When the indexer has not emitted `ResolvesTo` edges (Java, Go cross-module,
+// PHP, C#, C/C++, Swift, Dart), these resolvers answer at query time:
+// "does import node `import_sig` point to this `file_path`?"
+//
+// Used by `travsr-mcp::tools::get_blast_radius_raw` (Phase 2).
+// Lives in `travsr-core` so all downstream crates can use it without
+// violating the crate dependency DAG.
+
+pub trait ImportResolver: Send + Sync {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool;
+}
+
+/// Return the correct resolver for a `VName::language` string.
+/// Falls back to `NoopResolver` for TypeScript, JS, and Rust — `link_imports*`
+/// already emits `ResolvesTo` edges for those at index time.
+pub fn resolver_for_language(language: &str) -> &'static dyn ImportResolver {
+    match language {
+        "go" => &GoResolver,
+        "java" => &JavaResolver,
+        "kotlin" => &KotlinResolver,
+        "scala" => &ScalaResolver,
+        "python" => &PythonResolver,
+        "php" => &PhpResolver,
+        "csharp" | "c#" | "cs" => &CsharpResolver,
+        "cpp" | "c++" | "c" => &CppResolver,
+        "swift" => &SwiftResolver,
+        "dart" => &DartResolver,
+        // TypeScript/JS/Rust: link_imports* already emits ResolvesTo — noop here.
+        // Ruby: no import nodes emitted by the indexer — noop.
+        _ => &NoopResolver,
+    }
+}
+
+struct NoopResolver;
+impl ImportResolver for NoopResolver {
+    fn resolves_to(&self, _: &str, _: &str) -> bool {
+        false
+    }
+}
+
+// ── shared helpers ──────────────────────────────────────────────────────────
+
+fn file_parent_dir(fp: &str) -> String {
+    std::path::Path::new(fp)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|d| !d.is_empty() && *d != ".")
+        .unwrap_or("")
+        .replace('\\', "/")
+}
+
+/// True when `haystack` equals `needle` OR `haystack` ends with `/<needle>`.
+fn path_suffix_match(haystack: &str, needle: &str) -> bool {
+    haystack == needle || haystack.ends_with(&format!("/{needle}"))
+}
+
+/// Shared logic for dot-separated languages (Java, Kotlin, Scala, C#).
+/// Handles class-level imports ("import:com.example.Foo") and package-level
+/// imports ("import:com.example"), with optional wildcard stripping (".*").
+fn dot_lang_resolves_to(import_sig: &str, file_path: &str, exts: &[&str]) -> bool {
+    let raw = match import_sig.strip_prefix("import:") {
+        Some(p) => p,
+        None => return false,
+    };
+    let import_path = raw.trim_end_matches(".*"); // strip wildcard suffix
+    let as_slash = import_path.replace('.', "/");
+    let fp = file_path.replace('\\', "/");
+
+    // Class-level: "com/example/Foo.java"
+    for ext in exts {
+        let class_file = format!("{as_slash}{ext}");
+        if path_suffix_match(&fp, &class_file) {
+            return true;
+        }
+    }
+    // Package-level: any file whose parent dir ends with the package path
+    let dir = file_parent_dir(&fp);
+    path_suffix_match(&dir, &as_slash)
+}
+
+// ── Go ─────────────────────────────────────────────────────────────────────
+// Signature: `import:github.com/Foo/repo/pkg`
+// `link_imports_go` emits ResolvesTo for same-module paths; this resolves
+// cross-module references where the import path ends with the file's dir.
+
+struct GoResolver;
+impl ImportResolver for GoResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let import_path = match import_sig.strip_prefix("import:") {
+            Some(p) => p,
+            None => return false,
+        };
+        let fp = file_path.replace('\\', "/");
+        let file_dir = file_parent_dir(&fp);
+        if file_dir.is_empty() {
+            return false; // root-level Go files are unexportable main packages
+        }
+        path_suffix_match(import_path, &file_dir)
+    }
+}
+
+// ── Java ───────────────────────────────────────────────────────────────────
+// Signature: `import:org.springframework.web.Controller`
+// Dot-to-slash: "org/springframework/web/Controller.java"
+
+struct JavaResolver;
+impl ImportResolver for JavaResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        dot_lang_resolves_to(import_sig, file_path, &[".java"])
+    }
+}
+
+// ── Kotlin ─────────────────────────────────────────────────────────────────
+// Signature: `import:kotlin.collections.List` — same convention as Java.
+
+struct KotlinResolver;
+impl ImportResolver for KotlinResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        dot_lang_resolves_to(import_sig, file_path, &[".kt", ".kts"])
+    }
+}
+
+// ── Scala ──────────────────────────────────────────────────────────────────
+// Signature: `import:scala.collection.mutable` — same convention as Java.
+
+struct ScalaResolver;
+impl ImportResolver for ScalaResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        dot_lang_resolves_to(import_sig, file_path, &[".scala", ".sc"])
+    }
+}
+
+// ── Python ─────────────────────────────────────────────────────────────────
+// Signature: `import:os.path` (absolute), `import:.utils` (relative).
+// `link_imports_python` handles both at index time; relative imports require
+// the caller's path which is not available here — return false for those.
+
+struct PythonResolver;
+impl ImportResolver for PythonResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let spec = match import_sig.strip_prefix("import:") {
+            Some(s) => s,
+            None => return false,
+        };
+        if spec.starts_with('.') {
+            return false; // relative: link_imports_python is authoritative
+        }
+        let as_slash = spec.replace('.', "/");
+        let fp = file_path.replace('\\', "/");
+
+        // Module file: "os/path.py"
+        if path_suffix_match(&fp, &format!("{as_slash}.py")) {
+            return true;
+        }
+        // Package init: "os/path/__init__.py"
+        if path_suffix_match(&fp, &format!("{as_slash}/__init__.py")) {
+            return true;
+        }
+        // Directory match: any .py file in the package dir
+        let dir = file_parent_dir(&fp);
+        path_suffix_match(&dir, &as_slash)
+    }
+}
+
+// ── PHP ────────────────────────────────────────────────────────────────────
+// Signature: `import:Symfony\Component\HttpKernel\Controller`
+// PSR-4: backslash namespace separator → filesystem slash.
+
+struct PhpResolver;
+impl ImportResolver for PhpResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let import_path = match import_sig.strip_prefix("import:") {
+            Some(p) => p,
+            None => return false,
+        };
+        let as_slash = import_path.replace('\\', "/");
+        let fp = file_path.replace('\\', "/");
+
+        if path_suffix_match(&fp, &format!("{as_slash}.php")) {
+            return true;
+        }
+        let dir = file_parent_dir(&fp);
+        path_suffix_match(&dir, &as_slash)
+    }
+}
+
+// ── C# ─────────────────────────────────────────────────────────────────────
+// Signature: `import:System.Collections.Generic`
+// By convention (not enforced) C# namespaces map to directory structure.
+
+struct CsharpResolver;
+impl ImportResolver for CsharpResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        dot_lang_resolves_to(import_sig, file_path, &[".cs"])
+    }
+}
+
+// ── C / C++ ────────────────────────────────────────────────────────────────
+// Signature: `import:<stdio.h>` (system) or `import:"local/header.h"` (local).
+// Angle-bracket includes are external — cannot map to a project file.
+// Quote includes carry a relative path that directly matches the file.
+
+struct CppResolver;
+impl ImportResolver for CppResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let include = match import_sig.strip_prefix("import:") {
+            Some(p) => p,
+            None => return false,
+        };
+        if include.starts_with('<') {
+            return false; // system header
+        }
+        let bare = include.trim_matches('"');
+        let fp = file_path.replace('\\', "/");
+        path_suffix_match(&fp, bare)
+    }
+}
+
+// ── Swift ──────────────────────────────────────────────────────────────────
+// Signature: `import:Foundation`, `import:UIKit`, `import:MyModule`
+// SPM convention: module name == the directory under Sources/ that holds
+// the .swift files. A file belongs to a module when its parent dir name
+// matches the module name (handles Sources/MyModule/*.swift).
+
+struct SwiftResolver;
+impl ImportResolver for SwiftResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let module = match import_sig.strip_prefix("import:") {
+            Some(m) => m,
+            None => return false,
+        };
+        let fp = file_path.replace('\\', "/");
+        if !fp.ends_with(".swift") {
+            return false;
+        }
+        let dir = file_parent_dir(&fp);
+        // Last component of parent dir must equal the module name
+        let last_dir = dir.rsplit('/').next().unwrap_or(&dir);
+        last_dir == module
+    }
+}
+
+// ── Dart ───────────────────────────────────────────────────────────────────
+// Signature: `import:package:myapp/src/util.dart`, `import:dart:core`
+// `dart:` → stdlib, no local file.
+// Relative (`./`, `../`) → ResolvesTo already emitted by link_imports.
+// `package:` → strip scheme + package name, match against remaining path.
+
+struct DartResolver;
+impl ImportResolver for DartResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let uri = match import_sig.strip_prefix("import:") {
+            Some(u) => u,
+            None => return false,
+        };
+        if uri.starts_with("dart:") {
+            return false; // stdlib
+        }
+        if uri.starts_with("./") || uri.starts_with("../") {
+            return false; // relative: link_imports is authoritative
+        }
+        let path_part = if let Some(rest) = uri.strip_prefix("package:") {
+            // "package:myapp/src/util.dart" → "src/util.dart"
+            match rest.find('/') {
+                Some(pos) => &rest[pos + 1..],
+                None => return false, // "package:myapp" with no path
+            }
+        } else {
+            uri
+        };
+        let fp = file_path.replace('\\', "/");
+        path_suffix_match(&fp, path_part)
     }
 }
 
@@ -578,9 +936,10 @@ mod tests {
     #[test]
     fn version_byte_produces_different_id_than_unversioned() {
         // Regression guard: confirms the RFC-002 domain separator is actually
-        // prepended and that length-prefix encoding is used. The v1 format starts
-        // with [0x01][len][corpus...]; the v0 format starts with raw corpus bytes.
-        // These byte streams can never be equal regardless of field contents.
+        // prepended and that length-prefix encoding is used. The versioned format
+        // starts with [SIGNATURE_FORMAT_VERSION][len][corpus...]; the v0 format
+        // starts with raw corpus bytes. These byte streams can never be equal
+        // regardless of field contents.
         let v = sample_vname();
         let versioned_id = v.id(); // uses SIGNATURE_FORMAT_VERSION byte + length-prefix
 
@@ -736,7 +1095,12 @@ mod tests {
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("pyi"), Some(Language::Python));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
-        assert_eq!(Language::from_extension("js"), None);
+        assert_eq!(Language::from_extension("js"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("jsx"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("mjs"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("cjs"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("m"), Some(Language::ObjectiveC));
+        assert_eq!(Language::from_extension("mm"), Some(Language::ObjectiveC));
         assert_eq!(Language::from_extension(""), None);
     }
 
@@ -747,6 +1111,7 @@ mod tests {
             Language::Rust,
             Language::Python,
             Language::Go,
+            Language::ObjectiveC,
         ] {
             let s = lang.as_str();
             assert_eq!(
@@ -837,5 +1202,62 @@ mod tests {
         let json = r#"{"src":1,"dst":2,"kind":"ref/call"}"#;
         let e: Edge = serde_json::from_str(json).unwrap();
         assert_eq!(e.confidence, None);
+    }
+
+    #[test]
+    fn display_label_uses_path_for_file_nodes() {
+        let n = Node::new(VName::new("", "", "src/lib.rs", "rust", "file"), "file");
+        assert_eq!(display_label(&n), "src/lib.rs");
+    }
+
+    #[test]
+    fn display_label_uses_signature_otherwise() {
+        let n = Node::new(
+            VName::new("", "", "src/lib.rs", "rust", "fn:main"),
+            "function",
+        );
+        assert_eq!(display_label(&n), "fn:main");
+    }
+
+    #[test]
+    fn noise_detects_third_party() {
+        let n = Node::new(
+            VName::new("", "", "third_party/foo/bar.go", "go", "fn:bar"),
+            "function",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_scip_local() {
+        let n = Node::new(
+            VName::new("", "", "pkg/eviction/handler.go", "go", "local 27"),
+            "variable",
+        );
+        assert!(is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_keeps_production_node() {
+        let n = Node::new(
+            VName::new("", "", "pkg/eviction/handler.go", "go", "fn:Handle"),
+            "function",
+        );
+        assert!(!is_noise_node(&n));
+    }
+
+    #[test]
+    fn noise_detects_root_node_modules() {
+        let n = Node::new(
+            VName::new(
+                "",
+                "",
+                "node_modules/react/index.js",
+                "typescript",
+                "fn:createElement",
+            ),
+            "function",
+        );
+        assert!(is_noise_node(&n));
     }
 }

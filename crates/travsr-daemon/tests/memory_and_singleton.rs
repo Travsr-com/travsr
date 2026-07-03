@@ -23,6 +23,7 @@
 //!   thread pool rather than a single-threaded executor.
 //! - `tokio::sync::mpsc::channel` — same channel type used by the watcher.
 
+#[cfg(unix)]
 use std::path::Path;
 use std::process::Command as StdCommand;
 use std::time::Duration;
@@ -184,7 +185,8 @@ async fn rss_flood_under_200mb() {
     // Graceful shutdown via control socket — ensures the daemon's explicit
     // `drop(index_tx) + indexer_worker.await` path runs so the tokio
     // runtime can shut down without hanging on a detached spawn_blocking task.
-    let sock_path = tmp.path().join(".travsr/daemon.sock");
+    let travsr_dir = tmp.path().join(".travsr");
+    let sock_path = travsr_ipc::ControlAddr::for_repo(tmp.path()).socket_path(&travsr_dir);
     graceful_shutdown(&sock_path, daemon_task).await;
 
     println!(
@@ -234,7 +236,8 @@ async fn rss_flood_under_200mb() {
     // Graceful shutdown on Unix (UnixStream available); abort on Windows.
     #[cfg(unix)]
     {
-        let sock_path = tmp.path().join(".travsr/daemon.sock");
+        let travsr_dir = tmp.path().join(".travsr");
+        let sock_path = travsr_ipc::ControlAddr::for_repo(tmp.path()).socket_path(&travsr_dir);
         graceful_shutdown(&sock_path, daemon_task).await;
     }
     #[cfg(not(unix))]
@@ -285,7 +288,8 @@ async fn daemon_start_twice_single_process() {
 
     // Graceful shutdown of daemon 1 before asserting, so the TempDir can be
     // cleaned up and the lockfile is released cleanly.
-    let sock_path = tmp.path().join(".travsr/daemon.sock");
+    let travsr_dir = tmp.path().join(".travsr");
+    let sock_path = travsr_ipc::ControlAddr::for_repo(tmp.path()).socket_path(&travsr_dir);
     graceful_shutdown(&sock_path, daemon1).await;
 
     // Assert the second instance was rejected with the expected error.

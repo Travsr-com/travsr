@@ -460,6 +460,13 @@ type PanelMessage =
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
 
+/** Re-render every open managed panel — call after an external `travsr init` updates graph.db. */
+export function refreshOpenPanels(): void {
+  for (const { refresh } of managedPanels.values()) {
+    void refresh();
+  }
+}
+
 /**
  * Open (or reveal) a singleton management webview. `render` produces the HTML;
  * `handle` reacts to a posted message and may call the provided `refresh`.
@@ -706,7 +713,7 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
     let out = "";
     let resolved = false;
     const done = (v: string): void => { if (!resolved) { resolved = true; resolve(v); } };
-    const proc = cp.spawn(binary, args, { env: { ...process.env }, ...(cwd ? { cwd } : {}) });
+    const proc = cp.spawn(binary, args, { env: { ...process.env, TERM: "dumb", NO_COLOR: "1" }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done(""); }, timeoutMs);
@@ -722,10 +729,16 @@ function spawnLangCommand(binary: string, args: string[], cwd?: string, timeoutM
  */
 export function registerShowLanguages(
   client: McpClient,
-  binary: string
+  binary: string,
+  onAfterInit?: () => void
 ): vscode.Disposable {
   const getCorpus = (): string =>
     path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "");
+
+  // Read the configured binary path at call time so we always use the value
+  // written by checkBinaryAndPrompt, which runs async after activation.
+  const getBinary = (): string =>
+    vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || binary;
 
   let cachedAvailable: LangInfo[] = [];
   let availableLoaded = false;
@@ -733,7 +746,7 @@ export function registerShowLanguages(
   const render = async (): Promise<string> => {
     const langsRaw = await client.callTool("repo_languages");
     if (!availableLoaded) {
-      const raw = await spawnLangCommand(binary, ["lang", "list", "--json"]);
+      const raw = await spawnLangCommand(getBinary(), ["lang", "list", "--json"]);
       cachedAvailable = parseAvailableLanguages(raw);
       availableLoaded = true;
     }
@@ -749,7 +762,7 @@ export function registerShowLanguages(
     if (msg.command === "reloadAvailable") {
       availableLoaded = false;
       postStatus('Reloading available tools…');
-      void spawnLangCommand(binary, ["lang", "list", "--json"]).then((raw) => {
+      void spawnLangCommand(getBinary(), ["lang", "list", "--json"]).then((raw) => {
         cachedAvailable = parseAvailableLanguages(raw);
         availableLoaded = true;
         postStatus(""); // clear immediately — never couple clear to render()/callTool
@@ -763,7 +776,7 @@ export function registerShowLanguages(
         const args = ["lang", "install", msg.language, "--no-interactive", "--yes"];
         if (corpus) args.push("--corpus", corpus);
         postStatus(`Installing ${msg.language} tool…`);
-        void spawnLangCommand(binary, args).then(() => {
+        void spawnLangCommand(getBinary(), args).then(() => {
           availableLoaded = false;
           postStatus("");
           void refresh();
@@ -786,8 +799,8 @@ export function registerShowLanguages(
         const installArgs = ["lang", "install", m.language, "--no-interactive", "--yes"];
         if (corpus) installArgs.push("--corpus", corpus);
         postStatus(`Installing ${m.language} with elevated approval…`);
-        void spawnLangCommand(binary, approveArgs)
-          .then(() => spawnLangCommand(binary, installArgs))
+        void spawnLangCommand(getBinary(), approveArgs)
+          .then(() => spawnLangCommand(getBinary(), installArgs))
           .then(() => {
             availableLoaded = false;
             postStatus("");
@@ -798,7 +811,7 @@ export function registerShowLanguages(
       }
       case "removeLang":
         postStatus(`Disabling ${msg.language}…`);
-        void spawnLangCommand(binary, ["lang", "remove", msg.language]).then(() => {
+        void spawnLangCommand(getBinary(), ["lang", "remove", msg.language]).then(() => {
           availableLoaded = false;
           postStatus("");
           void refresh();
@@ -809,15 +822,17 @@ export function registerShowLanguages(
         const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!wsRoot) return;
         postStatus("Initializing repo…");
-        void spawnLangCommand(binary, ["init"], wsRoot, 60_000).then(() => {
+        void spawnLangCommand(getBinary(), ["init"], wsRoot, 120_000).then(() => {
           postStatus("");
-          void refresh();
+          // Graph rebuilt — evict stale blast-radius and caller counts.
+          onAfterInit?.();
+          refreshOpenPanels();
         });
         return;
       }
       case "detectLangs":
         postStatus('Detecting languages…');
-        void spawnLangCommand(binary, ["lang", "detect"]).then((out) => {
+        void spawnLangCommand(getBinary(), ["lang", "detect"]).then((out) => {
           void vscode.window.showInformationMessage(
             out.trim() ? `Detect: ${out.trim().slice(0, 120)}` : "Detection complete."
           );
@@ -825,6 +840,10 @@ export function registerShowLanguages(
           postStatus("");
           void refresh();
         });
+        return;
+      case "refresh":
+        availableLoaded = false;
+        await refresh();
         return;
       default:
         break;
@@ -841,7 +860,8 @@ export function registerShowLanguages(
 export function registerParityCommands(
   client: McpClient,
   context: vscode.ExtensionContext,
-  binary: string
+  binary: string,
+  onAfterInit?: () => void
 ): void {
   context.subscriptions.push(
     registerAskSymbol(client),
@@ -850,6 +870,6 @@ export function registerParityCommands(
     registerShowExecutionPath(client, context),
     registerShowRepos(client),
     registerShowGraphStats(client),
-    registerShowLanguages(client, binary)
+    registerShowLanguages(client, binary, onAfterInit)
   );
 }

@@ -14,6 +14,36 @@ fn indexer() -> Indexer {
 }
 
 #[test]
+fn interface_type_alias_enum_emitted() {
+    // RFC-014 #317: SCIP marks interfaces, type aliases, enums and abstract
+    // classes as `#` type symbols — Phase A must emit G1-matchable nodes.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("types.ts");
+    std::fs::write(
+        &path,
+        b"export interface Shape { area(): number }\nexport type Velocity = number;\nexport enum Color { Red, Green }\nexport abstract class Base { }\n",
+    )
+    .unwrap();
+    let out = indexer().parse_file(&path).unwrap();
+    let sigs: Vec<&str> = out
+        .nodes
+        .iter()
+        .map(|n| n.vname.signature.as_str())
+        .collect();
+    for expected in [
+        "interface:Shape",
+        "type:Velocity",
+        "enum:Color",
+        "class:Base",
+    ] {
+        assert!(
+            sigs.contains(&expected),
+            "missing {expected} — got {sigs:?}"
+        );
+    }
+}
+
+#[test]
 fn parse_empty_file_emits_only_file_node() {
     let out = indexer().parse_file(&fixture("empty.ts")).unwrap();
     assert_eq!(out.nodes.len(), 1, "expected exactly one file node");
@@ -196,13 +226,13 @@ fn link_imports_skips_package_imports() {
         "package imports must not produce resolves-to edges"
     );
 
-    // 12 relative imports (./mcp, ./status, ./codelens, ./hover, ./tree, ./welcome,
-    // ./clientProxy, ./installer, ./telemetry, ./graph, ./contextProvider, ./commands) × 2
-    // candidates each (.ts + .tsx probe) = 24 edges.
+    // 13 relative imports (./mcp, ./status, ./codelens, ./hover, ./tree, ./repoFileTree,
+    // ./welcome, ./clientProxy, ./installer, ./telemetry, ./graph, ./contextProvider,
+    // ./commands) × 2 candidates each (.ts + .tsx probe) = 26 edges.
     assert_eq!(
         edges.len(),
-        24,
-        "12 relative imports × 2 extension candidates = 24 resolves-to edges"
+        26,
+        "13 relative imports × 2 extension candidates = 26 resolves-to edges"
     );
 }
 

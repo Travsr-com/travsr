@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-const TRAVSR_MARKER: &str = "# installed by travsr — do not edit this line";
+const TRAVSR_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this line";
+#[cfg(windows)]
+const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
 
 const HOOK_BODY: &str = r#"#!/bin/sh
 # installed by travsr — do not edit this line
@@ -19,25 +21,38 @@ fi
 exec travsr hook-run --from-hook
 "#;
 
+/// Windows `.cmd` hook — CRLF line endings required for cmd.exe.
+#[cfg(windows)]
+const CMD_HOOK_BODY: &str =
+    "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\ntravsr hook-run --from-hook\r\n";
+
+/// Windows chain `.cmd` hook — calls any pre-existing hook before running travsr.
+#[cfg(windows)]
+const CMD_CHAIN_HOOK_BODY: &str =
+    "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0post-commit.travsr-pre.bak.cmd\" call \"%~dp0post-commit.travsr-pre.bak.cmd\"\r\ntravsr hook-run --from-hook\r\n";
+
 /// Install the Travsr `post-commit` hook in `repo_root/.git/hooks/`.
 ///
+/// On all platforms, writes a POSIX shell `post-commit` (works with Git Bash
+/// on Windows). On Windows, additionally writes `post-commit.cmd` so that git
+/// invoked from plain cmd.exe or PowerShell also triggers the hook.
+///
 /// If a hook already exists that was NOT installed by Travsr, it is renamed to
-/// `post-commit.travsr-pre.bak` and a chain script is written instead so the
-/// existing hook continues to run.
+/// `post-commit.travsr-pre.bak` (or `.bak.cmd`) and a chain script is written
+/// instead so the existing hook continues to run.
 pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
     let hooks_dir = repo_root.join(".git/hooks");
     std::fs::create_dir_all(&hooks_dir).context("creating .git/hooks directory")?;
 
+    // ── POSIX shell hook (all platforms) ─────────────────────────────────────
     let hook_path = hooks_dir.join("post-commit");
     let bak_path = hooks_dir.join("post-commit.travsr-pre.bak");
 
     let script = if hook_path.exists() {
         let existing = std::fs::read_to_string(&hook_path).context("reading existing hook")?;
-        if existing.contains(TRAVSR_MARKER) {
-            // Already ours — overwrite with fresh copy.
+        if existing.contains(TRAVSR_MARKER_SH) {
             HOOK_BODY
         } else {
-            // Foreign hook — back it up and chain.
             std::fs::rename(&hook_path, &bak_path).context("backing up existing hook")?;
             tracing::info!(
                 "existing post-commit hook backed up to {}",
@@ -51,8 +66,39 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
 
     std::fs::write(&hook_path, script).context("writing post-commit hook")?;
     set_executable(&hook_path)?;
-
     tracing::info!("installed post-commit hook at {}", hook_path.display());
+
+    // ── Windows .cmd hook (Windows only) ─────────────────────────────────────
+    #[cfg(windows)]
+    {
+        let cmd_hook_path = hooks_dir.join("post-commit.cmd");
+        let cmd_bak_path = hooks_dir.join("post-commit.travsr-pre.bak.cmd");
+
+        let cmd_script = if cmd_hook_path.exists() {
+            let existing =
+                std::fs::read_to_string(&cmd_hook_path).context("reading existing cmd hook")?;
+            if existing.contains(TRAVSR_MARKER_CMD) {
+                CMD_HOOK_BODY
+            } else {
+                std::fs::rename(&cmd_hook_path, &cmd_bak_path)
+                    .context("backing up existing cmd hook")?;
+                tracing::info!(
+                    "existing post-commit.cmd hook backed up to {}",
+                    cmd_bak_path.display()
+                );
+                CMD_CHAIN_HOOK_BODY
+            }
+        } else {
+            CMD_HOOK_BODY
+        };
+
+        std::fs::write(&cmd_hook_path, cmd_script).context("writing post-commit.cmd hook")?;
+        tracing::info!(
+            "installed post-commit.cmd hook at {}",
+            cmd_hook_path.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -107,41 +153,182 @@ pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
         .collect())
 }
 
-/// Attempt to dispatch the current commit reindex to a running daemon via the
-/// Unix domain control socket at `.travsr/daemon.sock`.
+/// Attempt to fire-and-forget a reindex request to the running daemon.
 ///
-/// Returns `true` if the daemon accepted the request; `false` if no daemon is
-/// running or the write fails. Write timeout is capped at 50 ms so the git
-/// hook never perceptibly blocks a commit.
+/// Returns `true` if the daemon received the message; `false` if no daemon is
+/// running or the write fails. The hook never reads a response — the daemon
+/// processes the reindex asynchronously after the hook exits.
+///
+/// Cross-platform: Unix uses a domain socket; Windows uses a Named Pipe
+/// (`\\.\pipe\travsr-<hex>`). Returns `false` on unsupported platforms.
 ///
 /// # Panics
 /// Never — hook must never panic.
-#[cfg(unix)]
 pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
-    use std::io::Write as _;
-    use std::time::Duration;
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::time::Duration;
+        use travsr_ipc::{ControlAddr, ControlMessage};
 
-    let sock = repo_root.join(".travsr/daemon.sock");
-    if !sock.exists() {
-        return false;
+        let sha = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo_root.to_string_lossy(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let Ok(line) = serde_json::to_string(&ControlMessage::ReindexCommit { sha }) else {
+            return false;
+        };
+
+        let addr = ControlAddr::for_repo(repo_root);
+        let travsr_dir = repo_root.join(".travsr");
+        let sock_path = addr.socket_path(&travsr_dir);
+        if !sock_path.exists() {
+            return false;
+        }
+        let Ok(mut conn) = std::os::unix::net::UnixStream::connect(&sock_path) else {
+            return false;
+        };
+        let _ = conn.set_write_timeout(Some(Duration::from_millis(50)));
+        writeln!(conn, "{line}").is_ok()
     }
-    let Ok(mut conn) = std::os::unix::net::UnixStream::connect(&sock) else {
-        return false;
-    };
-    let _ = conn.set_write_timeout(Some(Duration::from_millis(50)));
-    let sha = std::process::Command::new("git")
-        .args([
-            "-C",
-            &repo_root.to_string_lossy(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    let msg = format!(r#"{{"op":"reindex-commit","sha":"{sha}"}}"#);
-    writeln!(conn, "{msg}").is_ok()
+    #[cfg(windows)]
+    {
+        use travsr_ipc::windows::NamedPipeTransport;
+        use travsr_ipc::{ControlAddr, ControlMessage, ControlTransport as _};
+
+        let sha = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo_root.to_string_lossy(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let addr = ControlAddr::for_repo(repo_root);
+        let Ok(mut transport) = NamedPipeTransport::connect(&addr) else {
+            return false;
+        };
+        transport
+            .send_request(&ControlMessage::ReindexCommit { sha })
+            .is_ok()
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = repo_root;
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_fake_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git/hooks")).unwrap();
+        tmp
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_creates_both_scripts() {
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        let hooks = tmp.path().join(".git/hooks");
+
+        let sh = std::fs::read_to_string(hooks.join("post-commit")).unwrap();
+        assert!(sh.contains(TRAVSR_MARKER_SH));
+
+        let cmd = std::fs::read_to_string(hooks.join("post-commit.cmd")).unwrap();
+        assert!(cmd.contains(TRAVSR_MARKER_CMD));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_creates_only_sh() {
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        let hooks = tmp.path().join(".git/hooks");
+
+        assert!(hooks.join("post-commit").exists());
+        assert!(!hooks.join("post-commit.cmd").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreign_cmd_hook_is_backed_up() {
+        let tmp = make_fake_repo();
+        let hooks = tmp.path().join(".git/hooks");
+
+        std::fs::write(
+            hooks.join("post-commit.cmd"),
+            "@echo off\r\necho foreign\r\n",
+        )
+        .unwrap();
+
+        install_hook(tmp.path()).unwrap();
+
+        assert!(hooks.join("post-commit.travsr-pre.bak.cmd").exists());
+        let body = std::fs::read_to_string(hooks.join("post-commit.cmd")).unwrap();
+        assert!(body.contains(TRAVSR_MARKER_CMD));
+        assert!(body.contains("post-commit.travsr-pre.bak.cmd"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn second_install_detects_ownership() {
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        install_hook(tmp.path()).unwrap();
+
+        let hooks = tmp.path().join(".git/hooks");
+        assert!(!hooks.join("post-commit.travsr-pre.bak.cmd").exists());
+        let body = std::fs::read_to_string(hooks.join("post-commit.cmd")).unwrap();
+        assert!(body.contains(TRAVSR_MARKER_CMD));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn chain_cmd_hook_invokes_backed_up_hook() {
+        let tmp = make_fake_repo();
+        let hooks = tmp.path().join(".git/hooks");
+        let sentinel = hooks.join("sentinel.txt");
+
+        // Foreign hook: creates a sentinel file in the same directory.
+        std::fs::write(
+            hooks.join("post-commit.cmd"),
+            "@echo off\r\necho triggered > \"%~dp0sentinel.txt\"\r\n",
+        )
+        .unwrap();
+
+        install_hook(tmp.path()).unwrap();
+
+        // Run the chain script. `travsr hook-run` may fail (not in PATH) but
+        // the backed-up hook must run first and create the sentinel.
+        let _ = std::process::Command::new("cmd.exe")
+            .args(["/c", hooks.join("post-commit.cmd").to_str().unwrap()])
+            .status();
+
+        assert!(
+            sentinel.exists(),
+            "backed-up cmd hook should have created sentinel.txt"
+        );
+    }
 }

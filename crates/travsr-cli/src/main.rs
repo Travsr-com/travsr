@@ -3,12 +3,17 @@
 #![forbid(unsafe_code)]
 
 mod ask;
+#[cfg(windows)]
+mod autostart;
+mod daemon_client;
 mod graph;
 mod index;
 mod init;
 mod install;
 mod lang;
+mod logo;
 mod migrate;
+mod progress;
 mod repo;
 mod repos;
 mod serve;
@@ -16,7 +21,7 @@ mod status;
 mod synonym;
 
 use anyhow::{Context as _, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,7 +37,22 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Initialise a Travsr index in the current repository.
-    Init,
+    Init {
+        /// Suppress progress output and post-index tips.
+        #[arg(long, short)]
+        quiet: bool,
+        /// Emit machine-readable JSON (summary on stdout, progress on stderr).
+        #[arg(long)]
+        json: bool,
+        /// Number of parallel parse workers (default: available CPU cores).
+        #[arg(long, value_name = "N")]
+        jobs: Option<usize>,
+        /// Run semantic Phase B (call edges) synchronously before returning.
+        /// By default Phase B runs in the background via the daemon.
+        /// Use this in CI or scripts that query call edges immediately after init.
+        #[arg(long)]
+        semantic: bool,
+    },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
         #[command(subcommand)]
@@ -85,6 +105,16 @@ enum Command {
         /// Output format.
         #[arg(short, long, default_value = "tree")]
         format: graph::Format,
+        /// Edge-follow mode: semantic prefers call/override edges over imports (ignored with --all).
+        #[arg(long, default_value = "semantic")]
+        edges: graph::EdgeMode,
+        /// Include third-party and anonymous-local nodes in traversal output.
+        #[arg(long)]
+        include_noise: bool,
+        /// Cap output to roughly this many tokens (0 = unlimited). Truncation
+        /// keeps the closest nodes first and reports how many were cut.
+        #[arg(long, default_value = "4096")]
+        budget: usize,
     },
     /// Index a directory of source files and emit a graph JSON (for CI / tooling).
     Index {
@@ -201,9 +231,19 @@ async fn main() {
     // Clap exits immediately for --version and --help via process::exit, so
     // init_tracing() (which may start the OTLP exporter or its background
     // tasks) must not run first — otherwise those simple queries hang.
-    let cli = Cli::parse();
+    // Brand header for `--help`: the real logo as truecolor half-block art on a
+    // color terminal, else the geometric motif. Both are pure SGR, which clap's
+    // before_help preserves.
+    let matches = Cli::command().before_help(logo::banner()).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    init_tracing();
+    let is_daemon_fg = matches!(
+        &cli.command,
+        Command::Daemon { action: DaemonAction::Start { foreground: true } }
+    );
+    if !is_daemon_fg {
+        init_tracing();
+    }
 
     let result = run(cli).await;
 
@@ -307,7 +347,12 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init => init::run()?,
+        Command::Init {
+            quiet,
+            json,
+            jobs,
+            semantic,
+        } => init::run(quiet, json, jobs, semantic)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;
@@ -316,19 +361,18 @@ async fn run(cli: Cli) -> Result<()> {
                     if foreground {
                         travsr_daemon::Daemon::run(repo_root).await?;
                     } else {
-                        // Guard: if a daemon is already responding on the socket,
+                        // Guard: if a daemon is already responding on the transport,
                         // don't spawn another one. Each `daemon start` call was
                         // otherwise spawning a new background child (visible,
                         // 700 MB each) because the check happened *inside* the
                         // child after it was already running.
-                        let sock = repo_root.join(".travsr/daemon.sock");
-                        if daemon_is_running(&sock, 3, 300) {
+                        if daemon_is_running(&repo_root, 3, 300) {
                             eprintln!("travsr daemon is already running");
                             return Ok(());
                         }
                         // Spawn background child: re-exec with --foreground.
                         let exe = std::env::current_exe().context("finding current exe")?;
-                        std::process::Command::new(exe)
+                        std::process::Command::new(&exe)
                             .args(["daemon", "start", "--foreground"])
                             .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
@@ -336,21 +380,36 @@ async fn run(cli: Cli) -> Result<()> {
                             .spawn()
                             .context("spawning background daemon")?;
                         eprintln!("travsr daemon started in background");
+                        // Windows: register a Task Scheduler ONLOGON task so the
+                        // daemon auto-starts after reboot. Non-fatal — the daemon
+                        // is already running; auto-start just won't persist.
+                        #[cfg(windows)]
+                        if let Err(e) = autostart::register(&exe, &repo_root) {
+                            eprintln!("travsr: warning: could not register auto-start task: {e}");
+                        }
                     }
                 }
                 DaemonAction::Stop => {
-                    let sock = repo_root.join(".travsr/daemon.sock");
-                    send_daemon_command(&sock, r#"{"op":"shutdown"}"#)?;
+                    send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown)?;
+                    // Windows: remove the auto-start task so the daemon stays
+                    // stopped after the user logs out and back in.
+                    #[cfg(windows)]
+                    if let Err(e) = autostart::unregister(&repo_root) {
+                        eprintln!("travsr: warning: could not remove auto-start task: {e}");
+                    }
                 }
                 DaemonAction::Status => {
-                    let sock = repo_root.join(".travsr/daemon.sock");
-                    let resp = send_daemon_command(&sock, r#"{"op":"status"}"#)?;
-                    println!("{resp}");
+                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Status) {
+                        Ok(_) => {
+                            let transport = if cfg!(windows) { "named_pipe" } else { "unix" };
+                            println!("running [transport={transport}]");
+                        }
+                        Err(_) => println!("not running"),
+                    }
                 }
                 DaemonAction::Restart => {
-                    let sock = repo_root.join(".travsr/daemon.sock");
                     // Best-effort stop — ignore errors if daemon not running.
-                    let _ = send_daemon_command(&sock, r#"{"op":"shutdown"}"#);
+                    let _ = send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let exe = std::env::current_exe().context("finding current exe")?;
                     std::process::Command::new(exe)
@@ -403,10 +462,15 @@ async fn run(cli: Cli) -> Result<()> {
             depth,
             direction,
             format,
+            edges,
+            include_noise,
+            budget,
         } => match (all, query.as_deref()) {
             (true, Some(_)) => anyhow::bail!("--all and a query are mutually exclusive"),
-            (true, None) => graph::run_all(format)?,
-            (false, Some(q)) => graph::run(q, depth, direction, format)?,
+            (true, None) => graph::run_all(format, budget)?,
+            (false, Some(q)) => {
+                graph::run(q, depth, direction, format, edges, include_noise, budget)?
+            }
             (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
         },
         Command::HookRun { from_hook, paths } => {
@@ -416,7 +480,6 @@ async fn run(cli: Cli) -> Result<()> {
             // Prefer dispatching to a running daemon — it reindexes async and
             // never blocks the git commit. Fall back to in-process indexing when
             // no daemon is running.
-            #[cfg(unix)]
             if travsr_daemon::try_dispatch_to_daemon(&repo_root) {
                 return Ok(());
             }
@@ -442,50 +505,31 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Send a JSON command to the running daemon's Unix domain socket and return
-/// the trimmed response line. Times out after 5 seconds.
-#[cfg(unix)]
-fn send_daemon_command(sock: &std::path::Path, msg: &str) -> anyhow::Result<String> {
-    use std::io::{BufRead as _, Write as _};
-    let mut conn = std::os::unix::net::UnixStream::connect(sock).with_context(|| {
-        format!(
-            "daemon not running (socket not found at {})",
-            sock.display()
-        )
-    })?;
-    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    writeln!(conn, "{msg}")?;
-    let mut resp = String::new();
-    std::io::BufReader::new(conn).read_line(&mut resp)?;
-    Ok(resp.trim().to_string())
+/// Connect to the daemon's control transport for `repo_root`.
+/// Moved to `daemon_client` (#318 O1) — kept as a local alias for callers here.
+fn send_daemon_command(
+    repo_root: &std::path::Path,
+    msg: &travsr_ipc::ControlMessage,
+) -> anyhow::Result<travsr_ipc::ControlResponse> {
+    daemon_client::send_daemon_command(repo_root, msg)
 }
 
-#[cfg(not(unix))]
-fn send_daemon_command(_sock: &std::path::Path, _msg: &str) -> anyhow::Result<String> {
-    anyhow::bail!("daemon control socket not yet supported on Windows")
-}
-
-/// Retry pinging the daemon socket up to `attempts` times with `delay_ms` between tries.
+/// Retry pinging the daemon transport up to `attempts` times with `delay_ms` between tries.
 ///
 /// launchd `KeepAlive: true` restarts the daemon after `daemon stop`, so the
-/// socket may briefly vanish during restart. Without retries, a `daemon start`
-/// call immediately after `daemon stop` could incorrectly spawn a second daemon.
-#[cfg(unix)]
-fn daemon_is_running(sock: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
+/// transport may briefly be unavailable during restart. Without retries, a
+/// `daemon start` call immediately after `daemon stop` could incorrectly spawn
+/// a second daemon.
+pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
             // Blocking sleep is safe: no concurrent async tasks exist at daemon-start time.
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-        if send_daemon_command(sock, r#"{"op":"status"}"#).is_ok() {
+        if send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status).is_ok() {
             return true;
         }
     }
-    false
-}
-
-#[cfg(not(unix))]
-fn daemon_is_running(_sock: &std::path::Path, _attempts: u32, _delay_ms: u64) -> bool {
     false
 }
 
@@ -494,10 +538,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_is_running_returns_false_when_no_socket() {
+    fn daemon_is_running_returns_false_when_no_daemon() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("nonexistent.sock");
+        // No daemon running in tmp — transport connect should fail immediately.
         // Attempts=1, delay=0 — must not block.
-        assert!(!daemon_is_running(&sock, 1, 0));
+        assert!(!daemon_is_running(tmp.path(), 1, 0));
     }
 }

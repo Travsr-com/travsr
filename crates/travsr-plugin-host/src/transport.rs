@@ -1,4 +1,5 @@
 use crate::sandbox::policy::SandboxUnavailable;
+use crate::sandbox::StdioCfg;
 use std::io::{BufReader, BufWriter};
 use std::sync::{Arc, Mutex};
 use travsr_error::IndexError;
@@ -57,8 +58,8 @@ impl Transport for InProcess {
 // ── Sidecar I/O types ─────────────────────────────────────────────────────────
 
 type SidecarIo = (
-    BufWriter<std::process::ChildStdin>,
-    BufReader<std::process::ChildStdout>,
+    BufWriter<Box<dyn std::io::Write + Send>>,
+    BufReader<Box<dyn std::io::Read + Send>>,
 );
 
 /// Subprocess transport. Spawns under ADR-017 SandboxPolicy::Standard.
@@ -69,7 +70,7 @@ pub struct Sidecar {
     plugin_version: String,
     /// None for stub instances (P5-S1 compatibility).
     #[allow(dead_code)] // held for process lifetime; drop kills the subprocess
-    child: Option<Mutex<std::process::Child>>,
+    _child: Option<Mutex<crate::sandbox::SandboxedChild>>,
     io: Option<Mutex<SidecarIo>>,
     health: Mutex<PluginHealth>,
     /// Per-invocation scratch tmpdir (ADR-017 Rule 1 — read-write, cleaned up on drop).
@@ -82,26 +83,21 @@ impl Sidecar {
         Self {
             language: language.into(),
             plugin_version: String::new(),
-            child: None,
+            _child: None,
             io: None,
-            health: Mutex::new(PluginHealth::Disabled(
-                "Sidecar spawn not yet implemented (P5-S3)".into(),
-            )),
+            health: Mutex::new(PluginHealth::Disabled("stub sidecar".into())),
             _scratch: None,
         }
     }
 
     /// Spawn the plugin binary under the ADR-017 sandbox described by `spec`.
     ///
-    /// Returns the transport and the validated `HandshakeResponse` so the caller
-    /// can extract extensions and capability flags for dispatcher registration.
-    ///
     /// `spec.program` is the binary to execute; `spec.args` are its arguments;
     /// `spec.policy` controls the sandbox level applied before spawning.
     pub fn spawn(
         spec: &crate::resolver::PluginSpec,
         repo_root: &std::path::Path,
-    ) -> Result<(Self, travsr_plugin_protocol::HandshakeResponse), IndexError> {
+    ) -> Result<Self, IndexError> {
         let lang = &spec.language;
         // Create per-invocation scratch tmpdir (ADR-017 Rule 1).
         // Dropped when Sidecar drops — guarantees cleanup even on error paths.
@@ -113,31 +109,42 @@ impl Sidecar {
                 message: format!("failed to create scratch dir: {e}"),
             })?;
         let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
-        let mut cmd = Self::build_cmd(
+        tracing::debug!(
+            lang = %lang,
+            program = %spec.program,
+            "Phase B: spawning sidecar"
+        );
+        let mut spawner = Self::build_cmd(
             &spec.program,
             &args,
             repo_root,
             scratch.path(),
             &spec.policy,
+            &spec.language,
         )
         .map_err(|e| IndexError::Parse {
             file: format!("plugin:{lang}"),
             message: e.to_string(),
         })?;
 
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+        spawner
+            .stdin(StdioCfg::Pipe)
+            .stdout(StdioCfg::Pipe)
+            .stderr(StdioCfg::Null);
 
-        let mut child = cmd.spawn().map_err(|e| IndexError::Parse {
+        let mut child = spawner.spawn().map_err(|e| IndexError::Parse {
             file: format!("plugin:{lang}"),
             message: format!("spawn failed: {e}"),
         })?;
 
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let mut writer = BufWriter::new(stdin);
-        let mut reader = BufReader::new(stdout);
+        let (raw_stdin, raw_stdout) =
+            child.take_ipc_streams().ok_or_else(|| IndexError::Parse {
+                file: format!("plugin:{lang}"),
+                message: "piped stdio not available after spawn".into(),
+            })?;
+
+        let mut writer = BufWriter::new(raw_stdin);
+        let mut reader = BufReader::new(raw_stdout);
 
         // Handshake
         write_message(
@@ -156,7 +163,7 @@ impl Sidecar {
             message: e.to_string(),
         })?;
 
-        let handshake = match hs {
+        let plugin_version = match hs {
             PluginResponse::Handshake(h) => {
                 if h.protocol_version != PROTOCOL_VERSION {
                     return Err(IndexError::ProtocolVersionMismatch {
@@ -164,7 +171,7 @@ impl Sidecar {
                         got: h.protocol_version,
                     });
                 }
-                h
+                h.plugin_version
             }
             _ => {
                 return Err(IndexError::Parse {
@@ -174,15 +181,20 @@ impl Sidecar {
             }
         };
 
-        let sidecar = Self {
+        tracing::debug!(
+            lang = %lang,
+            plugin_version = %plugin_version,
+            "Phase B: sidecar handshake ok"
+        );
+
+        Ok(Self {
             language: lang.to_string(),
-            plugin_version: handshake.plugin_version.clone(),
-            child: Some(Mutex::new(child)),
+            plugin_version,
+            _child: Some(Mutex::new(child)),
             io: Some(Mutex::new((writer, reader))),
             health: Mutex::new(PluginHealth::Ok),
             _scratch: Some(scratch),
-        };
-        Ok((sidecar, handshake))
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -192,8 +204,11 @@ impl Sidecar {
         repo_root: &std::path::Path,
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
-    ) -> Result<std::process::Command, SandboxUnavailable> {
-        crate::sandbox::linux::build_sandboxed_command(program, args, repo_root, scratch, policy)
+        language: &str,
+    ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
+        crate::sandbox::linux::build_sandboxed_command(
+            program, args, repo_root, scratch, policy, language,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -203,18 +218,36 @@ impl Sidecar {
         repo_root: &std::path::Path,
         scratch: &std::path::Path,
         policy: &crate::sandbox::policy::SandboxPolicy,
-    ) -> Result<std::process::Command, SandboxUnavailable> {
-        crate::sandbox::macos::build_sandboxed_command(program, args, repo_root, scratch, policy)
+        language: &str,
+    ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
+        crate::sandbox::macos::build_sandboxed_command(
+            program, args, repo_root, scratch, policy, language,
+        )
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    fn build_cmd(
+        program: &str,
+        args: &[&str],
+        repo_root: &std::path::Path,
+        scratch: &std::path::Path,
+        policy: &crate::sandbox::policy::SandboxPolicy,
+        language: &str,
+    ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
+        crate::sandbox::windows::build_sandboxed_command(
+            program, args, repo_root, scratch, policy, language,
+        )
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn build_cmd(
         _p: &str,
         _a: &[&str],
         _r: &std::path::Path,
         _s: &std::path::Path,
         _policy: &crate::sandbox::policy::SandboxPolicy,
-    ) -> Result<std::process::Command, SandboxUnavailable> {
+        _language: &str,
+    ) -> Result<crate::sandbox::SandboxedSpawn, SandboxUnavailable> {
         Err(SandboxUnavailable("unsupported platform".into()))
     }
 
@@ -263,7 +296,12 @@ impl Transport for Sidecar {
         }
     }
 
-    fn invoke_phase_b(&self, req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+    fn invoke_phase_b(&self, mut req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
+        // Inject the sandbox-authorized scratch dir so the sidecar can write
+        // temp files (SCIP output, etc.) inside the sandbox's allowed write area.
+        if let Some(scratch) = self._scratch.as_ref() {
+            req.scratch = scratch.path().to_path_buf();
+        }
         let io_lock = match &self.io {
             Some(m) => m,
             None => return Err(IndexError::PhaseNotSupported),
@@ -338,6 +376,8 @@ mod tests {
         let req = InvokeRequest {
             root: std::path::PathBuf::from("."),
             corpus: String::new(),
+            scratch: std::path::PathBuf::default(),
+            files: None,
         };
         assert!(matches!(
             t.invoke_phase_b(req),

@@ -1,11 +1,14 @@
 use std::io::{self, Read, Write};
 
-/// Hard cap on a single frame's payload (256 MiB). A plugin is an untrusted
+/// Hard cap on a single frame's payload (1 GiB). A plugin is an untrusted
 /// peer over the wire: the 4-byte length prefix is attacker-controlled and a
 /// hostile/buggy plugin could send `0xFFFF_FFFF` to make the daemon allocate
 /// 4 GiB and OOM. We refuse any frame larger than this before allocating.
-/// 256 MiB comfortably exceeds the largest realistic ParseOutput/InvokeResponse.
-pub const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
+/// Sized from measurement: the kubernetes monorepo's Go InvokeResponse is
+/// ~288 MB once RFC-014 G2 `refs` are included, so 256 MiB was too small.
+/// 1 GiB gives ~3.5× headroom; repos beyond that need a streaming or
+/// compressed protocol (tracked as a follow-up).
+pub const MAX_FRAME_LEN: usize = 1024 * 1024 * 1024;
 
 pub fn encode_message<T: serde::Serialize>(msg: &T) -> io::Result<Vec<u8>> {
     let payload =

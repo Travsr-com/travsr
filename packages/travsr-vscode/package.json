@@ -2,7 +2,7 @@
   "name": "travsr-vscode",
   "displayName": "Travsr",
   "description": "Graph-native code intelligence for VS Code. Live call graph, blast radius, and callers — powered by the local Travsr daemon over MCP.",
-  "version": "0.6.0",
+  "version": "0.8.0",
   "publisher": "travsr",
   "license": "MIT",
   "icon": "icon.png",
@@ -58,6 +58,11 @@
         {
           "id": "travsrGraph",
           "name": "Travsr Graph",
+          "when": "true"
+        },
+        {
+          "id": "travsrRepoFiles",
+          "name": "Repo Files",
           "when": "true"
         }
       ]
@@ -130,6 +135,21 @@
         "command": "travsr.showLanguages",
         "title": "Travsr: Languages",
         "icon": "$(extensions)"
+      },
+      {
+        "command": "travsr.openFileGraph",
+        "title": "Travsr: Open File Graph",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "travsr.refreshRepoFiles",
+        "title": "Travsr: Refresh Repo Files",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "travsr.searchRepoFile",
+        "title": "Travsr: Search Files",
+        "icon": "$(search)"
       }
     ],
     "keybindings": [
@@ -148,6 +168,16 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "travsr.searchRepoFile",
+          "when": "view == travsrRepoFiles",
+          "group": "navigation"
+        },
+        {
+          "command": "travsr.refreshRepoFiles",
+          "when": "view == travsrRepoFiles",
+          "group": "navigation"
+        },
         {
           "command": "travsr.refreshGraph",
           "when": "view == travsrGraph",

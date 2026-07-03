@@ -6,25 +6,29 @@
 
 #![forbid(unsafe_code)]
 
-mod emit;
-pub mod ffi;
+// Parser modules now live in travsr-analysis (RFC-017).
+// Re-export the bridge modules so callers (travsr-daemon) still compile.
+pub use travsr_analysis::phase_b_dart;
+pub use travsr_analysis::phase_b_python;
+pub use travsr_analysis::phase_b_rust;
+pub use travsr_analysis::phase_b_typescript;
+
+pub mod ffi; // thin re-export wrapper → travsr_analysis::ffi
 mod ffi_resolver;
-mod go;
 mod hash;
 pub mod lsif;
-mod python;
 pub mod python_lsif;
 pub mod ra_runner;
 pub mod runner;
-mod rust;
 pub mod sandbox;
-mod typescript;
+pub mod scip_unifier;
 
 use std::path::Path;
 
 pub use hash::hash_and_read;
 use travsr_core::{EdgeKind, Language};
 
+// ParseOutput and FfiMarker are now owned by travsr-analysis.
 pub use ffi::{FfiMarker, FfiMarkerKind};
 pub use ffi_resolver::FfiConfig;
 pub use hash::hash_file;
@@ -32,6 +36,7 @@ pub use lsif::ingest as ingest_lsif;
 pub use lsif::{ingest_rust, ingest_rust_raw, ingest_scip};
 pub use ra_runner::run_ra_lsif;
 pub use runner::{run_lsif_emitter, run_scip_python};
+pub use travsr_analysis::ParseOutput;
 pub use travsr_core::{Edge, Node};
 pub use travsr_error::IndexError;
 
@@ -41,28 +46,77 @@ pub fn typescript_parse(
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    typescript::parse(corpus, path, vname_path)
+    travsr_analysis::typescript::parse(corpus, path, vname_path)
 }
 pub fn rust_parse(
     corpus: &str,
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    rust::parse(corpus, path, vname_path)
+    travsr_analysis::rust::parse(corpus, path, vname_path)
 }
 pub fn python_parse(
     corpus: &str,
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    python::parse(corpus, path, vname_path)
+    travsr_analysis::python::parse(corpus, path, vname_path)
 }
 pub fn go_parse(
     corpus: &str,
     path: &std::path::Path,
     vname_path: &str,
 ) -> anyhow::Result<ParseOutput> {
-    go::parse(corpus, path, vname_path)
+    travsr_analysis::go::parse(corpus, path, vname_path)
+}
+
+/// Native Phase B for Dart: calls travsr-dart-index-emitter directly.
+/// Bypasses the travsr-lang-dart sidecar to avoid a Dart AOT SIGABRT that
+/// occurs when the emitter is a nested subprocess of the sandboxed sidecar.
+pub fn phase_b_native_dart(
+    corpus: &str,
+    root: &std::path::Path,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_dart::extract_native_phase_b(corpus, root)
+}
+
+/// Native Phase B for Rust: Cargo.toml dep graph + tree-sitter call edges.
+/// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+///
+/// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
+/// Pass `None` to fall back to a local directory walk.
+pub fn phase_b_native_rust(
+    corpus: &str,
+    root: &std::path::Path,
+    files: Option<&[(std::path::PathBuf, String)]>,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_rust::extract_native_phase_b(corpus, root, files)
+}
+
+/// Native Phase B for TypeScript: tree-sitter call + inheritance edges.
+/// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+///
+/// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
+/// Pass `None` to fall back to a local directory walk.
+pub fn phase_b_native_typescript(
+    corpus: &str,
+    root: &std::path::Path,
+    files: Option<&[(std::path::PathBuf, String)]>,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_typescript::extract_native_phase_b(corpus, root, files)
+}
+
+/// Native Phase B for Python: tree-sitter call + inheritance edges.
+/// Zero external-tool downloads. SCIP enrichment is merged by the caller.
+///
+/// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
+/// Pass `None` to fall back to a local directory walk.
+pub fn phase_b_native_python(
+    corpus: &str,
+    root: &std::path::Path,
+    files: Option<&[(std::path::PathBuf, String)]>,
+) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+    phase_b_python::extract_native_phase_b(corpus, root, files)
 }
 
 /// Resolve relative imports in `nodes` to `resolves-to` edges.
@@ -105,8 +159,8 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
         for ext in ["ts", "tsx"] {
             let candidate = normalized.with_extension(ext);
             let candidate_str = candidate.to_string_lossy().replace('\\', "/");
-            let target = emit::file_node(corpus, &candidate_str);
-            edges.push(emit::resolves_to_edge(node.id, target.id));
+            let target = travsr_analysis::emit::file_node(corpus, &candidate_str);
+            edges.push(travsr_analysis::emit::resolves_to_edge(node.id, target.id));
         }
     }
 
@@ -499,6 +553,68 @@ pub fn link_imports_go(
     edges
 }
 
+/// Emit intra-package co-file `Depends` edges for Go.
+///
+/// In Go, files within the same package share the namespace without import
+/// statements. Each file parsed by `go::parse` emits a `go-pkg` node whose
+/// VName path is the parent directory — so every file in `strategies/` produces
+/// the same `go-pkg` NodeId regardless of which file is being parsed.
+///
+/// This function groups `file` nodes that share a `go-pkg` node (via
+/// `DefinesBinding` edges) and emits `file_B --Depends--> file_A` for every
+/// ordered pair (B ≠ A). Blast-radius Phase 1 follows these `Depends` edges
+/// during reverse BFS, so all co-package siblings appear in the affected set.
+///
+/// Call this once, after ALL Go files in the repo have been parsed, so that
+/// the complete package group is visible.
+///
+/// # DEBT-024
+/// Incremental reindex (`reindex_files`) does not call this function — the same
+/// limitation as FFI resolution. A full `travsr init` is required after adding
+/// or removing a `.go` file from a package to refresh co-package edges.
+///
+/// # Complexity
+/// O(N + E) where N = nodes, E = edges in the slice.
+pub fn link_go_copackage_edges(nodes: &[Node], edges: &[Edge]) -> Vec<Edge> {
+    use std::collections::HashMap;
+
+    // Index node kind by NodeId — O(N).
+    let kind_of: HashMap<travsr_core::NodeId, &str> =
+        nodes.iter().map(|n| (n.id, n.kind.as_str())).collect();
+
+    // Build pkg_node_id → Vec<file_node_id> from DefinesBinding edges — O(E).
+    let mut pkg_to_files: HashMap<travsr_core::NodeId, Vec<travsr_core::NodeId>> = HashMap::new();
+    for edge in edges {
+        if edge.kind != EdgeKind::DefinesBinding {
+            continue;
+        }
+        if kind_of.get(&edge.src).copied() != Some("file") {
+            continue;
+        }
+        if kind_of.get(&edge.dst).copied() != Some("go-pkg") {
+            continue;
+        }
+        pkg_to_files.entry(edge.dst).or_default().push(edge.src);
+    }
+
+    // Emit all ordered pairs for groups with ≥2 files — O(F²) where F = files per pkg.
+    // F is typically small (< 30 for realistic packages), so the quadratic factor is fine.
+    let mut result: Vec<Edge> = Vec::new();
+    for file_ids in pkg_to_files.values() {
+        if file_ids.len() < 2 {
+            continue;
+        }
+        for &b in file_ids {
+            for &a in file_ids {
+                if a != b {
+                    result.push(Edge::new(b, a, EdgeKind::Depends));
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Normalize a logical path by resolving `.` and `..` components without
 /// touching the filesystem. Returns a relative path with no redundant segments.
 fn normalize_vname_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -514,35 +630,6 @@ fn normalize_vname_path(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
     parts.iter().collect()
-}
-
-/// All graph records produced by parsing a single source file.
-#[derive(Debug, Default)]
-pub struct ParseOutput {
-    pub nodes: Vec<Node>,
-    pub edges: Vec<Edge>,
-    /// FFI boundary markers collected by per-language indexers.
-    /// Consumed by `ffi_resolver` in the second pass.
-    pub ffi_markers: Vec<crate::ffi::FfiMarker>,
-}
-
-impl ParseOutput {
-    /// Merge `other` into `self`, deduplicating edges on `(src, dst, kind)`.
-    /// Nodes are appended without dedup (dedup happens in each indexer's parse fn).
-    pub fn merge_deduped(&mut self, other: ParseOutput) {
-        self.nodes.extend(other.nodes);
-        let existing: std::collections::HashSet<(
-            travsr_core::NodeId,
-            travsr_core::NodeId,
-            travsr_core::EdgeKind,
-        )> = self.edges.iter().map(|e| (e.src, e.dst, e.kind)).collect();
-        for edge in other.edges {
-            if !existing.contains(&(edge.src, edge.dst, edge.kind)) {
-                self.edges.push(edge);
-            }
-        }
-        self.ffi_markers.extend(other.ffi_markers);
-    }
 }
 
 /// Streaming indexer that walks a repository and emits graph records.
@@ -612,14 +699,15 @@ impl Indexer {
         };
         let mut output = match Language::from_extension(ext) {
             Some(Language::TypeScript) => {
-                typescript::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
+                travsr_analysis::typescript::parse(&self.corpus, abs_path, vname_path)
+                    .map_err(map_err)?
             }
             Some(Language::Rust) => {
-                rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
+                travsr_analysis::rust::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
             }
             Some(Language::Python) => {
-                let mut ts_out =
-                    python::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?;
+                let mut ts_out = travsr_analysis::python::parse(&self.corpus, abs_path, vname_path)
+                    .map_err(map_err)?;
                 // Best-effort semantic enrichment via pyright (RFC-005 §3).
                 // Runs after tree-sitter; failures are logged and silently ignored.
                 let pyright_out = python_lsif::parse_python_with_pyright(
@@ -630,7 +718,9 @@ impl Indexer {
                 ts_out.merge_deduped(pyright_out);
                 ts_out
             }
-            Some(Language::Go) => go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?,
+            Some(Language::Go) => {
+                travsr_analysis::go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
+            }
             // Other future languages (#[non_exhaustive]) are silently skipped
             // until their parsers ship.
             _ => ParseOutput::default(),
@@ -639,7 +729,7 @@ impl Indexer {
         // Collect per-language FFI call-site markers (RFC-005 §3).
         match Language::from_extension(ext) {
             Some(Language::TypeScript) => {
-                let napi_markers = typescript::collect_napi_dts_markers(
+                let napi_markers = travsr_analysis::typescript::collect_napi_dts_markers(
                     &self.corpus,
                     abs_path,
                     vname_path,
@@ -648,7 +738,7 @@ impl Indexer {
                 output.ffi_markers.extend(napi_markers);
             }
             Some(Language::Python) => {
-                let pyo3_markers = python::collect_pyo3_pyi_markers(
+                let pyo3_markers = travsr_analysis::python::collect_pyo3_pyi_markers(
                     &self.corpus,
                     abs_path,
                     vname_path,

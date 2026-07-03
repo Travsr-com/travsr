@@ -1,53 +1,12 @@
 //! Linux sandbox (bubblewrap + optional Landlock). Fail-closed per ADR-017 Rule 2.
 use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
+use crate::sandbox::SandboxedSpawn;
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 /// Permitted env vars (ADR-017 Rule 1). TMPDIR set by caller to scratch dir.
 pub const ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL"];
-
-/// Cached probe: does `bwrap --unshare-net` succeed on this host?
-///
-/// GitHub Actions Ubuntu 24.04 runners disallow `RTM_NEWADDR` inside a new
-/// network namespace, so bwrap exits non-zero when it tries to bring up the
-/// loopback interface. We probe once, cache the result, and skip `--unshare-net`
-/// when it is not supported rather than aborting the sandbox invocation.
-#[cfg(target_os = "linux")]
-static NET_UNSHARE_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-#[cfg(target_os = "linux")]
-fn net_unshare_supported() -> bool {
-    *NET_UNSHARE_OK.get_or_init(|| {
-        // Mount /lib and /lib64 alongside /usr so the dynamic linker
-        // (/lib64/ld-linux-x86-64.so.2) is reachable inside the probe sandbox.
-        // On merged-usr systems these are host symlinks → /usr/lib{,64}; they
-        // don't appear automatically inside bwrap's fresh tmpfs root.
-        Command::new("bwrap")
-            .args([
-                "--unshare-net",
-                "--ro-bind-try",
-                "/usr",
-                "/usr",
-                "--ro-bind-try",
-                "/lib",
-                "/lib",
-                "--ro-bind-try",
-                "/lib64",
-                "/lib64",
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--",
-                "true",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
-}
 
 #[cfg(target_os = "linux")]
 pub fn build_sandboxed_command(
@@ -56,7 +15,8 @@ pub fn build_sandboxed_command(
     repo_root: &Path,
     scratch_dir: &Path,
     policy: &SandboxPolicy,
-) -> Result<Command, SandboxUnavailable> {
+    language: &str,
+) -> Result<SandboxedSpawn, SandboxUnavailable> {
     if !bwrap_available() {
         return Err(SandboxUnavailable(
             "bubblewrap (bwrap) is not available or cannot create sandboxes on this host \
@@ -74,28 +34,17 @@ pub fn build_sandboxed_command(
     let repo = repo_root.to_string_lossy();
     let scratch = scratch_dir.to_string_lossy();
 
+    // Per-language toolchain grants (e.g. go module/build caches + GO*/HOME env).
+    // Empty for languages with no out-of-repo needs.
+    let tc = crate::sandbox::toolchain::toolchain_access(language);
+
     let mut cmd = Command::new("bwrap");
 
     match policy {
-        SandboxPolicy::Standard => {
-            // --unshare-net is probed at first use: on hosts where loopback setup
-            // inside the new network namespace is blocked (e.g. GitHub Actions,
-            // some container runtimes) bwrap exits non-zero with
-            // "RTM_NEWADDR: Operation not permitted".
-            // ADR-017 Rule 2: fail-closed. Network isolation is a primary egress
-            // control; silently dropping it is not an acceptable degradation.
-            if net_unshare_supported() {
-                cmd.arg("--unshare-net");
-            } else {
-                return Err(SandboxUnavailable(
-                    "bwrap --unshare-net not supported on this host (loopback blocked \
-                     inside the network namespace); plugin disabled per ADR-017 Rule 2 \
-                     — to run on a host without network-namespace support, request an \
-                     Elevated policy exception via ADR-017 §Elevated"
-                        .into(),
-                ));
-            }
-        }
+        // Standard / NativeIpc: network access allowed — build tools (go, npm,
+        // pip, …) may need to fetch missing dependencies. File-system confinement
+        // via bwrap still applies; no --unshare-net.
+        SandboxPolicy::Standard | SandboxPolicy::NativeIpc => {}
         SandboxPolicy::Elevated {
             permitted_hosts, ..
         } => {
@@ -110,7 +59,14 @@ pub fn build_sandboxed_command(
             );
         }
     }
-    cmd.args(["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+    // NativeIpc policy: tool uses POSIX IPC queues/shm (e.g. scip-clang parallel
+    // workers). Skip --unshare-ipc so mq_open/shm_open work inside the namespace.
+    let ipc_unshare: &[&str] = if matches!(policy, SandboxPolicy::NativeIpc) {
+        &["--unshare-pid", "--unshare-uts"]
+    } else {
+        &["--unshare-pid", "--unshare-uts", "--unshare-ipc"]
+    };
+    cmd.args(ipc_unshare);
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
         cmd.args(["--ro-bind-try", path, path]);
     }
@@ -123,17 +79,6 @@ pub fn build_sandboxed_command(
         cmd.args(["--ro-bind-try", path, path]);
     }
     cmd.args(["--proc", "/proc", "--dev", "/dev"]);
-    // Bind-mount the directory containing the plugin binary so bwrap can exec it.
-    // The binary may live outside standard system paths (e.g. target/debug/ during
-    // development or a non-standard install prefix like /opt/travsr/bin/).
-    // Without this, bwrap exits with "execvp: No such file or directory" for any
-    // binary not under /usr, /bin, /sbin, /lib, or /lib64.
-    if let Some(bin_dir) = Path::new(program).parent() {
-        let bin_dir_str = bin_dir.to_string_lossy();
-        if !bin_dir_str.is_empty() {
-            cmd.args(["--ro-bind-try", bin_dir_str.as_ref(), bin_dir_str.as_ref()]);
-        }
-    }
     // Provide a writable scratch area inside the sandbox at /travsr-scratch by
     // bind-mounting the host scratch dir there. The host dir is owned by the
     // real UID (created via tempfile by the daemon), so the sandboxed process —
@@ -142,6 +87,22 @@ pub fn build_sandboxed_command(
     // tmpfs automatically. A plain --tmpfs would be root-owned and unwritable.
     cmd.args(["--bind", scratch.as_ref(), "/travsr-scratch"]); // writable scratch
     cmd.args(["--ro-bind", repo.as_ref(), repo.as_ref()]); // repo: ro
+                                                           // Per-language toolchain caches: read-only module/toolchain dirs, writable
+                                                           // build cache. Bound at their host paths so the GO*/HOME env (set below) resolve.
+    for path in &tc.read_paths {
+        let p = path.to_string_lossy();
+        cmd.args(["--ro-bind-try", p.as_ref(), p.as_ref()]);
+    }
+    for path in &tc.write_paths {
+        let p = path.to_string_lossy();
+        cmd.args(["--bind-try", p.as_ref(), p.as_ref()]);
+    }
+    // Bind ~/.travsr/bin so tools installed by `travsr lang install` (e.g. scip-java,
+    // scip-go) are accessible inside the bwrap namespace.
+    if let Ok(home) = std::env::var("HOME") {
+        let travsr_bin = format!("{home}/.travsr/bin");
+        cmd.args(["--ro-bind-try", &travsr_bin, &travsr_bin]);
+    }
     cmd.args(["--die-with-parent", "--"]);
     // Resource caps (ADR-017 Rule 1): 4 GiB virtual memory + 300s CPU via ulimit.
     let quoted_args = args
@@ -167,7 +128,19 @@ pub fn build_sandboxed_command(
     // Pass the real TERM if available, otherwise fall back to "dumb".
     let term = std::env::var("TERM").unwrap_or_else(|_| "dumb".to_string());
     cmd.env("TERM", term);
-    Ok(cmd)
+    // Per-language toolchain env (e.g. GOPATH/GOCACHE/GOMODCACHE/HOME) so the
+    // analyzer's build tool locates its caches inside the cleared sandbox env.
+    for (key, val) in &tc.env {
+        cmd.env(key, val);
+    }
+    // Prepend ~/.travsr/bin so tools installed by `travsr lang install` (e.g. scip-java,
+    // scip-go) are on PATH inside the sandbox.
+    if let Ok(home) = std::env::var("HOME") {
+        let travsr_bin = format!("{home}/.travsr/bin");
+        let base = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{travsr_bin}:{base}"));
+    }
+    Ok(SandboxedSpawn::Wrapped(cmd))
 }
 
 /// Returns true if `bwrap` is on PATH (installed).
@@ -233,7 +206,8 @@ pub fn build_sandboxed_command(
     _r: &Path,
     _s: &Path,
     _policy: &SandboxPolicy,
-) -> Result<Command, SandboxUnavailable> {
+    _lang: &str,
+) -> Result<SandboxedSpawn, SandboxUnavailable> {
     Err(SandboxUnavailable(
         "Linux sandbox not available on this platform".into(),
     ))

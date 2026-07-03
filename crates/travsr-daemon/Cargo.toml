@@ -10,8 +10,10 @@ rust-version.workspace = true
 
 [dependencies]
 travsr-core = { path = "../travsr-core" }
+travsr-ipc  = { workspace = true }
 travsr-mcp = { path = "../travsr-mcp" }
 travsr-indexer = { path = "../travsr-indexer" }
+travsr-retrieval = { path = "../travsr-retrieval" }
 travsr-store = { path = "../travsr-store" }
 travsr-plugin-host = { path = "../travsr-plugin-host" }
 tokio = { workspace = true }
@@ -23,6 +25,7 @@ ignore = { workspace = true }
 notify = { workspace = true }
 fs2 = { workspace = true }
 tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"

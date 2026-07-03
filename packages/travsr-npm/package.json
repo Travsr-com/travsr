@@ -1,6 +1,6 @@
 {
   "name": "@travsr.com/travsr",
-  "version": "0.7.0",
+  "version": "0.9.0",
   "description": "The code graph that lives next to git.",
   "license": "MIT",
   "repository": {
@@ -14,6 +14,8 @@
   "scripts": {
     "postinstall": "node scripts/install.js"
   },
+  "os": ["linux", "darwin", "win32"],
+  "cpu": ["x64", "arm64"],
   "engines": {
     "node": ">=18"
   },

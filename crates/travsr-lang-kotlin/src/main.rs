@@ -46,11 +46,12 @@ impl Plugin for KotlinPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_java(&req.root) {
+        match run_scip_java(&req.root, &req.scratch) {
             Ok(Some(bytes)) => match travsr_indexer::ingest_scip(&bytes, &req.corpus) {
                 Ok(out) => InvokeResponse {
                     nodes: out.nodes,
                     edges: out.edges,
+                    ..Default::default()
                 },
                 Err(e) => {
                     tracing::warn!("kotlin scip ingest: {e}");
@@ -85,16 +86,22 @@ fn find_tool(name: &str) -> Option<PathBuf> {
 
 /// Run `scip-java index` on `root` and return the raw SCIP protobuf bytes.
 /// `Ok(None)` = tool not installed (graceful skip).
-fn run_scip_java(root: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+///
+/// `scratch` is the sandbox-authorized writable directory from InvokeRequest —
+/// the SCIP output MUST go there (the sandbox write grant covers only that
+/// path). Falls back to the system temp dir for older daemons that send an
+/// empty scratch.
+fn run_scip_java(root: &Path, scratch: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(tool) = find_tool(SCIP_TOOL) else {
         return Ok(None);
     };
 
-    let scratch = tempfile::Builder::new()
-        .prefix("travsr-scip-kotlin-")
-        .tempdir()
-        .context("create scip-java scratch dir")?;
-    let output = scratch.path().join("index.scip");
+    let out_dir = if scratch.as_os_str().is_empty() {
+        std::env::temp_dir()
+    } else {
+        scratch.to_path_buf()
+    };
+    let output = out_dir.join(format!("travsr-scip-kotlin-{}.scip", std::process::id()));
 
     let mut child = std::process::Command::new(&tool)
         .arg("index")
@@ -110,6 +117,7 @@ fn run_scip_java(root: &Path) -> anyhow::Result<Option<Vec<u8>>> {
 
     let bytes = std::fs::read(&output)
         .with_context(|| format!("reading SCIP output {}", output.display()))?;
+    let _ = std::fs::remove_file(&output);
     Ok(Some(bytes))
 }
 
@@ -165,6 +173,8 @@ mod tests {
         let req = InvokeRequest {
             root: tmp.path().to_path_buf(),
             corpus: "github.com/travsr/test".into(),
+            scratch: tmp.path().to_path_buf(),
+            files: None,
         };
         let resp = KotlinPhaseB.invoke_phase_b(&req);
         assert!(resp.nodes.is_empty());

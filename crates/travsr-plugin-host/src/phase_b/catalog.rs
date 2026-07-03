@@ -12,6 +12,10 @@ pub enum OutputFormat {
 pub enum SandboxRequirement {
     /// No network, no build steps that download dependencies.
     Standard,
+    /// Needs POSIX IPC queues/shm (e.g. scip-clang parallel workers) but not network.
+    /// macOS sandbox-exec has no valid Seatbelt operation for mq_open; this policy
+    /// bypasses sandbox-exec and applies ulimit caps only. No PSE approval required.
+    NativeIpc,
     /// Needs network for dependency resolution (Maven/Gradle/NuGet/sbt).
     // ADR-017 Rule 1: RequiresElevated languages need an explicit host allowlist
     // recorded in ~/.travsr/lang.toml before the sandbox will permit network access.
@@ -35,6 +39,26 @@ pub struct ScipBinarySpec {
     pub verify_sha256: bool,
 }
 
+/// Specifies a zip archive on GitHub Releases that must be extracted rather than
+/// installed directly as a binary (e.g. kotlin-language-server ships `server.zip`).
+#[derive(Debug, Clone, Copy)]
+pub struct ZipBinarySpec {
+    /// GitHub repo slug, e.g. `"fwcd/kotlin-language-server"`.
+    pub repo: &'static str,
+    /// Map a release tag to the zip asset filename. Takes only `tag` (not target)
+    /// because platform-independent zip archives don't vary by host triple.
+    pub asset_fn: fn(tag: &str) -> String,
+    /// Subdirectory under `~/.travsr/` to extract the zip into (e.g. `"kls"`).
+    pub extract_dir: &'static str,
+    /// Path to the actual binary within the extracted directory, used to write
+    /// the `~/.travsr/bin/<install_name>` wrapper script (e.g. `"server/bin/kotlin-language-server"`).
+    pub binary_subpath: &'static str,
+    /// Wrapper script name placed in `~/.travsr/bin/`.
+    pub install_name: &'static str,
+    /// Fallback version tag when the GitHub API is unreachable.
+    pub version_fallback: &'static str,
+}
+
 /// How to install the underlying SCIP tool once the travsr-lang wrapper is present.
 #[derive(Debug, Clone, Copy)]
 pub enum ScipInstall {
@@ -42,6 +66,10 @@ pub enum ScipInstall {
     Command(&'static [&'static str]),
     /// Download a pre-built binary directly from the tool's GitHub Releases.
     GithubBinary(ScipBinarySpec),
+    /// Download a zip archive from GitHub Releases, extract it, and create a
+    /// wrapper script in `~/.travsr/bin/`. Used for tools that ship as archives
+    /// rather than standalone binaries (e.g. kotlin-language-server).
+    ZipBinary(ZipBinarySpec),
     /// No automated install available; show `underlying_tool_hint` to the user.
     Manual,
 }
@@ -62,11 +90,51 @@ pub fn scip_ruby_asset(_tag: &str, target: &str) -> Option<String> {
     }
 }
 
+/// kotlin-language-server ships a single platform-independent `server.zip`.
+pub fn kls_asset(_tag: &str) -> String {
+    "server.zip".to_string()
+}
+
 /// scip-clang ships arm64-darwin and x86_64-linux binaries (no version in asset name).
 pub fn scip_clang_asset(_tag: &str, target: &str) -> Option<String> {
     match target {
         "aarch64-apple-darwin" => Some("scip-clang-arm64-darwin".to_string()),
         "x86_64-unknown-linux-gnu" => Some("scip-clang-x86_64-linux".to_string()),
+        _ => None,
+    }
+}
+
+/// travsr-swift-index-emitter ships arm64-darwin and x86_64-linux binaries.
+pub fn swift_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => {
+            Some("travsr-swift-index-emitter-aarch64-apple-darwin".to_string())
+        }
+        "x86_64-unknown-linux-gnu" => {
+            Some("travsr-swift-index-emitter-x86_64-unknown-linux-gnu".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// travsr-dart-index-emitter ships arm64-darwin and x86_64-linux binaries (AOT-compiled via dart compile exe).
+pub fn dart_scip_emitter_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => {
+            Some("travsr-dart-index-emitter-aarch64-apple-darwin".to_string())
+        }
+        "x86_64-unknown-linux-gnu" => {
+            Some("travsr-dart-index-emitter-x86_64-unknown-linux-gnu".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// travsr-lang-objectivec — macOS-only (libclang-based); aarch64 and x86_64 Apple Darwin.
+pub fn objc_index_emitter_asset(_tag: &str, target: &str) -> Option<String> {
+    match target {
+        "aarch64-apple-darwin" => Some("travsr-lang-objectivec-aarch64-apple-darwin".to_string()),
+        "x86_64-apple-darwin" => Some("travsr-lang-objectivec-x86_64-apple-darwin".to_string()),
         _ => None,
     }
 }
@@ -106,6 +174,16 @@ pub struct PhaseBEntry {
     /// True for in-tree builtins (typescript, javascript) that are bundled with
     /// the travsr binary — no external binary on PATH required.
     pub builtin: bool,
+    /// True when this language has a native (in-process, zero-install) Phase B
+    /// implementation compiled into the daemon. When true, `lang list` shows
+    /// "✓ active" even if the external enrichment tool is absent — the external
+    /// tool is an optional upgrade, not a requirement for call-edge indexing.
+    pub native_phase_b: bool,
+    /// True when `travsr lang install` must also download a platform-independent
+    /// `<provider_binary>-share.tar.gz` asset and extract it into
+    /// ~/.travsr/share/<provider_binary>/. Used by languages whose sidecar
+    /// spawns an external script rather than a compiled tool (e.g. dart).
+    pub has_share_assets: bool,
 }
 
 pub static CATALOG: &[PhaseBEntry] = &[
@@ -124,6 +202,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".ts", ".tsx"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "javascript",
@@ -140,6 +220,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".js", ".jsx", ".mjs", ".cjs"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "rust",
@@ -156,6 +238,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".rs"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "go",
@@ -176,6 +260,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".go"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "python",
@@ -201,6 +287,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".py"],
         wrapper_version_fallback: "v0.1.0",
         builtin: true,
+        native_phase_b: true,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "java",
@@ -228,54 +316,67 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".java"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "kotlin",
         npm_package: Some("@travsr-plugin/kotlin"),
-        command: "scip-java",
-        args: &["index", "--output", "{output}", "{root}"],
+        // The sidecar drives kotlin-language-server (KLS) over LSP — build-system
+        // agnostic: KLS auto-detects Maven or Gradle and resolves the classpath itself.
+        command: "kotlin-language-server",
+        args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint:
             "travsr lang install kotlin  (security approval required — run interactively)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-java/releases — download scip-java-<version> and place in ~/.travsr/bin/scip-java (chmod +x)",
+        underlying_tool_hint: "travsr lang install kotlin  (auto-installs kotlin-language-server)",
         provider_binary: Some("travsr-lang-kotlin"),
         elevated_hosts: &[
             "repo1.maven.org",
             "repo.maven.apache.org",
             "plugins.gradle.org",
         ],
-        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
-            repo: "sourcegraph/scip-java",
-            asset_fn: scip_java_asset,
-            install_name: "scip-java",
-            version_fallback: "v0.12.3",
-            verify_sha256: true,
+        // KLS ships as server.zip — extracted to ~/.travsr/kls/, wrapper created at
+        // ~/.travsr/bin/kotlin-language-server automatically by `travsr lang install kotlin`.
+        scip_install: ScipInstall::ZipBinary(ZipBinarySpec {
+            repo: "fwcd/kotlin-language-server",
+            asset_fn: kls_asset,
+            extract_dir: "kls",
+            binary_subpath: "server/bin/kotlin-language-server",
+            install_name: "kotlin-language-server",
+            version_fallback: "1.3.13",
         }),
         extensions: &[".kt", ".kts"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "scala",
         npm_package: Some("@travsr-plugin/scala"),
-        command: "scip-scala",
-        args: &["{root}", "--output", "{output}"],
+        // The sidecar injects semanticdbEnabled := true and runs `sbt compile`.
+        // scip-scala is not published to any accessible registry.
+        command: "sbt",
+        args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::RequiresElevated,
         install_hint: "travsr lang install scala  (security approval required — run interactively)",
-        underlying_tool_hint: "https://github.com/sourcegraph/scip-scala  — install via the sbt plugin",
+        underlying_tool_hint: "https://www.scala-sbt.org/download.html — install sbt (usually already present in Scala projects)",
         provider_binary: Some("travsr-lang-scala"),
         elevated_hosts: &[
             "repo1.maven.org",
             "repo.maven.apache.org",
+            "repo.scala-sbt.org",
             "plugins.sbt.org",
-            "jcenter.bintray.com",
         ],
         scip_install: ScipInstall::Manual,
         extensions: &[".scala", ".sbt"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "ruby",
@@ -298,6 +399,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "php",
@@ -314,6 +417,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".php"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "csharp",
@@ -337,6 +442,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".cs", ".csx"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "cpp",
@@ -349,7 +456,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "{output}",
         ],
         output_format: OutputFormat::Scip,
-        sandbox: SandboxRequirement::Standard,
+        sandbox: SandboxRequirement::NativeIpc,
         install_hint: "travsr lang install cpp  (requires compile_commands.json)",
         underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-cpp"),
@@ -364,6 +471,8 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
     PhaseBEntry {
         language: "c",
@@ -376,7 +485,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "{output}",
         ],
         output_format: OutputFormat::Scip,
-        sandbox: SandboxRequirement::Standard,
+        sandbox: SandboxRequirement::NativeIpc,
         install_hint: "travsr lang install c  (requires compile_commands.json)",
         underlying_tool_hint: "https://github.com/sourcegraph/scip-clang/releases — download scip-clang-arm64-darwin or scip-clang-x86_64-linux and place in ~/.travsr/bin/scip-clang (chmod +x)",
         provider_binary: Some("travsr-lang-c"),
@@ -391,6 +500,87 @@ pub static CATALOG: &[PhaseBEntry] = &[
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.1.0",
         builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
+    },
+    PhaseBEntry {
+        language: "swift",
+        npm_package: Some("@travsr-plugin/swift"),
+        command: "travsr-swift-index-emitter",
+        args: &[],
+        output_format: OutputFormat::Scip,
+        sandbox: SandboxRequirement::Standard,
+        install_hint: "travsr lang install swift",
+        underlying_tool_hint: "",
+        provider_binary: Some("travsr-lang-swift"),
+        elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "Travsr-com/travsr-lang",
+            asset_fn: swift_index_emitter_asset,
+            install_name: "travsr-swift-index-emitter",
+            version_fallback: "v0.1.0",
+            verify_sha256: false,
+        }),
+        extensions: &[".swift"],
+        wrapper_version_fallback: "v0.1.0",
+        builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
+    },
+    PhaseBEntry {
+        language: "objectivec",
+        npm_package: Some("@travsr-plugin/objectivec"),
+        command: "travsr-lang-objectivec",
+        args: &[],
+        output_format: OutputFormat::Scip,
+        sandbox: SandboxRequirement::Standard,
+        install_hint: "travsr lang install objectivec",
+        underlying_tool_hint: "",
+        provider_binary: Some("travsr-lang-objectivec"),
+        elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "Travsr-com/travsr-lang",
+            asset_fn: objc_index_emitter_asset,
+            install_name: "travsr-lang-objectivec",
+            version_fallback: "v0.1.0",
+            verify_sha256: false,
+        }),
+        extensions: &[".m", ".mm"],
+        wrapper_version_fallback: "v0.1.0",
+        builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
+    },
+    PhaseBEntry {
+        language: "dart",
+        npm_package: Some("@travsr-plugin/dart"),
+        command: "travsr-dart-index-emitter",
+        args: &[],
+        output_format: OutputFormat::Scip,
+        // travsr-dart-index-emitter is a Dart AOT binary linked against
+        // Security.framework, CoreFoundation, Foundation, and CoreServices.
+        // These macOS system frameworks need unrestricted system-file access
+        // that can't be enumerated in a Seatbelt profile — the AOT runtime
+        // reads its own binary to load the embedded snapshot and sandbox-exec
+        // blocks that, producing "is not an AOT snapshot" errors. NativeIpc
+        // bypasses sandbox-exec and applies ulimit caps only (same as scip-clang).
+        sandbox: SandboxRequirement::NativeIpc,
+        install_hint: "travsr lang install dart",
+        underlying_tool_hint: "",
+        provider_binary: Some("travsr-lang-dart"),
+        elevated_hosts: &[],
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "Travsr-com/travsr-lang",
+            asset_fn: dart_scip_emitter_asset,
+            install_name: "travsr-dart-index-emitter",
+            version_fallback: "v0.1.0",
+            verify_sha256: false,
+        }),
+        extensions: &[".dart"],
+        wrapper_version_fallback: "v0.1.0",
+        builtin: false,
+        native_phase_b: false,
+        has_share_assets: false,
     },
 ];
 
