@@ -19,15 +19,45 @@ use std::time::Duration;
 /// Override with TRAVSR_EMBED_WORKERS env var.
 pub const MAX_EMBED_WORKERS: usize = 8;
 
-/// FT-H2: maximum wall-clock time for one reindex pass.
-/// A large repo with 100 k nodes × 384-dim embeddings at ~500 nodes/s takes
-/// ~3 min; 30 min gives 6× headroom. Override with TRAVSR_REINDEX_TIMEOUT_SECS.
-fn reindex_timeout_secs() -> u64 {
+/// FT-H2: no-progress watchdog window.
+///
+/// Rather than a fixed wall-clock ceiling (which is fatal for large repos —
+/// a 2 M-node monorepo legitimately takes >30 min), we watch the embed.db row
+/// count and only kill the sidecar when it has made *zero* progress for this
+/// many seconds. A healthy sidecar that keeps writing embeddings is never
+/// killed, regardless of total runtime.
+const NO_PROGRESS_SECS: u64 = 600;
+
+/// Optional hard wall-clock ceiling. Unset by default (the no-progress
+/// watchdog is the liveness check). Set TRAVSR_REINDEX_TIMEOUT_SECS to impose
+/// an absolute upper bound on a single reindex pass regardless of progress.
+fn reindex_hard_ceiling_secs() -> Option<u64> {
     std::env::var("TRAVSR_REINDEX_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&x: &u64| x > 0)
-        .unwrap_or(30 * 60)
+}
+
+/// Count embeddings written for `model_id` in the sidecar's embed.db.
+///
+/// Used by the no-progress watchdog to detect a stalled sidecar. Opens
+/// read-only + no-mutex so it never blocks the writer (embed.db is WAL,
+/// synchronous=OFF). Returns None on any error (missing db, locked) so the
+/// caller treats an unreadable count as "no observation this tick" rather than
+/// a stall.
+fn count_model_embeddings(embed_db_path: &Path, model_id: &str) -> Option<u64> {
+    let conn = rusqlite::Connection::open_with_flags(
+        embed_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+        [model_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
+    .map(|n| n as u64)
 }
 
 /// FT-H1: process-level single-flight guard.
@@ -56,23 +86,25 @@ const PHASE1_COVERAGE_FRACTION: f64 = 0.25;
 // ── Catalog types ─────────────────────────────────────────────────────────────
 
 /// One model file the CLI must download from HuggingFace.
-#[derive(Debug, Clone, Copy)]
+/// Catalog DATA, deserialized from `embed_catalog.toml` — not hardcoded in Rust.
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct EmbedModelFile {
     /// Filename placed under `~/.travsr/models/<backend_id>/`.
-    pub name: &'static str,
+    pub name: String,
     /// Path component after the HuggingFace base URL, e.g. `"onnx/model_int8.onnx"`.
-    pub url_path: &'static str,
+    pub url_path: String,
     /// HuggingFace repo slug, e.g. `"BAAI/bge-small-en-v1.5"`.
-    pub hf_repo: &'static str,
+    pub hf_repo: String,
     /// Approximate download size in MiB — shown in `travsr embed init` progress.
     pub size_hint_mb: u32,
 }
 
-/// One downloadable embedding backend.
-#[derive(Debug, Clone, Copy)]
+/// One downloadable embedding backend. Every field is catalog DATA — nothing about a
+/// model (dim, pooling, prefix, input count) is hardcoded in Rust logic.
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct EmbedBackend {
-    pub id: &'static str,
-    pub description: &'static str,
+    pub id: String,
+    pub description: String,
     pub dim: u32,
     /// Model parameter count in millions (e.g. 33 for bge-small).
     pub params_m: u32,
@@ -82,101 +114,119 @@ pub struct EmbedBackend {
     pub ram_mb: u32,
     /// Approximate reindex time in seconds for a 3.5k-node repo.
     pub init_secs: u32,
-    pub binary_name: &'static str,
-    pub github_repo: &'static str,
-    pub version_fallback: &'static str,
-    pub model_files: &'static [EmbedModelFile],
+    pub binary_name: String,
+    pub github_repo: String,
+    pub version_fallback: String,
+    /// Pooling mode written into the sidecar descriptor: `"cls"` | `"mean"`.
+    pub pooling: String,
+    /// Query-only prefix (documents get none). May be empty.
+    #[serde(default)]
+    pub query_prefix: String,
+    /// ONNX input tensor count: 2 (no `token_type_ids`) or 3 (classic BERT).
+    pub n_inputs: u32,
+    /// Matryoshka truncation: 0 = store the full native `dim`; N > 0 = truncate +
+    /// re-normalize each vector to its first N values (must be <= `dim`). Lets one
+    /// model ship both a full-fidelity and a smaller-storage catalog entry.
+    #[serde(default)]
+    pub truncate_dim: u32,
+    /// Informational architecture tag (e.g. `"bert"`).
+    #[serde(default)]
+    pub arch: String,
+    pub model_files: Vec<EmbedModelFile>,
 }
 
-pub const BACKENDS: &[EmbedBackend] = &[
-    EmbedBackend {
-        id: "bge-small-en-v1.5",
-        description: "Fastest. Good for everyday use on any machine. May miss specialised \
-                      technical vocabulary (e.g. algorithm-specific jargon).",
-        dim: 384,
-        params_m: 33,
-        mteb: 62.2,
-        ram_mb: 200,
-        init_secs: 11,
-        binary_name: "travsr-embed",
-        github_repo: "Travsr-com/travsr-embed",
-        version_fallback: "v1.0.0",
-        model_files: &[
-            EmbedModelFile {
-                name: "model.onnx",
-                url_path: "onnx/model.onnx",
-                hf_repo: "BAAI/bge-small-en-v1.5",
-                size_hint_mb: 127,
-            },
-            EmbedModelFile {
-                name: "tokenizer.json",
-                url_path: "tokenizer.json",
-                hf_repo: "BAAI/bge-small-en-v1.5",
-                size_hint_mb: 1,
-            },
-        ],
-    },
-    EmbedBackend {
-        id: "bge-base-en-v1.5",
-        description: "Recommended for technical codebases. 3× parameter increase closes \
-                      specialised vocabulary gaps (algorithm names, domain jargon). \
-                      ~4× slower reindex; same BERT architecture, ARM64 compatible.",
-        dim: 768,
-        params_m: 109,
-        mteb: 63.6,
-        ram_mb: 450,
-        init_secs: 47,
-        binary_name: "travsr-embed",
-        github_repo: "Travsr-com/travsr-embed",
-        version_fallback: "v1.0.0",
-        model_files: &[
-            EmbedModelFile {
-                name: "model.onnx",
-                url_path: "onnx/model.onnx",
-                hf_repo: "BAAI/bge-base-en-v1.5",
-                size_hint_mb: 270,
-            },
-            EmbedModelFile {
-                name: "tokenizer.json",
-                url_path: "tokenizer.json",
-                hf_repo: "BAAI/bge-base-en-v1.5",
-                size_hint_mb: 1,
-            },
-        ],
-    },
-    EmbedBackend {
-        id: "bge-large-en-v1.5",
-        description: "Maximum accuracy. Best semantic coverage for large or multilingual \
-                      codebases. Requires ~1.4 GB RAM; ~13× slower reindex than small. \
-                      Not recommended on machines with less than 8 GB available RAM.",
-        dim: 1024,
-        params_m: 335,
-        mteb: 64.2,
-        ram_mb: 1400,
-        init_secs: 150,
-        binary_name: "travsr-embed",
-        github_repo: "Travsr-com/travsr-embed",
-        version_fallback: "v1.0.0",
-        model_files: &[
-            EmbedModelFile {
-                name: "model.onnx",
-                url_path: "onnx/model.onnx",
-                hf_repo: "BAAI/bge-large-en-v1.5",
-                size_hint_mb: 800,
-            },
-            EmbedModelFile {
-                name: "tokenizer.json",
-                url_path: "tokenizer.json",
-                hf_repo: "BAAI/bge-large-en-v1.5",
-                size_hint_mb: 1,
-            },
-        ],
-    },
-];
+impl EmbedBackend {
+    /// Stored embedding dimension shown to users and used for the HNSW index:
+    /// `truncate_dim` when truncating, else native `dim`.
+    pub fn output_dim(&self) -> u32 {
+        if self.truncate_dim > 0 {
+            self.truncate_dim
+        } else {
+            self.dim
+        }
+    }
+}
+
+/// The merged model catalog: bundled defaults + optional user override, loaded once.
+///
+/// The bundled defaults live in `embed_catalog.toml` (a data file, compiled in via
+/// `include_str!`). A user override at `~/.travsr/embed_catalog.toml` lets a model be
+/// added or tweaked WITHOUT recompiling: an override entry whose `id` matches a
+/// bundled one replaces it; a new `id` is appended.
+///
+/// Returned as `&'static [EmbedBackend]` (backed by a `OnceLock`) so existing callers
+/// that hold `&'static EmbedBackend` keep working unchanged.
+pub fn backends() -> &'static [EmbedBackend] {
+    static CATALOG: std::sync::OnceLock<Vec<EmbedBackend>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(load_catalog).as_slice()
+}
+
+#[derive(serde::Deserialize)]
+struct CatalogFile {
+    #[serde(default)]
+    backend: Vec<EmbedBackend>,
+}
+
+fn load_catalog() -> Vec<EmbedBackend> {
+    // Bundled default catalog — data, not Rust literals.
+    let bundled: CatalogFile = toml::from_str(include_str!("embed_catalog.toml"))
+        .expect("bundled embed_catalog.toml must be valid");
+    let mut list = bundled.backend;
+
+    // Optional user override — never fatal.
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".travsr").join("embed_catalog.toml");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            match toml::from_str::<CatalogFile>(&text) {
+                Ok(user) => {
+                    for ub in user.backend {
+                        match list.iter_mut().find(|b| b.id == ub.id) {
+                            Some(existing) => *existing = ub,
+                            None => list.push(ub),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring invalid ~/.travsr/embed_catalog.toml"
+                ),
+            }
+        }
+    }
+    list
+}
 
 /// Look up a backend by its stable id string.
 pub fn lookup(id: &str) -> Option<&'static EmbedBackend> {
-    BACKENDS.iter().find(|b| b.id == id)
+    backends().iter().find(|b| b.id == id)
+}
+
+/// Write the per-model descriptor (`model.toml`) next to the downloaded model files.
+///
+/// This is the bridge to the sidecar: `travsr embed init` calls it after downloading a
+/// model so the sidecar reads dim/pooling/prefix/inputs from config, never hardcoded.
+pub fn write_model_descriptor(model_dir: &Path, b: &EmbedBackend) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    #[derive(serde::Serialize)]
+    struct Descriptor<'a> {
+        dim: u32,
+        pooling: &'a str,
+        query_prefix: &'a str,
+        n_inputs: u32,
+        truncate_dim: u32,
+    }
+    let content = toml::to_string(&Descriptor {
+        dim: b.dim,
+        pooling: &b.pooling,
+        query_prefix: &b.query_prefix,
+        n_inputs: b.n_inputs,
+        truncate_dim: b.truncate_dim,
+    })
+    .context("serialize model descriptor")?;
+    let path = model_dir.join("model.toml");
+    std::fs::write(&path, content)
+        .with_context(|| format!("writing model descriptor to {}", path.display()))
 }
 
 // ── Orchestrator types ────────────────────────────────────────────────────────
@@ -627,8 +677,14 @@ fn run_parallel_reindex(
             return Err(anyhow::Error::from(e).context("failed to spawn embed sidecar"));
         }
     };
-    let timeout = reindex_timeout_secs();
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
+    // No-progress watchdog: only kill the sidecar when the embed.db row count
+    // for this model has not grown for NO_PROGRESS_SECS. A healthy sidecar that
+    // keeps writing is never killed, so large repos are no longer capped by a
+    // fixed wall-clock limit. An optional env-set hard ceiling still applies.
+    let start = std::time::Instant::now();
+    let hard_ceiling = reindex_hard_ceiling_secs();
+    let mut last_count = count_model_embeddings(embed_db_path, model_id).unwrap_or(0);
+    let mut last_progress = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(s)) if s.success() => {
@@ -640,15 +696,46 @@ fn run_parallel_reindex(
                 anyhow::bail!("embed sidecar exited with code {:?}", s.code());
             }
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                let now = std::time::Instant::now();
+
+                // Observe progress. An unreadable count (None) is treated as "no
+                // observation" — it neither resets nor trips the watchdog.
+                if let Some(cur) = count_model_embeddings(embed_db_path, model_id) {
+                    if cur > last_count {
+                        last_count = cur;
+                        last_progress = now;
+                    }
+                }
+
+                let stalled = now.duration_since(last_progress).as_secs();
+                if stalled >= NO_PROGRESS_SECS {
                     tracing::warn!(
-                        timeout_secs = timeout,
-                        "embed: reindex sidecar timed out — killing"
+                        stalled_secs = stalled,
+                        embedded = last_count,
+                        "embed: reindex sidecar made no progress — killing"
                     );
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!("embed sidecar reindex timed out after {timeout}s");
+                    anyhow::bail!(
+                        "embed sidecar stalled: no new embeddings for {stalled}s \
+                         (stuck at {last_count})"
+                    );
                 }
+
+                if let Some(ceiling) = hard_ceiling {
+                    let elapsed = now.duration_since(start).as_secs();
+                    if elapsed >= ceiling {
+                        tracing::warn!(
+                            ceiling_secs = ceiling,
+                            embedded = last_count,
+                            "embed: reindex sidecar hit hard wall-clock ceiling — killing"
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!("embed sidecar reindex exceeded hard ceiling of {ceiling}s");
+                    }
+                }
+
                 std::thread::sleep(Duration::from_millis(500));
             }
             Err(e) => {
@@ -849,12 +936,62 @@ fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
     let backend_id = repo_backend_id(repo_root)?;
     let backend = lookup(&backend_id)?;
     let home = dirs::home_dir()?;
-    let bin_path = home.join(".travsr").join("bin").join(backend.binary_name);
+    let bin_path = home.join(".travsr").join("bin").join(&backend.binary_name);
     if !bin_path.exists() {
         return None;
     }
     let embed_db_path = db_path.with_file_name("embed.db");
     Some((bin_path, embed_db_path, backend_id))
+}
+
+/// Probe the repo's active embedding model with `queries` against its freshly-built
+/// HNSW and return each query's **top-1 cosine** (the maximum similarity of its
+/// nearest neighbour), in input order.
+///
+/// Used by the CLI to auto-calibrate the model-relative semantic floors (see
+/// `travsr-mcp` `seed::Calibration`): the caller measures the model's own
+/// query↔passage cosine scale on this corpus, label-free, so *any* model — bundled
+/// or user-added — self-calibrates on reindex with no hand-tuned constants.
+///
+/// Store-free by design (this crate does not depend on `travsr-store`): the caller
+/// supplies the query strings and applies the percentile policy. Spawns exactly one
+/// sidecar (single model load), warms it, then issues one KNN per query.
+///
+/// Returns `None` when no backend/binary is configured (calibration then skipped →
+/// the reader falls back to the reference-model identity). A query that errors or
+/// has no neighbour contributes `0.0`, keeping the output aligned with the input so
+/// the caller can split it. Best-effort: never panics; bounded by the sidecar's own
+/// per-call watchdog.
+pub fn probe_top1_cosines(db_path: &Path, queries: &[String]) -> Option<Vec<f32>> {
+    if queries.is_empty() {
+        return Some(Vec::new());
+    }
+    // `db_path` is graph.db; the sidecar derives embed.db from it (see EmbedSidecar).
+    let (bin_path, _embed_db, model_id) = resolve_backend(db_path)?;
+    let sidecar = crate::embed_sidecar::EmbedSidecar::spawn(&bin_path, db_path, &model_id).ok()?;
+
+    // Warm the model + HNSW once so the first real probe isn't charged cold-start
+    // latency inside its watchdog window.
+    let _ = sidecar.knn("warmup", 1, &model_id);
+
+    let cosines = queries
+        .iter()
+        .map(|q| {
+            sidecar
+                .knn(q, 5, &model_id)
+                .ok()
+                .and_then(|pairs| {
+                    pairs
+                        .into_iter()
+                        .map(|(_, c)| c)
+                        .fold(None, |acc: Option<f32>, c| {
+                            Some(acc.map_or(c, |a| a.max(c)))
+                        })
+                })
+                .unwrap_or(0.0)
+        })
+        .collect();
+    Some(cosines)
 }
 
 // ── Config helpers ────────────────────────────────────────────────────────────
@@ -911,8 +1048,8 @@ mod tests {
     #[test]
     fn catalog_ids_are_unique() {
         let mut seen = std::collections::HashSet::new();
-        for b in BACKENDS {
-            assert!(seen.insert(b.id), "duplicate backend id: {}", b.id);
+        for b in backends() {
+            assert!(seen.insert(b.id.as_str()), "duplicate backend id: {}", b.id);
         }
     }
 

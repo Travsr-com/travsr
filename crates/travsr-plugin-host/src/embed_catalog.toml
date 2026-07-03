@@ -1,0 +1,135 @@
+# Bundled default embed-model catalog (compiled in via include_str!).
+# Values live here as DATA, not hardcoded in Rust logic. Users can override or add
+# models at runtime — with no recompile — via ~/.travsr/embed_catalog.toml
+# (entries with a matching `id` replace the bundled one; new ids are appended).
+
+[[backend]]
+id               = "arctic-embed-m-v1.5"
+description      = "Recommended. Best retrieval accuracy in our benchmarks (hit@1 0.94). Snowflake arctic-embed, standard BERT — full speed, Apache-2.0. 768-dim."
+dim              = 768
+params_m         = 109
+mteb             = 65.0
+ram_mb           = 450
+init_secs        = 47
+binary_name      = "travsr-embed"
+github_repo      = "Travsr-com/travsr-embed"
+version_fallback = "v1.0.0"
+pooling          = "cls"
+query_prefix     = "Represent this sentence for searching relevant passages: "
+n_inputs         = 2
+arch             = "bert"
+  [[backend.model_files]]
+  name         = "model.onnx"
+  url_path     = "onnx/model.onnx"
+  hf_repo      = "Snowflake/snowflake-arctic-embed-m-v1.5"
+  size_hint_mb = 416
+  [[backend.model_files]]
+  name         = "tokenizer.json"
+  url_path     = "tokenizer.json"
+  hf_repo      = "Snowflake/snowflake-arctic-embed-m-v1.5"
+  size_hint_mb = 2
+
+[[backend]]
+id               = "arctic-embed-m-v1.5-256"
+description      = "arctic-embed-m truncated to 256-dim (Matryoshka). ~2.7x smaller vectors/HNSW than full 768 with minimal accuracy loss. Same download; pick this to save storage."
+dim              = 768
+truncate_dim     = 256
+params_m         = 109
+mteb             = 64.0
+ram_mb           = 450
+init_secs        = 47
+binary_name      = "travsr-embed"
+github_repo      = "Travsr-com/travsr-embed"
+version_fallback = "v1.0.0"
+pooling          = "cls"
+query_prefix     = "Represent this sentence for searching relevant passages: "
+n_inputs         = 2
+arch             = "bert"
+  [[backend.model_files]]
+  name         = "model.onnx"
+  url_path     = "onnx/model.onnx"
+  hf_repo      = "Snowflake/snowflake-arctic-embed-m-v1.5"
+  size_hint_mb = 416
+  [[backend.model_files]]
+  name         = "tokenizer.json"
+  url_path     = "tokenizer.json"
+  hf_repo      = "Snowflake/snowflake-arctic-embed-m-v1.5"
+  size_hint_mb = 2
+
+[[backend]]
+id               = "bge-small-en-v1.5"
+description      = "Fastest. Good for everyday use on any machine. May miss specialised technical vocabulary (e.g. algorithm-specific jargon)."
+dim              = 384
+params_m         = 33
+mteb             = 62.2
+ram_mb           = 200
+init_secs        = 11
+binary_name      = "travsr-embed"
+github_repo      = "Travsr-com/travsr-embed"
+version_fallback = "v1.0.0"
+pooling          = "cls"
+query_prefix     = "Represent this sentence: "
+n_inputs         = 3
+arch             = "bert"
+  [[backend.model_files]]
+  name         = "model.onnx"
+  url_path     = "onnx/model.onnx"
+  hf_repo      = "BAAI/bge-small-en-v1.5"
+  size_hint_mb = 127
+  [[backend.model_files]]
+  name         = "tokenizer.json"
+  url_path     = "tokenizer.json"
+  hf_repo      = "BAAI/bge-small-en-v1.5"
+  size_hint_mb = 1
+
+[[backend]]
+id               = "bge-base-en-v1.5"
+description      = "Technical codebases. 3x parameter increase closes specialised vocabulary gaps. ~4x slower reindex; same BERT architecture, ARM64 compatible."
+dim              = 768
+params_m         = 109
+mteb             = 63.6
+ram_mb           = 450
+init_secs        = 47
+binary_name      = "travsr-embed"
+github_repo      = "Travsr-com/travsr-embed"
+version_fallback = "v1.0.0"
+pooling          = "cls"
+query_prefix     = "Represent this sentence: "
+n_inputs         = 3
+arch             = "bert"
+  [[backend.model_files]]
+  name         = "model.onnx"
+  url_path     = "onnx/model.onnx"
+  hf_repo      = "BAAI/bge-base-en-v1.5"
+  size_hint_mb = 270
+  [[backend.model_files]]
+  name         = "tokenizer.json"
+  url_path     = "tokenizer.json"
+  hf_repo      = "BAAI/bge-base-en-v1.5"
+  size_hint_mb = 1
+
+[[backend]]
+id               = "bge-large-en-v1.5"
+description      = "Maximum BGE accuracy. Best semantic coverage for large or multilingual codebases. Requires ~1.4 GB RAM; ~13x slower reindex than small."
+dim              = 1024
+params_m         = 335
+mteb             = 64.2
+ram_mb           = 1400
+init_secs        = 150
+binary_name      = "travsr-embed"
+github_repo      = "Travsr-com/travsr-embed"
+version_fallback = "v1.0.0"
+pooling          = "cls"
+query_prefix     = "Represent this sentence: "
+n_inputs         = 3
+arch             = "bert"
+  [[backend.model_files]]
+  name         = "model.onnx"
+  url_path     = "onnx/model.onnx"
+  hf_repo      = "BAAI/bge-large-en-v1.5"
+  size_hint_mb = 800
+  [[backend.model_files]]
+  name         = "tokenizer.json"
+  url_path     = "tokenizer.json"
+  hf_repo      = "BAAI/bge-large-en-v1.5"
+  size_hint_mb = 1
