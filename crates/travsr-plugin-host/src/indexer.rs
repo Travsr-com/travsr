@@ -105,7 +105,19 @@ impl PluginIndexer {
             .parse_file(abs_path, vname_path, &corpus, "")?
         {
             Some(r) => r,
-            None => return Ok(ParseOutput::default()),
+            None => {
+                // Data formats have no sidecar plugin — fall back to the
+                // built-in Level 1 file-node emitter (Phase A only).
+                let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if Language::from_extension(ext).is_some_and(|l| l.is_data_format()) {
+                    return travsr_analysis::data_format::parse(&corpus, abs_path, vname_path)
+                        .map_err(|e| IndexError::Parse {
+                            file: abs_path.display().to_string(),
+                            message: e.to_string(),
+                        });
+                }
+                return Ok(ParseOutput::default());
+            }
         };
 
         self.cache.insert(key, resp.clone());
@@ -844,8 +856,16 @@ mod tests {
             Language::Swift,
             Language::Dart,
             Language::ObjectiveC,
+            Language::Json,
+            Language::Yaml,
+            Language::Toml,
+            Language::Xml,
         ];
         for v in variants {
+            if v.is_data_format() {
+                // Phase-A-only formats intentionally absent from the Phase B catalog.
+                continue;
+            }
             assert!(
                 catalog_names.contains(v.as_str()),
                 "Language::{}::as_str() = {:?} not found in CATALOG — P1 would silently skip it",

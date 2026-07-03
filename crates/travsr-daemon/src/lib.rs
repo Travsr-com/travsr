@@ -1412,7 +1412,11 @@ fn collect_present_languages_and_paths(
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         if let Some(lang) = Language::from_extension(ext) {
-            langs.insert(lang.as_str().to_string());
+            // Data formats index in Phase A only — exclude from the Phase B
+            // present_languages set so P1 never attempts a nonexistent tool.
+            if !lang.is_data_format() {
+                langs.insert(lang.as_str().to_string());
+            }
             paths.push(p);
         }
     }
