@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ignore::WalkBuilder;
-use travsr_analysis::skeleton::{skeleton_for_node, EmbedRichness};
+use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_file, ingest_lsif, link_imports, link_imports_go, link_imports_python_fs,
@@ -471,33 +471,70 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     if nodes.is_empty() {
         return;
     }
-    tracing::debug!(
+    tracing::info!(
         count = nodes.len(),
         ?richness,
-        "computing embed_text for nodes"
+        "regenerating embed_text (parse-once-per-file, parallel)"
     );
-    const BATCH: usize = 500;
-    let mut pairs: Vec<(travsr_core::NodeId, String)> = Vec::with_capacity(BATCH);
+
+    // Canonicalize the repo root once (skeleton_for_node did it per node).
+    let canon_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+
+    // Group nodes by source file so each file is tree-sitter-parsed exactly once
+    // instead of once per symbol — the O(nodes) re-parse that made this ~20 min on
+    // a 130k-node repo (a file with N symbols was read + parsed N times).
+    let mut by_file: std::collections::HashMap<&str, Vec<&travsr_core::Node>> =
+        std::collections::HashMap::new();
     for node in &nodes {
-        if let Some(skel) = skeleton_for_node(node, repo_root) {
-            let text = skel.to_embed_text(
-                &node.kind,
-                &node.vname.signature,
-                &node.vname.path,
-                richness,
-            );
-            pairs.push((node.id, text));
-            if pairs.len() >= BATCH {
-                if let Err(e) = store.write_embed_texts_batch(&pairs) {
-                    tracing::warn!("update_embed_texts: batch write failed: {e}");
-                }
-                pairs.clear();
-            }
+        if !node.vname.path.is_empty() {
+            by_file
+                .entry(node.vname.path.as_str())
+                .or_default()
+                .push(node);
         }
     }
-    if !pairs.is_empty() {
-        if let Err(e) = store.write_embed_texts_batch(&pairs) {
-            tracing::warn!("update_embed_texts: final batch write failed: {e}");
+    let files: Vec<(&str, Vec<&travsr_core::Node>)> = by_file.into_iter().collect();
+    if files.is_empty() {
+        return;
+    }
+
+    // Parse + build text in parallel across files (tree-sitter parsing is CPU-bound,
+    // so this scales with cores — the reason a single-threaded regen only used 1 CPU).
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let files_ref = &files;
+    let canon_ref = canon_root.as_path();
+    let pairs: Vec<(travsr_core::NodeId, String)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    let mut i = t;
+                    while i < files_ref.len() {
+                        let (path, fnodes) = &files_ref[i];
+                        local.extend(embed_texts_for_file(
+                            repo_root, canon_ref, path, fnodes, richness,
+                        ));
+                        i += nthreads;
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+
+    // Write path is single-threaded SQLite; batch to keep transactions small.
+    for chunk in pairs.chunks(500) {
+        if let Err(e) = store.write_embed_texts_batch(chunk) {
+            tracing::warn!("update_embed_texts: batch write failed: {e}");
         }
     }
 }
@@ -1499,8 +1536,11 @@ fn maybe_spawn_embed(
         return;
     }
 
-    // Phase 1 complete — handle Phase 2.
-    if phase2_spawned.load(Ordering::Relaxed) {
+    // Phase 1 complete — handle Phase 2. Skip only while a Phase 2 run we launched
+    // is STILL in progress. If it finished, failed, or timed out (in_flight=false)
+    // with work remaining, fall through so the next tick retries — otherwise a
+    // single Phase 2 timeout would strand the repo forever (phase2_spawned latched).
+    if phase2_spawned.load(Ordering::Relaxed) && travsr_plugin_host::embed_reindex_in_flight() {
         return;
     }
 
@@ -3180,7 +3220,12 @@ fn handle_control_message(
             let embed_line = if let Some(backend_id) =
                 travsr_plugin_host::repo_backend_id(repo_root)
             {
-                let threshold = 3u32;
+                // Derive the same Phase-1 threshold `embed status` and the actual
+                // embed logic use, so the phase split here isn't a different number.
+                let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(
+                    &repo_root.join(".travsr/graph.db"),
+                )
+                .unwrap_or(3);
                 match s.embed_progress(&backend_id, threshold) {
                     Ok((total, embedded, phase1_total, phase1_done)) => {
                         let phase2_done = embedded.saturating_sub(phase1_done);
@@ -3306,7 +3351,7 @@ pub fn try_inject_embed_hook(
     db_path: &Path,
 ) {
     use travsr_plugin_host::{
-        active_backend_id, lookup_embed_backend, EmbedSupervisor, EMBED_BACKENDS,
+        active_backend_id, embed_backends, lookup_embed_backend, EmbedSupervisor,
     };
 
     let Some(home) = dirs::home_dir() else {
@@ -3319,14 +3364,14 @@ pub fn try_inject_embed_hook(
     let backend = active_backend_id()
         .as_deref()
         .and_then(lookup_embed_backend)
-        .or_else(|| EMBED_BACKENDS.first())
-        .copied();
+        .or_else(|| embed_backends().first())
+        .cloned();
     let Some(backend) = backend else {
         return;
     };
 
-    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
-    let supervisor = EmbedSupervisor::try_start(&binary, db_path, backend.id);
+    let binary = home.join(".travsr").join("bin").join(&backend.binary_name);
+    let supervisor = EmbedSupervisor::try_start(&binary, db_path, &backend.id);
     if !supervisor.is_active() {
         return;
     }
