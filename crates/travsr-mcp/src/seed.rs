@@ -130,6 +130,96 @@ fn semantic_veto_floor() -> f32 {
         .unwrap_or(0.55)
 }
 
+/// Per-(model, corpus) semantic-floor calibration.
+///
+/// Every absolute cosine floor in this module (`SEMANTIC_ORACLE_MIN`,
+/// `SEMANTIC_ABS_FLOOR`, `semantic_veto_floor`, `confirm_anchor_floor`,
+/// `semantic_promote_strong`, …) was tuned to **bge-small**'s query↔passage cosine
+/// scale — its answerable queries sit ≳0.77 and its nonsense leak ≲0.64. A model
+/// with a different scale (arctic-embed-256's Matryoshka-truncated vectors and
+/// asymmetric query prefix land materially lower) would over- or under-abstain
+/// against those fixed numbers: the k8s bench showed literal symbol queries whose
+/// correct node was retrieved but demoted to "speculative guesses".
+///
+/// `Calibration` carries the active model's two measured anchors and maps each
+/// reference-model floor into the model's own cosine space, preserving the floor's
+/// *position within the answerable band*. It is derived automatically, label-free,
+/// at reindex (see `travsr_plugin_host::calibrate_semantic_floors`) and stored in
+/// graph.db meta. When absent/degenerate the mapping is the identity, so bge-small
+/// and every un-calibrated repo behave byte-for-byte as before.
+///
+/// Generic by construction: any model — bundled, future-release, or a user's own
+/// `embed_catalog.toml` entry — self-calibrates on its first reindex with no manual
+/// numbers. The floors are authored once (below), in the reference scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Calibration {
+    /// "Confident but unrelated" cosine scale (nonsense-leak p95).
+    pub lo: f32,
+    /// "Query matches its answer" cosine scale (self-match p50).
+    pub hi: f32,
+}
+
+impl Calibration {
+    /// bge-small reference anchors the floors in this module were tuned to, in the
+    /// same measurement space the auto-calibration probe uses:
+    ///   • `REF_LO` = bge's "confident but unrelated" (nonsense) cosine scale — the
+    ///     level the veto / abstain floors sit just above (`semantic_veto_floor`,
+    ///     `SEMANTIC_ABS_FLOOR` = 0.55).
+    ///   • `REF_HI` = bge's "a query matches its answer" (answerable) cosine scale —
+    ///     the level the promote floor targets (`semantic_promote_strong` ≈ 0.72,
+    ///     answerable band ≈ 0.77).
+    /// The probe measures each model's equivalents (nonsense p95, self-match p50); a
+    /// floor authored as a bge cosine then maps by the ratio of the two bands. They
+    /// MUST bracket the floors so no floor extrapolates below `lo` — that is what made
+    /// the veto vanish on a compressed model (the k8s arctic-256 abstain regression).
+    const REF_LO: f32 = 0.55;
+    const REF_HI: f32 = 0.77;
+
+    /// Identity mapping — the reference model and un-calibrated repos.
+    pub(crate) const IDENTITY: Calibration = Calibration {
+        lo: Self::REF_LO,
+        hi: Self::REF_HI,
+    };
+
+    /// Load `{lo, hi}` from graph.db meta (`embed_cos_lo` / `embed_cos_hi`).
+    /// Falls back to [`Self::IDENTITY`] when absent, unparseable, non-finite, or
+    /// degenerate (`hi <= lo`) — so a missing/corrupt calibration can only ever
+    /// reproduce today's behaviour, never break it.
+    pub(crate) fn load(store: &SqliteStore) -> Calibration {
+        let g = |k: &str| -> Option<f32> {
+            store
+                .get_meta(k)
+                .ok()
+                .flatten()
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .filter(|x| x.is_finite())
+        };
+        match (g("embed_cos_lo"), g("embed_cos_hi")) {
+            (Some(lo), Some(hi)) if hi > lo => Calibration { lo, hi },
+            _ => Self::IDENTITY,
+        }
+    }
+
+    /// Map a reference-model cosine *threshold* into this model's cosine space,
+    /// preserving its fractional position within the `[REF_LO, REF_HI]` band.
+    /// Identity when `self == IDENTITY`. Clamped to a valid cosine `[-1, 1]`.
+    ///
+    /// `O(1)`.
+    #[inline]
+    pub(crate) fn map(&self, ref_cos: f32) -> f32 {
+        let frac = (ref_cos - Self::REF_LO) / (Self::REF_HI - Self::REF_LO);
+        (self.lo + frac * (self.hi - self.lo)).clamp(-1.0, 1.0)
+    }
+
+    /// Scale a band-relative *width* (e.g. `SEMANTIC_REL_DELTA`) into this model's
+    /// band, so a "keep within Δ of the top" rule stays proportional to the model's
+    /// answerable-band width rather than an absolute cosine gap. `O(1)`.
+    #[inline]
+    pub(crate) fn map_delta(&self, ref_delta: f32) -> f32 {
+        ref_delta * (self.hi - self.lo) / (Self::REF_HI - Self::REF_LO)
+    }
+}
+
 // ── Core types ────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -399,6 +489,10 @@ fn classify_confidence(
     // only for the per-anchor `embed_agrees` / `embed_confirmed_specific` lookups.
     anchor_oracle: &HashMap<NodeId, f32>,
     scored_ids: &std::collections::HashSet<NodeId>,
+    // Model-relative floor calibration. All cosine thresholds below are authored in
+    // the bge-small reference scale and mapped into the active model's scale via
+    // `cal`; `Calibration::IDENTITY` reproduces the original absolute floors.
+    cal: &Calibration,
 ) -> Confidence {
     let rare_max = rare_anchor_max();
     let cov_strong = coverage_strong();
@@ -413,8 +507,8 @@ fn classify_confidence(
     // When the oracle is absent or weak we have no embedding opinion and trust
     // lexical evidence unchanged — the FTS-only path is identical to before.
     let oracle_top = knn_oracle.values().copied().fold(0.0_f32, f32::max);
-    let oracle_confident = oracle_top >= SEMANTIC_ORACLE_MIN;
-    let floor = (oracle_top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
+    let oracle_confident = oracle_top >= cal.map(SEMANTIC_ORACLE_MIN);
+    let floor = (oracle_top - cal.map_delta(SEMANTIC_REL_DELTA)).max(cal.map(SEMANTIC_ABS_FLOOR));
     // RFC-019: absence is no longer disagreement. With the direct-cosine oracle we
     // MEASURE every specific anchor; an anchor's node that is absent from the oracle
     // *after* we tried to score it (`scored_ids`) is genuinely unscoreable
@@ -464,7 +558,7 @@ fn classify_confidence(
     // low-coverage query clears ("Load mutationg manifests" → "manifests" ≈0.71) but
     // the salad word does not. High-coverage exact queries are unaffected: they pass
     // through `has_specific_anchor` (coverage ≥ cov_strong) regardless.
-    let confirm_floor = floor.max(confirm_anchor_floor());
+    let confirm_floor = floor.max(cal.map(confirm_anchor_floor()));
     let embed_confirmed_specific = oracle_confident
         && terms.iter().any(|t| {
             t.resolved
@@ -484,7 +578,7 @@ fn classify_confidence(
     let oracle_present = !knn_oracle.is_empty();
     let n_oracle_near = knn_oracle.values().filter(|&&c| c >= floor).count();
     let semantic_strong = has_any_seeds
-        && oracle_top >= semantic_promote_strong()
+        && oracle_top >= cal.map(semantic_promote_strong())
         && n_oracle_near >= semantic_promote_min_near();
 
     // Fix 1c: semantic veto. Embeddings ran and are confident nothing in the
@@ -493,7 +587,8 @@ fn classify_confidence(
     // windowsill" → 0.49) is then a false positive → abstain. A rare exact anchor
     // is exempt: a precise symbol the user literally typed is honoured even when
     // the model is weak on it.
-    let semantic_veto = oracle_present && oracle_top < semantic_veto_floor() && !has_rare_anchor;
+    let semantic_veto =
+        oracle_present && oracle_top < cal.map(semantic_veto_floor()) && !has_rare_anchor;
 
     if has_rare_anchor && coverage >= cov_strong {
         Confidence::Exact
@@ -585,15 +680,19 @@ const SEMANTIC_MIN_KEEP: usize = 5;
 ///
 /// No-op when the oracle is empty (embeddings off/degraded) or not confident
 /// (top cosine < `SEMANTIC_ORACLE_MIN`) — lexical evidence then stands unchanged.
-fn semantic_validate(seeds: Vec<Seed>, oracle: &HashMap<NodeId, f32>) -> Vec<Seed> {
+fn semantic_validate(
+    seeds: Vec<Seed>,
+    oracle: &HashMap<NodeId, f32>,
+    cal: &Calibration,
+) -> Vec<Seed> {
     if oracle.is_empty() || seeds.is_empty() {
         return seeds;
     }
     let top = oracle.values().copied().fold(0.0_f32, f32::max);
-    if top < SEMANTIC_ORACLE_MIN {
+    if top < cal.map(SEMANTIC_ORACLE_MIN) {
         return seeds; // oracle not confident — trust lexical evidence
     }
-    let floor = (top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
+    let floor = (top - cal.map_delta(SEMANTIC_REL_DELTA)).max(cal.map(SEMANTIC_ABS_FLOOR));
 
     let mut scored: Vec<(Seed, f32)> = seeds
         .into_iter()
@@ -775,6 +874,11 @@ pub(crate) fn build_seed_set(
     let intent = classify_intent(query);
     let content_tokens = tokenize_query(query);
     let n_content = content_tokens.len();
+
+    // Model-relative floor calibration for this repo's active embedding model.
+    // Identity (no-op) when the repo is un-calibrated or embedded with the bge-small
+    // reference model — so the FTS-only and bge-small paths are byte-for-byte unchanged.
+    let cal = Calibration::load(store);
 
     // Corpus size for IDF.  Clamp to ≥ 1 000 so the formula remains meaningful in
     // small repos / in-memory test stores: idf_weight(1, 1) collapses to the 0.05 floor,
@@ -1016,7 +1120,7 @@ pub(crate) fn build_seed_set(
     // coincidence ("literal", "semantic") resolve to confident FTS anchors that
     // are semantically unrelated to intent; the whole-query embedding is the only
     // signal that detects this. No-op when embeddings are absent/degraded.
-    let mut seeds = semantic_validate(seeds, &augmented_oracle);
+    let mut seeds = semantic_validate(seeds, &augmented_oracle, &cal);
 
     // ── RFC-019: seed re-rank (contamination gate + anchor-callee seeding) ─────
     // Only when the query named an exact symbol (an exact anchor exists) — never on
@@ -1044,7 +1148,7 @@ pub(crate) fn build_seed_set(
         // missed). Structurally-connected seeds and un-scoreable seeds are always
         // kept, and the gate never fires on pure-NL queries (no exact anchor), so
         // conceptual retrieval is untouched.
-        let rescue = disjoint_rescue_cos();
+        let rescue = cal.map(disjoint_rescue_cos());
         seeds.retain(|s| {
             if s.source == SeedSource::Exact {
                 return true;
@@ -1085,7 +1189,7 @@ pub(crate) fn build_seed_set(
     // left unchanged (structural seeds like anchor callees keep their justification).
     // No-op when the oracle is cold/absent.
     let oracle_top = augmented_oracle.values().copied().fold(0.0_f32, f32::max);
-    let oracle_confident = oracle_top >= SEMANTIC_ORACLE_MIN;
+    let oracle_confident = oracle_top >= cal.map(SEMANTIC_ORACLE_MIN);
     if oracle_confident {
         for s in seeds.iter_mut() {
             if s.source != SeedSource::Exact {
@@ -1109,7 +1213,8 @@ pub(crate) fn build_seed_set(
         // constant matched for "HorizontalPodAutoscaler reconcile loop") must not
         // outrank the semantically-correct neighbour (`reconcileAutoscaler`).
         // No-op when the oracle is cold/absent — `agrees` is vacuously true.
-        let cos_floor = (oracle_top - SEMANTIC_REL_DELTA).max(SEMANTIC_ABS_FLOOR);
+        let cos_floor =
+            (oracle_top - cal.map_delta(SEMANTIC_REL_DELTA)).max(cal.map(SEMANTIC_ABS_FLOOR));
         for s in seeds.iter_mut() {
             if s.source == SeedSource::Exact {
                 let agrees = !oracle_confident
@@ -1130,6 +1235,7 @@ pub(crate) fn build_seed_set(
         knn_oracle,        // cluster signals: KNN neighbours only
         &augmented_oracle, // per-anchor agreement: neighbours ∪ scored anchors
         &scored_ids,
+        &cal,
     );
 
     SeedSet {
@@ -1332,8 +1438,73 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(c, Confidence::None);
+    }
+
+    #[test]
+    fn calibration_map_is_identity_at_reference() {
+        let id = Calibration::IDENTITY;
+        for &x in &[0.55_f32, 0.58, 0.64, 0.66, 0.72, 0.77] {
+            assert!((id.map(x) - x).abs() < 1e-6, "map({x}) must be identity");
+        }
+        assert!((id.map_delta(0.13) - 0.13).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calibration_map_scales_compressed_model() {
+        // A model whose answerable band sits lower/narrower than bge-small's.
+        let cal = Calibration { lo: 0.45, hi: 0.62 };
+        assert!((cal.map(Calibration::REF_LO) - 0.45).abs() < 1e-6);
+        assert!((cal.map(Calibration::REF_HI) - 0.62).abs() < 1e-6);
+        // Interior floor stays strictly inside the mapped band, monotonic.
+        let m = cal.map(0.66);
+        assert!(m > 0.45 && m < 0.62);
+        // A band-relative width scales by the band ratio: 0.13 * (0.17 / 0.22).
+        let expected = 0.13 * (0.62 - 0.45) / (Calibration::REF_HI - Calibration::REF_LO);
+        assert!((cal.map_delta(0.13) - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn calibration_recovers_low_cosine_answerable_query() {
+        // Regression for the k8s arctic-256 over-abstention (bench L4/C4): a genuinely
+        // answerable conceptual query whose whole cosine scale is lower than bge-small's.
+        // Top cluster ~0.62 with a coherent near set, no lexical anchor.
+        let mut oracle = HashMap::new();
+        oracle.insert(NodeId(1), 0.62);
+        oracle.insert(NodeId(2), 0.60);
+        oracle.insert(NodeId(3), 0.58);
+        let scored = std::collections::HashSet::new();
+
+        // Reference (bge-small) floors demand oracle_top >= 0.72 to promote → abstains
+        // even though this is the model's *answerable* band. This is the bug.
+        let ref_c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+        );
+        assert_eq!(
+            ref_c,
+            Confidence::None,
+            "absolute bge-small floors over-abstain on a lower-scale model"
+        );
+
+        // Auto-calibrated to this model's band → the same cosines clear the mapped
+        // promote floor and the query is correctly Strong (not demoted to guesses).
+        let cal = Calibration { lo: 0.45, hi: 0.62 };
+        let got = classify_confidence(&[], 0.0, 0.0, true, true, &oracle, &oracle, &scored, &cal);
+        assert_eq!(
+            got,
+            Confidence::Strong,
+            "model-relative floors recover the answerable query"
+        );
     }
 
     #[test]
@@ -1354,6 +1525,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(c, Confidence::Exact);
     }
@@ -1376,6 +1548,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(c, Confidence::Strong);
     }
@@ -1415,6 +1588,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1447,6 +1621,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1476,7 +1651,17 @@ mod tests {
         // Strong must come from the anchor path).
         let oracle = HashMap::from([(NodeId(999), 0.79_f32)]);
         let scored: std::collections::HashSet<NodeId> = [anchor].into_iter().collect();
-        let c = classify_confidence(&terms, 1.0, 0.4, true, true, &oracle, &oracle, &scored);
+        let c = classify_confidence(
+            &terms,
+            1.0,
+            0.4,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+        );
         assert_eq!(
             c,
             Confidence::Strong,
@@ -1508,6 +1693,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1549,6 +1735,7 @@ mod tests {
             &cluster,
             &anchor_oracle,
             &scored,
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1559,7 +1746,15 @@ mod tests {
         // Same shape, anchor now in the answerable band (0.71) → Strong.
         let anchor_ok = HashMap::from([(sem, 0.71_f32)]);
         let c2 = classify_confidence(
-            &terms, 0.25, 15.0, true, true, &cluster, &anchor_ok, &scored,
+            &terms,
+            0.25,
+            15.0,
+            true,
+            true,
+            &cluster,
+            &anchor_ok,
+            &scored,
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c2,
@@ -1609,6 +1804,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1651,6 +1847,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1678,6 +1875,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(c, Confidence::Weak);
     }
@@ -1702,6 +1900,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1731,6 +1930,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1759,6 +1959,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1800,6 +2001,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1833,6 +2035,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1865,6 +2068,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1896,6 +2100,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1926,6 +2131,7 @@ mod tests {
             &oracle,
             &oracle,
             &std::collections::HashSet::new(),
+            &Calibration::IDENTITY,
         );
         assert_eq!(
             c,
@@ -1949,7 +2155,7 @@ mod tests {
     fn semantic_validate_noop_when_oracle_empty() {
         // Embeddings off/degraded → oracle empty → lexical seeds untouched.
         let seeds = vec![seed(1, SeedSource::Lexical), seed(2, SeedSource::Exact)];
-        let out = semantic_validate(seeds.clone(), &HashMap::new());
+        let out = semantic_validate(seeds.clone(), &HashMap::new(), &Calibration::IDENTITY);
         assert_eq!(out.len(), 2, "empty oracle must be a no-op");
     }
 
@@ -1958,7 +2164,7 @@ mod tests {
         // Top cosine below ORACLE_MIN → embedding found nothing strong → keep all.
         let seeds = vec![seed(1, SeedSource::Lexical), seed(2, SeedSource::Knn)];
         let oracle: HashMap<NodeId, f32> = [(NodeId(2), 0.50)].into_iter().collect();
-        let out = semantic_validate(seeds, &oracle);
+        let out = semantic_validate(seeds, &oracle, &Calibration::IDENTITY);
         assert_eq!(out.len(), 2, "weak oracle must not cut lexical seeds");
     }
 
@@ -1972,7 +2178,7 @@ mod tests {
         let oracle: HashMap<NodeId, f32> = (10..=15)
             .map(|i| (NodeId(i), 0.68 - (i as f32 - 10.0) * 0.01))
             .collect();
-        let out = semantic_validate(seeds, &oracle);
+        let out = semantic_validate(seeds, &oracle, &Calibration::IDENTITY);
         let kept: std::collections::HashSet<u64> = out.iter().map(|s| s.node.0).collect();
         assert!(
             kept.iter().all(|&id| id >= 10),
@@ -2002,7 +2208,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let out = semantic_validate(seeds, &oracle);
+        let out = semantic_validate(seeds, &oracle, &Calibration::IDENTITY);
         assert_eq!(
             out.len(),
             SEMANTIC_MIN_KEEP,

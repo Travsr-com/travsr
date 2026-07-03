@@ -72,7 +72,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
 
     use travsr_error::StoreError;
     use travsr_plugin_host::{
-        active_backend_id, lookup_embed_backend, EmbedQueryHook, EmbedSupervisor, EMBED_BACKENDS,
+        active_backend_id, embed_backends, lookup_embed_backend, EmbedQueryHook, EmbedSupervisor,
     };
     use travsr_store::{EmbedKnnHook, EmbedReadiness, EmbedScoreHook};
 
@@ -86,8 +86,8 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     let backend = active_backend_id()
         .as_deref()
         .and_then(lookup_embed_backend)
-        .or_else(|| EMBED_BACKENDS.first())
-        .copied();
+        .or_else(|| embed_backends().first())
+        .cloned();
     let Some(backend) = backend else { return };
 
     let binary = home.join(".travsr").join("bin").join(backend.binary_name);
