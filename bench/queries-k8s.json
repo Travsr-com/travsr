@@ -1,0 +1,27 @@
+{
+  "_comment": "Labeled query set for get_context correctness/usefulness benchmarking on the kubernetes/kubernetes repo (indexed at /Users/ak/Documents/k8/kubernetes, 131,873 symbols). category: literal (exact symbol exists), conceptual (NL, no literal symbol match), cross (spans files), nonsense (should abstain — domain outside k8s). expect: substrings; a result HITS if any returned node sig OR path contains any expect entry (case-insensitive). All expected symbols/paths verified present in the graph via `travsr ask`.",
+  "queries": [
+    { "id": "L1", "category": "literal", "query": "syncReplicaSet", "expect": ["syncReplicaSet", "replica_set.go"], "note": "ReplicaSetController.syncReplicaSet" },
+    { "id": "L2", "category": "literal", "query": "HorizontalController processNextWorkItem", "expect": ["HorizontalController", "podautoscaler/horizontal.go"], "note": "HPA controller" },
+    { "id": "L3", "category": "literal", "query": "SharedInformer interface", "expect": ["SharedInformer", "shared_informer.go"], "note": "client-go shared informer" },
+    { "id": "L4", "category": "literal", "query": "Scheduler ScheduleOne", "expect": ["ScheduleOne", "schedule_one.go"], "note": "scheduler main loop" },
+    { "id": "L5", "category": "literal", "query": "leaderElection", "expect": ["leaderElection", "leaderelection.go"], "note": "leader election" },
+    { "id": "L6", "category": "literal", "query": "iptables Proxier", "expect": ["Proxier", "proxy/iptables/proxier.go"], "note": "kube-proxy iptables" },
+
+    { "id": "C1", "category": "conceptual", "query": "how does the horizontal pod autoscaler scale replicas based on metrics", "expect": ["HorizontalController", "podautoscaler/horizontal.go"], "note": "HPA scaling" },
+    { "id": "C2", "category": "conceptual", "query": "how are pending pods assigned to nodes", "expect": ["ScheduleOne", "schedule_one.go", "scheduler"], "note": "scheduling" },
+    { "id": "C3", "category": "conceptual", "query": "controller reconciles desired number of pod replicas", "expect": ["syncReplicaSet", "ReplicaSetController", "replica_set.go"], "note": "replicaset reconcile" },
+    { "id": "C4", "category": "conceptual", "query": "elect a single active leader among controller manager replicas", "expect": ["leaderElection", "leaderelection.go"], "note": "leader election concept" },
+    { "id": "C5", "category": "conceptual", "query": "program network rules for services on each node", "expect": ["proxy/iptables", "Proxier"], "note": "kube-proxy" },
+    { "id": "C6", "category": "conceptual", "query": "cache and watch kubernetes resources with event handlers", "expect": ["SharedInformer", "shared_informer.go"], "note": "informer cache" },
+    { "id": "C7", "category": "conceptual", "query": "kubelet brings a pod to its desired running state", "expect": ["SyncPod", "pod_workers.go", "kubelet"], "note": "kubelet sync pod" },
+    { "id": "C8", "category": "conceptual", "query": "update service endpoints when backing pods change", "expect": ["endpoints_controller.go", "endpoint"], "note": "endpoints controller" },
+
+    { "id": "X1", "category": "cross", "query": "how a replicaset change flows from informer watch to pod creation", "expect": ["shared_informer", "syncReplicaSet", "replica_set.go"], "note": "informer to controller" },
+    { "id": "X2", "category": "cross", "query": "scheduling a pod from the queue through the binding cycle", "expect": ["ScheduleOne", "bindingCycle", "schedule_one.go"], "note": "schedule + bind" },
+
+    { "id": "N1", "category": "nonsense", "query": "quantum blockchain payment gateway subscription billing invoice", "expect": [], "note": "must abstain — no such domain in k8s" },
+    { "id": "N2", "category": "nonsense", "query": "react redux frontend css animation component styling theme", "expect": [], "note": "must abstain — no frontend UI here" },
+    { "id": "N3", "category": "nonsense", "query": "audio waveform synthesizer midi signal processing reverb filter", "expect": [], "note": "must abstain — no audio DSP here" }
+  ]
+}

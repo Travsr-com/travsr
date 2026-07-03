@@ -287,6 +287,76 @@ pub fn skeleton_for_node(node: &Node, repo_root: &Path) -> Option<AstSkeleton> {
     Some(extract_skeleton(decl, &src, node, &lang))
 }
 
+/// Batch form of [`skeleton_for_node`]: parse a source file **once** and build
+/// the `embed_text` for every node located in it, at the given richness.
+///
+/// `skeleton_for_node` reads + fully tree-sitter-parses the file per call, so
+/// computing text for a whole repo re-parsed each file once per symbol in it
+/// (O(nodes) parses). Callers that need many nodes should group by file and call
+/// this once per file — O(files) parses. `canon_root` is the caller's
+/// pre-canonicalized repo root (avoids a per-call `canonicalize`).
+pub fn embed_texts_for_file(
+    repo_root: &Path,
+    canon_root: &Path,
+    rel_path: &str,
+    nodes: &[&Node],
+    richness: EmbedRichness,
+) -> Vec<(travsr_core::NodeId, String)> {
+    if rel_path.is_empty() || nodes.is_empty() {
+        return Vec::new();
+    }
+    // SEC: reject path traversal / absolute paths — identical to skeleton_for_node.
+    let looks_absolute = rel_path.starts_with('/')
+        || rel_path.starts_with('\\')
+        || rel_path
+            .get(1..3)
+            .map(|s| s == ":\\" || s == ":/")
+            .unwrap_or(false);
+    if looks_absolute || rel_path.contains("..") {
+        return Vec::new();
+    }
+    let abs = repo_root.join(rel_path);
+    let canon_abs = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+    if !canon_abs.starts_with(canon_root) {
+        return Vec::new();
+    }
+    // All nodes in one file share a language; detect from the first that resolves.
+    let lang = match nodes.iter().find_map(|n| detect_lang(n)) {
+        Some(l) => l,
+        None => return Vec::new(),
+    };
+    let ts_lang = grammar_for(&lang, rel_path);
+    let src = match std::fs::read(&canon_abs) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&ts_lang).is_err() {
+        return Vec::new();
+    }
+    let tree = match parser.parse(&src, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let root = tree.root_node();
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let Some(line) = node.line else { continue };
+        let start_row = (line.saturating_sub(1)) as usize;
+        if let Some(decl) = find_decl_at_row(root, start_row, &lang) {
+            let skel = extract_skeleton(decl, &src, node, &lang);
+            let text = skel.to_embed_text(
+                &node.kind,
+                &node.vname.signature,
+                &node.vname.path,
+                richness,
+            );
+            out.push((node.id, text));
+        }
+    }
+    out
+}
+
 // ── Language detection ────────────────────────────────────────────────────────
 
 enum Lang {

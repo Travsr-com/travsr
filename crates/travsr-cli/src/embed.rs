@@ -6,15 +6,17 @@
 use anyhow::{bail, Context as _, Result};
 use clap::Subcommand;
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use travsr_daemon::regenerate_embed_texts_if_stale;
-use travsr_plugin_host::{lookup_embed_backend, EmbedBackend, EMBED_BACKENDS};
+use travsr_plugin_host::{
+    embed_backends, lookup_embed_backend, write_model_descriptor, EmbedBackend,
+};
 
-use crate::progress::{fmt_dur, Palette};
+use crate::progress::Palette;
 
 const EMBED_RELEASES_BASE: &str = "https://github.com";
 const HF_BASE: &str = "https://huggingface.co";
@@ -62,6 +64,18 @@ pub enum EmbedCommand {
         /// Backend ID to make active (run `travsr embed list` to see options).
         backend: String,
     },
+    /// Re-measure the model-relative semantic floors on the existing index.
+    ///
+    /// Runs the label-free calibration probe (self-match + nonsense cosines) against
+    /// the already-built HNSW and rewrites the `embed_cos_*` graph.db meta anchors —
+    /// without re-embedding. Runs automatically after every reindex; use this to
+    /// recalibrate after a model or corpus change that didn't go through reindex.
+    Calibrate {
+        /// Path to graph.db to calibrate (defaults to .travsr/graph.db in the
+        /// nearest git root).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 pub fn run(cmd: EmbedCommand) -> Result<()> {
@@ -71,7 +85,40 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
         EmbedCommand::Reindex { db, phase1 } => cmd_reindex(db, phase1),
         EmbedCommand::Status => cmd_status(),
         EmbedCommand::Switch { backend } => cmd_switch(&backend),
+        EmbedCommand::Calibrate { db } => cmd_calibrate(db),
     }
+}
+
+/// Resolve a graph.db path from an optional override, else `.travsr/graph.db` in the
+/// nearest git root. Errors when the resolved path does not exist.
+fn resolve_graph_db(db_override: Option<PathBuf>) -> Result<PathBuf> {
+    match db_override {
+        Some(p) => Ok(p),
+        None => {
+            let cwd = std::env::current_dir().context("getting cwd")?;
+            let repo_root = crate::repo::find_git_root(&cwd)?;
+            let p = repo_root.join(".travsr/graph.db");
+            anyhow::ensure!(
+                p.exists(),
+                "graph.db not found at {}\n  Run `travsr init` first.",
+                p.display()
+            );
+            Ok(p)
+        }
+    }
+}
+
+fn cmd_calibrate(db_override: Option<PathBuf>) -> Result<()> {
+    let db_path = resolve_graph_db(db_override)?;
+    match calibrate_semantic_floors(&db_path)? {
+        Some((lo, hi)) => {
+            println!("\u{2713} Calibrated semantic floors (cos_lo={lo:.3}, cos_hi={hi:.3}).")
+        }
+        None => println!(
+            "Calibration skipped (no embedding backend, or too few embedded nodes to sample)."
+        ),
+    }
+    Ok(())
 }
 
 // ── list ──────────────────────────────────────────────────────────────────────
@@ -81,16 +128,16 @@ fn cmd_list(json: bool) -> Result<()> {
     let bin_dir = embed_bin_dir()?;
 
     if json {
-        let entries: Vec<String> = EMBED_BACKENDS
+        let entries: Vec<String> = embed_backends()
             .iter()
             .map(|b| {
-                let installed = bin_dir.join(b.binary_name).exists();
-                let is_active = active.as_deref() == Some(b.id);
+                let installed = bin_dir.join(&b.binary_name).exists();
+                let is_active = active.as_deref() == Some(b.id.as_str());
                 format!(
                     r#"{{"id":"{}","description":"{}","dim":{},"params_m":{},"mteb":{:.1},"ram_mb":{},"download_mb":{},"installed":{},"active":{}}}"#,
                     b.id,
                     b.description,
-                    b.dim,
+                    b.output_dim(),
                     b.params_m,
                     b.mteb,
                     b.ram_mb,
@@ -109,9 +156,9 @@ fn cmd_list(json: bool) -> Result<()> {
         "BACKEND", "DIM", "PARAMS", "MTEB", "DOWNLOAD", "RAM"
     );
     println!("{}", "-".repeat(92));
-    for b in EMBED_BACKENDS {
-        let installed = bin_dir.join(b.binary_name).exists();
-        let is_active = active.as_deref() == Some(b.id);
+    for b in embed_backends() {
+        let installed = bin_dir.join(&b.binary_name).exists();
+        let is_active = active.as_deref() == Some(b.id.as_str());
         let status = if installed && is_active {
             format!("\u{2713} active  {}", b.description)
         } else if installed {
@@ -133,7 +180,7 @@ fn cmd_list(json: bool) -> Result<()> {
         println!(
             "{:<22} {:<5} {:<7} {:<5} {:<10} {:<8} {}",
             backend_label,
-            b.dim,
+            b.output_dim(),
             format!("{}M", b.params_m),
             format!("{:.1}", b.mteb),
             format!("{download_mb} MB"),
@@ -158,7 +205,7 @@ fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
             if !std::io::stdin().is_terminal() {
                 // Non-interactive: list and exit without selecting.
                 println!("Available embedding models (run with --backend <id> to install):\n");
-                for b in EMBED_BACKENDS {
+                for b in embed_backends() {
                     let dl_mb: u32 = b.model_files.iter().map(|f| f.size_hint_mb).sum();
                     println!("  {}  ({} MB download)", b.id, dl_mb);
                     println!("  {}\n", b.description);
@@ -192,7 +239,7 @@ fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
 
     if let Some(ref root) = repo_root {
         if db_path.is_some() {
-            if let Err(e) = travsr_plugin_host::write_repo_backend_id(root, backend.id) {
+            if let Err(e) = travsr_plugin_host::write_repo_backend_id(root, &backend.id) {
                 tracing::warn!("could not write repo embed config: {e}");
             }
         }
@@ -218,11 +265,11 @@ fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
     let bin_dir = embed_bin_dir()?;
 
     println!("  Available embedding models:\n");
-    for (i, b) in EMBED_BACKENDS.iter().enumerate() {
-        let is_active = active.as_deref() == Some(b.id);
-        let installed = bin_dir.join(b.binary_name).exists()
-            && embed_model_dir(b.id)
-                .map(|d| b.model_files.iter().all(|f| d.join(f.name).exists()))
+    for (i, b) in embed_backends().iter().enumerate() {
+        let is_active = active.as_deref() == Some(b.id.as_str());
+        let installed = bin_dir.join(&b.binary_name).exists()
+            && embed_model_dir(&b.id)
+                .map(|d| b.model_files.iter().all(|f| d.join(&f.name).exists()))
                 .unwrap_or(false);
         let tag = if is_active {
             "  (active)"
@@ -242,7 +289,7 @@ fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
             i + 1,
             b.id,
             tag,
-            b.dim,
+            b.output_dim(),
             b.params_m,
             b.mteb,
             dl_mb,
@@ -252,7 +299,7 @@ fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
     }
 
     use std::io::Write as _;
-    print!("  Which model? (1-{}, q to quit): ", EMBED_BACKENDS.len());
+    print!("  Which model? (1-{}, q to quit): ", embed_backends().len());
     std::io::stdout().flush()?;
 
     let mut input = String::new();
@@ -264,7 +311,7 @@ fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
     }
 
     match input.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= EMBED_BACKENDS.len() => Ok(Some(&EMBED_BACKENDS[n - 1])),
+        Ok(n) if n >= 1 && n <= embed_backends().len() => Ok(Some(&embed_backends()[n - 1])),
         _ => {
             println!("  invalid selection '{input}'");
             Ok(None)
@@ -275,7 +322,7 @@ fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
 fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool) -> Result<()> {
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     let bin_dir = embed_bin_dir()?;
-    let dest = bin_dir.join(backend.binary_name);
+    let dest = bin_dir.join(&backend.binary_name);
 
     if dest.exists() && !reinstall {
         println!("  {} {} ready", pal.green("\u{25cf}"), backend.binary_name);
@@ -312,9 +359,9 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
     }
 
     // Model files — one spinner per file.
-    let model_dir = embed_model_dir(backend.id)?;
-    for mf in backend.model_files {
-        let dest = model_dir.join(mf.name);
+    let model_dir = embed_model_dir(&backend.id)?;
+    for mf in &backend.model_files {
+        let dest = model_dir.join(&mf.name);
         if dest.exists() && !reinstall {
             println!("  {} {} already present", pal.green("\u{25cf}"), mf.name);
             continue;
@@ -328,6 +375,10 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
         })
         .with_context(|| format!("downloading {}", mf.name))?;
     }
+
+    // Bridge to the sidecar: write the per-model descriptor (model.toml) so the
+    // sidecar reads dim/pooling/prefix/inputs from config — never hardcoded.
+    write_model_descriptor(&model_dir, backend).context("writing model descriptor")?;
 
     Ok(())
 }
@@ -402,93 +453,61 @@ async fn download_model_file_with_progress(
     Ok(())
 }
 
-/// Reindex after `embed init`. If the daemon is already running we hand off to
-/// it rather than spawning a second sidecar that fights for the embed.db lock.
-fn reindex_after_init(backend: &'static EmbedBackend, db_path: &std::path::Path) -> Result<()> {
-    let is_tty = std::io::stderr().is_terminal();
+/// Embed the repo after `embed init`.
+///
+/// Always runs inline (with a live progress bar) rather than handing off to the
+/// daemon. The daemon is single-repo and only ticks its embed catch-up every
+/// 60 s, so a hand-off from `embed init` — especially in a repo whose daemon is
+/// stale, an older build without this model, or rooted elsewhere — silently does
+/// nothing (the bug this replaces). Inline is deterministic and shows progress
+/// immediately. Guarded by `embed.lock` so a concurrent `travsr embed reindex`
+/// can't double-write embed.db.
+fn reindex_after_init(backend: &'static EmbedBackend, db_path: &Path) -> Result<()> {
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
-
     println!();
 
-    // If the daemon is running it already embeds autonomously in the background.
-    // Spawning a second sidecar here would create two concurrent writers on
-    // embed.db — SQLite lock contention that throttles throughput to ~5 nodes/s.
-    // Also skip embed_text regen — the daemon handles that in maybe_spawn_embed_phase2.
-    let repo_root = db_path
+    // Same cross-process guard cmd_reindex uses: serialize writers to embed.db.
+    let embed_lock_path = db_path
         .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(std::path::Path::new("."));
-    if super::daemon_is_running(repo_root, 1, 0) {
-        println!("  {} {} is now active", pal.green("\u{25cf}"), backend.id,);
-        println!(
-            "  {} the daemon is embedding {} nodes in the background",
-            pal.dim("\u{2139}"),
-            backend.id,
-        );
-        println!(
-            "  {} run `travsr embed status` to monitor progress",
-            pal.dim("\u{2139}"),
-        );
-        return Ok(());
-    }
+        .map(|p| p.join("embed.lock"))
+        .unwrap_or_else(|| PathBuf::from("embed.lock"));
+    let embed_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&embed_lock_path)
+        .context("opening embed.lock")?;
+    fs2::FileExt::lock_exclusive(&embed_lock)
+        .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
 
-    // Daemon not running: regen embed_text then run the blocking reindex inline.
     if let Err(e) = regenerate_embed_texts_if_stale(db_path) {
         tracing::warn!("embed_text regen check failed (non-fatal): {e}");
     }
 
-    let done = Arc::new(AtomicBool::new(false));
-    let done2 = Arc::clone(&done);
-    let mid = backend.id.to_string();
+    run_reindex_with_progress(db_path, None)?;
 
-    let spinner = std::thread::spawn(move || {
-        if !is_tty {
-            return;
-        }
-        use std::io::Write as _;
-        const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
-        let pal2 = Palette::for_stream(true);
-        let start = std::time::Instant::now();
-        let mut i = 0usize;
-        while !done2.load(Ordering::Relaxed) {
-            let spin = pal2.orange(&FRAMES[i % 4].to_string());
-            let elapsed = start.elapsed().as_secs();
-            eprint!("\r  {spin} reindexing with {mid} ...  {elapsed}s    ");
-            let _ = std::io::stderr().flush();
-            i += 1;
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
-
-    let start = std::time::Instant::now();
-    let result = travsr_plugin_host::run_parallel_reindex_blocking_quiet(db_path);
-
-    done.store(true, Ordering::Relaxed);
-    let _ = spinner.join();
-
-    if is_tty {
-        use std::io::Write as _;
-        eprint!("\r{}\r", " ".repeat(72));
-        let _ = std::io::stderr().flush();
-    }
-
-    result?;
-
-    let elapsed = fmt_dur(start.elapsed());
-    let embedded = query_embed_stats(db_path, backend.id)
+    let embedded = query_embed_stats(db_path, &backend.id)
         .map(|s| s.stats.embedded)
         .unwrap_or(0);
-
     println!(
-        "  {} {} — {} nodes embedded · {elapsed}",
+        "  {} {} — {} nodes embedded",
         pal.green("\u{25cf}"),
         backend.id,
         fmt_count(embedded),
     );
-    println!(
-        "\n  {} restart the daemon to apply: travsr daemon restart",
-        pal.dim("\u{2139}")
-    );
+
+    // A running daemon still holds the previous model in memory; nudge a restart
+    // so queries use the newly-embedded model.
+    let repo_root = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(Path::new("."));
+    if super::daemon_is_running(repo_root, 1, 0) {
+        println!(
+            "\n  {} restart the daemon to apply: travsr daemon restart",
+            pal.dim("\u{2139}")
+        );
+    }
 
     Ok(())
 }
@@ -599,27 +618,222 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
         .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
 
     let workers = travsr_plugin_host::derive_num_workers_for_cli(&db_path);
-    println!(
-        "Reindexing {} ({} parallel worker{})...",
-        db_path.display(),
-        workers,
-        if workers == 1 { "" } else { "s" },
-    );
 
     // Regenerate embed_text with correct richness if the model tier changed.
+    // This is a CPU-heavy SQL pass over every node on large repos, so announce it
+    // first — otherwise the command looks hung while it runs (before the bar).
+    println!("Preparing embed text for {}...", db_path.display());
     if let Err(e) = regenerate_embed_texts_if_stale(&db_path) {
         tracing::warn!("embed_text regen check failed (non-fatal): {e}");
     }
 
-    // RFC-020: delegate to the parallel orchestrator in travsr-plugin-host.
-    // It handles worker count derivation, range partitioning, temp-file isolation,
-    // merge, and failure recovery per C-01 … C-08.
-    travsr_plugin_host::run_parallel_reindex_blocking(&db_path, phase1)
-        .context("parallel reindex failed")?;
+    println!(
+        "Reindexing ({} parallel worker{})...",
+        workers,
+        if workers == 1 { "" } else { "s" }
+    );
+
+    // RFC-020: delegate to the parallel orchestrator with a live progress bar.
+    run_reindex_with_progress(&db_path, phase1)?;
 
     println!("\u{2713} Reindex complete.");
     Ok(())
 }
+
+/// Run the parallel reindex with a live `travsr init`-style progress bar.
+///
+/// The parallel orchestrator prints nothing incrementally, so a monitor thread
+/// polls embed.db for the active model's embedded count (embed.db is WAL — reads
+/// during the reindex writes are safe) and drives [`crate::progress::LiveBar`].
+fn run_reindex_with_progress(db_path: &Path, phase1: Option<u32>) -> Result<()> {
+    let model_id = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(travsr_plugin_host::repo_backend_id);
+    let total = model_id
+        .as_deref()
+        .and_then(|m| query_embed_stats(db_path, m).ok())
+        .map(|s| s.stats.total_symbols)
+        .unwrap_or(0);
+
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let monitor = model_id.map(|mid| {
+        let df = Arc::clone(&done_flag);
+        let db = db_path.to_path_buf();
+        std::thread::spawn(move || {
+            let mut bar = crate::progress::LiveBar::new("embedding");
+            loop {
+                let done = query_embed_stats(&db, &mid)
+                    .map(|s| s.stats.embedded)
+                    .unwrap_or(0);
+                if df.load(Ordering::Relaxed) {
+                    bar.finish(done, total);
+                    break;
+                }
+                bar.tick(done, total);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        })
+    });
+
+    let result = travsr_plugin_host::run_parallel_reindex_blocking(db_path, phase1);
+
+    done_flag.store(true, Ordering::Relaxed);
+    if let Some(m) = monitor {
+        let _ = m.join();
+    }
+    result.context("parallel reindex failed")?;
+
+    // Auto-calibrate the model-relative semantic floors on the freshly-built index.
+    // Best-effort: a calibration failure must never fail the reindex.
+    match calibrate_semantic_floors(db_path) {
+        Ok(Some((lo, hi))) => {
+            println!("\u{2713} Calibrated semantic floors (cos_lo={lo:.3}, cos_hi={hi:.3}).")
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("floor calibration failed (non-fatal): {e:#}"),
+    }
+    Ok(())
+}
+
+/// Auto-calibrate the model-relative semantic floors for this repo's active model.
+///
+/// Label-free: after a reindex, measures the model's own query↔passage cosine scale
+/// on THIS corpus and records two anchors in graph.db meta, read by `travsr-mcp`'s
+/// `seed::Calibration::load`:
+///   • `embed_cos_hi` — p50 of top-1 cosines for a sample of real symbol signatures
+///     ("a query matches its answer" scale). Run through the model's real query path,
+///     so it captures query/passage-prefix asymmetry and dim-truncation compression —
+///     exactly the effects that make bge-small's absolute floors wrong for other models.
+///   • `embed_cos_lo` — p95 of top-1 cosines for cross-domain nonsense probes
+///     ("confident but unrelated" scale).
+///
+/// Every embedding model — bundled, future-release, or a user's own catalog entry —
+/// self-calibrates here with no hand-tuned constants. Best-effort: on any failure it
+/// logs and skips the write, leaving the reader on the safe reference-model identity.
+///
+/// Returns `Ok(Some((lo, hi)))` when written, `Ok(None)` when skipped.
+fn calibrate_semantic_floors(db_path: &Path) -> Result<Option<(f32, f32)>> {
+    const SAMPLE: usize = 256;
+    const MIN_SIG_SAMPLES: usize = 32;
+
+    // Sample real symbol signatures as "answerable" probes.
+    let store = travsr_store::SqliteStore::open_read_only(db_path)
+        .with_context(|| format!("opening {} for calibration", db_path.display()))?;
+    let nodes = store.all_nodes().context("reading nodes for calibration")?;
+    drop(store);
+
+    let mut sigs: Vec<String> = nodes
+        .into_iter()
+        .filter(|n| {
+            matches!(
+                n.kind.as_str(),
+                "function" | "method" | "class" | "interface" | "struct" | "enum"
+            )
+        })
+        .filter_map(|n| {
+            // Strip the leading "kind:" tag; embed the bare symbol path as the query.
+            let s = n.vname.signature;
+            let bare = s
+                .split_once(':')
+                .map(|(_, r)| r)
+                .unwrap_or(s.as_str())
+                .trim();
+            (!bare.is_empty()).then(|| bare.to_string())
+        })
+        .collect();
+    if sigs.len() < MIN_SIG_SAMPLES {
+        tracing::warn!(
+            "floor calibration skipped: only {} eligible signatures (< {MIN_SIG_SAMPLES})",
+            sigs.len()
+        );
+        return Ok(None);
+    }
+    // Deterministic stride sample down to SAMPLE (spread across the corpus).
+    if sigs.len() > SAMPLE {
+        let stride = (sigs.len() / SAMPLE).max(1);
+        sigs = sigs.into_iter().step_by(stride).take(SAMPLE).collect();
+    }
+
+    // One sidecar spawn: probe [signatures.., nonsense..] and split by index.
+    let n_sig = sigs.len();
+    let mut all = sigs;
+    all.extend(NONSENSE_PROBES.iter().map(|s| s.to_string()));
+    let Some(cos) = travsr_plugin_host::probe_top1_cosines(db_path, &all) else {
+        tracing::warn!("floor calibration skipped: no embedding backend/binary");
+        return Ok(None);
+    };
+    if cos.len() != all.len() {
+        tracing::warn!(
+            "floor calibration skipped: probe returned {} of {} cosines",
+            cos.len(),
+            all.len()
+        );
+        return Ok(None);
+    }
+    let (sig_cos, non_cos) = cos.split_at(n_sig);
+
+    // hi = p50 of positive self-match cosines; lo = p95 of nonsense cosines.
+    let hi = percentile(sig_cos.iter().copied().filter(|c| *c > 0.0).collect(), 0.50);
+    let lo = percentile(non_cos.to_vec(), 0.95);
+    let (Some(cos_hi), Some(cos_lo)) = (hi, lo) else {
+        tracing::warn!("floor calibration skipped: insufficient probe cosines");
+        return Ok(None);
+    };
+    if cos_hi <= cos_lo {
+        tracing::warn!(
+            "floor calibration skipped: degenerate band (hi {cos_hi:.3} <= lo {cos_lo:.3})"
+        );
+        return Ok(None);
+    }
+
+    // Persist to graph.db meta (read by Calibration::load).
+    let mut store = travsr_store::SqliteStore::open(db_path)
+        .with_context(|| format!("opening {} to write calibration", db_path.display()))?;
+    store
+        .set_meta("embed_cos_lo", &format!("{cos_lo}"))
+        .context("writing embed_cos_lo")?;
+    store
+        .set_meta("embed_cos_hi", &format!("{cos_hi}"))
+        .context("writing embed_cos_hi")?;
+    if let Some(mid) = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(travsr_plugin_host::repo_backend_id)
+    {
+        // Provenance: which model these anchors describe (aids debugging a stale set).
+        let _ = store.set_meta("embed_cos_model", &mid);
+    }
+    Ok(Some((cos_lo, cos_hi)))
+}
+
+/// Nearest-rank percentile `p ∈ [0,1]` of an unsorted sample. `None` when empty.
+fn percentile(mut xs: Vec<f32>, p: f32) -> Option<f32> {
+    if xs.is_empty() {
+        return None;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (((xs.len() - 1) as f32) * p).round() as usize;
+    Some(xs[idx.min(xs.len() - 1)])
+}
+
+/// Fixed cross-domain probes with no presence in a code repo — the "confident but
+/// unrelated" cosine scale for floor calibration. Deliberately spans many domains so
+/// the p95 reflects the model's genuine background, not one adversarial near-miss.
+const NONSENSE_PROBES: &[&str] = &[
+    "quantum blockchain payment gateway subscription billing invoice",
+    "react redux frontend css animation component styling theme",
+    "audio waveform synthesizer midi signal processing reverb filter",
+    "recipe cooking ingredients oven temperature baking sourdough",
+    "planetary orbit telescope astronomy nebula galaxy redshift",
+    "guitar chord progression melody rhythm tempo verse chorus",
+    "medieval castle knight armor sword shield banner heraldry",
+    "watercolor landscape painting brush canvas pigment gallery",
+    "marathon training nutrition hydration cadence stride recovery",
+    "stock dividend portfolio hedge derivative option yield curve",
+    "coral reef marine biology plankton tide salinity lagoon",
+    "origami paper folding crane geometry crease valley mountain",
+];
 
 // ── status ────────────────────────────────────────────────────────────────────
 
@@ -659,16 +873,6 @@ fn query_embed_stats(db_path: &std::path::Path, model_id: &str) -> Result<EmbedS
         },
         threshold,
     })
-}
-
-fn progress_bar(done: u64, total: u64, width: usize) -> String {
-    if total == 0 {
-        return format!("[{}]", " ".repeat(width));
-    }
-    let filled = ((done as f64 / total as f64) * width as f64).round() as usize;
-    let filled = filled.min(width);
-    let empty = width - filled;
-    format!("[{}{}]", "=".repeat(filled), " ".repeat(empty))
 }
 
 fn fmt_eta(remaining: u64, nodes_per_sec: f64) -> String {
@@ -733,11 +937,11 @@ fn cmd_status() -> Result<()> {
                 return Ok(());
             }
             Some(b) => {
-                let installed = bin_dir.join(b.binary_name).exists();
-                let model_dir = embed_model_dir(b.id).ok();
+                let installed = bin_dir.join(&b.binary_name).exists();
+                let model_dir = embed_model_dir(&b.id).ok();
                 let models_ok = model_dir
                     .as_ref()
-                    .map(|d| b.model_files.iter().all(|f| d.join(f.name).exists()))
+                    .map(|d| b.model_files.iter().all(|f| d.join(&f.name).exists()))
                     .unwrap_or(false);
 
                 let ok = installed && models_ok;
@@ -839,7 +1043,8 @@ fn cmd_status() -> Result<()> {
     };
     let remaining = stats.total_symbols.saturating_sub(stats.embedded);
     let eta = fmt_eta(remaining, nodes_per_sec);
-    let bar = progress_bar(stats.embedded, stats.total_symbols, 36);
+    let pal = Palette::for_stream(std::io::stdout().is_terminal());
+    let bar = crate::progress::bar_of_width(pal, stats.embedded, stats.total_symbols, 36);
 
     println!("Total symbols  : {}", fmt_count(stats.total_symbols));
     println!(
@@ -860,7 +1065,7 @@ fn cmd_status() -> Result<()> {
     } else {
         100.0
     };
-    let p1_bar = progress_bar(stats.phase1_done, stats.phase1_total, 24);
+    let p1_bar = crate::progress::bar_of_width(pal, stats.phase1_done, stats.phase1_total, 24);
     let p1_eta = fmt_eta(stats.phase1_total.saturating_sub(stats.phase1_done), 400.0);
     println!(
         "Phase 1 (shell \u{2265}{threshold}) {} {}/{}  ({:.0}%)  {}",
@@ -880,7 +1085,7 @@ fn cmd_status() -> Result<()> {
     } else {
         100.0
     };
-    let p2_bar = progress_bar(stats.phase2_done, stats.phase2_total, 24);
+    let p2_bar = crate::progress::bar_of_width(pal, stats.phase2_done, stats.phase2_total, 24);
     let p2_eta = fmt_eta(stats.phase2_total.saturating_sub(stats.phase2_done), 40.0);
     println!(
         "Phase 2 (shell <{threshold}) {} {}/{}  ({:.0}%)  {}",
@@ -934,7 +1139,7 @@ fn cmd_switch(backend_id: &str) -> Result<()> {
     })?;
 
     let bin_dir = embed_bin_dir()?;
-    if !bin_dir.join(backend.binary_name).exists() {
+    if !bin_dir.join(&backend.binary_name).exists() {
         bail!(
             "Backend '{backend_id}' is not installed. Run `travsr embed init --backend {backend_id}` first."
         );

@@ -1,0 +1,5 @@
+[
+  { "label": "small_fn", "sig": "method:podSyncerFuncs.SyncPod" },
+  { "label": "large_fn", "sig": "method:ReplicaSetController.syncReplicaSet" },
+  { "label": "class", "sig": "class:HorizontalController" }
+]
