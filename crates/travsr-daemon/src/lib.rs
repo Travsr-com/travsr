@@ -487,12 +487,16 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     // a 130k-node repo (a file with N symbols was read + parsed N times).
     let mut by_file: std::collections::HashMap<&str, Vec<&travsr_core::Node>> =
         std::collections::HashMap::new();
+    // Package/external nodes have path="" — collect separately for direct text gen.
+    let mut pathless: Vec<&travsr_core::Node> = Vec::new();
     for node in &nodes {
         if !node.vname.path.is_empty() {
             by_file
                 .entry(node.vname.path.as_str())
                 .or_default()
                 .push(node);
+        } else {
+            pathless.push(node);
         }
     }
     let files: Vec<(&str, Vec<&travsr_core::Node>)> = by_file.into_iter().collect();
@@ -530,6 +534,19 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
             .flat_map(|h| h.join().unwrap_or_default())
             .collect()
     });
+
+    // Generate embed text for pathless package nodes (pkg:foo@v1 → "foo v1").
+    let mut pairs = pairs;
+    for node in &pathless {
+        if node.kind == "package" {
+            let text = node
+                .vname
+                .signature
+                .trim_start_matches("pkg:")
+                .replace(['@', '/', ':'], " ");
+            pairs.push((node.id, text));
+        }
+    }
 
     // Write path is single-threaded SQLite; batch to keep transactions small.
     for chunk in pairs.chunks(500) {
@@ -577,6 +594,10 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
 
     let stored_id = store.get_meta("embed_text_model_id").ok().flatten();
     if stored_id.as_deref() == Some(active_id.as_str()) {
+        // Model unchanged — still populate embed_text for any nodes indexed since
+        // the last embed pass (e.g. data-format nodes added by a code change).
+        let richness = EmbedRichness::from_params_m(backend.params_m);
+        update_embed_texts(&mut store, repo_root, richness);
         return Ok(false);
     }
 

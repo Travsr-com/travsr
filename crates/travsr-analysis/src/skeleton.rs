@@ -320,6 +320,19 @@ pub fn embed_texts_for_file(
     if !canon_abs.starts_with(canon_root) {
         return Vec::new();
     }
+    // Data formats have no tree-sitter grammar — emit path-based embed text directly.
+    if nodes
+        .iter()
+        .any(|n| matches!(n.vname.language.as_str(), "json" | "yaml" | "toml" | "xml"))
+    {
+        return nodes
+            .iter()
+            .filter_map(|n| match n.kind.as_str() {
+                "file" => Some((n.id, format!("{} {}", n.vname.language, n.vname.path))),
+                _ => None,
+            })
+            .collect();
+    }
     // All nodes in one file share a language; detect from the first that resolves.
     let lang = match nodes.iter().find_map(|n| detect_lang(n)) {
         Some(l) => l,
@@ -3052,5 +3065,79 @@ mod tests {
             "callees should be deduplicated: {:?}",
             skel.callees
         );
+    }
+
+    // ── embed_texts_for_file — data format ───────────────────────────────────
+
+    #[test]
+    fn embed_texts_for_file_json_file_node_gets_lang_path_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let node = make_node("package.json", "file", "json", "file", 1, 1);
+        let canon = dir.path().canonicalize().unwrap();
+        let result = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            "package.json",
+            &[&node],
+            EmbedRichness::Compact,
+        );
+        assert_eq!(result.len(), 1, "json file node must produce embed text");
+        assert_eq!(result[0].1, "json package.json");
+    }
+
+    #[test]
+    fn embed_texts_for_file_yaml_file_node_gets_lang_path_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        std::fs::write(dir.path().join(".github/workflows/ci.yml"), "").unwrap();
+        let node = make_node(".github/workflows/ci.yml", "file", "yaml", "file", 1, 1);
+        let canon = dir.path().canonicalize().unwrap();
+        let result = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            ".github/workflows/ci.yml",
+            &[&node],
+            EmbedRichness::Compact,
+        );
+        assert_eq!(result.len(), 1, "yaml file node must produce embed text");
+        assert_eq!(result[0].1, "yaml .github/workflows/ci.yml");
+    }
+
+    #[test]
+    fn embed_texts_for_file_toml_file_node_gets_lang_path_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let node = make_node("Cargo.toml", "file", "toml", "file", 1, 1);
+        let canon = dir.path().canonicalize().unwrap();
+        let result = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            "Cargo.toml",
+            &[&node],
+            EmbedRichness::Compact,
+        );
+        assert_eq!(result.len(), 1, "toml file node must produce embed text");
+        assert_eq!(result[0].1, "toml Cargo.toml");
+    }
+
+    #[test]
+    fn embed_texts_for_file_data_format_skips_non_file_kind_nodes() {
+        // package nodes (kind="package", path="") are handled by update_embed_texts
+        // directly — embed_texts_for_file must not emit them.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let file_node = make_node("Cargo.toml", "file", "toml", "file", 1, 1);
+        let pkg_node = make_node("Cargo.toml", "pkg:serde@1", "toml", "package", 1, 1);
+        let canon = dir.path().canonicalize().unwrap();
+        let result = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            "Cargo.toml",
+            &[&file_node, &pkg_node],
+            EmbedRichness::Compact,
+        );
+        assert_eq!(result.len(), 1, "only file node emits text; package node skipped");
+        assert_eq!(result[0].1, "toml Cargo.toml");
     }
 }
