@@ -3137,7 +3137,11 @@ mod tests {
             &[&file_node, &pkg_node],
             EmbedRichness::Compact,
         );
-        assert_eq!(result.len(), 1, "only file node emits text; package node skipped");
+        assert_eq!(
+            result.len(),
+            1,
+            "only file node emits text; package node skipped"
+        );
         assert_eq!(result[0].1, "toml Cargo.toml");
     }
 }

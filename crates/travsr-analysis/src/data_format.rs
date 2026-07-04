@@ -8,9 +8,9 @@
 //! with a debug-level warning — never panic on user config files.
 use std::path::Path;
 
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::ParseOutput;
@@ -41,7 +41,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 
     match (lang_str, file_name) {
         ("json", "package.json") => parse_package_json(corpus, abs_path, file_id, &mut out),
-        ("json", "tsconfig.json") => parse_tsconfig_json(corpus, abs_path, vname_path, file_id, &mut out),
+        ("json", "tsconfig.json") => {
+            parse_tsconfig_json(corpus, abs_path, vname_path, file_id, &mut out)
+        }
         ("toml", "Cargo.toml") => parse_cargo_toml(corpus, abs_path, file_id, &mut out),
         ("yaml", n) if n.ends_with(".yml") || n.ends_with(".yaml") => {
             parse_yaml(corpus, abs_path, vname_path, file_id, &mut out);
@@ -69,10 +71,7 @@ fn parse_package_json(_corpus: &str, path: &Path, file_id: NodeId, out: &mut Par
             for (name, version) in deps {
                 let ver = version.as_str().unwrap_or("*");
                 let sig = format!("pkg:{name}@{ver}");
-                let pkg_node = Node::new(
-                    VName::new("npmjs.com", "", "", "json", &sig),
-                    "package",
-                );
+                let pkg_node = Node::new(VName::new("npmjs.com", "", "", "json", &sig), "package");
                 let edge = Edge::new(file_id, pkg_node.id, EdgeKind::ExternalDependency);
                 out.nodes.push(pkg_node);
                 out.edges.push(edge);
@@ -81,7 +80,13 @@ fn parse_package_json(_corpus: &str, path: &Path, file_id: NodeId, out: &mut Par
     }
 }
 
-fn parse_tsconfig_json(corpus: &str, path: &Path, vname_path: &str, file_id: NodeId, out: &mut ParseOutput) {
+fn parse_tsconfig_json(
+    corpus: &str,
+    path: &Path,
+    vname_path: &str,
+    file_id: NodeId,
+    out: &mut ParseOutput,
+) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
@@ -100,14 +105,9 @@ fn parse_tsconfig_json(corpus: &str, path: &Path, vname_path: &str, file_id: Nod
             };
             let raw = vname_dir.join(ref_path);
             // Normalise: collapse "./" and strip leading "./"
-            let target_path = raw
-                .to_string_lossy()
-                .trim_start_matches("./")
-                .to_string();
-            let target_node = Node::new(
-                VName::new(corpus, "", &target_path, "json", "file"),
-                "file",
-            );
+            let target_path = raw.to_string_lossy().trim_start_matches("./").to_string();
+            let target_node =
+                Node::new(VName::new(corpus, "", &target_path, "json", "file"), "file");
             let edge = Edge::new(file_id, target_node.id, EdgeKind::Configures);
             out.nodes.push(target_node);
             out.edges.push(edge);
@@ -133,16 +133,11 @@ fn parse_cargo_toml(_corpus: &str, path: &Path, file_id: NodeId, out: &mut Parse
         for (name, spec) in deps {
             let ver = match spec {
                 toml::Value::String(s) => s.as_str(),
-                toml::Value::Table(t) => {
-                    t.get("version").and_then(|v| v.as_str()).unwrap_or("*")
-                }
+                toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()).unwrap_or("*"),
                 _ => "*",
             };
             let sig = format!("pkg:{name}@{ver}");
-            let pkg_node = Node::new(
-                VName::new("crates.io", "", "", "toml", &sig),
-                "package",
-            );
+            let pkg_node = Node::new(VName::new("crates.io", "", "", "toml", &sig), "package");
             let edge = Edge::new(file_id, pkg_node.id, EdgeKind::ExternalDependency);
             out.nodes.push(pkg_node);
             out.edges.push(edge);
@@ -150,10 +145,15 @@ fn parse_cargo_toml(_corpus: &str, path: &Path, file_id: NodeId, out: &mut Parse
     }
 }
 
-
 // ── YAML ─────────────────────────────────────────────────────────────────────
 
-fn parse_yaml(_corpus: &str, path: &Path, vname_path: &str, file_id: NodeId, out: &mut ParseOutput) {
+fn parse_yaml(
+    _corpus: &str,
+    path: &Path,
+    vname_path: &str,
+    file_id: NodeId,
+    out: &mut ParseOutput,
+) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
@@ -171,7 +171,9 @@ fn parse_yaml(_corpus: &str, path: &Path, vname_path: &str, file_id: NodeId, out
     } else if Path::new(vname_path)
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n == "docker-compose.yml" || n == "docker-compose.yaml" || n.starts_with("compose."))
+        .map(|n| {
+            n == "docker-compose.yml" || n == "docker-compose.yaml" || n.starts_with("compose.")
+        })
         .unwrap_or(false)
     {
         parse_docker_compose(&doc, file_id, out);
@@ -238,10 +240,7 @@ fn parse_docker_compose(doc: &Yaml, file_id: NodeId, out: &mut ParseOutput) {
         };
         for dep in deps {
             let sig = format!("service:{dep}");
-            let node = Node::new(
-                VName::new("", "", "", "yaml", &sig),
-                "service",
-            );
+            let node = Node::new(VName::new("", "", "", "yaml", &sig), "service");
             let edge = Edge::new(file_id, node.id, EdgeKind::Configures);
             // Avoid duplicate service nodes when multiple services depend on the same one.
             if !out.nodes.iter().any(|n| n.id == node.id) {
@@ -294,7 +293,10 @@ fn parse_pom_xml(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
                 }
             }
             Ok(Event::Text(e)) if in_dependency => {
-                let text = std::str::from_utf8(e.as_ref()).unwrap_or("").trim().to_string();
+                let text = std::str::from_utf8(e.as_ref())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 match current_tag.as_str() {
                     "groupId" => group_id = text,
                     "artifactId" => artifact_id = text,
@@ -315,10 +317,8 @@ fn parse_pom_xml(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
                         if !group_id.is_empty() && !artifact_id.is_empty() {
                             let ver = if version.is_empty() { "*" } else { &version };
                             let sig = format!("pkg:{group_id}:{artifact_id}@{ver}");
-                            let node = Node::new(
-                                VName::new("maven.org", "", "", "xml", &sig),
-                                "package",
-                            );
+                            let node =
+                                Node::new(VName::new("maven.org", "", "", "xml", &sig), "package");
                             let edge = Edge::new(file_id, node.id, EdgeKind::ExternalDependency);
                             out.nodes.push(node);
                             out.edges.push(edge);
@@ -340,10 +340,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn write_tmp(content: &str, suffix: &str) -> NamedTempFile {
-        let mut f = tempfile::Builder::new()
-            .suffix(suffix)
-            .tempfile()
-            .unwrap();
+        let mut f = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
     }
@@ -395,12 +392,21 @@ mod tests {
         // file node + 3 package nodes
         assert_eq!(out.nodes.len(), 4);
         assert_eq!(out.edges.len(), 3);
-        assert!(out.edges.iter().all(|e| e.kind == EdgeKind::ExternalDependency));
+        assert!(out
+            .edges
+            .iter()
+            .all(|e| e.kind == EdgeKind::ExternalDependency));
 
-        let corpora: Vec<_> = out.nodes[1..].iter().map(|n| n.vname.corpus.as_str()).collect();
+        let corpora: Vec<_> = out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.corpus.as_str())
+            .collect();
         assert!(corpora.iter().all(|c| *c == "npmjs.com"));
 
-        let sigs: Vec<_> = out.nodes[1..].iter().map(|n| n.vname.signature.as_str()).collect();
+        let sigs: Vec<_> = out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
         assert!(sigs.iter().any(|s| s.starts_with("pkg:express@")));
         assert!(sigs.iter().any(|s| s.starts_with("pkg:lodash@")));
         assert!(sigs.iter().any(|s| s.starts_with("pkg:typescript@")));
@@ -449,12 +455,21 @@ tempfile = "3"
         // file node + 3 crate nodes
         assert_eq!(out.nodes.len(), 4);
         assert_eq!(out.edges.len(), 3);
-        assert!(out.edges.iter().all(|e| e.kind == EdgeKind::ExternalDependency));
+        assert!(out
+            .edges
+            .iter()
+            .all(|e| e.kind == EdgeKind::ExternalDependency));
 
-        let corpora: Vec<_> = out.nodes[1..].iter().map(|n| n.vname.corpus.as_str()).collect();
+        let corpora: Vec<_> = out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.corpus.as_str())
+            .collect();
         assert!(corpora.iter().all(|c| *c == "crates.io"));
 
-        let sigs: Vec<_> = out.nodes[1..].iter().map(|n| n.vname.signature.as_str()).collect();
+        let sigs: Vec<_> = out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
         assert!(sigs.iter().any(|s| s.starts_with("pkg:serde@")));
         assert!(sigs.iter().any(|s| s.starts_with("pkg:anyhow@")));
         assert!(sigs.iter().any(|s| s.starts_with("pkg:tempfile@")));
@@ -483,19 +498,20 @@ jobs:
         run: cargo test
 "#;
         let f = write_tmp(content, "ci.yml");
-        let out = parse(
-            "github.com/a/b",
-            f.path(),
-            ".github/workflows/ci.yml",
-        )
-        .unwrap();
+        let out = parse("github.com/a/b", f.path(), ".github/workflows/ci.yml").unwrap();
 
         // file node + 2 action nodes
         assert_eq!(out.nodes.len(), 3);
         assert_eq!(out.edges.len(), 2);
-        assert!(out.edges.iter().all(|e| e.kind == EdgeKind::ExternalDependency));
+        assert!(out
+            .edges
+            .iter()
+            .all(|e| e.kind == EdgeKind::ExternalDependency));
 
-        let sigs: Vec<_> = out.nodes[1..].iter().map(|n| n.vname.signature.as_str()).collect();
+        let sigs: Vec<_> = out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
         assert!(sigs.contains(&"pkg:actions/checkout@v4"));
         assert!(sigs.contains(&"pkg:dtolnay/rust-toolchain@stable"));
     }
@@ -527,8 +543,16 @@ services:
         // 2 ExternalDependency (images) + 1 Configures (depends_on)
         assert_eq!(out.edges.len(), 3);
 
-        let ext_dep_count = out.edges.iter().filter(|e| e.kind == EdgeKind::ExternalDependency).count();
-        let configures_count = out.edges.iter().filter(|e| e.kind == EdgeKind::Configures).count();
+        let ext_dep_count = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::ExternalDependency)
+            .count();
+        let configures_count = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Configures)
+            .count();
         assert_eq!(ext_dep_count, 2);
         assert_eq!(configures_count, 1);
     }
@@ -565,13 +589,24 @@ services:
         // file node + 2 maven package nodes
         assert_eq!(out.nodes.len(), 3);
         assert_eq!(out.edges.len(), 2);
-        assert!(out.edges.iter().all(|e| e.kind == EdgeKind::ExternalDependency));
+        assert!(out
+            .edges
+            .iter()
+            .all(|e| e.kind == EdgeKind::ExternalDependency));
 
-        let corpora: Vec<_> = out.nodes[1..].iter().map(|n| n.vname.corpus.as_str()).collect();
+        let corpora: Vec<_> = out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.corpus.as_str())
+            .collect();
         assert!(corpora.iter().all(|c| *c == "maven.org"));
 
-        let sigs: Vec<_> = out.nodes[1..].iter().map(|n| n.vname.signature.as_str()).collect();
-        assert!(sigs.iter().any(|s| s.starts_with("pkg:org.springframework:spring-core@")));
+        let sigs: Vec<_> = out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs
+            .iter()
+            .any(|s| s.starts_with("pkg:org.springframework:spring-core@")));
         assert!(sigs.iter().any(|s| s.starts_with("pkg:junit:junit@")));
     }
 
@@ -598,7 +633,7 @@ services:
         let f = write_tmp("<not valid xml ><<", "pom.xml");
         let out = parse("github.com/a/b", f.path(), "pom.xml").unwrap();
         // Malformed XML hits Eof/Err branch — still produces the file node
-        assert!(out.nodes.len() >= 1);
+        assert!(!out.nodes.is_empty());
         assert_eq!(out.nodes[0].kind, "file");
     }
 

@@ -1251,20 +1251,23 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn noise_keeps_external_package_node() {
         // Synthetic registry nodes (npmjs.com, crates.io) must NOT be filtered
         // out by is_noise_node — they have an empty path and a registry corpus.
         for (corpus, sig, lang) in [
             ("npmjs.com", "pkg:express@^4.18.0", "json"),
             ("crates.io", "pkg:serde@1", "toml"),
-            ("maven.org", "pkg:org.springframework:spring-core@6.0.0", "xml"),
+            (
+                "maven.org",
+                "pkg:org.springframework:spring-core@6.0.0",
+                "xml",
+            ),
         ] {
-            let node = Node::new(
-                VName::new(corpus, "", "", lang, sig),
-                "package",
+            let node = Node::new(VName::new(corpus, "", "", lang, sig), "package");
+            assert!(
+                !is_noise_node(&node),
+                "external package node for {corpus} must not be noise"
             );
-            assert!(!is_noise_node(&node), "external package node for {corpus} must not be noise");
         }
     }
 
