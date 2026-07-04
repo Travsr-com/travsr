@@ -136,6 +136,11 @@ pub enum Language {
     Swift,
     Dart,
     ObjectiveC,
+    // Data/config formats — Phase A only, never Phase B.
+    Json,
+    Yaml,
+    Toml,
+    Xml,
 }
 
 impl Language {
@@ -159,6 +164,10 @@ impl Language {
             "swift" => Some(Self::Swift),
             "dart" => Some(Self::Dart),
             "m" | "mm" => Some(Self::ObjectiveC),
+            "json" | "jsonc" => Some(Self::Json),
+            "yml" | "yaml" => Some(Self::Yaml),
+            "toml" => Some(Self::Toml),
+            "xml" | "xsd" | "xsl" => Some(Self::Xml),
             _ => None,
         }
     }
@@ -181,6 +190,10 @@ impl Language {
             Self::Swift => "swift",
             Self::Dart => "dart",
             Self::ObjectiveC => "objectivec",
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+            Self::Toml => "toml",
+            Self::Xml => "xml",
         }
     }
 
@@ -206,8 +219,21 @@ impl Language {
             // travsr-plugin-protocol) for external API callers; core uses the
             // canonical form only.
             "objectivec" => Some(Self::ObjectiveC),
+            "json" => Some(Self::Json),
+            "yaml" => Some(Self::Yaml),
+            "toml" => Some(Self::Toml),
+            "xml" => Some(Self::Xml),
             _ => None,
         }
+    }
+
+    /// Returns `true` for data/config formats that index in Phase A only.
+    ///
+    /// These variants have no Phase B tool (`travsr lang install` / `CATALOG`),
+    /// so they must be excluded from the Phase B `present_languages` set and
+    /// from the `language_as_str_covered_by_catalog` coverage gate.
+    pub fn is_data_format(self) -> bool {
+        matches!(self, Self::Json | Self::Yaml | Self::Toml | Self::Xml)
     }
 }
 
@@ -326,6 +352,14 @@ pub enum EdgeKind {
     /// so `EdgeKind` stays `Copy`. PPR weight: 0.85 (ADR-003 amendment, 2026-05-24).
     #[serde(rename = "ffi/call")]
     FFICall,
+    /// Config file → source file or target it configures.
+    /// E.g. `tsconfig.json` references a sub-project, `docker-compose.yml` depends_on a service.
+    #[serde(rename = "configures")]
+    Configures,
+    /// Config file → external package node (registry-hosted dependency).
+    /// E.g. `package.json` dependency, `Cargo.toml` crate, `pom.xml` artifact.
+    #[serde(rename = "external-dependency")]
+    ExternalDependency,
 }
 
 impl EdgeKind {
@@ -341,6 +375,8 @@ impl EdgeKind {
             Self::IsImplementation => "is-implementation",
             Self::Overrides => "overrides",
             Self::FFICall => "ffi/call",
+            Self::Configures => "configures",
+            Self::ExternalDependency => "external-dependency",
         }
     }
 
@@ -355,14 +391,19 @@ impl EdgeKind {
     ///
     /// | Kind              | Weight | Reasoning                               |
     /// |---|---|---|
-    /// | `RefCall`         | 1.00   | Direct call — strongest semantic link   |
-    /// | `DefinesBinding`  | 0.70   | Parent→child definition — strong structural link |
-    /// | `Exports`         | 0.60   | Exported API surface — important for callers |
-    /// | `Depends`         | 0.50   | File import — broad but less targeted   |
-    /// | `ResolvesTo`      | 0.50   | Import→file resolution — same as Depends |
-    /// | `RefImports`      | 0.40   | Named import specifier — narrower than file import |
-    /// | `IsImplementation`| 0.40   | Class implements interface — type-system link |
-    /// | `Overrides`       | 0.30   | Method override — weakest semantic tie  |
+    /// | Kind                | Weight | Reasoning                               |
+    /// |---|---|---|
+    /// | `RefCall`           | 1.00   | Direct call — strongest semantic link   |
+    /// | `FFICall`           | 0.85   | Cross-language call — near-call strength|
+    /// | `DefinesBinding`    | 0.70   | Parent→child definition — strong structural link |
+    /// | `Exports`           | 0.60   | Exported API surface — important for callers |
+    /// | `Depends`           | 0.50   | File import — broad but less targeted   |
+    /// | `ResolvesTo`        | 0.50   | Import→file resolution — same as Depends |
+    /// | `RefImports`        | 0.40   | Named import specifier — narrower than file import |
+    /// | `IsImplementation`  | 0.40   | Class implements interface — type-system link |
+    /// | `Overrides`         | 0.30   | Method override — weakest semantic tie  |
+    /// | `Configures`        | 0.35   | Config→target — below structural, above override |
+    /// | `ExternalDependency`| 0.30   | Config→registry package — declaration, not usage |
     ///
     /// Weights are normalised per-node at PPR iteration time so their
     /// absolute scale does not matter — only the ratios between kinds.
@@ -377,6 +418,8 @@ impl EdgeKind {
             Self::IsImplementation => 0.40,
             Self::Overrides => 0.30,
             Self::FFICall => 0.85,
+            Self::Configures => 0.35,
+            Self::ExternalDependency => 0.30,
         }
     }
 
@@ -393,6 +436,8 @@ impl EdgeKind {
             "is-implementation" => Some(Self::IsImplementation),
             "overrides" => Some(Self::Overrides),
             "ffi/call" => Some(Self::FFICall),
+            "configures" => Some(Self::Configures),
+            "external-dependency" => Some(Self::ExternalDependency),
             _ => None,
         }
     }
@@ -925,6 +970,8 @@ mod tests {
             EdgeKind::IsImplementation,
             EdgeKind::Overrides,
             EdgeKind::FFICall,
+            EdgeKind::Configures,
+            EdgeKind::ExternalDependency,
         ] {
             assert_eq!(EdgeKind::from_str(kind.as_str()), Some(kind));
         }
@@ -932,7 +979,7 @@ mod tests {
 
     #[test]
     fn ppr_weights_are_ordered_by_semantic_strength() {
-        // RefCall > DefinesBinding > Exports > Depends == ResolvesTo > RefImports == IsImplementation > Overrides
+        // RefCall > DefinesBinding > Exports > Depends == ResolvesTo > RefImports == IsImplementation > Configures > Overrides == ExternalDependency
         assert!(EdgeKind::RefCall.ppr_weight() > EdgeKind::DefinesBinding.ppr_weight());
         assert!(EdgeKind::DefinesBinding.ppr_weight() > EdgeKind::Exports.ppr_weight());
         assert!(EdgeKind::Exports.ppr_weight() > EdgeKind::Depends.ppr_weight());
@@ -945,7 +992,12 @@ mod tests {
             EdgeKind::RefImports.ppr_weight(),
             EdgeKind::IsImplementation.ppr_weight()
         );
-        assert!(EdgeKind::IsImplementation.ppr_weight() > EdgeKind::Overrides.ppr_weight());
+        assert!(EdgeKind::IsImplementation.ppr_weight() > EdgeKind::Configures.ppr_weight());
+        assert!(EdgeKind::Configures.ppr_weight() > EdgeKind::Overrides.ppr_weight());
+        assert_eq!(
+            EdgeKind::Overrides.ppr_weight(),
+            EdgeKind::ExternalDependency.ppr_weight()
+        );
     }
 
     #[test]
@@ -960,6 +1012,8 @@ mod tests {
             EdgeKind::IsImplementation,
             EdgeKind::Overrides,
             EdgeKind::FFICall,
+            EdgeKind::Configures,
+            EdgeKind::ExternalDependency,
         ] {
             let w = kind.ppr_weight();
             assert!(
@@ -1144,6 +1198,14 @@ mod tests {
         assert_eq!(Language::from_extension("cjs"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("m"), Some(Language::ObjectiveC));
         assert_eq!(Language::from_extension("mm"), Some(Language::ObjectiveC));
+        assert_eq!(Language::from_extension("json"), Some(Language::Json));
+        assert_eq!(Language::from_extension("jsonc"), Some(Language::Json));
+        assert_eq!(Language::from_extension("yml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("yaml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension("toml"), Some(Language::Toml));
+        assert_eq!(Language::from_extension("xml"), Some(Language::Xml));
+        assert_eq!(Language::from_extension("xsd"), Some(Language::Xml));
+        assert_eq!(Language::from_extension("xsl"), Some(Language::Xml));
         assert_eq!(Language::from_extension(""), None);
     }
 
@@ -1155,6 +1217,10 @@ mod tests {
             Language::Python,
             Language::Go,
             Language::ObjectiveC,
+            Language::Json,
+            Language::Yaml,
+            Language::Toml,
+            Language::Xml,
         ] {
             let s = lang.as_str();
             assert_eq!(
@@ -1171,6 +1237,10 @@ mod tests {
         assert_eq!(Language::Rust.as_str(), "rust");
         assert_eq!(Language::Python.as_str(), "python");
         assert_eq!(Language::Go.as_str(), "go");
+        assert_eq!(Language::Json.as_str(), "json");
+        assert_eq!(Language::Yaml.as_str(), "yaml");
+        assert_eq!(Language::Toml.as_str(), "toml");
+        assert_eq!(Language::Xml.as_str(), "xml");
     }
 
     #[test]
@@ -1178,6 +1248,38 @@ mod tests {
         assert_eq!(Language::from_str("go"), Some(Language::Go));
         assert_eq!(Language::from_str("TypeScript"), None);
         assert_eq!(Language::from_str(""), None);
+    }
+
+    #[test]
+    fn noise_keeps_external_package_node() {
+        // Synthetic registry nodes (npmjs.com, crates.io) must NOT be filtered
+        // out by is_noise_node — they have an empty path and a registry corpus.
+        for (corpus, sig, lang) in [
+            ("npmjs.com", "pkg:express@^4.18.0", "json"),
+            ("crates.io", "pkg:serde@1", "toml"),
+            (
+                "maven.org",
+                "pkg:org.springframework:spring-core@6.0.0",
+                "xml",
+            ),
+        ] {
+            let node = Node::new(VName::new(corpus, "", "", lang, sig), "package");
+            assert!(
+                !is_noise_node(&node),
+                "external package node for {corpus} must not be noise"
+            );
+        }
+    }
+
+    #[test]
+    fn is_data_format_true_for_data_formats_false_for_code() {
+        assert!(Language::Json.is_data_format());
+        assert!(Language::Yaml.is_data_format());
+        assert!(Language::Toml.is_data_format());
+        assert!(Language::Xml.is_data_format());
+        assert!(!Language::Rust.is_data_format());
+        assert!(!Language::TypeScript.is_data_format());
+        assert!(!Language::Python.is_data_format());
     }
 
     // Regression: two symbols in different languages (same file path, same sig)

@@ -38,6 +38,9 @@ pub mod ruby;
 pub mod scala;
 pub mod swift;
 
+// ── Data/config format parsers — Phase A only, no Phase B tool ───────────────
+pub mod data_format;
+
 // ── Phase B call-site parsers ─────────────────────────────────────────────────
 pub mod phase_b_dart;
 pub mod phase_b_python;

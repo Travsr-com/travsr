@@ -682,6 +682,10 @@ impl Indexer {
             Some(Language::Go) => {
                 travsr_analysis::go::parse(&self.corpus, abs_path, vname_path).map_err(map_err)?
             }
+            Some(Language::Json | Language::Yaml | Language::Toml | Language::Xml) => {
+                travsr_analysis::data_format::parse(&self.corpus, abs_path, vname_path)
+                    .map_err(map_err)?
+            }
             // Other future languages (#[non_exhaustive]) are silently skipped
             // until their parsers ship.
             _ => ParseOutput::default(),

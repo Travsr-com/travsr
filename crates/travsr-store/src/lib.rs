@@ -1922,7 +1922,7 @@ LIMIT 100",
                 "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line \
                  FROM nodes \
                  WHERE embed_text IS NULL \
-                   AND kind NOT IN ('file', 'file-module', 'import', 'module', 'variable')",
+                   AND kind NOT IN ('file-module', 'import', 'module', 'variable')",
             ).context("preparing nodes_missing_embed_text query")?;
             let rows = stmt
                 .query_map([], |row| {

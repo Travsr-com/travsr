@@ -3338,6 +3338,8 @@ fn edge_kind_str(kind: &travsr_core::EdgeKind) -> &'static str {
         EdgeKind::IsImplementation => "is-implementation",
         EdgeKind::Overrides => "overrides",
         EdgeKind::FFICall => "ffi/call",
+        EdgeKind::Configures => "configures",
+        EdgeKind::ExternalDependency => "external-dependency",
     }
 }
 
