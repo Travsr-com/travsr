@@ -681,8 +681,9 @@ const SEMANTIC_MIN_KEEP: usize = 5;
 /// preserving the anti-"confident salad" protection. Generic: match *strength*
 /// decides — no per-term string, plural, or stemming heuristics.
 ///
-/// Default 0.3; override via `TRAVSR_SCOPE_STRONG_FLOOR` for bench tuning. A value
-/// ≥ 1.0 restores the pre-#393 hard scope gate (nothing overrides scope).
+/// Default 0.3; override via `TRAVSR_SCOPE_STRONG_FLOOR` for bench tuning. Because
+/// `norm` is clamped to `<= 1.0`, a value `> 1.0` (e.g. 2.0) restores the pre-#393
+/// hard scope gate — every out-of-scope node is dropped, nothing overrides scope.
 const SCOPE_STRONG_FLOOR_DEFAULT: f32 = 0.3;
 
 fn scope_strong_floor() -> f32 {
@@ -691,6 +692,16 @@ fn scope_strong_floor() -> f32 {
         .and_then(|v| v.parse().ok())
         .filter(|&x: &f32| (0.0..=2.0).contains(&x))
         .unwrap_or(SCOPE_STRONG_FLOOR_DEFAULT)
+}
+
+/// #393 score-aware scope gate decision (pure, so the admit/gate policy is
+/// unit-testable without a store fixture). Returns `true` = DROP the seed.
+///
+/// An out-of-scope lexical seed is dropped only when anchors established a scope
+/// AND the seed's normalised score is below `floor`. In-scope seeds, seeds with
+/// no anchor scope, and strong out-of-scope seeds (`norm >= floor`) are kept.
+fn scope_gate_drops(has_anchor_scope: bool, in_scope: bool, norm: f32, floor: f32) -> bool {
+    has_anchor_scope && !in_scope && norm < floor
 }
 
 /// Demote seeds the embed oracle places far from the query, then reshuffle the
@@ -996,7 +1007,12 @@ pub(crate) fn build_seed_set(
     // ── Whole-query lexical FTS (scored BM25) ────────────────────────────────
     let lexical_scored = store.search_nodes_fuzzy_scored(query).unwrap_or_default();
 
-    let top_bm25 = lexical_scored.first().map(|p| p.1).unwrap_or(0.0);
+    // #393: `search_nodes_fuzzy_scored` now returns RRF-ordered + kind-diversified
+    // results, so the strongest lexical match is NO LONGER at position 0. Take the
+    // explicit max over the batch — using `.first()` here would understate the
+    // normalisation denominator and make the score-aware scope gate below (and the
+    // `top_bm25` abstention signal) silently more permissive than intended.
+    let top_bm25 = lexical_scored.iter().map(|p| p.1).fold(0.0_f32, f32::max);
     // Normalise BM25 scores per-batch for PPR weight (max = 1.0); floor at 0.05.
     let max_bm25 = top_bm25.max(0.001);
 
@@ -1017,12 +1033,24 @@ pub(crate) fn build_seed_set(
         // names both a symbol and a directory in different crates) is not collapsed
         // to a single anchor's scope. Weak cross-domain FTS drift stays gated.
         // Nodes with no parseable root are allowed through as before.
-        if !anchor_roots.is_empty() && norm < scope_strong_floor() {
-            if let Some(root) = package_root(&node.vname.path) {
-                if !anchor_roots.contains(root) {
-                    continue;
-                }
-            }
+        //
+        // Safety note: on a warm embed oracle, `semantic_validate` / the RFC-019
+        // contamination gate further prune anything admitted here that the query
+        // embedding disagrees with. On the FTS-only / cold-oracle path there is no
+        // such backstop, so the `scope_strong_floor()` (relative BM25) IS the gate.
+        // The floor is deliberately the sole knob (env-tunable), and it depends on
+        // `max_bm25` being the true batch max above — hence the explicit fold-max.
+        let in_scope = match package_root(&node.vname.path) {
+            Some(root) => anchor_roots.contains(root),
+            None => true, // no parseable root — allowed through as before
+        };
+        if scope_gate_drops(
+            !anchor_roots.is_empty(),
+            in_scope,
+            norm,
+            scope_strong_floor(),
+        ) {
+            continue;
         }
         let path_count = lex_path_counts.entry(node.vname.path.clone()).or_insert(0);
         if *path_count >= MAX_SEEDS_PER_PATH {
@@ -1328,6 +1356,43 @@ pub(crate) fn abstain_message(seed_set: &SeedSet, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #393 score-aware scope gate ──────────────────────────────────────────
+
+    #[test]
+    fn scope_gate_admits_strong_out_of_scope() {
+        // Out of the anchor crate scope, but a strong lexical match (norm >= floor)
+        // overrides the structural scope — the multi-domain case (#393).
+        assert!(!scope_gate_drops(true, false, 0.50, 0.3));
+        assert!(!scope_gate_drops(true, false, 0.30, 0.3)); // exactly at floor => kept
+    }
+
+    #[test]
+    fn scope_gate_drops_weak_out_of_scope() {
+        // Weak cross-domain FTS drift stays gated.
+        assert!(scope_gate_drops(true, false, 0.10, 0.3));
+        assert!(scope_gate_drops(true, false, 0.29, 0.3));
+    }
+
+    #[test]
+    fn scope_gate_keeps_in_scope_regardless_of_score() {
+        assert!(!scope_gate_drops(true, true, 0.01, 0.3));
+    }
+
+    #[test]
+    fn scope_gate_noop_without_anchor_scope() {
+        // No anchors established a scope => nothing is gated (unrestricted).
+        assert!(!scope_gate_drops(false, false, 0.01, 0.3));
+    }
+
+    #[test]
+    fn scope_gate_floor_above_one_restores_hard_gate() {
+        // `norm` is clamped to <= 1.0, so a floor > 1.0 (TRAVSR_SCOPE_STRONG_FLOOR=2.0)
+        // drops every out-of-scope node — the pre-#393 hard gate.
+        for norm in [0.05f32, 0.5, 1.0] {
+            assert!(scope_gate_drops(true, false, norm, 2.0));
+        }
+    }
 
     #[test]
     fn tokenize_strips_stop_words() {

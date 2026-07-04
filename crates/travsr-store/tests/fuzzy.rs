@@ -396,6 +396,110 @@ fn issue393_exact_signature_still_fast_paths() {
     );
 }
 
+#[test]
+fn issue393_filtered_lang_scopes_and_fuses() {
+    let mut store = open();
+    let rs = Node::new(
+        VName::new(
+            "corpus",
+            "root",
+            "crates/a/src/lib.rs",
+            "rust",
+            "fn:workflow_parse",
+        ),
+        "function",
+    );
+    let ts = Node::new(
+        VName::new(
+            "corpus",
+            "root",
+            "pkg/b/src/x.ts",
+            "typescript",
+            "fn:workflowParse",
+        ),
+        "function",
+    );
+    put(&mut store, &rs);
+    put(&mut store, &ts);
+
+    let rust_only = store
+        .search_nodes_fuzzy_filtered("workflow", Some("rust"))
+        .unwrap();
+    assert!(!rust_only.is_empty(), "lang-filtered query must resolve");
+    assert!(
+        rust_only.iter().all(|n| n.vname.language == "rust"),
+        "#393: _filtered(Some(\"rust\")) must return only rust nodes"
+    );
+    assert!(rust_only
+        .iter()
+        .any(|n| n.vname.signature == "fn:workflow_parse"));
+}
+
+#[test]
+fn issue393_scored_carries_bm25_scale_not_rrf() {
+    let mut store = open();
+    put(
+        &mut store,
+        &node("crates/x/src/a.rs", "fn:knapsack_select", "function"),
+    );
+    // The score must be BM25/synthetic scale (>0.1), never the tiny internal RRF
+    // accumulator (~0.03). Guards the "RRF orders, does not rescore" contract that
+    // get_context's BM25-scale relevance floor depends on (#393 §5.1).
+    let scored = store.search_nodes_fuzzy_scored("knapsack_select").unwrap();
+    assert!(!scored.is_empty());
+    let top = scored.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
+    assert!(top > 0.1, "score must be BM25/synthetic scale, got {top}");
+}
+
+#[test]
+fn issue393_embed_gated_and_get_context_path_never_embeds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut store = open();
+    put(
+        &mut store,
+        &node("crates/x/src/a.rs", "fn:dispatch_tool_call", "function"),
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let hook: travsr_store::EmbedKnnHook = Arc::new(move |_q, _k| {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    });
+    store.set_embed_knn_hook(hook);
+
+    // Cheap SQLite stages resolve => embed must NOT fire (G2 gate).
+    let _ = store.search_nodes_fuzzy("dispatch_tool_call").unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "embed must not fire when the cheap stages already return results"
+    );
+
+    // Combined Stage1+Stage2 miss on the ask path (include_embed=true) => embed fires.
+    let _ = store
+        .search_nodes_fuzzy("zzqqvv nonexistent token")
+        .unwrap();
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "embed must fire on a combined miss (ask path)"
+    );
+
+    // get_context path (_scored, include_embed=false) must NEVER call embed — it has
+    // its own KNN channel, so double-embedding would be redundant (#393 §5.1).
+    let before = calls.load(Ordering::SeqCst);
+    let _ = store
+        .search_nodes_fuzzy_scored("zzqqvv nonexistent token")
+        .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before,
+        "get_context (_scored) path must not invoke the embed hook"
+    );
+}
+
 // ── Empty graph ───────────────────────────────────────────────────────────────
 
 #[test]

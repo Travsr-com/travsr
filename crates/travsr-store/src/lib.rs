@@ -2963,7 +2963,10 @@ impl SqliteStore {
                 let contrib = weight / (Self::RRF_K + (rank as f32) + 1.0);
                 let entry = acc
                     .entry(node.id)
-                    .or_insert_with(|| (node.clone(), 0.0, f32::MIN));
+                    // Seed the natural score with the first observed value (not
+                    // f32::MIN): naturals are always finite here, and MIN.max(NaN)
+                    // would silently carry a garbage score if that ever regressed.
+                    .or_insert_with(|| (node.clone(), 0.0, *natural));
                 entry.1 += contrib;
                 entry.2 = entry.2.max(*natural);
             }
@@ -3091,7 +3094,11 @@ impl SqliteStore {
                 (n, s)
             })
             .collect();
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
         Ok(out)
     }
 
