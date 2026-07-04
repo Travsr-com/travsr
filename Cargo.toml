@@ -44,7 +44,7 @@ opentelemetry         = { version = "0.24", default-features = false, features =
 opentelemetry_sdk     = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp    = { version = "0.17", features = ["tonic"] }
 tracing-opentelemetry = "0.25"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 sha2 = "0.11"
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
