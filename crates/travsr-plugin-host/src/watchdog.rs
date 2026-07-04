@@ -20,9 +20,22 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// Best-effort SIGTERM of a subprocess by OS PID. Uses a shell `kill` so no
-/// `libc` dependency is required. A no-op if the process already exited.
+/// Best-effort kill of a subprocess by OS PID. Uses a shell command so no
+/// `libc`/`winapi` dependency is required. A no-op if the process already exited.
+///
+/// Platform note: `kill` (Unix) and the MSYS `kill` shim do NOT terminate a
+/// native Windows process by its OS PID (different PID namespace — the shim
+/// reports "No such process"). `child.id()` returns the *native* Windows PID, so
+/// on Windows we must use `taskkill /PID <native> /F` (force) `/T` (tree) to
+/// actually terminate the sidecar — otherwise the watchdog kill is a silent
+/// no-op and a wedged plugin never gets killed.
 pub(crate) fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .status();
+
+    #[cfg(not(windows))]
     let _ = std::process::Command::new("kill")
         .arg(pid.to_string())
         .status();
@@ -62,8 +75,6 @@ pub(crate) fn with_io_watchdog<T>(pid: u32, timeout: Duration, io: impl FnOnce()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
-    use std::process::{Command, Stdio};
     use std::time::Instant;
 
     /// Happy path: the closure returns well within `timeout`, so the watchdog is
@@ -82,10 +93,18 @@ mod tests {
     /// Regression for #388: a blocking read on a child that never responds must
     /// be unblocked by the watchdog killing the child, not hang forever. We
     /// spawn a child that sleeps far longer than the timeout and never writes to
-    /// stdout; the guarded `read` blocks until the watchdog SIGKILLs it, closing
+    /// stdout; the guarded `read` blocks until the watchdog kills it, closing
     /// stdout (EOF) so `read` returns.
+    ///
+    /// Unix-only: relies on the `sleep` binary and `kill`-style termination.
+    /// The Windows kill path (`taskkill`) is exercised in production, not here —
+    /// the cross-platform mechanism (Condvar wakeup) is covered by the test above.
+    #[cfg(unix)]
     #[test]
     fn watchdog_kills_hung_child_and_unblocks_read() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
         let mut child = Command::new("sleep")
             .arg("120")
             .stdin(Stdio::piped())
