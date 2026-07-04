@@ -321,10 +321,10 @@ pub fn embed_texts_for_file(
         return Vec::new();
     }
     // Data formats have no tree-sitter grammar — emit path-based embed text directly.
-    if nodes
-        .iter()
-        .any(|n| matches!(n.vname.language.as_str(), "json" | "yaml" | "toml" | "xml"))
-    {
+    if nodes.iter().any(|n| {
+        travsr_core::Language::from_str(n.vname.language.as_str())
+            .is_some_and(|l| l.is_data_format())
+    }) {
         return nodes
             .iter()
             .filter_map(|n| match n.kind.as_str() {
