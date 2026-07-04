@@ -285,6 +285,14 @@ pub fn register_phase_a_sidecars(dispatcher: &mut Dispatcher, repo_root: &std::p
                 );
                 continue;
             }
+            crate::subscriptions::Verdict::Disabled => {
+                tracing::info!(
+                    lang = entry.language,
+                    "language disabled by user policy — run `travsr lang enable {}` to restore",
+                    entry.language
+                );
+                continue;
+            }
         };
 
         // D-6 tier: verified capability + live toolchain presence.

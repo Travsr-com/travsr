@@ -78,6 +78,27 @@ pub enum LangCommand {
         #[arg(long, value_delimiter = ',')]
         permitted_hosts: Vec<String>,
     },
+    /// Run the conformance verification probe for a language plugin and
+    /// record the verdict (RFC-013 / ADR-019).
+    Verify {
+        /// Canonical language name (e.g. cpp, kotlin).
+        language: String,
+        /// Re-probe regardless of any cached verdict — including a HARD
+        /// Rejected one (the "I fixed my environment" escape hatch).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Disable a language plugin by explicit policy (supersedes any verdict).
+    Disable {
+        /// Canonical language name.
+        language: String,
+    },
+    /// Re-enable a language disabled with `travsr lang disable`. The cached
+    /// verification verdict applies immediately — no re-probe.
+    Enable {
+        /// Canonical language name.
+        language: String,
+    },
 }
 
 /// Exit code 2: wrapper installed but underlying SCIP tool missing (partial install).
@@ -120,7 +141,91 @@ pub fn run(cmd: LangCommand) -> Result<()> {
             reason,
             permitted_hosts,
         } => cmd_approve(&language, &approved_by, &reason, permitted_hosts),
+        LangCommand::Verify { language, force } => cmd_verify(&language, force),
+        LangCommand::Disable { language } => cmd_set_disabled(&language, true),
+        LangCommand::Enable { language } => cmd_set_disabled(&language, false),
     }
+}
+
+// ── verify / disable / enable (ADR-019) ──────────────────────────────────────
+
+/// Resolve the language's Phase A sidecar binary and run the verification
+/// probe, printing the resulting verdict.
+fn cmd_verify(language: &str, force: bool) -> Result<()> {
+    use travsr_plugin_host::registry::PHASE_A_SIDECARS;
+
+    let Some(entry) = PHASE_A_SIDECARS.iter().find(|e| e.language == language) else {
+        anyhow::bail!(
+            "'{language}' is not a sidecar plugin language \
+             (ts/js/rust/python are in-process builtins; see `travsr lang list`)"
+        );
+    };
+
+    let program = which_in_travsr_paths(entry.binary).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} not found in ~/.travsr/bin or on PATH — install it first \
+             (`travsr lang install {language}`)",
+            entry.binary
+        )
+    })?;
+
+    let spec = travsr_plugin_host::resolver::PluginSpec {
+        language: language.to_string(),
+        program,
+        args: vec![],
+        policy: travsr_plugin_host::SandboxPolicy::Standard,
+    };
+
+    match travsr_plugin_host::subscriptions::check_subscription(&spec, force) {
+        travsr_plugin_host::Verdict::Active { supports_phase_b } => {
+            let tier = if supports_phase_b { "A+B capable" } else { "A only" };
+            println!("✓ {language}: Active ({tier}) — verdict cached in ~/.travsr/subscriptions.lock");
+            Ok(())
+        }
+        travsr_plugin_host::Verdict::Rejected { reason } => {
+            println!("✗ {language}: Rejected (HARD) — {reason}");
+            println!("  A changed binary clears this automatically; or re-run with --force.");
+            std::process::exit(1);
+        }
+        travsr_plugin_host::Verdict::Unverified { reason } => {
+            println!("? {language}: Unverified (environment) — {reason}");
+            println!("  Not attributed to the binary; will be re-probed on the next trigger.");
+            std::process::exit(1);
+        }
+        travsr_plugin_host::Verdict::Disabled => {
+            println!("- {language}: disabled by policy — run `travsr lang enable {language}` first");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_set_disabled(language: &str, disabled: bool) -> Result<()> {
+    let was = travsr_plugin_host::subscriptions::set_language_disabled(language, disabled);
+    match (was, disabled) {
+        (true, true) => println!("{language} is already disabled"),
+        (false, false) => println!("{language} is not disabled"),
+        (_, true) => println!(
+            "{language} disabled — Phase A/B will skip it until `travsr lang enable {language}`"
+        ),
+        (_, false) => println!(
+            "{language} enabled — the cached verification verdict applies (no re-probe)"
+        ),
+    }
+    Ok(())
+}
+
+/// ~/.travsr/bin first, then PATH — mirrors the host resolver's search order.
+fn which_in_travsr_paths(name: &str) -> Option<String> {
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".travsr").join("bin").join(name);
+        if p.is_file() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 // ── list ──────────────────────────────────────────────────────────────────────

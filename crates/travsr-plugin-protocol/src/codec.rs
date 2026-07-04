@@ -31,15 +31,26 @@ pub fn encode_message<T: serde::Serialize>(msg: &T) -> io::Result<Vec<u8>> {
 }
 
 pub fn decode_message<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> io::Result<T> {
+    decode_message_limited(reader, MAX_FRAME_LEN)
+}
+
+/// Like [`decode_message`] but with a caller-supplied frame cap — used by the
+/// host to enforce ADR-018 `output_max` on per-parse responses so a forged or
+/// runaway giant `ParseResponse` is rejected before allocation (T16).
+pub fn decode_message_limited<T: serde::de::DeserializeOwned>(
+    reader: &mut impl Read,
+    max_len: usize,
+) -> io::Result<T> {
+    let max_len = max_len.min(MAX_FRAME_LEN);
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
     // Reject oversized frames BEFORE allocating — prevents a hostile plugin from
     // triggering a multi-gigabyte allocation via a forged length prefix (DoS).
-    if len > MAX_FRAME_LEN {
+    if len > max_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame length {len} exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN} bytes)"),
+            format!("frame length {len} exceeds the {max_len}-byte cap"),
         ));
     }
     let mut payload = vec![0u8; len];
@@ -81,6 +92,31 @@ mod tests {
         assert_eq!(decoded.path, req.path);
         assert_eq!(decoded.vname_path, req.vname_path);
         assert_eq!(decoded.corpus, req.corpus);
+    }
+
+    /// ADR-018 output_max (T16): a frame over the caller's cap is rejected
+    /// from the length prefix alone — before the payload is allocated or read.
+    #[test]
+    fn oversized_frame_rejected_by_limited_decode() {
+        let req = ParseRequest {
+            path: PathBuf::from("a.ts"),
+            vname_path: "a.ts".into(),
+            corpus: String::new(),
+            package: String::new(),
+            source: None,
+        };
+        let encoded = encode_message(&req).unwrap();
+        let payload_len = encoded.len() - 4;
+
+        // Under the cap → decodes fine.
+        let mut cursor = Cursor::new(&encoded);
+        assert!(decode_message_limited::<ParseRequest>(&mut cursor, payload_len).is_ok());
+
+        // Over the cap → InvalidData, nothing allocated.
+        let mut cursor = Cursor::new(&encoded);
+        let err = decode_message_limited::<ParseRequest>(&mut cursor, payload_len - 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

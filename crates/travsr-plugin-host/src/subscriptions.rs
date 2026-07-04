@@ -43,6 +43,10 @@ pub enum Verdict {
     Rejected { reason: String },
     /// SOFT — machine fault at probe time. Never attributed to the binary.
     Unverified { reason: String },
+    /// Explicit user policy override (`travsr lang disable <lang>`) —
+    /// supersedes any verification verdict, orthogonal to it (ADR-019
+    /// Rule 5). Re-enable restores the cached verdict with no re-probe.
+    Disabled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +98,10 @@ struct LockFile {
     analyzers: Vec<AnalyzerEntry>,
     #[serde(default)]
     pairings: Vec<PairingEntry>,
+    /// Languages disabled by explicit user policy (`travsr lang disable`).
+    /// A policy override, not a verdict — orthogonal to verification.
+    #[serde(default)]
+    disabled: Vec<String>,
 }
 
 struct Manager {
@@ -205,6 +213,12 @@ mod hex {
 pub fn check_subscription(spec: &PluginSpec, force: bool) -> Verdict {
     let mut mgr = manager().lock().expect("subscription manager poisoned");
 
+    // Policy override supersedes any verdict (ADR-019 Rule 5). `--force`
+    // re-verifies but does not bypass an explicit disable.
+    if mgr.lock.disabled.iter().any(|l| l == &spec.language) {
+        return Verdict::Disabled;
+    }
+
     if !force {
         if let Some(v) = mgr.decisions.get(&spec.language) {
             return v.clone();
@@ -236,6 +250,16 @@ pub fn check_subscription(spec: &PluginSpec, force: bool) -> Verdict {
             }
         },
     };
+
+    // AUTHORIZE (ADR-020 Rule 2): signature verification is a precondition of
+    // execution. Runs before the cache is consulted — a cached `Active` never
+    // skips this gate (the cache is advisory, T17).
+    if let Err(reason) = authorize_signature(&spec.program) {
+        tracing::warn!(lang = %spec.language, %reason, "AUTHORIZE failed — binary quarantined, not executed");
+        let verdict = Verdict::Rejected { reason };
+        mgr.decisions.insert(spec.language.clone(), verdict.clone());
+        return verdict;
+    }
 
     // Cache hit by the full key tuple (ADR-019 Rule 4). The verdict survives
     // delete/restore and path moves because it is hash-keyed (Rule 5).
@@ -309,11 +333,104 @@ pub fn check_subscription(spec: &PluginSpec, force: bool) -> Verdict {
             );
             save_lock_file(&mgr.lock);
         }
-        Verdict::Unverified { .. } => {}
+        Verdict::Unverified { .. } | Verdict::Disabled => {}
     }
 
     mgr.decisions.insert(spec.language.clone(), verdict.clone());
     verdict
+}
+
+/// Set / clear the explicit disable policy for a language (ADR-019 Rule 5:
+/// a policy override orthogonal to verification — re-enable restores the
+/// cached verdict with no re-probe). Returns the previous state.
+pub fn set_language_disabled(language: &str, disabled: bool) -> bool {
+    let mut mgr = manager().lock().expect("subscription manager poisoned");
+    let was = mgr.lock.disabled.iter().any(|l| l == language);
+    if disabled && !was {
+        mgr.lock.disabled.push(language.to_string());
+    } else if !disabled && was {
+        mgr.lock.disabled.retain(|l| l != language);
+    }
+    if was != disabled {
+        save_lock_file(&mgr.lock);
+        // Invalidate the in-process memo so the change applies immediately.
+        mgr.decisions.remove(language);
+    }
+    was
+}
+
+/// Whether a language is explicitly disabled by user policy.
+pub fn is_language_disabled(language: &str) -> bool {
+    let mgr = manager().lock().expect("subscription manager poisoned");
+    mgr.lock.disabled.iter().any(|l| l == language)
+}
+
+// ── ADR-020: signing verification at AUTHORIZE ────────────────────────────────
+
+/// Expected signing identity for first-party `travsr-lang-*` release binaries
+/// (ADR-020 Rule 2). Org-wide pin: the repo's GitHub Actions release workflow,
+/// keyless OIDC. (First-party-only scope per Rule 5 — a community registry
+/// with per-publisher identities is deferred.)
+const EXPECTED_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+const EXPECTED_IDENTITY_REGEXP: &str =
+    r"^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml@.*$";
+
+/// Verify a plugin binary's cosign bundle when one is present.
+///
+/// Distributed binaries ship `<binary>.cosign.bundle` next to the binary
+/// (written by `travsr lang install` from the release assets). When the
+/// bundle exists, verification MUST pass or the binary is quarantined
+/// without being executed. A binary with **no** bundle is treated as a
+/// locally-built / `--command`-class binary (ADR-020 Rule 5): it still runs
+/// under ADR-017 trust + sandbox but carries no authenticity guarantee —
+/// surfaced at debug level, not blocked (blocking would break every local
+/// build).
+fn authorize_signature(program: &str) -> Result<(), String> {
+    let bundle = format!("{program}.cosign.bundle");
+    if !Path::new(&bundle).exists() {
+        tracing::debug!(
+            binary = program,
+            "no cosign bundle — locally-built binary, no authenticity guarantee (ADR-020 Rule 5)"
+        );
+        return Ok(());
+    }
+
+    // A bundle is present → this claims to be a distributed release binary;
+    // verification is mandatory and fail-closed.
+    let cosign = which_cosign().ok_or_else(|| {
+        "Untrusted: signature bundle present but cosign is not installed — \
+         cannot verify; refusing to execute (ADR-020 Rule 1 fail-closed)"
+            .to_string()
+    })?;
+
+    let out = std::process::Command::new(cosign)
+        .args([
+            "verify-blob",
+            "--bundle",
+            &bundle,
+            "--certificate-oidc-issuer",
+            EXPECTED_OIDC_ISSUER,
+            "--certificate-identity-regexp",
+            EXPECTED_IDENTITY_REGEXP,
+            program,
+        ])
+        .output()
+        .map_err(|e| format!("Untrusted: cosign invocation failed: {e}"))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Untrusted: cosign signature verification failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+fn which_cosign() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("cosign"))
+        .find(|p| p.is_file())
 }
 
 fn upsert_entry(lock: &mut LockFile, entry: Entry) {
@@ -434,6 +551,7 @@ mod tests {
                 language: "kotlin".into(),
                 verified_at_unix: 1,
             }],
+            disabled: vec!["php".into()],
         };
         let s = toml::to_string_pretty(&lock).unwrap();
         let back: LockFile = toml::from_str(&s).unwrap();

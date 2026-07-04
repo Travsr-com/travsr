@@ -1,5 +1,42 @@
 use thiserror::Error;
 
+/// ADR-018 Rule 1 — normative resource block applied to every plugin process
+/// and to the verification probe. Enforcement mechanism (Rule 2):
+/// - `PARSE_DEADLINE` / probe deadline: host-side timer in the transport /
+///   probe, `SIGKILL` on breach (works identically on every platform).
+/// - `OUTPUT_MAX`: frame cap on the decoded `ParseResponse` (rejected before
+///   allocation — T16).
+/// - `MEMORY_MAX` (kill) / `MEMORY_HIGH` (recycle trigger): supervisor RSS
+///   watchdog sampling `/proc/<pid>/statm` on Linux and `ps -o rss=` on macOS
+///   (the ADR's documented sampled-enforcement path; a sub-interval spike can
+///   transiently overshoot — accepted).
+/// - `RECYCLE_AFTER_FILES` / `IDLE_TTL`: the LazySidecar transport drains and
+///   respawns at the boundary; respawn reuses the cached verdict (no
+///   re-probe, ADR-018 Rule 3).
+/// - cgroup `memory.max` / `RLIMIT_AS` hard caps and cgroup `cpu.max` are a
+///   deferred hardening layer on top of the watchdog — the process boundary
+///   already insulates the daemon.
+pub mod resource_limits {
+    use std::time::Duration;
+
+    /// Per plugin process RSS: kill threshold.
+    pub const MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+    /// Per plugin process RSS: graceful recycle threshold (drain + respawn).
+    pub const MEMORY_HIGH_BYTES: u64 = 768 * 1024 * 1024;
+    /// Wall-clock per ParseRequest (host-side).
+    pub const PARSE_DEADLINE: Duration = Duration::from_secs(30);
+    /// Cap on a decoded ParseResponse frame.
+    pub const OUTPUT_MAX_BYTES: usize = 64 * 1024 * 1024;
+    /// Recycle after this many files even without memory pressure.
+    pub const RECYCLE_AFTER_FILES: u32 = 2000;
+    /// No in-flight files for this long → spin the process down.
+    pub const IDLE_TTL: Duration = Duration::from_secs(120);
+    /// RSS/idle sampling interval of the supervisor watchdog.
+    pub const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+    /// Consecutive parse crashes before the language is disabled for the run.
+    pub const MAX_CONSECUTIVE_CRASHES: u32 = 3;
+}
+
 /// ADR-017 normative sandbox policy enum.
 #[derive(Debug, Clone)]
 pub enum SandboxPolicy {
