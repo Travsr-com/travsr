@@ -4,7 +4,7 @@
 
 **Please do not file a public GitHub issue for security vulnerabilities.**
 
-Email **security@travsr.com** with:
+Email **connect@travsr.com** with:
 
 - A description of the vulnerability
 - Steps to reproduce
