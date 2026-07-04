@@ -600,10 +600,12 @@ impl PluginIndexer {
                                 }
                             }
                             LangWork::Sidecar(spec) => {
-                                // C1: per-language timeout — kill the child if it doesn't
-                                // respond within TIMEOUT_SECS. Prevents KLS/sbt hangs from
-                                // starving the Tokio blocking thread pool indefinitely.
-                                const TIMEOUT_SECS: u64 = 300; // 5 min
+                                // #388: both the spawn handshake and the invoke
+                                // round-trip are now watchdog-guarded inside the
+                                // transport (HANDSHAKE_TIMEOUT_SECS / INVOKE_TIMEOUT_SECS),
+                                // so a wedged plugin is killed and surfaced as a
+                                // crash instead of hanging this scoped thread — no
+                                // bespoke timeout needed here.
                                 let req = travsr_plugin_protocol::InvokeRequest {
                                     root: repo_root.to_path_buf(),
                                     corpus: corpus.to_string(),
@@ -614,25 +616,6 @@ impl PluginIndexer {
                                 };
                                 match crate::transport::Sidecar::spawn(&spec, repo_root) {
                                     Ok(sidecar) => {
-                                        // Watchdog: kills the child after TIMEOUT_SECS so the
-                                        // blocking thread never hangs indefinitely.
-                                        let pid = sidecar.child_pid();
-                                        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                        let done_wg = std::sync::Arc::clone(&done);
-                                        let lang_wg = lang.clone();
-                                        std::thread::spawn(move || {
-                                            std::thread::sleep(std::time::Duration::from_secs(TIMEOUT_SECS));
-                                            if !done_wg.load(std::sync::atomic::Ordering::SeqCst) {
-                                                tracing::warn!(
-                                                    lang = %lang_wg,
-                                                    timeout_secs = TIMEOUT_SECS,
-                                                    "Phase B timeout — killing sidecar"
-                                                );
-                                                if let Some(p) = pid {
-                                                    sidecar_kill(p);
-                                                }
-                                            }
-                                        });
                                         let result = match crate::transport::Transport::invoke_phase_b(
                                             &sidecar, req,
                                         ) {
@@ -714,7 +697,6 @@ impl PluginIndexer {
                                                 }
                                             }
                                         };
-                                        done.store(true, std::sync::atomic::Ordering::SeqCst);
                                         result
                                     }
                                     Err(e) => {
@@ -815,15 +797,6 @@ impl PluginIndexer {
     ) -> Vec<travsr_core::Edge> {
         travsr_indexer::Indexer::with_corpus(&self.corpus).resolve_ffi_edges(markers)
     }
-}
-
-/// C1: SIGTERM a sidecar process by OS PID when the per-language watchdog fires.
-/// Uses a shell `kill` invocation to avoid adding `libc` as a dependency.
-/// Best-effort — if the process already exited, this is a no-op.
-fn sidecar_kill(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status();
 }
 
 #[cfg(test)]

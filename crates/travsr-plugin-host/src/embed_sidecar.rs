@@ -8,7 +8,7 @@
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use travsr_plugin_protocol::{
@@ -105,44 +105,7 @@ impl Drop for EmbedSidecar {
     }
 }
 
-/// FT-C2: best-effort SIGTERM by OS PID when the I/O watchdog fires.
-/// Mirrors `sidecar_kill` in indexer.rs — avoids adding libc as a dep.
-fn embed_sidecar_kill(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status();
-}
-
-/// Run a blocking sidecar I/O step guarded by a watchdog that SIGKILLs the
-/// sidecar (`pid`) if it does not complete within `timeout`.
-///
-/// Returns as soon as `io` completes — the watchdog waits on a `Condvar` and is
-/// woken the instant we finish, so `join()` returns immediately. A bare
-/// `thread::sleep(timeout)` + `join()` is NOT interruptible: it would block the
-/// full `timeout` on *every* call (the FT-C2/FT-H5 stall — 30 s per KNN, 60 s
-/// per handshake) even when the response arrived in milliseconds.
-fn with_io_watchdog<T>(pid: u32, timeout: Duration, io: impl FnOnce() -> T) -> T {
-    let state = Arc::new((Mutex::new(false), Condvar::new()));
-    let state_wg = Arc::clone(&state);
-    let watchdog = std::thread::spawn(move || {
-        let (lock, cv) = &*state_wg;
-        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (done, res) = cv
-            .wait_timeout_while(guard, timeout, |d| !*d)
-            .unwrap_or_else(|e| e.into_inner());
-        if res.timed_out() && !*done {
-            embed_sidecar_kill(pid);
-        }
-    });
-
-    let out = io();
-
-    let (lock, cv) = &*state;
-    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    cv.notify_all();
-    drop(watchdog.join());
-    out
-}
+use crate::watchdog::with_io_watchdog;
 
 impl EmbedSidecar {
     /// Spawn the embed plugin binary and perform the capabilities handshake.

@@ -18,6 +18,7 @@ pub mod sandbox;
 pub mod supervisor;
 pub mod transport;
 pub mod trust;
+mod watchdog;
 
 pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
