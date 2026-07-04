@@ -672,6 +672,27 @@ const SEMANTIC_ABS_FLOOR: f32 = 0.55;
 /// validation even when the oracle is harsh.
 const SEMANTIC_MIN_KEEP: usize = 5;
 
+/// #393 score-aware scope gate. A lexical seed whose package root is outside the
+/// anchor crate scope is admitted when its per-batch normalised score reaches
+/// this floor. Rationale: strong lexical evidence (the query term directly names
+/// a symbol or a path segment in another crate) is real relevance, not cross-
+/// domain drift, so it overrides the structural scope. Weak FTS trigram drift
+/// (e.g. "works" → "workspace") scores far below the floor and stays gated,
+/// preserving the anti-"confident salad" protection. Generic: match *strength*
+/// decides — no per-term string, plural, or stemming heuristics.
+///
+/// Default 0.3; override via `TRAVSR_SCOPE_STRONG_FLOOR` for bench tuning. A value
+/// ≥ 1.0 restores the pre-#393 hard scope gate (nothing overrides scope).
+const SCOPE_STRONG_FLOOR_DEFAULT: f32 = 0.3;
+
+fn scope_strong_floor() -> f32 {
+    std::env::var("TRAVSR_SCOPE_STRONG_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| (0.0..=2.0).contains(&x))
+        .unwrap_or(SCOPE_STRONG_FLOOR_DEFAULT)
+}
+
 /// Demote seeds the embed oracle places far from the query, then reshuffle the
 /// survivors by cosine.  A seed absent from the oracle (not among the over-fetched
 /// nearest neighbours) is treated as semantically distant (cosine 0.0) — this is
@@ -988,9 +1009,15 @@ pub(crate) fn build_seed_set(
         if !filter.allow(node.id, node.id, Some(node.vname.corpus.as_str())) {
             continue;
         }
-        // Structural scope gate: if anchors established a crate scope, restrict FTS
-        // results to that scope.  Nodes with no parseable root are allowed through.
-        if !anchor_roots.is_empty() {
+        let norm = (bm25 / max_bm25).clamp(0.05, 1.0);
+        // Score-aware structural scope gate (#393). If anchors established a crate
+        // scope, a node outside it is dropped ONLY when its lexical match is weak
+        // (normalised score < scope_strong_floor()). A strong lexical match is trusted
+        // regardless of crate, so a legitimately multi-domain query (a term that
+        // names both a symbol and a directory in different crates) is not collapsed
+        // to a single anchor's scope. Weak cross-domain FTS drift stays gated.
+        // Nodes with no parseable root are allowed through as before.
+        if !anchor_roots.is_empty() && norm < scope_strong_floor() {
             if let Some(root) = package_root(&node.vname.path) {
                 if !anchor_roots.contains(root) {
                     continue;
@@ -1002,7 +1029,6 @@ pub(crate) fn build_seed_set(
             continue;
         }
         *path_count += 1;
-        let norm = (bm25 / max_bm25).clamp(0.05, 1.0);
         let w = norm * kind_boost(&node.kind, &node.vname.language);
         lexical_raw.push((node.id, w));
     }

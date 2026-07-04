@@ -315,6 +315,87 @@ fn kind_update_reindex_no_duplicate_fts_rows() {
     );
 }
 
+// ── #393: RRF fusion — kind-diversity + singular/plural overlap ───────────────
+//
+// Reproduces the reported bug: functions containing "workflow" starved out the
+// `.github/workflows/*.yml` file nodes, and singular vs plural returned disjoint
+// sets. After RRF fusion + kind diversity the two kinds must co-exist.
+
+/// Build the #393 fixture: 12 `workflow`-named functions in one file + 6 file
+/// nodes under a `workflows/` directory.
+fn put_393_fixture(store: &mut SqliteStore) {
+    for i in 0..12 {
+        let f = node(
+            "crates/travsr-analysis/src/data_format.rs",
+            &format!("fn:github_actions_workflow_parse_{i}"),
+            "function",
+        );
+        put(store, &f);
+    }
+    for name in ["ci", "release", "fuzz", "bench", "osv-scan", "vscode"] {
+        let path = format!(".github/workflows/{name}.yml");
+        let f = node(&path, &path, "file");
+        put(store, &f);
+    }
+}
+
+#[test]
+fn issue393_workflow_singular_surfaces_files_not_only_functions() {
+    let mut store = open();
+    put_393_fixture(&mut store);
+
+    let r = store.search_nodes_fuzzy("workflow").unwrap();
+    let n_files = r.iter().filter(|n| n.kind == "file").count();
+    let n_funcs = r.iter().filter(|n| n.kind == "function").count();
+    assert!(n_funcs > 0, "functions must still be present");
+    assert!(
+        n_files > 0,
+        "#393: singular 'workflow' must surface the workflows/*.yml files, not 0"
+    );
+    // Diversity: a file must reach the visible top-K, not be starved to the tail.
+    let top = &r[..r.len().min(6)];
+    assert!(
+        top.iter().any(|n| n.kind == "file"),
+        "#393: a file node must appear in the top-6, not be starved by functions"
+    );
+}
+
+#[test]
+fn issue393_singular_and_plural_results_overlap() {
+    let mut store = open();
+    put_393_fixture(&mut store);
+
+    let singular = store.search_nodes_fuzzy("workflow").unwrap();
+    let plural = store.search_nodes_fuzzy("workflows").unwrap();
+
+    let sig_set = |v: &[Node]| {
+        v.iter()
+            .map(|n| n.vname.signature.clone())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let overlap = sig_set(&singular).intersection(&sig_set(&plural)).count();
+    assert!(
+        overlap > 0,
+        "#393: 'workflow' and 'workflows' must share results, not be disjoint"
+    );
+}
+
+#[test]
+fn issue393_exact_signature_still_fast_paths() {
+    let mut store = open();
+    put_393_fixture(&mut store);
+    // An exact signature match must still win outright (G1 fast path, TL3):
+    // diversity/interleave must not demote a crisp symbol lookup.
+    let r = store
+        .search_nodes_fuzzy("fn:github_actions_workflow_parse_3")
+        .unwrap();
+    assert_eq!(
+        r.first().map(|n| n.vname.signature.as_str()),
+        Some("fn:github_actions_workflow_parse_3"),
+        "#393 G1: exact signature hit must remain the first result"
+    );
+}
+
 // ── Empty graph ───────────────────────────────────────────────────────────────
 
 #[test]

@@ -2829,6 +2829,326 @@ impl SqliteStore {
         Ok(())
     }
 
+    // ── #393: RRF fusion cascade (replaces the first-nonempty short-circuit) ──
+    //
+    // The legacy cascade returned the first non-empty stage and stopped, which
+    // let a partial substring match hide better FTS/embed results and made
+    // singular/plural queries return disjoint sets. `fused_search_scored` unifies
+    // all three public entry points onto one core that (G1) fast-paths a
+    // confident exact-signature hit, (G2) always fuses the two cheap SQLite
+    // stages and gates the costly L2-A/embed stages to a combined miss, and
+    // (G3) round-robin-interleaves by kind so one kind can't starve out another.
+
+    /// RRF constant `k` (Cormack et al.); dampens the contribution of low ranks.
+    const RRF_K: f32 = 60.0;
+    /// Per-stage RRF weights. Exact-substring is the most trusted signal.
+    const RRF_W_EXACT: f32 = 2.0;
+    const RRF_W_FTS: f32 = 1.0;
+    const RRF_W_L2A: f32 = 0.7;
+    const RRF_W_EMBED: f32 = 1.0;
+
+    /// Unified fuzzy-search core (#393). `lang_filter = Some(l)` scopes every
+    /// stage to language `l`; `include_embed = false` skips the semantic-ANN
+    /// stage (used by the get_context seed path, which has its own KNN channel
+    /// and must not double-count the embed signal — see plan §5.1).
+    ///
+    /// Returns `(Node, score)` where `score` is a BM25-scale relevance float
+    /// (FTS rows carry `-bm25()`, exact/substring rows a synthetic descending
+    /// score, L2-A rows a 0.25 floor, embed rows the cosine). The *ordering* is
+    /// RRF-fused + kind-diversified; the *score* stays BM25-scale so downstream
+    /// relevance floors remain calibrated.
+    fn fused_search_scored(
+        &self,
+        query: &str,
+        lang_filter: Option<&str>,
+        include_embed: bool,
+    ) -> Result<Vec<(Node, f32)>, StoreError> {
+        let _span = tracing::debug_span!(
+            "store.fused_search_scored",
+            query,
+            lang = lang_filter.unwrap_or(""),
+            include_embed
+        )
+        .entered();
+
+        // Stage 1 — exact substring, ranked best-first.
+        let stage1_nodes = match lang_filter {
+            Some(l) => self.search_nodes_by_name_with_lang(query, l)?,
+            None => self.search_nodes_by_name(query)?,
+        };
+
+        // G1 — confident-exact fast path: the top row is an exact signature match
+        // (SQL rank 0). Return Stage 1 only, so crisp symbol lookups stay precise
+        // and can't be diluted by fuzzy neighbours (preserves TL3).
+        if let Some(first) = stage1_nodes.first() {
+            if first.vname.signature == query {
+                tracing::debug!(
+                    layer = "exact_fastpath",
+                    nodes_returned = stage1_nodes.len()
+                );
+                return Ok(Self::synthetic_desc_scores(stage1_nodes));
+            }
+        }
+
+        let stage1 = Self::synthetic_desc_scores(stage1_nodes);
+
+        // Stage 2 — FTS5 BM25 (scored), best-first.
+        let stage2 = match build_fuzzy_match_expr_db(query, &self.conn)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
+            Some(expr) => match lang_filter {
+                Some(l) => self
+                    .fts_query_nodes_scored_with_lang(&expr, l)
+                    .map_err(|e| StoreError::Database(e.to_string()))?,
+                None => self
+                    .fts_query_nodes_scored(&expr)
+                    .map_err(|e| StoreError::Database(e.to_string()))?,
+            },
+            // All tokens < 3 chars — nothing to MATCH.
+            None => Vec::new(),
+        };
+
+        // G2 (part 1) — always fuse the two cheap SQLite stages.
+        let mut fused = Self::rrf_fuse(&[(Self::RRF_W_EXACT, &stage1), (Self::RRF_W_FTS, &stage2)]);
+
+        // G2 (part 2) — gate the costly stages. Phase 1: fire only on a combined
+        // Stage 1 + Stage 2 miss (same trigger as the legacy empty-cascade), so no
+        // added latency on the hot path. Phase 2 will loosen this to weak-union.
+        if fused.is_empty() {
+            let stage3 = self.l2a_scored(query, lang_filter)?;
+            let stage4 = if include_embed {
+                self.embed_scored(query, lang_filter)?
+            } else {
+                Vec::new()
+            };
+            fused = Self::rrf_fuse(&[
+                (Self::RRF_W_EXACT, &stage1),
+                (Self::RRF_W_FTS, &stage2),
+                (Self::RRF_W_L2A, &stage3),
+                (Self::RRF_W_EMBED, &stage4),
+            ]);
+        }
+
+        // G3 — kind diversity so one kind can't saturate the visible top-K.
+        Ok(Self::diversify_topk(fused))
+    }
+
+    /// Assign descending synthetic relevance scores [1.0 … 0.1] to a ranked node
+    /// list (Stage 1 order is already best-first). Matches the legacy exact-branch
+    /// scoring so the exact fast path stays score-compatible.
+    fn synthetic_desc_scores(nodes: Vec<Node>) -> Vec<(Node, f32)> {
+        let len = nodes.len() as f32;
+        nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let score = (1.0f32 - (i as f32 / (len + 1.0))).max(0.1);
+                (n, score)
+            })
+            .collect()
+    }
+
+    /// Reciprocal Rank Fusion over pre-ordered stages (each best-first).
+    ///
+    /// `RRF(d) = Σ_i w_i / (k + rank_i(d))` with 1-based ranks. Nodes are ordered
+    /// by descending fused score, tie-broken on node id for determinism. Each
+    /// returned node carries the **max natural (BM25-scale) score** across the
+    /// stages it appeared in, so downstream BM25 floors stay calibrated (#393 §5.1).
+    fn rrf_fuse(stages: &[(f32, &[(Node, f32)])]) -> Vec<(Node, f32)> {
+        use std::collections::HashMap;
+        // id → (node, accumulated rrf, best natural score)
+        let mut acc: HashMap<NodeId, (Node, f32, f32)> = HashMap::new();
+        for (weight, stage) in stages {
+            for (rank, (node, natural)) in stage.iter().enumerate() {
+                let contrib = weight / (Self::RRF_K + (rank as f32) + 1.0);
+                let entry = acc
+                    .entry(node.id)
+                    .or_insert_with(|| (node.clone(), 0.0, f32::MIN));
+                entry.1 += contrib;
+                entry.2 = entry.2.max(*natural);
+            }
+        }
+        let mut fused: Vec<(Node, f32, f32)> = acc.into_values().collect();
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        fused.into_iter().map(|(n, _rrf, nat)| (n, nat)).collect()
+    }
+
+    /// G3 — round-robin interleave by node `kind`, preserving RRF order within
+    /// each kind and leading with the globally best node. A single-kind result
+    /// passes through unchanged. Guarantees minority kinds (e.g. data-format
+    /// `file` nodes) reach the visible top-K instead of being starved by a
+    /// dominant kind (#393).
+    fn diversify_topk(fused: Vec<(Node, f32)>) -> Vec<(Node, f32)> {
+        if fused.len() <= 2 {
+            return fused;
+        }
+        // Insertion-ordered kind buckets; `fused` is already RRF-sorted, so the
+        // first bucket created holds the globally best node.
+        let mut buckets: Vec<(String, std::collections::VecDeque<(Node, f32)>)> = Vec::new();
+        for (node, score) in fused {
+            match buckets.iter_mut().find(|(k, _)| *k == node.kind) {
+                Some((_, q)) => q.push_back((node, score)),
+                None => {
+                    let kind = node.kind.clone();
+                    let mut q = std::collections::VecDeque::new();
+                    q.push_back((node, score));
+                    buckets.push((kind, q));
+                }
+            }
+        }
+        if buckets.len() <= 1 {
+            return buckets.into_iter().flat_map(|(_, q)| q).collect();
+        }
+        let mut out = Vec::new();
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            for (_, q) in &mut buckets {
+                if let Some(item) = q.pop_front() {
+                    out.push(item);
+                    progressed = true;
+                }
+            }
+        }
+        out
+    }
+
+    /// L2-A vocabulary-grounded expansion as a scored stage (0.25 floor). Shared
+    /// by the fused core; `lang_filter` scopes the FTS lookup. Returns `[]` when
+    /// the query yields no tokens or no in-vocabulary expansion candidates.
+    fn l2a_scored(
+        &self,
+        query: &str,
+        lang_filter: Option<&str>,
+    ) -> Result<Vec<(Node, f32)>, StoreError> {
+        (|| -> AnyResult<Vec<(Node, f32)>> {
+            let raw_str = tokenize_identifier(query);
+            if raw_str.is_empty() {
+                return Ok(Vec::new());
+            }
+            let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
+            let t0_tokens = crate::seed_lexicon::expand_tokens(&raw);
+            let l2a_extra = self.expand_query(&t0_tokens)?;
+            if l2a_extra.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut arms: Vec<String> = t0_tokens;
+            for c in l2a_extra {
+                if arms.len() >= 16 {
+                    break;
+                }
+                if !arms.iter().any(|t| t == &c) {
+                    arms.push(c);
+                }
+            }
+            arms.sort();
+            arms.truncate(16);
+            let match_expr = arms
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let nodes = match lang_filter {
+                Some(l) => self.fts_query_nodes_with_lang(&match_expr, l)?,
+                None => self.fts_query_nodes(&match_expr)?,
+            };
+            Ok(nodes.into_iter().map(|n| (n, 0.25f32)).collect())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Semantic-ANN (RFC-018) as a scored stage carrying the cosine similarity.
+    /// Returns `[]` when no embed hook is installed or nothing is scored;
+    /// `lang_filter` post-filters KNN results by language.
+    fn embed_scored(
+        &self,
+        query: &str,
+        lang_filter: Option<&str>,
+    ) -> Result<Vec<(Node, f32)>, StoreError> {
+        let Some(knn_fn) = self.embed_knn_hook.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let pairs = knn_fn(query, 20)?;
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<NodeId> = pairs.iter().map(|(id, _)| *id).collect();
+        let scores: std::collections::HashMap<NodeId, f32> = pairs.into_iter().collect();
+        let nodes = self.get_nodes(&ids)?;
+        // get_nodes may reorder; re-attach cosine and restore descending order.
+        let mut out: Vec<(Node, f32)> = nodes
+            .into_iter()
+            .filter(|n| match lang_filter {
+                Some(l) => n.vname.language == l,
+                None => true,
+            })
+            .map(|n| {
+                let s = scores.get(&n.id).copied().unwrap_or(0.0);
+                (n, s)
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
+    }
+
+    /// Language-scoped, scored variant of [`fts_query_nodes_scored`].
+    fn fts_query_nodes_scored_with_lang(
+        &self,
+        match_expr: &str,
+        lang: &str,
+    ) -> AnyResult<Vec<(Node, f32)>> {
+        let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                          n.kind, n.package, n.line, n.end_line, -bm25(nodes_fts) \
+                   FROM nodes_fts \
+                   JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
+                   JOIN nodes n ON n.id = m.node_id \
+                   WHERE nodes_fts MATCH ?1 \
+                     AND n.language = ?2 \
+                   ORDER BY bm25(nodes_fts) \
+                   LIMIT 50";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("preparing lang-filtered scored FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr, lang], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                let bm25: f64 = row.get(10).unwrap_or(0.0);
+                Ok((
+                    Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    },
+                    bm25 as f32,
+                ))
+            })
+            .context("executing lang-filtered scored FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding lang-filtered scored FTS5 row")?);
+        }
+        Ok(out)
+    }
+
     /// Layered seed selection (RFC-012 L1 + A1).
     ///
     /// 1. Exact substring via `search_nodes_by_name` — if ≥1 result, return it.
@@ -2844,98 +3164,16 @@ impl SqliteStore {
     /// as `build_match_expr` (TL4).  L2-A is vocabulary-grounded: it can only
     /// propose tokens that exist in `fts_vocab` (populated by `put_node_fts`),
     /// so no hallucinated token ever reaches the FTS index — enforcing PA C4.
+    ///
+    /// #393: thin wrapper over [`fused_search_scored`] — RRF fusion of the cheap
+    /// SQLite stages, gated L2-A/embed, and kind diversity replace the legacy
+    /// first-nonempty short-circuit. `include_embed = true` (the `ask` path).
     pub fn search_nodes_fuzzy(&self, query: &str) -> Result<Vec<Node>, StoreError> {
-        let _span = tracing::debug_span!("store.search_nodes_fuzzy", query).entered();
-
-        // Step 1 — exact substring (never regresses, TL3).
-        let exact = self.search_nodes_by_name(query)?;
-        if !exact.is_empty() {
-            tracing::debug!(layer = "exact", nodes_returned = exact.len());
-            return Ok(exact);
-        }
-
-        // Step 2 — FTS5 trigram MATCH on the T0 heuristic-normalised token union.
-        // build_fuzzy_match_expr_db uses fts_synonyms (DB-backed, RFC-012 A2 F1)
-        // instead of the compile-time static; pure build_fuzzy_match_expr is kept
-        // for unit tests that run without a live connection.
-        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
-            .map_err(|e| StoreError::Database(e.to_string()))?
-        {
-            Some(e) => e,
-            // All tokens < 3 chars (e.g. pure punctuation) — nothing to search.
-            None => {
-                tracing::debug!(layer = "fts5_skip_empty_tokens");
-                return Ok(Vec::new());
-            }
-        };
-        let step2 = self
-            .fts_query_nodes(&step2_expr)
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        if !step2.is_empty() {
-            tracing::debug!(layer = "fts5_t0", nodes_returned = step2.len());
-            return Ok(step2);
-        }
-
-        // Step 3 — L2-A vocabulary-grounded expansion (RFC-012 A1).
-        // Only fires on combined Step 1 + Step 2 miss.
-        let step3 = (|| -> AnyResult<Vec<Node>> {
-            let raw_str = tokenize_identifier(query);
-            if raw_str.is_empty() {
-                return Ok(Vec::new());
-            }
-            let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
-            let t0_tokens = crate::seed_lexicon::expand_tokens(&raw);
-            let l2a_extra = self.expand_query(&t0_tokens)?;
-            if l2a_extra.is_empty() {
-                tracing::debug!(layer = "fts5_l2a_no_candidates");
-                return Ok(Vec::new());
-            }
-
-            // Merge T0 tokens + L2-A candidates; sort for determinism; cap at 16.
-            let mut arms: Vec<String> = t0_tokens;
-            for c in l2a_extra {
-                if arms.len() >= 16 {
-                    break;
-                }
-                if !arms.iter().any(|t| t == &c) {
-                    arms.push(c);
-                }
-            }
-            arms.sort();
-            arms.truncate(16);
-
-            let match_expr = arms
-                .iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-
-            let step3 = self.fts_query_nodes(&match_expr)?;
-            tracing::debug!(
-                layer = "fts5_l2a",
-                arms = arms.len(),
-                nodes_returned = step3.len()
-            );
-            Ok(step3)
-        })()
-        .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        if !step3.is_empty() {
-            return Ok(step3);
-        }
-
-        // Step 4 — semantic ANN (RFC-018). Fires only when Steps 1–3 all return
-        // empty. The hook is injected by the daemon's EmbedSupervisor at store-open
-        // time; it is None by default (zero cost — no embed plugin installed).
-        if let Some(knn_fn) = self.embed_knn_hook.as_ref() {
-            let pairs = knn_fn(query, 20)?;
-            if !pairs.is_empty() {
-                tracing::debug!(layer = "embed_ann", nodes_returned = pairs.len());
-                let ids: Vec<NodeId> = pairs.into_iter().map(|(id, _score)| id).collect();
-                return self.get_nodes(&ids);
-            }
-        }
-        Ok(Vec::new())
+        Ok(self
+            .fused_search_scored(query, None, true)?
+            .into_iter()
+            .map(|(n, _score)| n)
+            .collect())
     }
 
     /// Execute a raw FTS5 MATCH expression against the nodes index.
@@ -3119,55 +3357,16 @@ LIMIT 100",
     }
 
     /// Scored variant of [`search_nodes_fuzzy`]: returns `(Node, score)` pairs where
-    /// score is a positive relevance float (higher = better).
+    /// score is a positive, BM25-scale relevance float (higher = better).
     ///
-    /// Step 1 (exact substring) assigns descending rank scores [1.0, 0.9, …].
-    /// Step 2 (FTS5 BM25) returns the raw `-bm25()` values.
-    /// Step 3 (L2-A expansion fallback) assigns a fixed floor score of 0.25.
+    /// #393: this is the `get_context` seed path. It runs through
+    /// [`fused_search_scored`] with `include_embed = false` — get_context has its
+    /// own KNN seed channel, so folding the embed stage in here would double-count
+    /// the semantic signal (plan §5.1). Scores stay BM25-scale (RRF only reorders,
+    /// it does not rescore) so the downstream relevance/abstention floor that reads
+    /// the top score remains calibrated.
     pub fn search_nodes_fuzzy_scored(&self, query: &str) -> Result<Vec<(Node, f32)>, StoreError> {
-        let _span = tracing::debug_span!("store.search_nodes_fuzzy_scored", query).entered();
-
-        // Step 1 — exact substring match (never regresses, TL3).
-        let exact = self.search_nodes_by_name(query)?;
-        if !exact.is_empty() {
-            let len = exact.len() as f32;
-            return Ok(exact
-                .into_iter()
-                .enumerate()
-                .map(|(i, n)| {
-                    let score = (1.0f32 - (i as f32 / (len + 1.0))).max(0.1);
-                    (n, score)
-                })
-                .collect());
-        }
-
-        // Step 2 — FTS5 BM25.
-        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
-            .map_err(|e| StoreError::Database(e.to_string()))?
-        {
-            Some(e) => e,
-            None => {
-                // All tokens < 3 chars — fall through to step3.
-                return Ok(self
-                    .search_nodes_fuzzy(query)?
-                    .into_iter()
-                    .map(|n| (n, 0.25f32))
-                    .collect());
-            }
-        };
-        let step2 = self
-            .fts_query_nodes_scored(&step2_expr)
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        if !step2.is_empty() {
-            return Ok(step2);
-        }
-
-        // Step 3 — L2-A expansion via the existing unscored path; assign floor score.
-        Ok(self
-            .search_nodes_fuzzy(query)?
-            .into_iter()
-            .map(|n| (n, 0.25f32))
-            .collect())
+        self.fused_search_scored(query, None, false)
     }
 
     /// Returns the count of nodes whose `signature` contains `token` as a substring.
@@ -3256,88 +3455,14 @@ LIMIT 100",
         query: &str,
         lang_filter: Option<&str>,
     ) -> Result<Vec<Node>, StoreError> {
-        let lang = match lang_filter {
-            None => return self.search_nodes_fuzzy(query),
-            Some(l) => l,
-        };
-        let _span =
-            tracing::debug_span!("store.search_nodes_fuzzy_filtered", query, lang).entered();
-
-        // Step 1 — exact substring, language-filtered.
-        let exact = self.search_nodes_by_name_with_lang(query, lang)?;
-        if !exact.is_empty() {
-            tracing::debug!(layer = "exact_lang", nodes_returned = exact.len());
-            return Ok(exact);
-        }
-
-        // Step 2 — FTS5, language-filtered.
-        let step2_expr = match build_fuzzy_match_expr_db(query, &self.conn)
-            .map_err(|e| StoreError::Database(e.to_string()))?
-        {
-            Some(e) => e,
-            None => return Ok(Vec::new()),
-        };
-        let step2 = self
-            .fts_query_nodes_with_lang(&step2_expr, lang)
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        if !step2.is_empty() {
-            tracing::debug!(layer = "fts5_t0_lang", nodes_returned = step2.len());
-            return Ok(step2);
-        }
-
-        // Step 3 — L2-A expansion, language-filtered.
-        let step3 = (|| -> AnyResult<Vec<Node>> {
-            let raw_str = tokenize_identifier(query);
-            if raw_str.is_empty() {
-                return Ok(Vec::new());
-            }
-            let raw: Vec<String> = raw_str.split_whitespace().map(str::to_string).collect();
-            let t0_tokens = crate::seed_lexicon::expand_tokens(&raw);
-            let l2a_extra = self.expand_query(&t0_tokens)?;
-            if l2a_extra.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut arms: Vec<String> = t0_tokens;
-            for c in l2a_extra {
-                if arms.len() >= 16 {
-                    break;
-                }
-                if !arms.iter().any(|t| t == &c) {
-                    arms.push(c);
-                }
-            }
-            arms.sort();
-            arms.truncate(16);
-            let match_expr = arms
-                .iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            self.fts_query_nodes_with_lang(&match_expr, lang)
-        })()
-        .map_err(|e| StoreError::Database(e.to_string()))?;
-        if !step3.is_empty() {
-            tracing::debug!(layer = "fts5_l2a_lang", nodes_returned = step3.len());
-            return Ok(step3);
-        }
-
-        // Step 4 — embed ANN + post-filter by language.
-        if let Some(knn_fn) = self.embed_knn_hook.as_ref() {
-            let pairs = knn_fn(query, 20)?;
-            if !pairs.is_empty() {
-                let ids: Vec<NodeId> = pairs.into_iter().map(|(id, _score)| id).collect();
-                let nodes = self.get_nodes(&ids)?;
-                let filtered: Vec<Node> = nodes
-                    .into_iter()
-                    .filter(|n| n.vname.language == lang)
-                    .collect();
-                if !filtered.is_empty() {
-                    tracing::debug!(layer = "embed_ann_lang", nodes_returned = filtered.len());
-                    return Ok(filtered);
-                }
-            }
-        }
-        Ok(Vec::new())
+        // #393: thin wrapper over the fused core. `lang_filter = None` behaves
+        // identically to [`search_nodes_fuzzy`]; `Some(l)` scopes every stage to
+        // language `l`. `include_embed = true` (the `search_symbol` path).
+        Ok(self
+            .fused_search_scored(query, lang_filter, true)?
+            .into_iter()
+            .map(|(n, _score)| n)
+            .collect())
     }
 
     /// L2-A: vocabulary-grounded token expansion (RFC-012 A1 Step 3).
