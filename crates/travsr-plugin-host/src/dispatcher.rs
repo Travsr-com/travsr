@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use travsr_error::IndexError;
 use travsr_plugin_protocol::{
-    language_from_proto_str, HandshakeResponse, ParseRequest, ParseResponse, PROTOCOL_VERSION,
+    language_id_from_proto_str, HandshakeResponse, ParseRequest, ParseResponse, PROTOCOL_VERSION,
 };
 
 /// Maps file extension → Transport. Built from plugin handshakes.
@@ -36,7 +36,11 @@ impl Dispatcher {
                 got: handshake.protocol_version,
             });
         }
-        if language_from_proto_str(&handshake.language).is_none() {
+        // RFC-013 D-1: accept any WELL-FORMED LanguageId from a trusted,
+        // verified plugin — builtin enum membership is no longer the gate.
+        // Only a malformed identity (empty, uppercase, invalid chars) is
+        // refused. Builtin `Language` lookup is a secondary, non-gating step.
+        if language_id_from_proto_str(&handshake.language).is_none() {
             return Err(IndexError::UnknownLanguage {
                 reported: handshake.language,
             });
@@ -113,6 +117,46 @@ mod tests {
         assert!(matches!(result, Ok(None)));
     }
 
+    /// RFC-013 Phase 1 exit criterion: a plugin can declare a language core
+    /// never enumerated and reach the dispatcher.
+    #[test]
+    fn non_enumerated_language_is_accepted() {
+        let mut d = Dispatcher::new("github.com/acme/foo");
+        use crate::transport::Sidecar;
+        let t: Arc<dyn Transport> = Arc::new(Sidecar::stub("zig"));
+        let hs = HandshakeResponse {
+            protocol_version: PROTOCOL_VERSION,
+            plugin_version: "0.1.0".into(),
+            language: "zig".into(), // not in the Language enum
+            extensions: vec!["zig".into()],
+            supports_phase_b: false,
+            golden_fixture: None,
+        };
+        assert!(d.register(hs, t).is_ok(), "well-formed open identity must register");
+    }
+
+    /// Malformed identities (empty, uppercase, invalid chars) are still refused.
+    #[test]
+    fn malformed_language_id_is_refused() {
+        for bad in ["", "Zig", "zig lang", "1zig"] {
+            let mut d = Dispatcher::new("github.com/acme/foo");
+            use crate::transport::Sidecar;
+            let t: Arc<dyn Transport> = Arc::new(Sidecar::stub(bad));
+            let hs = HandshakeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                plugin_version: "0.1.0".into(),
+                language: bad.into(),
+                extensions: vec!["x".into()],
+                supports_phase_b: false,
+                golden_fixture: None,
+            };
+            assert!(
+                matches!(d.register(hs, t), Err(IndexError::UnknownLanguage { .. })),
+                "malformed id {bad:?} must be refused"
+            );
+        }
+    }
+
     #[test]
     fn version_mismatch_returns_error() {
         let mut d = Dispatcher::new("github.com/acme/foo");
@@ -124,6 +168,7 @@ mod tests {
             language: "go".into(),
             extensions: vec!["go".into()],
             supports_phase_b: false,
+            golden_fixture: None,
         };
         assert!(matches!(
             d.register(bad_handshake, t),

@@ -28,9 +28,12 @@ pub fn run_plugin<P: Plugin>(plugin: P) {
                 PluginResponse::Handshake(HandshakeResponse {
                     protocol_version: PROTOCOL_VERSION,
                     plugin_version: env!("CARGO_PKG_VERSION").to_string(),
+                    // RFC-013 D-1: emit the plugin's declared LanguageId —
+                    // an open identity, not a Language enum round-trip.
                     language: plugin.language().as_str().to_string(),
                     extensions: plugin.extensions().iter().map(|s| s.to_string()).collect(),
                     supports_phase_b: plugin.supports_phase_b(),
+                    golden_fixture: plugin.golden_fixture(),
                 })
             }
             PluginRequest::Parse(req) => PluginResponse::Parse(plugin.parse(&req)),

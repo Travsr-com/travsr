@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use travsr_analysis::ParseOutput;
 use travsr_plugin_protocol::{
-    FfiMarker as WireFfi, FfiMarkerKind as WireKind, InvokeRequest, InvokeResponse, ParseRequest,
-    ParseResponse, Plugin,
+    FfiMarker as WireFfi, FfiMarkerKind as WireKind, GoldenFixture, InvokeRequest, InvokeResponse,
+    ParseRequest, ParseResponse, Plugin,
 };
-use travsr_plugin_sdk::{run_plugin, Language};
+use travsr_plugin_sdk::{run_plugin, Language, LanguageId};
 
 /// Phase A parse function signature — matches `travsr_analysis::<lang>::parse`.
 pub type ParseFn = fn(&str, &Path, &str) -> anyhow::Result<ParseOutput>;
@@ -41,11 +41,15 @@ pub struct LangSidecar {
     /// `None` → Phase B unsupported by this binary (handshake says so; the
     /// host's catalog gating never routes Phase B here).
     pub phase_b: Option<ScipRunFn>,
+    /// Golden fixture `(file_name, source)` for the host's conformance probe
+    /// (ADR-019 Rule 2). Ship a small representative snippet; the host
+    /// asserts structural validity + determinism over it — never content.
+    pub fixture: Option<(&'static str, &'static str)>,
 }
 
 impl Plugin for LangSidecar {
-    fn language(&self) -> Language {
-        self.language
+    fn language(&self) -> LanguageId {
+        self.language.into()
     }
 
     fn extensions(&self) -> &[&str] {
@@ -54,6 +58,13 @@ impl Plugin for LangSidecar {
 
     fn supports_phase_b(&self) -> bool {
         self.phase_b.is_some()
+    }
+
+    fn golden_fixture(&self) -> Option<GoldenFixture> {
+        self.fixture.map(|(file_name, source)| GoldenFixture {
+            file_name: file_name.to_string(),
+            source: source.to_string(),
+        })
     }
 
     fn parse(&self, req: &ParseRequest) -> ParseResponse {

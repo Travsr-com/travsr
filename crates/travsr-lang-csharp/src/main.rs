@@ -13,6 +13,12 @@ fn main() {
         language: Language::CSharp,
         extensions: travsr_analysis::csharp::CONFIG.extensions,
         parse: travsr_analysis::csharp::parse,
+        fixture: Some(("Probe.cs", r#"using System;
+namespace Probe {
+    interface IShape { int Area(); }
+    class Widget : IShape { public int Area() { return 1; } }
+}
+"#)),
         phase_b: None,
     });
 }

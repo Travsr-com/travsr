@@ -13,6 +13,12 @@ fn main() {
         language: Language::Php,
         extensions: travsr_analysis::php::CONFIG.extensions,
         parse: travsr_analysis::php::parse,
+        fixture: Some(("probe.php", r#"<?php
+namespace Probe;
+use Probe\Util;
+class Widget { public function draw(): int { return 1; } }
+function helper() { return 1; }
+"#)),
         phase_b: None,
     });
 }

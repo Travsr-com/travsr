@@ -13,6 +13,12 @@ fn main() {
         language: Language::Scala,
         extensions: travsr_analysis::scala::CONFIG.extensions,
         parse: travsr_analysis::scala::parse,
+        fixture: Some(("probe.scala", r#"package probe
+import scala.collection.mutable
+class Widget { def draw(): Int = 1 }
+object Main { def run(): Unit = () }
+trait Shape { def area(): Int }
+"#)),
         phase_b: None,
     });
 }

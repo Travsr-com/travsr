@@ -44,6 +44,13 @@ fn main() {
         language: Language::Cpp,
         extensions: travsr_analysis::cpp::CONFIG.extensions,
         parse: travsr_analysis::cpp::parse,
+        fixture: Some(("probe.cpp", r#"#include <vector>
+namespace probe {
+class Widget { public: void draw(); };
+struct Pod { int n; };
+int compute(int x) { return x * 2; }
+}
+"#)),
         phase_b: Some(run_scip_clang),
     });
 }
@@ -58,6 +65,13 @@ mod tests {
             language: Language::Cpp,
             extensions: travsr_analysis::cpp::CONFIG.extensions,
             parse: travsr_analysis::cpp::parse,
+        fixture: Some(("probe.cpp", r#"#include <vector>
+namespace probe {
+class Widget { public: void draw(); };
+struct Pod { int n; };
+int compute(int x) { return x * 2; }
+}
+"#)),
             phase_b: Some(run_scip_clang),
         }
     }

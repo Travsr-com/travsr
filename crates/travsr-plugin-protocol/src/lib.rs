@@ -9,9 +9,9 @@ pub mod types;
 
 pub use codec::{decode_message, encode_message, write_message};
 pub use ffi_marker::{FfiMarker, FfiMarkerKind};
-pub use language_map::{language_from_proto_str, language_to_proto_str};
+pub use language_map::{language_from_proto_str, language_id_from_proto_str, language_to_proto_str};
 pub use plugin::Plugin;
 pub use types::{
-    HandshakeRequest, HandshakeResponse, InvokeRequest, InvokeResponse, ParseRequest,
-    ParseResponse, PluginError, PluginRequest, PluginResponse, PROTOCOL_VERSION,
+    GoldenFixture, HandshakeRequest, HandshakeResponse, InvokeRequest, InvokeResponse,
+    ParseRequest, ParseResponse, PluginError, PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };

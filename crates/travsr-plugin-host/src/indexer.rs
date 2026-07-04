@@ -446,11 +446,19 @@ impl PluginIndexer {
 
         for r in lang_results {
             if r.ran {
-                outcome.ran.push(r.lang);
+                outcome.ran.push(r.lang.clone());
             } else if r.skipped_no_analyzer {
-                outcome.skipped_no_analyzer.push(r.lang);
+                outcome.skipped_no_analyzer.push(r.lang.clone());
             } else if r.crashed {
-                outcome.crashed.push(r.lang);
+                outcome.crashed.push(r.lang.clone());
+            }
+            // D-7 pairing gate (ADR-019 Rule 6): validate the analyzer's
+            // output for this language before it merges into the graph; the
+            // first structurally-valid output records the (analyzer,
+            // language) pairing in subscriptions.lock. Invalid output is
+            // held out — Phase A for the language is unaffected.
+            if !crate::subscriptions::check_phase_b_pairing(&r.lang, &r.nodes, &r.edges) {
+                continue;
             }
             all_nodes.extend(r.nodes);
             all_edges.extend(r.edges);

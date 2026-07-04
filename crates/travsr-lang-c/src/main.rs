@@ -43,6 +43,12 @@ fn main() {
         language: Language::C,
         extensions: travsr_analysis::c::CONFIG.extensions,
         parse: travsr_analysis::c::parse,
+        fixture: Some(("probe.c", r#"#include <stdio.h>
+struct Point { int x; int y; };
+enum Color { RED, GREEN };
+typedef int Integer;
+int add(int a, int b) { return a + b; }
+"#)),
         phase_b: Some(run_scip_clang),
     });
 }
@@ -65,6 +71,12 @@ mod tests {
             language: Language::C,
             extensions: travsr_analysis::c::CONFIG.extensions,
             parse: travsr_analysis::c::parse,
+        fixture: Some(("probe.c", r#"#include <stdio.h>
+struct Point { int x; int y; };
+enum Color { RED, GREEN };
+typedef int Integer;
+int add(int a, int b) { return a + b; }
+"#)),
             phase_b: Some(run_scip_clang),
         }
         .invoke_phase_b(&req);

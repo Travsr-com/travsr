@@ -152,7 +152,7 @@ type Point struct{ X, Y int }
 func add(a, b int) int { return a + b }
 "#,
         "go",
-        &["file", "struct", "function", "import"],
+        &["file", "class", "function", "import"],
     );
 }
 
@@ -168,7 +168,7 @@ public class Greeter {
 interface Greets { String hi(); }
 "#,
         "java",
-        &["file", "class", "interface", "function", "import"],
+        &["file", "class", "interface", "method", "constructor", "import"],
     );
 }
 

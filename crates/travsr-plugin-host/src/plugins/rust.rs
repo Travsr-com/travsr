@@ -1,12 +1,12 @@
 use super::parse_output_to_response;
-use travsr_core::Language;
+use travsr_core::{Language, LanguageId};
 use travsr_plugin_protocol::{InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin};
 
 pub struct RustPlugin;
 
 impl Plugin for RustPlugin {
-    fn language(&self) -> Language {
-        Language::Rust
+    fn language(&self) -> LanguageId {
+        Language::Rust.into()
     }
     fn extensions(&self) -> &[&str] {
         &["rs"]

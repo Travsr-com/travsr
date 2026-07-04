@@ -31,6 +31,12 @@ fn main() {
         language: Language::Kotlin,
         extensions: travsr_analysis::kotlin::CONFIG.extensions,
         parse: travsr_analysis::kotlin::parse,
+        fixture: Some(("probe.kt", r#"import java.time.Instant
+class Widget {
+    fun draw(): Int = 1
+}
+object Registry { fun lookup(name: String): String = name }
+"#)),
         phase_b: Some(run_scip_java),
     });
 }
@@ -53,6 +59,12 @@ mod tests {
             language: Language::Kotlin,
             extensions: travsr_analysis::kotlin::CONFIG.extensions,
             parse: travsr_analysis::kotlin::parse,
+        fixture: Some(("probe.kt", r#"import java.time.Instant
+class Widget {
+    fun draw(): Int = 1
+}
+object Registry { fun lookup(name: String): String = name }
+"#)),
             phase_b: Some(run_scip_java),
         }
         .invoke_phase_b(&req);

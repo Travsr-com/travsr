@@ -107,6 +107,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
                 language: $lang.to_string(),
                 extensions: $exts.iter().map(|s: &&str| s.to_string()).collect(),
                 supports_phase_b: $phase_b,
+                golden_fixture: None,
             };
             let t = Arc::new(InProcess::new($plugin));
             dispatcher
@@ -209,26 +210,30 @@ pub const PHASE_A_SIDECARS: &[PhaseASidecar] = &[
     },
 ];
 
-/// Register all Phase A sidecar plugins from [`PHASE_A_SIDECARS`].
+/// Register all Phase A sidecar plugins from [`PHASE_A_SIDECARS`] through the
+/// runtime SUBSCRIBE → AUTHORIZE → VERIFY → ADMIT lifecycle (RFC-013 D-4,
+/// ADR-019 Rule 1).
 ///
 /// Called once per PluginIndexer with the repo root so the sandbox can grant
 /// read access to the source tree being parsed.
 ///
-/// Registration is cheap: a PATH lookup per language plus a handshake struct.
-/// The actual subprocess spawn is deferred to the first parse request for
-/// that language ([`LazySidecar`]) — a repo with no Ruby files never spawns
-/// travsr-lang-ruby, and the daemon's parallel workers only spawn sidecars
-/// for languages present in their shard.
+/// Per language:
+/// - **SUBSCRIBE**: the binary is resolved from `~/.travsr/bin` / PATH.
+/// - **AUTHORIZE**: sandbox availability (ADR-017 Rule 2). ADR-020 signature
+///   verification is pending sidecar release signing — accepted gap.
+/// - **VERIFY**: cached verdict from `~/.travsr/subscriptions.lock` when the
+///   binary hash matches (ADR-019 Rules 4–5); otherwise the conformance probe
+///   runs now (structural + determinism, reproducibility rule). HARD-rejected
+///   binaries are never admitted; SOFT (environment) failures skip this run
+///   and re-probe on the next trigger.
+/// - **ADMIT**: extensions register against a [`LazySidecar`] transport —
+///   the actual worker subprocess spawn is still deferred to the first file
+///   of the language, and respawn reuses the cached verdict (ADR-018 Rule 3).
 ///
-/// Phase A spawns always use `SandboxPolicy::Standard` — grammar parsing
-/// needs no network and no writes outside the scratch dir. Phase B goes
-/// through the resolver with the catalog's per-language sandbox requirement
-/// (Standard vs RequiresElevated + approved hosts) — a separate spawn.
-///
-/// Fail-closed per ADR-017 Rule 2:
-/// - binary not on PATH → language not registered, logged at info.
-/// - sandbox unavailable → nothing registered, logged once.
-/// - spawn failure at first use → cached failure, no respawn storm.
+/// Tier (RFC-013 D-6): `Active(A+B)` vs `Active(A only)` is logged from the
+/// verified `supports_phase_b` capability plus a live Phase B toolchain check
+/// — a toolchain installed later upgrades the tier on the next registration
+/// with no re-probe.
 pub fn register_phase_a_sidecars(dispatcher: &mut Dispatcher, repo_root: &std::path::Path) {
     if !sandbox_available() {
         tracing::warn!(
@@ -252,23 +257,57 @@ pub fn register_phase_a_sidecars(dispatcher: &mut Dispatcher, repo_root: &std::p
             continue;
         };
 
-        // Handshake synthesised from the catalog. supports_phase_b stays
-        // false here: Phase B for sidecar languages routes through the
-        // resolver + Phase B catalog (with its sandbox policy), never
-        // through this Phase A dispatcher registration.
-        let hs = HandshakeResponse {
-            protocol_version: PROTOCOL_VERSION,
-            plugin_version: version.clone(),
-            language: entry.language.to_string(),
-            extensions: entry.extensions.iter().map(|s| s.to_string()).collect(),
-            supports_phase_b: false,
-        };
-
         let spec = PluginSpec {
             language: entry.language.to_string(),
             program,
             args: vec![],
             policy: SandboxPolicy::Standard,
+        };
+
+        // VERIFY: cached verdict or conformance probe (once per process).
+        let supports_phase_b = match crate::subscriptions::check_subscription(&spec, false) {
+            crate::subscriptions::Verdict::Active { supports_phase_b } => supports_phase_b,
+            crate::subscriptions::Verdict::Rejected { reason } => {
+                tracing::warn!(
+                    lang = entry.language,
+                    %reason,
+                    "plugin quarantined (HARD verdict) — not admitted; replace the \
+                     binary or run a forced re-verify to clear"
+                );
+                continue;
+            }
+            crate::subscriptions::Verdict::Unverified { reason } => {
+                tracing::warn!(
+                    lang = entry.language,
+                    %reason,
+                    "cannot verify plugin (environment) — skipped this run, \
+                     re-probed on the next trigger"
+                );
+                continue;
+            }
+        };
+
+        // D-6 tier: verified capability + live toolchain presence.
+        let tool_present = crate::phase_b::catalog::lookup(entry.language)
+            .map(|cat| which_binary(cat.command).is_some())
+            .unwrap_or(false);
+        let tier = if supports_phase_b && tool_present {
+            "Active(A+B)"
+        } else {
+            "Active(A only)"
+        };
+
+        // ADMIT: register extensions against the lazy transport.
+        let hs = HandshakeResponse {
+            protocol_version: PROTOCOL_VERSION,
+            plugin_version: version.clone(),
+            language: entry.language.to_string(),
+            extensions: entry.extensions.iter().map(|s| s.to_string()).collect(),
+            // Phase B for sidecar languages routes through the resolver +
+            // Phase B catalog (with its per-language sandbox policy), never
+            // through this Phase A dispatcher registration.
+            supports_phase_b: false,
+            golden_fixture: None,
         };
 
         let transport = Arc::new(LazySidecar::new(spec, repo_root));
@@ -282,7 +321,8 @@ pub fn register_phase_a_sidecars(dispatcher: &mut Dispatcher, repo_root: &std::p
             tracing::debug!(
                 lang = entry.language,
                 binary = entry.binary,
-                "Phase A sidecar registered (lazy spawn)"
+                tier,
+                "plugin admitted (lazy spawn)"
             );
         }
     }

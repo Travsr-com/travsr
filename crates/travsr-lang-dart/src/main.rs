@@ -13,6 +13,11 @@ fn main() {
         language: Language::Dart,
         extensions: travsr_analysis::dart::CONFIG.extensions,
         parse: travsr_analysis::dart::parse,
+        fixture: Some(("probe.dart", r#"import 'dart:io';
+enum Color { red, green }
+class Widget { int area() => 1; }
+int helper() { return 1; }
+"#)),
         phase_b: None,
     });
 }

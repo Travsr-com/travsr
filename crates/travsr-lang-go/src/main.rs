@@ -38,6 +38,14 @@ fn main() {
         language: Language::Go,
         extensions: EXTENSIONS,
         parse: travsr_analysis::go::parse,
+        fixture: Some(("probe.go", r#"package probe
+
+import "fmt"
+
+type Point struct{ X, Y int }
+
+func Add(a, b int) int { fmt.Sprint(a); return a + b }
+"#)),
         phase_b: Some(run_scip_go),
     });
 }
@@ -60,6 +68,14 @@ mod tests {
             language: Language::Go,
             extensions: EXTENSIONS,
             parse: travsr_analysis::go::parse,
+        fixture: Some(("probe.go", r#"package probe
+
+import "fmt"
+
+type Point struct{ X, Y int }
+
+func Add(a, b int) int { fmt.Sprint(a); return a + b }
+"#)),
             phase_b: Some(run_scip_go),
         }
         .invoke_phase_b(&req);

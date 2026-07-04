@@ -13,6 +13,11 @@ fn main() {
         language: Language::Swift,
         extensions: travsr_analysis::swift::CONFIG.extensions,
         parse: travsr_analysis::swift::parse,
+        fixture: Some(("probe.swift", r#"import Foundation
+protocol Shape { func area() -> Int }
+class Widget: Shape { func area() -> Int { return 1 } }
+func helper() -> Int { return 1 }
+"#)),
         phase_b: None,
     });
 }

@@ -98,6 +98,16 @@ impl Sidecar {
         spec: &crate::resolver::PluginSpec,
         repo_root: &std::path::Path,
     ) -> Result<Self, IndexError> {
+        Self::spawn_with_handshake(spec, repo_root).map(|(s, _)| s)
+    }
+
+    /// Like [`Sidecar::spawn`] but also returns the validated handshake —
+    /// used by the verification probe (ADR-019), which needs the plugin's
+    /// declared LanguageId, capabilities, and golden fixture.
+    pub fn spawn_with_handshake(
+        spec: &crate::resolver::PluginSpec,
+        repo_root: &std::path::Path,
+    ) -> Result<(Self, travsr_plugin_protocol::HandshakeResponse), IndexError> {
         let lang = &spec.language;
         // Create per-invocation scratch tmpdir (ADR-017 Rule 1).
         // Dropped when Sidecar drops — guarantees cleanup even on error paths.
@@ -163,7 +173,7 @@ impl Sidecar {
             message: e.to_string(),
         })?;
 
-        let plugin_version = match hs {
+        let handshake = match hs {
             PluginResponse::Handshake(h) => {
                 if h.protocol_version != PROTOCOL_VERSION {
                     return Err(IndexError::ProtocolVersionMismatch {
@@ -171,7 +181,7 @@ impl Sidecar {
                         got: h.protocol_version,
                     });
                 }
-                h.plugin_version
+                h
             }
             _ => {
                 return Err(IndexError::Parse {
@@ -183,18 +193,34 @@ impl Sidecar {
 
         tracing::debug!(
             lang = %lang,
-            plugin_version = %plugin_version,
-            "Phase B: sidecar handshake ok"
+            plugin_version = %handshake.plugin_version,
+            "sidecar handshake ok"
         );
 
-        Ok(Self {
+        let sidecar = Self {
             language: lang.to_string(),
-            plugin_version,
+            plugin_version: handshake.plugin_version.clone(),
             _child: Some(Mutex::new(child)),
             io: Some(Mutex::new((writer, reader))),
             health: Mutex::new(PluginHealth::Ok),
             _scratch: Some(scratch),
-        })
+        };
+        Ok((sidecar, handshake))
+    }
+
+    /// Kill the child process. Used by the verification probe's deadline
+    /// enforcement (ADR-018 `probe_deadline`) — unblocks any thread waiting
+    /// on the pipe.
+    pub fn kill(&self) {
+        if let Some(child) = &self._child {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        if let Ok(mut h) = self.health.lock() {
+            *h = PluginHealth::Disabled(format!("plugin {} killed (deadline)", self.language));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -438,8 +464,8 @@ mod tests {
 
     struct NoOpPlugin;
     impl Plugin for NoOpPlugin {
-        fn language(&self) -> travsr_core::Language {
-            travsr_core::Language::TypeScript
+        fn language(&self) -> travsr_core::LanguageId {
+            travsr_core::Language::TypeScript.into()
         }
         fn extensions(&self) -> &[&str] {
             &["ts"]

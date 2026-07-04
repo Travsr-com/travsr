@@ -33,12 +33,18 @@ fn new_parse(abs_path: &Path, vname_path: &str) -> travsr_indexer::ParseOutput {
 /// Like `new_parse` but with Phase A sidecars registered — required for
 /// non-builtin languages (go, java, …) whose parsing moved out of process
 /// (RFC-013 Direction A). Callers must gate on `sidecar_on_path` first.
+///
+/// Paths are canonicalised: the daemon only ever passes absolute paths, and
+/// the sandbox bind-mounts + sidecar reads require them.
 fn new_parse_sidecar(abs_path: &Path, vname_path: &str) -> travsr_indexer::ParseOutput {
+    let abs_path = abs_path
+        .canonicalize()
+        .expect("canonicalizing fixture path");
     let repo_root = abs_path.parent().unwrap().to_path_buf();
     let mut indexer = PluginIndexer::new(CORPUS);
     indexer.register_phase_a_sidecars(&repo_root);
     indexer
-        .parse_file_with_vname(abs_path, vname_path)
+        .parse_file_with_vname(&abs_path, vname_path)
         .expect("PluginIndexer sidecar parse failed")
 }
 

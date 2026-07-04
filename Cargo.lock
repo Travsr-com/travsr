@@ -3393,6 +3393,7 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+ "sha2",
  "streaming-iterator",
  "tempfile",
  "thiserror 1.0.69",

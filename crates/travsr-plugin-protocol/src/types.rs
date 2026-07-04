@@ -4,7 +4,12 @@ use std::path::PathBuf;
 use travsr_core::{Edge, Node, ScipRef};
 
 /// Current protocol version. Bump on any breaking wire change.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// BOUNDARY-CHANGE: v2 (RFC-013 D-1) — `Plugin::language()` returns an open
+/// `LanguageId` instead of the closed `Language` enum, and the handshake
+/// carries an optional `golden_fixture` for the host's conformance probe
+/// (ADR-019 Rule 2). v1 sidecar binaries are refused at handshake.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseRequest {
@@ -72,14 +77,31 @@ pub struct HandshakeRequest {
     pub daemon_protocol_version: u32,
 }
 
+/// A plugin-shipped source sample for the host's conformance probe
+/// (ADR-019 Rule 2). The host writes `source` to a scratch file named
+/// `file_name`, parses it twice through the plugin, and asserts structural
+/// validity + determinism — never content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenFixture {
+    /// File name including the extension the plugin claims (e.g. `probe.rb`).
+    pub file_name: String,
+    /// Source text of the fixture.
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeResponse {
     pub protocol_version: u32,
     pub plugin_version: String,
-    /// Canonical lowercase language string — must match the normative table in language_map.rs.
+    /// Validated lowercase language identifier (RFC-013 D-1 open identity).
+    /// Not restricted to the builtin `Language` enum — the dispatcher admits
+    /// any well-formed id from a trusted, verified plugin.
     pub language: String,
     pub extensions: Vec<String>,
     pub supports_phase_b: bool,
+    /// Fixture for the verification probe. Absent from old plugins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden_fixture: Option<GoldenFixture>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

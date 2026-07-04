@@ -1,12 +1,12 @@
 use super::parse_output_to_response;
-use travsr_core::Language;
+use travsr_core::{Language, LanguageId};
 use travsr_plugin_protocol::{InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin};
 
 pub struct TypeScriptPlugin;
 
 impl Plugin for TypeScriptPlugin {
-    fn language(&self) -> Language {
-        Language::TypeScript
+    fn language(&self) -> LanguageId {
+        Language::TypeScript.into()
     }
     fn extensions(&self) -> &[&str] {
         &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]

@@ -32,6 +32,13 @@ fn main() {
         language: Language::Java,
         extensions: travsr_analysis::java::EXTENSIONS,
         parse: travsr_analysis::java::parse,
+        fixture: Some(("Probe.java", r#"import java.util.List;
+public class Probe {
+    public Probe() {}
+    public String hi() { return "hi"; }
+}
+interface Greets { String hi(); }
+"#)),
         phase_b: Some(run_scip_java),
     });
 }
@@ -54,6 +61,13 @@ mod tests {
             language: Language::Java,
             extensions: travsr_analysis::java::EXTENSIONS,
             parse: travsr_analysis::java::parse,
+        fixture: Some(("Probe.java", r#"import java.util.List;
+public class Probe {
+    public Probe() {}
+    public String hi() { return "hi"; }
+}
+interface Greets { String hi(); }
+"#)),
             phase_b: Some(run_scip_java),
         }
         .invoke_phase_b(&req);

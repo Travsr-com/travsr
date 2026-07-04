@@ -13,6 +13,17 @@ fn main() {
         language: Language::ObjectiveC,
         extensions: travsr_analysis::objc::CONFIG.extensions,
         parse: travsr_analysis::objc::parse,
+        fixture: Some(("probe.m", r#"#import <Foundation/Foundation.h>
+@protocol Shape
+- (int)area;
+@end
+@interface Widget : NSObject <Shape>
+@end
+@implementation Widget
+- (int)area { return 1; }
+@end
+int helper(int a) { return a; }
+"#)),
         phase_b: None,
     });
 }

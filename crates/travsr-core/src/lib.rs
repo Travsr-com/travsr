@@ -211,6 +211,65 @@ impl Language {
     }
 }
 
+/// Open language identity (RFC-013 D-1).
+///
+/// A validated, lowercase language identifier that is NOT restricted to the
+/// [`Language`] enum. This is what frees the published `Plugin` trait so a
+/// plugin can declare a language core never enumerated: the dispatcher admits
+/// any *well-formed* `LanguageId` from a trusted, verified plugin; `Language`
+/// remains a builtin fast-path / grammar selector only.
+///
+/// Format: 1–64 chars of `[a-z0-9_+-]`, starting with a letter. Lowercase is
+/// mandatory so identity comparisons and the `nodes.language` column stay
+/// canonical (the column already stores strings — store unaffected).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LanguageId(std::borrow::Cow<'static, str>);
+
+impl LanguageId {
+    /// Validate and construct. Returns `None` for a malformed identifier.
+    pub fn new(s: impl Into<String>) -> Option<Self> {
+        let s: String = s.into();
+        if Self::is_valid(&s) {
+            Some(Self(std::borrow::Cow::Owned(s)))
+        } else {
+            None
+        }
+    }
+
+    /// Whether `s` is a well-formed language identifier.
+    pub fn is_valid(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '+' | '-'))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The builtin [`Language`] this id names, if any. A secondary,
+    /// non-gating lookup (RFC-013 D-1): unknown ids are still valid identities.
+    pub fn as_builtin(&self) -> Option<Language> {
+        Language::from_str(&self.0)
+    }
+}
+
+impl From<Language> for LanguageId {
+    fn from(lang: Language) -> Self {
+        // Language::as_str values are all well-formed by construction.
+        Self(std::borrow::Cow::Borrowed(lang.as_str()))
+    }
+}
+
+impl std::fmt::Display for LanguageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Kythe-style globally unique identifier for a code entity.
 ///
 /// VNames are stable across repos, languages, and time — they form the
@@ -838,6 +897,28 @@ impl ImportResolver for DartResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_id_validation() {
+        // Valid: lowercase, digits, _+-, starts with a letter.
+        for ok in ["zig", "objectivec", "csharp", "c", "f-sharp", "c_2", "cpp"] {
+            assert!(LanguageId::new(ok).is_some(), "{ok:?} should be valid");
+        }
+        // Invalid: empty, uppercase, spaces, leading digit/symbol, too long.
+        for bad in ["", "Zig", "zig lang", "1zig", "-zig", &"a".repeat(65)] {
+            assert!(LanguageId::new(bad).is_none(), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn language_id_builtin_round_trip() {
+        let id: LanguageId = Language::Kotlin.into();
+        assert_eq!(id.as_str(), "kotlin");
+        assert_eq!(id.as_builtin(), Some(Language::Kotlin));
+        // Open identity: unknown ids are valid but have no builtin.
+        let zig = LanguageId::new("zig").unwrap();
+        assert_eq!(zig.as_builtin(), None);
+    }
 
     fn sample_vname() -> VName {
         VName::new(

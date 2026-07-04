@@ -12,9 +12,11 @@ pub mod plugins;
 pub mod registry;
 pub mod resolver;
 pub mod sandbox;
+pub mod subscriptions;
 pub mod supervisor;
 pub mod transport;
 pub mod trust;
+pub mod verify;
 
 pub use dispatcher::Dispatcher;
 pub use indexer::{PhaseBInputs, PhaseBOutcome, PluginIndexer};
@@ -24,6 +26,7 @@ pub use phase_b::{
 };
 pub use registry::probe_sandbox;
 pub use sandbox::policy::{SandboxPolicy, SandboxUnavailable};
+pub use subscriptions::Verdict;
 pub use transport::{InProcess, PluginHealth, Sidecar, Transport};
 
 /// Formal plugin state — reported at startup and queryable by the daemon.

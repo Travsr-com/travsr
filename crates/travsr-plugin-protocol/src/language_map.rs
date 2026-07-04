@@ -1,7 +1,21 @@
-use travsr_core::Language;
+use travsr_core::{Language, LanguageId};
 
-/// Map a canonical proto language string to a Language variant.
-/// Case-sensitive. Returns None for unrecognised values.
+/// Validate a wire language string into an open [`LanguageId`]
+/// (RFC-013 D-1: validate format, do NOT reject unknowns).
+///
+/// This is the registration gate: any well-formed id is a valid identity.
+/// Mapping to a builtin [`Language`] is a secondary, non-gating step — use
+/// [`language_from_proto_str`] (or `LanguageId::as_builtin`) for that.
+pub fn language_id_from_proto_str(s: &str) -> Option<LanguageId> {
+    // Accept the historical "objc" alias by canonicalising it first.
+    let canonical = if s == "objc" { "objectivec" } else { s };
+    LanguageId::new(canonical)
+}
+
+/// Map a canonical proto language string to a builtin Language variant.
+/// Case-sensitive. Returns None for unrecognised values — which, post
+/// RFC-013 D-1, is NOT a registration error; it merely means the language
+/// has no builtin fast-path.
 pub fn language_from_proto_str(s: &str) -> Option<Language> {
     match s {
         "typescript" | "javascript" => Some(Language::TypeScript),

@@ -13,6 +13,14 @@ fn main() {
         language: Language::Ruby,
         extensions: travsr_analysis::ruby::CONFIG.extensions,
         parse: travsr_analysis::ruby::parse,
+        fixture: Some(("probe.rb", r#"module Probe
+  class Widget
+    def draw
+      1
+    end
+  end
+end
+"#)),
         phase_b: None,
     });
 }

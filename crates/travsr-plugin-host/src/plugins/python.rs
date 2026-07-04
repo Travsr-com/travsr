@@ -1,12 +1,12 @@
 use super::parse_output_to_response;
-use travsr_core::Language;
+use travsr_core::{Language, LanguageId};
 use travsr_plugin_protocol::{InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin};
 
 pub struct PythonPlugin;
 
 impl Plugin for PythonPlugin {
-    fn language(&self) -> Language {
-        Language::Python
+    fn language(&self) -> LanguageId {
+        Language::Python.into()
     }
     fn extensions(&self) -> &[&str] {
         &["py", "pyi"]
