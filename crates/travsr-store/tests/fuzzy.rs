@@ -315,6 +315,191 @@ fn kind_update_reindex_no_duplicate_fts_rows() {
     );
 }
 
+// ── #393: RRF fusion — kind-diversity + singular/plural overlap ───────────────
+//
+// Reproduces the reported bug: functions containing "workflow" starved out the
+// `.github/workflows/*.yml` file nodes, and singular vs plural returned disjoint
+// sets. After RRF fusion + kind diversity the two kinds must co-exist.
+
+/// Build the #393 fixture: 12 `workflow`-named functions in one file + 6 file
+/// nodes under a `workflows/` directory.
+fn put_393_fixture(store: &mut SqliteStore) {
+    for i in 0..12 {
+        let f = node(
+            "crates/travsr-analysis/src/data_format.rs",
+            &format!("fn:github_actions_workflow_parse_{i}"),
+            "function",
+        );
+        put(store, &f);
+    }
+    for name in ["ci", "release", "fuzz", "bench", "osv-scan", "vscode"] {
+        let path = format!(".github/workflows/{name}.yml");
+        let f = node(&path, &path, "file");
+        put(store, &f);
+    }
+}
+
+#[test]
+fn issue393_workflow_singular_surfaces_files_not_only_functions() {
+    let mut store = open();
+    put_393_fixture(&mut store);
+
+    let r = store.search_nodes_fuzzy("workflow").unwrap();
+    let n_files = r.iter().filter(|n| n.kind == "file").count();
+    let n_funcs = r.iter().filter(|n| n.kind == "function").count();
+    assert!(n_funcs > 0, "functions must still be present");
+    assert!(
+        n_files > 0,
+        "#393: singular 'workflow' must surface the workflows/*.yml files, not 0"
+    );
+    // Diversity: a file must reach the visible top-K, not be starved to the tail.
+    let top = &r[..r.len().min(6)];
+    assert!(
+        top.iter().any(|n| n.kind == "file"),
+        "#393: a file node must appear in the top-6, not be starved by functions"
+    );
+}
+
+#[test]
+fn issue393_singular_and_plural_results_overlap() {
+    let mut store = open();
+    put_393_fixture(&mut store);
+
+    let singular = store.search_nodes_fuzzy("workflow").unwrap();
+    let plural = store.search_nodes_fuzzy("workflows").unwrap();
+
+    let sig_set = |v: &[Node]| {
+        v.iter()
+            .map(|n| n.vname.signature.clone())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let overlap = sig_set(&singular).intersection(&sig_set(&plural)).count();
+    assert!(
+        overlap > 0,
+        "#393: 'workflow' and 'workflows' must share results, not be disjoint"
+    );
+}
+
+#[test]
+fn issue393_exact_signature_still_fast_paths() {
+    let mut store = open();
+    put_393_fixture(&mut store);
+    // An exact signature match must still win outright (G1 fast path, TL3):
+    // diversity/interleave must not demote a crisp symbol lookup.
+    let r = store
+        .search_nodes_fuzzy("fn:github_actions_workflow_parse_3")
+        .unwrap();
+    assert_eq!(
+        r.first().map(|n| n.vname.signature.as_str()),
+        Some("fn:github_actions_workflow_parse_3"),
+        "#393 G1: exact signature hit must remain the first result"
+    );
+}
+
+#[test]
+fn issue393_filtered_lang_scopes_and_fuses() {
+    let mut store = open();
+    let rs = Node::new(
+        VName::new(
+            "corpus",
+            "root",
+            "crates/a/src/lib.rs",
+            "rust",
+            "fn:workflow_parse",
+        ),
+        "function",
+    );
+    let ts = Node::new(
+        VName::new(
+            "corpus",
+            "root",
+            "pkg/b/src/x.ts",
+            "typescript",
+            "fn:workflowParse",
+        ),
+        "function",
+    );
+    put(&mut store, &rs);
+    put(&mut store, &ts);
+
+    let rust_only = store
+        .search_nodes_fuzzy_filtered("workflow", Some("rust"))
+        .unwrap();
+    assert!(!rust_only.is_empty(), "lang-filtered query must resolve");
+    assert!(
+        rust_only.iter().all(|n| n.vname.language == "rust"),
+        "#393: _filtered(Some(\"rust\")) must return only rust nodes"
+    );
+    assert!(rust_only
+        .iter()
+        .any(|n| n.vname.signature == "fn:workflow_parse"));
+}
+
+#[test]
+fn issue393_scored_carries_bm25_scale_not_rrf() {
+    let mut store = open();
+    put(
+        &mut store,
+        &node("crates/x/src/a.rs", "fn:knapsack_select", "function"),
+    );
+    // The score must be BM25/synthetic scale (>0.1), never the tiny internal RRF
+    // accumulator (~0.03). Guards the "RRF orders, does not rescore" contract that
+    // get_context's BM25-scale relevance floor depends on (#393 §5.1).
+    let scored = store.search_nodes_fuzzy_scored("knapsack_select").unwrap();
+    assert!(!scored.is_empty());
+    let top = scored.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
+    assert!(top > 0.1, "score must be BM25/synthetic scale, got {top}");
+}
+
+#[test]
+fn issue393_embed_gated_and_get_context_path_never_embeds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut store = open();
+    put(
+        &mut store,
+        &node("crates/x/src/a.rs", "fn:dispatch_tool_call", "function"),
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let hook: travsr_store::EmbedKnnHook = Arc::new(move |_q, _k| {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    });
+    store.set_embed_knn_hook(hook);
+
+    // Cheap SQLite stages resolve => embed must NOT fire (G2 gate).
+    let _ = store.search_nodes_fuzzy("dispatch_tool_call").unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "embed must not fire when the cheap stages already return results"
+    );
+
+    // Combined Stage1+Stage2 miss on the ask path (include_embed=true) => embed fires.
+    let _ = store
+        .search_nodes_fuzzy("zzqqvv nonexistent token")
+        .unwrap();
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "embed must fire on a combined miss (ask path)"
+    );
+
+    // get_context path (_scored, include_embed=false) must NEVER call embed — it has
+    // its own KNN channel, so double-embedding would be redundant (#393 §5.1).
+    let before = calls.load(Ordering::SeqCst);
+    let _ = store
+        .search_nodes_fuzzy_scored("zzqqvv nonexistent token")
+        .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before,
+        "get_context (_scored) path must not invoke the embed hook"
+    );
+}
+
 // ── Empty graph ───────────────────────────────────────────────────────────────
 
 #[test]

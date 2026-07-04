@@ -16,10 +16,15 @@
 /// intentionally ABSENT because they appear in real identifiers.
 /// 2-char tokens (`is`, `do`, `of`, `we`) are already dropped by
 /// `tokenize_identifier`'s <3-char rule, so only 3+-char words are listed here.
+// NOTE: kept sorted ascending — `is_stopword` relies on `binary_search`.
+// Filler verbs (works/uses/runs) are stopwords: in NL queries like "how ppr
+// works" they are function words, not search terms, and would otherwise strong-
+// match coincidental identifiers ("works" → "inWorkspace"), #393.
 pub(crate) static STOPWORDS: &[&str] = &[
     "about", "and", "any", "are", "can", "did", "does", "find", "for", "from", "give", "how",
-    "into", "its", "our", "please", "show", "tell", "that", "the", "then", "this", "using", "was",
-    "were", "what", "when", "where", "which", "who", "whose", "why", "with",
+    "into", "its", "our", "please", "runs", "show", "tell", "that", "the", "then", "this", "uses",
+    "using", "was", "were", "what", "when", "where", "which", "who", "whose", "why", "with",
+    "works",
 ];
 
 /// Bounded, curated synonym/alias table.  Each entry is `(term, &[aliases])`.
@@ -148,6 +153,22 @@ mod tests {
 
     fn toks(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn stopwords_sorted_for_binary_search() {
+        // `is_stopword` uses binary_search — an unsorted list silently misses.
+        let mut sorted = STOPWORDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(STOPWORDS, sorted.as_slice(), "STOPWORDS must stay sorted");
+    }
+
+    #[test]
+    fn filler_verbs_are_stopwords() {
+        // #393: filler verbs must not survive as search terms.
+        for w in ["works", "uses", "runs", "does", "using"] {
+            assert!(is_stopword(w), "'{w}' should be a stopword");
+        }
     }
 
     #[test]
