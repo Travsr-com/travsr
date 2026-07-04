@@ -104,8 +104,19 @@ fn parse_tsconfig_json(
                 continue;
             };
             let raw = vname_dir.join(ref_path);
-            // Normalise: collapse "./" and strip leading "./"
-            let target_path = raw.to_string_lossy().trim_start_matches("./").to_string();
+            // Normalise to a repo-relative, forward-slash path: drop every "."
+            // component (leading *and* interior, e.g. "sub/./pkg") so the target
+            // NodeId matches the real file node. Keep ".." for out-of-dir refs.
+            let target_path = raw
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::CurDir => None,
+                    std::path::Component::ParentDir => Some(".."),
+                    std::path::Component::Normal(s) => s.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
             let target_node =
                 Node::new(VName::new(corpus, "", &target_path, "json", "file"), "file");
             let edge = Edge::new(file_id, target_node.id, EdgeKind::Configures);
@@ -433,6 +444,18 @@ mod tests {
         assert_eq!(out.nodes.len(), 3);
         assert_eq!(out.edges.len(), 2);
         assert!(out.edges.iter().all(|e| e.kind == EdgeKind::Configures));
+    }
+
+    #[test]
+    fn tsconfig_nested_dir_normalises_interior_dot_in_target_path() {
+        // A tsconfig in a subdirectory with a "./"-prefixed ref must resolve to a
+        // clean repo-relative path (no interior "/./"), so the Configures edge's
+        // target NodeId matches the real file node.
+        let content = r#"{ "references": [{ "path": "./pkg/core" }] }"#;
+        let f = write_tmp(content, "tsconfig.json");
+        let out = parse("github.com/a/b", f.path(), "sub/tsconfig.json").unwrap();
+        assert_eq!(out.nodes.len(), 2);
+        assert_eq!(out.nodes[1].vname.path, "sub/pkg/core");
     }
 
     #[test]

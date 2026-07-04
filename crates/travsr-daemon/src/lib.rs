@@ -500,9 +500,9 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
         }
     }
     let files: Vec<(&str, Vec<&travsr_core::Node>)> = by_file.into_iter().collect();
-    if files.is_empty() {
-        return;
-    }
+    // NB: do NOT early-return when `files` is empty — pathless package nodes
+    // (path="") are handled below and would otherwise be stranded without
+    // embed_text whenever they are the only nodes missing it.
 
     // Parse + build text in parallel across files (tree-sitter parsing is CPU-bound,
     // so this scales with cores — the reason a single-threaded regen only used 1 CPU).
@@ -512,28 +512,32 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
         .clamp(1, 8);
     let files_ref = &files;
     let canon_ref = canon_root.as_path();
-    let pairs: Vec<(travsr_core::NodeId, String)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|t| {
-                scope.spawn(move || {
-                    let mut local = Vec::new();
-                    let mut i = t;
-                    while i < files_ref.len() {
-                        let (path, fnodes) = &files_ref[i];
-                        local.extend(embed_texts_for_file(
-                            repo_root, canon_ref, path, fnodes, richness,
-                        ));
-                        i += nthreads;
-                    }
-                    local
+    let pairs: Vec<(travsr_core::NodeId, String)> = if files.is_empty() {
+        Vec::new()
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nthreads)
+                .map(|t| {
+                    scope.spawn(move || {
+                        let mut local = Vec::new();
+                        let mut i = t;
+                        while i < files_ref.len() {
+                            let (path, fnodes) = &files_ref[i];
+                            local.extend(embed_texts_for_file(
+                                repo_root, canon_ref, path, fnodes, richness,
+                            ));
+                            i += nthreads;
+                        }
+                        local
+                    })
                 })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
 
     // Generate embed text for pathless package nodes (pkg:foo@v1 → "foo v1").
     let mut pairs = pairs;
