@@ -939,9 +939,15 @@ fn cmd_status() -> Result<()> {
             Some(b) => {
                 let installed = bin_dir.join(&b.binary_name).exists();
                 let model_dir = embed_model_dir(&b.id).ok();
+                // #391: the sidecar requires a `model.toml` descriptor and exits code 1
+                // without it, so a present-but-descriptor-less install is NOT ready.
+                // Check it alongside the model weights to avoid the old false positive.
                 let models_ok = model_dir
                     .as_ref()
-                    .map(|d| b.model_files.iter().all(|f| d.join(&f.name).exists()))
+                    .map(|d| {
+                        b.model_files.iter().all(|f| d.join(&f.name).exists())
+                            && d.join("model.toml").exists()
+                    })
                     .unwrap_or(false);
 
                 let ok = installed && models_ok;

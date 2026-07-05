@@ -1033,9 +1033,19 @@ impl SqliteStore {
         model_id: &str,
         shell_threshold: u32,
     ) -> Result<(u64, u64, u64, u64), StoreError> {
-        // Must match travsr-embed sidecar's kind exclusion list exactly.
-        const KIND_FILTER: &str =
-            "kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')";
+        // #391: must match travsr-embed sidecar's NODE_ELIGIBLE predicate exactly —
+        // a node is embeddable if it's a normal symbol kind OR the daemon opted it
+        // in via embed_text (admits data-format file nodes: yaml/toml/json/xml).
+        // If this drifts from the sidecar, `embedded` (which counts every row in
+        // node_embeddings) can exceed `total_symbols`, showing >100% progress and
+        // suppressing the auto-reindex trigger for pending file nodes.
+        // Two forms: bare columns for `FROM nodes`, and `n.`-qualified for the JOIN.
+        const KIND_FILTER: &str = "(kind NOT IN \
+             ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+             OR embed_text IS NOT NULL)";
+        const KIND_FILTER_N: &str = "(n.kind NOT IN \
+             ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+             OR n.embed_text IS NOT NULL)";
 
         (|| -> AnyResult<(u64, u64, u64, u64)> {
             let total_symbols: i64 = self
@@ -1097,7 +1107,7 @@ impl SqliteStore {
                             &format!(
                                 "SELECT COUNT(*) FROM edb.node_embeddings ne \
                                  JOIN nodes n ON ne.node_id = n.id \
-                                 WHERE ne.model_id = ?1 AND n.{KIND_FILTER} \
+                                 WHERE ne.model_id = ?1 AND {KIND_FILTER_N} \
                                  AND n.shell_number >= ?2"
                             ),
                             rusqlite::params![model_id, shell_threshold],

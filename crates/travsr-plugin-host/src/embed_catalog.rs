@@ -225,8 +225,58 @@ pub fn write_model_descriptor(model_dir: &Path, b: &EmbedBackend) -> anyhow::Res
     })
     .context("serialize model descriptor")?;
     let path = model_dir.join("model.toml");
-    std::fs::write(&path, content)
-        .with_context(|| format!("writing model descriptor to {}", path.display()))
+
+    // Atomic write: the sidecar reads `model.toml` at startup and hard-errors on a
+    // malformed descriptor, so a concurrent spawn (or the `ensure_model_descriptor`
+    // migration path) must never observe a torn/partial file. Write to a uniquely
+    // named temp in the same directory, then rename into place (atomic on a single
+    // filesystem). `NamedTempFile` guarantees a distinct name — parallel writers in
+    // the same process can't collide — and drops/cleans up the temp on any error.
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new_in(model_dir).with_context(|| {
+        format!(
+            "creating temp for model descriptor in {}",
+            model_dir.display()
+        )
+    })?;
+    tmp.write_all(content.as_bytes())
+        .context("writing model descriptor to temp file")?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow::Error::new(e.error))
+        .with_context(|| format!("persisting model descriptor to {}", path.display()))?;
+    Ok(())
+}
+
+/// Self-heal a pre-descriptor install: write `model.toml` iff the model is
+/// installed (`model.onnx` present) but the descriptor is absent.
+///
+/// Pre-4da54c9 installs (e.g. `bge-small-en-v1.5` from before the descriptor
+/// requirement existed) have model weights but no `model.toml`; the sidecar
+/// (>= Jul 2026) then exits code 1 on every spawn. Calling this on the spawn
+/// path migrates them transparently without a re-`travsr embed init`.
+///
+/// Never fatal: a write failure is logged and the caller proceeds, so the sidecar
+/// still surfaces the canonical "run `travsr embed init`" error rather than a
+/// silent no-op. No-op when the descriptor already exists or the model is not
+/// installed.
+fn ensure_model_descriptor(model_dir: &Path, backend: &EmbedBackend) {
+    let onnx = model_dir.join("model.onnx");
+    let toml = model_dir.join("model.toml");
+    if !onnx.exists() || toml.exists() {
+        return;
+    }
+    match write_model_descriptor(model_dir, backend) {
+        Ok(()) => tracing::info!(
+            model = %backend.id,
+            path = %toml.display(),
+            "embed: migrated pre-descriptor install — wrote missing model.toml"
+        ),
+        Err(e) => tracing::warn!(
+            model = %backend.id,
+            error = %e,
+            "embed: could not write missing model.toml (spawn will surface the descriptor error)"
+        ),
+    }
 }
 
 // ── Orchestrator types ────────────────────────────────────────────────────────
@@ -940,6 +990,13 @@ fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
     if !bin_path.exists() {
         return None;
     }
+
+    // #391 Fix 1A: every sidecar spawn funnels through here, so this is the single
+    // chokepoint to self-heal pre-descriptor installs (model.onnx present, model.toml
+    // absent) that would otherwise make the sidecar exit code 1 on every spawn.
+    let model_dir = home.join(".travsr").join("models").join(&backend_id);
+    ensure_model_descriptor(&model_dir, backend);
+
     let embed_db_path = db_path.with_file_name("embed.db");
     Some((bin_path, embed_db_path, backend_id))
 }
@@ -1051,6 +1108,83 @@ mod tests {
         for b in backends() {
             assert!(seen.insert(b.id.as_str()), "duplicate backend id: {}", b.id);
         }
+    }
+
+    // ── #391: model.toml descriptor migration ─────────────────────────────────
+
+    fn touch(path: &std::path::Path) {
+        std::fs::write(path, b"x").expect("touch test file");
+    }
+
+    #[test]
+    fn ensure_descriptor_writes_when_onnx_present_and_toml_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = lookup("bge-small-en-v1.5").expect("bge in catalog");
+        touch(&dir.path().join("model.onnx"));
+
+        ensure_model_descriptor(dir.path(), b);
+
+        let toml_path = dir.path().join("model.toml");
+        assert!(toml_path.exists(), "descriptor must be created");
+        // Round-trips to exactly what a fresh `travsr embed init` would write.
+        let text = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            text.contains(&format!("dim = {}", b.dim)),
+            "dim mismatch: {text}"
+        );
+        assert!(
+            text.contains(&format!("n_inputs = {}", b.n_inputs)),
+            "n_inputs mismatch: {text}"
+        );
+    }
+
+    #[test]
+    fn ensure_descriptor_noop_when_toml_already_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = lookup("bge-small-en-v1.5").expect("bge in catalog");
+        touch(&dir.path().join("model.onnx"));
+        let toml_path = dir.path().join("model.toml");
+        std::fs::write(&toml_path, b"# hand-edited sentinel\n").unwrap();
+
+        ensure_model_descriptor(dir.path(), b);
+
+        // Existing descriptor is never clobbered.
+        assert_eq!(
+            std::fs::read_to_string(&toml_path).unwrap(),
+            "# hand-edited sentinel\n"
+        );
+    }
+
+    #[test]
+    fn ensure_descriptor_noop_when_model_not_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = lookup("bge-small-en-v1.5").expect("bge in catalog");
+        // No model.onnx → model isn't installed → nothing to migrate.
+        ensure_model_descriptor(dir.path(), b);
+        assert!(
+            !dir.path().join("model.toml").exists(),
+            "must not write a descriptor for an uninstalled model"
+        );
+    }
+
+    #[test]
+    fn write_descriptor_is_atomic_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = lookup("bge-small-en-v1.5").expect("bge in catalog");
+        write_model_descriptor(dir.path(), b).expect("write descriptor");
+
+        // The dir must contain exactly `model.toml` — no NamedTempFile leftover of
+        // any name survives a successful persist/rename.
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["model.toml".to_string()],
+            "only model.toml must remain (no temp litter), found: {entries:?}"
+        );
     }
 
     #[test]
