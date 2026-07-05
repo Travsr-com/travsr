@@ -3,9 +3,8 @@
 **The code graph that lives next to git.**
 
 > Source code is a deterministic graph, not unstructured text. Travsr builds
-> that graph on every commit and exposes it via MCP so AI agents traverse edges
-> instead of guessing from vector chunks — 80% fewer tokens, zero structural
-> hallucinations.
+> that graph on every commit and exposes it via MCP so AI agents traverse real
+> edges instead of guessing from vector chunks.
 
 [![CI](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
@@ -46,7 +45,7 @@ Restart Claude Desktop. Ask: *"Who calls PaymentService.charge?"*
 
 ## Works with Every MCP-Compatible AI Tool
 
-Travsr speaks [MCP](https://modelcontextprotocol.io) — the open standard for
+Travsr speaks [MCP](https://modelcontextprotocol.io) - the open standard for
 connecting AI agents to tools. The same `travsr mcp --stdio` command works
 with any client that supports it.
 
@@ -118,7 +117,7 @@ Add to `~/.continue/config.json` under `mcpServers`:
 
 ### Any other MCP client
 
-The pattern is always the same — point your client at `travsr mcp --stdio`.
+The pattern is always the same - point your client at `travsr mcp --stdio`.
 Travsr handles the rest.
 
 ```
@@ -155,7 +154,7 @@ travsr mcp --stdio   Start the MCP stdio server (used by Claude Desktop)
 git commit
   └─▶ post-commit hook
         └─▶ travsr hook-run <changed files>
-              └─▶ SHA256 delta — only reindex changed files
+              └─▶ SHA256 delta - only reindex changed files
                     └─▶ SQLite graph DB  (.travsr/graph.db)
                           └─▶ MCP stdio server reads on demand
 ```
@@ -179,7 +178,7 @@ cargo build --release   # requires Rust 1.75+
 - **Binary not found after install?**  
   Set `TRAVSR_BINARY=/path/to/travsr` to point to a local build.
 - **Corporate proxy blocks the postinstall download?**  
-  Same — set `TRAVSR_BINARY` to skip the remote fetch.
+  Same - set `TRAVSR_BINARY` to skip the remote fetch.
 
 ---
 

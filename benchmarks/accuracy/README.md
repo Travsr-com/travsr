@@ -27,11 +27,11 @@ as a workflow artifact for trend inspection.
 
 ## Corpora
 
-- `fixtures/ts-callers`, `fixtures/ts-small` — pinned in-repo polyglot
+- `fixtures/ts-callers`, `fixtures/ts-small` - pinned in-repo polyglot
   fixtures; ground truth is exact and the gate fully deterministic. These run
   on the Phase A (tree-sitter) structural graph, so the suite passes with no
   external language tooling installed.
-- `kubernetes-pkg` — staged behind `enabled: false`. The corpus that motivated
+- `kubernetes-pkg` - staged behind `enabled: false`. The corpus that motivated
   WS2/WS3 (613K-node index): a sparse clone of `kubernetes/kubernetes@<pinned
   SHA>` limited to `pkg/kubelet`, indexed with scip-go Phase B, with
   caller-set ground truth sampled per the RFC-014 verification protocol.
@@ -43,4 +43,4 @@ Add fixture files (or a pinned `clone` spec), then append to
 `manifest.json`: `expected_definitions` drives `method-recall`; each entry in
 `cases` declares its `class`, the exact CLI `args`, and the expectation. The
 runner copies the corpus into a temp git repo, runs `travsr init`, and asserts
-on the `--format json` output — no store internals are touched.
+on the `--format json` output - no store internals are touched.

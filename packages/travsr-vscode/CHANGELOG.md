@@ -1,6 +1,13 @@
 # Changelog
 
-## [0.8.0] — 2026-06-11
+## [0.9.0] - 2026-07-05
+
+### Changed
+
+- Bundled binary reference updated to travsr v0.10.0.
+- Production parity with the daemon: live call graph, blast radius, callers, and the Context Explorer panel over MCP.
+
+## [0.8.0] - 2026-06-11
 
 ### Added
 
@@ -17,7 +24,7 @@
 - Blast radius depth slider and corpus auto-trust.
 - Update bundled binary reference to v0.9.0.
 
-## [0.7.0] — 2026-06-06
+## [0.7.0] - 2026-06-06
 
 ### Added
 
@@ -30,7 +37,7 @@
 - `showLanguages` using a binary path captured at activation time instead of the current resolved path.
 - Update bundled binary reference to v0.8.0.
 
-## [0.6.0] — 2026-06-04
+## [0.6.0] - 2026-06-04
 
 ### Added
 
@@ -41,20 +48,20 @@
 - Context provider (F4): push model with EventEmitter, KEYWORDS filter, and structured logging.
 - Builtin semantic badge shown for all built-in-indexed languages; init button and auto-reconnect added.
 
-## [0.4.0] — 2026-05-27
+## [0.4.0] - 2026-05-27
 
 ### Added
 
 - CI publish pipeline: `vsce package` + `vsce publish` + `ovsx publish` triggered automatically on `vscode-v*` tags, with a `dry_run` dispatch option.
 - VS Code test matrix expanded to 15 combinations (3 OS × 5 VS Code versions: 1.85, 1.90, 1.95, stable, insiders).
-- GitHub Environment gate (`marketplace`) on the publish job — every tag-triggered publish requires manual approval before marketplace steps run.
+- GitHub Environment gate (`marketplace`) on the publish job - every tag-triggered publish requires manual approval before marketplace steps run.
 - `.vsix` artifact uploaded to GitHub Release on every tag push.
 
 ### Fixed
 
-- `.vscodeignore` now excludes `out/test/**` — compiled test files were being bundled into the `.vsix` (18 files / 32 KB, down from 28 files / 49 KB).
+- `.vscodeignore` now excludes `out/test/**` - compiled test files were being bundled into the `.vsix` (18 files / 32 KB, down from 28 files / 49 KB).
 
-## [0.3.0] — 2026-05-26
+## [0.3.0] - 2026-05-26
 
 ### Added
 
@@ -69,7 +76,7 @@
 - Daemon OOM-kill regression: the daemon no longer spawns one thread per file-watcher event (was 800 MB RSS spike on 100-file floods). Single dedicated indexer worker used instead.
 - Repeated `daemon start` calls no longer spawn multiple 700 MB background processes; the singleton guard now checks the control socket in the parent process before spawning.
 
-## [0.2.0] — 2026-05-26
+## [0.2.0] - 2026-05-26
 
 ### Added
 
@@ -78,7 +85,7 @@
 - `travsr.refreshGraph` command wired to the panel's refresh button.
 - Cache invalidation on file save across all three providers (status bar, code lens, hover, tree).
 
-## [0.1.1] — 2026-05-24
+## [0.1.1] - 2026-05-24
 
 ### Changed
 
@@ -87,7 +94,7 @@
 - Added MIT `LICENSE` file.
 - Rewrote `README.md` for marketplace audience: added install steps, supported languages table, feature descriptions, and links.
 
-## [0.1.0] — initial
+## [0.1.0] - initial
 
 - Status bar showing live graph health (`get_repo_map` polled every 30 s).
 - Blast radius code lens on `.ts`, `.tsx`, `.rs`, `.py` files (`get_blast_radius`).

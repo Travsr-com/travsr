@@ -4,6 +4,31 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v0.10.0 - 2026-07-05
+
+### travsr binary
+
+- **Semantic embeddings (RFC-018).** A downloadable embedding plugin sidecar adds vector recall alongside graph traversal. Config-driven model catalog with arctic-embed-m as the recommended model, auto-calibrated model-relative semantic floors, and a cosine oracle (RFC-019) for context-quality checks.
+- **RRF fusion retrieval.** `get_context` and `ask` now fuse exact, full-text, and embedding candidates with reciprocal-rank fusion, gated by a score-aware scope check.
+- **k-core decomposition.** Shell propagation recovers buried-middle nodes and boosts `get_context` coverage.
+- **New analysis crate (RFC-017).** Tree-sitter parsing, AST skeleton building, and snippet extraction moved into `travsr-analysis`, powering the `get_snippets` MCP tool for kind-aware code retrieval.
+- **Data-format support.** JSON, YAML, TOML, and XML are now parsed as Phase A nodes (`configures` / `external-dependency` edges).
+- **`get_callers` reports exact call-site `path:line`** without a schema change.
+- **Git-aware worktree resolution** and a rank penalty for generated / mock code so real definitions surface first.
+- **Phase B plugin I/O is bounded** so a wedged language plugin can no longer deadlock indexing.
+- **Daemon file logging** to `.travsr/daemon.log` with daily rotation.
+- **Relicensed from MIT to Apache-2.0.**
+- Fixes: stale Phase 1 embeddings (model.toml migration + file-node eligibility), documentation accuracy pass.
+
+### VS Code extension (vscode-v0.9.0)
+
+- Production parity with the daemon: live graph, blast radius, callers, and Context Explorer over MCP.
+- Bundled binary reference updated to v0.10.0.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.9.1...v0.10.0
+
+---
+
 ## v0.9.0 - 2026-06-11
 
 ### travsr binary
