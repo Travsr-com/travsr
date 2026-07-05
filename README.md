@@ -3,9 +3,8 @@
 **The code graph that lives next to git.**
 
 > Source code is a deterministic graph, not unstructured text. Travsr builds
-> that graph on every commit and exposes it via MCP so AI agents traverse edges
-> instead of guessing from vector chunks. 80% fewer tokens, zero structural
-> hallucinations.
+> that graph on every commit and exposes it via MCP so AI agents traverse real
+> edges instead of guessing from vector chunks.
 
 [![CI](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
 [![Bench](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml)
@@ -182,36 +181,73 @@ In global mode, tools that accept a `file` or `symbol` argument also accept
 an optional `repo` parameter to target a specific registered repo. Omitting
 `repo` searches all registered repos.
 
-| Tool | Required | Optional | Description |
-|---|---|---|---|
-| `get_dependencies(file)` | `file`: file path | `repo` | Return all imports/dependencies of a file |
-| `get_callers(symbol)` | `symbol`: symbol name | `repo` | Return all nodes with an incoming edge to a symbol |
-| `get_blast_radius(file)` | `file`: file path | `repo` | Return the set of files transitively affected if the given file changes |
-| `search_symbol(name)` | `name`: symbol name | `repo` | Find symbol definitions matching a name across the indexed graph |
-| `get_repo_map` | (none) | `repo` | Return a structural overview of the indexed repository |
-| `get_execution_path(source, sink)` | `source`, `sink`: symbol names | `repo` | Return the PCST-optimal execution path between two symbols |
-| `get_context(query, token_budget)` | `query`: search term | `repo`, `token_budget` | PPR traversal ranked by relevance, budget-capped by 0-1 knapsack |
+**Query tools** (available in both single-repo and global mode):
+
+| Tool | Description |
+|---|---|
+| `get_dependencies(file)` | All imports/dependencies of a file |
+| `get_callers(symbol)` | All nodes with an incoming edge to a symbol |
+| `get_blast_radius(file)` | Files transitively affected if the given file changes |
+| `search_symbol(name)` | Symbol definitions matching a name across the graph |
+| `get_repo_map` | Structural overview of the indexed repository |
+| `get_execution_path(source, sink)` | PCST-optimal execution path between two symbols |
+| `get_context(query, token_budget)` | PPR traversal ranked by relevance, budget-capped by knapsack |
+| `get_graph_stats` | Node/edge counts, schema version, last-indexed SHA |
+| `get_graph_json(query, direction, depth)` | Subgraph as structured JSON for graph renderers |
+| `get_snippets(symbol)` | Source snippets for a symbol with file and line context |
+| `get_lang_status` | Phase B indexer status for each language in the repo |
+| `repo_languages` | Languages detected in the indexed repository |
+
+**Repo management tools** (global mode):
+
+| Tool | Description |
+|---|---|
+| `repos_list` | List all globally registered repos |
+| `repos_remove(repo)` | Remove a repo from the global registry |
+| `repos_prune` | Remove registry entries whose db path no longer exists |
+
+**Synonym tools** (query expansion):
+
+| Tool | Description |
+|---|---|
+| `synonym_add(term, alias)` | Add a single term/alias pair |
+| `synonym_set(term, aliases)` | Replace all aliases for a term atomically |
+| `synonym_remove(term, alias)` | Remove one term/alias pair |
+| `synonym_remove_term(term)` | Remove all aliases for a term |
+| `synonym_list` | List all configured synonyms |
+| `synonym_reset` | Clear all synonyms |
+
+In global mode, tools that accept a `file` or `symbol` argument also accept an optional `repo` parameter to target a specific registered repo. Omitting `repo` searches all registered repos.
 
 ---
 
 ## CLI Commands
 
 ```
-travsr init                      Index the repo, install git hook, register globally
-travsr repos                     List all globally registered repos
-travsr status                    Show node/edge counts, schema version, last-indexed SHA
-travsr ask <query>               PPR + knapsack symbol lookup from the terminal (partial match)
-travsr migrate --to kuzu         Migrate the graph store from SQLite to Kùzu backend
-travsr mcp --stdio               Start the MCP stdio server (single-repo, cwd-based)
-travsr mcp --stdio --global      Start the MCP stdio server (all registered repos)
-travsr mcp --stdio --db <path>   Start the MCP stdio server (explicit db path)
-travsr graph <query>             Show dependency graph for a symbol or file
-travsr graph --all               Show graph for the entire indexed repository
-travsr lang list                 List all known Phase B language indexers and their status
-travsr lang install <language>   Download and register a Phase B language indexer
-travsr lang detect               Scan the repo, detect supported languages, auto-install
-travsr lang remove <language>    Unregister a Phase B language indexer
-travsr lang approve <language>   Pre-approve a language that needs network access during indexing
+travsr init                          Index the repo, install git hook, register globally
+travsr daemon start/stop/status      Start, stop, or check the background daemon
+travsr repos                         List all globally registered repos
+travsr status                        Show node/edge counts, schema version, last-indexed SHA
+travsr ask <query>                   PPR + knapsack symbol lookup from the terminal
+travsr graph <query>                 Show dependency graph for a symbol or file
+travsr graph --all                   Show graph for the entire indexed repository
+travsr mcp --stdio                   Start the MCP stdio server (single-repo, cwd-based)
+travsr mcp --stdio --global          Start the MCP stdio server (all registered repos)
+travsr mcp --stdio --db <path>       Start the MCP stdio server (explicit db path)
+travsr lang list                     List all known Phase B language indexers and their status
+travsr lang install <language>       Download and register a Phase B language indexer
+travsr lang detect                   Scan the repo, detect supported languages, auto-install
+travsr lang remove <language>        Unregister a Phase B language indexer
+travsr lang approve <language>       Pre-approve a language that needs network access
+travsr synonym add <term> <alias>    Add a query synonym
+travsr synonym list                  List all configured synonyms
+travsr synonym remove <term>         Remove a synonym term
+travsr embed list                    List available embedding models
+travsr embed init                    Initialize the embedding index for this repo
+travsr embed status                  Show embedding index status
+travsr embed reindex                 Rebuild the embedding index
+travsr embed switch <model>          Switch to a different embedding model
+travsr migrate --to kuzu             Migrate the graph store from SQLite to Kuzu backend
 ```
 
 ### travsr migrate
@@ -324,15 +360,13 @@ The extension uses your installed `travsr` binary. Set `travsr.binaryPath` in VS
 
 ## Storage Backends
 
-| Backend | Flag | Best for | Status |
+| Backend | Flag | Notes | Status |
 |---|---|---|---|
-| SQLite + WAL | _(default)_ | < 75M nodes, zero setup | Available |
-| Kùzu | `--features kuzu` | < 2.5B edges, production workloads | Available (Phase 2) |
-| RocksDB | `--features rocksdb` | Hyperscale / unlimited | Planned (Phase 3) |
+| SQLite + WAL | _(default)_ | Zero setup, works everywhere | Available |
+| Kuzu | `--features kuzu` | Native property-graph engine, production workloads | Available |
 
-SQLite is the default and requires no additional dependencies. Kùzu is a native
-property-graph engine that is 64× faster than Neo4j on graph workloads and is
-now available behind a feature flag.
+SQLite is the default and requires no additional dependencies. Kuzu is available
+behind a feature flag and requires CMake and a C++ toolchain to build.
 
 To migrate an existing SQLite graph to Kùzu, build with `--features kuzu` and
 run `travsr migrate --to kuzu`.
@@ -373,10 +407,13 @@ Language support: **TypeScript / TSX, Rust, Python, Go** (builtin, zero configur
 | Algorithm | When used | Status |
 |---|---|---|
 | BFS depth-3 | `get_dependencies` / `get_callers` queries | Available |
-| Personalized PageRank (PPR) | `get_context` and deep traversal | Available (α=0.15, ε=1e-6, p95 < 50ms on 1k-file fixture) |
+| Personalized PageRank (PPR) | `get_context` and deep traversal | Available |
+| PPR weighted | Score-aware PPR variant | Available |
 | 0-1 Knapsack | Token budget cap on `get_context` results | Available |
-| Prize-Collecting Steiner Tree | `get_execution_path`: optimal path between two symbols | Available |
-| k-core decomposition | Buried-middle recovery | Planned |
+| Prize-Collecting Steiner Tree (PCST) | `get_execution_path`: optimal path between two symbols | Available |
+| k-core decomposition | Buried-middle recovery | Available |
+| BM25 | Full-text ranked retrieval | Available |
+| RBAC | Role-based access filtering on graph queries | Available |
 
 ### Edge kinds
 
@@ -470,64 +507,7 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 
 ## Changelog
 
-### v0.9.0 (2026-06-11)
-
-**travsr binary (npm: v0.9.0)**
-
-- Add native Phase B semantic indexing for Rust, TypeScript, and Python (no external SCIP tools required)
-- Add Phase B support for Kotlin via Kotlin Language Server with ZipBinary install
-- Add Phase B support for Swift and Dart: Phase A tree-sitter configs and GithubBinary install
-- Add Phase B support for Java: sandbox, resolver, and edge wiring end-to-end
-- Add Phase B support for C#: dotnet tools PATH check and toolchain grants
-- Add Phase B support for Scala: sbt catalog
-- Add .travsrignore support for excluding paths during `travsr init`
-- Add live progress UI during `travsr init` with parallel batched indexing
-- Add branded `--help` logo
-- Add blast radius Phase 2 and 3: ImportResolver for 14 languages and Go intra-package co-file edges
-- Add Tree-sitter vs Semantic toggle for the blast radius view
-- Add native_phase_b flag for per-language configuration
-- Allow network access in Phase B sandboxes; display live schema version in `travsr status`
-- Fix Dart Phase B: bypass sidecar, call emitter directly
-- Fix bwrap network isolation enforcement on Linux NativeIpc sandbox
-- Fix bulk_init: create _bulk_fts_pending table before write_file_graphs_batch
-- Fix generalized co-package pass and Phase B batch writes
-- Fix JS/TS file extension handling, Dart sandbox, and Phase B edge writes
-
-**VS Code extension (vscode-v0.8.0)**
-
-- Add JavaScript and C# to codelens and hover selectors
-- Add Tree-sitter vs Semantic toggle in blast radius webview
-- Extend hover and codelens selectors to all 13 indexed languages
-- Fix re-index triggering, panel refresh, and test regressions
-- Fix stale language list refresh and status bar .travsr watcher
-- Fix MCP envelope leaking into file lists
-- Fix blast radius depth slider and corpus auto-trust
-- Update bundled binary reference to v0.9.0
-
----
-
-### v0.8.0 (2026-06-06)
-
-**travsr binary (npm: v0.8.0)**
-
-- Add `travsr-ipc` crate: platform-agnostic control plane (Unix socket on macOS/Linux, Named Pipe on Windows)
-- Add Windows Named Pipe daemon control: `travsr daemon start/stop/status` now works on Windows (WS2)
-- Add dual-write post-commit hook on Windows: installs both `post-commit` and `post-commit.cmd` so the hook fires from CMD, PowerShell, and Git Bash (WS3)
-- Add Windows Task Scheduler auto-start via `travsr autostart` and `travsr daemon start --autostart` (WS5/WS6)
-- Add AppContainer + Job Object sandbox for plugin host processes on Windows, matching the macOS sandbox posture (RFC-014, WS4)
-- Add full `CreateProcessW` spawn inside AppContainer for plugin indexers on Windows (P5-S3)
-- Add CI matrix for elevated AppContainer sandbox tests on Windows (T1-T5)
-- Fix `lang list` incorrectly showing built-in indexers as disabled on Windows
-- Fix `travsr unregister` treating task-not-found as an error instead of a no-op
-- Fix graph.db file permissions on Windows (restricted via `icacls`)
-
-**VS Code extension (vscode-v0.7.0)**
-
-- Add `.exe`-only binary spawn on Windows with `assertExecutableBinary` path validation (WS1, PSE R5)
-- Fix `showLanguages` using a stale binary path captured at activation time
-- Fix stale download URLs and `assertExecutableBinary` not being called in `reindexNow`
-- Fix `assertExecutableBinary` metacharacter regex on Windows paths
-- Update bundled binary reference to v0.8.0
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ---
 
