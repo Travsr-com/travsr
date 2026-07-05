@@ -1,21 +1,37 @@
 //! Binary download module for `travsr lang install`.
 //! Downloads travsr-lang-* wrappers from GitHub Releases into ~/.travsr/bin/.
 //!
+//! Ownership (RFC-013 conflict resolution): `travsr-lang-*` wrapper binaries
+//! are FIRST-PARTY — built from this workspace's `crates/travsr-lang-*` and
+//! published (cosign-signed, per ADR-020) by the CORE repo's release
+//! workflow, versioned in lock-step with the `travsr` binary and its
+//! `PROTOCOL_VERSION`. The external `travsr-lang` repo is no longer a binary
+//! source: its published wrappers predate protocol v2, and installing one
+//! over a local v2 build bricked the language (ProtocolSkew quarantine).
+//! That repo remains only (a) the template for third-party plugin authors
+//! and (b) the legacy host for `-share.tar.gz` emitter assets.
+//!
 //! Environment variable overrides (for testing):
-//!   TRAVSR_LANG_RELEASES_BASE — base URL for release asset downloads
+//!   TRAVSR_LANG_RELEASES_BASE — base URL for wrapper release asset downloads
 //!   TRAVSR_LANG_API_URL       — GitHub API URL for latest release lookup
 //!   TRAVSR_SKIP_DOWNLOAD=1    — skip network entirely; return expected dest path
 
 use anyhow::{bail, Context as _, Result};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const RELEASES_BASE_ENV: &str = "TRAVSR_LANG_RELEASES_BASE";
 const API_URL_ENV: &str = "TRAVSR_LANG_API_URL";
 const SKIP_DOWNLOAD_ENV: &str = "TRAVSR_SKIP_DOWNLOAD";
 
-const DEFAULT_RELEASES_BASE: &str = "https://github.com/Travsr-com/travsr-lang/releases";
-const DEFAULT_API_URL: &str = "https://api.github.com/repos/Travsr-com/travsr-lang/releases/latest";
+/// Wrapper binaries ship with the CORE release (see release.yml: one signed
+/// `travsr-lang-<x>-<tag>-<target>.tar.gz` per language per target).
+const DEFAULT_RELEASES_BASE: &str = "https://github.com/Travsr-com/travsr/releases";
+const DEFAULT_API_URL: &str = "https://api.github.com/repos/Travsr-com/travsr/releases/latest";
+
+/// Legacy external repo — still hosts `-share.tar.gz` emitter assets only.
+/// Never a source of executable wrapper binaries.
+const LEGACY_SHARE_RELEASES_BASE: &str = "https://github.com/Travsr-com/travsr-lang/releases";
 
 const SIZE_LIMIT: u64 = 100 * 1024 * 1024;
 
@@ -82,8 +98,8 @@ pub async fn fetch_latest_version_for_repo(repo: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing tag_name in releases response for {repo}"))
 }
 
-/// Fetches the latest version tag for the travsr-lang releases.
-/// Wrapper around `fetch_latest_version_for_repo` for the travsr-lang repo.
+/// Fetches the latest CORE release tag — the version wrapper binaries ship
+/// under (they version in lock-step with the `travsr` binary).
 pub async fn fetch_latest_version() -> Result<String> {
     let url = std::env::var(API_URL_ENV).unwrap_or_else(|_| DEFAULT_API_URL.to_string());
     let client = reqwest::Client::builder()
@@ -212,8 +228,17 @@ pub async fn download_scip_binary(
 
 /// Downloads and installs a travsr-lang-* wrapper binary into ~/.travsr/bin/.
 ///
-/// Downloads the binary and its .sha256 file in parallel, verifies integrity,
-/// then atomically renames into place. Returns the final install path.
+/// Source of truth: the CORE repo's release assets — one signed
+/// `<binary_name>-<version>-<target>.tar.gz` per language per target
+/// (produced by release.yml, ADR-020 Rule 1). Integrity is verified against
+/// the release's combined `SHA256SUMS`; when `cosign` is available, the
+/// tarball's Sigstore bundle is additionally verified against the pinned
+/// release-workflow identity (Rule 2) — a failed signature is a hard abort.
+///
+/// Any pre-existing binary at the destination is preserved as
+/// `<binary>.old` so the caller can roll back if the freshly installed
+/// wrapper fails its verification probe (never leave the user with a
+/// quarantined language when they had a working one).
 pub async fn download_and_install_wrapper(
     version: &str,
     binary_name: &str,
@@ -226,8 +251,9 @@ pub async fn download_and_install_wrapper(
     let base =
         std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
 
-    let bin_url = format!("{base}/download/{version}/{binary_name}-{target}");
-    let sha_url = format!("{bin_url}.sha256");
+    let asset = format!("{binary_name}-{version}-{target}.tar.gz");
+    let tar_url = format!("{base}/download/{version}/{asset}");
+    let sums_url = format!("{base}/download/{version}/SHA256SUMS");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -235,58 +261,187 @@ pub async fn download_and_install_wrapper(
         .build()
         .context("building HTTP client")?;
 
-    let (bin_resp, sha_resp) =
-        tokio::try_join!(client.get(&bin_url).send(), client.get(&sha_url).send(),)
+    let (tar_resp, sums_resp) =
+        tokio::try_join!(client.get(&tar_url).send(), client.get(&sums_url).send(),)
             .context("sending download requests")?;
 
-    if !bin_resp.status().is_success() {
-        bail!("download failed ({}): {bin_url}", bin_resp.status());
+    if !tar_resp.status().is_success() {
+        bail!(
+            "download failed ({}): {tar_url}\n\
+             (wrapper binaries ship with core releases; this travsr version may \
+             predate the first signed release for {binary_name} — build locally \
+             with `cargo build --release -p {binary_name}` and copy to ~/.travsr/bin)",
+            tar_resp.status()
+        );
     }
-    if !sha_resp.status().is_success() {
-        bail!("SHA256 download failed ({}): {sha_url}", sha_resp.status());
+    if !sums_resp.status().is_success() {
+        bail!("SHA256SUMS download failed ({}): {sums_url}", sums_resp.status());
     }
 
-    // Reject oversized binaries before downloading the full body.
-    if let Some(len) = bin_resp.content_length() {
+    // Reject oversized tarballs before downloading the full body.
+    if let Some(len) = tar_resp.content_length() {
         if len > SIZE_LIMIT {
-            bail!("binary exceeds 100 MB limit ({len} bytes): {bin_url}");
+            bail!("asset exceeds 100 MB limit ({len} bytes): {tar_url}");
         }
     }
 
-    let bin_bytes = bin_resp.bytes().await.context("reading binary body")?;
-    if bin_bytes.len() as u64 > SIZE_LIMIT {
-        bail!("binary exceeds 100 MB limit after download");
+    let tar_bytes = tar_resp.bytes().await.context("reading tarball body")?;
+    if tar_bytes.len() as u64 > SIZE_LIMIT {
+        bail!("asset exceeds 100 MB limit after download");
     }
-    let sha_text = sha_resp.text().await.context("reading SHA256 body")?;
+    let sums_text = sums_resp.text().await.context("reading SHA256SUMS body")?;
 
-    // Verify integrity.
-    let expected = parse_sha256_line(&sha_text)?;
-    let actual = hex_encode_sha256(&bin_bytes);
+    // Integrity: find this asset's line in the combined SHA256SUMS.
+    let expected = sums_text
+        .lines()
+        .find(|l| l.contains(&asset))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("{asset} not listed in release SHA256SUMS"))?;
+    let actual = hex_encode_sha256(&tar_bytes);
     if actual != expected {
-        bail!("SHA256 mismatch for {binary_name}: expected {expected}, got {actual}");
+        bail!("SHA256 mismatch for {asset}: expected {expected}, got {actual}");
     }
 
-    // Atomic write: write to a temp path, then rename into place.
-    let dest_dir = travsr_bin_dir()?;
-    let dest = dest_dir.join(binary_name);
-    let tmp = dest_dir.join(format!("{binary_name}.tmp.{}", uuid::Uuid::new_v4()));
+    // Authenticity (ADR-020 Rule 2): verify the Sigstore bundle when cosign
+    // is installed. Bundle-missing is tolerated transitionally (warn);
+    // verification FAILURE is always a hard abort.
+    verify_cosign_bundle(&client, &tar_url, &tar_bytes, &asset).await?;
 
-    std::fs::write(&tmp, &bin_bytes)
-        .with_context(|| format!("writing temp file {}", tmp.display()))?;
+    // Extract the single binary from the tarball into a temp dir.
+    let dest_dir = travsr_bin_dir()?;
+    let work = dest_dir.join(format!(".extract.{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&work).context("creating extraction dir")?;
+    let tmp_tar = work.join(&asset);
+    std::fs::write(&tmp_tar, &tar_bytes)
+        .with_context(|| format!("writing temp tarball {}", tmp_tar.display()))?;
+    let status = std::process::Command::new("tar")
+        .args(["-xzf", tmp_tar.to_str().unwrap(), "-C", work.to_str().unwrap()])
+        .status()
+        .context("running tar to extract wrapper")?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&work);
+        bail!("tar extraction failed for {asset}");
+    }
+
+    let extracted = [binary_name.to_string(), format!("{binary_name}.exe")]
+        .iter()
+        .map(|n| work.join(n))
+        .find(|p| p.is_file())
+        .ok_or_else(|| anyhow::anyhow!("{binary_name} not found inside {asset}"))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        std::fs::set_permissions(&extracted, std::fs::Permissions::from_mode(0o755))
             .context("setting executable permission")?;
     }
 
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("moving {} to {}", tmp.display(), dest.display()));
+    // Preserve any existing binary for rollback, then move into place.
+    let dest = dest_dir.join(
+        extracted
+            .file_name()
+            .expect("extracted path has a file name"),
+    );
+    if dest.is_file() {
+        let backup = wrapper_backup_path(&dest);
+        std::fs::rename(&dest, &backup)
+            .with_context(|| format!("backing up existing {}", dest.display()))?;
     }
+    if let Err(e) = std::fs::rename(&extracted, &dest) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err(e).with_context(|| format!("installing {}", dest.display()));
+    }
+    let _ = std::fs::remove_dir_all(&work);
 
     Ok(dest)
+}
+
+/// `<binary>.old` — where [`download_and_install_wrapper`] parks the previous
+/// binary so a failed post-install verification can roll back.
+pub fn wrapper_backup_path(dest: &Path) -> PathBuf {
+    let mut os = dest.as_os_str().to_os_string();
+    os.push(".old");
+    PathBuf::from(os)
+}
+
+/// Restore the `.old` backup over `dest`. Returns true if a backup existed.
+pub fn restore_wrapper_backup(dest: &Path) -> bool {
+    let backup = wrapper_backup_path(dest);
+    backup.is_file() && std::fs::rename(&backup, dest).is_ok()
+}
+
+/// Remove the `.old` backup after a successful install + verification.
+pub fn discard_wrapper_backup(dest: &Path) {
+    let _ = std::fs::remove_file(wrapper_backup_path(dest));
+}
+
+/// Verify `<asset>.bundle` (Sigstore) against the pinned first-party release
+/// identity when `cosign` is on PATH. Missing cosign or a 404 bundle is a
+/// transitional warn; a verification FAILURE aborts the install.
+async fn verify_cosign_bundle(
+    client: &reqwest::Client,
+    tar_url: &str,
+    tar_bytes: &[u8],
+    asset: &str,
+) -> Result<()> {
+    let cosign_available = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|d| d.join("cosign").is_file());
+    if !cosign_available {
+        eprintln!(
+            "warning: cosign not installed — skipping signature verification for {asset} \
+             (integrity still checked via SHA256SUMS)"
+        );
+        return Ok(());
+    }
+
+    let bundle_url = format!("{tar_url}.bundle");
+    let resp = client
+        .get(&bundle_url)
+        .send()
+        .await
+        .context("fetching signature bundle")?;
+    if !resp.status().is_success() {
+        eprintln!(
+            "warning: no signature bundle for {asset} ({}) — release predates signing; \
+             integrity checked via SHA256SUMS only",
+            resp.status()
+        );
+        return Ok(());
+    }
+    let bundle_bytes = resp.bytes().await.context("reading bundle body")?;
+
+    let work = std::env::temp_dir().join(format!("travsr-cosign-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&work).context("creating cosign work dir")?;
+    let blob = work.join(asset);
+    let bundle = work.join(format!("{asset}.bundle"));
+    std::fs::write(&blob, tar_bytes).context("writing blob for cosign")?;
+    std::fs::write(&bundle, &bundle_bytes).context("writing bundle for cosign")?;
+
+    let out = std::process::Command::new("cosign")
+        .args([
+            "verify-blob",
+            "--bundle",
+            bundle.to_str().unwrap(),
+            "--certificate-oidc-issuer",
+            travsr_plugin_host::subscriptions::EXPECTED_OIDC_ISSUER,
+            "--certificate-identity-regexp",
+            travsr_plugin_host::subscriptions::EXPECTED_IDENTITY_REGEXP,
+            blob.to_str().unwrap(),
+        ])
+        .output()
+        .context("invoking cosign")?;
+    let _ = std::fs::remove_dir_all(&work);
+
+    if !out.status.success() {
+        bail!(
+            "cosign signature verification FAILED for {asset}: {} — refusing to install \
+             (ADR-020 Rule 2 fail-closed)",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    println!("\u{2713} {asset} signature verified (cosign)");
+    Ok(())
 }
 
 /// Downloads `<binary_name>-share.tar.gz` from the same travsr-lang release and
@@ -298,8 +453,10 @@ pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()
         return Ok(());
     }
 
-    let base =
-        std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
+    // Share assets (emitter scripts/data, no executables) still live on the
+    // legacy external repo — wrapper BINARIES never come from there.
+    let base = std::env::var(RELEASES_BASE_ENV)
+        .unwrap_or_else(|_| LEGACY_SHARE_RELEASES_BASE.to_string());
 
     let asset = format!("{binary_name}-share.tar.gz");
     let url = format!("{base}/download/{version}/{asset}");

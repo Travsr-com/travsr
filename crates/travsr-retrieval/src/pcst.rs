@@ -8,7 +8,7 @@
 //! 1. Build a bounded local subgraph via bidirectional BFS from source + sink (depth 5).
 //! 2. Map to a petgraph `DiGraph` with edge costs = `1.0 - ppr_weight`.
 //! 3. Run Dijkstra from source; extract the minimum-cost path to sink.
-//! 4. Include nodes within λ of the optimal path cost (λ = 0.5, ADR-007).
+//! 4. Include nodes within λ of the optimal jpath cost (λ = 0.5, ADR-007).
 //! 5. On timeout (> 80ms) or no path found: fall back to BFS depth-3.
 //!
 //! Full Goemans-Williamson (1995) is deferred to S16 when benchmark data
@@ -19,7 +19,7 @@
 //! where V and E are bounded by the BFS expansion depth (≤ 5).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::time::Instant; 
 
 use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{DiGraph, NodeIndex};

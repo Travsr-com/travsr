@@ -214,6 +214,18 @@ fn cmd_set_disabled(language: &str, disabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Run the sandboxed subscription probe for a wrapper binary at `program`
+/// (ADR-019). Used by install to decide keep / replace / roll back.
+fn probe_wrapper(language: &str, program: &str, force: bool) -> travsr_plugin_host::Verdict {
+    let spec = travsr_plugin_host::resolver::PluginSpec {
+        language: language.to_string(),
+        program: program.to_string(),
+        args: vec![],
+        policy: travsr_plugin_host::SandboxPolicy::Standard,
+    };
+    travsr_plugin_host::subscriptions::check_subscription(&spec, force)
+}
+
 /// ~/.travsr/bin first, then PATH — mirrors the host resolver's search order.
 fn which_in_travsr_paths(name: &str) -> Option<String> {
     if let Some(home) = dirs::home_dir() {
@@ -444,22 +456,56 @@ fn cmd_install(
     }
 
     // Download and install the travsr-lang-* wrapper binary.
+    //
+    // Ownership (RFC-013 conflict resolution): wrappers are FIRST-PARTY,
+    // published by the CORE release in lock-step with this CLI's
+    // PROTOCOL_VERSION. An existing binary is probed before being touched —
+    // a verified-Active one is kept; a stale/quarantined one (e.g. a
+    // protocol-v1 leftover from the old external repo) is replaced. After
+    // any install the new binary MUST verify Active or it is rolled back:
+    // installation never downgrades a working language to a quarantined one.
     let wrapper_installed = match entry.provider_binary {
         None => true, // builtin — no external wrapper needed
-        Some(bin) if which(bin) && !reinstall => {
-            println!("\u{2713} {bin} already installed.");
-            true
-        }
         Some(bin) => {
-            if skip_wrapper {
-                which(bin)
+            let existing = which_in_travsr_paths(bin);
+
+            // Probe any existing wrapper first (sandboxed, verdict-cached).
+            let existing_verified = match (&existing, reinstall) {
+                (Some(path), false) => match probe_wrapper(language, path, false) {
+                    travsr_plugin_host::Verdict::Active { .. } => {
+                        println!("\u{2713} {bin} already installed and verified.");
+                        true
+                    }
+                    travsr_plugin_host::Verdict::Disabled => {
+                        println!(
+                            "- {language} is disabled by policy — keeping the existing binary. \
+                             Run `travsr lang enable {language}` to use it."
+                        );
+                        true
+                    }
+                    travsr_plugin_host::Verdict::Rejected { reason }
+                    | travsr_plugin_host::Verdict::Unverified { reason } => {
+                        println!(
+                            "! existing {bin} failed verification ({reason}) — replacing it"
+                        );
+                        false
+                    }
+                },
+                _ => false,
+            };
+
+            if existing_verified {
+                true
+            } else if skip_wrapper {
+                existing.is_some()
             } else {
                 let target =
                     crate::install::current_target().context("determining install target")?;
 
-                // Fetch the latest release version; fall back to catalog default
-                // if GitHub is unreachable (e.g. offline / CI without network).
-                let version = fetch_version_with_fallback(entry.wrapper_version_fallback);
+                // Wrappers version in lock-step with the core binary; the
+                // running CLI's own version is the offline fallback.
+                let cli_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+                let version = fetch_version_with_fallback(&cli_version);
 
                 println!("Installing {bin} {version}...");
 
@@ -472,14 +518,51 @@ fn cmd_install(
                 })
                 .context("downloading wrapper binary")?;
 
-                println!("\u{2713} {bin} installed to {}", path.display());
+                // Post-install VERIFY (ADR-019): the freshly installed binary
+                // must probe Active; anything else restores the backup.
+                match probe_wrapper(language, &path.to_string_lossy(), true) {
+                    travsr_plugin_host::Verdict::Active { supports_phase_b } => {
+                        crate::install::discard_wrapper_backup(&path);
+                        let tier = if supports_phase_b { "A+B capable" } else { "A only" };
+                        println!(
+                            "\u{2713} {bin} installed to {} and verified ({tier})",
+                            path.display()
+                        );
+                    }
+                    travsr_plugin_host::Verdict::Disabled => {
+                        crate::install::discard_wrapper_backup(&path);
+                        println!(
+                            "\u{2713} {bin} installed to {} — {language} is disabled by \
+                             policy; run `travsr lang enable {language}` to use it",
+                            path.display()
+                        );
+                    }
+                    travsr_plugin_host::Verdict::Rejected { reason }
+                    | travsr_plugin_host::Verdict::Unverified { reason } => {
+                        let restored = crate::install::restore_wrapper_backup(&path);
+                        anyhow::bail!(
+                            "freshly installed {bin} failed verification: {reason}\n{}",
+                            if restored {
+                                "the previous binary was restored — the language keeps working"
+                            } else {
+                                "no previous binary to restore — the language is unavailable \
+                                 until a compatible wrapper is installed"
+                            }
+                        );
+                    }
+                }
 
                 if entry.has_share_assets {
-                    let sv = version.clone();
+                    // Share assets still version against the legacy external
+                    // repo's tags (they never contained wrapper binaries).
+                    let share_version = run_async(
+                        crate::install::fetch_latest_version_for_repo("Travsr-com/travsr-lang"),
+                    )
+                    .unwrap_or_else(|_| entry.wrapper_version_fallback.to_string());
                     let sb = bin.to_string();
-                    match run_async(
-                        async move { crate::install::install_share_assets(&sv, &sb).await },
-                    ) {
+                    match run_async(async move {
+                        crate::install::install_share_assets(&share_version, &sb).await
+                    }) {
                         Ok(()) => println!("\u{2713} {bin} emitter files installed"),
                         Err(e) => println!("warning: could not install {bin} share assets: {e:#}"),
                     }

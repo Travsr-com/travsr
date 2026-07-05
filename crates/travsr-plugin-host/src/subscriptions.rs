@@ -370,9 +370,10 @@ pub fn is_language_disabled(language: &str) -> bool {
 /// Expected signing identity for first-party `travsr-lang-*` release binaries
 /// (ADR-020 Rule 2). Org-wide pin: the repo's GitHub Actions release workflow,
 /// keyless OIDC. (First-party-only scope per Rule 5 — a community registry
-/// with per-publisher identities is deferred.)
-const EXPECTED_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
-const EXPECTED_IDENTITY_REGEXP: &str =
+/// with per-publisher identities is deferred.) Public so `travsr lang install`
+/// verifies downloaded release tarballs against the same pin.
+pub const EXPECTED_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+pub const EXPECTED_IDENTITY_REGEXP: &str =
     r"^https://github\.com/Travsr-com/travsr/\.github/workflows/release\.yml@.*$";
 
 /// Verify a plugin binary's cosign bundle when one is present.
