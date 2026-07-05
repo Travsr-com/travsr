@@ -1613,6 +1613,10 @@ impl SqliteStore {
            OR path LIKE 'tests/%' OR path LIKE '%/tests/%' THEN 25 ELSE 0 END
     + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
            OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
+    + CASE WHEN path LIKE '%zz_generated%' OR path LIKE '%.pb.go'
+           OR path LIKE '%_pb2.py' OR path LIKE '%.pb.cc' OR path LIKE '%.pb.h'
+           OR path LIKE '%.generated.%' OR path LIKE '%.g.dart'
+           OR path LIKE '%mock%' OR path LIKE '%fake%' THEN 20 ELSE 0 END
     + (LENGTH(path) / 32)
     + CASE kind
         WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
@@ -3266,6 +3270,10 @@ impl SqliteStore {
            OR path LIKE 'tests/%' OR path LIKE '%/tests/%' THEN 25 ELSE 0 END
     + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
            OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
+    + CASE WHEN path LIKE '%zz_generated%' OR path LIKE '%.pb.go'
+           OR path LIKE '%_pb2.py' OR path LIKE '%.pb.cc' OR path LIKE '%.pb.h'
+           OR path LIKE '%.generated.%' OR path LIKE '%.g.dart'
+           OR path LIKE '%mock%' OR path LIKE '%fake%' THEN 20 ELSE 0 END
     + (LENGTH(path) / 32)
     + CASE kind
         WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
@@ -4904,6 +4912,33 @@ mod tests {
         let results = store.search_nodes_by_name("util").unwrap();
         // vendor path must rank below production
         assert_eq!(results[0].vname.path, "src/util.go");
+    }
+
+    #[test]
+    fn search_ranks_generated_and_mock_below_production() {
+        // Issue #297: generated (`zz_generated`, `.pb.go`) and mock/fake files
+        // must not outrank the real decl. Both signatures are substring-equal
+        // matches (same match tier) so only the generated/mock penalty (+20)
+        // differentiates them.
+        for gen_path in [
+            "pkg/api/zz_generated.deepcopy.go",
+            "pkg/api/types.pb.go",
+            "pkg/api/mock_handler.go",
+            "pkg/api/fake_handler.go",
+        ] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            store
+                .put_node(&node_with_path(gen_path, "fn:handleGen"))
+                .unwrap();
+            store
+                .put_node(&node_with_path("pkg/api/handler.go", "fn:handleProd"))
+                .unwrap();
+            let results = store.search_nodes_by_name("handle").unwrap();
+            assert_eq!(
+                results[0].vname.path, "pkg/api/handler.go",
+                "production file must outrank generated/mock file {gen_path}"
+            );
+        }
     }
 
     #[test]
