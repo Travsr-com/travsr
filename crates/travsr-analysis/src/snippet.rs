@@ -86,43 +86,7 @@ pub fn snippet_for_node_capped(node: &Node, repo_root: &Path, cap: usize) -> Opt
     let start_1based = node.line? as usize; // 1-based, None → bail
     let end_1based = node.end_line.unwrap_or(node.line.unwrap()) as usize;
 
-    if node.vname.path.is_empty() {
-        return None;
-    }
-
-    // SEC: reject any vname.path that attempts to escape the repo root.
-    // Path::join on an absolute component replaces the prefix entirely on all
-    // platforms. Detect explicit traversal patterns and absolute-path prefixes
-    // before constructing the joined path.
-    // vname.path always uses '/' (POSIX) as stored by Tree-sitter/LSIF, but a
-    // crafted DB entry could hold Windows-style absolute paths — cover both.
-    let p = &node.vname.path;
-    let looks_absolute = p.starts_with('/')         // Unix absolute
-        || p.starts_with('\\')                      // Windows UNC prefix
-        || p.get(1..3).map(|s| s == ":\\" || s == ":/").unwrap_or(false); // C:\ or C:/
-    if looks_absolute || p.contains("..") {
-        tracing::debug!(
-            path = %node.vname.path,
-            "snippet_for_node: skipping node with absolute or traversal path"
-        );
-        return None;
-    }
-    let abs = repo_root.join(&node.vname.path);
-    // Canonicalize both paths to resolve symlinks before comparing.
-    // Fall back to lexical comparison when canonicalize fails (e.g. file
-    // missing) — the starts_with guard below still catches traversal attempts.
-    let canon_abs = abs.canonicalize().unwrap_or_else(|_| abs.clone());
-    let canon_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
-    if !canon_abs.starts_with(&canon_root) {
-        tracing::warn!(
-            path = %node.vname.path,
-            "snippet_for_node: path escapes repo_root — skipping"
-        );
-        return None;
-    }
-
+    let canon_abs = resolve_source_path(node, repo_root)?;
     let content = std::fs::read_to_string(&canon_abs).ok()?;
     let all_lines: Vec<&str> = content.lines().collect();
 
@@ -152,6 +116,119 @@ pub fn snippet_for_node_capped(node: &Node, repo_root: &Path, cap: usize) -> Opt
         return None;
     }
     Some(trimmed.join("\n"))
+}
+
+/// Resolve `node.vname.path` to a canonicalized absolute path under `repo_root`,
+/// applying the SEC path-traversal / containment guards shared by all source
+/// readers here. Returns `None` when the path is empty, looks absolute, contains
+/// `..`, or (after canonicalization) escapes `repo_root`.
+///
+/// vname.path always uses '/' (POSIX) as stored by Tree-sitter/LSIF, but a
+/// crafted DB entry could hold Windows-style absolute paths — both are covered.
+pub fn resolve_source_path(node: &Node, repo_root: &Path) -> Option<std::path::PathBuf> {
+    if node.vname.path.is_empty() {
+        return None;
+    }
+    let p = &node.vname.path;
+    let looks_absolute = p.starts_with('/')         // Unix absolute
+        || p.starts_with('\\')                      // Windows UNC prefix
+        || p.get(1..3).map(|s| s == ":\\" || s == ":/").unwrap_or(false); // C:\ or C:/
+    if looks_absolute || p.contains("..") {
+        tracing::debug!(
+            path = %node.vname.path,
+            "resolve_source_path: skipping node with absolute or traversal path"
+        );
+        return None;
+    }
+    let abs = repo_root.join(&node.vname.path);
+    // Canonicalize both paths to resolve symlinks before comparing. Fall back to
+    // lexical comparison when canonicalize fails (e.g. file missing) — the
+    // starts_with guard below still catches traversal attempts.
+    let canon_abs = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+    let canon_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    if !canon_abs.starts_with(&canon_root) {
+        tracing::warn!(
+            path = %node.vname.path,
+            "resolve_source_path: path escapes repo_root — skipping"
+        );
+        return None;
+    }
+    Some(canon_abs)
+}
+
+/// Scan `node`'s source span for lines where `name` occurs as a standalone
+/// identifier token, returning their 1-based line numbers (capped at `max`).
+///
+/// For a node with a known span (`line`..=`end_line`) only that range is read;
+/// for a span-less node (e.g. a file-kind caller) the whole file is scanned.
+/// Reuses [`resolve_source_path`]'s SEC guards. Empty when the file can't be
+/// read or `name` never appears bounded by non-identifier characters.
+///
+/// This backs `get_callers` call-site resolution (#399): a `RefCall` graph edge
+/// is deduplicated by `(src,dst,kind)`, so one edge can represent several calls
+/// from the same caller — re-scanning the caller body recovers each site as
+/// `path:line` without storing per-occurrence rows.
+pub fn call_site_lines(node: &Node, repo_root: &Path, name: &str, max: usize) -> Vec<u32> {
+    if name.is_empty() || max == 0 {
+        return Vec::new();
+    }
+    let path = match resolve_source_path(node, repo_root) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let all_lines: Vec<&str> = content.lines().collect();
+
+    // Scan window (0-based, end-exclusive): the node's span, or the whole file
+    // when the node has no line (file-kind caller).
+    let (from, to) = match node.line {
+        Some(l) => {
+            let from = (l as usize).saturating_sub(1);
+            let end = node.end_line.map(|e| e as usize).unwrap_or(l as usize);
+            (from, end.min(all_lines.len()))
+        }
+        None => (0, all_lines.len()),
+    };
+    if from >= all_lines.len() || to <= from {
+        return Vec::new();
+    }
+
+    let mut hits: Vec<u32> = Vec::new();
+    for (offset, line) in all_lines[from..to].iter().enumerate() {
+        if line_has_identifier(line, name) {
+            hits.push((from + offset + 1) as u32); // back to 1-based
+            if hits.len() >= max {
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// True when `name` appears in `line` bounded by non-identifier characters on
+/// both sides, so `Sync` does not match inside `SyncPod`. Identifier characters
+/// are ASCII alphanumerics and `_`. Byte offsets from `match_indices` are always
+/// UTF-8 char boundaries, so multibyte neighbours are treated as boundaries.
+fn line_has_identifier(line: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for (idx, _) in line.match_indices(name) {
+        let before_ok = idx == 0 || !is_ident(bytes[idx - 1]);
+        let after = idx + name.len();
+        let after_ok = after >= bytes.len() || !is_ident(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -283,6 +360,68 @@ mod tests {
         assert!(snippet.starts_with("function charge(amount)"));
         assert!(!snippet.contains("apply fee"));
         assert!(snippet.contains("return amount * 1.02"));
+    }
+
+    // ── line_has_identifier ───────────────────────────────────────────────────
+
+    #[test]
+    fn line_has_identifier_respects_word_boundaries() {
+        assert!(line_has_identifier("  SyncPod(ctx)", "SyncPod"));
+        assert!(line_has_identifier("x = a.SyncPod();", "SyncPod"));
+        assert!(line_has_identifier("SyncPod", "SyncPod"));
+        // Must NOT match inside a longer identifier.
+        assert!(!line_has_identifier("  SyncPodWorker(ctx)", "SyncPod"));
+        assert!(!line_has_identifier("  mySyncPod(ctx)", "SyncPod"));
+        assert!(!line_has_identifier("  _SyncPod2()", "SyncPod"));
+    }
+
+    // ── call_site_lines (#399) ────────────────────────────────────────────────
+
+    #[test]
+    fn call_site_lines_finds_each_occurrence_in_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("worker.go");
+        // caller func spans lines 2..=8; calls SyncPod on lines 4, 6 and a decoy
+        // SyncPodX on line 7 that must NOT match.
+        std::fs::write(
+            &src,
+            "package main\nfunc run() {\n  setup()\n  SyncPod(a)\n  log()\n  SyncPod(b)\n  SyncPodX(c)\n}\n",
+        )
+        .unwrap();
+        let caller = make_fn_node("worker.go", "fn:run", 2, 8);
+        let sites = call_site_lines(&caller, dir.path(), "SyncPod", 50);
+        assert_eq!(sites, vec![4, 6], "both call sites, decoy excluded");
+    }
+
+    #[test]
+    fn call_site_lines_scans_whole_file_when_no_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("f.ts");
+        std::fs::write(&src, "a();\nfoo();\nb();\nfoo();\n").unwrap();
+        // Span-less caller (e.g. file-kind node): line = None → whole-file scan.
+        let node = Node::new(
+            VName::new("corpus", "", "f.ts", "typescript", "file:f"),
+            "file",
+        );
+        let sites = call_site_lines(&node, dir.path(), "foo", 50);
+        assert_eq!(sites, vec![2, 4]);
+    }
+
+    #[test]
+    fn call_site_lines_respects_max_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("m.ts");
+        std::fs::write(&src, "foo();\nfoo();\nfoo();\nfoo();\n").unwrap();
+        let node = make_fn_node("m.ts", "fn:wrap", 1, 4);
+        let sites = call_site_lines(&node, dir.path(), "foo", 2);
+        assert_eq!(sites.len(), 2, "capped at max");
+    }
+
+    #[test]
+    fn call_site_lines_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node("does_not_exist.rs", "fn:x", 1, 3);
+        assert!(call_site_lines(&node, dir.path(), "foo", 50).is_empty());
     }
 
     #[test]

@@ -243,19 +243,66 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         .into_iter()
         .map(|n| (n.id, n))
         .collect();
-    let lines: Vec<String> = relevant
-        .iter()
-        .filter_map(|(edge, tag)| {
-            node_map.get(&edge.src).map(|src_node| {
-                let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
-                format!(
-                    "{tag} {} ({}) — {}{}",
-                    src_node.vname.signature, src_node.kind, src_node.vname.path, loc
-                )
-            })
-        })
-        .collect();
+
+    // #399: resolve exact call-site `path:line`s for true call edges. A RefCall
+    // edge is deduplicated by `(src,dst,kind)`, so one edge can stand for several
+    // calls from the same caller — we re-scan the caller's source span for the
+    // callee's name to recover each site. Requires `repo_root` (stored in meta by
+    // init); absent (older indexes) or unresolvable → fall back to the caller's
+    // definition line, never worse than before.
+    let repo_root = match store.get_meta("repo_root") {
+        Ok(Some(r)) if !r.is_empty() => Some(PathBuf::from(r)),
+        _ => None,
+    };
+    let callee_name = simple_name(&seed.vname.signature);
+    const MAX_SITES_PER_CALLER: usize = 50;
+
+    let mut lines: Vec<String> = Vec::new();
+    for &(edge, tag) in &relevant {
+        let Some(src_node) = node_map.get(&edge.src) else {
+            continue;
+        };
+        // True call edge: try to expand into exact call-site lines.
+        if tag == "[call]" {
+            if let Some(root) = &repo_root {
+                let sites = call_site_lines(src_node, root, &callee_name, MAX_SITES_PER_CALLER);
+                if !sites.is_empty() {
+                    for line in sites {
+                        lines.push(format!(
+                            "{tag} {} ({}) — {}:{}",
+                            src_node.vname.signature, src_node.kind, src_node.vname.path, line
+                        ));
+                    }
+                    continue;
+                }
+            }
+        }
+        // Structural edge, or a call edge with no resolvable site / no repo_root:
+        // report the node's definition line as before.
+        let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
+        lines.push(format!(
+            "{tag} {} ({}) — {}{}",
+            src_node.vname.signature, src_node.kind, src_node.vname.path, loc
+        ));
+    }
     lines.join("\n")
+}
+
+/// Extract the bare symbol name from a stored signature for textual call-site
+/// matching: strips the `kind:` prefix and any scope qualifier. Examples:
+/// `fn:SyncPod` → `SyncPod`, `method:Foo#charge` → `charge`,
+/// `fn:SqliteStore.iter_edges_to` → `iter_edges_to`,
+/// `fn:crate::repo::find_git_root` → `find_git_root`.
+fn simple_name(signature: &str) -> String {
+    // rsplit(':') drops the `kind:` prefix and yields the last `::` component;
+    // then split off any `.`/`#` method/scope qualifier.
+    let after_kind = signature.rsplit(':').next().unwrap_or(signature);
+    after_kind
+        .rsplit(['.', '#'])
+        .next()
+        .unwrap_or(after_kind)
+        .trim()
+        .to_string()
 }
 
 /// Global variant of `get_dependencies` — searches one named repo or all registered repos.
@@ -4136,6 +4183,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn simple_name_strips_kind_and_scope() {
+        assert_eq!(simple_name("fn:SyncPod"), "SyncPod");
+        assert_eq!(simple_name("method:Foo#charge"), "charge");
+        assert_eq!(simple_name("fn:SqliteStore.iter_edges_to"), "iter_edges_to");
+        assert_eq!(
+            simple_name("fn:crate::repo::find_git_root"),
+            "find_git_root"
+        );
+        assert_eq!(simple_name("bareName"), "bareName");
+    }
+
+    /// #399: when repo_root + source are available, get_callers expands a single
+    /// RefCall edge into every exact call-site line, not the caller's def line.
+    #[test]
+    fn get_callers_expands_to_exact_call_sites() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        // caller `run` spans lines 2..=7 and calls SyncPod on lines 4 and 6;
+        // SyncPodX on line 5 is a decoy that must not match.
+        std::fs::write(
+            dir.path().join("worker.go"),
+            "package main\nfunc run() {\n  x()\n  SyncPod(a)\n  SyncPodX(z)\n  SyncPod(b)\n}\n",
+        )
+        .unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "sync.go", "go", "fn:SyncPod"),
+            "function",
+        );
+        let caller = Node::new(VName::new("", "", "worker.go", "go", "fn:run"), "function")
+            .with_line(2)
+            .with_end_line(7);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+
+        let result = get_callers(&store, "SyncPod");
+        assert!(result.contains("worker.go:4"), "site on line 4: {result}");
+        assert!(result.contains("worker.go:6"), "site on line 6: {result}");
+        assert!(
+            !result.contains("worker.go:5"),
+            "decoy SyncPodX must not match: {result}"
+        );
+        // Two distinct sites from one edge.
+        assert_eq!(
+            result.matches("worker.go:").count(),
+            2,
+            "one edge → two call sites: {result}"
+        );
+    }
+
     // ── blast radius unit tests ───────────────────────────────────────────────
 
     fn make_store(
@@ -4983,7 +5088,7 @@ mod tests {
 use travsr_analysis::skeleton::skeleton_for_node as skeleton_for_node_inner;
 pub use travsr_analysis::snippet::SNIPPET_DEFAULT_BUDGET;
 use travsr_analysis::snippet::{
-    snippet_for_node, snippet_for_node_full, snippet_line_cap, SNIPPET_SEP,
+    call_site_lines, snippet_for_node, snippet_for_node_full, snippet_line_cap, SNIPPET_SEP,
 };
 
 /// How `get_snippets` renders each symbol's body.
