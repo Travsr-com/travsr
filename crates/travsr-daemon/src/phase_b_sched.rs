@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 /// Pending-run state (FT-M6). `deadline` is the debounce target (pushed forward
 /// by each commit); `first_arm` is when the *current* pending window opened and
-/// is NOT pushed forward — it anchors the max-staleness ceiling so a fast commit
+/// is NOT pushed forward: it anchors the max-staleness ceiling so a fast commit
 /// stream cannot defer Phase B forever.
 #[derive(Clone, Copy)]
 struct DirtyState {
@@ -57,7 +57,7 @@ impl PhaseBScheduler {
         Self::with_max_defer(debounce, Self::DEFAULT_MAX_DEFER)
     }
 
-    /// Explicit ceiling — used by FT-M6 tests to exercise the starvation guard
+    /// Explicit ceiling, used by FT-M6 tests to exercise the starvation guard
     /// deterministically without waiting 300 s.
     pub fn with_max_defer(debounce: Duration, max_defer: Duration) -> Self {
         Self {

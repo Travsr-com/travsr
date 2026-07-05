@@ -17,7 +17,7 @@ pub(crate) struct StderrRing {
 }
 
 impl StderrRing {
-    /// Create a ring with no backing reader — used when stderr is not piped.
+    /// Create a ring with no backing reader (used when stderr is not piped).
     pub(crate) fn spawn_empty() -> Self {
         Self {
             buf: Arc::new(Mutex::new(VecDeque::new())),

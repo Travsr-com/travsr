@@ -69,9 +69,9 @@ static REINDEX_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// RAII reset for the process-level single-flight guard (FT-M4).
 ///
-/// Holding one of these keeps REINDEX_IN_FLIGHT = true; dropping it — on normal
+/// Holding one of these keeps REINDEX_IN_FLIGHT = true; dropping it (on normal
 /// return, `?`, an early `return`, OR a panic unwinding out of the reindex
-/// closure — resets the flag. This replaces the hand-written tail `store(false)`
+/// closure) resets the flag. This replaces the hand-written tail `store(false)`
 /// which a panic in `run_parallel_reindex` would skip, permanently wedging all
 /// future reindex passes.
 struct ReindexInFlightGuard;

@@ -147,7 +147,7 @@ impl EmbedSidecar {
         let stderr_ring = if let Some(stderr) = child.stderr.take() {
             StderrRing::spawn(stderr)
         } else {
-            // Spawned without piped stderr — create a no-op ring.
+            // Spawned without piped stderr; create a no-op ring.
             StderrRing::spawn_empty()
         };
 
@@ -279,7 +279,7 @@ impl EmbedSidecar {
     /// the sidecar if no response arrives within EMBED_IO_TIMEOUT_SECS.
     ///
     /// Serialization: this holds `self.io` for the entire request round-trip
-    /// (write + blocking read). That is intentional — the sidecar loads ONE model
+    /// (write + blocking read). That is intentional: the sidecar loads ONE model
     /// and runs ONE inference loop (RFC-021), so concurrent callers must serialize
     /// at the transport anyway; narrowing the lock would only move the queue, not
     /// remove it. The per-call `with_io_watchdog` bounds how long any single caller
@@ -338,7 +338,7 @@ impl EmbedSidecar {
     /// arrives within EMBED_IO_TIMEOUT_SECS.
     ///
     /// Serialization: this holds `self.io` for the entire request round-trip
-    /// (write + blocking read). That is intentional — the sidecar loads ONE model
+    /// (write + blocking read). That is intentional: the sidecar loads ONE model
     /// and runs ONE inference loop (RFC-021), so concurrent callers must serialize
     /// at the transport anyway; narrowing the lock would only move the queue, not
     /// remove it. The per-call `with_io_watchdog` bounds how long any single caller

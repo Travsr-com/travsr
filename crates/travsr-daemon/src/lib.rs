@@ -3023,10 +3023,10 @@ impl Daemon {
                                     );
                                     listener = l;
                                     tracing::warn!(sock = %sock_path.display(),
-                                        "control socket was missing — re-bound");
+                                        "control socket was missing, re-bound");
                                 }
                                 Err(e) => tracing::warn!(sock = %sock_path.display(),
-                                    "control socket missing and re-bind failed: {e} — retrying next tick"),
+                                    "control socket missing and re-bind failed: {e}; retrying next tick"),
                             }
                         }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
