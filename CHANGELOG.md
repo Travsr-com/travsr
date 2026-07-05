@@ -4,11 +4,76 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v0.9.0 - 2026-06-11
+
+### travsr binary
+
+- Add native Phase B semantic indexing for Rust, TypeScript, and Python (no external SCIP tools required)
+- Add Phase B support for Kotlin via Kotlin Language Server with ZipBinary install
+- Add Phase B support for Swift and Dart: Phase A tree-sitter configs and GithubBinary install
+- Add Phase B support for Java: sandbox, resolver, and edge wiring end-to-end
+- Add Phase B support for C#: dotnet tools PATH check and toolchain grants
+- Add Phase B support for Scala: sbt catalog
+- Add `.travsrignore` support for excluding paths during `travsr init`
+- Add live progress UI during `travsr init` with parallel batched indexing
+- Add branded `--help` logo
+- Add blast radius Phase 2 and 3: ImportResolver for 14 languages and Go intra-package co-file edges
+- Add Tree-sitter vs Semantic toggle for the blast radius view
+- Add `native_phase_b` flag for per-language configuration
+- Allow network access in Phase B sandboxes; display live schema version in `travsr status`
+- Fix Dart Phase B: bypass sidecar, call emitter directly
+- Fix bwrap network isolation enforcement on Linux NativeIpc sandbox
+- Fix `bulk_init`: create `_bulk_fts_pending` table before `write_file_graphs_batch`
+- Fix generalized co-package pass and Phase B batch writes
+- Fix JS/TS file extension handling, Dart sandbox, and Phase B edge writes
+
+### VS Code extension (vscode-v0.8.0)
+
+- Add JavaScript and C# to codelens and hover selectors
+- Add Tree-sitter vs Semantic toggle in blast radius webview
+- Extend hover and codelens selectors to all 13 indexed languages
+- Fix re-index triggering, panel refresh, and test regressions
+- Fix stale language list refresh and status bar `.travsr` watcher
+- Fix MCP envelope leaking into file lists
+- Fix blast radius depth slider and corpus auto-trust
+- Update bundled binary reference to v0.9.0
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.8.0...v0.9.0
+
+---
+
+## v0.8.0 - 2026-06-06
+
+### travsr binary
+
+- Add `travsr-ipc` crate: platform-agnostic control plane (Unix socket on macOS/Linux, Named Pipe on Windows)
+- Add Windows Named Pipe daemon control: `travsr daemon start/stop/status` now works on Windows
+- Add dual-write post-commit hook on Windows: installs both `post-commit` and `post-commit.cmd` so the hook fires from CMD, PowerShell, and Git Bash
+- Add Windows Task Scheduler auto-start via `travsr daemon start --autostart`
+- Add AppContainer + Job Object sandbox for plugin host processes on Windows
+- Add full `CreateProcessW` spawn inside AppContainer for plugin indexers on Windows
+- Add CI matrix for elevated AppContainer sandbox tests on Windows
+- Fix `lang list` incorrectly showing built-in indexers as disabled on Windows
+- Fix `travsr unregister` treating task-not-found as an error instead of a no-op
+- Fix `graph.db` file permissions on Windows (restricted via `icacls`)
+
+### VS Code extension (vscode-v0.7.0)
+
+- Add `.exe`-only binary spawn on Windows with `assertExecutableBinary` path validation
+- Fix `showLanguages` using a stale binary path captured at activation time
+- Fix stale download URLs and `assertExecutableBinary` not being called in `reindexNow`
+- Fix `assertExecutableBinary` metacharacter regex on Windows paths
+- Update bundled binary reference to v0.8.0
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.6.0...v0.8.0
+
+---
+
 ## v0.6.0 - 2026-05-31
 
 This release ships the complete Phase 2 retrieval stack, the VS Code graph panel,
 line-number storage for go-to-definition, and a new `get_graph_stats` introspection
-tool. All seven MCP tools are now fully implemented.
+tool.
 
 ### Retrieval
 
@@ -88,7 +153,7 @@ tool. All seven MCP tools are now fully implemented.
 
 ---
 
-## v0.3.1 — 2026-05-21
+## v0.3.1 - 2026-05-21
 
 Security patch release on top of v0.3.0. No new features. Upgrade strongly recommended.
 
@@ -99,7 +164,7 @@ Security patch release on top of v0.3.0. No new features. Upgrade strongly recom
   containing `;`, `$(...)`, or other shell metacharacters could execute
   arbitrary code on every `git commit`. The hook now calls
   `travsr hook-run --from-hook`; the binary reads changed files from git
-  directly via `std::process::Command` — no shell involved.
+  directly via `std::process::Command`. No shell involved.
 
 - **File permission hardening**: `graph.db` is now created `0600` (owner
   read/write only). `~/.travsr/` is created `0700`. `registry.json` is
@@ -111,11 +176,11 @@ Security patch release on top of v0.3.0. No new features. Upgrade strongly recom
 - `travsr-retrieval`: remove redundant closure wrapping `ppr_inner`
   (clippy `redundant_closure_call`).
 
-**Full changelog:** https://github.com/raj-rkv/travsr/compare/v0.3.0...v0.3.1
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.3.0...v0.3.1
 
 ---
 
-## v0.3.0 — 2026-05-21
+## v0.3.0 - 2026-05-21
 
 This release closes Phase 2 of the Travsr roadmap. The production Kùzu storage
 backend is now available, the security hardening recommended in the Phase 1 audit
@@ -123,18 +188,17 @@ is complete, and the graph identity foundation (Kythe VNames, RFC-002) is locked
 in for cross-repo support in Phase 3.
 
 ⚠️ **Migration required for v0.2.x users:** RFC-002 changes the VName corpus
-format. Re-run `travsr init` in each repo — old signatures are rejected by
+format. Re-run `travsr init` in each repo; old signatures are rejected by
 v0.3.0. The old `.travsr/graph.db` can be deleted safely; `travsr init` rebuilds
 it from source.
 
 ### Production Storage
 
-- **Kùzu backend** (`--features kuzu`): The production graph engine is now
-  available. Kùzu handles up to 2.5B edges and is 64× faster than Neo4j on
-  graph workloads. Build with `cargo build --release --features kuzu` to enable.
+- **Kuzu backend** (`--features kuzu`): The production graph engine is now
+  available. Build with `cargo build --release --features kuzu` to enable.
 
 - **`travsr migrate --to kuzu`**: Migrate an existing SQLite graph to Kùzu
-  with a single command. The migration is idempotent — running it twice is safe.
+  with a single command. The migration is idempotent; running it twice is safe.
   SQLite is never deleted; both backends coexist.
 
 - **Migration integrity manifest**: Every migration computes a SHA-256 digest
@@ -144,7 +208,7 @@ it from source.
 
 - **Backend-agnostic schema migration framework**: All storage backends now
   share a versioned migration runner. Schema migrations are idempotent and
-  version-gated — re-running migrations on an already-migrated store is a no-op.
+  version-gated. Re-running migrations on an already-migrated store is a no-op.
 
 ### Security
 
@@ -164,7 +228,7 @@ it from source.
 - **Git hook shell-injection hardening**: The `post-commit` hook no longer
   passes git-reported filenames through shell expansion. The hook now calls
   `travsr hook-run --from-hook`, which reads changed files from git directly
-  via `std::process::Command` — filenames containing spaces, semicolons, or
+  via `std::process::Command`. Filenames containing spaces, semicolons, or
   shell metacharacters are handled safely.
 
 - **File permission hardening**: `graph.db` is now created with `0600`
@@ -174,26 +238,26 @@ it from source.
 
 ### Architecture
 
-- **RFC-002 — VName signature format versioning**: VName signatures now include
+- **RFC-002: VName signature format versioning**: VName signatures now include
   a version prefix and domain separator. Signatures from different versions do
-  not collide. The corpus meta write is now a hard error — a repo with a
+  not collide. The corpus meta write is now a hard error; a repo with a
   mismatched or missing corpus identity will not index silently.
 
-- **ARCH-102 — Kythe corpus naming convention**: Corpus names are now derived
+- **ARCH-102: Kythe corpus naming convention**: Corpus names are now derived
   deterministically from the git remote URL (or directory name as fallback).
   All repos indexed with v0.3.0+ use the standardized convention.
 
-- **ADR-003 — PPR algorithm constants**: The Personalized PageRank constants
+- **ADR-003: PPR algorithm constants**: The Personalized PageRank constants
   (`α = 0.85`, `ε = 1e-6`) are now defined in a dedicated module with
   compile-time bounds assertions. These will power the Phase 3 traversal engine.
 
 ### Quality
 
-- **QA-010 — SQLite/Kùzu parity harness**: A property-based test harness verifies
+- **QA-010: SQLite/Kuzu parity harness**: A property-based test harness verifies
   that SQLite and Kùzu backends return identical results for all graph queries.
   Parity is enforced on every CI run when `--features kuzu` is enabled.
 
-- **QA-012 — MCP Phase 2 conformance suite**: The MCP server is now validated
+- **QA-012: MCP Phase 2 conformance suite**: The MCP server is now validated
   against the full JSON-RPC envelope spec, sanitization pipeline, and multi-repo
   `repo` argument routing.
 
@@ -206,28 +270,28 @@ it from source.
 - **`graph.db` and `~/.travsr/` permissions**: These are now created `0600`/`0700`.
   Existing files are updated on the next `travsr init` or `travsr migrate` run.
 
-**Full changelog:** https://github.com/raj-rkv/travsr/compare/v0.2.0...v0.3.0
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.2.0...v0.3.0
 
 ---
 
-## v0.2.0 — Phase 1 complete
+## v0.2.0 - Phase 1 complete
 
 Initial public release. Tree-sitter TypeScript indexer, SQLite graph store,
 BFS retrieval, MCP stdio server, `travsr init` / `travsr ask` / `travsr mcp` CLI,
 git post-commit hook, SHA-256 delta reindex, global multi-repo registry.
 
-**Full changelog:** https://github.com/raj-rkv/travsr/compare/v0.1.3...v0.2.0
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.1.3...v0.2.0
 
 ---
 
-## v0.1.3 — Patch
+## v0.1.3 - Patch
 
-**Full changelog:** https://github.com/raj-rkv/travsr/compare/v0.1.2...v0.1.3
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.1.2...v0.1.3
 
-## v0.1.2 — Patch
+## v0.1.2 - Patch
 
-**Full changelog:** https://github.com/raj-rkv/travsr/compare/v0.1.1...v0.1.2
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.1.1...v0.1.2
 
-## v0.1.1 — Initial alpha
+## v0.1.1 - Initial alpha
 
-**Full changelog:** https://github.com/raj-rkv/travsr/releases/tag/v0.1.1
+**Full changelog:** https://github.com/Travsr-com/travsr/releases/tag/v0.1.1
