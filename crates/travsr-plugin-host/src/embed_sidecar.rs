@@ -11,6 +11,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::stderr_ring::StderrRing;
+
 use travsr_plugin_protocol::{
     codec::{decode_message, write_message},
     EmbedHandshakeRequest, EmbedPluginRequest, EmbedPluginResponse, EmbedRequest, KnnRequest,
@@ -92,6 +94,10 @@ pub struct EmbedSidecar {
     /// KnnRequest so the sidecar opens embed.db with sqlite-vec for ANN — never
     /// the shared graph.db WAL which would reintroduce write contention.
     embed_db_path: PathBuf,
+    /// FT-M2: bounded ring buffer draining the sidecar's stderr so model-load
+    /// errors (OOM, corrupt weights, missing descriptor) are surfaced in the
+    /// daemon log on non-zero exit rather than silently discarded.
+    stderr_ring: StderrRing,
 }
 
 // FT-C1: kill + reap the child on drop so the 270 MB–1.4 GB model process
@@ -126,7 +132,7 @@ impl EmbedSidecar {
             .arg(model_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped()) // FT-M2: capture for error surfacing
             .spawn()
             .map_err(|e| EmbedError::Spawn(e.to_string()))?;
 
@@ -138,6 +144,12 @@ impl EmbedSidecar {
             .stdout
             .take()
             .ok_or_else(|| EmbedError::Spawn("piped stdout not available after spawn".into()))?;
+        let stderr_ring = if let Some(stderr) = child.stderr.take() {
+            StderrRing::spawn(stderr)
+        } else {
+            // Spawned without piped stderr; create a no-op ring.
+            StderrRing::spawn_empty()
+        };
 
         let mut writer = BufWriter::new(raw_stdin);
         let mut reader = BufReader::new(raw_stdout);
@@ -160,11 +172,24 @@ impl EmbedSidecar {
                 .map_err(|e| EmbedError::Handshake(e.to_string()))
         });
 
-        let hs = handshake_result?;
+        let hs = match handshake_result {
+            Ok(r) => r,
+            Err(e) => {
+                let tail = stderr_ring.tail();
+                if !tail.is_empty() {
+                    tracing::warn!(stderr = %tail, "embed sidecar handshake failed");
+                }
+                return Err(e);
+            }
+        };
 
         let caps = match hs {
             EmbedPluginResponse::Handshake(h) => {
                 if h.protocol_version != EMBED_PROTOCOL_VERSION {
+                    let tail = stderr_ring.tail();
+                    if !tail.is_empty() {
+                        tracing::warn!(stderr = %tail, "embed sidecar version mismatch");
+                    }
                     return Err(EmbedError::VersionMismatch {
                         expected: EMBED_PROTOCOL_VERSION,
                         got: h.protocol_version,
@@ -179,9 +204,13 @@ impl EmbedSidecar {
                 }
             }
             _ => {
+                let tail = stderr_ring.tail();
+                if !tail.is_empty() {
+                    tracing::warn!(stderr = %tail, "embed sidecar unexpected handshake response");
+                }
                 return Err(EmbedError::Handshake(
                     "expected EmbedHandshakeResponse".into(),
-                ))
+                ));
             }
         };
 
@@ -202,6 +231,7 @@ impl EmbedSidecar {
             // RFC-019: KNN queries target embed.db, not graph.db, to avoid
             // competing with the daemon's WAL write lock.
             embed_db_path: db_path.with_file_name("embed.db"),
+            stderr_ring,
         })
     }
 
@@ -215,8 +245,16 @@ impl EmbedSidecar {
             return false;
         }
         if let Ok(mut child) = self.child.lock() {
-            if let Ok(Some(_)) = child.try_wait() {
+            if let Ok(Some(status)) = child.try_wait() {
                 drop(child);
+                let tail = self.stderr_ring.tail();
+                if !tail.is_empty() {
+                    tracing::warn!(
+                        exit = ?status.code(),
+                        stderr = %tail,
+                        "embed sidecar exited unexpectedly"
+                    );
+                }
                 self.mark_crashed();
                 return false;
             }
@@ -239,6 +277,14 @@ impl EmbedSidecar {
     /// frame → pipe fills → read never reached → deadlock).
     /// FT-C2: each chunk's read is guarded by an I/O watchdog thread that kills
     /// the sidecar if no response arrives within EMBED_IO_TIMEOUT_SECS.
+    ///
+    /// Serialization: this holds `self.io` for the entire request round-trip
+    /// (write + blocking read). That is intentional: the sidecar loads ONE model
+    /// and runs ONE inference loop (RFC-021), so concurrent callers must serialize
+    /// at the transport anyway; narrowing the lock would only move the queue, not
+    /// remove it. The per-call `with_io_watchdog` bounds how long any single caller
+    /// can hold it (`EMBED_IO_TIMEOUT_SECS`), so one stalled inference cannot wedge
+    /// the mutex indefinitely.
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<u8>>, EmbedError> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -290,6 +336,14 @@ impl EmbedSidecar {
     ///
     /// FT-C2: guarded by a watchdog thread that kills the sidecar if no response
     /// arrives within EMBED_IO_TIMEOUT_SECS.
+    ///
+    /// Serialization: this holds `self.io` for the entire request round-trip
+    /// (write + blocking read). That is intentional: the sidecar loads ONE model
+    /// and runs ONE inference loop (RFC-021), so concurrent callers must serialize
+    /// at the transport anyway; narrowing the lock would only move the queue, not
+    /// remove it. The per-call `with_io_watchdog` bounds how long any single caller
+    /// can hold it (`EMBED_IO_TIMEOUT_SECS`), so one stalled inference cannot wedge
+    /// the mutex indefinitely.
     pub fn knn(
         &self,
         query_text: &str,

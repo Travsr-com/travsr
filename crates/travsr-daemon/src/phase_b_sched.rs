@@ -18,15 +18,28 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Pending-run state (FT-M6). `deadline` is the debounce target (pushed forward
+/// by each commit); `first_arm` is when the *current* pending window opened and
+/// is NOT pushed forward: it anchors the max-staleness ceiling so a fast commit
+/// stream cannot defer Phase B forever.
+#[derive(Clone, Copy)]
+struct DirtyState {
+    deadline: Instant,
+    first_arm: Instant,
+}
+
 /// Coordinates background Phase B refreshes across the daemon's tasks.
 pub struct PhaseBScheduler {
-    /// `Some(deadline)` while a re-run is pending; `None` when idle or already
-    /// claimed by an in-flight run. Re-arming pushes the deadline out so a burst
-    /// of commits settles into one run.
-    dirty: Mutex<Option<Instant>>,
+    /// `Some(state)` while a re-run is pending; `None` when idle or already
+    /// claimed by an in-flight run. Re-arming pushes `deadline` forward but
+    /// keeps `first_arm` fixed so a burst of commits still triggers a run.
+    dirty: Mutex<Option<DirtyState>>,
     /// Single-flight guard: at most one background Phase B run at a time.
     running: AtomicBool,
     debounce: Duration,
+    /// Force a run once the pending window has been open this long, regardless
+    /// of ongoing debounce re-arming (FT-M6).
+    max_defer: Duration,
     /// Consecutive all-crash failures. After MAX_FAILURES the scheduler backs off
     /// until the daemon is restarted, preventing an infinite crash-retry loop when
     /// all Phase B sidecars are broken (e.g. tools not installed).
@@ -35,14 +48,23 @@ pub struct PhaseBScheduler {
 
 impl PhaseBScheduler {
     const MAX_FAILURES: u32 = 3;
+    /// Default ceiling when constructed via `new`. 10× the 30 s debounce.
+    const DEFAULT_MAX_DEFER: Duration = Duration::from_secs(300);
 }
 
 impl PhaseBScheduler {
     pub fn new(debounce: Duration) -> Self {
+        Self::with_max_defer(debounce, Self::DEFAULT_MAX_DEFER)
+    }
+
+    /// Explicit ceiling, used by FT-M6 tests to exercise the starvation guard
+    /// deterministically without waiting 300 s.
+    pub fn with_max_defer(debounce: Duration, max_defer: Duration) -> Self {
         Self {
             dirty: Mutex::new(None),
             running: AtomicBool::new(false),
             debounce,
+            max_defer,
             consecutive_failures: AtomicU32::new(0),
         }
     }
@@ -55,12 +77,22 @@ impl PhaseBScheduler {
     }
 
     /// Arm (or re-arm) a re-run for `debounce` from now. Called after a
-    /// commit-triggered reindex. Re-arming intentionally pushes the deadline
-    /// forward so that a rapid series of commits triggers a single run once the
-    /// activity settles.
+    /// commit-triggered reindex. Re-arming pushes `deadline` forward so a burst
+    /// of commits settles into one run, but keeps `first_arm` fixed so a fast
+    /// commit stream cannot defer Phase B past `max_defer` (FT-M6).
     pub fn mark_dirty(&self) {
+        let now = Instant::now();
         let mut d = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        *d = Some(Instant::now() + self.debounce);
+        match d.as_mut() {
+            // Re-arm: push debounce deadline, KEEP first_arm (ceiling anchor).
+            Some(st) => st.deadline = now + self.debounce,
+            None => {
+                *d = Some(DirtyState {
+                    deadline: now + self.debounce,
+                    first_arm: now,
+                })
+            }
+        }
     }
 
     /// Arm for an immediate run with no debounce. Used by `phase_b_tick` on
@@ -69,17 +101,20 @@ impl PhaseBScheduler {
     /// never interferes with a commit-triggered debounce window that is already
     /// counting down.
     pub fn arm_immediate(&self) {
+        let now = Instant::now();
         let mut d = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
         if d.is_none() {
-            // Set deadline in the past so the next try_claim() fires immediately.
-            *d = Some(Instant::now());
+            *d = Some(DirtyState {
+                deadline: now,
+                first_arm: now,
+            });
         }
     }
 
-    /// If a run is due (armed and past its deadline) and none is in flight,
-    /// atomically claim the run slot and consume the pending mark. Returns
-    /// `true` iff the caller should start a background run; the caller MUST call
-    /// [`finish`](Self::finish) when that run completes.
+    /// If a run is due (armed and past its deadline OR past max_defer) and none
+    /// is in flight, atomically claim the run slot and consume the pending mark.
+    /// Returns `true` iff the caller should start a background run; the caller
+    /// MUST call [`finish`](Self::finish) when that run completes.
     ///
     /// `now` is injectable for deterministic tests; production callers pass
     /// `Instant::now()` via [`try_claim`](Self::try_claim).
@@ -89,7 +124,12 @@ impl PhaseBScheduler {
             return false;
         }
         let mut d = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        let due = matches!(*d, Some(deadline) if now >= deadline);
+        let due = match *d {
+            Some(st) => {
+                now >= st.deadline || now.saturating_duration_since(st.first_arm) >= self.max_defer
+            }
+            None => false,
+        };
         if !due {
             return false;
         }
@@ -100,7 +140,7 @@ impl PhaseBScheduler {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            *d = None;
+            *d = None; // consumes the mark → first_arm resets on next mark_dirty
             true
         } else {
             false
@@ -242,5 +282,51 @@ mod tests {
         s.reset_failures();
         s.mark_dirty();
         assert!(s.try_claim(), "must be claimable after reset_failures");
+    }
+
+    // ── TC-FT-M6: max-staleness ceiling ──────────────────────────────────────
+
+    #[test]
+    fn ceiling_forces_run_despite_continuous_rearm() {
+        // debounce=30s, max_defer=100s. Directly inject DirtyState so first_arm
+        // and deadline are both anchored to t0 (avoids wall-clock vs virtual-time
+        // mismatch that arises when mark_dirty() captures its own Instant::now()).
+        let s = PhaseBScheduler::with_max_defer(Duration::from_secs(30), Duration::from_secs(100));
+        let t0 = Instant::now();
+        // Simulate: first armed at t0, then re-armed to push deadline to t0+129s.
+        *s.dirty.lock().unwrap() = Some(DirtyState {
+            deadline: t0 + Duration::from_secs(129),
+            first_arm: t0,
+        });
+        // At t0+99s: deadline not hit (99 < 129), ceiling not hit (99 < 100).
+        assert!(!s.try_claim_at(t0 + Duration::from_secs(99)));
+        // At t0+100s: ceiling fires (elapsed from first_arm == max_defer).
+        assert!(s.try_claim_at(t0 + Duration::from_secs(100)));
+    }
+
+    #[test]
+    fn first_arm_resets_after_claim() {
+        // After a ceiling-forced claim+finish, the next mark opens a fresh window
+        // whose ceiling is measured from its own first_arm, not the old one.
+        let s = PhaseBScheduler::with_max_defer(Duration::from_secs(30), Duration::from_secs(100));
+        let t0 = Instant::now();
+        // First window: first_arm=t0, deadline=t0+129s.
+        *s.dirty.lock().unwrap() = Some(DirtyState {
+            deadline: t0 + Duration::from_secs(129),
+            first_arm: t0,
+        });
+        assert!(s.try_claim_at(t0 + Duration::from_secs(100)));
+        s.finish();
+        // Second window: first_arm=t1, deadline=t1+30s. Inject directly so the
+        // virtual t1 is precisely t0+105s.
+        let t1 = t0 + Duration::from_secs(105);
+        *s.dirty.lock().unwrap() = Some(DirtyState {
+            deadline: t1 + Duration::from_secs(30),
+            first_arm: t1,
+        });
+        // At t1+29s: debounce not hit (29 < 30), ceiling not hit (29 < 100).
+        assert!(!s.try_claim_at(t1 + Duration::from_secs(29)));
+        // At t1+100s: ceiling fires on the new window.
+        assert!(s.try_claim_at(t1 + Duration::from_secs(100)));
     }
 }
