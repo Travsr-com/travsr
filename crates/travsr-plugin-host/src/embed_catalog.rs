@@ -10,8 +10,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
+
+use crate::stderr_ring::StderrRing;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -64,6 +66,62 @@ fn count_model_embeddings(embed_db_path: &Path, model_id: &str) -> Option<u64> {
 /// Prevents Phase1/Phase2/post-commit from launching ≥2 reindex sidecars that
 /// write to the same embed.db concurrently (no temp-db isolation in RFC-021).
 static REINDEX_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII reset for the process-level single-flight guard (FT-M4).
+///
+/// Holding one of these keeps REINDEX_IN_FLIGHT = true; dropping it — on normal
+/// return, `?`, an early `return`, OR a panic unwinding out of the reindex
+/// closure — resets the flag. This replaces the hand-written tail `store(false)`
+/// which a panic in `run_parallel_reindex` would skip, permanently wedging all
+/// future reindex passes.
+struct ReindexInFlightGuard;
+
+impl ReindexInFlightGuard {
+    /// Claim the single-flight slot. `None` if a reindex is already running.
+    fn try_acquire() -> Option<Self> {
+        REINDEX_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| ReindexInFlightGuard)
+    }
+}
+
+impl Drop for ReindexInFlightGuard {
+    fn drop(&mut self) {
+        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+/// OS PID of the in-flight reindex sidecar, or 0 when none is running (L8).
+/// Set immediately after spawn; cleared (RAII) on any exit path of
+/// `run_parallel_reindex`. Read by `terminate_inflight_reindex()` at daemon
+/// shutdown to SIGTERM an otherwise-orphaned sidecar.
+static REINDEX_CHILD_PID: AtomicU32 = AtomicU32::new(0);
+
+/// RAII: clears REINDEX_CHILD_PID on drop so a panic/`?`/return inside the
+/// reindex loop never leaves a stale PID that a later shutdown would kill by
+/// mistake (PID reuse).
+struct ReindexPidGuard;
+
+impl Drop for ReindexPidGuard {
+    fn drop(&mut self) {
+        REINDEX_CHILD_PID.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Best-effort terminate an in-flight reindex sidecar. Called from the daemon
+/// shutdown path (L8). No-op when no reindex is running.
+pub fn terminate_inflight_reindex() {
+    let pid = REINDEX_CHILD_PID.load(Ordering::SeqCst);
+    if pid != 0 {
+        tracing::info!(
+            pid,
+            "terminating in-flight embed reindex sidecar on shutdown"
+        );
+        crate::watchdog::kill_pid(pid);
+        REINDEX_CHILD_PID.store(0, Ordering::SeqCst);
+    }
+}
 
 /// Memory overhead per reader thread inside the sidecar (batch buffers, tokenizer state).
 /// The model weights are loaded ONCE by the single sidecar (RFC-021), so only this
@@ -699,9 +757,9 @@ fn run_parallel_reindex(
         .arg("--parallel")
         .arg(n.to_string())
         .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    // Suppress sidecar stdout when the caller renders its own progress UI
-    // (e.g. `travsr embed init`). Background daemon paths leave it inherited.
+        .stderr(Stdio::piped()); // FT-M2: capture for error surfacing
+                                 // Suppress sidecar stdout when the caller renders its own progress UI
+                                 // (e.g. `travsr embed init`). Background daemon paths leave it inherited.
     if quiet {
         cmd.stdout(Stdio::null());
     }
@@ -727,6 +785,18 @@ fn run_parallel_reindex(
             return Err(anyhow::Error::from(e).context("failed to spawn embed sidecar"));
         }
     };
+    // L8: register PID so the daemon shutdown path can SIGTERM this sidecar
+    // instead of orphaning it. Cleared by ReindexPidGuard on every exit path.
+    REINDEX_CHILD_PID.store(child.id(), Ordering::SeqCst);
+    let _pid_guard = ReindexPidGuard; // clears PID on return, `?`, or panic
+
+    // FT-M2: capture sidecar stderr so model-load errors are surfaced on failure.
+    let stderr_ring = if let Some(stderr) = child.stderr.take() {
+        StderrRing::spawn(stderr)
+    } else {
+        StderrRing::spawn_empty()
+    };
+
     // No-progress watchdog: only kill the sidecar when the embed.db row count
     // for this model has not grown for NO_PROGRESS_SECS. A healthy sidecar that
     // keeps writing is never killed, so large repos are no longer capped by a
@@ -742,8 +812,9 @@ fn run_parallel_reindex(
                 return Ok(());
             }
             Ok(Some(s)) => {
-                tracing::warn!(exit = ?s.code(), "embed: sidecar exited with failure");
-                anyhow::bail!("embed sidecar exited with code {:?}", s.code());
+                let tail = stderr_ring.tail();
+                tracing::warn!(exit = ?s.code(), stderr = %tail, "embed: sidecar exited with failure");
+                anyhow::bail!("embed sidecar exited with code {:?}: {tail}", s.code());
             }
             Ok(None) => {
                 let now = std::time::Instant::now();
@@ -759,30 +830,36 @@ fn run_parallel_reindex(
 
                 let stalled = now.duration_since(last_progress).as_secs();
                 if stalled >= NO_PROGRESS_SECS {
+                    let tail = stderr_ring.tail();
                     tracing::warn!(
                         stalled_secs = stalled,
                         embedded = last_count,
+                        stderr = %tail,
                         "embed: reindex sidecar made no progress — killing"
                     );
                     let _ = child.kill();
                     let _ = child.wait();
                     anyhow::bail!(
                         "embed sidecar stalled: no new embeddings for {stalled}s \
-                         (stuck at {last_count})"
+                         (stuck at {last_count}): {tail}"
                     );
                 }
 
                 if let Some(ceiling) = hard_ceiling {
                     let elapsed = now.duration_since(start).as_secs();
                     if elapsed >= ceiling {
+                        let tail = stderr_ring.tail();
                         tracing::warn!(
                             ceiling_secs = ceiling,
                             embedded = last_count,
+                            stderr = %tail,
                             "embed: reindex sidecar hit hard wall-clock ceiling — killing"
                         );
                         let _ = child.kill();
                         let _ = child.wait();
-                        anyhow::bail!("embed sidecar reindex exceeded hard ceiling of {ceiling}s");
+                        anyhow::bail!(
+                            "embed sidecar reindex exceeded hard ceiling of {ceiling}s: {tail}"
+                        );
                     }
                 }
 
@@ -813,31 +890,26 @@ pub fn embed_reindex_in_flight() -> bool {
 /// centrality. This ensures Phase 1 completes in a few minutes regardless of
 /// repo size while always embedding the structurally most important nodes first.
 pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
-    // FT-H1: single-flight guard — skip if another reindex is already running.
-    if REINDEX_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(guard) = ReindexInFlightGuard::try_acquire() else {
         tracing::debug!("embed Phase 1: reindex already in-flight — skipping");
         return false;
-    }
+    };
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
-        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
-        return false;
+        return false; // guard drops here → flag reset
     };
     let Some(threshold) = derive_phase1_threshold(db_path, PHASE1_COVERAGE_FRACTION) else {
-        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         tracing::warn!(
             db = %db_path.display(),
             "embed Phase 1: k-core data not ready — skipping (will retry after next Phase B)"
         );
-        return false;
+        return false; // guard drops here → flag reset
     };
     tracing::info!(threshold, "embed Phase 1: derived shell_number threshold");
     let db_path = db_path.to_path_buf();
     std::thread::Builder::new()
         .name("embed-reindex-phase1".into())
         .spawn(move || {
+            let _guard = guard; // moved in; drops on return OR panic → flag reset
             if let Err(e) = run_parallel_reindex(
                 &bin_path,
                 &db_path,
@@ -848,7 +920,6 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
             ) {
                 tracing::warn!("embed Phase 1 failed: {e:#}");
             }
-            REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         })
         .is_ok()
 }
@@ -859,17 +930,12 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
 /// Uses the same threshold derivation as Phase 1 so the two phases are
 /// complementary and together cover all symbol nodes.
 pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
-    // FT-H1: single-flight guard.
-    if REINDEX_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(guard) = ReindexInFlightGuard::try_acquire() else {
         tracing::debug!("embed Phase 2: reindex already in-flight — skipping");
         return false;
-    }
+    };
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
-        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
-        return false;
+        return false; // guard drops here → flag reset
     };
     // Derive same threshold as Phase 1 for complementary coverage.
     // If k-core data is missing, fall back to embedding all remaining nodes.
@@ -887,12 +953,12 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
     std::thread::Builder::new()
         .name("embed-reindex-phase2".into())
         .spawn(move || {
+            let _guard = guard; // moved in; drops on return OR panic → flag reset
             if let Err(e) =
                 run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase, false)
             {
                 tracing::warn!("embed Phase 2 failed: {e:#}");
             }
-            REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         })
         .is_ok()
 }
@@ -900,22 +966,18 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
 /// Spawn reindex for all pending nodes (used after Phase B completes)
 /// as a detached background thread. Returns true if launched.
 pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
-    // FT-H1: single-flight guard.
-    if REINDEX_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let Some(guard) = ReindexInFlightGuard::try_acquire() else {
         tracing::debug!("embed reindex-all: reindex already in-flight — skipping");
         return false;
-    }
+    };
     let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
-        REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
-        return false;
+        return false; // guard drops here → flag reset
     };
     let db_path = db_path.to_path_buf();
     std::thread::Builder::new()
         .name("embed-reindex-all".into())
         .spawn(move || {
+            let _guard = guard; // moved in; drops on return OR panic → flag reset
             if let Err(e) = run_parallel_reindex(
                 &bin_path,
                 &db_path,
@@ -926,7 +988,6 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
             ) {
                 tracing::warn!("embed reindex-all failed: {e:#}");
             }
-            REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
         })
         .is_ok()
 }
@@ -1101,6 +1162,70 @@ mod tests {
     use super::*;
 
     // ── TC-00: catalog invariants ─────────────────────────────────────────────
+
+    // ── TC-L8: in-flight PID guard ───────────────────────────────────────────
+
+    #[test]
+    fn terminate_inflight_reindex_is_noop_when_idle() {
+        // PID is 0 → no panic, no kill attempt.
+        REINDEX_CHILD_PID.store(0, Ordering::SeqCst);
+        terminate_inflight_reindex(); // must not panic
+        assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reindex_pid_guard_clears_pid() {
+        REINDEX_CHILD_PID.store(12345, Ordering::SeqCst);
+        let guard = ReindexPidGuard;
+        assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 12345);
+        drop(guard);
+        assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 0);
+    }
+
+    // ── TC-FT-M4: RAII single-flight guard ───────────────────────────────────
+
+    #[test]
+    fn reindex_guard_resets_flag_on_drop() {
+        // Acquire then drop; flag must return to false.
+        let guard = ReindexInFlightGuard::try_acquire().expect("flag should be free");
+        assert!(
+            REINDEX_IN_FLIGHT.load(Ordering::SeqCst),
+            "flag must be true while held"
+        );
+        drop(guard);
+        assert!(
+            !REINDEX_IN_FLIGHT.load(Ordering::SeqCst),
+            "flag must reset on drop"
+        );
+    }
+
+    #[test]
+    fn reindex_guard_is_single_flight() {
+        let g1 = ReindexInFlightGuard::try_acquire().expect("first acquire");
+        assert!(
+            ReindexInFlightGuard::try_acquire().is_none(),
+            "second acquire must fail while first is held"
+        );
+        drop(g1);
+        let g2 = ReindexInFlightGuard::try_acquire();
+        assert!(g2.is_some(), "acquire must succeed after first is dropped");
+        drop(g2);
+    }
+
+    #[test]
+    fn reindex_guard_resets_on_panic() {
+        // Regression for FT-M4: a panic inside the reindex closure must not leave
+        // REINDEX_IN_FLIGHT permanently set.
+        let handle = std::thread::spawn(|| {
+            let _guard = ReindexInFlightGuard::try_acquire().expect("should acquire");
+            panic!("simulated reindex panic");
+        });
+        let _ = handle.join(); // expect Err (panicked)
+        assert!(
+            !REINDEX_IN_FLIGHT.load(Ordering::SeqCst),
+            "flag must reset after panic-induced drop"
+        );
+    }
 
     #[test]
     fn catalog_ids_are_unique() {

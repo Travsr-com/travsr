@@ -2793,7 +2793,7 @@ impl Daemon {
 
         // Control socket bound AFTER watcher scan completes (see above).
         #[cfg(unix)]
-        let listener = UnixListener::bind(&sock_path).context("binding control socket")?;
+        let mut listener = UnixListener::bind(&sock_path).context("binding control socket")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3007,6 +3007,28 @@ impl Daemon {
                             );
                             std::process::exit(0);
                         }
+                        // M9: .travsr is in SKIP_DIRS so the watcher never sees a
+                        // socket deletion. Poll here (same 5 s tick) and re-bind if
+                        // the control socket vanished, so the daemon self-heals into
+                        // reachability instead of running blind.
+                        #[cfg(unix)]
+                        if !sock_path.exists() {
+                            let _ = std::fs::remove_file(&sock_path);
+                            match tokio::net::UnixListener::bind(&sock_path) {
+                                Ok(l) => {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let _ = std::fs::set_permissions(
+                                        &sock_path,
+                                        std::fs::Permissions::from_mode(0o600),
+                                    );
+                                    listener = l;
+                                    tracing::warn!(sock = %sock_path.display(),
+                                        "control socket was missing — re-bound");
+                                }
+                                Err(e) => tracing::warn!(sock = %sock_path.display(),
+                                    "control socket missing and re-bind failed: {e} — retrying next tick"),
+                            }
+                        }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
                         // restarted after a crash mid-Phase-B).
                         arm_phase_b_if_pending(&store, &phase_b_scheduler);
@@ -3122,6 +3144,9 @@ impl Daemon {
         //    30s is generous; in practice the worker exits in milliseconds once
         //    index_tx is dropped.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(30), indexer_worker).await;
+
+        // L8: SIGTERM any in-flight embed reindex sidecar so it is not orphaned.
+        travsr_plugin_host::terminate_inflight_reindex();
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
