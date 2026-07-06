@@ -3304,6 +3304,27 @@ fn handle_control_message(
             (ControlResponse::ok(Some(msg)), false)
         }
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
+        // WS3 (#420): pause auto-reindex and gracefully cancel any in-flight run.
+        Ok(ControlMessage::StopEmbed) => {
+            tracing::info!("control: stop-embed — pausing auto-reindex + cancelling in-flight");
+            travsr_plugin_host::pause_embed();
+            let was_running = travsr_plugin_host::embed_reindex_in_flight();
+            travsr_plugin_host::terminate_inflight_reindex();
+            let msg = if was_running {
+                "embed auto-reindex paused; in-flight reindex cancelled (partial embeddings preserved)"
+            } else {
+                "embed auto-reindex paused (nothing was running)"
+            };
+            (ControlResponse::ok(Some(msg.to_string())), false)
+        }
+        Ok(ControlMessage::ResumeEmbed) => {
+            tracing::info!("control: resume-embed — clearing auto-reindex pause");
+            travsr_plugin_host::resume_embed();
+            (
+                ControlResponse::ok(Some("embed auto-reindex resumed".to_string())),
+                false,
+            )
+        }
         // #318 O1: read-only CLI queries served from the daemon's warm store —
         // skips the per-command store open that dominates CLI latency.
         Ok(ControlMessage::Query {

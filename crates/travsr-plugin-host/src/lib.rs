@@ -24,9 +24,10 @@ mod watchdog;
 
 pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
-    active_backend_id, backends as embed_backends, derive_num_workers_for_cli,
-    derive_phase1_threshold_for_status, embed_reindex_in_flight, lookup as lookup_embed_backend,
-    probe_top1_cosines, repo_backend_id, resolve_governance_for_db, run_parallel_reindex_blocking,
+    active_backend_id, backends as embed_backends, cancel_sentinel_path,
+    derive_num_workers_for_cli, derive_phase1_threshold_for_status, embed_paused,
+    embed_reindex_in_flight, lookup as lookup_embed_backend, pause_embed, probe_top1_cosines,
+    repo_backend_id, resolve_governance_for_db, resume_embed, run_parallel_reindex_blocking,
     run_parallel_reindex_blocking_quiet, spawn_background_reindex_all,
     spawn_background_reindex_phase1, spawn_background_reindex_phase2, terminate_inflight_reindex,
     write_model_descriptor, write_repo_backend_id, EmbedBackend, EmbedModelFile, MAX_EMBED_WORKERS,

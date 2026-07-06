@@ -88,6 +88,8 @@ base64           = "0.22"
 tokio-util       = { version = "0.7", features = ["rt"] }
 tokio-stream     = "0.1"
 fs2              = "0.4"
+# SIGINT/Ctrl-C handler for graceful foreground reindex cancel (WS3).
+ctrlc            = "3"
 tracing-appender = "0.2"
 # Pin cxx-build to match cxx — both must be the same version or kuzu's
 # C++ bridge symbols are undefined at link time (cxx-build 1.0.194 breaks

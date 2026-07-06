@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::governance::{self, EmbedOverrides};
@@ -110,17 +111,160 @@ impl Drop for ReindexPidGuard {
     }
 }
 
-/// Best-effort terminate an in-flight reindex sidecar. Called from the daemon
-/// shutdown path (L8). No-op when no reindex is running.
+/// WS3 (#420): when true, the daemon's `spawn_background_reindex_*` chokepoints
+/// refuse to launch a new reindex. Set by `stop-embed`, cleared by `resume-embed`.
+/// In-memory for the daemon's lifetime (§4.5) — a restart resumes normal behavior.
+static EMBED_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// WS3: absolute path of the cancel sentinel for the in-flight reindex, set at
+/// spawn time in `run_parallel_reindex`. `terminate_inflight_reindex` reads it to
+/// signal a graceful drain. `None` when no reindex has ever run this process.
+static REINDEX_SENTINEL_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// WS3: grace window the daemon waits for the sidecar to drain and exit after the
+/// cancel sentinel is written, before falling back to a hard kill (E1/H4).
+const CANCEL_GRACE_SECS: u64 = 10;
+
+/// RAII: clears `REINDEX_SENTINEL_PATH` and removes the sentinel file on every
+/// exit path of `run_parallel_reindex`, so a stale path/file never leaks to the
+/// next run (E5). Best-effort removal — the sidecar already deletes it on cancel.
+struct SentinelGuard;
+impl Drop for SentinelGuard {
+    fn drop(&mut self) {
+        if let Some(p) = REINDEX_SENTINEL_PATH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Pause the daemon's auto-reindex (WS3 `stop-embed`).
+pub fn pause_embed() {
+    EMBED_PAUSED.store(true, Ordering::SeqCst);
+}
+
+/// Resume the daemon's auto-reindex (WS3 `resume-embed`).
+pub fn resume_embed() {
+    EMBED_PAUSED.store(false, Ordering::SeqCst);
+}
+
+/// True while auto-reindex is paused by `stop-embed`.
+pub fn embed_paused() -> bool {
+    EMBED_PAUSED.load(Ordering::SeqCst)
+}
+
+/// Cancel sentinel path co-located with graph.db: `<repo>/.travsr/embed.cancel`.
+/// `db_path` is `<repo>/.travsr/graph.db`, so the sentinel is its sibling. Both
+/// the sidecar (which polls it) and the terminate path (which writes it) agree on
+/// this convention, so no extra plumbing is needed for the CLI-with-no-daemon case.
+pub fn cancel_sentinel_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(|d| d.join("embed.cancel"))
+        .unwrap_or_else(|| PathBuf::from("embed.cancel"))
+}
+
+/// Feature-probe whether the installed sidecar understands `--cancel-sentinel`.
+/// Runs `<bin> --version` (added in travsr-embed 1.1.0) with a short deadline; an
+/// old sidecar prints nothing parseable → we return false and fall back to a hard
+/// kill on cancel (F5/H4). Best-effort: any probe failure is treated as "no".
+fn sidecar_supports_cancel(bin_path: &Path) -> bool {
+    // First release with `--cancel-sentinel`.
+    const MIN_MAJOR: u64 = 1;
+    const MIN_MINOR: u64 = 1;
+    let Ok(out) = Command::new(bin_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Expected form: "travsr-embed <MAJOR>.<MINOR>.<PATCH>".
+    let Some(ver) = text.split_whitespace().last() else {
+        return false;
+    };
+    let mut parts = ver.split('.').filter_map(|p| p.parse::<u64>().ok());
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    (major, minor) >= (MIN_MAJOR, MIN_MINOR)
+}
+
+/// True if a process with `pid` is currently alive (no signal sent).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    // Windows falls straight through to `kill_pid` (taskkill /F) — no grace poll.
+    false
+}
+
+/// Gracefully cancel an in-flight reindex sidecar, else best-effort terminate it.
+///
+/// Called from the daemon shutdown path (L8) and from `stop-embed` (WS3 B4).
+/// Writes the cancel sentinel so a cancel-aware sidecar drains its in-flight batch
+/// and exits 0 (embedded rows preserved); polls up to [`CANCEL_GRACE_SECS`] for it
+/// to exit, then falls back to `kill_pid` (SIGTERM/taskkill) for an old or wedged
+/// sidecar. No-op when no reindex is running.
 pub fn terminate_inflight_reindex() {
     let pid = REINDEX_CHILD_PID.load(Ordering::SeqCst);
-    if pid != 0 {
-        tracing::info!(
-            pid,
-            "terminating in-flight embed reindex sidecar on shutdown"
-        );
+    if pid == 0 {
+        return; // idempotent: nothing running (E6)
+    }
+    let sentinel = REINDEX_SENTINEL_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    if let Some(ref path) = sentinel {
+        tracing::info!(pid, sentinel = %path.display(), "embed: writing cancel sentinel — graceful drain");
+        // Empty marker file; the sidecar polls for its existence.
+        if let Err(e) = std::fs::write(path, b"") {
+            tracing::warn!(err = %e, "embed: failed to write cancel sentinel — will hard-kill");
+        } else {
+            // Grace poll: wait for the sidecar (any spawn surface clears
+            // REINDEX_CHILD_PID via ReindexPidGuard on exit) to drain and exit.
+            let deadline = std::time::Instant::now() + Duration::from_secs(CANCEL_GRACE_SECS);
+            while std::time::Instant::now() < deadline {
+                if REINDEX_CHILD_PID.load(Ordering::SeqCst) == 0 || !pid_alive(pid) {
+                    tracing::info!(pid, "embed: reindex drained gracefully after cancel");
+                    let _ = std::fs::remove_file(path);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            tracing::warn!(
+                pid,
+                grace_secs = CANCEL_GRACE_SECS,
+                "embed: sidecar did not drain within grace window — force-killing"
+            );
+        }
+    }
+
+    // Fallback / no sentinel: hard terminate.
+    if pid_alive(pid) {
+        tracing::info!(pid, "terminating in-flight embed reindex sidecar");
         crate::watchdog::kill_pid(pid);
-        REINDEX_CHILD_PID.store(0, Ordering::SeqCst);
+    }
+    REINDEX_CHILD_PID.store(0, Ordering::SeqCst);
+    if let Some(path) = sentinel {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -774,6 +918,18 @@ fn run_parallel_reindex(
     let n = derive_num_workers(model_ram_mb, gov.max_workers.value, gov.capacity_fraction());
     let priority = gov.priority.value;
 
+    // WS3: set up the graceful-cancel sentinel. Remove any stale sentinel from a
+    // prior crashed run so it cannot cancel this one on sight, record the path so
+    // `terminate_inflight_reindex` can signal us, and pass it to the sidecar only
+    // when it is new enough to understand the flag (else force-kill fallback, H4).
+    let sentinel_path = cancel_sentinel_path(db_path);
+    let _ = std::fs::remove_file(&sentinel_path);
+    *REINDEX_SENTINEL_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(sentinel_path.clone());
+    let _sentinel_guard = SentinelGuard;
+    let cancel_supported = sidecar_supports_cancel(bin_path);
+
     let mut cmd = priority.reindex_command(bin_path);
     cmd.arg("--model-id")
         .arg(model_id)
@@ -791,6 +947,10 @@ fn run_parallel_reindex(
         cmd.stdout(Stdio::null());
     }
 
+    if cancel_supported {
+        cmd.arg("--cancel-sentinel").arg(&sentinel_path);
+    }
+
     if let Some((flag, val)) = phase.sidecar_flag() {
         cmd.arg(flag).arg(val.to_string());
     }
@@ -802,6 +962,7 @@ fn run_parallel_reindex(
         capacity_src = gov.capacity.source.label(),
         max_workers = ?gov.max_workers.value,
         priority = priority.as_str(),
+        cancel_supported,
         "embed: spawning sidecar (single model, {} reader threads)",
         n
     );
@@ -849,6 +1010,13 @@ fn run_parallel_reindex(
             }
             Ok(None) => {
                 let now = std::time::Instant::now();
+
+                // WS3 (E4): while a cancel is draining, treat it as progress so the
+                // no-progress watchdog cannot force-kill the sidecar while it commits
+                // its final batch. The grace window is enforced by the terminate path.
+                if sentinel_path.exists() {
+                    last_progress = now;
+                }
 
                 // Observe progress. An unreadable count (None) is treated as "no
                 // observation" — it neither resets nor trips the watchdog.
@@ -921,6 +1089,10 @@ pub fn embed_reindex_in_flight() -> bool {
 /// centrality. This ensures Phase 1 completes in a few minutes regardless of
 /// repo size while always embedding the structurally most important nodes first.
 pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
+    if embed_paused() {
+        tracing::debug!("embed Phase 1: auto-reindex paused (stop-embed) — skipping");
+        return false;
+    }
     let Some(guard) = ReindexInFlightGuard::try_acquire() else {
         tracing::debug!("embed Phase 1: reindex already in-flight — skipping");
         return false;
@@ -962,6 +1134,10 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
 /// Uses the same threshold derivation as Phase 1 so the two phases are
 /// complementary and together cover all symbol nodes.
 pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
+    if embed_paused() {
+        tracing::debug!("embed Phase 2: auto-reindex paused (stop-embed) — skipping");
+        return false;
+    }
     let Some(guard) = ReindexInFlightGuard::try_acquire() else {
         tracing::debug!("embed Phase 2: reindex already in-flight — skipping");
         return false;
@@ -1004,6 +1180,10 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
 /// Spawn reindex for all pending nodes (used after Phase B completes)
 /// as a detached background thread. Returns true if launched.
 pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
+    if embed_paused() {
+        tracing::debug!("embed reindex-all: auto-reindex paused (stop-embed) — skipping");
+        return false;
+    }
     let Some(guard) = ReindexInFlightGuard::try_acquire() else {
         tracing::debug!("embed reindex-all: reindex already in-flight — skipping");
         return false;

@@ -21,6 +21,25 @@ use crate::progress::Palette;
 const EMBED_RELEASES_BASE: &str = "https://github.com";
 const HF_BASE: &str = "https://huggingface.co";
 
+/// WS3 (B3): process-wide flag set by the Ctrl-C handler during a foreground
+/// reindex. Read after the sidecar drains so we skip calibration (E3) and report
+/// "cancelled" rather than "complete".
+static REINDEX_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn Ctrl-C into a graceful reindex cancel: write the cancel sentinel — the
+/// sidecar drains its in-flight batch, commits, and exits 0 — and record that we
+/// cancelled. The `embed.lock` flock and single-flight guard release on the normal
+/// return path once the sidecar exits, so no orphan survives (E5). Best-effort and
+/// idempotent: a second install in the same process (init then reindex) is ignored.
+fn install_reindex_cancel_handler(db_path: &Path) {
+    let sentinel = travsr_plugin_host::cancel_sentinel_path(db_path);
+    let _ = ctrlc::set_handler(move || {
+        eprintln!("\n^C — cancelling reindex (finishing current batch)...");
+        let _ = std::fs::write(&sentinel, b"");
+        REINDEX_CANCELLED.store(true, Ordering::SeqCst);
+    });
+}
+
 /// CLI spelling of `travsr_plugin_host::Priority` (keeps clap out of plugin-host).
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum PriorityArg {
@@ -527,6 +546,9 @@ fn reindex_after_init(backend: &'static EmbedBackend, db_path: &Path) -> Result<
         tracing::warn!("embed_text regen check failed (non-fatal): {e}");
     }
 
+    // B3: Ctrl-C during the post-init reindex cancels gracefully, no orphan sidecar.
+    install_reindex_cancel_handler(db_path);
+
     // Init has no CLI capacity flags; honour config + env via default overrides.
     run_reindex_with_progress(
         db_path,
@@ -715,9 +737,19 @@ fn cmd_reindex(
         prio_note,
     );
 
+    // B3: Ctrl-C now gracefully cancels this foreground reindex.
+    install_reindex_cancel_handler(&db_path);
+
     // RFC-020: delegate to the parallel orchestrator with a live progress bar.
     run_reindex_with_progress(&db_path, phase1, &overrides)?;
 
+    if REINDEX_CANCELLED.load(Ordering::SeqCst) {
+        println!(
+            "\u{2717} Reindex cancelled \u{2014} partial embeddings preserved. \
+             Run `travsr embed reindex` to resume and make them searchable."
+        );
+        return Ok(());
+    }
     println!("\u{2713} Reindex complete.");
     Ok(())
 }
@@ -769,6 +801,13 @@ fn run_reindex_with_progress(
         let _ = m.join();
     }
     result.context("parallel reindex failed")?;
+
+    // WS3 (E3): on a cancelled reindex the index is a partial set (fast-stop) — skip
+    // calibration and keep the prior anchors rather than measuring against a
+    // half-built corpus.
+    if REINDEX_CANCELLED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
 
     // Auto-calibrate the model-relative semantic floors on the freshly-built index.
     // Best-effort: a calibration failure must never fail the reindex.
