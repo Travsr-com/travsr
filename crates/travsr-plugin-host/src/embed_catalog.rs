@@ -958,7 +958,7 @@ fn run_parallel_reindex(
     tracing::info!(
         n,
         phase = ?phase,
-        capacity_pct = gov.capacity.value,
+        capacity = %gov.capacity.value.label(),
         capacity_src = gov.capacity.source.label(),
         max_workers = ?gov.max_workers.value,
         priority = priority.as_str(),

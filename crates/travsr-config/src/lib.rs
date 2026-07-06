@@ -119,10 +119,11 @@ pub struct KeySpec {
 pub static KEYS: &[KeySpec] = &[
     KeySpec {
         key: "embed.capacity",
-        description: "Percent of derived embedding workers to use (1-100). 100 = full speed.",
+        description:
+            "Embedding worker budget: `auto` (load-adaptive) or a percent 1-100. 100 = full speed.",
         env: Some("TRAVSR_EMBED_CAPACITY"),
         default_display: "100",
-        validate: validate_percent,
+        validate: validate_capacity,
     },
     KeySpec {
         key: "embed.max_workers",
@@ -145,13 +146,19 @@ pub fn spec(key: &str) -> Option<&'static KeySpec> {
     KEYS.iter().find(|k| k.key == key)
 }
 
-fn validate_percent(s: &str) -> Result<toml::Value> {
-    let n: i64 = s
-        .trim()
+/// Capacity accepts the adaptive sentinel `auto` or an integer percent 1-100.
+/// `auto` is stored verbatim; the reindex path resolves it to a load-adjusted
+/// worker count at each spawn (WS5).
+fn validate_capacity(s: &str) -> Result<toml::Value> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Ok(toml::Value::String("auto".to_string()));
+    }
+    let n: i64 = t
         .parse()
-        .map_err(|_| anyhow::anyhow!("expected an integer 1-100, got '{s}'"))?;
+        .map_err(|_| anyhow::anyhow!("expected `auto` or an integer 1-100, got '{s}'"))?;
     if !(1..=100).contains(&n) {
-        bail!("capacity must be between 1 and 100 (percent), got {n}");
+        bail!("capacity must be `auto` or between 1 and 100 (percent), got {n}");
     }
     Ok(toml::Value::Integer(n))
 }
@@ -399,14 +406,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_percent_bounds() {
-        assert!(validate_percent("50").is_ok());
-        assert!(validate_percent("1").is_ok());
-        assert!(validate_percent("100").is_ok());
-        assert!(validate_percent("0").is_err());
-        assert!(validate_percent("101").is_err());
-        assert!(validate_percent("-5").is_err());
-        assert!(validate_percent("abc").is_err());
+    fn validate_capacity_bounds_and_auto() {
+        assert!(validate_capacity("50").is_ok());
+        assert!(validate_capacity("1").is_ok());
+        assert!(validate_capacity("100").is_ok());
+        assert!(validate_capacity("auto").is_ok());
+        assert!(validate_capacity("AUTO").is_ok());
+        assert_eq!(
+            validate_capacity("auto").unwrap(),
+            toml::Value::String("auto".into())
+        );
+        assert!(validate_capacity("0").is_err());
+        assert!(validate_capacity("101").is_err());
+        assert!(validate_capacity("-5").is_err());
+        assert!(validate_capacity("abc").is_err());
     }
 
     #[test]

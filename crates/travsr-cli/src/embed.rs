@@ -58,6 +58,13 @@ impl From<PriorityArg> for travsr_plugin_host::Priority {
     }
 }
 
+/// Clap parser for `--capacity <auto|1-100>`. Accepts the adaptive `auto`
+/// sentinel (WS5) or a percent, matching the `embed.capacity` config validator.
+fn parse_capacity(s: &str) -> std::result::Result<travsr_plugin_host::Capacity, String> {
+    travsr_plugin_host::Capacity::parse(s)
+        .ok_or_else(|| format!("expected `auto` or a percent 1-100, got '{s}'"))
+}
+
 #[derive(Debug, Subcommand)]
 pub enum EmbedCommand {
     /// Show available embedding backends and their install status.
@@ -79,6 +86,17 @@ pub enum EmbedCommand {
         /// Re-download even if already installed.
         #[arg(long)]
         reinstall: bool,
+        /// Worker budget for the post-install reindex: `auto` or a percent 1-100.
+        /// When omitted on an interactive terminal, `init` prompts for a CPU
+        /// budget; on a non-interactive shell it uses config/env/default.
+        #[arg(long, value_name = "AUTO|PCT", value_parser = parse_capacity)]
+        capacity: Option<travsr_plugin_host::Capacity>,
+        /// Absolute number of parallel embed workers for the post-install reindex.
+        #[arg(long, short = 'j', value_name = "N")]
+        jobs: Option<usize>,
+        /// OS scheduling priority for the post-install reindex sidecar.
+        #[arg(long, value_enum)]
+        priority: Option<PriorityArg>,
     },
     /// Embed all un-embedded nodes in the current repo's graph.db.
     ///
@@ -93,11 +111,11 @@ pub enum EmbedCommand {
         /// Omit to embed all pending nodes.
         #[arg(long)]
         phase1: Option<u32>,
-        /// Use this percent (1-100) of the derived worker count for this run.
-        /// Leaves the rest of the cores free for interactive work. Overrides the
-        /// `embed.capacity` config for this run only.
-        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(1..=100))]
-        capacity: Option<u8>,
+        /// Worker budget for this run: `auto` (load-adaptive) or a percent 1-100
+        /// of the derived worker count. Leaves cores free for interactive work.
+        /// Overrides the `embed.capacity` config for this run only.
+        #[arg(long, value_name = "AUTO|PCT", value_parser = parse_capacity)]
+        capacity: Option<travsr_plugin_host::Capacity>,
         /// Absolute number of parallel embed workers for this run (overrides
         /// --capacity and the derived count).
         #[arg(long, short = 'j', value_name = "N")]
@@ -105,6 +123,31 @@ pub enum EmbedCommand {
         /// OS scheduling priority for the embed sidecar this run.
         #[arg(long, value_enum)]
         priority: Option<PriorityArg>,
+    },
+    /// Change the reindex resource budget of a running or paused reindex and
+    /// apply it immediately (WS4).
+    ///
+    /// Persists the given knob(s) to config (this repo unless `--global`), then
+    /// gracefully cancels any in-flight reindex and respawns it with the new
+    /// worker count / priority — resuming from partial work (no node is
+    /// re-embedded). At least one of `--capacity` / `-j` / `--priority` is
+    /// required.
+    Reconfigure {
+        /// Path to graph.db (defaults to .travsr/graph.db in the nearest git root).
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// New worker budget: `auto` (load-adaptive) or a percent 1-100.
+        #[arg(long, value_name = "AUTO|PCT", value_parser = parse_capacity)]
+        capacity: Option<travsr_plugin_host::Capacity>,
+        /// New absolute worker count (overrides --capacity).
+        #[arg(long, short = 'j', value_name = "N")]
+        jobs: Option<usize>,
+        /// New OS scheduling priority for the embed sidecar.
+        #[arg(long, value_enum)]
+        priority: Option<PriorityArg>,
+        /// Persist to the machine-global config instead of this repo's config.
+        #[arg(long)]
+        global: bool,
     },
     /// Show the currently active embedding model and binary status.
     Status,
@@ -130,7 +173,20 @@ pub enum EmbedCommand {
 pub fn run(cmd: EmbedCommand) -> Result<()> {
     match cmd {
         EmbedCommand::List { json } => cmd_list(json),
-        EmbedCommand::Init { backend, reinstall } => cmd_init(backend.as_deref(), reinstall),
+        EmbedCommand::Init {
+            backend,
+            reinstall,
+            capacity,
+            jobs,
+            priority,
+        } => {
+            let overrides = travsr_plugin_host::EmbedOverrides {
+                capacity,
+                max_workers: jobs,
+                priority: priority.map(Into::into),
+            };
+            cmd_init(backend.as_deref(), reinstall, overrides)
+        }
         EmbedCommand::Reindex {
             db,
             phase1,
@@ -144,6 +200,20 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
                 priority: priority.map(Into::into),
             };
             cmd_reindex(db, phase1, overrides)
+        }
+        EmbedCommand::Reconfigure {
+            db,
+            capacity,
+            jobs,
+            priority,
+            global,
+        } => {
+            let overrides = travsr_plugin_host::EmbedOverrides {
+                capacity,
+                max_workers: jobs,
+                priority: priority.map(Into::into),
+            };
+            cmd_reconfigure(db, overrides, global)
         }
         EmbedCommand::Status => cmd_status(),
         EmbedCommand::Switch { backend } => cmd_switch(&backend),
@@ -255,7 +325,11 @@ fn cmd_list(json: bool) -> Result<()> {
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
-fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
+fn cmd_init(
+    backend_id: Option<&str>,
+    reinstall: bool,
+    mut overrides: travsr_plugin_host::EmbedOverrides,
+) -> Result<()> {
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
 
     let backend: &'static EmbedBackend = match backend_id {
@@ -280,6 +354,20 @@ fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
             }
         }
     };
+
+    // WS6 (A3): when the user gave no explicit budget flags and we're on an
+    // interactive terminal, offer a CPU-budget choice before the (potentially
+    // long) reindex — parity with `travsr init`'s prompts. Headless/CI keeps the
+    // config/env/default path with no prompt (H3).
+    if overrides.capacity.is_none()
+        && overrides.max_workers.is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
+        if let Some(cap) = prompt_cpu_budget()? {
+            overrides.capacity = Some(cap);
+        }
+    }
 
     println!();
     install_backend_with_progress(backend, reinstall)?;
@@ -308,7 +396,7 @@ fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
     }
 
     match db_path {
-        Some(ref p) => reindex_after_init(backend, p)?,
+        Some(ref p) => reindex_after_init(backend, p, &overrides)?,
         None => {
             println!("\n  {} {} installed", pal.green("\u{25cf}"), backend.id);
             println!(
@@ -319,6 +407,58 @@ fn cmd_init(backend_id: Option<&str>, reinstall: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Interactive CPU-budget prompt shown at `embed init` (WS6 A3). Returns the
+/// chosen [`Capacity`], or `None` to fall through to config/env/default (the
+/// "Full" default). Only called on an interactive terminal.
+fn prompt_cpu_budget() -> Result<Option<travsr_plugin_host::Capacity>> {
+    use std::io::Write as _;
+    use travsr_plugin_host::Capacity;
+
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let cores_note = if cores > 0 {
+        format!(" (detected {cores} cores)")
+    } else {
+        String::new()
+    };
+
+    println!("\n  How much CPU should embedding use?{cores_note}");
+    println!("  [1] Full     — all available cores (fastest; default)");
+    println!("  [2] Half     — 50% of cores");
+    println!("  [3] Quarter  — 25% of cores (leaves the machine responsive)");
+    println!("  [4] Auto     — adapt to current system load");
+    println!("  [5] Custom   — enter a percent 1-100");
+    print!("  Choice? (1-5, Enter for Full): ");
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    match input.trim() {
+        "" | "1" => Ok(None), // Full → defer to config/default (100%)
+        "2" => Ok(Some(Capacity::Percent(50))),
+        "3" => Ok(Some(Capacity::Percent(25))),
+        "4" => Ok(Some(Capacity::Auto)),
+        "5" => {
+            print!("  Percent (1-100): ");
+            std::io::stdout().flush()?;
+            let mut pct = String::new();
+            std::io::stdin().read_line(&mut pct)?;
+            match Capacity::parse(pct.trim()) {
+                Some(c) => Ok(Some(c)),
+                None => {
+                    println!("  (not a valid percent — using Full)");
+                    Ok(None)
+                }
+            }
+        }
+        _ => {
+            println!("  (unrecognised — using Full)");
+            Ok(None)
+        }
+    }
 }
 
 /// Interactive numbered model selector, matching the `travsr lang detect` style.
@@ -524,7 +664,11 @@ async fn download_model_file_with_progress(
 /// nothing (the bug this replaces). Inline is deterministic and shows progress
 /// immediately. Guarded by `embed.lock` so a concurrent `travsr embed reindex`
 /// can't double-write embed.db.
-fn reindex_after_init(backend: &'static EmbedBackend, db_path: &Path) -> Result<()> {
+fn reindex_after_init(
+    backend: &'static EmbedBackend,
+    db_path: &Path,
+    overrides: &travsr_plugin_host::EmbedOverrides,
+) -> Result<()> {
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     println!();
 
@@ -549,12 +693,13 @@ fn reindex_after_init(backend: &'static EmbedBackend, db_path: &Path) -> Result<
     // B3: Ctrl-C during the post-init reindex cancels gracefully, no orphan sidecar.
     install_reindex_cancel_handler(db_path);
 
-    // Init has no CLI capacity flags; honour config + env via default overrides.
-    run_reindex_with_progress(
-        db_path,
-        None,
-        &travsr_plugin_host::EmbedOverrides::default(),
-    )?;
+    // Show the resolved worker count / budget / priority, same wording as
+    // `travsr embed reindex`, so init and reindex read identically (WS6).
+    let workers = travsr_plugin_host::derive_num_workers_for_cli(db_path, overrides);
+    let gov = travsr_plugin_host::resolve_governance_for_db(db_path, overrides);
+    println!("  {}", reindex_banner(workers, &gov));
+
+    run_reindex_with_progress(db_path, None, overrides)?;
 
     let embedded = query_embed_stats(db_path, &backend.id)
         .map(|s| s.stats.embedded)
@@ -655,26 +800,48 @@ async fn download_embed_binary(
 
 // ── reindex ───────────────────────────────────────────────────────────────────
 
+/// One-line "Reindexing (N workers) (capacity X, source) [priority: p]..." banner,
+/// shared by `embed reindex`, `embed init`, and `embed reconfigure` so all three
+/// report the resolved budget identically (G1/WS6). The capacity note is omitted
+/// at the default 100% (nothing surprising to report); priority note omitted at
+/// normal.
+fn reindex_banner(workers: usize, gov: &travsr_plugin_host::EmbedGovernance) -> String {
+    let plural = if workers == 1 { "" } else { "s" };
+    let cap_note = match gov.capacity.value {
+        travsr_plugin_host::Capacity::Percent(100) => String::new(),
+        c => format!(
+            "  (capacity {}, {})",
+            c.label(),
+            gov.capacity.source.label()
+        ),
+    };
+    let prio = gov.priority.value;
+    let prio_note = if prio == travsr_plugin_host::Priority::Normal {
+        String::new()
+    } else {
+        format!("  [priority: {}]", prio.as_str())
+    };
+    format!("Reindexing ({workers} parallel worker{plural}){cap_note}{prio_note}...")
+}
+
 fn cmd_reindex(
     db_override: Option<PathBuf>,
     phase1: Option<u32>,
     overrides: travsr_plugin_host::EmbedOverrides,
 ) -> Result<()> {
-    let db_path = match db_override {
-        Some(p) => p,
-        None => {
-            let cwd = std::env::current_dir().context("getting cwd")?;
-            let repo_root = crate::repo::find_git_root(&cwd)?;
-            let p = repo_root.join(".travsr/graph.db");
-            anyhow::ensure!(
-                p.exists(),
-                "graph.db not found at {}\n  Run `travsr init` first.",
-                p.display()
-            );
-            p
-        }
-    };
+    let db_path = resolve_graph_db(db_override)?;
+    run_reindex_locked(&db_path, phase1, &overrides)
+}
 
+/// The locked reindex core: `embed.lock` guard, embed-text regen, resolved-budget
+/// banner, Ctrl-C cancel handler, and the progress-bar run. Shared by `embed
+/// reindex` and `embed reconfigure` (WS4) so both serialize on `embed.lock`,
+/// report the same banner, and resume incrementally from partial work.
+fn run_reindex_locked(
+    db_path: &Path,
+    phase1: Option<u32>,
+    overrides: &travsr_plugin_host::EmbedOverrides,
+) -> Result<()> {
     // C2: an absolute -j above the physical core count oversubscribes — warn but
     // honour it (the user asked explicitly). Best-effort core count.
     if let Some(j) = overrides.max_workers {
@@ -704,44 +871,26 @@ fn cmd_reindex(
     fs2::FileExt::lock_exclusive(&embed_lock)
         .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
 
-    let workers = travsr_plugin_host::derive_num_workers_for_cli(&db_path, &overrides);
-    let gov = travsr_plugin_host::resolve_governance_for_db(&db_path, &overrides);
+    let workers = travsr_plugin_host::derive_num_workers_for_cli(db_path, overrides);
+    let gov = travsr_plugin_host::resolve_governance_for_db(db_path, overrides);
 
     // Regenerate embed_text with correct richness if the model tier changed.
     // This is a CPU-heavy SQL pass over every node on large repos, so announce it
     // first — otherwise the command looks hung while it runs (before the bar).
     println!("Preparing embed text for {}...", db_path.display());
-    if let Err(e) = regenerate_embed_texts_if_stale(&db_path) {
+    if let Err(e) = regenerate_embed_texts_if_stale(db_path) {
         tracing::warn!("embed_text regen check failed (non-fatal): {e}");
     }
 
     // Show the resolved worker count, the capacity governor + its source, and the
     // scheduling priority so the user can confirm their config took effect (G1).
-    let cap = gov.capacity.value;
-    let cap_note = if cap == 100 {
-        String::new()
-    } else {
-        format!("  (capacity {cap}%, {})", gov.capacity.source.label())
-    };
-    let prio = gov.priority.value;
-    let prio_note = if prio == travsr_plugin_host::Priority::Normal {
-        String::new()
-    } else {
-        format!("  [priority: {}]", prio.as_str())
-    };
-    println!(
-        "Reindexing ({} parallel worker{}){}{}...",
-        workers,
-        if workers == 1 { "" } else { "s" },
-        cap_note,
-        prio_note,
-    );
+    println!("{}", reindex_banner(workers, &gov));
 
     // B3: Ctrl-C now gracefully cancels this foreground reindex.
-    install_reindex_cancel_handler(&db_path);
+    install_reindex_cancel_handler(db_path);
 
     // RFC-020: delegate to the parallel orchestrator with a live progress bar.
-    run_reindex_with_progress(&db_path, phase1, &overrides)?;
+    run_reindex_with_progress(db_path, phase1, overrides)?;
 
     if REINDEX_CANCELLED.load(Ordering::SeqCst) {
         println!(
@@ -752,6 +901,145 @@ fn cmd_reindex(
     }
     println!("\u{2713} Reindex complete.");
     Ok(())
+}
+
+// ── reconfigure (WS4) ─────────────────────────────────────────────────────────
+
+/// `travsr embed reconfigure` — change the reindex resource budget of a running
+/// or paused reindex and apply it immediately.
+///
+/// = persist (config `set`) + graceful cancel (WS3) + respawn (WS2) resuming from
+/// partial. The knob change is declarative: it is written to config so a running
+/// daemon's future auto-reindexes honour it too (mirrors `systemctl set-property`
+/// / `docker update`). Then any in-flight reindex is cancelled and re-launched
+/// with the new params. No embedding is lost — rows persist per batch (INV-A); a
+/// mid-run cancel keeps them and the respawn resumes via the `NOT EXISTS` filter.
+fn cmd_reconfigure(
+    db_override: Option<PathBuf>,
+    overrides: travsr_plugin_host::EmbedOverrides,
+    global: bool,
+) -> Result<()> {
+    // At least one knob must be given — reconfigure with nothing to change is a
+    // user error, not a silent no-op reindex.
+    if overrides.capacity.is_none()
+        && overrides.max_workers.is_none()
+        && overrides.priority.is_none()
+    {
+        bail!(
+            "reconfigure needs at least one of --capacity / -j / --priority\n  \
+             e.g. `travsr embed reconfigure --capacity 50`"
+        );
+    }
+
+    let db_path = resolve_graph_db(db_override)?;
+    let repo_root = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .context("locating repo root from graph.db path")?;
+
+    // 1. Persist the new knob(s) so the change sticks across daemon respawns.
+    persist_overrides(&overrides, &repo_root, global)?;
+
+    // 2. Cancel any in-flight reindex, then respawn with the new budget.
+    trigger_reindex_now(&repo_root, &db_path, &overrides)
+}
+
+/// Write the present knobs of `overrides` to config (repo scope unless `global`),
+/// using the same registry/validation as `travsr config set`.
+fn persist_overrides(
+    overrides: &travsr_plugin_host::EmbedOverrides,
+    repo_root: &Path,
+    global: bool,
+) -> Result<()> {
+    let scope = || {
+        if global {
+            travsr_config::Scope::Global
+        } else {
+            travsr_config::Scope::Repo(repo_root.to_path_buf())
+        }
+    };
+    let where_ = if global {
+        "global config"
+    } else {
+        "repo config"
+    };
+
+    if let Some(cap) = overrides.capacity {
+        travsr_config::set("embed.capacity", &cap.to_config_value(), scope())?;
+        println!("\u{2713} set embed.capacity = {}  ({where_})", cap.label());
+    }
+    if let Some(j) = overrides.max_workers {
+        travsr_config::set("embed.max_workers", &j.to_string(), scope())?;
+        println!("\u{2713} set embed.max_workers = {j}  ({where_})");
+    }
+    if let Some(p) = overrides.priority {
+        travsr_config::set("embed.priority", p.as_str(), scope())?;
+        println!("\u{2713} set embed.priority = {}  ({where_})", p.as_str());
+    }
+    Ok(())
+}
+
+/// Cancel any in-flight reindex for `repo_root`, then run a fresh reindex with
+/// `overrides`, resuming from partial. Shared by `embed reconfigure` (WS4) and
+/// `config set --now`.
+///
+/// - If a daemon holds the repo, `stop-embed` is sent: it pauses auto-reindex and
+///   synchronously drains the daemon's in-flight sidecar (grace-poll then force
+///   kill), so no daemon sidecar is still writing when we respawn. We `resume-embed`
+///   afterwards to restore normal auto-reindex.
+/// - With no daemon, we drop the cancel sentinel so a concurrent foreground
+///   reindex in another terminal drains; `embed.lock` then serializes our respawn.
+pub(crate) fn trigger_reindex_now(
+    repo_root: &Path,
+    db_path: &Path,
+    overrides: &travsr_plugin_host::EmbedOverrides,
+) -> Result<()> {
+    let daemon_running = crate::daemon_client::daemon_lock_held(repo_root);
+    let mut paused_daemon = false;
+
+    if daemon_running {
+        match crate::daemon_client::send_daemon_command(
+            repo_root,
+            &travsr_ipc::ControlMessage::StopEmbed,
+        ) {
+            Ok(resp) => {
+                paused_daemon = true;
+                if let Some(m) = resp.message {
+                    println!("  {m}");
+                }
+            }
+            Err(e) => {
+                // Best-effort: a daemon that won't take the message shouldn't block
+                // a reconfigure — the embed.lock still serializes writers.
+                tracing::warn!("stop-embed before reconfigure failed: {e}");
+            }
+        }
+    } else {
+        // No daemon: nudge any foreground sidecar in another terminal to drain.
+        // run_reindex_locked's spawn removes this stale sentinel before launching
+        // its own sidecar, so it never cancels our new run.
+        let sentinel = travsr_plugin_host::cancel_sentinel_path(db_path);
+        let _ = std::fs::write(&sentinel, b"");
+    }
+
+    // A fresh reindex with the new budget. Blocks on embed.lock until the
+    // cancelled run releases; resumes incrementally (no re-embed).
+    let result = run_reindex_locked(db_path, None, overrides);
+
+    if paused_daemon {
+        if let Err(e) = crate::daemon_client::send_daemon_command(
+            repo_root,
+            &travsr_ipc::ControlMessage::ResumeEmbed,
+        ) {
+            tracing::warn!("resume-embed after reconfigure failed: {e}");
+            eprintln!(
+                "warning: could not resume daemon auto-reindex — run `travsr daemon resume-embed`"
+            );
+        }
+    }
+
+    result
 }
 
 /// Run the parallel reindex with a live `travsr init`-style progress bar.

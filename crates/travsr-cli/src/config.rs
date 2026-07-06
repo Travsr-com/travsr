@@ -24,6 +24,11 @@ pub enum ConfigCommand {
         /// Write to this repository's `.travsr/config.toml` instead of the global one.
         #[arg(long)]
         repo: bool,
+        /// Apply immediately: after writing, gracefully cancel any in-flight embed
+        /// reindex and respawn it with the new value (WS4). Only meaningful for the
+        /// `embed.*` governance keys; a no-op prompt otherwise.
+        #[arg(long)]
+        now: bool,
     },
     /// List every known key with its resolved value and source layer.
     List {
@@ -36,7 +41,12 @@ pub enum ConfigCommand {
 pub fn run(cmd: ConfigCommand) -> Result<()> {
     match cmd {
         ConfigCommand::Get { key } => cmd_get(&key),
-        ConfigCommand::Set { key, value, repo } => cmd_set(&key, &value, repo),
+        ConfigCommand::Set {
+            key,
+            value,
+            repo,
+            now,
+        } => cmd_set(&key, &value, repo, now),
         ConfigCommand::List { json } => cmd_list(json),
     }
 }
@@ -58,7 +68,7 @@ fn cmd_get(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_set(key: &str, value: &str, repo: bool) -> Result<()> {
+fn cmd_set(key: &str, value: &str, repo: bool, now: bool) -> Result<()> {
     let scope = if repo {
         let root = current_repo_root()
             .context("--repo requires being inside a git repository (no .travsr found)")?;
@@ -69,6 +79,31 @@ fn cmd_set(key: &str, value: &str, repo: bool) -> Result<()> {
     travsr_config::set(key, value, scope)?;
     let where_ = if repo { "repo config" } else { "global config" };
     println!("\u{2713} set {key} = {value}  ({where_})");
+
+    // WS4: `--now` applies an embed governance change immediately by cancelling
+    // and respawning any in-flight reindex with the freshly-written config (the
+    // default overrides resolve to the value we just set).
+    if now {
+        if !key.starts_with("embed.") {
+            eprintln!(
+                "note: --now only applies to `embed.*` keys; '{key}' written but not applied"
+            );
+            return Ok(());
+        }
+        let root = current_repo_root()
+            .context("--now needs to run inside a git repository (to locate the reindex target)")?;
+        let db_path = root.join(".travsr/graph.db");
+        anyhow::ensure!(
+            db_path.exists(),
+            "graph.db not found at {} — run `travsr init` first",
+            db_path.display()
+        );
+        crate::embed::trigger_reindex_now(
+            &root,
+            &db_path,
+            &travsr_plugin_host::EmbedOverrides::default(),
+        )?;
+    }
     Ok(())
 }
 
