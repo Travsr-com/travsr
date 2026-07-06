@@ -3132,6 +3132,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "travsr-config",
  "travsr-core",
  "travsr-daemon",
  "travsr-indexer",
@@ -3143,6 +3144,18 @@ dependencies = [
  "travsr-store",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "travsr-config"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "serde",
+ "tempfile",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -3275,6 +3288,7 @@ dependencies = [
  "toml",
  "tracing",
  "travsr-analysis",
+ "travsr-config",
  "travsr-core",
  "travsr-error",
  "travsr-indexer",

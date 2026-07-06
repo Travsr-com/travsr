@@ -5,6 +5,7 @@
 mod ask;
 #[cfg(windows)]
 mod autostart;
+mod config;
 mod daemon_client;
 mod embed;
 mod graph;
@@ -170,6 +171,11 @@ enum Command {
     Embed {
         #[command(subcommand)]
         action: embed::EmbedCommand,
+    },
+    /// Inspect and set layered configuration (global + per-repo).
+    Config {
+        #[command(subcommand)]
+        action: config::ConfigCommand,
     },
 }
 
@@ -567,6 +573,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
         Command::Embed { action } => embed::run(action)?,
+        Command::Config { action } => config::run(action)?,
     }
     Ok(())
 }

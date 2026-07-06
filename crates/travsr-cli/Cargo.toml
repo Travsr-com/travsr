@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 travsr-core = { path = "../travsr-core" }
+travsr-config = { workspace = true }
 travsr-ipc  = { workspace = true }
 travsr-indexer = { path = "../travsr-indexer" }
 travsr-daemon = { path = "../travsr-daemon" }
