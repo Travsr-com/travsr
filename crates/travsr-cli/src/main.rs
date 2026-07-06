@@ -162,12 +162,12 @@ enum Command {
         #[command(subcommand)]
         action: lang::LangCommand,
     },
-    /// Manage per-repo dynamic synonym pairs (RFC-012 A2 F1).
+    /// Manage per-repo synonym pairs for richer semantic search.
     Synonym {
         #[command(subcommand)]
         action: synonym::SynonymCommand,
     },
-    /// Manage embedding backends for semantic code search (RFC-018).
+    /// Manage embedding backends for semantic code search.
     Embed {
         #[command(subcommand)]
         action: embed::EmbedCommand,

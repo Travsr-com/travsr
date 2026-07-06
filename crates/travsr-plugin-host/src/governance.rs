@@ -385,6 +385,12 @@ mod tests {
         {
             return;
         }
+        // Skip if the global config file exists — it may set embed.* keys that
+        // shadow the defaults under test. CI runs in a clean home dir so this
+        // guard never fires there; on developer machines it prevents false failures.
+        if travsr_config::global_path().map_or(false, |p| p.exists()) {
+            return;
+        }
         let g = resolve_embed(None, &EmbedOverrides::default());
         assert_eq!(g.capacity.value, Capacity::Percent(100));
         assert_eq!(g.priority.value, Priority::Normal);

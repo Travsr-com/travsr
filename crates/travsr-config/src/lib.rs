@@ -269,24 +269,39 @@ pub fn get(key: &str, repo_root: Option<&Path>) -> Result<KeyStatus> {
 }
 
 /// Resolve every registered key across the stored layers, for `config list`.
+///
+/// Loads each config file exactly once and shares the parsed tables across all
+/// keys, so a malformed file warning prints once instead of once per key.
 pub fn list(repo_root: Option<&Path>) -> Vec<KeyStatus> {
-    KEYS.iter().map(|s| status_for(s, repo_root)).collect()
+    let repo_table = repo_root.map(|r| load_table(&repo_path(r)));
+    let global_table = global_path().map(|p| load_table(&p));
+    KEYS.iter()
+        .map(|s| status_for_tables(s, repo_table.as_ref(), global_table.as_ref()))
+        .collect()
 }
 
 /// Read the three stored layers for `spec` from the real environment and files,
 /// then hand them to the pure [`resolve_status`]. All I/O lives here; the
-/// precedence logic is pure and independently tested.
+/// precedence logic is pure and independently tested. Used by `get` (single key).
 fn status_for(spec: &'static KeySpec, repo_root: Option<&Path>) -> KeyStatus {
+    let repo_table = repo_root.map(|r| load_table(&repo_path(r)));
+    let global_table = global_path().map(|p| load_table(&p));
+    status_for_tables(spec, repo_table.as_ref(), global_table.as_ref())
+}
+
+/// Like `status_for` but accepts already-loaded tables so `list` can share one
+/// file-load across all keys — a malformed file warns exactly once, not N times.
+fn status_for_tables(
+    spec: &'static KeySpec,
+    repo_table: Option<&toml::Table>,
+    global_table: Option<&toml::Table>,
+) -> KeyStatus {
     let env_val = spec
         .env
         .and_then(|e| std::env::var(e).ok())
         .filter(|s| !s.is_empty());
-    let repo_val = repo_root
-        .map(|r| load_table(&repo_path(r)))
-        .and_then(|t| table_get(&t, spec.key));
-    let global_val = global_path()
-        .map(|p| load_table(&p))
-        .and_then(|t| table_get(&t, spec.key));
+    let repo_val = repo_table.and_then(|t| table_get(t, spec.key));
+    let global_val = global_table.and_then(|t| table_get(t, spec.key));
     resolve_status(spec, env_val, repo_val, global_val)
 }
 

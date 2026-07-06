@@ -132,6 +132,10 @@ pub enum EmbedCommand {
     /// worker count / priority — resuming from partial work (no node is
     /// re-embedded). At least one of `--capacity` / `-j` / `--priority` is
     /// required.
+    #[command(
+        about = "Change the reindex resource budget and apply it immediately.",
+        long_about = "Change the reindex resource budget and apply it immediately.\n\nPersists the given knob(s) to config (this repo unless `--global`), then gracefully cancels any in-flight reindex and respawns it with the new worker count / priority — resuming from partial work (no node is re-embedded). At least one of `--capacity` / `-j` / `--priority` is required."
+    )]
     Reconfigure {
         /// Path to graph.db (defaults to .travsr/graph.db in the nearest git root).
         #[arg(long)]

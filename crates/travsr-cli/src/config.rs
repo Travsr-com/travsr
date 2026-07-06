@@ -27,7 +27,10 @@ pub enum ConfigCommand {
         /// Apply immediately: after writing, gracefully cancel any in-flight embed
         /// reindex and respawn it with the new value (WS4). Only meaningful for the
         /// `embed.*` governance keys; a no-op prompt otherwise.
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Apply immediately: after writing, gracefully cancel any in-flight embed reindex and respawn it with the new value. Only meaningful for the `embed.*` governance keys; a no-op prompt otherwise."
+        )]
         now: bool,
     },
     /// List every known key with its resolved value and source layer.
