@@ -14,6 +14,7 @@ travsr-core            = { path = "../travsr-core" }
 travsr-error           = { path = "../travsr-error" }
 travsr-indexer         = { path = "../travsr-indexer" }
 travsr-analysis        = { path = "../travsr-analysis" }
+travsr-config          = { workspace = true }
 anyhow     = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }

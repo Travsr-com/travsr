@@ -25,6 +25,15 @@ pub enum ControlMessage {
     },
     Status,
     Shutdown,
+    /// WS3 (#420): pause the daemon's auto-reindex and gracefully cancel any
+    /// in-flight embed reindex (writes the cancel sentinel, grace-polls the
+    /// sidecar, then force-kills as a fallback). The pause is in-memory for the
+    /// daemon's lifetime (§4.5) — a restart resumes normal auto-reindex.
+    /// Daemons older than this variant answer with a parse error; the CLI
+    /// reports the feature as unavailable rather than mis-routing.
+    StopEmbed,
+    /// WS3: clear the auto-reindex pause set by [`ControlMessage::StopEmbed`].
+    ResumeEmbed,
     /// Run a read-only CLI query (`ask`/`graph`/`status`) against the daemon's
     /// warm store (#318 O1). Daemons older than this variant fail to parse the
     /// line and answer with a parse error — the CLI treats that as "route
@@ -115,6 +124,20 @@ mod tests {
         assert!(!resp.ok);
         assert!(resp.protocol.is_none());
         assert!(resp.result.is_none());
+    }
+
+    #[test]
+    fn stop_and_resume_embed_round_trip() {
+        for (msg, tag) in [
+            (ControlMessage::StopEmbed, "stop-embed"),
+            (ControlMessage::ResumeEmbed, "resume-embed"),
+        ] {
+            let line = serde_json::to_string(&msg).unwrap();
+            assert!(line.contains(&format!(r#""op":"{tag}""#)), "got {line}");
+            // Must deserialize back to the same variant.
+            let back: ControlMessage = serde_json::from_str(&line).unwrap();
+            assert_eq!(std::mem::discriminant(&back), std::mem::discriminant(&msg));
+        }
     }
 
     #[test]

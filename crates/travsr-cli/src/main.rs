@@ -5,6 +5,7 @@
 mod ask;
 #[cfg(windows)]
 mod autostart;
+mod config;
 mod daemon_client;
 mod embed;
 mod graph;
@@ -161,15 +162,20 @@ enum Command {
         #[command(subcommand)]
         action: lang::LangCommand,
     },
-    /// Manage per-repo dynamic synonym pairs (RFC-012 A2 F1).
+    /// Manage per-repo synonym pairs for richer semantic search.
     Synonym {
         #[command(subcommand)]
         action: synonym::SynonymCommand,
     },
-    /// Manage embedding backends for semantic code search (RFC-018).
+    /// Manage embedding backends for semantic code search.
     Embed {
         #[command(subcommand)]
         action: embed::EmbedCommand,
+    },
+    /// Inspect and set layered configuration (global + per-repo).
+    Config {
+        #[command(subcommand)]
+        action: config::ConfigCommand,
     },
 }
 
@@ -187,6 +193,12 @@ enum DaemonAction {
     Status,
     /// Stop the running daemon and start a fresh one.
     Restart,
+    /// Pause background embed reindexing and cancel any in-flight reindex
+    /// (graceful — partial embeddings are preserved). Pause lasts until
+    /// `resume-embed` or a daemon restart.
+    StopEmbed,
+    /// Resume background embed reindexing paused by `stop-embed`.
+    ResumeEmbed,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -473,6 +485,51 @@ async fn run(cli: Cli) -> Result<()> {
                         _ => eprintln!("travsr daemon restarted in background"),
                     }
                 }
+                DaemonAction::StopEmbed => {
+                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::StopEmbed) {
+                        Ok(resp) => eprintln!(
+                            "{}",
+                            resp.message
+                                .unwrap_or_else(|| "embed auto-reindex paused".into())
+                        ),
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("No such file")
+                                || msg.contains("Connection refused")
+                                || msg.contains("os error 2")
+                                || msg.contains("os error 111")
+                                || msg.contains("os error 61")
+                            {
+                                eprintln!("travsr daemon is not running");
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                DaemonAction::ResumeEmbed => {
+                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::ResumeEmbed)
+                    {
+                        Ok(resp) => eprintln!(
+                            "{}",
+                            resp.message
+                                .unwrap_or_else(|| "embed auto-reindex resumed".into())
+                        ),
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("No such file")
+                                || msg.contains("Connection refused")
+                                || msg.contains("os error 2")
+                                || msg.contains("os error 111")
+                                || msg.contains("os error 61")
+                            {
+                                eprintln!("travsr daemon is not running");
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
             }
         }
         Command::Mcp {
@@ -567,6 +624,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
         Command::Embed { action } => embed::run(action)?,
+        Command::Config { action } => config::run(action)?,
     }
     Ok(())
 }
