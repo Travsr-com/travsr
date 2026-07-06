@@ -21,6 +21,24 @@ use crate::progress::Palette;
 const EMBED_RELEASES_BASE: &str = "https://github.com";
 const HF_BASE: &str = "https://huggingface.co";
 
+/// CLI spelling of `travsr_plugin_host::Priority` (keeps clap out of plugin-host).
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum PriorityArg {
+    Normal,
+    Low,
+    Idle,
+}
+
+impl From<PriorityArg> for travsr_plugin_host::Priority {
+    fn from(p: PriorityArg) -> Self {
+        match p {
+            PriorityArg::Normal => travsr_plugin_host::Priority::Normal,
+            PriorityArg::Low => travsr_plugin_host::Priority::Low,
+            PriorityArg::Idle => travsr_plugin_host::Priority::Idle,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum EmbedCommand {
     /// Show available embedding backends and their install status.
@@ -56,6 +74,18 @@ pub enum EmbedCommand {
         /// Omit to embed all pending nodes.
         #[arg(long)]
         phase1: Option<u32>,
+        /// Use this percent (1-100) of the derived worker count for this run.
+        /// Leaves the rest of the cores free for interactive work. Overrides the
+        /// `embed.capacity` config for this run only.
+        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(1..=100))]
+        capacity: Option<u8>,
+        /// Absolute number of parallel embed workers for this run (overrides
+        /// --capacity and the derived count).
+        #[arg(long, short = 'j', value_name = "N")]
+        jobs: Option<usize>,
+        /// OS scheduling priority for the embed sidecar this run.
+        #[arg(long, value_enum)]
+        priority: Option<PriorityArg>,
     },
     /// Show the currently active embedding model and binary status.
     Status,
@@ -82,7 +112,20 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
     match cmd {
         EmbedCommand::List { json } => cmd_list(json),
         EmbedCommand::Init { backend, reinstall } => cmd_init(backend.as_deref(), reinstall),
-        EmbedCommand::Reindex { db, phase1 } => cmd_reindex(db, phase1),
+        EmbedCommand::Reindex {
+            db,
+            phase1,
+            capacity,
+            jobs,
+            priority,
+        } => {
+            let overrides = travsr_plugin_host::EmbedOverrides {
+                capacity,
+                max_workers: jobs,
+                priority: priority.map(Into::into),
+            };
+            cmd_reindex(db, phase1, overrides)
+        }
         EmbedCommand::Status => cmd_status(),
         EmbedCommand::Switch { backend } => cmd_switch(&backend),
         EmbedCommand::Calibrate { db } => cmd_calibrate(db),
@@ -484,7 +527,12 @@ fn reindex_after_init(backend: &'static EmbedBackend, db_path: &Path) -> Result<
         tracing::warn!("embed_text regen check failed (non-fatal): {e}");
     }
 
-    run_reindex_with_progress(db_path, None)?;
+    // Init has no CLI capacity flags; honour config + env via default overrides.
+    run_reindex_with_progress(
+        db_path,
+        None,
+        &travsr_plugin_host::EmbedOverrides::default(),
+    )?;
 
     let embedded = query_embed_stats(db_path, &backend.id)
         .map(|s| s.stats.embedded)
@@ -585,7 +633,11 @@ async fn download_embed_binary(
 
 // ── reindex ───────────────────────────────────────────────────────────────────
 
-fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> {
+fn cmd_reindex(
+    db_override: Option<PathBuf>,
+    phase1: Option<u32>,
+    overrides: travsr_plugin_host::EmbedOverrides,
+) -> Result<()> {
     let db_path = match db_override {
         Some(p) => p,
         None => {
@@ -600,6 +652,19 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
             p
         }
     };
+
+    // C2: an absolute -j above the physical core count oversubscribes — warn but
+    // honour it (the user asked explicitly). Best-effort core count.
+    if let Some(j) = overrides.max_workers {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0);
+        if cores > 0 && j > cores {
+            eprintln!(
+                "warning: -j {j} exceeds {cores} available cores — may oversubscribe the CPU"
+            );
+        }
+    }
 
     // M6: prevent concurrent `travsr embed reindex` runs from writing to the same
     // embed.db simultaneously (two terminals, CI + local). Flock on embed.lock in
@@ -617,7 +682,8 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
     fs2::FileExt::lock_exclusive(&embed_lock)
         .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
 
-    let workers = travsr_plugin_host::derive_num_workers_for_cli(&db_path);
+    let workers = travsr_plugin_host::derive_num_workers_for_cli(&db_path, &overrides);
+    let gov = travsr_plugin_host::resolve_governance_for_db(&db_path, &overrides);
 
     // Regenerate embed_text with correct richness if the model tier changed.
     // This is a CPU-heavy SQL pass over every node on large repos, so announce it
@@ -627,14 +693,30 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
         tracing::warn!("embed_text regen check failed (non-fatal): {e}");
     }
 
+    // Show the resolved worker count, the capacity governor + its source, and the
+    // scheduling priority so the user can confirm their config took effect (G1).
+    let cap = gov.capacity.value;
+    let cap_note = if cap == 100 {
+        String::new()
+    } else {
+        format!("  (capacity {cap}%, {})", gov.capacity.source.label())
+    };
+    let prio = gov.priority.value;
+    let prio_note = if prio == travsr_plugin_host::Priority::Normal {
+        String::new()
+    } else {
+        format!("  [priority: {}]", prio.as_str())
+    };
     println!(
-        "Reindexing ({} parallel worker{})...",
+        "Reindexing ({} parallel worker{}){}{}...",
         workers,
-        if workers == 1 { "" } else { "s" }
+        if workers == 1 { "" } else { "s" },
+        cap_note,
+        prio_note,
     );
 
     // RFC-020: delegate to the parallel orchestrator with a live progress bar.
-    run_reindex_with_progress(&db_path, phase1)?;
+    run_reindex_with_progress(&db_path, phase1, &overrides)?;
 
     println!("\u{2713} Reindex complete.");
     Ok(())
@@ -645,7 +727,11 @@ fn cmd_reindex(db_override: Option<PathBuf>, phase1: Option<u32>) -> Result<()> 
 /// The parallel orchestrator prints nothing incrementally, so a monitor thread
 /// polls embed.db for the active model's embedded count (embed.db is WAL — reads
 /// during the reindex writes are safe) and drives [`crate::progress::LiveBar`].
-fn run_reindex_with_progress(db_path: &Path, phase1: Option<u32>) -> Result<()> {
+fn run_reindex_with_progress(
+    db_path: &Path,
+    phase1: Option<u32>,
+    overrides: &travsr_plugin_host::EmbedOverrides,
+) -> Result<()> {
     let model_id = db_path
         .parent()
         .and_then(|p| p.parent())
@@ -676,7 +762,7 @@ fn run_reindex_with_progress(db_path: &Path, phase1: Option<u32>) -> Result<()> 
         })
     });
 
-    let result = travsr_plugin_host::run_parallel_reindex_blocking(db_path, phase1);
+    let result = travsr_plugin_host::run_parallel_reindex_blocking(db_path, phase1, overrides);
 
     done_flag.store(true, Ordering::Relaxed);
     if let Some(m) = monitor {

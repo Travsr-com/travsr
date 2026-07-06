@@ -9,6 +9,7 @@ pub mod dispatcher;
 pub mod embed_catalog;
 pub mod embed_sidecar;
 pub mod embed_supervisor;
+pub mod governance;
 pub mod indexer;
 pub mod phase_b;
 pub mod plugins;
@@ -25,13 +26,14 @@ pub use dispatcher::Dispatcher;
 pub use embed_catalog::{
     active_backend_id, backends as embed_backends, derive_num_workers_for_cli,
     derive_phase1_threshold_for_status, embed_reindex_in_flight, lookup as lookup_embed_backend,
-    probe_top1_cosines, repo_backend_id, run_parallel_reindex_blocking,
+    probe_top1_cosines, repo_backend_id, resolve_governance_for_db, run_parallel_reindex_blocking,
     run_parallel_reindex_blocking_quiet, spawn_background_reindex_all,
     spawn_background_reindex_phase1, spawn_background_reindex_phase2, terminate_inflight_reindex,
     write_model_descriptor, write_repo_backend_id, EmbedBackend, EmbedModelFile, MAX_EMBED_WORKERS,
 };
 pub use embed_sidecar::{EmbedCapabilities, EmbedError, EmbedSidecar};
 pub use embed_supervisor::{EmbedQueryHook, EmbedSupervisor};
+pub use governance::{EmbedGovernance, EmbedOverrides, Priority};
 pub use indexer::{PhaseBInputs, PhaseBOutcome, PluginIndexer};
 pub use phase_b::{
     lookup as lookup_phase_b, OutputFormat, PhaseBEntry, SandboxRequirement,

@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use crate::governance::{self, EmbedOverrides};
 use crate::stderr_ring::StderrRing;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -550,20 +551,21 @@ fn windows_p_core_count() -> Option<usize> {
     }
 }
 
-/// Derive the number of parallel reader threads for the sidecar (C-01).
+/// Derive the number of parallel reader threads for the sidecar (C-01), after
+/// applying the WS2 governance knobs.
 ///
-/// Priority: TRAVSR_EMBED_WORKERS env var → P-core count (clamped) → RAM guard.
-/// `model_ram_mb` is the fixed RAM cost of loading the model once (from the catalog).
-/// Pass 0 when the model is unknown — falls back to the conservative slot estimate.
-fn derive_num_workers(model_ram_mb: u64) -> usize {
-    let env_override = std::env::var("TRAVSR_EMBED_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
+/// `max_workers` is the resolved absolute cap (`-j` / `TRAVSR_EMBED_WORKERS`): when
+/// set it wins outright and `capacity` is ignored. Otherwise the count is derived
+/// from P-cores + the RAM guard and then scaled by `capacity` (a `[0.01, 1.0]`
+/// fraction). `model_ram_mb` is the fixed RAM cost of loading the model once (0 =
+/// unknown → conservative slot estimate).
+fn derive_num_workers(model_ram_mb: u64, max_workers: Option<usize>, capacity: f32) -> usize {
     derive_num_workers_inner(
         p_core_count(),
         available_memory_mb(),
         model_ram_mb,
-        env_override,
+        max_workers,
+        capacity,
     )
 }
 
@@ -571,21 +573,25 @@ fn derive_num_workers(model_ram_mb: u64) -> usize {
 ///
 /// RAM formula (RFC-021 single-sidecar):
 ///   headroom = available_ram − model_fixed_ram − OS_RESERVE_MB
-///   workers  = headroom / PER_READER_THREAD_MB   (clamped to [1, MAX_EMBED_WORKERS])
+///   derived  = min(p_cores, MAX_EMBED_WORKERS, headroom / PER_READER_THREAD_MB)
+///   workers  = max(1, floor(derived × capacity))
 ///
-/// When `model_ram_mb == 0` (unknown model) falls back to the coarser
-/// `available / FALLBACK_RAM_PER_SLOT_MB` estimate that was used before this change.
+/// `max_workers` (absolute `-j` / env override) short-circuits the whole formula
+/// and, per the epic, wins over `capacity`. When `model_ram_mb == 0` (unknown
+/// model) the RAM guard falls back to `available / FALLBACK_RAM_PER_SLOT_MB`.
 fn derive_num_workers_inner(
     p_cores: usize,
     available_ram_mb: u64,
     model_ram_mb: u64,
-    env_override: Option<usize>,
+    max_workers: Option<usize>,
+    capacity: f32,
 ) -> usize {
-    if let Some(n) = env_override {
+    // Absolute cap wins outright; the capacity governor is ignored (INV: -j > capacity).
+    if let Some(n) = max_workers {
         return n.clamp(1, MAX_EMBED_WORKERS);
     }
     let cpu_bound = p_cores.min(MAX_EMBED_WORKERS);
-    if available_ram_mb > 0 {
+    let derived = if available_ram_mb > 0 {
         let ram_bound = if model_ram_mb > 0 {
             let headroom = available_ram_mb.saturating_sub(model_ram_mb + OS_RESERVE_MB);
             ((headroom / PER_READER_THREAD_MB) as usize).max(1)
@@ -595,7 +601,9 @@ fn derive_num_workers_inner(
         cpu_bound.min(ram_bound)
     } else {
         cpu_bound
-    }
+    };
+    // Governor only reduces: floor(derived × capacity), never below 1 worker.
+    ((derived as f32 * capacity.clamp(0.01, 1.0)).floor() as usize).max(1)
 }
 
 /// Best-effort AVAILABLE RAM in MiB (not total physical RAM).
@@ -679,7 +687,7 @@ fn available_memory_mb() -> u64 {
 /// Looks up the per-repo model id from `<db_path>/../embed.toml` so the RAM guard
 /// uses the correct model's fixed RAM cost. Pass any `.travsr/graph.db` path.
 /// Falls back to the conservative slot estimate when the model is unconfigured.
-pub fn derive_num_workers_for_cli(db_path: &Path) -> usize {
+pub fn derive_num_workers_for_cli(db_path: &Path, overrides: &EmbedOverrides) -> usize {
     let model_ram_mb = db_path
         .parent()
         .and_then(|p| p.parent())
@@ -687,7 +695,19 @@ pub fn derive_num_workers_for_cli(db_path: &Path) -> usize {
         .and_then(|id| lookup(&id))
         .map(|b| b.ram_mb as u64)
         .unwrap_or(0);
-    derive_num_workers(model_ram_mb)
+    let gov = resolve_governance_for_db(db_path, overrides);
+    derive_num_workers(model_ram_mb, gov.max_workers.value, gov.capacity_fraction())
+}
+
+/// Resolve the effective embed governance for a repo's `graph.db`, combining the
+/// layered config (per-repo + global + env) with one-shot CLI `overrides`.
+/// Exposed so the CLI can report the active capacity/priority and their source.
+pub fn resolve_governance_for_db(
+    db_path: &Path,
+    overrides: &EmbedOverrides,
+) -> governance::EmbedGovernance {
+    let repo_root = db_path.parent().and_then(|p| p.parent());
+    governance::resolve_embed(repo_root, overrides)
 }
 
 /// Public re-export for `travsr embed status` so it shows the real threshold label.
@@ -743,11 +763,18 @@ fn run_parallel_reindex(
     model_id: &str,
     phase: PhaseFilter,
     quiet: bool,
+    overrides: &EmbedOverrides,
 ) -> anyhow::Result<()> {
     let model_ram_mb = lookup(model_id).map(|b| b.ram_mb as u64).unwrap_or(0);
-    let n = derive_num_workers(model_ram_mb);
 
-    let mut cmd = Command::new(bin_path);
+    // WS2: resolve capacity / max_workers / priority from CLI overrides + the
+    // layered config (per-repo + global + env). Governance changes speed only.
+    let repo_root = db_path.parent().and_then(|p| p.parent());
+    let gov = governance::resolve_embed(repo_root, overrides);
+    let n = derive_num_workers(model_ram_mb, gov.max_workers.value, gov.capacity_fraction());
+    let priority = gov.priority.value;
+
+    let mut cmd = priority.reindex_command(bin_path);
     cmd.arg("--model-id")
         .arg(model_id)
         .arg("--reindex")
@@ -771,6 +798,10 @@ fn run_parallel_reindex(
     tracing::info!(
         n,
         phase = ?phase,
+        capacity_pct = gov.capacity.value,
+        capacity_src = gov.capacity.source.label(),
+        max_workers = ?gov.max_workers.value,
+        priority = priority.as_str(),
         "embed: spawning sidecar (single model, {} reader threads)",
         n
     );
@@ -917,6 +948,7 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
                 &model_id,
                 PhaseFilter::Phase1 { threshold },
                 false,
+                &EmbedOverrides::default(),
             ) {
                 tracing::warn!("embed Phase 1 failed: {e:#}");
             }
@@ -954,9 +986,15 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
         .name("embed-reindex-phase2".into())
         .spawn(move || {
             let _guard = guard; // moved in; drops on return OR panic → flag reset
-            if let Err(e) =
-                run_parallel_reindex(&bin_path, &db_path, &embed_db_path, &model_id, phase, false)
-            {
+            if let Err(e) = run_parallel_reindex(
+                &bin_path,
+                &db_path,
+                &embed_db_path,
+                &model_id,
+                phase,
+                false,
+                &EmbedOverrides::default(),
+            ) {
                 tracing::warn!("embed Phase 2 failed: {e:#}");
             }
         })
@@ -985,6 +1023,7 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
                 &model_id,
                 PhaseFilter::All,
                 false,
+                &EmbedOverrides::default(),
             ) {
                 tracing::warn!("embed reindex-all failed: {e:#}");
             }
@@ -1000,6 +1039,7 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
 pub fn run_parallel_reindex_blocking(
     db_path: &Path,
     phase1_threshold: Option<u32>,
+    overrides: &EmbedOverrides,
 ) -> anyhow::Result<()> {
     let (bin_path, embed_db_path, model_id) = resolve_backend(db_path).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1013,7 +1053,15 @@ pub fn run_parallel_reindex_blocking(
         None => PhaseFilter::All,
     };
 
-    run_parallel_reindex(&bin_path, db_path, &embed_db_path, &model_id, phase, false)
+    run_parallel_reindex(
+        &bin_path,
+        db_path,
+        &embed_db_path,
+        &model_id,
+        phase,
+        false,
+        overrides,
+    )
 }
 
 /// Blocking reindex with sidecar stdout suppressed — called from `travsr embed init`
@@ -1032,6 +1080,7 @@ pub fn run_parallel_reindex_blocking_quiet(db_path: &Path) -> anyhow::Result<()>
         &model_id,
         PhaseFilter::All,
         true,
+        &EmbedOverrides::default(),
     )
 }
 
@@ -1326,39 +1375,50 @@ mod tests {
 
     // ── TC-01: worker count ───────────────────────────────────────────────────
     //
-    // Signature: derive_num_workers_inner(p_cores, available_ram_mb, model_ram_mb, env_override)
+    // Signature: derive_num_workers_inner(p_cores, available_ram_mb, model_ram_mb,
+    //                                     max_workers, capacity)
+    // A `1.0` capacity is the full-speed default (governor disabled), so the RAM/CPU
+    // cases below match pre-WS2 behaviour. `max_workers = Some(n)` is the absolute
+    // override that wins over capacity (was `env_override`).
     //
     // RAM formula (when model_ram_mb > 0):
     //   headroom = available_ram − model_ram − OS_RESERVE_MB(256)
     //   ram_bound = max(1, headroom / PER_READER_THREAD_MB(50))
-    //   result = min(p_cores, MAX_EMBED_WORKERS, ram_bound)
+    //   derived = min(p_cores, MAX_EMBED_WORKERS, ram_bound)
+    //   result = max(1, floor(derived × capacity))
     //
     // When model_ram_mb == 0 (unknown):
     //   ram_bound = max(1, available_ram / FALLBACK_RAM_PER_SLOT_MB(500))
 
     #[test]
-    fn worker_count_env_override_is_clamped() {
+    fn worker_count_absolute_override_is_clamped() {
         assert_eq!(
-            derive_num_workers_inner(2, 16_000, 200, Some(0)),
+            derive_num_workers_inner(2, 16_000, 200, Some(0), 1.0),
             1,
             "0 should clamp to 1"
         );
         assert_eq!(
-            derive_num_workers_inner(16, 64_000, 200, Some(100)),
+            derive_num_workers_inner(16, 64_000, 200, Some(100), 1.0),
             MAX_EMBED_WORKERS,
             "100 should clamp to MAX_EMBED_WORKERS"
         );
-        assert_eq!(derive_num_workers_inner(8, 16_000, 200, Some(3)), 3);
+        assert_eq!(derive_num_workers_inner(8, 16_000, 200, Some(3), 1.0), 3);
+        // Absolute override wins over the capacity governor.
+        assert_eq!(
+            derive_num_workers_inner(8, 16_000, 200, Some(4), 0.25),
+            4,
+            "max_workers must ignore capacity"
+        );
     }
 
     #[test]
     fn worker_count_cpu_bound() {
         // 2 P-cores, ample RAM → capped by CPU, not RAM
         // headroom = 16000 - 200 - 256 = 15544 → ram_bound = 310 → min(2, 310) = 2
-        assert_eq!(derive_num_workers_inner(2, 16_000, 200, None), 2);
+        assert_eq!(derive_num_workers_inner(2, 16_000, 200, None, 1.0), 2);
         // 12 P-cores → capped at MAX_EMBED_WORKERS
         assert_eq!(
-            derive_num_workers_inner(12, 64_000, 200, None),
+            derive_num_workers_inner(12, 64_000, 200, None, 1.0),
             MAX_EMBED_WORKERS
         );
     }
@@ -1368,31 +1428,31 @@ mod tests {
         // bge-small (200 MB) on a machine with 1 000 MB available:
         //   headroom = 1000 - 200 - 256 = 544 → 544/50 = 10 → min(8, 10) = 8
         // Previously: 1000/500 = 2  ← the original bug
-        assert_eq!(derive_num_workers_inner(8, 1_000, 200, None), 8);
+        assert_eq!(derive_num_workers_inner(8, 1_000, 200, None, 1.0), 8);
 
         // bge-base (450 MB), 1 500 MB available:
         //   headroom = 1500 - 450 - 256 = 794 → 794/50 = 15 → min(8, 15) = 8
-        assert_eq!(derive_num_workers_inner(8, 1_500, 450, None), 8);
+        assert_eq!(derive_num_workers_inner(8, 1_500, 450, None, 1.0), 8);
 
         // bge-large (1 400 MB), 1 500 MB available — very tight:
         //   headroom = 1500 - 1400 - 256 = -156 → saturating_sub = 0 → max(1) = 1
-        assert_eq!(derive_num_workers_inner(8, 1_500, 1_400, None), 1);
+        assert_eq!(derive_num_workers_inner(8, 1_500, 1_400, None, 1.0), 1);
 
         // bge-large (1 400 MB), 2 000 MB available:
         //   headroom = 2000 - 1400 - 256 = 344 → 344/50 = 6 → min(8, 6) = 6
-        assert_eq!(derive_num_workers_inner(8, 2_000, 1_400, None), 6);
+        assert_eq!(derive_num_workers_inner(8, 2_000, 1_400, None, 1.0), 6);
 
         // ram_mb = 0 means "unavailable" → skip RAM guard entirely, use p_cores
-        assert_eq!(derive_num_workers_inner(4, 0, 200, None), 4);
+        assert_eq!(derive_num_workers_inner(4, 0, 200, None, 1.0), 4);
     }
 
     #[test]
     fn worker_count_unknown_model_uses_fallback() {
         // model_ram_mb = 0 → fallback: available / FALLBACK_RAM_PER_SLOT_MB(500)
         // 8 cores, 2 000 MB → 2000/500 = 4
-        assert_eq!(derive_num_workers_inner(8, 2_000, 0, None), 4);
+        assert_eq!(derive_num_workers_inner(8, 2_000, 0, None, 1.0), 4);
         // 8 cores, 300 MB → max(1, 300/500) = 1
-        assert_eq!(derive_num_workers_inner(8, 300, 0, None), 1);
+        assert_eq!(derive_num_workers_inner(8, 300, 0, None, 1.0), 1);
     }
 
     #[test]
@@ -1401,6 +1461,32 @@ mod tests {
         //   4 P-cores, ~1 000 MB available, bge-small (200 MB)
         //   headroom = 1000 - 200 - 256 = 544 → 544/50 = 10 → min(4, 10) = 4
         // Previously: 1000/500 = 2
-        assert_eq!(derive_num_workers_inner(4, 1_000, 200, None), 4);
+        assert_eq!(derive_num_workers_inner(4, 1_000, 200, None, 1.0), 4);
+    }
+
+    #[test]
+    fn worker_count_capacity_governor_scales_derived() {
+        // 8 P-cores, ample RAM → derived = 8. Capacity scales it, floor, min 1.
+        assert_eq!(derive_num_workers_inner(8, 64_000, 200, None, 1.0), 8);
+        assert_eq!(
+            derive_num_workers_inner(8, 64_000, 200, None, 0.5),
+            4,
+            "50%"
+        );
+        assert_eq!(
+            derive_num_workers_inner(8, 64_000, 200, None, 0.25),
+            2,
+            "25%"
+        );
+        // floor(8 × 0.10) = 0 → clamped up to the 1-worker minimum.
+        assert_eq!(
+            derive_num_workers_inner(8, 64_000, 200, None, 0.10),
+            1,
+            "min 1"
+        );
+        // Reduce-only: a 4-core box at 100% is 4, never more.
+        assert_eq!(derive_num_workers_inner(4, 64_000, 200, None, 1.0), 4);
+        // Capacity applies after the RAM guard: derived = min(8, ram=6) = 6 → ×0.5 = 3.
+        assert_eq!(derive_num_workers_inner(8, 2_000, 1_400, None, 0.5), 3);
     }
 }
