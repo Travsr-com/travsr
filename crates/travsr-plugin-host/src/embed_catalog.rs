@@ -1390,12 +1390,21 @@ pub fn active_backend_id() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global `REINDEX_IN_FLIGHT` /
+    /// `REINDEX_CHILD_PID` statics. `cargo test` runs tests in parallel, so
+    /// without this a guard held by one test makes another test's
+    /// `try_acquire()` return `None` (observed as a macOS-only flake on PR #440:
+    /// `reindex_guard_resets_flag_on_drop` panicking on "flag should be free").
+    /// Poison is recovered because these tests may panic by design.
+    static REINDEX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // ── TC-00: catalog invariants ─────────────────────────────────────────────
 
     // ── TC-L8: in-flight PID guard ───────────────────────────────────────────
 
     #[test]
     fn terminate_inflight_reindex_is_noop_when_idle() {
+        let _serial = REINDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // PID is 0 → no panic, no kill attempt.
         REINDEX_CHILD_PID.store(0, Ordering::SeqCst);
         terminate_inflight_reindex(); // must not panic
@@ -1404,6 +1413,7 @@ mod tests {
 
     #[test]
     fn reindex_pid_guard_clears_pid() {
+        let _serial = REINDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         REINDEX_CHILD_PID.store(12345, Ordering::SeqCst);
         let guard = ReindexPidGuard;
         assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 12345);
@@ -1415,6 +1425,7 @@ mod tests {
 
     #[test]
     fn reindex_guard_resets_flag_on_drop() {
+        let _serial = REINDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Acquire then drop; flag must return to false.
         let guard = ReindexInFlightGuard::try_acquire().expect("flag should be free");
         assert!(
@@ -1430,6 +1441,7 @@ mod tests {
 
     #[test]
     fn reindex_guard_is_single_flight() {
+        let _serial = REINDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let g1 = ReindexInFlightGuard::try_acquire().expect("first acquire");
         assert!(
             ReindexInFlightGuard::try_acquire().is_none(),
@@ -1443,6 +1455,7 @@ mod tests {
 
     #[test]
     fn reindex_guard_resets_on_panic() {
+        let _serial = REINDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Regression for FT-M4: a panic inside the reindex closure must not leave
         // REINDEX_IN_FLIGHT permanently set.
         let handle = std::thread::spawn(|| {

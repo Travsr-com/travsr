@@ -5119,6 +5119,160 @@ impl SnippetMode {
     }
 }
 
+/// Maximum snippets returned per bare-signature token when multiple nodes match.
+/// Each node has its own stored path + line range; `snippet_for_node` reads the
+/// correct file for each. The token budget naturally limits how many fit.
+const MAX_SIGNATURE_MATCHES: usize = 3;
+
+/// A parsed token from a `symbols_arg` string, classified into one of four
+/// resolution tiers ordered by decreasing context richness.
+#[derive(Debug)]
+enum SymbolToken<'a> {
+    /// `"nodeId:42"` — direct primary-key lookup, O(1), zero search.
+    /// Used by VS Code Context Explorer which already has the resolved node.
+    NodeId(u64),
+    /// `"fn:run (function) — src/cmd/serve.rs [package: server]"` — the full
+    /// header emitted by `get_context` / `get_callers` / `search_symbol`.
+    /// O(log N) exact index lookup, guaranteed single result.
+    FullHeader { sig: &'a str, path: &'a str },
+    /// `"src/main.rs:42"` or `"src/main.rs:42-55"` — file-coordinate snippet.
+    /// Zero DB access; reads the stored line range directly.
+    /// Used for call-site snippets from `get_callers` output.
+    PathLine {
+        path: &'a str,
+        start: u32,
+        end: Option<u32>,
+    },
+    /// `"fn:run"` — bare signature, no path context.
+    /// O(log N) exact index lookup; may return multiple nodes (each with its
+    /// own stored path + line). Returns up to `MAX_SIGNATURE_MATCHES` snippets.
+    BareSig(&'a str),
+}
+
+/// Split `symbols_arg` on newline / comma and classify each token into the
+/// appropriate [`SymbolToken`] resolution tier.
+///
+/// Detection order (first match wins per token):
+/// 1. Starts with `"nodeId:"` → [`SymbolToken::NodeId`]
+/// 2. Contains `" \u{2014} "` (em-dash with spaces, the `get_context` header
+///    separator) → [`SymbolToken::FullHeader`]
+/// 3. Last `:` is followed by purely digits and the prefix contains `/`
+///    → [`SymbolToken::PathLine`]
+/// 4. Everything else → [`SymbolToken::BareSig`]
+///
+/// Strip a trailing ":{line}" or ":{start}-{end}" locator from a path, returning
+/// the bare path slice. `format_node_line` appends the definition line to the
+/// path in `get_context` headers (e.g. `"src/serve.rs:42"`), but the stored node
+/// path has no such suffix — leaving it in place breaks the path-pin lookup.
+fn strip_line_suffix(path: &str) -> &str {
+    let Some(idx) = path.rfind(':') else {
+        return path;
+    };
+    let suffix = &path[idx + 1..];
+    if suffix.is_empty() {
+        return path;
+    }
+    let is_locator = match suffix.split_once('-') {
+        Some((start, end)) => {
+            !start.is_empty()
+                && !end.is_empty()
+                && start.bytes().all(|b| b.is_ascii_digit())
+                && end.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => suffix.bytes().all(|b| b.is_ascii_digit()),
+    };
+    if is_locator {
+        &path[..idx]
+    } else {
+        path
+    }
+}
+
+fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
+    symbols_arg
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|token| {
+            // Tier 0: explicit node ID.
+            if let Some(rest) = token.strip_prefix("nodeId:") {
+                if let Ok(id) = rest.trim().parse::<u64>() {
+                    return Some(SymbolToken::NodeId(id));
+                }
+            }
+
+            // Tier 1: full get_context header — contains em-dash separator.
+            // Real format (see `format_node_line`):
+            //   "{sig} ({kind}) \u{2014} {path}:{line} [package: {pkg}] [via: ..] [score: ..]"
+            // `[package: ..]` is omitted when the package is empty, and the path
+            // always carries a trailing ":{line}" definition locator. The " ("
+            // separates sig from kind; " \u{2014} " separates kind from path.
+            if let Some(em_pos) = token.find(" \u{2014} ") {
+                // sig is everything before the first " ("
+                let before_em = &token[..em_pos];
+                let sig = if let Some(p) = before_em.find(" (") {
+                    before_em[..p].trim()
+                } else {
+                    before_em.trim()
+                };
+                // Terminate the path at the first bracketed field ("[package:",
+                // "[via:", "[score:", ..). Matching " [" generally is required
+                // because the package field is dropped for package-less nodes,
+                // in which case " [via:" is the first trailer.
+                let after_em = &token[em_pos + " \u{2014} ".len()..];
+                let path_with_loc = match after_em.find(" [") {
+                    Some(p) => after_em[..p].trim(),
+                    None => after_em.trim(),
+                };
+                // Strip the trailing ":{line}" / ":{start}-{end}" locator that
+                // `format_node_line` appends — the stored node path has none.
+                let path = strip_line_suffix(path_with_loc);
+                if !sig.is_empty() && !path.is_empty() {
+                    return Some(SymbolToken::FullHeader { sig, path });
+                }
+                // Has em-dash but no usable path — fall through to BareSig.
+                if !sig.is_empty() {
+                    return Some(SymbolToken::BareSig(sig));
+                }
+            }
+
+            // Tier 2: {path}:{line} or {path}:{start}-{end}.
+            // The path part must contain '/' to distinguish "src/main.rs:42"
+            // from Kythe signatures like "fn:run" or "method:Foo::bar".
+            if let Some(colon_pos) = token.rfind(':') {
+                let path_part = &token[..colon_pos];
+                let line_part = &token[colon_pos + 1..];
+                if path_part.contains('/') {
+                    if let Some(dash) = line_part.find('-') {
+                        if let (Ok(s), Ok(e)) = (
+                            line_part[..dash].parse::<u32>(),
+                            line_part[dash + 1..].parse::<u32>(),
+                        ) {
+                            return Some(SymbolToken::PathLine {
+                                path: path_part,
+                                start: s,
+                                end: Some(e),
+                            });
+                        }
+                    } else if let Ok(line) = line_part.parse::<u32>() {
+                        return Some(SymbolToken::PathLine {
+                            path: path_part,
+                            start: line,
+                            end: None,
+                        });
+                    }
+                }
+            }
+
+            // Tier 3: bare signature — anything else.
+            if !token.is_empty() {
+                return Some(SymbolToken::BareSig(token));
+            }
+            None
+        })
+        .collect()
+}
+
 /// Core snippet assembly: resolves symbols, fetches snippets, enforces budget.
 ///
 /// `symbols_arg` is a newline- or comma-separated list of symbol names.
@@ -5142,29 +5296,64 @@ fn get_snippets_body(
         }
     };
 
-    // Parse symbol list — support both newline and comma as separators so the
-    // tool is easy to call after copy-pasting output from get_context / get_callers.
-    let symbol_names: Vec<&str> = symbols_arg
-        .split(['\n', ','])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Parse every token into its resolution tier.  Tokens in the same request
+    // may use different forms (nodeId, full header, path:line, bare sig).
+    let tokens = parse_symbol_tokens(symbols_arg);
 
-    if symbol_names.is_empty() {
+    if tokens.is_empty() {
         return String::new();
     }
 
-    // Resolve each name → Node.  search_nodes_by_name accepts partial matches;
-    // skip file-kind nodes (they have no meaningful snippet body).
+    // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
+    // path + line/end_line, so snippet_for_node reads the correct file for each.
+    // search_nodes_by_name (O(N) LIKE) is never called — every tier uses the
+    // V19NodesSignatureIdx exact-match index (O(log N)) or direct primary-key
+    // lookup (O(1)).
     let mut resolved: Vec<CoreNode> = Vec::new();
-    for name in &symbol_names {
-        match store.search_nodes_by_name(name) {
-            Ok(nodes) => {
-                if let Some(n) = nodes.into_iter().find(|n| n.kind != "file") {
-                    resolved.push(n);
+    for tok in &tokens {
+        match tok {
+            // Tier 0: VS Code / internal callers pass the node's primary key.
+            SymbolToken::NodeId(id) => match store.get_node(travsr_core::NodeId(*id)) {
+                Ok(Some(n)) if n.kind != "file" => resolved.push(n),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("get_snippets nodeId:{id} lookup error: {e}"),
+            },
+
+            // Tier 1: full get_context header — path-pinned, exactly 1 result.
+            SymbolToken::FullHeader { sig, path } => {
+                match store.lookup_nodes_exact(sig, Some(path)) {
+                    Ok(nodes) => {
+                        // SQL ORDER BY puts the path-pinned row first.
+                        if let Some(n) = nodes.into_iter().next() {
+                            resolved.push(n);
+                        }
+                    }
+                    Err(e) => tracing::warn!("get_snippets FullHeader lookup '{sig}': {e}"),
                 }
             }
-            Err(e) => tracing::warn!("get_snippets lookup for '{name}': {e}"),
+
+            // Tier 2: file-coordinate snippet — build a synthetic node so the
+            // same rendering loop handles it.  kind "source-range" bypasses the
+            // kind-aware line cap and always reads the exact stored range.
+            SymbolToken::PathLine { path, start, end } => {
+                let end_line = end.unwrap_or(start.saturating_add(39));
+                let syn = CoreNode::new(
+                    travsr_core::VName::new("", "", *path, "", format!("{path}:{start}")),
+                    "source-range",
+                )
+                .with_line(*start)
+                .with_end_line(end_line);
+                resolved.push(syn);
+            }
+
+            // Tier 3: bare signature — exact index, returns up to
+            // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
+            SymbolToken::BareSig(sig) => match store.lookup_nodes_exact(sig, None) {
+                Ok(nodes) => {
+                    resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
+                }
+                Err(e) => tracing::warn!("get_snippets BareSig lookup '{sig}': {e}"),
+            },
         }
     }
 
@@ -5181,27 +5370,40 @@ fn get_snippets_body(
 
     for node in &resolved {
         let header = format!(
-            "{} ({}) — {} [package: {}]",
+            "{} ({}) \u{2014} {} [package: {}]",
             node.vname.signature, node.kind, node.vname.path, node.package
         );
-        let skeleton = |n| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
-        let body_text: Option<String> = match mode {
-            // Full source of the definition, no line cap. Skeleton is the fallback
-            // only when the file can't be read.
-            SnippetMode::Full => snippet_for_node_full(node, &repo_root).or_else(|| skeleton(node)),
-            // AST skeleton always; raw body only if the skeleton can't be built.
-            SnippetMode::Skeleton => skeleton(node).or_else(|| snippet_for_node(node, &repo_root)),
-            // Auto: raw when it fits the kind line-cap, skeleton when it overflows
-            // (a truncated raw snippet is a half-implementation; skeleton summarises).
-            SnippetMode::Auto => {
-                let node_height =
-                    node.end_line
-                        .unwrap_or_else(|| node.line.unwrap_or(0))
-                        .saturating_sub(node.line.unwrap_or(0)) as usize;
-                if node_height > snippet_line_cap(&node.kind) {
+        let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
+
+        // "source-range" nodes (Tier 2 PathLine) always use full mode so the
+        // exact stored line range is returned regardless of the caller's mode.
+        let body_text: Option<String> = if node.kind == "source-range" {
+            snippet_for_node_full(node, &repo_root)
+        } else {
+            match mode {
+                // Full source of the definition, no line cap. Skeleton is the
+                // fallback only when the file can't be read.
+                SnippetMode::Full => {
+                    snippet_for_node_full(node, &repo_root).or_else(|| skeleton(node))
+                }
+                // AST skeleton always; raw body only if the skeleton can't be built.
+                SnippetMode::Skeleton => {
                     skeleton(node).or_else(|| snippet_for_node(node, &repo_root))
-                } else {
-                    snippet_for_node(node, &repo_root).or_else(|| skeleton(node))
+                }
+                // Auto: raw when it fits the kind line-cap, skeleton when it
+                // overflows (a truncated raw snippet is a half-implementation;
+                // skeleton summarises).
+                SnippetMode::Auto => {
+                    let node_height = node
+                        .end_line
+                        .unwrap_or_else(|| node.line.unwrap_or(0))
+                        .saturating_sub(node.line.unwrap_or(0))
+                        as usize;
+                    if node_height > snippet_line_cap(&node.kind) {
+                        skeleton(node).or_else(|| snippet_for_node(node, &repo_root))
+                    } else {
+                        snippet_for_node(node, &repo_root).or_else(|| skeleton(node))
+                    }
                 }
             }
         };
@@ -5533,6 +5735,294 @@ mod snippet_tests {
             "readable repo-internal file must produce a snippet"
         );
         assert!(snippet.unwrap().contains("return 42"));
+    }
+
+    // ── Issue #438: duplicate-signature disambiguation ───────────────────────
+
+    // T-M1: when two files define "fn:run" and the caller passes the bare
+    // signature, the result must include snippets for ALL matching nodes up to
+    // MAX_SIGNATURE_MATCHES — not a disambiguation block and not silently the wrong one.
+    #[test]
+    fn get_snippets_duplicate_sig_bare_name_returns_all_snippets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "function run() { /* a */ }\n").unwrap();
+        std::fs::write(dir.path().join("b.ts"), "function run() { /* b */ }\n").unwrap();
+
+        let node_a = make_fn_node("a.ts", "fn:run", 1, 1);
+        let node_b = make_fn_node("b.ts", "fn:run", 1, 1);
+        let store = make_store_with_meta(&[node_a, node_b], dir.path());
+
+        let result = get_snippets_body(&store, "fn:run", 2000, SnippetMode::Full);
+
+        // Both nodes must appear in the output.
+        assert!(
+            result.contains("a.ts"),
+            "result must mention a.ts: {result}"
+        );
+        assert!(
+            result.contains("b.ts"),
+            "result must mention b.ts: {result}"
+        );
+        // Both snippets must be present.
+        assert!(
+            result.contains("/* a */"),
+            "snippet from a.ts missing: {result}"
+        );
+        assert!(
+            result.contains("/* b */"),
+            "snippet from b.ts missing: {result}"
+        );
+        // Summary footer must show 2 symbols.
+        assert!(
+            result.contains("2 symbols"),
+            "footer must count 2 symbols: {result}"
+        );
+    }
+
+    // T-M2: when the caller passes the full get_context header (with path), the
+    // correct node must be resolved and its snippet returned.
+    #[test]
+    fn get_snippets_duplicate_sig_full_header_resolves_correct_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "function run() { /* a */ }\n").unwrap();
+        std::fs::write(dir.path().join("b.ts"), "function run() { /* b */ }\n").unwrap();
+
+        let node_a = make_fn_node("a.ts", "fn:run", 1, 1);
+        let node_b = make_fn_node("b.ts", "fn:run", 1, 1);
+        let store = make_store_with_meta(&[node_a, node_b], dir.path());
+
+        // Caller passes the full header with path — should resolve to a.ts only.
+        let full_header = "fn:run (function) \u{2014} a.ts [package: mypkg]";
+        let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full);
+
+        assert!(
+            result.contains("/* a */"),
+            "must show snippet from a.ts: {result}"
+        );
+        assert!(
+            !result.contains("/* b */"),
+            "must NOT show snippet from b.ts: {result}"
+        );
+        assert!(
+            !result.contains("definitions found"),
+            "must not show disambiguation when path hint resolves uniquely: {result}"
+        );
+    }
+
+    // T-M2b: the header the caller actually pastes is produced by
+    // `format_node_line`, which appends a ":{line}" locator to the path and a
+    // trailing " [via: ..] [score: ..]" — and omits " [package: ..]" for
+    // package-less nodes (the common case in this suite). The Tier 1 parser must
+    // resolve the correct node from that real format, not just the idealized one.
+    #[test]
+    fn get_snippets_full_header_from_format_node_line_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "function run() { /* a */ }\n").unwrap();
+        std::fs::write(dir.path().join("b.ts"), "function run() { /* b */ }\n").unwrap();
+
+        let node_a = make_fn_node("a.ts", "fn:run", 1, 1);
+        let node_b = make_fn_node("b.ts", "fn:run", 1, 1);
+        let store = make_store_with_meta(&[node_a.clone(), node_b], dir.path());
+
+        // Package-less header (make_fn_node leaves package empty): the path
+        // carries ":1" and the only trailer is " [via: ..] [score: ..]".
+        let header = format_node_line(&node_a, "seed", Some(0.80), None);
+        assert!(
+            header.contains("a.ts:1"),
+            "sanity: real header must carry the line locator: {header}"
+        );
+        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full);
+        assert!(
+            result.contains("/* a */"),
+            "must resolve a.ts from the real get_context header: {result}\nheader={header}"
+        );
+        assert!(
+            !result.contains("/* b */"),
+            "must NOT resolve the colliding b.ts: {result}"
+        );
+
+        // Package-present header exercises the " [package: ..]" terminator too.
+        let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
+        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None);
+        assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
+        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
+        assert!(
+            result_pkg.contains("/* a */") && !result_pkg.contains("/* b */"),
+            "package-present header must also resolve a.ts only: {result_pkg}"
+        );
+    }
+
+    // T-M3: parse_symbol_tokens covers all four resolution tiers.
+    #[test]
+    fn parse_symbol_tokens_covers_all_four_tiers() {
+        // Tier 0: nodeId: prefix.
+        let t0 = parse_symbol_tokens("nodeId:42");
+        assert_eq!(t0.len(), 1);
+        assert!(matches!(t0[0], SymbolToken::NodeId(42)));
+
+        // Tier 1: full header — contains em-dash (U+2014).
+        let full = "fn:run (function) \u{2014} src/cmd/serve.rs [package: server]";
+        let t1 = parse_symbol_tokens(full);
+        assert_eq!(t1.len(), 1);
+        assert!(
+            matches!(t1[0], SymbolToken::FullHeader { sig, path }
+                if sig == "fn:run" && path == "src/cmd/serve.rs"),
+            "FullHeader parse failed: {:?}",
+            t1[0]
+        );
+
+        // Tier 1 — qualified name with double colons.
+        let method = "fn:Iterator::next (method) \u{2014} std/iter.rs [package: std]";
+        let t1m = parse_symbol_tokens(method);
+        assert_eq!(t1m.len(), 1);
+        assert!(
+            matches!(t1m[0], SymbolToken::FullHeader { sig, .. } if sig == "fn:Iterator::next")
+        );
+
+        // Tier 2: path:line or path:line-end.
+        let t2 = parse_symbol_tokens("src/main.rs:42");
+        assert_eq!(t2.len(), 1);
+        assert!(
+            matches!(t2[0], SymbolToken::PathLine { path, start, end }
+                if path == "src/main.rs" && start == 42 && end.is_none()),
+            "PathLine parse failed: {:?}",
+            t2[0]
+        );
+
+        // Tier 3: bare sig — everything else.
+        let t3 = parse_symbol_tokens("fn:run");
+        assert_eq!(t3.len(), 1);
+        assert!(matches!(t3[0], SymbolToken::BareSig("fn:run")));
+
+        // Multi-token via newline.
+        let multi = parse_symbol_tokens("fn:run\nfn:stop");
+        assert_eq!(multi.len(), 2);
+        assert!(matches!(multi[0], SymbolToken::BareSig("fn:run")));
+        assert!(matches!(multi[1], SymbolToken::BareSig("fn:stop")));
+
+        // Multi-token via comma.
+        let csv = parse_symbol_tokens("fn:run,fn:stop");
+        assert_eq!(csv.len(), 2);
+
+        // Empty tokens are silently dropped.
+        let sparse = parse_symbol_tokens("fn:run,,\n,fn:stop");
+        assert_eq!(sparse.len(), 2);
+    }
+
+    // T-M4: a unique signature (no duplicates in the DB) still resolves and
+    // returns the snippet — regression guard ensuring the new path doesn't
+    // break the happy case.
+    #[test]
+    fn get_snippets_unique_sig_still_returns_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+
+        let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
+        let store = make_store_with_meta(&[node], dir.path());
+
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        assert!(
+            result.contains("function hello()"),
+            "snippet body missing: {result}"
+        );
+        assert!(
+            result.contains("return 'hi'"),
+            "snippet content missing: {result}"
+        );
+        assert!(
+            !result.contains("definitions found"),
+            "must not show disambiguation for a unique symbol: {result}"
+        );
+    }
+
+    // T-M6: PathLine tier (Tier 2) always reads the exact stored range,
+    // ignoring the SnippetMode, even when mode=Skeleton.
+    // Path token must contain '/' to be recognized as Tier 2 vs. a Kythe sig.
+    #[test]
+    fn get_snippets_path_line_tier_reads_exact_range() {
+        let dir = tempfile::tempdir().unwrap();
+        // 10-line file under a subdir so the token "src/exact.ts:3-5" has '/'.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src: String = (1u32..=10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(src_dir.join("exact.ts"), &src).unwrap();
+
+        // No graph nodes needed — PathLine creates a synthetic node at read time.
+        let db_path = dir.path().join(".travsr").join("graph.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut store = SqliteStore::open(&db_path).unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+
+        let result = get_snippets_body(&store, "src/exact.ts:3-5", 2000, SnippetMode::Skeleton);
+
+        assert!(
+            result.contains("line3"),
+            "line3 must be in result: {result}"
+        );
+        assert!(
+            result.contains("line5"),
+            "line5 must be in result: {result}"
+        );
+        assert!(!result.contains("line6"), "line6 must NOT appear: {result}");
+    }
+
+    // T-M7: NodeId tier (Tier 0) resolves directly by DB row id —
+    // bypasses signature lookup entirely.
+    #[test]
+    fn get_snippets_nodeid_tier_resolves_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("direct.ts"),
+            "function direct() {\n  return 99;\n}\n",
+        )
+        .unwrap();
+
+        let node = make_fn_node("direct.ts", "fn:direct", 1, 3);
+        let store = make_store_with_meta(&[node], dir.path());
+
+        // Look up the row id the store assigned.
+        let rows = store
+            .lookup_nodes_exact("fn:direct", None)
+            .expect("lookup failed");
+        assert_eq!(rows.len(), 1, "expected 1 node");
+        let id = rows[0].id.0;
+
+        let result = get_snippets_body(&store, &format!("nodeId:{id}"), 2000, SnippetMode::Auto);
+        assert!(result.contains("return 99"), "snippet missing: {result}");
+        assert!(result.contains("fn:direct"), "header missing: {result}");
+    }
+
+    // T-M8: when more than MAX_SIGNATURE_MATCHES nodes share a bare signature,
+    // the result contains at most MAX_SIGNATURE_MATCHES snippets — not all of them.
+    #[test]
+    fn get_snippets_bare_sig_capped_at_max_signature_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = MAX_SIGNATURE_MATCHES + 2;
+        let mut nodes = Vec::new();
+        for i in 0..count {
+            let path = format!("pkg{i}/run.ts");
+            std::fs::write(
+                dir.path().join(format!("run{i}.ts")),
+                format!("function run() {{ /* {i} */ }}\n"),
+            )
+            .unwrap();
+            nodes.push(make_fn_node(&path, "fn:run", 1, 1));
+        }
+        let store = make_store_with_meta(&nodes, dir.path());
+
+        let result = get_snippets_body(&store, "fn:run", 8000, SnippetMode::Auto);
+
+        // Footer must report exactly MAX_SIGNATURE_MATCHES symbols resolved.
+        assert!(
+            result.contains(&format!("{MAX_SIGNATURE_MATCHES} symbols")),
+            "must cap at {MAX_SIGNATURE_MATCHES} symbols, got: {result}"
+        );
     }
 
     // ── get_context include_snippets tests ───────────────────────────────────
