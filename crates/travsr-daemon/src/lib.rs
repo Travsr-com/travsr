@@ -3170,7 +3170,20 @@ impl Daemon {
         // alive after drop(index_tx). Without this, recv() never returns Err,
         // indexer_worker.await hangs, and the tokio runtime's blocking-thread
         // pool stalls on macOS/Windows.
+        //
+        // worker_stop_guard sets the flag whenever Daemon::run exits — whether
+        // via graceful shutdown, tokio task abort() (Windows test path), or
+        // panic. Tokio runs Drop on abort() before considering the task done.
         let worker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _worker_stop_guard = {
+            struct Guard(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            Guard(Arc::clone(&worker_stop))
+        };
         let indexer_worker = {
             let store_worker = Arc::clone(&store);
             let repo_worker = Arc::clone(&repo_root_arc);
