@@ -3165,15 +3165,32 @@ impl Daemon {
         // worker. No new threads are ever spawned for indexing — at most ONE
         // blocking thread handles indexing at any time.
         let (index_tx, index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+        // worker_stop lets shutdown signal the worker to exit even though
+        // index_tx_worker (the clone held by the closure) keeps the channel
+        // alive after drop(index_tx). Without this, recv() never returns Err,
+        // indexer_worker.await hangs, and the tokio runtime's blocking-thread
+        // pool stalls on macOS/Windows.
+        let worker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let indexer_worker = {
             let store_worker = Arc::clone(&store);
             let repo_worker = Arc::clone(&repo_root_arc);
             let index_tx_worker = index_tx.clone();
+            let worker_stop_inner = Arc::clone(&worker_stop);
             tokio::task::spawn_blocking(move || {
-                while let Ok(ev) = index_rx.recv() {
-                    handle_watch_event(ev, &repo_worker, &store_worker, &index_tx_worker);
+                loop {
+                    match index_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(ev) => {
+                            handle_watch_event(ev, &repo_worker, &store_worker, &index_tx_worker);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if worker_stop_inner.load(std::sync::atomic::Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
-                tracing::debug!("indexer worker exiting — channel closed");
+                tracing::debug!("indexer worker exiting");
             })
         };
 
@@ -3463,8 +3480,11 @@ impl Daemon {
         while let Ok(ev) = rx.try_recv() {
             let _ = index_tx.send(ev);
         }
-        // 2. Signal the indexer worker: drop index_tx to close the std channel.
-        //    The worker drains any remaining events from index_rx then exits.
+        // 2. Signal the indexer worker: set stop flag first (so the worker can
+        //    exit via the recv_timeout path even though index_tx_worker keeps
+        //    the channel open), then drop index_tx as a belt-and-suspenders
+        //    close signal for the Disconnected path.
+        worker_stop.store(true, std::sync::atomic::Ordering::Release);
         drop(index_tx);
         // 3. Wait for the indexer worker to finish draining index_rx and exit.
         //    Without this await, the tokio runtime would wait for the detached
