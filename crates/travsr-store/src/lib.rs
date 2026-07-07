@@ -1859,7 +1859,7 @@ impl SqliteStore {
                     report.ghost_paths.push(ghost_path.clone());
                 }
                 // Yield between batches so queries are not starved.
-                std::hint::spin_loop();
+                std::thread::yield_now();
             }
 
             Ok(report)

@@ -887,7 +887,30 @@ pub fn init_repo_with_progress(
     // ARCH-102: detect canonical corpus from the git remote and persist it so
     // every VName in this graph uses the same corpus identifier.
     // reindex_files reads this value back on subsequent hook runs.
+    let stored_corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
     let corpus = detect_corpus(repo_root);
+
+    // §5 #12 / G5: corpus change (git remote changed) means every NodeId is
+    // different — the old corpus string is baked into every BLAKE3 hash. Purge
+    // all graph data so the new init starts clean rather than mixing id spaces.
+    if nodes_before > 0 && !stored_corpus.is_empty() && stored_corpus != corpus {
+        tracing::warn!(
+            old = %stored_corpus,
+            new = %corpus,
+            "corpus changed — purging all graph data for clean rebuild (§5 #12)"
+        );
+        let empty_walked = std::collections::HashSet::<String>::new();
+        let purge_policy = travsr_core::SafetyPolicy {
+            mass_delete_ceiling_pct: 1.0,
+            ..Default::default()
+        };
+        store
+            .reconcile(&empty_walked, &purge_policy, repo_root, &stored_corpus)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("corpus-change global-invalidation purge")?;
+        tracing::info!("corpus-change purge complete — rebuilding from scratch");
+    }
+
     store
         .set_meta("corpus", &corpus)
         .context("writing corpus to meta (ARCH-102)")?;
@@ -1851,7 +1874,7 @@ pub fn reindex_files(
     paths: &[PathBuf],
     repo_root: &Path,
     store: &mut SqliteStore,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<travsr_core::DirtySet> {
     // RFC-002: detect signature format version mismatch before touching the
     // graph. The hook must never block a commit, so return Ok(()) on mismatch
     // and let the user resolve it with `travsr init`.
@@ -1862,14 +1885,14 @@ pub fn reindex_files(
                  but this binary uses v{SIGNATURE_FORMAT_VERSION}. \
                  Run `travsr init` to re-index and update the graph."
             );
-            return Ok(());
+            return Ok(Default::default());
         }
         Err(e) => {
             tracing::warn!(
                 "could not read signature_format_version: {e}, skipping reindex. \
                  Run `travsr init` to repair the graph."
             );
-            return Ok(());
+            return Ok(Default::default());
         }
         _ => {}
     }
@@ -1898,6 +1921,8 @@ pub fn reindex_files(
     // markers from both sides of each FFI boundary are available.
     let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
     let mut any_changed = false;
+    // Accumulate Tier-0 dirty callers across all files in this batch.
+    let mut callers_all = travsr_core::DirtySet::default();
 
     for abs_path in paths {
         let vname_path = abs_path
@@ -1921,9 +1946,10 @@ pub fn reindex_files(
                             tracing::debug!(
                                 path = %vname_path,
                                 callers = %callers.len(),
-                                "delete_file: callers pending Tier-0 re-resolution (TODO #402)"
+                                "delete_file: collecting {} caller(s) for Tier-0 re-resolution",
+                                callers.len()
                             );
-                            // TODO(travsr): #402 Tier-0 — enqueue callers for dirty re-resolution
+                            callers_all.extend(callers);
                         }
                         any_changed = true;
                     }
@@ -1975,9 +2001,10 @@ pub fn reindex_files(
                         path = %vname_path,
                         removed = %report.removed_count,
                         callers = %report.callers.len(),
-                        "reindex_replace: removed symbols, callers pending Tier-0 (TODO #402)"
+                        "reindex_replace: removed symbols, collecting {} caller(s) for Tier-0",
+                        report.callers.len()
                     );
-                    // TODO(travsr): #402 Tier-0 — enqueue report.callers for dirty re-resolution
+                    callers_all.extend(report.callers);
                 }
                 any_changed = true;
                 // Collect FFI markers for the repo-level pass (RFC-005).
@@ -2037,7 +2064,7 @@ pub fn reindex_files(
     // The LSIF pass now runs only from `init_repo` (full initial index).
     // Per-commit LSIF delta is tracked as DEBT(travsr-25).
 
-    Ok(())
+    Ok(callers_all)
 }
 
 /// Run the LSIF semantic pass if `tsconfig.json` is present at the repo root,
@@ -2652,6 +2679,103 @@ mod tests {
         );
     }
 
+    /// §9 CI invariant: incremental delete + reindex must produce the same
+    /// node and edge counts as a full rebuild on the mutated tree.
+    ///
+    /// This is the executable form of principle #4 ("full reindex and an
+    /// incremental reindex of the same codebase produce identical graphs") and
+    /// would have caught #402.
+    #[test]
+    fn incremental_delete_matches_full_rebuild() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { run() {} }\n").unwrap();
+        std::fs::write(tmp.path().join("app.ts"), "export class App { go() {} }\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Incremental path: delete svc.ts on disk, then run reindex_files.
+        let svc_path = tmp.path().join("svc.ts");
+        std::fs::remove_file(&svc_path).unwrap();
+        {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&svc_path), tmp.path(), &mut store).unwrap();
+        }
+        let (inc_nodes, inc_edges) = {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            (store.node_count().unwrap(), store.edge_count().unwrap())
+        };
+
+        // Full-rebuild path: wipe .travsr and re-init on the same (now mutated) tree.
+        std::fs::remove_dir_all(tmp.path().join(".travsr")).unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+        let (full_nodes, full_edges) = {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            (store.node_count().unwrap(), store.edge_count().unwrap())
+        };
+
+        assert_eq!(
+            inc_nodes, full_nodes,
+            "incremental delete + reindex must yield same node count as full rebuild \
+             (incremental={inc_nodes}, full={full_nodes})"
+        );
+        assert_eq!(
+            inc_edges, full_edges,
+            "incremental delete + reindex must yield same edge count as full rebuild \
+             (incremental={inc_edges}, full={full_edges})"
+        );
+    }
+
+    /// Tier-0 propagation depth-1 bound: re-indexing a file that removes no
+    /// exported symbols (body-only edit) must return an empty DirtySet.
+    ///
+    /// This is the invariant that prevents cascade: when a Tier-0 caller is
+    /// re-indexed, its outbound edges are re-resolved but its own exported
+    /// symbols are unchanged, so `removed = ∅` and it enqueues nothing further.
+    #[test]
+    fn tier0_propagation_is_depth_one_no_cascade() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { run() {} }\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+
+        // Body-only edit: same exported symbol `Svc`, just different method body.
+        // This simulates what happens when a Tier-0 caller is re-indexed — it
+        // re-points its outbound edges but never renames its own symbols.
+        std::fs::write(
+            tmp.path().join("svc.ts"),
+            "export class Svc { run() { return 42; } }\n",
+        )
+        .unwrap();
+        let svc_path = tmp.path().join("svc.ts");
+        let cascade =
+            reindex_files(std::slice::from_ref(&svc_path), tmp.path(), &mut store).unwrap();
+
+        assert!(
+            cascade.is_empty(),
+            "body-only edit (no symbols removed) must return empty DirtySet; \
+             got {} caller(s) — Tier-0 cascade depth-1 bound would be violated",
+            cascade.len()
+        );
+    }
+
     // ── maybe_spawn_embed tests ───────────────────────────────────────────────
 
     fn setup_embed_store(tmp: &std::path::Path) -> travsr_store::SqliteStore {
@@ -3041,9 +3165,10 @@ impl Daemon {
         let indexer_worker = {
             let store_worker = Arc::clone(&store);
             let repo_worker = Arc::clone(&repo_root_arc);
+            let index_tx_worker = index_tx.clone();
             tokio::task::spawn_blocking(move || {
                 while let Ok(ev) = index_rx.recv() {
-                    handle_watch_event(ev, &repo_worker, &store_worker);
+                    handle_watch_event(ev, &repo_worker, &store_worker, &index_tx_worker);
                 }
                 tracing::debug!("indexer worker exiting — channel closed");
             })
@@ -3062,6 +3187,7 @@ impl Daemon {
             let sd_win = Arc::clone(&pipe_shutdown);
             let cache_win = Arc::clone(&query_cache);
             let sched_win = Arc::clone(&phase_b_scheduler);
+            let index_tx_win = index_tx.clone();
             let pipe_name_accept = pipe_name.clone();
             tokio::spawn(async move {
                 let mut first_instance = true;
@@ -3090,6 +3216,7 @@ impl Daemon {
                     let sd = Arc::clone(&sd_win);
                     let cache = Arc::clone(&cache_win);
                     let sched = Arc::clone(&sched_win);
+                    let index_tx_conn = index_tx_win.clone();
                     tokio::spawn(async move {
                         let (reader, mut writer) = tokio::io::split(server);
                         let mut lines = BufReader::new(reader).lines();
@@ -3103,6 +3230,7 @@ impl Daemon {
                                         &read_store,
                                         &cache,
                                         &sched,
+                                        &index_tx_conn,
                                     )
                                 })
                                 .await
@@ -3148,6 +3276,7 @@ impl Daemon {
                         let sd_notify = Arc::clone(&sock_shutdown);
                         let cache = Arc::clone(&query_cache);
                         let sched = Arc::clone(&phase_b_scheduler);
+                        let index_tx_conn = index_tx.clone();
                         tokio::spawn(async move {
                             let (reader, mut writer) = conn.into_split();
                             let mut lines = BufReader::new(reader).lines();
@@ -3164,6 +3293,7 @@ impl Daemon {
                                             &read_store,
                                             &cache,
                                             &sched,
+                                            &index_tx_conn,
                                         )
                                     })
                                     .await
@@ -3351,18 +3481,64 @@ impl Daemon {
     }
 }
 
+/// Hard cap on Tier-0 dirty callers enqueued per reindex operation.
+///
+/// Overflow drops the excess; the next-commit Phase B or `travsr init`
+/// reconcile covers missed re-resolutions.
+const DIRTY_QUEUE_CAP: usize = 100_000;
+
+/// Send Tier-0 re-resolve requests for `callers` into the indexer channel.
+///
+/// Each caller is sent as a `WatchEvent::Upsert` so it runs through the same
+/// `reindex_files` path as a normal watcher event. Callers whose path is
+/// absent on disk are skipped (a concurrent delete will arrive as a Remove
+/// event separately). The cap enforces the `MAX_PENDING` bound from §4.
+fn enqueue_dirty_callers(
+    callers: travsr_core::DirtySet,
+    repo_root: &std::path::Path,
+    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+) {
+    if callers.is_empty() {
+        return;
+    }
+    let total = callers.len();
+    let mut enqueued = 0usize;
+    for caller in callers.into_iter().take(DIRTY_QUEUE_CAP) {
+        let abs = repo_root.join(&caller);
+        if !abs.exists() {
+            continue;
+        }
+        if index_tx.send(watcher::WatchEvent::Upsert(abs)).is_err() {
+            tracing::warn!("Tier-0: indexer channel closed, dropping remaining callers");
+            break;
+        }
+        enqueued += 1;
+    }
+    if total > DIRTY_QUEUE_CAP {
+        tracing::warn!(
+            total,
+            "Tier-0: dirty caller set ({total}) exceeded cap {DIRTY_QUEUE_CAP}; \
+             excess deferred to Phase B / next reconcile"
+        );
+    } else {
+        tracing::debug!(enqueued, "Tier-0: enqueued {enqueued} dirty caller(s) for re-resolution");
+    }
+}
+
 fn handle_watch_event(
     ev: watcher::WatchEvent,
     repo_root: &std::path::Path,
     store: &std::sync::Mutex<SqliteStore>,
+    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
 ) {
     use watcher::WatchEvent;
 
     match ev {
         WatchEvent::Upsert(path) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
-                tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed");
+            match reindex_files(std::slice::from_ref(&path), repo_root, &mut s) {
+                Ok(callers) => enqueue_dirty_callers(callers, repo_root, index_tx),
+                Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher reindex failed"),
             }
         }
         WatchEvent::Remove(path) => {
@@ -3379,15 +3555,7 @@ fn handle_watch_event(
                 .flatten()
                 .unwrap_or_default();
             match s.delete_file(&corpus, &vname_path) {
-                Ok(callers) if !callers.is_empty() => {
-                    tracing::debug!(
-                        path = %path.display(),
-                        callers = %callers.len(),
-                        "watcher delete_file: callers pending Tier-0 (TODO #402)"
-                    );
-                    // TODO(travsr): #402 Tier-0 — enqueue callers for dirty re-resolution
-                }
-                Ok(_) => {}
+                Ok(callers) => enqueue_dirty_callers(callers, repo_root, index_tx),
                 Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher delete_file failed"),
             }
         }
@@ -3420,6 +3588,7 @@ fn handle_control_message(
     read_store: &std::sync::Mutex<SqliteStore>,
     cache: &std::sync::Mutex<query_cache::QueryCache>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
+    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
 ) -> (travsr_ipc::ControlResponse, bool) {
     use travsr_ipc::{ControlMessage, ControlResponse};
 
@@ -3434,11 +3603,15 @@ fn handle_control_message(
                 }
             };
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
-                tracing::warn!(err=%e, "control reindex failed");
-                return (ControlResponse::err(e.to_string()), false);
-            }
+            let dirty = match reindex_files(&paths, repo_root, &mut s) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(err=%e, "control reindex failed");
+                    return (ControlResponse::err(e.to_string()), false);
+                }
+            };
             drop(s);
+            enqueue_dirty_callers(dirty, repo_root, index_tx);
             // #318 O3: Phase A is now fresh for this commit; arm a debounced
             // background Phase B refresh so the semantic layer catches up too.
             phase_b_scheduler.mark_dirty();
@@ -3449,9 +3622,12 @@ fn handle_control_message(
         }
         Ok(ControlMessage::ReindexPaths { paths }) => {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = reindex_files(&paths, repo_root, &mut s) {
-                return (ControlResponse::err(e.to_string()), false);
-            }
+            let dirty = match reindex_files(&paths, repo_root, &mut s) {
+                Ok(d) => d,
+                Err(e) => return (ControlResponse::err(e.to_string()), false),
+            };
+            drop(s);
+            enqueue_dirty_callers(dirty, repo_root, index_tx);
             (ControlResponse::ok(None), false)
         }
         Ok(ControlMessage::Status) => {

@@ -628,7 +628,16 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 paths.iter().map(|p| repo_root.join(p)).collect()
             };
-            travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
+            let dirty = travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
+            if !dirty.is_empty() {
+                // No daemon running: Tier-0 callers cannot be re-enqueued.
+                // Phase B on the next commit will re-resolve cross-file edges.
+                tracing::debug!(
+                    callers = dirty.len(),
+                    "hook-run (no daemon): {} Tier-0 caller(s) deferred to next Phase B",
+                    dirty.len()
+                );
+            }
         }
         Command::Migrate { to } => migrate::run_to(&to)?,
         Command::Serve { port, tenants_dir } => {

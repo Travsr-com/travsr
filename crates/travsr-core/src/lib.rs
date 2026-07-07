@@ -930,7 +930,7 @@ impl ImportResolver for DartResolver {
 pub type DirtySet = std::collections::HashSet<String>;
 
 /// Returned by the store's `reindex_replace` operation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ReplaceReport {
     /// Number of symbols that vanished in this edit (old id not present in new parse).
     pub removed_count: usize,
@@ -939,7 +939,7 @@ pub struct ReplaceReport {
 }
 
 /// Summary returned by `reconcile` / `travsr fsck`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct GcReport {
     /// VName paths ghost-deleted from the graph.
     pub ghost_paths: Vec<String>,

@@ -9,14 +9,8 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
     let report = travsr_daemon::fsck_repo(&repo_root, fix, force)?;
 
     if json {
-        let out = serde_json::json!({
-            "node_count": report.node_count,
-            "edge_count": report.edge_count,
-            "ghost_paths": report.ghost_paths,
-            "orphan_edges_swept": report.orphan_edges_swept,
-            "aborted": report.aborted,
-            "abort_reason": report.abort_reason,
-        });
+        let out = serde_json::to_string_pretty(&report)
+            .context("serializing GcReport to JSON")?;
         println!("{out}");
         return Ok(());
     }
