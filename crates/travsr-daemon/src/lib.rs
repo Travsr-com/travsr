@@ -628,6 +628,96 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Graph integrity check and optional repair — the `travsr fsck` entry point.
+///
+/// Walks the repo, computes the ghost set (paths tracked in the DB but absent
+/// on disk), and reports them. With `fix=true`, deletes ghosts and sweeps
+/// orphan edges. With `force=true`, overrides the mass-delete circuit breaker.
+///
+/// Returns a [`travsr_core::GcReport`] suitable for human or JSON output.
+pub fn fsck_repo(
+    repo_root: &Path,
+    fix: bool,
+    force: bool,
+) -> anyhow::Result<travsr_core::GcReport> {
+    let db_path = repo_root.join(".travsr/graph.db");
+    anyhow::ensure!(
+        db_path.exists(),
+        "no graph.db found at {} — run `travsr init` first",
+        db_path.display()
+    );
+
+    let mut store = SqliteStore::open(&db_path)
+        .with_context(|| format!("opening {}", db_path.display()))?;
+
+    let corpus = store.get_meta("corpus")?.unwrap_or_default();
+
+    let mut report = travsr_core::GcReport {
+        node_count: store.node_count()?,
+        edge_count: store.edge_count()?,
+        ..travsr_core::GcReport::default()
+    };
+
+    // Walk the disk (follow_links=false per §6.5 S4, matching the watcher).
+    let mut walked_paths = std::collections::HashSet::<String>::new();
+    for entry in ignore::WalkBuilder::new(repo_root)
+        .follow_links(false)
+        .build()
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel = path.strip_prefix(repo_root).unwrap_or(path);
+        if rel
+            .components()
+            .any(|c| watcher::SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip))
+        {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if travsr_core::Language::from_extension(ext).is_none() {
+            continue;
+        }
+        walked_paths.insert(rel.to_string_lossy().replace('\\', "/"));
+    }
+
+    // Compute ghost set: in DB but absent on disk.
+    let db_hashes = store.get_all_file_hashes()?;
+    let db_paths: std::collections::HashSet<String> = db_hashes.into_keys().collect();
+    let ghosts: Vec<String> = db_paths.difference(&walked_paths).cloned().collect();
+    report.ghost_paths = ghosts.clone();
+
+    if !fix {
+        return Ok(report);
+    }
+
+    let policy = if force {
+        travsr_core::SafetyPolicy {
+            mass_delete_ceiling_pct: 1.0,
+            ..Default::default()
+        }
+    } else {
+        travsr_core::SafetyPolicy::default()
+    };
+
+    // reconcile enforces the circuit breaker, TOCTOU re-check, and batched deletes.
+    let mut fix_report = store.reconcile(&walked_paths, &policy, repo_root, &corpus)?;
+
+    // Sweep any residual orphan edges (Tier-4 defect indicator).
+    let orphans = store.sweep_orphans()?;
+    fix_report.orphan_edges_swept = orphans;
+    if orphans > 0 {
+        tracing::warn!(
+            orphans,
+            "fsck: non-zero orphan edge count — write-path invariant violated"
+        );
+    }
+
+    Ok(fix_report)
+}
+
 pub fn init_repo(repo_root: &Path) -> anyhow::Result<InitStats> {
     init_repo_with_progress(repo_root, None, false, &mut |_| {})
 }
@@ -1816,8 +1906,31 @@ pub fn reindex_files(
             .to_string_lossy()
             .replace('\\', "/");
 
+        // §2 GC keystone: detect deletion before touching the graph.
         let new_hash = match hash_file(abs_path) {
             Ok(h) => h,
+            Err(ref err)
+                if err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                // File was deleted — both-direction delete + clear file hash row.
+                match store.delete_file(&corpus, &vname_path) {
+                    Ok(callers) => {
+                        if !callers.is_empty() {
+                            tracing::debug!(
+                                path = %vname_path,
+                                callers = %callers.len(),
+                                "delete_file: callers pending Tier-0 re-resolution (TODO #402)"
+                            );
+                            // TODO(travsr): #402 Tier-0 — enqueue callers for dirty re-resolution
+                        }
+                        any_changed = true;
+                    }
+                    Err(e) => tracing::warn!(path = %vname_path, err = %e, "delete_file failed"),
+                }
+                continue;
+            }
             Err(err) => {
                 tracing::warn!("skipping {}: {err}", abs_path.display());
                 continue;
@@ -1830,28 +1943,16 @@ pub fn reindex_files(
             continue; // unchanged — skip
         }
 
-        store.delete_nodes_for_path(&vname_path)?;
-
+        // §2 GC keystone: parse FIRST — a syntax error never erases the old graph.
         let out = match indexer.parse_file_with_vname(abs_path, &vname_path) {
             Ok(o) => o,
             Err(err) => {
                 tracing::warn!("parse error for {}: {err}", abs_path.display());
-                continue;
+                continue; // keep old graph intact
             }
         };
 
-        for node in &out.nodes {
-            if let Err(err) = store.put_node(node) {
-                tracing::warn!("node write error: {err}");
-            }
-        }
-        for edge in &out.edges {
-            if let Err(err) = store.put_edge(edge) {
-                tracing::warn!("edge write error: {err}");
-            }
-        }
-
-        // Route to the language-appropriate import resolver.
+        // Build import-resolver edges before the atomic reindex_replace call.
         let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let import_edges = match Language::from_extension(ext) {
             Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
@@ -1861,17 +1962,29 @@ pub fn reindex_files(
             }
             _ => Vec::new(),
         };
-        for edge in import_edges {
-            if let Err(err) = store.put_edge(&edge) {
-                tracing::warn!("resolves-to edge write error: {err}");
+        let mut all_edges = out.edges.clone();
+        all_edges.extend(import_edges);
+
+        // §2: owned-edge-only atomic replace — preserves inbound edges to surviving
+        // symbols (blank-line/body edits lossless) and eagerly deletes orphans for
+        // removed symbols. Hash upsert is inside the same transaction.
+        match store.reindex_replace(&corpus, &vname_path, &out.nodes, &all_edges, &new_hex) {
+            Ok(report) => {
+                if !report.callers.is_empty() {
+                    tracing::debug!(
+                        path = %vname_path,
+                        removed = %report.removed_count,
+                        callers = %report.callers.len(),
+                        "reindex_replace: removed symbols, callers pending Tier-0 (TODO #402)"
+                    );
+                    // TODO(travsr): #402 Tier-0 — enqueue report.callers for dirty re-resolution
+                }
+                any_changed = true;
+                // Collect FFI markers for the repo-level pass (RFC-005).
+                all_ffi_markers.extend(out.ffi_markers);
             }
+            Err(e) => tracing::warn!(path = %vname_path, err = %e, "reindex_replace failed"),
         }
-
-        store.put_file_hash(&vname_path, &new_hex)?;
-        any_changed = true;
-
-        // Collect FFI markers for the repo-level pass (RFC-005).
-        all_ffi_markers.extend(out.ffi_markers);
     }
 
     // Cross-language FFI resolution — single pass over all accumulated markers
@@ -2454,6 +2567,88 @@ mod tests {
             stats.total_nodes > 0,
             "total_nodes must reflect existing graph on re-run, got {}",
             stats.total_nodes
+        );
+    }
+
+    // ── GC invariant tests ───────────────────────────────────────────────────
+
+    /// A blank-line edit (no structural change) must preserve the node count
+    /// after `reindex_replace`, and leave no orphan edges. (Edge count is not
+    /// asserted because Tree-sitter uses byte-offset spans in some edge source
+    /// locations, which can change when lines shift — node identity is what
+    /// matters for graph correctness.)
+    #[test]
+    fn blank_line_preserves_node_count_and_no_orphans() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        let ts_path = tmp.path().join("svc.ts");
+        std::fs::write(&ts_path, "export class Svc { run() {} }\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let nodes_before = store.node_count().unwrap();
+        assert!(nodes_before > 0, "must have nodes after init");
+
+        // Insert a blank line at the start — shifts all source positions.
+        std::fs::write(&ts_path, "\nexport class Svc { run() {} }\n").unwrap();
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+
+        let nodes_after = store.node_count().unwrap();
+        assert_eq!(
+            nodes_before, nodes_after,
+            "blank-line edit must not change node count ({nodes_before} → {nodes_after})"
+        );
+
+        // No orphan edges must remain regardless of edge-count change.
+        let orphans = store.sweep_orphans().unwrap();
+        assert_eq!(
+            orphans, 0,
+            "blank-line reindex must leave no orphan edges; sweep found {orphans}"
+        );
+    }
+
+    /// `delete_file` uses both-direction semantics: all edges whose src or dst
+    /// lives in the deleted file are removed. After deletion, `sweep_orphans`
+    /// must report 0 (the write path left no dangling edges).
+    #[test]
+    fn delete_file_leaves_no_orphan_edges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // Two files so the indexer records edges for both.
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { run() {} }").unwrap();
+        std::fs::write(tmp.path().join("app.ts"), "export class App { go() {} }").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(store.node_count().unwrap() > 0, "must have nodes after init");
+
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        store.delete_file(&corpus, "svc.ts").unwrap();
+
+        // No nodes from svc.ts should remain.
+        let svc_nodes = store.search_nodes_by_name("Svc").unwrap();
+        assert!(
+            svc_nodes.is_empty(),
+            "delete_file must remove all nodes for svc.ts"
+        );
+
+        // Orphan sweep must find nothing — both-direction delete left no dangling edges.
+        let orphans = store.sweep_orphans().unwrap();
+        assert_eq!(
+            orphans, 0,
+            "delete_file must leave no orphan edges; sweep found {orphans}"
         );
     }
 
@@ -3177,8 +3372,23 @@ fn handle_watch_event(
                 .to_string_lossy()
                 .replace('\\', "/");
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = s.delete_nodes_for_path(&vname_path) {
-                tracing::warn!(path=%path.display(), err=%e, "watcher delete failed");
+            // Read corpus from meta so delete_file uses the correct VName scope.
+            let corpus = s
+                .get_meta("corpus")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            match s.delete_file(&corpus, &vname_path) {
+                Ok(callers) if !callers.is_empty() => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        callers = %callers.len(),
+                        "watcher delete_file: callers pending Tier-0 (TODO #402)"
+                    );
+                    // TODO(travsr): #402 Tier-0 — enqueue callers for dirty re-resolution
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher delete_file failed"),
             }
         }
     }

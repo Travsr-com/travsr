@@ -99,7 +99,7 @@ impl EmbedReadiness {
 
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
+use travsr_core::{DirtySet, Edge, EdgeKind, GcReport, Node, NodeId, ReplaceReport, SafetyPolicy, VName};
 use travsr_error::StoreError;
 
 use crate::fts_tokenize::{build_fuzzy_match_expr_db, tokenize_identifier};
@@ -1503,6 +1503,384 @@ impl SqliteStore {
             Ok(count as u64)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// True file-deletion GC: removes all nodes, both-direction edges, FTS rows,
+    /// and the `files` hash row for `path`. Returns the set of caller file paths
+    /// that had inbound edges to the deleted nodes so the daemon can enqueue them
+    /// for Tier-0 re-resolution.
+    ///
+    /// Corpus-scoped so every lookup hits the v13 `(corpus, path)` index.
+    /// All operations run in one transaction (atomicity + WAL crash safety).
+    pub fn delete_file(&mut self, corpus: &str, path: &str) -> Result<DirtySet, StoreError> {
+        (|| -> AnyResult<DirtySet> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting delete_file transaction")?;
+
+            // Collect callers BEFORE any delete.
+            let mut callers = DirtySet::default();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT DISTINCT n.path \
+                         FROM edges e JOIN nodes n ON n.id = e.src \
+                         WHERE e.dst IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                           AND n.path != ?2",
+                    )
+                    .context("preparing caller query for delete_file")?;
+                for row in stmt
+                    .query_map(params![corpus, path], |r| r.get::<_, String>(0))
+                    .context("executing caller query")?
+                {
+                    callers.insert(row.context("reading caller path")?);
+                }
+            }
+
+            // Load token strings for vocab decrement BEFORE removing map rows.
+            let token_strings: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT m.tokens FROM nodes_fts_map m \
+                         JOIN nodes n ON n.id = m.node_id \
+                         WHERE n.corpus=?1 AND n.path=?2",
+                    )
+                    .context("preparing token load for delete_file")?;
+                let rows: Vec<String> = stmt
+                    .query_map(params![corpus, path], |r| r.get::<_, String>(0))
+                    .context("executing token load")?
+                    .collect::<rusqlite::Result<_>>()
+                    .context("collecting token strings")?;
+                rows
+            };
+
+            // Delete ALL edges (both directions) — every symbol in this path is dead.
+            tx.execute(
+                "DELETE FROM edges \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                    OR dst IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("deleting both-direction edges for delete_file")?;
+
+            // Retract FTS entries before deleting nodes.
+            tx.execute(
+                "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
+                 SELECT 'delete', m.node_id, m.tokens \
+                 FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.corpus=?1 AND n.path=?2",
+                params![corpus, path],
+            )
+            .context("retracting FTS rows for delete_file")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("removing nodes_fts_map rows for delete_file")?;
+            for ts in &token_strings {
+                Self::vocab_decrement(&tx, ts)?;
+            }
+
+            // Delete nodes — v17 capture_node_delete trigger auto-writes tombstones.
+            tx.execute(
+                "DELETE FROM nodes WHERE corpus=?1 AND path=?2",
+                params![corpus, path],
+            )
+            .context("deleting nodes for delete_file")?;
+
+            // Clear the file hash row so Tier-2 reconcile never sees this as a ghost.
+            tx.execute("DELETE FROM files WHERE path=?1", params![path])
+                .context("removing file hash row for delete_file")?;
+
+            tx.commit().context("committing delete_file transaction")?;
+            Ok(callers)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// In-place file update with owned-edge-only semantics (§2 of the GC doc).
+    ///
+    /// The caller MUST parse first; call this only on parse success so a syntax
+    /// error never erases the existing graph. All operations run in one transaction.
+    ///
+    /// Ownership rule:
+    /// - Deletes only `src ∈ nodes(corpus, path)` edges (outbound, owned by this file).
+    /// - Inbound edges to surviving symbol IDs are never touched (blank-line/body
+    ///   edits are lossless).
+    /// - Symbols that vanished have their inbound edges deleted eagerly so PPR/BFS
+    ///   never traverses into a missing node.
+    pub fn reindex_replace(
+        &mut self,
+        corpus: &str,
+        path: &str,
+        nodes: &[Node],
+        edges: &[Edge],
+        new_hash: &str,
+    ) -> Result<ReplaceReport, StoreError> {
+        (|| -> AnyResult<ReplaceReport> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting reindex_replace transaction")?;
+
+            // Snapshot old NodeIds (i64) before any delete.
+            let old_ids: std::collections::HashSet<i64> = {
+                let mut stmt = tx
+                    .prepare("SELECT id FROM nodes WHERE corpus=?1 AND path=?2")
+                    .context("preparing old_ids snapshot")?;
+                let rows: std::collections::HashSet<i64> = stmt
+                    .query_map(params![corpus, path], |r| r.get::<_, i64>(0))
+                    .context("executing old_ids snapshot")?
+                    .collect::<rusqlite::Result<_>>()
+                    .context("collecting old_ids")?;
+                rows
+            };
+
+            // Load token strings for vocab decrement BEFORE removing map rows.
+            let token_strings: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT m.tokens FROM nodes_fts_map m \
+                         JOIN nodes n ON n.id = m.node_id \
+                         WHERE n.corpus=?1 AND n.path=?2",
+                    )
+                    .context("preparing token load for reindex_replace")?;
+                let rows: Vec<String> = stmt
+                    .query_map(params![corpus, path], |r| r.get::<_, String>(0))
+                    .context("executing token load")?
+                    .collect::<rusqlite::Result<_>>()
+                    .context("collecting token strings")?;
+                rows
+            };
+
+            // Delete only OWNED (outbound) edges — inbound edges from other files retained.
+            tx.execute(
+                "DELETE FROM edges \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("deleting owned edges for reindex_replace")?;
+
+            // Retract FTS for old nodes.
+            tx.execute(
+                "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
+                 SELECT 'delete', m.node_id, m.tokens \
+                 FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.corpus=?1 AND n.path=?2",
+                params![corpus, path],
+            )
+            .context("retracting FTS rows for reindex_replace")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("removing nodes_fts_map rows for reindex_replace")?;
+            for ts in &token_strings {
+                Self::vocab_decrement(&tx, ts)?;
+            }
+
+            // Delete old nodes — v17 trigger auto-writes tombstones for changed IDs.
+            tx.execute(
+                "DELETE FROM nodes WHERE corpus=?1 AND path=?2",
+                params![corpus, path],
+            )
+            .context("deleting old nodes for reindex_replace")?;
+
+            // Write new nodes + FTS within this transaction.
+            // put_node_fts accepts &Connection; Transaction derefs to Connection.
+            let mut new_ids = std::collections::HashSet::<i64>::new();
+            for node in nodes {
+                let id_i64 = node_id_to_i64(node.id);
+                new_ids.insert(id_i64);
+                tx.execute(
+                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                     ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
+                     package = excluded.package, \
+                     line = COALESCE(excluded.line, nodes.line), \
+                     end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                    params![
+                        id_i64,
+                        node.vname.corpus,
+                        node.vname.root,
+                        node.vname.path,
+                        node.vname.language,
+                        node.vname.signature,
+                        node.kind,
+                        node.package,
+                        node.line.map(|l| l as i64),
+                        node.end_line.map(|l| l as i64),
+                    ],
+                )
+                .context("inserting node in reindex_replace")?;
+                Self::put_node_fts(&tx, node).context("put_node_fts in reindex_replace")?;
+            }
+
+            // Write new edges.
+            for edge in edges {
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1, ?2, ?3, 'tree-sitter', ?4) \
+                     ON CONFLICT(src, dst, kind) DO NOTHING",
+                    params![
+                        node_id_to_i64(edge.src),
+                        node_id_to_i64(edge.dst),
+                        edge.kind.as_str(),
+                        edge.confidence.map(|c| c as i64),
+                    ],
+                )
+                .context("inserting edge in reindex_replace")?;
+            }
+
+            // Detect symbols that vanished (old id absent from new parse).
+            let removed_ids: Vec<i64> = old_ids
+                .iter()
+                .filter(|id| !new_ids.contains(id))
+                .copied()
+                .collect();
+
+            let mut callers = DirtySet::default();
+            if !removed_ids.is_empty() {
+                for &removed_id in &removed_ids {
+                    // Find callers before deleting their inbound edge.
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT DISTINCT n.path FROM edges e JOIN nodes n ON n.id = e.src \
+                             WHERE e.dst = ?1 AND n.path != ?2",
+                        )
+                        .context("preparing per-symbol caller query")?;
+                    for row in stmt
+                        .query_map(params![removed_id, path], |r| r.get::<_, String>(0))
+                        .context("executing per-symbol caller query")?
+                    {
+                        callers.insert(row.context("reading caller path")?);
+                    }
+                    // Eagerly delete inbound orphan edges for this removed symbol.
+                    tx.execute("DELETE FROM edges WHERE dst = ?1", params![removed_id])
+                        .context("deleting inbound orphan edges for removed symbol")?;
+                }
+            }
+
+            // Upsert file hash.
+            tx.execute(
+                "INSERT INTO files(path, sha256, last_indexed_at) \
+                 VALUES(?1, ?2, unixepoch()) \
+                 ON CONFLICT(path) DO UPDATE SET \
+                   sha256 = excluded.sha256, \
+                   last_indexed_at = excluded.last_indexed_at",
+                params![path, new_hash],
+            )
+            .context("upserting file hash in reindex_replace")?;
+
+            tx.commit()
+                .context("committing reindex_replace transaction")?;
+
+            Ok(ReplaceReport {
+                removed_count: removed_ids.len(),
+                callers,
+            })
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Tier-2 disk-vs-graph reconciliation with §6.5 safety guards.
+    ///
+    /// `walked_paths` is the VName-normalised path set found on disk (caller
+    /// is responsible for the walk + normalisation). `db_paths − walked` = ghosts.
+    ///
+    /// Safety (§6.5): mass-delete circuit breaker + TOCTOU re-check + batched
+    /// deletes ≤500/txn so a large branch switch cannot hold the write lock for
+    /// seconds or starve queries.
+    pub fn reconcile(
+        &mut self,
+        walked_paths: &std::collections::HashSet<String>,
+        policy: &SafetyPolicy,
+        repo_root: &std::path::Path,
+        corpus: &str,
+    ) -> Result<GcReport, StoreError> {
+        (|| -> AnyResult<GcReport> {
+            let node_count = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+                .context("counting nodes for GcReport")? as u64;
+            let edge_count = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get::<_, i64>(0))
+                .context("counting edges for GcReport")? as u64;
+            let mut report = GcReport { node_count, edge_count, ..GcReport::default() };
+
+            let db_hashes = self
+                .get_all_file_hashes()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let db_paths: std::collections::HashSet<String> = db_hashes.into_keys().collect();
+
+            let ghosts: Vec<String> = db_paths.difference(walked_paths).cloned().collect();
+
+            // §6.5 S2 — mass-delete circuit breaker.
+            let ceiling = std::cmp::max(
+                policy.mass_delete_ceiling_min,
+                (db_paths.len() as f64 * policy.mass_delete_ceiling_pct) as usize,
+            );
+            if ghosts.len() > ceiling {
+                let reason = format!(
+                    "ghost count {} exceeds ceiling {} ({}% of {} tracked paths); \
+                     re-run with --force to override",
+                    ghosts.len(),
+                    ceiling,
+                    (policy.mass_delete_ceiling_pct * 100.0) as u32,
+                    db_paths.len(),
+                );
+                tracing::error!(
+                    ghost_count = ghosts.len(),
+                    ceiling,
+                    "reconcile: circuit breaker tripped — deleting nothing"
+                );
+                report.aborted = true;
+                report.abort_reason = Some(reason);
+                return Ok(report);
+            }
+
+            const BATCH: usize = 500;
+            for chunk in ghosts.chunks(BATCH) {
+                for ghost_path in chunk {
+                    // §6.5 S3 — TOCTOU re-check.
+                    if policy.toctou_recheck && repo_root.join(ghost_path).exists() {
+                        tracing::debug!(
+                            path = %ghost_path,
+                            "reconcile: TOCTOU — file reappeared, skipping"
+                        );
+                        continue;
+                    }
+                    self.delete_file(corpus, ghost_path)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    report.ghost_paths.push(ghost_path.clone());
+                }
+                // Yield between batches so queries are not starved.
+                std::hint::spin_loop();
+            }
+
+            Ok(report)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Orphan-edge sweep: deletes every edge whose src or dst is absent from
+    /// `nodes`. Should return 0 in correct operation after Tiers 0–2; a non-zero
+    /// count indicates a write-path invariant violation.
+    pub fn sweep_orphans(&mut self) -> Result<u64, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM edges \
+                 WHERE src NOT IN (SELECT id FROM nodes) \
+                    OR dst NOT IN (SELECT id FROM nodes)",
+                [],
+            )
+            .map(|n| n as u64)
+            .context("sweeping orphan edges")
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Delete all nodes (and their edges) whose VName path starts with `prefix`.

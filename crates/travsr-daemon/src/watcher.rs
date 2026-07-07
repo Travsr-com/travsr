@@ -206,19 +206,27 @@ pub fn spawn(
                                 }
                             }
 
-                            if should_skip(path, &repo_root, &gitignore) {
+                            if should_skip_all(path, &repo_root, &gitignore) {
                                 continue;
                             }
 
                             // Name(From) is the "old path" half of a rename — treat
                             // it as Remove so deleted nodes are tombstoned.
                             // Name(To) and all other events are Upsert.
+                            // For Upsert: also apply the upsert-specific filter
+                            // (is_file + language ext). NOT applied to Remove: the
+                            // file no longer exists so is_file() returns false.
                             let kind = match event.kind {
                                 EventKind::Remove(_)
                                 | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
                                     PendingKind::Remove
                                 }
-                                _ => PendingKind::Upsert,
+                                _ => {
+                                    if should_skip_upsert(path) {
+                                        continue;
+                                    }
+                                    PendingKind::Upsert
+                                }
                             };
 
                             let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
@@ -294,8 +302,9 @@ fn build_gitignore(repo_root: &Path) -> Gitignore {
     builder.build().unwrap_or(Gitignore::empty())
 }
 
-fn should_skip(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
-    // Skip directory components in the SKIP_DIRS list.
+/// Filter applied to ALL events (Upsert and Remove).
+/// Skips SKIP_DIRS components and gitignored paths.
+fn should_skip_all(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
     let rel = path.strip_prefix(repo_root).unwrap_or(path);
     if rel
         .components()
@@ -303,12 +312,14 @@ fn should_skip(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
     {
         return true;
     }
-    // Skip gitignored paths.
-    if gitignore.matched(rel, path.is_dir()).is_ignore() {
-        return true;
-    }
-    // Sockets, directories, FIFOs, and other non-regular entries have no
-    // indexable content — skip them rather than letting them fall through.
+    gitignore.matched(rel, false).is_ignore()
+}
+
+/// Additional filter applied only to Upsert events.
+/// Skips non-regular files and files with no indexable language extension.
+/// NOT applied to Remove events: the file no longer exists on disk when the
+/// event fires, so `is_file()` would return false for a just-deleted source file.
+fn should_skip_upsert(path: &Path) -> bool {
     if !path.is_file() {
         return true;
     }
