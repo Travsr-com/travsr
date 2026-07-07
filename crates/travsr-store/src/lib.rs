@@ -2075,12 +2075,28 @@ LIMIT 100",
         signature: &str,
         path_hint: Option<&str>,
     ) -> Result<Vec<Node>, StoreError> {
+        // Escape SQL LIKE metacharacters so a path hint is matched literally.
+        // Paired with `ESCAPE '\'` in the query. `\` itself is escaped first.
+        fn escape_like(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if matches!(c, '\\' | '%' | '_') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
         let _span = tracing::debug_span!(
             "store.lookup_nodes_exact",
             signature,
             path_hint = path_hint.unwrap_or("(none)")
         )
         .entered();
+        // `?2` is the raw hint (exact match + NULL guard); `?3` is the same hint
+        // with LIKE metacharacters (`%`, `_`, `\`) escaped so a suffix pin like
+        // "my_file.rs" is matched literally and never treated as a wildcard.
+        let like_hint: Option<String> = path_hint.map(escape_like);
         (|| -> AnyResult<Vec<Node>> {
             let mut stmt = self
                 .conn
@@ -2092,11 +2108,11 @@ WHERE signature = ?1
   AND (
         ?2 IS NULL
      OR path = ?2
-     OR path LIKE '%/' || ?2
+     OR path LIKE '%/' || ?3 ESCAPE '\\'
   )
 ORDER BY
   CASE
-    WHEN ?2 IS NOT NULL AND (path = ?2 OR path LIKE '%/' || ?2) THEN 0
+    WHEN ?2 IS NOT NULL AND (path = ?2 OR path LIKE '%/' || ?3 ESCAPE '\\') THEN 0
     ELSE 1
   END ASC,
   id ASC
@@ -2105,7 +2121,7 @@ LIMIT 20",
                 .context("preparing lookup_nodes_exact query")?;
 
             let rows = stmt
-                .query_map(params![signature, path_hint], |row| {
+                .query_map(params![signature, path_hint, like_hint], |row| {
                     let id = i64_to_node_id(row.get::<_, i64>(0)?);
                     let vname = VName::new(
                         row.get::<_, String>(1)?,
@@ -5857,18 +5873,42 @@ mod tests {
         );
         store.put_node(&n).unwrap();
 
-        // A hint with SQL wildcard characters must not match src/main.rs.
+        // The hint "src/%" must be matched literally: since no stored path ends
+        // with the literal three chars "src/%", nothing matches. Before the
+        // ESCAPE fix, '%' was a wildcard and this would have matched src/main.rs.
         let results = store.lookup_nodes_exact("fn:run", Some("src/%")).unwrap();
-        // The hint "src/%" is NOT a suffix of "src/main.rs" so must not match
-        // (we only use it as a literal suffix, not a LIKE pattern for the hint
-        // itself; the SQL uses '%/' || ?2 which would be '%/src/%' and would
-        // match 'x/src/%' literally — fine as long as no path IS literally
-        // 'src/%').
-        // Primary assertion: the node whose path is "src/main.rs" is NOT
-        // matched by the hint literal "src/%" (no path ends with "src/%").
         assert!(
             results.is_empty(),
             "wildcard characters in path_hint must not be interpolated as SQL wildcards"
+        );
+    }
+
+    // T-S6: an underscore in a path hint is a literal character, not the LIKE
+    // single-character wildcard. "my_file.rs" must pin only src/my_file.rs and
+    // must NOT match the decoy src/myXfile.rs.
+    #[test]
+    fn lookup_nodes_exact_underscore_hint_is_literal() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let real = Node::new(
+            VName::new("corpus", "", "src/my_file.rs", "rust", "fn:run"),
+            "function",
+        );
+        let decoy = Node::new(
+            VName::new("corpus", "", "src/myXfile.rs", "rust", "fn:run"),
+            "function",
+        );
+        store.put_node(&real).unwrap();
+        store.put_node(&decoy).unwrap();
+
+        // Suffix pin via filename only — exercises the LIKE branch.
+        let hits = store
+            .lookup_nodes_exact("fn:run", Some("my_file.rs"))
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|n| n.vname.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/my_file.rs"],
+            "underscore must be literal — decoy myXfile.rs must not match: {paths:?}"
         );
     }
 

@@ -5159,6 +5159,35 @@ enum SymbolToken<'a> {
 /// 3. Last `:` is followed by purely digits and the prefix contains `/`
 ///    → [`SymbolToken::PathLine`]
 /// 4. Everything else → [`SymbolToken::BareSig`]
+///
+/// Strip a trailing ":{line}" or ":{start}-{end}" locator from a path, returning
+/// the bare path slice. `format_node_line` appends the definition line to the
+/// path in `get_context` headers (e.g. `"src/serve.rs:42"`), but the stored node
+/// path has no such suffix — leaving it in place breaks the path-pin lookup.
+fn strip_line_suffix(path: &str) -> &str {
+    let Some(idx) = path.rfind(':') else {
+        return path;
+    };
+    let suffix = &path[idx + 1..];
+    if suffix.is_empty() {
+        return path;
+    }
+    let is_locator = match suffix.split_once('-') {
+        Some((start, end)) => {
+            !start.is_empty()
+                && !end.is_empty()
+                && start.bytes().all(|b| b.is_ascii_digit())
+                && end.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => suffix.bytes().all(|b| b.is_ascii_digit()),
+    };
+    if is_locator {
+        &path[..idx]
+    } else {
+        path
+    }
+}
+
 fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
     symbols_arg
         .split(['\n', ','])
@@ -5173,8 +5202,11 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
             }
 
             // Tier 1: full get_context header — contains em-dash separator.
-            // Format: "{sig} ({kind}) \u{2014} {path} [package: {pkg}]"
-            // The " (" separates sig from kind; " \u{2014} " separates kind from path.
+            // Real format (see `format_node_line`):
+            //   "{sig} ({kind}) \u{2014} {path}:{line} [package: {pkg}] [via: ..] [score: ..]"
+            // `[package: ..]` is omitted when the package is empty, and the path
+            // always carries a trailing ":{line}" definition locator. The " ("
+            // separates sig from kind; " \u{2014} " separates kind from path.
             if let Some(em_pos) = token.find(" \u{2014} ") {
                 // sig is everything before the first " ("
                 let before_em = &token[..em_pos];
@@ -5183,12 +5215,18 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
                 } else {
                     before_em.trim()
                 };
+                // Terminate the path at the first bracketed field ("[package:",
+                // "[via:", "[score:", ..). Matching " [" generally is required
+                // because the package field is dropped for package-less nodes,
+                // in which case " [via:" is the first trailer.
                 let after_em = &token[em_pos + " \u{2014} ".len()..];
-                let path = if let Some(p) = after_em.find(" [package:") {
-                    after_em[..p].trim()
-                } else {
-                    after_em.trim()
+                let path_with_loc = match after_em.find(" [") {
+                    Some(p) => after_em[..p].trim(),
+                    None => after_em.trim(),
                 };
+                // Strip the trailing ":{line}" / ":{start}-{end}" locator that
+                // `format_node_line` appends — the stored node path has none.
+                let path = strip_line_suffix(path_with_loc);
                 if !sig.is_empty() && !path.is_empty() {
                     return Some(SymbolToken::FullHeader { sig, path });
                 }
@@ -5233,72 +5271,6 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
             None
         })
         .collect()
-}
-
-/// Render snippets for nodes that are **already resolved** — bypasses all DB
-/// search. Used by callers (e.g. VS Code) that hold a `CoreNode` slice from a
-/// prior graph query and only need the source text back.
-#[allow(dead_code)]
-pub(crate) fn get_snippets_for_nodes(
-    nodes: &[&CoreNode],
-    repo_root: &std::path::Path,
-    token_budget: usize,
-    mode: SnippetMode,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut tokens_used: usize = 0;
-    let mut n_with_snippet: usize = 0;
-
-    for node in nodes {
-        let header = format!(
-            "{} ({}) \u{2014} {} [package: {}]",
-            node.vname.signature, node.kind, node.vname.path, node.package
-        );
-        let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, repo_root).map(|s| s.render());
-        let body_text: Option<String> = match mode {
-            SnippetMode::Full => snippet_for_node_full(node, repo_root).or_else(|| skeleton(node)),
-            SnippetMode::Skeleton => skeleton(node).or_else(|| snippet_for_node(node, repo_root)),
-            SnippetMode::Auto => {
-                let node_height =
-                    node.end_line
-                        .unwrap_or_else(|| node.line.unwrap_or(0))
-                        .saturating_sub(node.line.unwrap_or(0)) as usize;
-                if node_height > snippet_line_cap(&node.kind) {
-                    skeleton(node).or_else(|| snippet_for_node(node, repo_root))
-                } else {
-                    snippet_for_node(node, repo_root).or_else(|| skeleton(node))
-                }
-            }
-        };
-
-        let snippet_chars = body_text.as_deref().map(str::len).unwrap_or(0);
-        let block_cost = (header.len() + snippet_chars) / TOKEN_CHARS_PER_TOKEN + 1;
-        if !parts.is_empty() && tokens_used + block_cost > token_budget {
-            break;
-        }
-        tokens_used += block_cost;
-
-        let block = if let Some(code) = &body_text {
-            n_with_snippet += 1;
-            format!("{header}\n{SNIPPET_SEP}\n{code}")
-        } else {
-            header
-        };
-        parts.push(block);
-    }
-
-    if parts.is_empty() {
-        return String::new();
-    }
-    let body = parts.join("\n\n");
-    let sanitized = sanitize_mcp_body_with_limit(
-        &body,
-        (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
-    );
-    format!(
-        "{sanitized}\n\n[{} symbols, {n_with_snippet} with snippets, ~{tokens_used} tokens]",
-        parts.len()
-    )
 }
 
 /// Core snippet assembly: resolves symbols, fetches snippets, enforces budget.
@@ -5837,6 +5809,49 @@ mod snippet_tests {
         );
     }
 
+    // T-M2b: the header the caller actually pastes is produced by
+    // `format_node_line`, which appends a ":{line}" locator to the path and a
+    // trailing " [via: ..] [score: ..]" — and omits " [package: ..]" for
+    // package-less nodes (the common case in this suite). The Tier 1 parser must
+    // resolve the correct node from that real format, not just the idealized one.
+    #[test]
+    fn get_snippets_full_header_from_format_node_line_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "function run() { /* a */ }\n").unwrap();
+        std::fs::write(dir.path().join("b.ts"), "function run() { /* b */ }\n").unwrap();
+
+        let node_a = make_fn_node("a.ts", "fn:run", 1, 1);
+        let node_b = make_fn_node("b.ts", "fn:run", 1, 1);
+        let store = make_store_with_meta(&[node_a.clone(), node_b], dir.path());
+
+        // Package-less header (make_fn_node leaves package empty): the path
+        // carries ":1" and the only trailer is " [via: ..] [score: ..]".
+        let header = format_node_line(&node_a, "seed", Some(0.80), None);
+        assert!(
+            header.contains("a.ts:1"),
+            "sanity: real header must carry the line locator: {header}"
+        );
+        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full);
+        assert!(
+            result.contains("/* a */"),
+            "must resolve a.ts from the real get_context header: {result}\nheader={header}"
+        );
+        assert!(
+            !result.contains("/* b */"),
+            "must NOT resolve the colliding b.ts: {result}"
+        );
+
+        // Package-present header exercises the " [package: ..]" terminator too.
+        let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
+        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None);
+        assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
+        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
+        assert!(
+            result_pkg.contains("/* a */") && !result_pkg.contains("/* b */"),
+            "package-present header must also resolve a.ts only: {result_pkg}"
+        );
+    }
+
     // T-M3: parse_symbol_tokens covers all four resolution tiers.
     #[test]
     fn parse_symbol_tokens_covers_all_four_tiers() {
@@ -5924,30 +5939,6 @@ mod snippet_tests {
         );
     }
 
-    // T-M5: get_snippets_for_nodes — pre-resolved path, no DB lookup needed.
-    // VS Code Context Explorer uses this path: it already holds the CoreNode;
-    // it just needs the snippet text back.
-    #[test]
-    fn get_snippets_for_nodes_renders_pre_resolved_nodes() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("widget.ts"),
-            "function widget() {\n  return 'ok';\n}\n",
-        )
-        .unwrap();
-
-        let node = make_fn_node("widget.ts", "fn:widget", 1, 3);
-        let result = get_snippets_for_nodes(&[&node], dir.path(), 2000, SnippetMode::Auto);
-
-        assert!(result.contains("fn:widget"), "header missing: {result}");
-        assert!(
-            result.contains("return 'ok'"),
-            "snippet body missing: {result}"
-        );
-        // No DB, no budget footer — this helper returns the raw block only.
-        assert!(!result.is_empty(), "result must not be empty");
-    }
-
     // T-M6: PathLine tier (Tier 2) always reads the exact stored range,
     // ignoring the SnippetMode, even when mode=Skeleton.
     // Path token must contain '/' to be recognized as Tier 2 vs. a Kythe sig.
@@ -6018,7 +6009,7 @@ mod snippet_tests {
             let path = format!("pkg{i}/run.ts");
             std::fs::write(
                 dir.path().join(format!("run{i}.ts")),
-                &format!("function run() {{ /* {i} */ }}\n"),
+                format!("function run() {{ /* {i} */ }}\n"),
             )
             .unwrap();
             nodes.push(make_fn_node(&path, "fn:run", 1, 1));
