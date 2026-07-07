@@ -923,6 +923,62 @@ impl ImportResolver for DartResolver {
     }
 }
 
+// ── Graph GC types ────────────────────────────────────────────────────────────
+
+/// Paths of files that held inbound edges to deleted/changed symbols.
+/// The daemon enqueues these for Tier-0 dirty re-resolution.
+pub type DirtySet = std::collections::HashSet<String>;
+
+/// Returned by the store's `reindex_replace` operation.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReplaceReport {
+    /// Number of symbols that vanished in this edit (old id not present in new parse).
+    pub removed_count: usize,
+    /// Paths of files that had inbound edges to the removed symbols.
+    pub callers: DirtySet,
+}
+
+/// Summary returned by `reconcile` / `travsr fsck`.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct GcReport {
+    /// VName paths ghost-deleted from the graph.
+    pub ghost_paths: Vec<String>,
+    /// Number of orphan edges swept (should be 0 in normal operation).
+    pub orphan_edges_swept: u64,
+    /// Total node count at reconcile start.
+    pub node_count: u64,
+    /// Total edge count at reconcile start.
+    pub edge_count: u64,
+    /// `true` if the mass-delete circuit breaker aborted the reconcile.
+    pub aborted: bool,
+    /// Human-readable reason for abort (set when `aborted = true`).
+    pub abort_reason: Option<String>,
+}
+
+/// Safety guards for reconciliation (§6.5 of the GC architecture doc).
+#[derive(Debug, Clone)]
+pub struct SafetyPolicy {
+    /// Maximum fraction of tracked paths deletable in one pass (0.0–1.0).
+    /// Circuit breaker aborts if ghost count exceeds
+    /// `max(mass_delete_ceiling_min, db_paths.len() * pct)`. Default `0.50`.
+    pub mass_delete_ceiling_pct: f64,
+    /// Minimum number of deletions always allowed regardless of `pct`. Default `100`.
+    pub mass_delete_ceiling_min: usize,
+    /// Re-check `exists_on_disk` immediately before each `delete_file` to guard
+    /// against TOCTOU races (§6.5 S3). Default `true`.
+    pub toctou_recheck: bool,
+}
+
+impl Default for SafetyPolicy {
+    fn default() -> Self {
+        Self {
+            mass_delete_ceiling_pct: 0.50,
+            mass_delete_ceiling_min: 100,
+            toctou_recheck: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

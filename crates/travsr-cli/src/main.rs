@@ -8,6 +8,7 @@ mod autostart;
 mod config;
 mod daemon_client;
 mod embed;
+mod fsck;
 mod graph;
 mod index;
 mod init;
@@ -176,6 +177,18 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: config::ConfigCommand,
+    },
+    /// Check graph integrity; optionally repair ghost nodes and orphan edges.
+    Fsck {
+        /// Delete ghost nodes and sweep orphan edges (default: report only).
+        #[arg(long)]
+        fix: bool,
+        /// Emit results as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        /// Override the mass-delete circuit breaker (use with care).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -615,7 +628,16 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 paths.iter().map(|p| repo_root.join(p)).collect()
             };
-            travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
+            let dirty = travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
+            if !dirty.is_empty() {
+                // No daemon running: Tier-0 callers cannot be re-enqueued.
+                // Phase B on the next commit will re-resolve cross-file edges.
+                tracing::debug!(
+                    callers = dirty.len(),
+                    "hook-run (no daemon): {} Tier-0 caller(s) deferred to next Phase B",
+                    dirty.len()
+                );
+            }
         }
         Command::Migrate { to } => migrate::run_to(&to)?,
         Command::Serve { port, tenants_dir } => {
@@ -625,6 +647,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Synonym { action } => synonym::run(action)?,
         Command::Embed { action } => embed::run(action)?,
         Command::Config { action } => config::run(action)?,
+        Command::Fsck { fix, json, force } => fsck::run(fix, json, force)?,
     }
     Ok(())
 }
