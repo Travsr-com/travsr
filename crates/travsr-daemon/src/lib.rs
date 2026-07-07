@@ -647,8 +647,8 @@ pub fn fsck_repo(
         db_path.display()
     );
 
-    let mut store = SqliteStore::open(&db_path)
-        .with_context(|| format!("opening {}", db_path.display()))?;
+    let mut store =
+        SqliteStore::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
     let corpus = store.get_meta("corpus")?.unwrap_or_default();
 
@@ -2659,7 +2659,10 @@ mod tests {
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
-        assert!(store.node_count().unwrap() > 0, "must have nodes after init");
+        assert!(
+            store.node_count().unwrap() > 0,
+            "must have nodes after init"
+        );
 
         let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
         store.delete_file(&corpus, "svc.ts").unwrap();
@@ -3521,7 +3524,10 @@ fn enqueue_dirty_callers(
              excess deferred to Phase B / next reconcile"
         );
     } else {
-        tracing::debug!(enqueued, "Tier-0: enqueued {enqueued} dirty caller(s) for re-resolution");
+        tracing::debug!(
+            enqueued,
+            "Tier-0: enqueued {enqueued} dirty caller(s) for re-resolution"
+        );
     }
 }
 
@@ -3549,14 +3555,12 @@ fn handle_watch_event(
                 .replace('\\', "/");
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             // Read corpus from meta so delete_file uses the correct VName scope.
-            let corpus = s
-                .get_meta("corpus")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
             match s.delete_file(&corpus, &vname_path) {
                 Ok(callers) => enqueue_dirty_callers(callers, repo_root, index_tx),
-                Err(e) => tracing::warn!(path=%path.display(), err=%e, "watcher delete_file failed"),
+                Err(e) => {
+                    tracing::warn!(path=%path.display(), err=%e, "watcher delete_file failed")
+                }
             }
         }
     }

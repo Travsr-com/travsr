@@ -9,8 +9,7 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
     let report = travsr_daemon::fsck_repo(&repo_root, fix, force)?;
 
     if json {
-        let out = serde_json::to_string_pretty(&report)
-            .context("serializing GcReport to JSON")?;
+        let out = serde_json::to_string_pretty(&report).context("serializing GcReport to JSON")?;
         println!("{out}");
         return Ok(());
     }

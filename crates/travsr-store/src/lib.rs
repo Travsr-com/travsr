@@ -99,7 +99,9 @@ impl EmbedReadiness {
 
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use travsr_core::{DirtySet, Edge, EdgeKind, GcReport, Node, NodeId, ReplaceReport, SafetyPolicy, VName};
+use travsr_core::{
+    DirtySet, Edge, EdgeKind, GcReport, Node, NodeId, ReplaceReport, SafetyPolicy, VName,
+};
 use travsr_error::StoreError;
 
 use crate::fts_tokenize::{build_fuzzy_match_expr_db, tokenize_identifier};
@@ -1810,7 +1812,11 @@ impl SqliteStore {
                 .conn
                 .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get::<_, i64>(0))
                 .context("counting edges for GcReport")? as u64;
-            let mut report = GcReport { node_count, edge_count, ..GcReport::default() };
+            let mut report = GcReport {
+                node_count,
+                edge_count,
+                ..GcReport::default()
+            };
 
             let db_hashes = self
                 .get_all_file_hashes()

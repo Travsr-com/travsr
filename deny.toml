@@ -13,6 +13,10 @@ ignore = [
     # Zero runtime attack surface. Revisit when tabled_derive migrates to
     # manyhow or proc-macro2-diagnostics.
     { id = "RUSTSEC-2026-0173", reason = "build-time proc-macro only, no runtime exposure" },
+    # crossbeam-epoch 0.9.18 fmt::Pointer null-deref (RUSTSEC-2026-0204). Only
+    # triggered by printing a null Atomic/Shared via {:p}; our code never does
+    # this. Transitive dep via rayon (criterion dev-dep). Unblock on 0.9.19+.
+    { id = "RUSTSEC-2026-0204", reason = "null-ptr fmt::Pointer path never reached; dev-dep via criterion/rayon" },
 ]
 
 [licenses]
