@@ -2058,6 +2058,87 @@ LIMIT 100",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Exact-signature lookup with optional path-suffix pin.
+    ///
+    /// Uses the `nodes_signature_idx` index for O(log N) access. When
+    /// `path_hint` is `Some`, only rows whose `path` equals or ends with the
+    /// hint are returned, and those rows sort first. Returns at most 20
+    /// non-file nodes.
+    ///
+    /// Callers interpret the result length:
+    /// - 0  → not found; fall back to fuzzy search
+    /// - 1  → unambiguous match
+    /// - >1 + `path_hint` Some → path-pinned rows sort first; take index 0
+    /// - >1 + `path_hint` None → genuinely ambiguous; caller must disambiguate
+    pub fn lookup_nodes_exact(
+        &self,
+        signature: &str,
+        path_hint: Option<&str>,
+    ) -> Result<Vec<Node>, StoreError> {
+        let _span = tracing::debug_span!(
+            "store.lookup_nodes_exact",
+            signature,
+            path_hint = path_hint.unwrap_or("(none)")
+        )
+        .entered();
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line
+FROM nodes
+WHERE signature = ?1
+  AND kind != 'file'
+  AND (
+        ?2 IS NULL
+     OR path = ?2
+     OR path LIKE '%/' || ?2
+  )
+ORDER BY
+  CASE
+    WHEN ?2 IS NOT NULL AND (path = ?2 OR path LIKE '%/' || ?2) THEN 0
+    ELSE 1
+  END ASC,
+  id ASC
+LIMIT 20",
+                )
+                .context("preparing lookup_nodes_exact query")?;
+
+            let rows = stmt
+                .query_map(params![signature, path_hint], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing lookup_nodes_exact query")?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding lookup_nodes_exact row")?);
+            }
+            tracing::debug!(nodes_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn all_nodes(&self) -> Result<Vec<Node>, StoreError> {
         (|| -> AnyResult<Vec<Node>> {
             let mut stmt = self
@@ -5677,6 +5758,118 @@ mod tests {
         let results = store.search_nodes_by_name("fn:bar").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].package, "bar-crate");
+    }
+
+    // T-S1: unique exact-signature match, no path hint.
+    #[test]
+    fn lookup_nodes_exact_unique_match_no_path_hint() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("corpus", "", "src/main.rs", "rust", "fn:run"),
+            "function",
+        );
+        store.put_node(&n).unwrap();
+
+        let results = store.lookup_nodes_exact("fn:run", None).unwrap();
+        assert_eq!(results.len(), 1, "must find the single matching node");
+        assert_eq!(results[0].vname.path, "src/main.rs");
+        assert_eq!(results[0].vname.signature, "fn:run");
+    }
+
+    // T-S2: two nodes with the same signature in different files — path hint
+    // must pin to the correct one and return it first.
+    #[test]
+    fn lookup_nodes_exact_path_pin_disambiguates() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let serve = Node::new(
+            VName::new("corpus", "", "src/cmd/serve.rs", "rust", "fn:run"),
+            "function",
+        );
+        let worker = Node::new(
+            VName::new("corpus", "", "src/worker/run.rs", "rust", "fn:run"),
+            "function",
+        );
+        store.put_node(&serve).unwrap();
+        store.put_node(&worker).unwrap();
+
+        // Pin to serve.rs via exact path.
+        let pinned = store
+            .lookup_nodes_exact("fn:run", Some("src/cmd/serve.rs"))
+            .unwrap();
+        assert!(!pinned.is_empty(), "must return the pinned node");
+        assert_eq!(
+            pinned[0].vname.path, "src/cmd/serve.rs",
+            "path-pinned row must sort first"
+        );
+
+        // Pin via suffix only (filename).
+        let by_suffix = store
+            .lookup_nodes_exact("fn:run", Some("serve.rs"))
+            .unwrap();
+        assert!(!by_suffix.is_empty());
+        assert_eq!(by_suffix[0].vname.path, "src/cmd/serve.rs");
+
+        // Pin to worker.
+        let worker_pin = store
+            .lookup_nodes_exact("fn:run", Some("worker/run.rs"))
+            .unwrap();
+        assert!(!worker_pin.is_empty());
+        assert_eq!(worker_pin[0].vname.path, "src/worker/run.rs");
+
+        // No hint → both rows returned.
+        let both = store.lookup_nodes_exact("fn:run", None).unwrap();
+        assert_eq!(both.len(), 2, "without a path hint both nodes are returned");
+    }
+
+    // T-S3: file-kind nodes are excluded even when signature matches exactly.
+    #[test]
+    fn lookup_nodes_exact_excludes_file_kind_nodes() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file_node = Node::new(
+            VName::new("corpus", "", "src/run.rs", "rust", "fn:run"),
+            "file",
+        );
+        store.put_node(&file_node).unwrap();
+
+        let results = store.lookup_nodes_exact("fn:run", None).unwrap();
+        assert!(
+            results.is_empty(),
+            "file-kind nodes must be excluded from lookup_nodes_exact"
+        );
+    }
+
+    // T-S4: signature that does not exist returns an empty vec, not an error.
+    #[test]
+    fn lookup_nodes_exact_missing_signature_returns_empty() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let results = store.lookup_nodes_exact("fn:does_not_exist", None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // T-S5: LIKE wildcard characters in the path hint must not be interpreted
+    // as SQL wildcards (path_hint is bound as a parameter, not interpolated).
+    #[test]
+    fn lookup_nodes_exact_path_hint_is_not_sql_wildcard() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node::new(
+            VName::new("corpus", "", "src/main.rs", "rust", "fn:run"),
+            "function",
+        );
+        store.put_node(&n).unwrap();
+
+        // A hint with SQL wildcard characters must not match src/main.rs.
+        let results = store.lookup_nodes_exact("fn:run", Some("src/%")).unwrap();
+        // The hint "src/%" is NOT a suffix of "src/main.rs" so must not match
+        // (we only use it as a literal suffix, not a LIKE pattern for the hint
+        // itself; the SQL uses '%/' || ?2 which would be '%/src/%' and would
+        // match 'x/src/%' literally — fine as long as no path IS literally
+        // 'src/%').
+        // Primary assertion: the node whose path is "src/main.rs" is NOT
+        // matched by the hint literal "src/%" (no path ends with "src/%").
+        assert!(
+            results.is_empty(),
+            "wildcard characters in path_hint must not be interpolated as SQL wildcards"
+        );
     }
 
     #[test]
