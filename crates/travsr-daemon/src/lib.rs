@@ -28,6 +28,16 @@ use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
 pub use hook::{changed_files_from_git, install_hook, try_dispatch_to_daemon};
 
+/// Set the process-level opt-in flag that allows `rust-analyzer` to run
+/// unconfined when the OS sandbox is unavailable.
+///
+/// Call this **before** `init_repo_with_progress` or any indexing operation.
+/// Corresponds to `travsr init --allow-unsandboxed-lsif`. The value is
+/// forwarded to `travsr_indexer::sandbox::set_cli_allow_unsandboxed`.
+pub fn set_allow_unsandboxed_lsif(val: bool) {
+    travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
+}
+
 /// Statistics returned by [`init_repo`] and displayed by `travsr init`.
 #[derive(Debug, Default)]
 pub struct InitStats {
@@ -1505,6 +1515,16 @@ fn write_phase_b_results(
         let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
     } else {
         let _ = store.set_meta("phase_b_warnings", "");
+    }
+
+    // M1 degradation flag: record when rust-analyzer LSIF was skipped because
+    // the OS sandbox was unavailable and --allow-unsandboxed-lsif was not set.
+    // Surfaced by `travsr status` so the user knows Rust semantic edges are
+    // degraded without having to grep logs.
+    if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
+        let _ = store.set_meta("rust_lsif_degraded", "sandbox_unavailable");
+    } else {
+        let _ = store.set_meta("rust_lsif_degraded", "");
     }
 
     PhaseBReport {

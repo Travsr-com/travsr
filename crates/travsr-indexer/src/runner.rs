@@ -10,9 +10,106 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
-/// Hard ceiling for how long the TS compiler may run before we kill it.
-/// Prevents a hung or looping `travsr-lsif-ts` from blocking `git commit`.
-const TIMEOUT: Duration = Duration::from_secs(60);
+// ── Shared subprocess constants ───────────────────────────────────────────────
+
+/// Default hard ceiling for Node LSIF emitters (TS + Python), matching the
+/// 300 s used by scip-python and rust-analyzer. Override via
+/// `TRAVSR_LSIF_TIMEOUT_SECS`.
+const LSIF_TIMEOUT_DEFAULT_SECS: u64 = 300;
+
+/// Sanity clamp so a fat-fingered env value can't wedge `git commit` for a day.
+const MAX_LSIF_TIMEOUT_SECS: u64 = 3_600;
+
+/// Poll interval for the try_wait loop. 200 ms is immaterial against multi-
+/// second tool runs; 100 ms was arbitrary and inconsistent across runners.
+const POLL_INTERVAL_MS: u64 = 200;
+
+/// Hard ceiling for `scip-python` (large projects can be slow).
+/// Separate from LSIF_TIMEOUT because scip-python is a different tool class.
+const SCIP_PYTHON_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Return the configured timeout for Node LSIF emitters (TS and Python).
+///
+/// Reads `TRAVSR_LSIF_TIMEOUT_SECS` from the environment; falls back to
+/// [`LSIF_TIMEOUT_DEFAULT_SECS`] on parse failure, zero, or absurd values.
+fn lsif_node_timeout() -> Duration {
+    let secs = std::env::var("TRAVSR_LSIF_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&x| x > 0 && x <= MAX_LSIF_TIMEOUT_SECS)
+        .unwrap_or(LSIF_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+// ── Shared drain helper ───────────────────────────────────────────────────────
+
+/// Drain stdout + stderr on background threads while polling for exit with a
+/// wall-clock deadline. Kills the child on overrun; joins both drain threads on
+/// **both** the normal-exit and timeout-kill paths so no thread dangles.
+///
+/// `name` is used only for error messages. The child **must** have been spawned
+/// with `Stdio::piped()` for both stdout and stderr.
+///
+/// Returns `(exit_status, stdout_bytes, stderr_string)`.
+///
+/// Stdout is drained into `Vec<u8>` to avoid silent truncation on a stray
+/// non-UTF-8 byte in a multi-MB LSIF dump (O(output_size) memory — acceptable
+/// for LSIF < 10 MB). Callers that need a `String` convert via
+/// `String::from_utf8_lossy`. Stderr is small diagnostic text and is decoded
+/// as `String` directly.
+///
+/// `wait_with_output()` is **not** a substitute: it drains safely but cannot
+/// express a concurrent timeout-kill, which every runner needs so a hung tool
+/// can't block `git commit`.
+pub(crate) fn run_with_drain(
+    mut child: std::process::Child,
+    timeout: Duration,
+    name: &str,
+) -> anyhow::Result<(std::process::ExitStatus, Vec<u8>, String)> {
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("{name} child has no piped stdout"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("{name} child has no piped stderr"))?;
+
+    let out_t = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut pipe = stdout_pipe;
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut pipe = stderr_pipe;
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("polling {name}"))?
+        {
+            Some(s) => break s,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                // Join drain threads so they don't dangle after we return.
+                let _ = out_t.join();
+                let _ = err_t.join();
+                anyhow::bail!("{name} timed out after {}s — killed", timeout.as_secs());
+            }
+            None => std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS)),
+        }
+    };
+
+    let stdout = out_t.join().unwrap_or_default();
+    let stderr = err_t.join().unwrap_or_default();
+    Ok((status, stdout, stderr))
+}
 
 /// Resolve the LSIF emitter program + args without requiring a global PATH install.
 ///
@@ -68,18 +165,19 @@ fn resolve_lsif_emitter() -> (String, Vec<String>) {
 
 /// Run the LSIF emitter for `<tsconfig>` and return the LSIF dump.
 ///
-/// The emitter is resolved relative to the travsr binary — no global PATH install
-/// required. The subprocess is killed and an error is returned if it does not
-/// complete within 60 seconds.
+/// The emitter is resolved relative to the travsr binary — no global PATH
+/// install required. Both stdout and stderr are drained on background threads
+/// concurrently with the polling loop so that large LSIF dumps (> 64 KB OS
+/// pipe buffer) do not deadlock the child. The subprocess is killed if it does
+/// not complete within [`lsif_node_timeout()`] (default 300 s).
 ///
 /// # Errors
 /// - Emitter not found (not bundled, not on PATH)
-/// - Non-zero exit code from the emitter (stderr forwarded as context)
-/// - Process exceeds the 60s timeout
-/// - Stdout is not valid UTF-8
+/// - Non-zero exit code (first 5 lines of stderr included)
+/// - Timeout exceeded
 pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
     let (program, prefix_args) = resolve_lsif_emitter();
-    let mut child = std::process::Command::new(&program)
+    let child = std::process::Command::new(&program)
         .args(&prefix_args)
         .arg("--project")
         .arg(tsconfig)
@@ -94,42 +192,18 @@ pub fn run_lsif_emitter(tsconfig: &Path) -> anyhow::Result<String> {
             )
         })?;
 
-    let deadline = Instant::now() + TIMEOUT;
-
-    let status = loop {
-        match child.try_wait().context("polling travsr-lsif-ts")? {
-            Some(s) => break s,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                anyhow::bail!(
-                    "travsr-lsif-ts timed out after {}s — killed",
-                    TIMEOUT.as_secs()
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    let (status, stdout_bytes, stderr) =
+        run_with_drain(child, lsif_node_timeout(), "travsr-lsif-ts")?;
 
     if !status.success() {
-        anyhow::bail!("travsr-lsif-ts exited with {status}: {stderr}");
+        let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
+        anyhow::bail!("travsr-lsif-ts exited with {status}: {stderr_head}");
     }
 
-    Ok(stdout)
+    Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
 }
 
 // ── scip-python ───────────────────────────────────────────────────────────────
-
-/// Hard ceiling for `scip-python` (large projects can be slow).
-const SCIP_PYTHON_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Locate the `scip-python` binary.
 ///
@@ -181,6 +255,9 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
         .context("create scip-python scratch dir")?;
     let output = scratch.path().join("index.scip");
 
+    // stdout goes to the tempfile (no pipe deadlock risk there), but stderr is
+    // still piped and must be drained on a background thread to avoid the same
+    // read-after-wait footgun that caused C1 in run_lsif_emitter.
     let mut child = std::process::Command::new(&scip_python)
         .args([
             "index",
@@ -193,10 +270,21 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
         ])
         .arg(root)
         .current_dir(root)
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn scip-python for {}", root.display()))?;
+
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("scip-python child has no piped stderr"))?;
+    let err_t = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut pipe = stderr_pipe;
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
 
     let deadline = Instant::now() + SCIP_PYTHON_TIMEOUT;
     let status = loop {
@@ -204,19 +292,17 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
             Some(s) => break s,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
+                let _ = err_t.join();
                 anyhow::bail!(
                     "scip-python timed out after {}s — killed",
                     SCIP_PYTHON_TIMEOUT.as_secs()
                 );
             }
-            None => std::thread::sleep(Duration::from_millis(200)),
+            None => std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS)),
         }
     };
 
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    let stderr = err_t.join().unwrap_or_default();
 
     if !status.success() {
         anyhow::bail!("scip-python exited with {status}: {stderr}");
@@ -228,9 +314,6 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
 }
 
 // ── travsr-lsif-py ────────────────────────────────────────────────────────────
-
-/// Timeout for `travsr-lsif-py` (large Python repos with many files can be slow).
-const LSIF_PY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Resolve the Python LSIF emitter program + args without requiring PATH install.
 ///
@@ -287,17 +370,17 @@ fn resolve_lsif_py_emitter() -> (String, Vec<String>) {
 /// Returns:
 /// - `Ok(Some(dump))` — LSIF dump ready for [`crate::lsif::ingest`].
 /// - `Ok(None)` — emitter binary not found (spawn failed); native Phase B
-///   tree-sitter output still runs — this is graceful degradation, not an error.
-/// - `Err(_)` — emitter was found and spawned but produced a non-zero exit code,
-///   or timed out after [`LSIF_PY_TIMEOUT`].
+///   tree-sitter output still runs — graceful degradation, not an error.
+/// - `Err(_)` — emitter found but produced a non-zero exit code, or timed out
+///   after [`lsif_node_timeout()`] (default 300 s, override via
+///   `TRAVSR_LSIF_TIMEOUT_SECS`).
 ///
-/// Pipe buffers (64 KB on Linux) would deadlock if the emitter writes > 64 KB of
-/// LSIF before we drain — so stdout and stderr are drained on background threads
-/// concurrently with the polling loop (same pattern as [`crate::ra_runner::run_ra_lsif`]).
+/// Stdout and stderr are drained on background threads concurrently with the
+/// polling loop via [`run_with_drain`] to prevent OS pipe-buffer deadlock.
 pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
     let (program, prefix_args) = resolve_lsif_py_emitter();
 
-    let mut child = match std::process::Command::new(&program)
+    let child = match std::process::Command::new(&program)
         .args(&prefix_args)
         .arg("--root")
         .arg(root)
@@ -315,51 +398,15 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
         }
     };
 
-    // Drain stdout/stderr on background threads to prevent OS pipe-buffer deadlock.
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("travsr-lsif-py child has no piped stdout"))?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("travsr-lsif-py child has no piped stderr"))?;
-    let stdout_thread = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + LSIF_PY_TIMEOUT;
-    let exit_status = loop {
-        match child.try_wait().context("polling travsr-lsif-py")? {
-            Some(s) => break s,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                anyhow::bail!(
-                    "travsr-lsif-py timed out after {}s — killed",
-                    LSIF_PY_TIMEOUT.as_secs()
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(200)),
-        }
-    };
-
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
+    let (exit_status, stdout_bytes, stderr) =
+        run_with_drain(child, lsif_node_timeout(), "travsr-lsif-py")?;
 
     if !exit_status.success() {
         let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
         anyhow::bail!("travsr-lsif-py exited with {exit_status}: {stderr_head}");
     }
 
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     tracing::info!(
         root = %root.display(),
         lines = stdout.lines().count(),
@@ -374,13 +421,15 @@ mod tests {
     use super::*;
 
     // Env-var mutations are process-global. Serialize all tests that touch
-    // TRAVSR_LSIF_TS / TRAVSR_LSIF_PY to prevent races on parallel test runners
-    // (especially Windows, which schedules threads differently from Linux/macOS).
+    // TRAVSR_LSIF_TS / TRAVSR_LSIF_PY / TRAVSR_LSIF_TIMEOUT_SECS to prevent
+    // races on parallel test runners.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ── resolve tests (existing, kept) ───────────────────────────────────────
 
     #[test]
     fn resolve_falls_back_to_path_when_no_env_and_no_sibling() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("TRAVSR_LSIF_TS");
         let (program, args) = resolve_lsif_emitter();
         assert!(!program.is_empty());
@@ -389,7 +438,7 @@ mod tests {
 
     #[test]
     fn resolve_honours_env_override_when_file_exists() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let exe = std::env::current_exe().unwrap();
         std::env::set_var("TRAVSR_LSIF_TS", exe.to_str().unwrap());
         let (program, args) = resolve_lsif_emitter();
@@ -400,7 +449,7 @@ mod tests {
 
     #[test]
     fn resolve_lsif_py_falls_back_to_path_when_no_env_and_no_sibling() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("TRAVSR_LSIF_PY");
         let (program, args) = resolve_lsif_py_emitter();
         assert!(!program.is_empty());
@@ -409,7 +458,7 @@ mod tests {
 
     #[test]
     fn resolve_lsif_py_honours_env_override_when_file_exists() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let exe = std::env::current_exe().unwrap();
         std::env::set_var("TRAVSR_LSIF_PY", exe.to_str().unwrap());
         let (program, args) = resolve_lsif_py_emitter();
@@ -420,7 +469,7 @@ mod tests {
 
     #[test]
     fn run_lsif_py_emitter_returns_none_for_missing_binary() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("TRAVSR_LSIF_PY");
         let spawn_result = std::process::Command::new("__travsr_lsif_py_absent_binary__")
             .arg("--root")
@@ -430,5 +479,535 @@ mod tests {
             spawn_result.is_err(),
             "non-existent binary must fail to spawn"
         );
+    }
+
+    // ── M2 — timeout parser tests ─────────────────────────────────────────────
+
+    #[test]
+    fn timeout_unset_defaults_300() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn timeout_valid_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "120");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(120));
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn timeout_zero_rejected() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "0");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn timeout_negative_rejected() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "-5");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn timeout_non_numeric_rejected() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "abc");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn timeout_whitespace_trimmed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", " 90 ");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(90));
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn timeout_absurd_clamped_to_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // overflow string → parse fails → default
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "999999999999999999999");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+        // beyond MAX_LSIF_TIMEOUT_SECS → clamped to default
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "999999");
+        assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+    }
+
+    // ── Helper: spawn a node stub (skips when node is absent) ────────────────
+
+    /// Returns the path to `node` if available, `None` otherwise.
+    fn node_path() -> Option<std::path::PathBuf> {
+        std::process::Command::new("node")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .filter(|s| s.success())
+            .map(|_| std::path::PathBuf::from("node"))
+    }
+
+    /// Write a Node.js stub script to a tempfile, return the file (kept alive
+    /// for the duration of the test).
+    fn stub_node(body: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::Builder::new()
+            .suffix(".js")
+            .tempfile()
+            .expect("tempfile");
+        write!(f, "{body}").unwrap();
+        f
+    }
+
+    /// Set TRAVSR_LSIF_TS to `script`, call `f`, restore env. Holds ENV_LOCK.
+    fn with_lsif_ts_env<F: FnOnce()>(script: &std::path::Path, f: F) {
+        std::env::set_var("TRAVSR_LSIF_TS", script.to_str().unwrap());
+        f();
+        std::env::remove_var("TRAVSR_LSIF_TS");
+    }
+
+    // ── R.1-R.3 — run_with_drain shared contract ──────────────────────────────
+
+    #[test]
+    fn run_drained_large_output_no_deadlock() {
+        // 128 KiB stdout + 96 KiB stderr — proves both pipes drain past the
+        // 64 KB OS pipe buffer without deadlock.
+        // Watchdog channel: test fails if run_with_drain doesn't return in 20 s.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node(
+            "require('fs').writeSync(1,Buffer.alloc(131072,0x61));\
+             require('fs').writeSync(2,Buffer.alloc(98304,0x62));",
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        std::thread::spawn(move || {
+            let child = std::process::Command::new("node")
+                .arg(&script_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn node");
+            let result = run_with_drain(child, Duration::from_secs(20), "test");
+            let _ = tx.send(result);
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("run_with_drain must return within watchdog window");
+        let (_status, stdout, _stderr) = result.expect("must succeed");
+        assert_eq!(stdout.len(), 131072, "full 128 KiB stdout must be drained");
+    }
+
+    #[test]
+    fn run_drained_timeout_joins_threads() {
+        // Child hangs forever; low timeout must kill it and join threads cleanly.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node("setInterval(()=>{},1e9);");
+        let child = std::process::Command::new("node")
+            .arg(script.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn node");
+
+        let result = run_with_drain(child, Duration::from_millis(400), "hang-test");
+        assert!(result.is_err(), "must return Err on timeout");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timed out"),
+            "error must mention timed out: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_drained_nonzero_exit_preserves_stderr() {
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node(
+            "process.stderr.write('fatal error\\n');\
+             process.exit(3);",
+        );
+        let child = std::process::Command::new("node")
+            .arg(script.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn node");
+
+        let (status, _out, stderr) =
+            run_with_drain(child, Duration::from_secs(10), "exit3-test").expect("must not err");
+        assert!(!status.success());
+        assert!(
+            stderr.contains("fatal error"),
+            "stderr must be captured: {stderr}"
+        );
+    }
+
+    // ── C1 — run_lsif_emitter drain / deadlock matrix ────────────────────────
+
+    #[test]
+    fn emitter_large_stdout_does_not_deadlock() {
+        // C1.1 — 128 KiB stdout, proves the deadlock is gone.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node("require('fs').writeSync(1,Buffer.alloc(131072,0x61));");
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("must return within watchdog window — deadlock?");
+        let dump = result.expect("must succeed");
+        assert_eq!(dump.len(), 131072, "all 128 KiB must be returned");
+    }
+
+    #[test]
+    fn emitter_large_stdout_and_stderr_drain_both_pipes() {
+        // C1.2 — 128 KiB stdout + 96 KiB stderr interleaved; exit 0.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node(
+            "require('fs').writeSync(1,Buffer.alloc(131072,0x61));\
+             require('fs').writeSync(2,Buffer.alloc(98304,0x62));",
+        );
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("must return within watchdog window");
+        let dump = result.expect("must succeed");
+        assert_eq!(dump.len(), 131072, "full stdout must be returned");
+    }
+
+    #[test]
+    fn emitter_exit_zero_empty_stdout_is_ok() {
+        // C1.3 — empty output + exit 0 must NOT be an error.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node("process.exit(0);");
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("must return");
+        let dump = result.expect("exit 0 empty stdout must not error");
+        assert!(dump.is_empty());
+    }
+
+    #[test]
+    fn emitter_non_utf8_stdout_contract() {
+        // C1.4 — non-UTF-8 bytes survive via lossy conversion (no silent truncation).
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Write valid ASCII prefix then a stray 0xFF byte.
+        let script = stub_node(
+            "process.stdout.write(Buffer.from('hello')); \
+             process.stdout.write(Buffer.from([0xff])); \
+             process.exit(0);",
+        );
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("must return");
+        let dump = result.expect("lossy conversion must succeed");
+        // The ASCII prefix must be intact.
+        assert!(
+            dump.starts_with("hello"),
+            "ASCII prefix must survive: {dump:?}"
+        );
+        // Total length must be > 5 (the 0xFF was replaced with the U+FFFD replacement char).
+        assert!(dump.len() > 5, "no silent truncation after non-UTF-8 byte");
+    }
+
+    #[test]
+    fn emitter_nonzero_exit_discards_partial_stdout() {
+        // C1.5 — non-zero exit → Err; partial stdout must NOT be returned as Ok.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node(
+            "process.stdout.write(Buffer.alloc(40960, 0x61));\
+             process.stderr.write('fatal boom\\n');\
+             process.exit(3);",
+        );
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("must return");
+        assert!(result.is_err(), "non-zero exit must be Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exited with"),
+            "error must mention exit: {msg}"
+        );
+    }
+
+    #[test]
+    fn emitter_killed_mid_write_no_corruption() {
+        // C1.6 — child writes slowly (via setInterval) then hangs; low timeout
+        // must kill it, join threads, and return Err without dangling threads.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node("setInterval(()=>{},1e9);");
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        // Use TRAVSR_LSIF_TIMEOUT_SECS to inject a very short timeout.
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "1");
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("must return after timeout+slop");
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+        assert!(result.is_err(), "timeout must be Err");
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn emitter_child_hangs_forever_hits_timeout_and_joins() {
+        // C1.7 — writes 100 KiB then hangs via setInterval; exact production failure.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node(
+            "process.stdout.write(Buffer.alloc(102400, 0x61));\
+             setInterval(()=>{},1e9);",
+        );
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "1");
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("must return within watchdog window");
+        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn emitter_5mb_output_completes() {
+        // C1.8 — smoke test for O(output_size) memory contract.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node("require('fs').writeSync(1,Buffer.alloc(5*1024*1024,0x61));");
+        let tsconfig = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tsconfig tempfile");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let tsconfig_path = tsconfig.path().to_path_buf();
+        std::thread::spawn(move || {
+            with_lsif_ts_env(&script_path, || {
+                let _ = tx.send(run_lsif_emitter(&tsconfig_path));
+            });
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("must return within watchdog window");
+        let dump = result.expect("5 MiB must succeed");
+        assert_eq!(dump.len(), 5 * 1024 * 1024);
+    }
+
+    // ── C1 variant for run_lsif_py_emitter ───────────────────────────────────
+
+    #[test]
+    fn py_emitter_large_stdout_does_not_deadlock() {
+        // Mirrors C1.1 but exercises run_lsif_py_emitter to prove its drain claim.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node("require('fs').writeSync(1,Buffer.alloc(131072,0x61));");
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let root_path = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            std::env::set_var("TRAVSR_LSIF_PY", script_path.to_str().unwrap());
+            let r = run_lsif_py_emitter(&root_path);
+            std::env::remove_var("TRAVSR_LSIF_PY");
+            let _ = tx.send(r);
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("must return within watchdog window");
+        let dump = result.expect("must succeed").expect("must be Some");
+        assert_eq!(dump.len(), 131072);
+    }
+
+    #[test]
+    fn py_emitter_large_stdout_and_stderr_drain_both() {
+        // Mirrors C1.2 for run_lsif_py_emitter.
+        let Some(_node) = node_path() else {
+            eprintln!("SKIP: node not available");
+            return;
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let script = stub_node(
+            "require('fs').writeSync(1,Buffer.alloc(131072,0x61));\
+             require('fs').writeSync(2,Buffer.alloc(98304,0x62));",
+        );
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script_path = script.path().to_path_buf();
+        let root_path = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            std::env::set_var("TRAVSR_LSIF_PY", script_path.to_str().unwrap());
+            let r = run_lsif_py_emitter(&root_path);
+            std::env::remove_var("TRAVSR_LSIF_PY");
+            let _ = tx.send(r);
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("must return within watchdog window");
+        let dump = result.expect("must succeed").expect("must be Some");
+        assert_eq!(dump.len(), 131072);
     }
 }

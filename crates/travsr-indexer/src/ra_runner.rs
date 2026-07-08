@@ -11,13 +11,15 @@
 //! Neither case fails the overall index — Tree-sitter structural edges are
 //! always emitted regardless of whether LSIF ingestion succeeds.
 
-use std::io::Read as _;
 use std::path::Path;
-use std::time::Instant;
 
 use anyhow::Context as _;
 
-use crate::sandbox::{build_sandboxed_command, SandboxConfig, SandboxStatus};
+use crate::runner::run_with_drain;
+use crate::sandbox::{
+    build_sandboxed_command, record_ra_lsif_sandbox_skip, should_skip_unsandboxed, SandboxConfig,
+    SandboxStatus,
+};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -125,12 +127,25 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
                 repo = %repo_root.display(),
                 reason,
                 "rust-analyzer running WITHOUT sandbox — \
-                 install bubblewrap on Linux for process isolation"
+                 install bubblewrap for isolation"
             );
+            if should_skip_unsandboxed(&status, cfg.allow_unsandboxed) {
+                tracing::warn!(
+                    repo = %repo_root.display(),
+                    "rust-analyzer LSIF SKIPPED — sandbox unavailable and \
+                     --allow-unsandboxed-lsif not set; Rust semantic edges degraded \
+                     to tree-sitter/native structural edges. Install bubblewrap, or \
+                     pass --allow-unsandboxed-lsif if you trust this repository."
+                );
+                record_ra_lsif_sandbox_skip();
+                return Ok(None);
+            }
+            // allow_unsandboxed=true: operator opted in, fall through and spawn
+            // unconfined. The error! above already records the audit trail.
         }
     }
 
-    let mut child = cmd
+    let child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -141,63 +156,20 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
             )
         })?;
 
-    // Drain stdout and stderr on background threads BEFORE polling for exit.
-    // rust-analyzer LSIF output can exceed the OS pipe buffer (64 KB on Linux);
-    // if we poll try_wait() without draining, the child blocks on a full pipe
-    // and never exits — causing a spurious timeout kill. The drain threads run
-    // concurrently with the polling loop and join after the child exits or is
-    // killed. O(output_size) memory — acceptable for LSIF dumps (< 10 MB).
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("rust-analyzer child has no piped stdout"))?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("rust-analyzer child has no piped stderr"))?;
-    let stdout_thread = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + cfg.timeout;
-
-    let exit_status = loop {
-        match child.try_wait().context("polling rust-analyzer")? {
-            Some(s) => break s,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                // Join drain threads so they don't dangle after we return.
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                anyhow::bail!(
-                    "rust-analyzer lsif timed out after {}s — killed",
-                    cfg.timeout.as_secs()
-                );
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(200)),
-        }
-    };
-
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
+    // Drain both pipes concurrently via the shared helper — see run_with_drain
+    // for the pipe-buffer deadlock rationale.
+    let (exit_status, stdout_bytes, stderr) =
+        run_with_drain(child, cfg.timeout, "rust-analyzer lsif")?;
 
     if !exit_status.success() {
-        // Include first 5 lines of stderr to aid debugging without flooding logs.
         let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
         anyhow::bail!("rust-analyzer lsif exited with {exit_status}: {stderr_head}");
     }
 
-    let line_count = stdout.lines().count();
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     tracing::info!(
         repo = %repo_root.display(),
-        lines = line_count,
+        lines = stdout.lines().count(),
         "rust-analyzer lsif complete"
     );
 
@@ -208,8 +180,6 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::*;
     use crate::sandbox::SandboxConfig;
 
     #[test]
@@ -241,6 +211,7 @@ mod tests {
         // Skipped on Windows where `sleep` is not available.
         #[cfg(unix)]
         {
+            use std::time::Instant;
             let mut child = std::process::Command::new("sleep")
                 .arg("60")
                 .stdout(std::process::Stdio::null())

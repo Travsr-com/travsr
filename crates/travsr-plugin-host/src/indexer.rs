@@ -429,6 +429,7 @@ impl PluginIndexer {
                                 // fallback so it works even when daemon PATH is stripped.
                                 let cfg = SandboxConfig {
                                     repo_root: repo_root.to_path_buf(),
+                                    allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in(),
                                     ..Default::default()
                                 };
                                 match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
