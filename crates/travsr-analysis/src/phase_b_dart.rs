@@ -103,22 +103,38 @@ pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<
         .spawn()
         .with_context(|| format!("failed to spawn {}", emitter.display()))?;
 
+    // Drain stderr on a background thread before entering the poll loop so a
+    // verbose emitter can't fill the 64 KiB OS pipe buffer and block here
+    // (same footgun as Issue #412 C1). Stdout is Stdio::null() — no risk there.
+    // travsr-analysis is upstream of travsr-indexer so run_with_drain is not
+    // available here; the pattern is intentionally inlined.
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("dart emitter child has no piped stderr"))?;
+    let err_t = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    // `try_wait` is used intentionally here: stderr is already draining above
+    // so there is no pipe-buffer deadlock risk. run_with_drain (travsr-indexer)
+    // cannot be called from this crate due to the dependency direction.
+    #[allow(clippy::disallowed_methods)]
     let status = loop {
         match child.try_wait().context("polling dart emitter")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = err_t.join();
                 anyhow::bail!("dart emitter timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
         }
     };
 
-    let mut stderr_buf = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_buf);
-    }
+    let stderr_buf = err_t.join().unwrap_or_default();
     if !stderr_buf.is_empty() {
         tracing::debug!("phase_b_dart stderr:\n{stderr_buf}");
     }

@@ -31,9 +31,23 @@ pub use hook::{changed_files_from_git, install_hook, try_dispatch_to_daemon};
 /// Set the process-level opt-in flag that allows `rust-analyzer` to run
 /// unconfined when the OS sandbox is unavailable.
 ///
-/// Call this **before** `init_repo_with_progress` or any indexing operation.
-/// Corresponds to `travsr init --allow-unsandboxed-lsif`. The value is
-/// forwarded to `travsr_indexer::sandbox::set_cli_allow_unsandboxed`.
+/// # Scope: `travsr init` only (R2)
+///
+/// This function has exactly **one** caller: `travsr_cli::init::run`, which sets
+/// it once before `init_repo_with_progress` and then exits. The flag therefore
+/// applies only to the single-shot `travsr init` process.
+///
+/// The **long-lived daemon** (git-hook / file-watcher incremental reindex path)
+/// is a separate process that never calls this setter, so
+/// `ALLOW_UNSANDBOXED_BY_CLI` stays `false` on every daemon-triggered reindex.
+/// This is intentional: the daemon always fails closed unless the operator sets
+/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the daemon's process environment — a
+/// deliberate, auditable, per-environment decision that cannot be silently
+/// inherited from a one-time `init` invocation.
+///
+/// If you need the daemon to run RA unconfined, set
+/// `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` in the environment where the daemon is
+/// launched (e.g. your shell profile or systemd unit file).
 pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
@@ -1229,6 +1243,10 @@ pub fn init_repo_with_progress(
         // Phase B — deep semantic analysis via sidecar plugins (RFC-011 §3).
         let t_phase_b = std::time::Instant::now();
         let report = {
+            // R1: reset the per-Phase-B skip latch before each run so a previous
+            // skip on another repo doesn't produce a false degradation flag for
+            // this repo's write_phase_b_results call.
+            travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
             let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
             let inputs = travsr_plugin_host::PhaseBInputs {
                 repo_root,
@@ -1787,6 +1805,8 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     // P6 (#329): single walk yields both present_languages and indexable_paths
     // so Phase B runners skip their own directory walks.
     let (present_languages, indexable_paths) = collect_present_languages_and_paths(repo_root);
+    // R1: reset per-Phase-B skip latch before the run (same as init_repo_with_progress).
+    travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
     let inputs = travsr_plugin_host::PhaseBInputs {
         repo_root,

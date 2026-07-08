@@ -997,6 +997,11 @@ fn run_parallel_reindex(
     let hard_ceiling = reindex_hard_ceiling_secs();
     let mut last_count = count_model_embeddings(embed_db_path, model_id).unwrap_or(0);
     let mut last_progress = std::time::Instant::now();
+    // Stdout is Stdio::null() (quiet) or inherited — never a pipe. Stderr is
+    // already draining on the StderrRing background thread (line above). No
+    // pipe-buffer deadlock risk; run_with_drain (travsr-indexer) is not
+    // available to this crate due to the dependency direction.
+    #[allow(clippy::disallowed_methods)]
     loop {
         match child.try_wait() {
             Ok(Some(s)) if s.success() => {

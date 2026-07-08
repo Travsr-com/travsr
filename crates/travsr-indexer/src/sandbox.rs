@@ -105,23 +105,20 @@ pub fn set_cli_allow_unsandboxed(val: bool) {
 ///
 /// Priority (highest first):
 /// 1. CLI flag set via [`set_cli_allow_unsandboxed`] — deliberate, per-invocation.
-/// 2. `TRAVSR_ALLOW_UNSANDBOXED=1` env var — logs `error!` on each use to make
-///    the unsandboxed execution visible in CI logs; never sourced from repo files.
+/// 2. `TRAVSR_ALLOW_UNSANDBOXED_LSIF=1` env var — fallback for daemon / hook reindex
+///    paths where the CLI flag is not propagated (see `set_allow_unsandboxed_lsif`
+///    in `travsr-daemon` for scoping notes).
+///
+/// **Pure function — no logging side effects.** The mandatory unconfined-proceed
+/// `error!` is emitted only at the actual spawn decision point in `run_ra_lsif`
+/// so it never fires spuriously when the OS sandbox is Active.
 pub fn allow_unsandboxed_opt_in() -> bool {
     if ALLOW_UNSANDBOXED_BY_CLI.load(Ordering::Relaxed) {
         return true;
     }
-    let from_env = std::env::var("TRAVSR_ALLOW_UNSANDBOXED")
+    std::env::var("TRAVSR_ALLOW_UNSANDBOXED_LSIF")
         .map(|v| v.trim() == "1")
-        .unwrap_or(false);
-    if from_env {
-        tracing::error!(
-            "TRAVSR_ALLOW_UNSANDBOXED=1 is set — rust-analyzer will run UNCONFINED \
-             over this repository. Set this only in fully trusted environments. \
-             Prefer `travsr init --allow-unsandboxed-lsif` for explicit per-run control."
-        );
-    }
-    from_env
+        .unwrap_or(false)
 }
 
 /// Pure function: return `true` when the subprocess should be **skipped** given
@@ -142,8 +139,20 @@ pub fn record_ra_lsif_sandbox_skip() {
     RA_LSIF_SANDBOX_SKIPPED.store(true, Ordering::Relaxed);
 }
 
-/// Return `true` if any `run_ra_lsif` call in this process was skipped due to
-/// sandbox fail-closed. Used by the daemon to write the degradation meta key.
+/// Reset the per-Phase-B-run skip latch to `false`.
+///
+/// **Must be called once before each `invoke_phase_b_all` / Phase B pass** so
+/// the flag is scoped to a single run. Without this reset, the global stays
+/// `true` after the first skip and falsely signals degradation for every
+/// subsequent repo indexed in the same long-lived daemon process (R1 fix).
+pub fn reset_ra_lsif_sandbox_skip() {
+    RA_LSIF_SANDBOX_SKIPPED.store(false, Ordering::Relaxed);
+}
+
+/// Return `true` if a `run_ra_lsif` call **in the current Phase B run** was
+/// skipped due to sandbox fail-closed. Used by the daemon to write the
+/// degradation meta key. Call [`reset_ra_lsif_sandbox_skip`] before each
+/// Phase B pass so this reflects only the current run's state.
 pub fn ra_lsif_sandbox_was_skipped() -> bool {
     RA_LSIF_SANDBOX_SKIPPED.load(Ordering::Relaxed)
 }
@@ -478,21 +487,27 @@ mod tests {
 
     #[test]
     fn opt_in_round_trips_via_env() {
-        // M1.5 — env var parsing
+        // M1.5 — env var parsing (R4: correct var is TRAVSR_ALLOW_UNSANDBOXED_LSIF)
         let _g = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Reset CLI flag so env var is the only source.
         set_cli_allow_unsandboxed(false);
 
-        std::env::remove_var("TRAVSR_ALLOW_UNSANDBOXED");
+        std::env::remove_var("TRAVSR_ALLOW_UNSANDBOXED_LSIF");
         assert!(!allow_unsandboxed_opt_in(), "unset → false");
 
-        std::env::set_var("TRAVSR_ALLOW_UNSANDBOXED", "0");
+        std::env::set_var("TRAVSR_ALLOW_UNSANDBOXED_LSIF", "1");
+        assert!(allow_unsandboxed_opt_in(), "'1' → true");
+
+        std::env::set_var("TRAVSR_ALLOW_UNSANDBOXED_LSIF", "0");
         assert!(!allow_unsandboxed_opt_in(), "'0' → false");
 
-        std::env::set_var("TRAVSR_ALLOW_UNSANDBOXED", "garbage");
+        std::env::set_var("TRAVSR_ALLOW_UNSANDBOXED_LSIF", "garbage");
         assert!(!allow_unsandboxed_opt_in(), "garbage → false");
 
-        std::env::remove_var("TRAVSR_ALLOW_UNSANDBOXED");
+        std::env::set_var("TRAVSR_ALLOW_UNSANDBOXED_LSIF", " 1 ");
+        assert!(allow_unsandboxed_opt_in(), "trimmed ' 1 ' → true");
+
+        std::env::remove_var("TRAVSR_ALLOW_UNSANDBOXED_LSIF");
     }
 
     #[test]
@@ -508,26 +523,39 @@ mod tests {
     }
 
     #[test]
-    fn ra_lsif_sandbox_skip_tracking() {
-        // Record + query round-trip.
-        // Note: AtomicBool is process-global; once set it stays set for the
-        // process lifetime, so this test only checks the monotonic direction.
+    fn ra_lsif_sandbox_skip_tracking_and_reset() {
+        // R1 fix: verify both directions of the latch — set and reset.
+        // Uses SANDBOX_ENV_LOCK so it is serialized with other global-state tests.
+        let _g = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ra_lsif_sandbox_skip(); // start clean
+        assert!(!ra_lsif_sandbox_was_skipped(), "fresh state must be false");
         record_ra_lsif_sandbox_skip();
-        assert!(ra_lsif_sandbox_was_skipped());
+        assert!(ra_lsif_sandbox_was_skipped(), "after record must be true");
+        reset_ra_lsif_sandbox_skip();
+        assert!(
+            !ra_lsif_sandbox_was_skipped(),
+            "after reset must be false again"
+        );
     }
 
-    #[cfg(target_os = "windows")]
+    // M1.6 / R7 — Windows + unknown-OS fallback is fail-closed.
+    //
+    // The original test was #[cfg(target_os = "windows")] and never ran on Linux/macOS CI.
+    // Refactored to a platform-agnostic unit test using a synthetic Unavailable status so
+    // it compiles and runs on every host, proving the guard logic independently of the OS.
     #[test]
-    fn windows_fallback_is_fail_closed_without_opt_in() {
-        // M1.6 — Windows fallback branch always returns Unavailable.
-        let cfg = SandboxConfig::default();
-        let (_, status) = build_sandboxed_command("echo", &["hi"], &cfg);
+    fn windows_and_unknown_os_fallback_is_fail_closed_without_opt_in() {
+        let unavailable = SandboxStatus::Unavailable {
+            reason: "Windows AppContainer sandbox not yet implemented (Issue #124)".to_owned(),
+        };
         assert!(
-            matches!(status, SandboxStatus::Unavailable { .. }),
-            "Windows must always be Unavailable"
+            should_skip_unsandboxed(&unavailable, false),
+            "Windows/unknown-OS Unavailable + !allow must skip (fail-closed)"
         );
-        // Without opt-in, should_skip_unsandboxed must return true.
-        assert!(should_skip_unsandboxed(&status, false));
+        assert!(
+            !should_skip_unsandboxed(&unavailable, true),
+            "Windows/unknown-OS Unavailable + allow must proceed"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

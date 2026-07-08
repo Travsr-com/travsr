@@ -89,6 +89,9 @@ pub(crate) fn run_with_drain(
     });
 
     let deadline = Instant::now() + timeout;
+    // Both pipes are already draining on background threads above — no pipe-buffer
+    // deadlock risk. This is the one site in the codebase where try_wait is safe.
+    #[allow(clippy::disallowed_methods)]
     let status = loop {
         match child
             .try_wait()
@@ -255,10 +258,12 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
         .context("create scip-python scratch dir")?;
     let output = scratch.path().join("index.scip");
 
-    // stdout goes to the tempfile (no pipe deadlock risk there), but stderr is
-    // still piped and must be drained on a background thread to avoid the same
-    // read-after-wait footgun that caused C1 in run_lsif_emitter.
-    let mut child = std::process::Command::new(&scip_python)
+    // Pipe both stdout and stderr through run_with_drain (R8 — 4/4 runner
+    // consolidation). scip-python writes its SCIP payload to the --output
+    // tempfile, so stdout bytes are status/progress messages; we drain and
+    // discard them. Piping (rather than Stdio::null()) ensures the OS pipe
+    // buffer never fills and blocks the child mid-write.
+    let child = std::process::Command::new(&scip_python)
         .args([
             "index",
             "--project-name",
@@ -270,39 +275,13 @@ pub fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<Option<Vec<u
         ])
         .arg(root)
         .current_dir(root)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn scip-python for {}", root.display()))?;
 
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("scip-python child has no piped stderr"))?;
-    let err_t = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut pipe = stderr_pipe;
-        let _ = pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + SCIP_PYTHON_TIMEOUT;
-    let status = loop {
-        match child.try_wait().context("polling scip-python")? {
-            Some(s) => break s,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = err_t.join();
-                anyhow::bail!(
-                    "scip-python timed out after {}s — killed",
-                    SCIP_PYTHON_TIMEOUT.as_secs()
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS)),
-        }
-    };
-
-    let stderr = err_t.join().unwrap_or_default();
+    let (status, _stdout_bytes, stderr) =
+        run_with_drain(child, SCIP_PYTHON_TIMEOUT, "scip-python")?;
 
     if !status.success() {
         anyhow::bail!("scip-python exited with {status}: {stderr}");
@@ -425,6 +404,35 @@ mod tests {
     // races on parallel test runners.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// RAII guard that restores an environment variable to its previous value
+    /// on drop, even if the test panics. Prevents env-var leaks from failing
+    /// assertions that would otherwise contaminate sibling tests in the same
+    /// binary (R12 fix — replaces manual `set_var` + `remove_var` pairs).
+    struct EnvGuard {
+        var: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(var: &'static str, val: &str) -> Self {
+            let prev = std::env::var(var).ok();
+            std::env::set_var(var, val);
+            Self { var, prev }
+        }
+        fn clear(var: &'static str) -> Self {
+            let prev = std::env::var(var).ok();
+            std::env::remove_var(var);
+            Self { var, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.var, v),
+                None => std::env::remove_var(self.var),
+            }
+        }
+    }
+
     // ── resolve tests (existing, kept) ───────────────────────────────────────
 
     #[test]
@@ -486,60 +494,56 @@ mod tests {
     #[test]
     fn timeout_unset_defaults_300() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
+        let _env = EnvGuard::clear("TRAVSR_LSIF_TIMEOUT_SECS");
         assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
     }
 
     #[test]
     fn timeout_valid_override() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "120");
+        let _env = EnvGuard::set("TRAVSR_LSIF_TIMEOUT_SECS", "120");
         assert_eq!(lsif_node_timeout(), Duration::from_secs(120));
-        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
     }
 
     #[test]
     fn timeout_zero_rejected() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "0");
+        let _env = EnvGuard::set("TRAVSR_LSIF_TIMEOUT_SECS", "0");
         assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
-        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
     }
 
     #[test]
     fn timeout_negative_rejected() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "-5");
+        let _env = EnvGuard::set("TRAVSR_LSIF_TIMEOUT_SECS", "-5");
         assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
-        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
     }
 
     #[test]
     fn timeout_non_numeric_rejected() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "abc");
+        let _env = EnvGuard::set("TRAVSR_LSIF_TIMEOUT_SECS", "abc");
         assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
-        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
     }
 
     #[test]
     fn timeout_whitespace_trimmed() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", " 90 ");
+        let _env = EnvGuard::set("TRAVSR_LSIF_TIMEOUT_SECS", " 90 ");
         assert_eq!(lsif_node_timeout(), Duration::from_secs(90));
-        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
     }
 
     #[test]
     fn timeout_absurd_clamped_to_default() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // overflow string → parse fails → default
-        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "999999999999999999999");
-        assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+        {
+            // overflow string → parse fails → default
+            let _env = EnvGuard::set("TRAVSR_LSIF_TIMEOUT_SECS", "999999999999999999999");
+            assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
+        }
         // beyond MAX_LSIF_TIMEOUT_SECS → clamped to default
-        std::env::set_var("TRAVSR_LSIF_TIMEOUT_SECS", "999999");
+        let _env = EnvGuard::set("TRAVSR_LSIF_TIMEOUT_SECS", "999999");
         assert_eq!(lsif_node_timeout(), Duration::from_secs(300));
-        std::env::remove_var("TRAVSR_LSIF_TIMEOUT_SECS");
     }
 
     // ── Helper: spawn a node stub (skips when node is absent) ────────────────
@@ -568,11 +572,11 @@ mod tests {
         f
     }
 
-    /// Set TRAVSR_LSIF_TS to `script`, call `f`, restore env. Holds ENV_LOCK.
+    /// Set TRAVSR_LSIF_TS to `script`, call `f`, restore env via RAII.
+    /// Caller must already hold ENV_LOCK. EnvGuard restores on drop even on panic.
     fn with_lsif_ts_env<F: FnOnce()>(script: &std::path::Path, f: F) {
-        std::env::set_var("TRAVSR_LSIF_TS", script.to_str().unwrap());
+        let _guard = EnvGuard::set("TRAVSR_LSIF_TS", script.to_str().unwrap());
         f();
-        std::env::remove_var("TRAVSR_LSIF_TS");
     }
 
     // ── R.1-R.3 — run_with_drain shared contract ──────────────────────────────

@@ -91,7 +91,7 @@ pub fn ra_available() -> bool {
 ///
 /// Returns:
 /// - `Ok(Some(dump))` — LSIF dump ready for [`crate::lsif::ingest_rust`].
-/// - `Ok(None)` — rust-analyzer not on PATH; skip LSIF silently.
+/// - `Ok(None)` — rust-analyzer not on PATH, or sandbox unavailable + not opted in.
 /// - `Err(_)` — rust-analyzer failed (non-zero exit, timeout, spawn error).
 ///
 /// `cfg.timeout` is enforced via a polling loop; the process is killed on
@@ -111,9 +111,22 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     };
     let ra_str = ra_path.to_string_lossy().into_owned();
     let repo_str = repo_root.to_string_lossy();
-    let (mut cmd, status) =
-        build_sandboxed_command(ra_str.as_str(), &["lsif", repo_str.as_ref()], cfg);
+    let (cmd, status) = build_sandboxed_command(ra_str.as_str(), &["lsif", repo_str.as_ref()], cfg);
+    spawn_or_skip_ra(cmd, status, repo_root, cfg)
+}
 
+/// Guard + spawn logic for `run_ra_lsif`, extracted so tests can inject a
+/// synthetic [`SandboxStatus`] without touching the real OS sandbox.
+///
+/// Returns `Ok(None)` when the sandbox is [`SandboxStatus::Unavailable`] and
+/// `cfg.allow_unsandboxed` is `false` (fail-closed). This is the SEV-2
+/// security guarantee: `cmd.spawn()` is **never** called on that path.
+fn spawn_or_skip_ra(
+    mut cmd: std::process::Command,
+    status: SandboxStatus,
+    repo_root: &Path,
+    cfg: &SandboxConfig,
+) -> anyhow::Result<Option<String>> {
     match &status {
         SandboxStatus::Active { mechanism } => {
             tracing::info!(
@@ -126,8 +139,7 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
             tracing::error!(
                 repo = %repo_root.display(),
                 reason,
-                "rust-analyzer running WITHOUT sandbox — \
-                 install bubblewrap for isolation"
+                "rust-analyzer sandbox unavailable — install bubblewrap for isolation"
             );
             if should_skip_unsandboxed(&status, cfg.allow_unsandboxed) {
                 tracing::warn!(
@@ -140,8 +152,14 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
                 record_ra_lsif_sandbox_skip();
                 return Ok(None);
             }
-            // allow_unsandboxed=true: operator opted in, fall through and spawn
-            // unconfined. The error! above already records the audit trail.
+            // allow_unsandboxed=true: operator opted in. Emit the unconfined-spawn
+            // audit-trail error HERE (R6 fix) — not at config-construction time —
+            // so it never fires spuriously when the sandbox is Active.
+            tracing::error!(
+                repo = %repo_root.display(),
+                "rust-analyzer will run UNCONFINED — TRAVSR_ALLOW_UNSANDBOXED_LSIF \
+                 opt-in acknowledged. Ensure this repository is fully trusted."
+            );
         }
     }
 
@@ -180,13 +198,14 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
 
 #[cfg(test)]
 mod tests {
-    use crate::sandbox::SandboxConfig;
+    use super::spawn_or_skip_ra;
+    use crate::sandbox::{SandboxConfig, SandboxStatus};
 
     #[test]
     fn run_ra_lsif_returns_none_when_ra_missing() {
-        // Patch: directly test the graceful-skip path by verifying that a
-        // binary we know is absent returns Ok(None) via the same logic.
-        // We can't override ra_available() here, so we test the helper directly.
+        // Graceful-skip: a binary we know is absent must fail to spawn.
+        // (run_ra_lsif itself returns Ok(None) before spawn when RA is absent;
+        // this test confirms the spawn path would fail, not silently succeed.)
         let missing = std::process::Command::new("__ra_nonexistent_binary__")
             .arg("--version")
             .status();
@@ -198,20 +217,94 @@ mod tests {
         let cfg = SandboxConfig::default();
         assert_eq!(cfg.timeout, std::time::Duration::from_secs(300));
         assert_eq!(cfg.mem_limit_bytes, 4 * 1024 * 1024 * 1024);
+        // M1.4: default must be fail-closed (R3 coverage)
+        assert!(
+            !cfg.allow_unsandboxed,
+            "default SandboxConfig must be fail-closed"
+        );
+    }
+
+    /// R3 — SEV-2 regression guard: `Unavailable + !allow_unsandboxed` must return
+    /// `Ok(None)` without ever calling `cmd.spawn()`.
+    ///
+    /// Uses `spawn_or_skip_ra` with a synthetic `Unavailable` status and a sentinel
+    /// command that would leave a detectable side effect if spawned. This directly
+    /// proves the order invariant: the guard check fires **before** `cmd.spawn()`.
+    #[test]
+    #[cfg(unix)]
+    fn fail_closed_unavailable_sandbox_never_spawns_ra() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sentinel = dir.path().join("was_spawned");
+
+        // Sentinel script: touches a file if executed.
+        let script = dir.path().join("sentinel.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch {}\n", sentinel.display()),
+        )
+        .expect("write sentinel script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod sentinel");
+
+        let cmd = std::process::Command::new(&script);
+        let status = SandboxStatus::Unavailable {
+            reason: "injected for test".to_owned(),
+        };
+        let cfg = SandboxConfig {
+            allow_unsandboxed: false,
+            repo_root: dir.path().to_path_buf(),
+            ..SandboxConfig::default()
+        };
+
+        let result = spawn_or_skip_ra(cmd, status, dir.path(), &cfg);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "Unavailable + !allow_unsandboxed must return Ok(None), got: {result:?}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "sentinel file must not exist — spawn_or_skip_ra called cmd.spawn() \
+             despite Unavailable sandbox and allow_unsandboxed=false (SEV-2 regression)"
+        );
+    }
+
+    /// R3 companion: opt-in path DOES reach spawn (and fails loudly on a bad binary).
+    /// Proves the guard is bypassable only through the explicit opt-in.
+    #[test]
+    #[cfg(unix)]
+    fn opt_in_unavailable_sandbox_attempts_spawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Use a binary that fails to spawn so we get an Err, not Ok(None).
+        let cmd = std::process::Command::new("__sentinel_must_not_exist_ra__");
+        let status = SandboxStatus::Unavailable {
+            reason: "injected for test".to_owned(),
+        };
+        let cfg = SandboxConfig {
+            allow_unsandboxed: true,
+            repo_root: dir.path().to_path_buf(),
+            ..SandboxConfig::default()
+        };
+
+        let result = spawn_or_skip_ra(cmd, status, dir.path(), &cfg);
+        // Must reach spawn() — which fails on the nonexistent binary → Err.
+        assert!(
+            result.is_err(),
+            "opt-in path must attempt spawn and fail (not return Ok(None)): {result:?}"
+        );
     }
 
     #[test]
     fn run_ra_lsif_timeout_kills_long_running_process() {
         // Verify the timeout-kill polling loop using a raw `sleep` process.
-        // We deliberately bypass build_sandboxed_command here: on CI runners
-        // bwrap may be installed but user namespaces disabled at the kernel
-        // level (common in Docker), causing bwrap to exit immediately and the
-        // test to see timed_out=false. Sandbox correctness is tested separately
-        // in sandbox.rs. This test only exercises the kill-on-deadline path.
+        // Deliberately bypasses build_sandboxed_command — sandbox correctness is
+        // tested in sandbox.rs. This test only exercises the kill-on-deadline path.
         // Skipped on Windows where `sleep` is not available.
         #[cfg(unix)]
         {
             use std::time::Instant;
+            #[allow(clippy::disallowed_methods)] // legitimate: testing the kill loop, not draining
             let mut child = std::process::Command::new("sleep")
                 .arg("60")
                 .stdout(std::process::Stdio::null())
@@ -222,6 +315,7 @@ mod tests {
             let timeout = std::time::Duration::from_millis(200);
             let deadline = Instant::now() + timeout;
             let timed_out = loop {
+                #[allow(clippy::disallowed_methods)]
                 match child.try_wait().expect("try_wait") {
                     Some(_) => break false,
                     None if Instant::now() >= deadline => {
