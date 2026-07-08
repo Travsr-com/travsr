@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use streaming_iterator::StreamingIterator as _;
-use travsr_core::{Edge, EdgeKind, Node, UnresolvedCall, VName};
+use travsr_core::{Edge, EdgeKind, Node, ScipRef, UnresolvedCall, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 // ── Tree-sitter query ─────────────────────────────────────────────────────────
@@ -57,12 +57,20 @@ const NOISE_NAMES: &[&str] = &[
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Native Rust Phase B output: `(nodes, edges, unresolved_calls, refs)`.
+/// `refs` carries same-file call occurrences (issue #299) for `edge_sites`.
+pub type NativePhaseB = (Vec<Node>, Vec<Edge>, Vec<UnresolvedCall>, Vec<ScipRef>);
+
 /// Extract native Phase B edges for a Rust corpus rooted at `root`.
 ///
-/// Returns `(nodes, edges, unresolved_calls)`:
+/// Returns `(nodes, edges, unresolved_calls, refs)`:
 ///   - crate nodes + `Depends` edges from Cargo.toml dependency graph
-///   - `RefCall` edges from tree-sitter call-site analysis
+///   - `Depends`/structural edges (same-file call edges are carried as `refs`)
 ///   - `UnresolvedCall`s for cross-crate calls that cannot be anchored locally
+///   - `ScipRef` occurrence records for same-file and struct/enum scoped calls
+///     (issue #299): carry the call-site line so the store's
+///     `write_scip_attributed_batch` records `edge_sites` rows, giving
+///     `find_references` exact `path:line` for Rust.
 ///
 /// Note: travsr-analysis does not have daemon plumbing, so `unresolved_calls`
 /// are returned to the caller but are NOT resolved against the store here.
@@ -75,10 +83,11 @@ pub fn extract_native_phase_b(
     corpus: &str,
     root: &Path,
     files: Option<&[(PathBuf, String)]>,
-) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<UnresolvedCall>)> {
+) -> anyhow::Result<NativePhaseB> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
+    let mut refs: Vec<ScipRef> = Vec::new();
 
     // Pass 1: crate dependency graph via Cargo.toml
     match extract_cargo_deps(corpus, root) {
@@ -95,7 +104,7 @@ pub fn extract_native_phase_b(
         Ok(q) => q,
         Err(e) => {
             tracing::warn!(err = %e, "rust call-site query compile failed — skipping Phase B calls");
-            return Ok((nodes, edges, unresolved));
+            return Ok((nodes, edges, unresolved, refs));
         }
     };
 
@@ -112,9 +121,9 @@ pub fn extract_native_phase_b(
 
     for (abs_path, vname_path) in file_pairs {
         match extract_file_call_edges(corpus, abs_path, vname_path, &language, &query) {
-            Ok((file_edges, file_unresolved)) => {
-                edges.extend(file_edges);
+            Ok((file_unresolved, file_refs)) => {
                 unresolved.extend(file_unresolved);
+                refs.extend(file_refs);
             }
             Err(e) => {
                 tracing::debug!(err = %e, path = %abs_path.display(), "rust call extraction skipped")
@@ -127,10 +136,32 @@ pub fn extract_native_phase_b(
     nodes.dedup_by_key(|n| n.id);
     edges.sort_unstable_by_key(|e| (e.src, e.dst));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
-    unresolved.sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
-    unresolved.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+    // Dedup on (src, callee_sig, caller_line) so two distinct call sites of the
+    // same callee from one caller both survive — find_references (#299) needs
+    // every occurrence line, not just the first.
+    unresolved.sort_unstable_by(|a, b| {
+        a.src
+            .0
+            .cmp(&b.src.0)
+            .then(a.callee_sig.cmp(&b.callee_sig))
+            .then(a.caller_line.cmp(&b.caller_line))
+    });
+    unresolved.dedup_by(|a, b| {
+        a.src == b.src && a.callee_sig == b.callee_sig && a.caller_line == b.caller_line
+    });
+    refs.sort_unstable_by(|a, b| {
+        a.caller_path
+            .cmp(&b.caller_path)
+            .then(a.caller_line.cmp(&b.caller_line))
+            .then(a.callee_id.0.cmp(&b.callee_id.0))
+    });
+    refs.dedup_by(|a, b| {
+        a.caller_path == b.caller_path
+            && a.caller_line == b.caller_line
+            && a.callee_id == b.callee_id
+    });
 
-    Ok((nodes, edges, unresolved))
+    Ok((nodes, edges, unresolved, refs))
 }
 
 // ── Cargo.toml dependency graph ───────────────────────────────────────────────
@@ -250,7 +281,7 @@ fn extract_file_call_edges(
     vname_path: &str,
     language: &tree_sitter::Language,
     query: &Query,
-) -> anyhow::Result<(Vec<Edge>, Vec<UnresolvedCall>)> {
+) -> anyhow::Result<(Vec<UnresolvedCall>, Vec<ScipRef>)> {
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
@@ -271,8 +302,8 @@ fn extract_file_call_edges(
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(query, tree.root_node(), source.as_slice());
 
-    let mut edges: Vec<Edge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
+    let mut refs: Vec<ScipRef> = Vec::new();
 
     while let Some(m) = iter.next() {
         for &cap in m.captures {
@@ -286,6 +317,9 @@ fn extract_file_call_edges(
             if callee_name.len() < 2 {
                 continue;
             }
+
+            // 1-based call-site line (issue #299). tree-sitter rows are 0-based.
+            let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
 
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(cap.node, source.as_slice())
             else {
@@ -322,7 +356,11 @@ fn extract_file_call_edges(
                         }
                     };
                     if caller_id != callee_id {
-                        edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
+                        refs.push(ScipRef {
+                            caller_path: vname_path.to_string(),
+                            caller_line: occ_line,
+                            callee_id,
+                        });
                     }
                 }
                 "call.scoped" => {
@@ -347,7 +385,11 @@ fn extract_file_call_edges(
                             )
                             .id();
                             if caller_id != callee_id {
-                                edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
+                                refs.push(ScipRef {
+                                    caller_path: vname_path.to_string(),
+                                    caller_line: occ_line,
+                                    callee_id,
+                                });
                             }
                         }
                         Some(ref qual) => {
@@ -357,6 +399,7 @@ fn extract_file_call_edges(
                                     src: caller_id,
                                     callee_sig: format!("fn:{callee_name}"),
                                     hint_crate: Some(qual.clone()),
+                                    caller_line: occ_line,
                                 });
                             }
                         }
@@ -367,6 +410,7 @@ fn extract_file_call_edges(
                                     src: caller_id,
                                     callee_sig: format!("fn:{callee_name}"),
                                     hint_crate: None,
+                                    caller_line: occ_line,
                                 });
                             }
                         }
@@ -380,6 +424,7 @@ fn extract_file_call_edges(
                         src: caller_id,
                         callee_sig: format!("fn:{callee_name}"),
                         hint_crate: None,
+                        caller_line: occ_line,
                     });
                 }
                 _ => {}
@@ -387,7 +432,7 @@ fn extract_file_call_edges(
         }
     }
 
-    Ok((edges, unresolved))
+    Ok((unresolved, refs))
 }
 
 /// Walk up the tree-sitter AST to find the nearest enclosing `function_item`.

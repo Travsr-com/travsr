@@ -16,7 +16,9 @@ mod install;
 mod lang;
 mod logo;
 mod migrate;
+mod pattern;
 mod progress;
+mod references;
 mod repo;
 mod repos;
 mod serve;
@@ -104,6 +106,29 @@ enum Command {
         /// Output format: table (default) or json.
         #[arg(long, value_enum, default_value = "table")]
         format: ask::OutputFormat,
+    },
+    /// Enumerate every use site (path:line) of a symbol across the repo.
+    #[command(alias = "refs")]
+    References {
+        /// Symbol to enumerate references of (bare name or full signature).
+        symbol: String,
+        /// Optional file-path hint to disambiguate overloaded names.
+        #[arg(long)]
+        path: Option<String>,
+        /// Output format: text (default) or json.
+        #[arg(long, value_enum, default_value = "text")]
+        format: references::OutputFormat,
+    },
+    /// Graph-scoped textual search (git grep) over a bounded file set.
+    Pattern {
+        /// Text or regex to search for.
+        pattern: String,
+        /// Optional scope: a path prefix, or files-importing(<symbol>).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output format: text (default) or json.
+        #[arg(long, value_enum, default_value = "text")]
+        format: pattern::OutputFormat,
     },
     /// Show the dependency graph for a symbol or file as a tree or DOT.
     Graph {
@@ -602,6 +627,16 @@ async fn run(cli: Cli) -> Result<()> {
         } => repos::run(prune, remove.as_deref(), json)?,
         Command::Status => status::run()?,
         Command::Ask { query, format } => ask::run(&query, format)?,
+        Command::References {
+            symbol,
+            path,
+            format,
+        } => references::run(&symbol, path, format)?,
+        Command::Pattern {
+            pattern,
+            scope,
+            format,
+        } => pattern::run(&pattern, scope, format)?,
         Command::Graph {
             query,
             all,

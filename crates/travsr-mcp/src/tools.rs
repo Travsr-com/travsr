@@ -364,6 +364,431 @@ pub fn get_callers_global(
     sanitize_for_mcp(&raw)
 }
 
+// ── find_references (issue #299) ───────────────────────────────────────────────
+
+/// Per-symbol cap on returned occurrence sites. Hub symbols (e.g. `error`) can
+/// have thousands of uses; capping keeps the MCP byte budget bounded. Mirrors
+/// the spirit of `MAX_SITES_PER_CALLER` but is per-symbol, not per-caller.
+const MAX_REFERENCE_SITES: usize = 500;
+
+/// Resolution outcome for a `find_references` symbol argument.
+enum RefTarget {
+    /// Exactly one definition — enumerate its references.
+    Unique(CoreNode),
+    /// Multiple definitions and no disambiguating `path` — return the list so the
+    /// caller can re-query with a `path` hint (never silently pick `[0]`).
+    Ambiguous(Vec<CoreNode>),
+    /// No definition matched the name.
+    None,
+}
+
+/// Resolve a symbol name (or full signature) to its definition node(s).
+///
+/// Ladder (consistent with `get_snippets` resolution): exact-signature match
+/// first (handles full headers like `fn:charge` from `get_context`), then an
+/// exact simple-name match over the FTS candidates. An optional `path` suffix
+/// pins overloaded names to one file.
+fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&str>) -> RefTarget {
+    // Tier 1: exact signature (+ optional path pin).
+    let mut candidates = store.lookup_nodes_exact(symbol, path).unwrap_or_else(|e| {
+        tracing::warn!("find_references lookup_nodes_exact '{symbol}': {e}");
+        Vec::new()
+    });
+
+    // Tier 2: exact simple-name match over FTS candidates (bare names like `charge`).
+    if candidates.is_empty() {
+        candidates = match store.search_nodes_by_name(symbol) {
+            Ok(nodes) => nodes
+                .into_iter()
+                .filter(|n| {
+                    n.kind != "file"
+                        && (n.vname.signature == symbol
+                            || simple_name(&n.vname.signature) == symbol)
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("find_references search '{symbol}': {e}");
+                Vec::new()
+            }
+        };
+    }
+
+    // Apply the path suffix pin if the caller supplied one (Tier 2 didn't use it).
+    if let Some(p) = path {
+        candidates.retain(|n| n.vname.path == p || n.vname.path.ends_with(p));
+    }
+
+    // Distinct definitions by node id.
+    candidates.sort_by_key(|n| n.id.0);
+    candidates.dedup_by_key(|n| n.id);
+
+    match candidates.len() {
+        0 => RefTarget::None,
+        1 => candidates
+            .pop()
+            .map(RefTarget::Unique)
+            .unwrap_or(RefTarget::None),
+        _ => RefTarget::Ambiguous(candidates),
+    }
+}
+
+/// Enumerate every use site (`path:line`) of a symbol across the current repo.
+///
+/// Reads the `edge_sites` occurrence store (populated by every ingestion path —
+/// SCIP, LSIF, native tree-sitter). When a language has `ref/call` edges but no
+/// occurrence rows yet, degrades to caller-definition lines (labelled) rather
+/// than returning empty, matching `get_callers`' structural fallback.
+pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
+    // SEC-002: validate every argument before any store query.
+    if let Err(reason) = validate_mcp_arg(symbol) {
+        tracing::warn!("find_references rejected invalid symbol arg: {reason}");
+        return String::new();
+    }
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("find_references rejected invalid path arg: {reason}");
+            return String::new();
+        }
+    }
+    if phase_b_pending(store) {
+        return r#"{"status":"pending","message":"Semantic occurrence index is building in the background. References will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
+    }
+    // SEC-001: sanitize before returning to the MCP client / LLM.
+    sanitize_for_mcp(&find_references_raw(store, symbol, path))
+}
+
+/// Raw (unsanitized) variant, shared by the global aggregator.
+fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
+    let target = match resolve_reference_targets(store, symbol, path) {
+        RefTarget::Unique(n) => n,
+        RefTarget::None => return String::new(),
+        RefTarget::Ambiguous(nodes) => {
+            let mut out = format!(
+                "'{symbol}' is ambiguous — {} definitions. Re-run with a `path` hint to pick one:\n",
+                nodes.len()
+            );
+            for n in nodes.iter().take(MAX_REFERENCE_SITES) {
+                let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+                out.push_str(&format!(
+                    "  {} ({}) — {}{}\n",
+                    n.vname.signature, n.kind, n.vname.path, loc
+                ));
+            }
+            return out.trim_end().to_string();
+        }
+    };
+
+    let resolved_loc = target.line.map(|l| format!(":{l}")).unwrap_or_default();
+    let header = format!(
+        "resolved: {} ({}) — {}{}",
+        target.vname.signature, target.kind, target.vname.path, resolved_loc
+    );
+
+    // Primary path: occurrence sites from edge_sites.
+    match store.reference_sites(target.id) {
+        Ok(sites) if !sites.is_empty() => {
+            let total = sites.len();
+            let shown = total.min(MAX_REFERENCE_SITES);
+            let mut lines = Vec::with_capacity(shown + 2);
+            lines.push(header);
+            lines.push(format!("{total} reference(s):"));
+            for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
+                lines.push(format!("{}:{}", s.path, s.line));
+            }
+            if total > shown {
+                lines.push(format!("[truncated: showing {shown} of {total} sites]"));
+            }
+            lines.join("\n")
+        }
+        Ok(_) => {
+            // Fallback: no occurrence rows for this dst. Degrade to caller
+            // definition lines from structural ref/call edges (labelled), so a
+            // language not yet feeding edge_sites still returns something useful.
+            reference_fallback_from_edges(store, &target, &header)
+        }
+        Err(e) => {
+            tracing::warn!("find_references reference_sites error: {e}");
+            reference_fallback_from_edges(store, &target, &header)
+        }
+    }
+}
+
+/// Structural fallback: enumerate caller definitions of `target` via `RefCall`
+/// edges when no `edge_sites` occurrence rows exist. Always labelled as
+/// degraded so the caller knows these are definition lines, not exact sites.
+fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header: &str) -> String {
+    use travsr_core::EdgeKind;
+    let edges = match store.iter_edges_to(target.id) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("find_references fallback edge query error: {e}");
+            return String::new();
+        }
+    };
+    let caller_ids: Vec<NodeId> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::RefCall)
+        .map(|e| e.src)
+        .collect();
+    if caller_ids.is_empty() {
+        // Resolution succeeded but the occurrence store has nothing: either the
+        // symbol genuinely has no callers, or its name is shared by definitions
+        // in other files/crates, in which case bare calls to it are not indexed
+        // (the resolver refuses to guess the target — precision over recall).
+        // Say so explicitly rather than returning a blank envelope.
+        return format!(
+            "{header}\n0 reference(s) recorded. If this name is also defined \
+             elsewhere, bare calls to it are left unindexed to avoid mis-targeting; \
+             use `find_pattern` for a textual search instead."
+        );
+    }
+    let callers = store.get_nodes(&caller_ids).unwrap_or_default();
+    let mut sites: Vec<String> = callers
+        .iter()
+        .map(|n| {
+            let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+            format!("{}{}", n.vname.path, loc)
+        })
+        .collect();
+    sites.sort();
+    sites.dedup();
+    let total = sites.len();
+    let mut lines = Vec::with_capacity(total + 2);
+    lines.push(header.to_string());
+    lines.push(format!(
+        "{total} caller definition(s) (exact occurrence lines unavailable for this language — showing caller definitions):"
+    ));
+    lines.extend(sites.into_iter().take(MAX_REFERENCE_SITES));
+    lines.join("\n")
+}
+
+/// Global variant of `find_references` — searches one named repo or all repos.
+pub fn find_references_global(
+    repos: &HashMap<String, PathBuf>,
+    symbol: &str,
+    path: Option<&str>,
+    repo: Option<&str>,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(symbol) {
+        tracing::warn!("find_references_global rejected invalid symbol arg: {reason}");
+        return String::new();
+    }
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("find_references_global rejected invalid path arg: {reason}");
+            return String::new();
+        }
+    }
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = find_references_raw(store, symbol, path);
+        if result.is_empty() || single {
+            result
+        } else {
+            result
+                .lines()
+                .map(|l| format!("[{repo_name}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    });
+    sanitize_for_mcp(&raw)
+}
+
+// ── find_pattern (issue #299) ──────────────────────────────────────────────────
+
+/// Cap on returned grep matches (byte-budget guard).
+const MAX_PATTERN_MATCHES: usize = 500;
+
+/// Graph-scoped textual search: `git grep` confined to a bounded file set.
+///
+/// `scope` selects the search set:
+///   - `None` → whole repository (tracked files).
+///   - `files-importing(<symbol>)` → only files whose graph node imports/depends
+///     on `<symbol>` (`Depends` / `RefImports` / `ResolvesTo` incoming edges).
+///   - any other string → treated as a repo-relative path prefix (pathspec).
+///
+/// Security (SEC): the pattern and every pathspec are passed as an argument
+/// vector to `git` — never through a shell — so shell metacharacters cannot
+/// inject. Control characters are rejected, absolute / parent-escaping
+/// pathspecs are dropped, execution is pinned to the repo root, and the match
+/// count is capped.
+pub fn find_pattern(store: &SqliteStore, pattern: &str, scope: Option<&str>) -> String {
+    // SEC-002: validate the pattern; reject control chars (newlines, NUL, …) that
+    // could smuggle additional grep semantics or corrupt the output framing.
+    if let Err(reason) = validate_mcp_arg(pattern) {
+        tracing::warn!("find_pattern rejected invalid pattern: {reason}");
+        return String::new();
+    }
+    if pattern.is_empty() || pattern.chars().any(|c| c.is_control()) {
+        tracing::warn!("find_pattern rejected empty or control-char pattern");
+        return String::new();
+    }
+    if let Some(s) = scope {
+        if let Err(reason) = validate_mcp_arg(s) {
+            tracing::warn!("find_pattern rejected invalid scope: {reason}");
+            return String::new();
+        }
+    }
+
+    let repo_root = match store.get_meta("repo_root") {
+        Ok(Some(r)) if !r.is_empty() => PathBuf::from(r),
+        _ => {
+            return "Pattern search unavailable: run `travsr init` to record the repo root."
+                .to_string()
+        }
+    };
+
+    // Resolve the scope into a bounded pathspec list (empty = whole repo).
+    let pathspecs: Vec<String> = match scope {
+        None => Vec::new(),
+        Some(s) => {
+            if let Some(sym) = s
+                .strip_prefix("files-importing(")
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                match scope_files_importing(store, sym.trim()) {
+                    Some(files) if !files.is_empty() => files,
+                    Some(_) => {
+                        return format!("No files import '{}'.", sym.trim());
+                    }
+                    None => return String::new(), // invalid symbol arg (already logged)
+                }
+            } else {
+                // Plain path prefix. Confine to the repo: reject absolute paths and
+                // parent-directory escapes.
+                if s.starts_with('/') || s.split('/').any(|c| c == "..") {
+                    tracing::warn!("find_pattern rejected out-of-repo scope: {s}");
+                    return String::new();
+                }
+                vec![s.to_string()]
+            }
+        }
+    };
+
+    sanitize_for_mcp(&run_git_grep(&repo_root, pattern, &pathspecs))
+}
+
+/// Resolve `files-importing(<symbol>)` to the set of repo-relative file paths
+/// whose node has an incoming import-like edge from another node — i.e. the
+/// files that reference `symbol`. Returns `None` on an invalid symbol argument.
+fn scope_files_importing(store: &SqliteStore, symbol: &str) -> Option<Vec<String>> {
+    use travsr_core::EdgeKind;
+    if validate_mcp_arg(symbol).is_err() {
+        tracing::warn!("find_pattern files-importing: invalid symbol");
+        return None;
+    }
+    let targets = store.search_nodes_by_name(symbol).unwrap_or_default();
+    let mut files: Vec<String> = Vec::new();
+    for t in &targets {
+        let edges = match store.iter_edges_to(t.id) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("find_pattern files-importing edge query: {e}");
+                continue;
+            }
+        };
+        let src_ids: Vec<NodeId> = edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EdgeKind::Depends | EdgeKind::RefImports | EdgeKind::ResolvesTo
+                )
+            })
+            .map(|e| e.src)
+            .collect();
+        for n in store.get_nodes(&src_ids).unwrap_or_default() {
+            if !n.vname.path.is_empty() {
+                files.push(n.vname.path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Some(files)
+}
+
+/// Execute `git grep` under `repo_root` with an argument vector (no shell) and
+/// format the capped results as `path:line:col: text`.
+fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]) -> String {
+    use std::process::Command;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_root)
+        .arg("grep")
+        .arg("--no-color")
+        .arg("-n") // line numbers
+        .arg("--column") // column numbers
+        .arg("-I") // skip binary files
+        .arg("-e")
+        .arg(pattern);
+    // `--` terminates options so the pattern/pathspecs can never be read as flags.
+    cmd.arg("--");
+    for spec in pathspecs {
+        cmd.arg(spec);
+    }
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("find_pattern git grep spawn failed: {e}");
+            return String::new();
+        }
+    };
+    // git grep exits 1 with no matches — a normal empty result, not an error.
+    // Any non-zero status with stdout is unusual but we still surface what we got.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let all: Vec<&str> = stdout.lines().collect();
+    if all.is_empty() {
+        return String::new();
+    }
+    let total = all.len();
+    let shown = total.min(MAX_PATTERN_MATCHES);
+    let mut lines: Vec<String> = Vec::with_capacity(shown + 1);
+    lines.push(format!("{total} match(es):"));
+    lines.extend(
+        all.into_iter()
+            .take(MAX_PATTERN_MATCHES)
+            .map(str::to_string),
+    );
+    if total > shown {
+        lines.push(format!("[truncated: showing {shown} of {total} matches]"));
+    }
+    lines.join("\n")
+}
+
+/// Global variant of `find_pattern` — runs the graph-scoped grep per repo.
+pub fn find_pattern_global(
+    repos: &HashMap<String, PathBuf>,
+    pattern: &str,
+    scope: Option<&str>,
+    repo: Option<&str>,
+) -> String {
+    if let Err(reason) = validate_mcp_arg(pattern) {
+        tracing::warn!("find_pattern_global rejected invalid pattern: {reason}");
+        return String::new();
+    }
+    if let Some(s) = scope {
+        if let Err(reason) = validate_mcp_arg(s) {
+            tracing::warn!("find_pattern_global rejected invalid scope: {reason}");
+            return String::new();
+        }
+    }
+    // `find_pattern` already sanitizes; collect_global sanitizes the aggregate
+    // again (idempotent) so per-repo prefixing stays inside the sanitized band.
+    collect_global(repos, repo, |store, repo_name, single| {
+        let result = find_pattern(store, pattern, scope);
+        if result.is_empty() || single {
+            result
+        } else {
+            result
+                .lines()
+                .map(|l| format!("[{repo_name}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    })
+}
+
 fn collect_global(
     repos: &HashMap<String, PathBuf>,
     target_repo: Option<&str>,
@@ -7230,5 +7655,129 @@ mod snippet_tests {
             !result.contains("cb_knn_only"),
             "circuit-breaker must discard KNN results after timeout; got: {result}"
         );
+    }
+
+    // ── find_references (#299) ─────────────────────────────────────────────
+
+    #[test]
+    fn find_references_emits_occurrence_sites() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:charge"),
+            "function",
+        )
+        .with_line(4);
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        // Two distinct occurrence lines from the same caller must both appear.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 9), (caller.id, callee.id, 10)])
+            .unwrap();
+
+        let out = find_references(&store, "charge", None);
+        assert!(out.contains("resolved: fn:charge"), "header missing: {out}");
+        assert!(out.contains("src/svc.rs:9"), "site 9 missing: {out}");
+        assert!(out.contains("src/svc.rs:10"), "site 10 missing: {out}");
+        assert!(out.contains("2 reference(s)"), "count missing: {out}");
+    }
+
+    #[test]
+    fn find_references_none_has_no_resolution() {
+        // No match resolves nothing: like get_callers, the body is empty (the MCP
+        // envelope may still wrap it), so there is no `resolved:` header or sites.
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let out = find_references(&store, "doesnotexist", None);
+        assert!(!out.contains("resolved:"), "unexpected resolution: {out}");
+        assert!(!out.contains("reference(s)"), "unexpected sites: {out}");
+    }
+
+    #[test]
+    fn find_references_ambiguous_lists_candidates() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(VName::new("", "", "a.rs", "rust", "fn:charge"), "function").with_line(1);
+        let b = Node::new(VName::new("", "", "b.rs", "rust", "fn:charge"), "function").with_line(2);
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let out = find_references(&store, "charge", None);
+        assert!(
+            out.contains("ambiguous"),
+            "expected disambiguation list: {out}"
+        );
+        assert!(
+            out.contains("a.rs") && out.contains("b.rs"),
+            "both defs listed: {out}"
+        );
+
+        // A path hint disambiguates to exactly one definition.
+        let pinned = find_references(&store, "charge", Some("a.rs"));
+        assert!(
+            !pinned.contains("ambiguous"),
+            "path hint must disambiguate: {pinned}"
+        );
+    }
+
+    #[test]
+    fn find_references_falls_back_to_edges_without_sites() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("", "", "svc.rs", "rust", "fn:charge"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("", "", "caller.rs", "rust", "fn:run"),
+            "function",
+        )
+        .with_line(12);
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        // RefCall edge but NO edge_sites row → degraded caller-definition fallback.
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        let out = find_references(&store, "charge", None);
+        assert!(
+            out.contains("caller.rs:12"),
+            "fallback caller def missing: {out}"
+        );
+        assert!(
+            out.contains("occurrence lines unavailable"),
+            "fallback must be labelled degraded: {out}"
+        );
+    }
+
+    // ── find_pattern (#299) ────────────────────────────────────────────────
+
+    #[test]
+    fn find_pattern_rejects_control_chars() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Newline / NUL in the pattern must be rejected before any exec.
+        assert!(find_pattern(&store, "foo\nbar", None).is_empty());
+        assert!(find_pattern(&store, "", None).is_empty());
+    }
+
+    #[test]
+    fn find_pattern_without_repo_root_is_graceful() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let out = find_pattern(&store, "charge", None);
+        assert!(
+            out.contains("run `travsr init`"),
+            "expected init hint: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_rejects_out_of_repo_scope() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", "/tmp/whatever").unwrap();
+        // Absolute and parent-escaping scopes must be dropped before exec.
+        assert!(find_pattern(&store, "charge", Some("/etc")).is_empty());
+        assert!(find_pattern(&store, "charge", Some("../secrets")).is_empty());
     }
 }

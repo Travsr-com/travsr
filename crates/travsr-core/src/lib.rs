@@ -532,6 +532,20 @@ pub struct ScipRef {
     pub callee_id: NodeId,
 }
 
+/// A single reference occurrence returned by `find_references` (issue #299):
+/// the file path and 1-based line of one use site of a symbol.
+///
+/// Produced by `SqliteStore::reference_sites` from the `edge_sites` occurrence
+/// store. Language-agnostic — every ingestion path (SCIP, LSIF, native
+/// tree-sitter) feeds the same table, so one struct describes them all.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefSite {
+    /// Repo-relative path of the file containing the reference occurrence.
+    pub path: String,
+    /// 1-based source line of the occurrence.
+    pub line: u32,
+}
+
 /// Human-readable label: path for file nodes (whose `signature` is the
 /// literal `"file"`), signature for everything else.
 pub fn display_label(node: &Node) -> &str {
@@ -643,6 +657,13 @@ pub struct UnresolvedCall {
     /// `None` for bare `call.fn` identifiers — resolver uses name-only lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint_crate: Option<String>,
+    /// 1-based source line of the call-site occurrence (issue #299). Recorded so
+    /// the daemon can emit an `edge_sites` row when it resolves `callee_sig` to a
+    /// concrete node, giving `find_references` occurrence-level `path:line` for
+    /// cross-crate bare calls. `0` means "unknown" (older extractors); the daemon
+    /// skips `edge_sites` emission for zero lines.
+    #[serde(default)]
+    pub caller_line: u32,
 }
 
 // ── Import Resolution ────────────────────────────────────────────────────────

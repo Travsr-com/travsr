@@ -2737,6 +2737,81 @@ LIMIT 20",
         tx.commit().context("write_scip_attributed_batch: commit")
     }
 
+    /// Occurrence sites (`path:line`) of every `ref/call` to `dst`, read from the
+    /// `edge_sites` occurrence store (issue #299 `find_references`).
+    ///
+    /// `edge_sites.src` is the enclosing-function (or file-fallback) node, which
+    /// by construction lives in the **same file** as the occurrence
+    /// (`find_narrowest_enclosing` only searches the reference file's spans, and
+    /// the fallback is that file's node). Therefore `nodes.path[src]` is exactly
+    /// the occurrence file. Rows are deduplicated by the `edge_sites` PK
+    /// `(src, dst, kind, line)` and returned in deterministic `(path, line)`
+    /// order for stable snapshots.
+    ///
+    /// An empty vec means no occurrence rows exist for `dst`; callers may then
+    /// fall back to structural `ref/call` edge enumeration (as `get_callers`
+    /// does) so a language not yet feeding `edge_sites` still degrades gracefully.
+    ///
+    /// O(k log k) where k = occurrence count (SQLite index scan + sort).
+    pub fn reference_sites(&self, dst: NodeId) -> anyhow::Result<Vec<travsr_core::RefSite>> {
+        let _span = tracing::debug_span!("store.reference_sites", dst = dst.0).entered();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT n.path AS path, es.line AS line \
+                 FROM edge_sites es JOIN nodes n ON n.id = es.src \
+                 WHERE es.dst = ?1 AND es.kind = 'ref/call' \
+                 ORDER BY n.path, es.line",
+            )
+            .context("preparing reference_sites query")?;
+        let rows = stmt
+            .query_map(params![node_id_to_i64(dst)], |row| {
+                let path: String = row.get(0)?;
+                let line: i64 = row.get(1)?;
+                Ok((path, line))
+            })
+            .context("executing reference_sites query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, line) = row.context("decoding reference_sites row")?;
+            out.push(travsr_core::RefSite {
+                path,
+                // Clamp defensively — stored lines are already 1-based u32.
+                line: u32::try_from(line).unwrap_or(0),
+            });
+        }
+        tracing::debug!(sites_returned = out.len());
+        Ok(out)
+    }
+
+    /// Record `ref/call` occurrence lines directly (issue #299 WS-4).
+    ///
+    /// Used for producers that already know the enclosing-caller node id and the
+    /// occurrence line — currently the daemon's cross-crate `UnresolvedCall`
+    /// resolution, where `src` is the caller function node and `line` is the
+    /// call-site line. Rows with `line == 0` (unknown) are skipped. Idempotent
+    /// via the `edge_sites` PK; safe to re-run on every reindex.
+    pub fn record_edge_sites(&mut self, sites: &[(NodeId, NodeId, u32)]) -> anyhow::Result<()> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("record_edge_sites: begin")?;
+        for &(src, dst, line) in sites {
+            if line == 0 {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
+                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64],
+            )
+            .context("record_edge_sites: insert")?;
+        }
+        tx.commit().context("record_edge_sites: commit")
+    }
+
     /// G1: Register a mapping from a raw SCIP symbol string to a unified tree-sitter `NodeId`.
     ///
     /// Idempotent: if the alias already exists with the same `node_id`, this is a no-op.
@@ -5152,6 +5227,91 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn reference_sites_returns_ordered_deduped_path_line() {
+        // #299: reference_sites joins edge_sites.src → nodes.path and returns
+        // deterministic (path, line) order, deduped by the edge_sites PK.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "file"),
+            "file",
+        );
+        let b = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "file"),
+            "file",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+            "fn",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&callee).unwrap();
+
+        // Out-of-order + a duplicate (a.rs:10 twice) to exercise ORDER BY + PK dedup.
+        store
+            .record_edge_sites(&[
+                (a.id, callee.id, 10),
+                (b.id, callee.id, 3),
+                (a.id, callee.id, 2),
+                (a.id, callee.id, 10),
+            ])
+            .unwrap();
+
+        let sites = store.reference_sites(callee.id).unwrap();
+        assert_eq!(
+            sites,
+            vec![
+                travsr_core::RefSite {
+                    path: "a.rs".into(),
+                    line: 2
+                },
+                travsr_core::RefSite {
+                    path: "a.rs".into(),
+                    line: 10
+                },
+                travsr_core::RefSite {
+                    path: "b.rs".into(),
+                    line: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_sites_empty_when_no_occurrences() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let unknown = travsr_core::VName::new("c", "", "x.rs", "rust", "fn:nope").id();
+        assert!(store.reference_sites(unknown).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_edge_sites_skips_zero_line() {
+        // line == 0 means "unknown occurrence line" and must not be stored.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "file"),
+            "file",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:f"),
+            "fn",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 0), (caller.id, callee.id, 5)])
+            .unwrap();
+        let sites = store.reference_sites(callee.id).unwrap();
+        assert_eq!(
+            sites,
+            vec![travsr_core::RefSite {
+                path: "a.rs".into(),
+                line: 5
+            }]
+        );
     }
 
     #[test]

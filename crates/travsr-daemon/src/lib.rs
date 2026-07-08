@@ -1257,13 +1257,20 @@ pub fn init_repo_with_progress(
             };
             let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
-            let resolved = resolve_unresolved_calls(&store, &pb_unresolved);
+            let (resolved, resolved_sites) = resolve_unresolved_calls(&store, &pb_unresolved);
             tracing::debug!(
                 resolved_cross_crate_edges = resolved.len(),
                 "Phase B UnresolvedCall resolution complete"
             );
             pb_edges.extend(resolved);
-            write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
+            let report =
+                write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            // #299 WS-4: record cross-crate call occurrence lines after the edges
+            // (and their callee nodes) are in the store.
+            if let Err(e) = store.record_edge_sites(&resolved_sites) {
+                tracing::warn!("recording cross-crate edge_sites: {e:#}");
+            }
+            report
         };
         tracing::info!(
             elapsed_ms = t_phase_b.elapsed().as_millis(),
@@ -1375,12 +1382,25 @@ pub fn init_repo_with_progress(
 ///
 /// Overconnection is safe: when multiple nodes share a signature (e.g. two crates
 /// both define `fn:new`) all matches are emitted. PPR damping absorbs the noise.
+/// Resolve cross-crate `UnresolvedCall`s against Phase A nodes.
+///
+/// Returns `(edges, sites)`:
+///   - `edges`: the deduped `RefCall` edges (caller → resolved callee).
+///   - `sites`: `(caller_node, callee_node, caller_line)` occurrence tuples for
+///     `edge_sites` (issue #299 WS-4). `caller_line` comes from the tree-sitter
+///     call site; `0` (unknown) rows are skipped by `record_edge_sites`. This is
+///     what gives `find_references` occurrence `path:line` for Rust cross-crate
+///     bare/lowercase-scoped calls, which are not visible to the same-file
+///     ScipRef pass.
 fn resolve_unresolved_calls(
     store: &SqliteStore,
     unresolved: &[travsr_core::UnresolvedCall],
-) -> Vec<travsr_core::Edge> {
+) -> (
+    Vec<travsr_core::Edge>,
+    Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
+) {
     if unresolved.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let sigs: Vec<String> = {
@@ -1394,7 +1414,7 @@ fn resolve_unresolved_calls(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("resolve_unresolved_calls: store query failed: {e}");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
@@ -1409,6 +1429,7 @@ fn resolve_unresolved_calls(
     }
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
+    let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
         let Some(matches) = by_sig.get(u.callee_sig.as_str()) else {
             continue;
@@ -1436,13 +1457,19 @@ fn resolve_unresolved_calls(
                     dst,
                     travsr_core::EdgeKind::RefCall,
                 ));
+                // #299: record the call-site occurrence. `u.src` is the caller
+                // function node (same file as the call), so nodes.path[src] is the
+                // occurrence file — exactly what reference_sites returns.
+                sites.push((u.src, dst, u.caller_line));
             }
         }
     }
 
     edges.sort_unstable_by_key(|e| (e.src.0, e.dst.0));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
-    edges
+    sites.sort_unstable_by_key(|(s, d, l)| (s.0, d.0, *l));
+    sites.dedup();
+    (edges, sites)
 }
 
 /// Factored out of `init_repo_with_progress` so the background refresh
@@ -1819,7 +1846,7 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
 
-    let resolved = resolve_unresolved_calls(&s, &pb_unresolved);
+    let (resolved, resolved_sites) = resolve_unresolved_calls(&s, &pb_unresolved);
     tracing::debug!(
         resolved_cross_crate_edges = resolved.len(),
         "Phase B UnresolvedCall resolution complete"
@@ -1834,6 +1861,10 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     }
 
     let report = write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    // #299 WS-4: record cross-crate call occurrence lines after their edges land.
+    if let Err(e) = s.record_edge_sites(&resolved_sites) {
+        tracing::warn!("recording cross-crate edge_sites: {e:#}");
+    }
 
     // C4: only advance phase_b_commit when no language crashed. A partial result
     // should not suppress the next background refresh so crashed languages can

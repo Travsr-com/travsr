@@ -33,11 +33,11 @@ impl Plugin for RustPlugin {
             .map(|rel| rel.iter().map(|r| (req.root.join(r), r.clone())).collect());
 
         // Native Phase B: always runs, zero external-tool requirements.
-        let (mut nodes, mut edges, mut unresolved_calls) =
+        let (mut nodes, mut edges, mut unresolved_calls, mut refs) =
             travsr_indexer::phase_b_native_rust(&req.corpus, &req.root, files_owned.as_deref())
                 .unwrap_or_else(|e| {
                     tracing::warn!("rust native phase_b: {e}");
-                    (vec![], vec![], vec![])
+                    (vec![], vec![], vec![], vec![])
                 });
         tracing::debug!(
             nodes = nodes.len(),
@@ -74,15 +74,37 @@ impl Plugin for RustPlugin {
         nodes.dedup_by_key(|n| n.id);
         edges.sort_unstable_by_key(|e| (e.src, e.dst));
         edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
-        unresolved_calls
-            .sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
-        unresolved_calls.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+        // Keep caller_line in the dedup key (#299) so every distinct call site
+        // survives to edge_sites, not just the first per (caller, callee).
+        unresolved_calls.sort_unstable_by(|a, b| {
+            a.src
+                .0
+                .cmp(&b.src.0)
+                .then(a.callee_sig.cmp(&b.callee_sig))
+                .then(a.caller_line.cmp(&b.caller_line))
+        });
+        unresolved_calls.dedup_by(|a, b| {
+            a.src == b.src && a.callee_sig == b.callee_sig && a.caller_line == b.caller_line
+        });
+        // #299: native same-file call occurrence lines flow as ScipRefs so the
+        // daemon's G2 attributed-write records edge_sites for find_references.
+        refs.sort_unstable_by(|a, b| {
+            a.caller_path
+                .cmp(&b.caller_path)
+                .then(a.caller_line.cmp(&b.caller_line))
+                .then(a.callee_id.0.cmp(&b.callee_id.0))
+        });
+        refs.dedup_by(|a, b| {
+            a.caller_path == b.caller_path
+                && a.caller_line == b.caller_line
+                && a.callee_id == b.callee_id
+        });
 
         InvokeResponse {
             nodes,
             edges,
+            refs,
             unresolved_calls,
-            ..Default::default()
         }
     }
 }
