@@ -371,6 +371,13 @@ pub fn get_callers_global(
 /// the spirit of `MAX_SITES_PER_CALLER` but is per-symbol, not per-caller.
 const MAX_REFERENCE_SITES: usize = 500;
 
+/// Byte cap for `find_references` / `find_pattern` output. The default scalar
+/// cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped 500-site list
+/// mid-line and drop the truncation notice — the same trap `get_snippets`
+/// avoids. These tools enumerate up to `MAX_*` rows, so they wrap with this
+/// larger limit instead (still well under the 1 MiB MCP hard ceiling).
+const FIND_OUTPUT_LIMIT: usize = 512_000;
+
 /// Resolution outcome for a `find_references` symbol argument.
 enum RefTarget {
     /// Exactly one definition — enumerate its references.
@@ -453,8 +460,13 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     if phase_b_pending(store) {
         return r#"{"status":"pending","message":"Semantic occurrence index is building in the background. References will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
     }
-    // SEC-001: sanitize before returning to the MCP client / LLM.
-    sanitize_for_mcp(&find_references_raw(store, symbol, path))
+    // SEC-001: sanitize before returning. Use the larger find-output limit (not
+    // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
+    // survive intact instead of being cut mid-line.
+    wrap_envelope(&sanitize_mcp_body_with_limit(
+        &find_references_raw(store, symbol, path),
+        FIND_OUTPUT_LIMIT,
+    ))
 }
 
 /// Raw (unsanitized) variant, shared by the global aggregator.
@@ -591,7 +603,7 @@ pub fn find_references_global(
                 .join("\n")
         }
     });
-    sanitize_for_mcp(&raw)
+    wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
 // ── find_pattern (issue #299) ──────────────────────────────────────────────────
@@ -613,6 +625,16 @@ const MAX_PATTERN_MATCHES: usize = 500;
 /// pathspecs are dropped, execution is pinned to the repo root, and the match
 /// count is capped.
 pub fn find_pattern(store: &SqliteStore, pattern: &str, scope: Option<&str>) -> String {
+    // Wrap with the larger find-output limit (not the 4 KiB scalar cap) so a
+    // capped 500-match list and its truncation notice survive intact.
+    wrap_envelope(&sanitize_mcp_body_with_limit(
+        &find_pattern_body(store, pattern, scope),
+        FIND_OUTPUT_LIMIT,
+    ))
+}
+
+/// Raw (unsanitized) body for `find_pattern`, shared by the global aggregator.
+fn find_pattern_body(store: &SqliteStore, pattern: &str, scope: Option<&str>) -> String {
     // SEC-002: validate the pattern; reject control chars (newlines, NUL, …) that
     // could smuggle additional grep semantics or corrupt the output framing.
     if let Err(reason) = validate_mcp_arg(pattern) {
@@ -665,7 +687,7 @@ pub fn find_pattern(store: &SqliteStore, pattern: &str, scope: Option<&str>) -> 
         }
     };
 
-    sanitize_for_mcp(&run_git_grep(&repo_root, pattern, &pathspecs))
+    run_git_grep(&repo_root, pattern, &pathspecs)
 }
 
 /// Resolve `files-importing(<symbol>)` to the set of repo-relative file paths
@@ -741,15 +763,24 @@ fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]
     if all.is_empty() {
         return String::new();
     }
+    // Per-match line-length cap: a single minified/generated line can be
+    // hundreds of KB and would otherwise blow the output budget on its own.
+    const MAX_MATCH_LINE: usize = 512;
     let total = all.len();
     let shown = total.min(MAX_PATTERN_MATCHES);
     let mut lines: Vec<String> = Vec::with_capacity(shown + 1);
     lines.push(format!("{total} match(es):"));
-    lines.extend(
-        all.into_iter()
-            .take(MAX_PATTERN_MATCHES)
-            .map(str::to_string),
-    );
+    lines.extend(all.into_iter().take(MAX_PATTERN_MATCHES).map(|l| {
+        if l.len() > MAX_MATCH_LINE {
+            let mut cut = MAX_MATCH_LINE;
+            while cut > 0 && !l.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{} …[line truncated]", &l[..cut])
+        } else {
+            l.to_string()
+        }
+    }));
     if total > shown {
         lines.push(format!("[truncated: showing {shown} of {total} matches]"));
     }
@@ -773,10 +804,10 @@ pub fn find_pattern_global(
             return String::new();
         }
     }
-    // `find_pattern` already sanitizes; collect_global sanitizes the aggregate
-    // again (idempotent) so per-repo prefixing stays inside the sanitized band.
-    collect_global(repos, repo, |store, repo_name, single| {
-        let result = find_pattern(store, pattern, scope);
+    // Aggregate raw per-repo bodies (not the wrapped form) so there is a single
+    // envelope + one large-limit sanitize over the whole result.
+    let raw = collect_global(repos, repo, |store, repo_name, single| {
+        let result = find_pattern_body(store, pattern, scope);
         if result.is_empty() || single {
             result
         } else {
@@ -786,7 +817,8 @@ pub fn find_pattern_global(
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-    })
+    });
+    wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
 fn collect_global(
@@ -7757,9 +7789,11 @@ mod snippet_tests {
     #[test]
     fn find_pattern_rejects_control_chars() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        // Newline / NUL in the pattern must be rejected before any exec.
-        assert!(find_pattern(&store, "foo\nbar", None).is_empty());
-        assert!(find_pattern(&store, "", None).is_empty());
+        // Newline / NUL in the pattern must be rejected before any exec: the body
+        // is empty, so only the empty envelope comes back (never a match list).
+        let empty = "<travsr-data></travsr-data>";
+        assert_eq!(find_pattern(&store, "foo\nbar", None), empty);
+        assert_eq!(find_pattern(&store, "", None), empty);
     }
 
     #[test]
@@ -7776,8 +7810,10 @@ mod snippet_tests {
     fn find_pattern_rejects_out_of_repo_scope() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("repo_root", "/tmp/whatever").unwrap();
-        // Absolute and parent-escaping scopes must be dropped before exec.
-        assert!(find_pattern(&store, "charge", Some("/etc")).is_empty());
-        assert!(find_pattern(&store, "charge", Some("../secrets")).is_empty());
+        // Absolute and parent-escaping scopes must be dropped before exec →
+        // empty envelope, never a match list.
+        let empty = "<travsr-data></travsr-data>";
+        assert_eq!(find_pattern(&store, "charge", Some("/etc")), empty);
+        assert_eq!(find_pattern(&store, "charge", Some("../secrets")), empty);
     }
 }
