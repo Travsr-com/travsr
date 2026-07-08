@@ -55,6 +55,16 @@ enum Command {
         /// Use this in CI or scripts that query call edges immediately after init.
         #[arg(long)]
         semantic: bool,
+        /// Allow rust-analyzer to run UNCONFINED when the OS sandbox (bubblewrap
+        /// on Linux, sandbox-exec on macOS) is unavailable. Without this flag,
+        /// the rust-analyzer LSIF pass is skipped entirely on sandbox-less hosts
+        /// and Rust semantic edges degrade to tree-sitter structural edges.
+        ///
+        /// Only set this when you fully trust the repository being indexed.
+        /// This flag cannot be set by repository contents (.env, Cargo.toml,
+        /// tsconfig, etc.) — it must be an explicit, per-invocation decision.
+        #[arg(long)]
+        allow_unsandboxed_lsif: bool,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -383,7 +393,8 @@ async fn run(cli: Cli) -> Result<()> {
             json,
             jobs,
             semantic,
-        } => init::run(quiet, json, jobs, semantic)?,
+            allow_unsandboxed_lsif,
+        } => init::run(quiet, json, jobs, semantic, allow_unsandboxed_lsif)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
             let repo_root = repo::find_git_root(&cwd)?;

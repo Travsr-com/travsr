@@ -3,9 +3,19 @@ use anyhow::Context as _;
 
 use crate::repo::find_git_root;
 
-pub fn run(quiet: bool, json: bool, jobs: Option<usize>, semantic: bool) -> anyhow::Result<()> {
+pub fn run(
+    quiet: bool,
+    json: bool,
+    jobs: Option<usize>,
+    semantic: bool,
+    allow_unsandboxed_lsif: bool,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
+
+    // Apply the operator opt-in before any indexing begins. This sets a
+    // process-global flag consulted by run_ra_lsif via allow_unsandboxed_opt_in().
+    travsr_daemon::set_allow_unsandboxed_lsif(allow_unsandboxed_lsif);
 
     // Live progress so a long indexing run is not mistaken for a hang (#293).
     // Renders to stderr; the summary below stays on stdout.

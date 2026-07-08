@@ -49,6 +49,7 @@ impl Plugin for RustPlugin {
         // LSIF enrichment: merge higher-fidelity edges when rust-analyzer is available.
         let cfg = SandboxConfig {
             repo_root: req.root.clone(),
+            allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in(),
             ..Default::default()
         };
         match run_ra_lsif(&req.root, &cfg) {

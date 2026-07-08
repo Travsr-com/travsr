@@ -88,5 +88,17 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // M1: warn when Rust semantic edges are degraded due to sandbox unavailability.
+    if let Some(reason) = &payload.rust_lsif_degraded {
+        if reason == "sandbox_unavailable" {
+            eprintln!(
+                "warning: Rust semantic edges degraded — rust-analyzer LSIF was \
+                 skipped because the OS sandbox (bubblewrap/sandbox-exec) is \
+                 unavailable. Install bubblewrap, or re-run \
+                 `travsr init --allow-unsandboxed-lsif` if you trust this repo."
+            );
+        }
+    }
+
     Ok(())
 }

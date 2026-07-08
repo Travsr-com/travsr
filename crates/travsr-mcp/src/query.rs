@@ -150,6 +150,10 @@ pub struct StatusPayload {
     /// H3: warnings from the last Phase B run (crashed/version_mismatch/needs_approval).
     /// Empty string = no warnings.
     pub phase_b_warnings: Option<String>,
+    /// M1: set to "sandbox_unavailable" when the last Phase B skipped rust-analyzer
+    /// LSIF because the OS sandbox was unavailable. Empty string = not degraded.
+    #[serde(default)]
+    pub rust_lsif_degraded: Option<String>,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -169,6 +173,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         signature_format_version: store.get_signature_format_version()?,
         phase_b_commit: store.get_meta("phase_b_commit")?,
         phase_b_warnings: store.get_meta("phase_b_warnings")?,
+        rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
     })
 }
 

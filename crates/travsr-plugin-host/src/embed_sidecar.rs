@@ -245,6 +245,10 @@ impl EmbedSidecar {
             return false;
         }
         if let Ok(mut child) = self.child.lock() {
+            // Health-check poll only — not a pipe-drain context. The sidecar's
+            // stdout is consumed live via the IPC BufReader; try_wait here just
+            // checks exit status without reading any pipe, so no deadlock risk.
+            #[allow(clippy::disallowed_methods)]
             if let Ok(Some(status)) = child.try_wait() {
                 drop(child);
                 let tail = self.stderr_ring.tail();
