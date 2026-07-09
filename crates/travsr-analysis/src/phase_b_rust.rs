@@ -609,3 +609,80 @@ fn walk(root: &Path, dir: &Path, exts: &[&str], out: &mut Vec<(PathBuf, String)>
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn parse_rust(source: &[u8]) -> tree_sitter::Tree {
+        let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    #[test]
+    fn extract_macro_calls_recovers_method_assoc_and_bare_calls() {
+        // #299 R1: tree-sitter does not expose call expressions inside a macro
+        // token_tree (`println!(z.describe())`), so the call sites are recovered
+        // by scanning the raw tokens. Verify the three classifications and that
+        // each site is attributed to its enclosing function with the right line.
+        let source = br#"
+fn run(z: &Zoo) {
+    println!("{}", z.describe());
+    println!("{}", Animal::speak());
+    println!("{}", greet());
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out: Vec<UnresolvedCall> = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "main.rs", &mut out);
+
+        let by_sig: HashMap<&str, &UnresolvedCall> =
+            out.iter().map(|u| (u.callee_sig.as_str(), u)).collect();
+
+        // Method call `z.describe()` (prev token `.`) → resolve by leaf name.
+        let describe = by_sig
+            .get("fn:describe")
+            .expect("method call recovered from macro");
+        assert_eq!(describe.caller_line, 3);
+        // Associated call `Animal::speak()` (prev `::`) keeps the qualifier.
+        let speak = by_sig
+            .get("fn:Animal.speak")
+            .expect("associated call recovered from macro");
+        assert_eq!(speak.caller_line, 4);
+        // Bare call `greet()`.
+        let greet = by_sig
+            .get("fn:greet")
+            .expect("bare call recovered from macro");
+        assert_eq!(greet.caller_line, 5);
+
+        // No guessed callee ids: every recovered call is attributed to `run`.
+        let run_id = VName::new("c", "", "main.rs", "rust", "fn:run").id();
+        for u in &out {
+            assert_eq!(u.src, run_id, "call {} not attributed to run", u.callee_sig);
+        }
+        // `println` itself (the macro name, outside the token_tree) is not a call.
+        assert!(!by_sig.contains_key("fn:println"));
+    }
+
+    #[test]
+    fn extract_macro_calls_skips_noise_and_short_names() {
+        // NOISE_NAMES and single-char identifiers inside a macro must not
+        // produce edges (they carry no cross-crate signal).
+        let source = br#"
+fn run() {
+    vec![x.clone(), y.new()];
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out: Vec<UnresolvedCall> = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "main.rs", &mut out);
+        assert!(
+            out.is_empty(),
+            "expected no calls, got {:?}",
+            out.iter().map(|u| &u.callee_sig).collect::<Vec<_>>()
+        );
+    }
+}

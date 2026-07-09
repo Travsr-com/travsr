@@ -5371,6 +5371,93 @@ mod tests {
     }
 
     #[test]
+    fn language_has_edge_sites_distinguishes_missing_index_from_zero_refs() {
+        // #299 M1: a language with a recorded ref/call occurrence reads true; a
+        // language whose def node exists but has no occurrence row reads false,
+        // so the reader can say "index unavailable" instead of "0 references".
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "main.rs", "rust", "file"),
+            "file",
+        );
+        let rust_fn = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+            "function",
+        );
+        // Java def node exists but never receives an occurrence row.
+        let java_fn = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "Svc.java", "java", "fn:charge"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&rust_fn).unwrap();
+        store.put_node(&java_fn).unwrap();
+
+        store
+            .record_edge_sites(&[(caller.id, rust_fn.id, 12)])
+            .unwrap();
+
+        assert!(store.language_has_edge_sites("rust").unwrap());
+        // Def node present, but no ref/call site -> index not built for java.
+        assert!(!store.language_has_edge_sites("java").unwrap());
+        // A language with no nodes at all is also "unavailable", not zero.
+        assert!(!store.language_has_edge_sites("go").unwrap());
+    }
+
+    #[test]
+    fn fn_nodes_by_leaf_name_matches_bare_and_qualified_leaves() {
+        // #299 R1: the daemon leaf-name fallback recovers a qualified
+        // fn:Type.method / method:Type.method node from a bare leaf, restricts
+        // to callable kinds, and escapes LIKE metacharacters so `_` is literal.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let nodes = [
+            ("a.rs", "fn:describe", "function"),
+            ("a.rs", "fn:Animal.describe", "function"),
+            ("b.rs", "method:Zoo.add", "method"),
+            ("c.rs", "fn:Zoo.announce_all", "method"),
+            // `_` must be escaped: an `X` in the same slot must NOT be matched
+            // when searching the underscore name.
+            ("c.rs", "fn:Zoo.announceXall", "method"),
+            // Non-callable kind with a matching leaf must be excluded.
+            ("d.rs", "class:describe", "class"),
+        ];
+        for (path, sig, kind) in nodes {
+            let n =
+                travsr_core::Node::new(travsr_core::VName::new("c", "", path, "rust", sig), kind);
+            store.put_node(&n).unwrap();
+        }
+
+        let mut got: Vec<String> = store
+            .fn_nodes_by_leaf_name(&["describe".to_string(), "add".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|(_, sig, _)| sig)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "fn:Animal.describe".to_string(),
+                "fn:describe".to_string(),
+                "method:Zoo.add".to_string(),
+            ]
+        );
+
+        // `announce_all` matches only the literal underscore node, never the
+        // `announceXall` wildcard trap -> proves the LIKE `_` is escaped.
+        let hit: Vec<String> = store
+            .fn_nodes_by_leaf_name(&["announce_all".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|(_, sig, _)| sig)
+            .collect();
+        assert_eq!(hit, vec!["fn:Zoo.announce_all".to_string()]);
+
+        // Empty input short-circuits with no query.
+        assert!(store.fn_nodes_by_leaf_name(&[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn record_edge_sites_skips_zero_line() {
         // line == 0 means "unknown occurrence line" and must not be stored.
         let mut store = SqliteStore::open_in_memory().unwrap();

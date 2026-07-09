@@ -281,3 +281,77 @@ fn parse_emitter_output(
 
     Ok((nodes, edges, refs_out))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn parse_emitter_output_emits_scip_refs_for_resolved_references() {
+        // #299 S1/E1: the Dart emitter's per-reference lines must become ScipRef
+        // occurrence records (path:line) keyed to the definition node, so the
+        // daemon can populate edge_sites and find_references works for Dart.
+        // A reference to a symbol with no definition in this index is dropped.
+        let json = r#"{
+          "documents": [
+            {
+              "path": "animal.dart",
+              "definitions": [
+                {"symbol": "pkg:app/animal.dart::Animal.describe",
+                 "kind": "method", "line": 8, "end_line": 10}
+              ],
+              "references": []
+            },
+            {
+              "path": "main.dart",
+              "definitions": [],
+              "references": [
+                {"symbol": "pkg:app/animal.dart::Animal.describe", "line": 16},
+                {"symbol": "pkg:ghost/x.dart::Ghost.method", "line": 99}
+              ]
+            }
+          ]
+        }"#;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+
+        let (nodes, edges, refs) = parse_emitter_output(f.path(), "c").unwrap();
+
+        // One definition node, carrying kind + line span.
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].kind, "method");
+        assert_eq!(nodes[0].line, Some(8));
+        assert_eq!(nodes[0].end_line, Some(10));
+        let def_id = VName::new(
+            "c",
+            "",
+            "animal.dart",
+            "dart",
+            "pkg:app/animal.dart::Animal.describe",
+        )
+        .id();
+        assert_eq!(nodes[0].id, def_id);
+
+        // The resolved reference becomes exactly one occurrence record; the
+        // reference to the undefined `Ghost.method` symbol is dropped.
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].caller_path, "main.dart");
+        assert_eq!(refs[0].caller_line, 16);
+        assert_eq!(refs[0].callee_id, def_id);
+
+        // And a RefCall edge from the referencing file node to the definition.
+        let main_file_id = VName::new("c", "", "main.dart", "dart", "file").id();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].src, main_file_id);
+        assert_eq!(edges[0].dst, def_id);
+        assert_eq!(edges[0].kind, EdgeKind::RefCall);
+    }
+
+    #[test]
+    fn parse_emitter_output_empty_file_is_no_op() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let (nodes, edges, refs) = parse_emitter_output(f.path(), "c").unwrap();
+        assert!(nodes.is_empty() && edges.is_empty() && refs.is_empty());
+    }
+}
