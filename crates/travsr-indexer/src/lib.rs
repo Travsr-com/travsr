@@ -77,7 +77,11 @@ pub fn go_parse(
 pub fn phase_b_native_dart(
     corpus: &str,
     root: &std::path::Path,
-) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+) -> anyhow::Result<(
+    Vec<travsr_core::Node>,
+    Vec<travsr_core::Edge>,
+    Vec<travsr_core::ScipRef>,
+)> {
     phase_b_dart::extract_native_phase_b(corpus, root)
 }
 

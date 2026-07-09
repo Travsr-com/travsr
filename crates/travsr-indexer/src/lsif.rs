@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use anyhow::Context as _;
-use travsr_core::{Edge, EdgeKind, VName};
+use travsr_core::{Edge, EdgeKind, Language, VName};
 
 use crate::ParseOutput;
 
@@ -106,14 +106,28 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
             }
 
             ("vertex", "resultSet") => {
-                // Non-standard field emitted by travsr-lsif-ts.
+                // Non-standard field emitted by the travsr LSIF emitters
+                // (travsr-lsif-ts, travsr-lsif-py).
                 if let Some(vname_obj) = obj.get("travsr_vname") {
                     let path = vname_obj["path"].as_str().unwrap_or("").to_string();
                     let sig = vname_obj["signature"].as_str().unwrap_or("").to_string();
                     if !path.is_empty() && !sig.is_empty() {
+                        // #299 P1: derive the node language from the file extension
+                        // (not a hardcoded "typescript") so the resultSet VName id
+                        // matches the Phase A node — otherwise Python (.py) refs
+                        // computed a `typescript`-tagged id that matched no node and
+                        // orphaned every occurrence. Mirrors Phase A's own
+                        // extension→language mapping. Falls back to typescript for
+                        // the graph-LSIF's original TS/JS producer.
+                        let lang = std::path::Path::new(&path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .and_then(Language::from_extension)
+                            .map(Language::as_str)
+                            .unwrap_or("typescript");
                         graph
                             .result_sets
-                            .insert(id, VName::new(corpus, "", path, "typescript", sig));
+                            .insert(id, VName::new(corpus, "", path, lang, sig));
                     }
                 }
             }

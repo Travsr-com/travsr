@@ -429,6 +429,23 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
     candidates.sort_by_key(|n| n.id.0);
     candidates.dedup_by_key(|n| n.id);
 
+    // C/C++ split a symbol into a header declaration and a source definition
+    // (`utils.h` decl + `utils.c` def). They share the simple name, so both
+    // survive the ladder above and the result reads as "ambiguous" even though
+    // only the definition carries occurrence sites. When both a header node and
+    // a non-header node with the same simple name are present, prefer the
+    // definition (drop the header declarations). Header-only results (a pure
+    // declaration with no definition indexed) are left untouched.
+    if candidates.len() > 1 {
+        let is_header = |p: &str| {
+            let p = p.to_ascii_lowercase();
+            p.ends_with(".h") || p.ends_with(".hpp") || p.ends_with(".hh") || p.ends_with(".hxx")
+        };
+        if candidates.iter().any(|n| !is_header(&n.vname.path)) {
+            candidates.retain(|n| !is_header(&n.vname.path));
+        }
+    }
+
     match candidates.len() {
         0 => RefTarget::None,
         1 => candidates
@@ -543,15 +560,31 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         .map(|e| e.src)
         .collect();
     if caller_ids.is_empty() {
-        // Resolution succeeded but the occurrence store has nothing: either the
-        // symbol genuinely has no callers, or its name is shared by definitions
-        // in other files/crates, in which case bare calls to it are not indexed
-        // (the resolver refuses to guess the target — precision over recall).
-        // Say so explicitly rather than returning a blank envelope.
+        // Resolution succeeded but neither occurrence rows nor structural
+        // ref/call edges exist for this node. #299 M1: three very different
+        // situations reach here and must not read identically.
+        let lang = &target.vname.language;
+        let index_built_for_lang = store.language_has_edge_sites(lang).unwrap_or(false);
+        if !index_built_for_lang {
+            // The occurrence index was never populated for this language —
+            // Phase B did not run / failed / its provider records no occurrence
+            // lines. This is a coverage gap, not a "zero references" answer.
+            return format!(
+                "{header}\nOccurrence index unavailable for '{lang}': semantic \
+                 analysis (Phase B) recorded no reference occurrences for this \
+                 language in this repo — the result below is not a definitive \
+                 zero. Run `travsr status` to check Phase B, or use `find_pattern` \
+                 for a textual search."
+            );
+        }
+        // The index is populated for this language and this symbol has neither
+        // occurrence rows nor ref/call edges: a genuine zero. (If the same name
+        // is also defined elsewhere, bare calls to it are left unindexed to
+        // avoid mis-targeting — precision over recall.)
         return format!(
-            "{header}\n0 reference(s) recorded. If this name is also defined \
-             elsewhere, bare calls to it are left unindexed to avoid mis-targeting; \
-             use `find_pattern` for a textual search instead."
+            "{header}\n0 reference(s). This symbol has no recorded uses. If this \
+             name is also defined elsewhere, bare calls to it are left unindexed \
+             to avoid mis-targeting; use `find_pattern` for a textual search."
         );
     }
     let callers = store.get_nodes(&caller_ids).unwrap_or_default();

@@ -2281,6 +2281,68 @@ LIMIT 20",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Function/method definition nodes whose *leaf identifier* (the segment
+    /// after the last `.`, or the whole name for an unqualified `fn:name`)
+    /// matches one of `names`.
+    ///
+    /// #299 R1: a Rust method call `recv.method()` cannot be resolved to the
+    /// receiver's type syntactically, so the native extractor emits a bare
+    /// `fn:method` `UnresolvedCall`. When the definition is a qualified
+    /// `fn:Type.method` / `method:Type.method` node, the exact-signature pass
+    /// misses it. This precise, index-time fallback recovers the qualified
+    /// node by leaf name; the caller resolves only when the match is unique so
+    /// no false edge is created. LIKE metacharacters (`_`, `%`) in identifiers
+    /// are escaped so `announce_all` is matched literally.
+    pub fn fn_nodes_by_leaf_name(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+            let mut clauses: Vec<&str> = Vec::with_capacity(names.len() * 3);
+            let mut params: Vec<String> = Vec::with_capacity(names.len() * 3);
+            for name in names {
+                let esc = name
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                clauses.push("signature = ?");
+                params.push(format!("fn:{name}"));
+                clauses.push("signature LIKE ? ESCAPE '\\'");
+                params.push(format!("fn:%.{esc}"));
+                clauses.push("signature LIKE ? ESCAPE '\\'");
+                params.push(format!("method:%.{esc}"));
+            }
+            let sql = format!(
+                "SELECT id, signature, path FROM nodes \
+                 WHERE kind IN ('function','method') AND ({})",
+                clauses.join(" OR ")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("preparing fn_nodes_by_leaf_name")?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt
+                .query_map(params_vec.as_slice(), |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let sig: String = row.get(1)?;
+                    let path: String = row.get(2)?;
+                    Ok((id, sig, path))
+                })
+                .context("executing fn_nodes_by_leaf_name")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding fn_nodes_by_leaf_name row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Return all (src_path, dst_path) pairs via the two-hop import chain:
     /// any_node --[depends]--> import_node --[resolves-to]--> file.
     /// src_path is the path of the node making the import (any kind: file, function, etc.).
@@ -2782,6 +2844,27 @@ LIMIT 20",
         }
         tracing::debug!(sites_returned = out.len());
         Ok(out)
+    }
+
+    /// Whether the occurrence index (`edge_sites`) holds any `ref/call` row
+    /// targeting a definition node of `language`.
+    ///
+    /// #299 M1: lets `find_references` distinguish "the occurrence index was
+    /// never built for this language" (Phase B absent, failed, or a language
+    /// whose provider does not emit occurrence lines) from "this symbol
+    /// genuinely has no references" — the two must not render identically.
+    pub fn language_has_edge_sites(&self, language: &str) -> anyhow::Result<bool> {
+        let present: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM edge_sites es JOIN nodes n ON n.id = es.dst \
+                   WHERE es.kind = 'ref/call' AND n.language = ?1)",
+                params![language],
+                |row| row.get(0),
+            )
+            .context("querying language_has_edge_sites")?;
+        Ok(present != 0)
     }
 
     /// Record `ref/call` occurrence lines directly (issue #299 WS-4).

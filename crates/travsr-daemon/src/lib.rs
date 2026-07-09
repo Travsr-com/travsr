@@ -1428,11 +1428,56 @@ fn resolve_unresolved_calls(
             .push((*id, path.as_str()));
     }
 
+    // #299 R1: leaf-name fallback for method calls. `recv.method()` can't be
+    // resolved to the receiver's type syntactically, so the Rust extractor emits
+    // a bare `fn:method` sig; when the definition is a qualified `fn:Type.method`
+    // node the exact pass above misses it. Look up the still-unmatched sigs by
+    // leaf identifier and resolve only when the leaf is unique (precision).
+    let leaf_of = |sig: &str| -> String {
+        let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
+        body.rsplit('.').next().unwrap_or(body).to_string()
+    };
+    let unmatched_leaves: Vec<String> = {
+        let mut v: Vec<String> = unresolved
+            .iter()
+            .filter(|u| !by_sig.contains_key(u.callee_sig.as_str()))
+            .map(|u| leaf_of(&u.callee_sig))
+            .filter(|l| !l.is_empty())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let leaf_candidates = if unmatched_leaves.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .fn_nodes_by_leaf_name(&unmatched_leaves)
+            .unwrap_or_else(|e| {
+                tracing::warn!("resolve_unresolved_calls: leaf fallback query failed: {e}");
+                Vec::new()
+            })
+    };
+    // leaf → Vec<(NodeId, path)>
+    let mut by_leaf: std::collections::HashMap<String, Vec<(travsr_core::NodeId, &str)>> =
+        std::collections::HashMap::new();
+    for (id, sig, path) in &leaf_candidates {
+        by_leaf
+            .entry(leaf_of(sig))
+            .or_default()
+            .push((*id, path.as_str()));
+    }
+
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
-        let Some(matches) = by_sig.get(u.callee_sig.as_str()) else {
-            continue;
+        // Exact signature first; fall back to a unique leaf-name match (R1).
+        let matches: &Vec<(travsr_core::NodeId, &str)> = match by_sig.get(u.callee_sig.as_str()) {
+            Some(m) => m,
+            None => match by_leaf.get(&leaf_of(&u.callee_sig)) {
+                Some(m) => m,
+                None => continue,
+            },
         };
         let filtered: Vec<_> = if let Some(hint) = &u.hint_crate {
             let hint_dash = hint.replace('_', "-");

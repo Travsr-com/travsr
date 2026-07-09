@@ -134,7 +134,20 @@ export function walk(rootDir: string, emitter: Emitter): void {
     const refRangeIds: number[] = [];
     const fileDir = path.dirname(relPath).replace(/\\/g, '/');
     const importTable = buildImportTable(tree.rootNode, fileDir, defMap);
-    visitRefs(tree.rootNode, docId, importTable, defMap, emitter, refRangeIds);
+    // #299 P1: track local variable types (`x = SomeClass()`) so method calls on
+    // locals (`x.method()`), and `self.method()`, resolve to `method:Class.method`.
+    const localTypes = buildLocalTypes(tree.rootNode, importTable, defMap, relPath);
+    visitRefs(
+      tree.rootNode,
+      docId,
+      importTable,
+      defMap,
+      emitter,
+      refRangeIds,
+      relPath,
+      null,
+      localTypes
+    );
     emitter.emitContains(docId, refRangeIds);
   }
 }
@@ -446,6 +459,12 @@ function lookupInDefMap(
 /** PY-H2: maximum AST recursion depth for visitRefs / visitDefs. */
 const MAX_AST_DEPTH = 2000;
 
+/** A local variable's inferred class type: the file + class name of its def. */
+interface LocalType {
+  relpath: string;
+  className: string;
+}
+
 function visitRefs(
   node: SyntaxNode,
   docId: number,
@@ -453,6 +472,9 @@ function visitRefs(
   defMap: DefMap,
   emitter: Emitter,
   refRangeIds: number[],
+  relPath: string,
+  enclosingClass: string | null,
+  localTypes: Map<string, LocalType>,
   depth = 0
 ): void {
   // PY-H2: bail out before the JS call stack overflows on deeply nested ASTs.
@@ -461,7 +483,14 @@ function visitRefs(
   if (node.type === 'call') {
     const funcNode = node.childForFieldName('function');
     if (funcNode) {
-      const info = resolveCallTarget(funcNode, importTable, defMap);
+      const info = resolveCallTarget(
+        funcNode,
+        importTable,
+        defMap,
+        relPath,
+        enclosingClass,
+        localTypes
+      );
       if (info) {
         const rangeId = emitter.emitRange(funcNode);
         emitter.emitEdge('next', rangeId, info.resultSetId);
@@ -471,15 +500,85 @@ function visitRefs(
     }
   }
 
+  // Track the enclosing class so `self.method()` resolves inside method bodies.
+  const nextClass =
+    node.type === 'class_definition'
+      ? (node.childForFieldName('name')?.text ?? enclosingClass)
+      : enclosingClass;
+
   for (const child of node.namedChildren) {
-    visitRefs(child, docId, importTable, defMap, emitter, refRangeIds, depth + 1);
+    visitRefs(
+      child,
+      docId,
+      importTable,
+      defMap,
+      emitter,
+      refRangeIds,
+      relPath,
+      nextClass,
+      localTypes,
+      depth + 1
+    );
   }
+}
+
+/**
+ * Scan a file for `var = SomeClass(...)` assignments and record `var`'s class
+ * type when `SomeClass` resolves to a first-party class (same file or a direct
+ * import). File-scoped and last-write-wins — sufficient for the common case
+ * without full flow analysis.
+ */
+function buildLocalTypes(
+  rootNode: SyntaxNode,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): Map<string, LocalType> {
+  const types = new Map<string, LocalType>();
+  const visit = (node: SyntaxNode, depth = 0): void => {
+    if (depth >= MAX_AST_DEPTH) return;
+    if (node.type === 'assignment') {
+      const left = node.childForFieldName('left');
+      const right = node.childForFieldName('right');
+      if (left?.type === 'identifier' && right?.type === 'call') {
+        const fn = right.childForFieldName('function');
+        if (fn?.type === 'identifier') {
+          const cls = resolveClassName(fn.text, importTable, defMap, relPath);
+          if (cls) types.set(left.text, cls);
+        }
+      }
+    }
+    for (const child of node.namedChildren) visit(child, depth + 1);
+  };
+  visit(rootNode);
+  return types;
+}
+
+/** Resolve a class name to its defining file + name (same file or direct import). */
+function resolveClassName(
+  name: string,
+  importTable: Map<string, ImportEntry>,
+  defMap: DefMap,
+  relPath: string
+): LocalType | undefined {
+  if (defMap.has(`${relPath}:class:${name}`)) {
+    return { relpath: relPath, className: name };
+  }
+  const entry = importTable.get(name);
+  if (entry?.kind === 'direct') {
+    const m = /^(.*):class:(.+)$/.exec(entry.key);
+    if (m) return { relpath: m[1], className: m[2] };
+  }
+  return undefined;
 }
 
 function resolveCallTarget(
   funcNode: SyntaxNode,
   importTable: Map<string, ImportEntry>,
-  defMap: DefMap
+  defMap: DefMap,
+  relPath: string,
+  enclosingClass: string | null,
+  localTypes: Map<string, LocalType>
 ): SymbolInfo | undefined {
   if (funcNode.type === 'identifier') {
     // foo() — simple direct call: look up the name in the import table.
@@ -491,7 +590,7 @@ function resolveCallTarget(
   }
 
   if (funcNode.type === 'attribute') {
-    // x.foo() — attribute call: look up x as a module, then foo inside it.
+    // x.foo() — attribute call.
     const objNode = funcNode.childForFieldName('object');
     const attrNode = funcNode.childForFieldName('attribute');
     if (!objNode || !attrNode) return undefined;
@@ -500,15 +599,33 @@ function resolveCallTarget(
     if (objNode.type !== 'identifier') return undefined;
 
     const entry = importTable.get(objNode.text);
-    if (entry?.kind !== 'module') return undefined;
-
-    for (const relpath of entry.relpaths) {
-      for (const sigPrefix of ['fn', 'class']) {
-        const key = `${relpath}:${sigPrefix}:${attrNode.text}`;
-        const info = defMap.get(key);
-        if (info) return info;
+    if (entry?.kind === 'module') {
+      // Module member call: look up foo inside the imported module.
+      for (const relpath of entry.relpaths) {
+        for (const sigPrefix of ['fn', 'class']) {
+          const key = `${relpath}:${sigPrefix}:${attrNode.text}`;
+          const info = defMap.get(key);
+          if (info) return info;
+        }
       }
+      return undefined;
     }
+
+    // #299 P1: `self.method()` inside a class body resolves to the enclosing
+    // class's method.
+    if (objNode.text === 'self' && enclosingClass) {
+      const info = defMap.get(`${relPath}:method:${enclosingClass}.${attrNode.text}`);
+      if (info) return info;
+    }
+
+    // #299 P1: `local.method()` where `local` has a tracked class type resolves
+    // to that class's method.
+    const lt = localTypes.get(objNode.text);
+    if (lt) {
+      const info = defMap.get(`${lt.relpath}:method:${lt.className}.${attrNode.text}`);
+      if (info) return info;
+    }
+
     return undefined;
   }
 

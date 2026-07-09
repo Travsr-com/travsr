@@ -364,17 +364,18 @@ impl PluginIndexer {
                         match item.work {
                             LangWork::Dart => {
                                 match travsr_indexer::phase_b_native_dart(corpus, repo_root) {
-                                    Ok((nodes, edges)) => {
+                                    Ok((nodes, edges, refs)) => {
                                         tracing::debug!(
                                             nodes = nodes.len(),
                                             edges = edges.len(),
+                                            refs = refs.len(),
                                             "Phase B: native dart complete"
                                         );
                                         LangResult {
                                             lang,
                                             nodes,
                                             edges,
-                                            refs: Vec::new(),
+                                            refs,
                                             unresolved_calls: Vec::new(),
                                             ran: true,
                                             skipped_no_analyzer: false,

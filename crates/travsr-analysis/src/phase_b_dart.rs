@@ -10,13 +10,49 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
+use travsr_core::{Edge, EdgeKind, Node, NodeId, ScipRef, VName};
 
 const TIMEOUT_SECS: u64 = 300;
 
 /// Platform-correct binary name for the emitter.
 fn emitter_name() -> String {
     format!("travsr-dart-index-emitter{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Detect the Dart SDK root so the AOT emitter can be told where it lives.
+///
+/// #299 E1: the emitter is an AOT binary, so the analyzer's default SDK
+/// auto-detection resolves relative to the emitter's own path
+/// (`~/.travsr/lib/...`) and fails to read `lib/_internal/…`. We find `dart` on
+/// `PATH`, canonicalize it (`<sdk>/bin/dart`), and take `<sdk>` — verified by the
+/// presence of `lib/_internal/allowed_experiments.json` — then pass it via the
+/// `DART_SDK` env the emitter reads. Returns `None` when no usable SDK is found
+/// (the emitter falls back to auto-detection).
+fn detect_dart_sdk() -> Option<PathBuf> {
+    // Explicit override wins.
+    if let Ok(p) = std::env::var("DART_SDK") {
+        let path = PathBuf::from(&p);
+        if !p.is_empty() && path.join("lib/_internal/allowed_experiments.json").exists() {
+            return Some(path);
+        }
+    }
+    let dart_name = format!("dart{}", std::env::consts::EXE_SUFFIX);
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(&dart_name);
+        if !candidate.exists() {
+            continue;
+        }
+        // `<sdk>/bin/dart` → `<sdk>`. Canonicalize to follow symlinks
+        // (Homebrew: /opt/homebrew/bin/dart → …/dart-sdk/<ver>/libexec/bin/dart).
+        let real = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        if let Some(sdk) = real.parent().and_then(|p| p.parent()) {
+            if sdk.join("lib/_internal/allowed_experiments.json").exists() {
+                return Some(sdk.to_path_buf());
+            }
+        }
+    }
+    None
 }
 
 fn emitter_path() -> Option<PathBuf> {
@@ -78,7 +114,10 @@ fn emitter_path() -> Option<PathBuf> {
 }
 
 /// Call the Dart AOT emitter binary directly and return Phase B nodes + edges.
-pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+pub fn extract_native_phase_b(
+    corpus: &str,
+    root: &Path,
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<ScipRef>)> {
     let emitter = emitter_path().context(
         "travsr-dart-index-emitter not found — \
          set $TRAVSR_DART_EMITTER or run `travsr lang install dart`",
@@ -95,11 +134,20 @@ pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<
         "phase_b_dart: launching emitter"
     );
 
-    let mut child = std::process::Command::new(&emitter)
+    let mut command = std::process::Command::new(&emitter);
+    command
         .arg(root)
         .arg(&output_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // #299 E1: point the AOT emitter at the real Dart SDK — without this the
+    // analyzer resolves the SDK relative to the emitter binary and crashes
+    // reading `lib/_internal/…`, leaving Dart Phase B empty.
+    if let Some(sdk) = detect_dart_sdk() {
+        tracing::debug!(sdk = %sdk.display(), "phase_b_dart: DART_SDK");
+        command.env("DART_SDK", sdk);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn {}", emitter.display()))?;
 
@@ -147,12 +195,15 @@ pub fn extract_native_phase_b(corpus: &str, root: &Path) -> anyhow::Result<(Vec<
     parse_emitter_output(&output_path, corpus)
 }
 
-fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+fn parse_emitter_output(
+    json_path: &Path,
+    corpus: &str,
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<ScipRef>)> {
     let bytes = std::fs::read(json_path)
         .with_context(|| format!("reading emitter output {}", json_path.display()))?;
 
     if bytes.is_empty() {
-        return Ok((vec![], vec![]));
+        return Ok((vec![], vec![], vec![]));
     }
 
     let root_val: serde_json::Value =
@@ -189,8 +240,12 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<(Vec<N
         }
     }
 
-    // Pass 2: resolve references → RefCall edges.
+    // Pass 2: resolve references → RefCall edges + occurrence records.
     let mut edges: Vec<Edge> = Vec::new();
+    // #299 S1/E1: emit ScipRef occurrence records (path:line) so the daemon
+    // populates edge_sites and find_references works for Dart — the emitter
+    // already gives us each reference's line.
+    let mut refs_out: Vec<ScipRef> = Vec::new();
 
     for doc in docs {
         let path = doc["path"].as_str().unwrap_or("");
@@ -205,6 +260,14 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<(Vec<N
             }
             if let Some(&dst_id) = def_ids.get(sym) {
                 edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+                // Emitter lines are 1-based (definitions store them as-is).
+                if let Some(line) = r["line"].as_u64() {
+                    refs_out.push(ScipRef {
+                        caller_path: path.to_string(),
+                        caller_line: line as u32,
+                        callee_id: dst_id,
+                    });
+                }
             }
         }
     }
@@ -212,8 +275,9 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<(Vec<N
     tracing::info!(
         nodes = nodes.len(),
         edges = edges.len(),
+        refs = refs_out.len(),
         "phase_b_dart: ingestion complete"
     );
 
-    Ok((nodes, edges))
+    Ok((nodes, edges, refs_out))
 }
