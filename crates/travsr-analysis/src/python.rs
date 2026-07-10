@@ -232,10 +232,7 @@ fn find_parent_class(fn_def: tree_sitter::Node<'_>, source: &[u8]) -> Option<Str
             "function_definition" => return None,
             _ => {}
         }
-        match current.parent() {
-            Some(p) => current = p,
-            None => return None,
-        }
+        current = current.parent()?;
     }
 }
 
