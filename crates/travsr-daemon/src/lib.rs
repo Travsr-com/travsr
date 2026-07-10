@@ -1257,13 +1257,23 @@ pub fn init_repo_with_progress(
             };
             let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
-            let resolved = resolve_unresolved_calls(&store, &pb_unresolved);
+            let (resolved, resolved_sites) = resolve_unresolved_calls(&store, &pb_unresolved);
             tracing::debug!(
                 resolved_cross_crate_edges = resolved.len(),
                 "Phase B UnresolvedCall resolution complete"
             );
             pb_edges.extend(resolved);
-            write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome)
+            let (report, alias_map) =
+                write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            // #299 WS-4: record cross-crate call occurrence lines after the edges
+            // (and their callee nodes) are in the store. #299 F2: remap dst ids
+            // through the unification alias map first so a site never points at a
+            // SCIP node that `write_phase_b_results` dropped.
+            let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
+            if let Err(e) = store.record_edge_sites(&resolved_sites) {
+                tracing::warn!("recording cross-crate edge_sites: {e:#}");
+            }
+            report
         };
         tracing::info!(
             elapsed_ms = t_phase_b.elapsed().as_millis(),
@@ -1375,12 +1385,25 @@ pub fn init_repo_with_progress(
 ///
 /// Overconnection is safe: when multiple nodes share a signature (e.g. two crates
 /// both define `fn:new`) all matches are emitted. PPR damping absorbs the noise.
+/// Resolve cross-crate `UnresolvedCall`s against Phase A nodes.
+///
+/// Returns `(edges, sites)`:
+///   - `edges`: the deduped `RefCall` edges (caller → resolved callee).
+///   - `sites`: `(caller_node, callee_node, caller_line)` occurrence tuples for
+///     `edge_sites` (issue #299 WS-4). `caller_line` comes from the tree-sitter
+///     call site; `0` (unknown) rows are skipped by `record_edge_sites`. This is
+///     what gives `find_references` occurrence `path:line` for Rust cross-crate
+///     bare/lowercase-scoped calls, which are not visible to the same-file
+///     ScipRef pass.
 fn resolve_unresolved_calls(
     store: &SqliteStore,
     unresolved: &[travsr_core::UnresolvedCall],
-) -> Vec<travsr_core::Edge> {
+) -> (
+    Vec<travsr_core::Edge>,
+    Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
+) {
     if unresolved.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let sigs: Vec<String> = {
@@ -1394,7 +1417,7 @@ fn resolve_unresolved_calls(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("resolve_unresolved_calls: store query failed: {e}");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
@@ -1408,10 +1431,56 @@ fn resolve_unresolved_calls(
             .push((*id, path.as_str()));
     }
 
+    // #299 R1: leaf-name fallback for method calls. `recv.method()` can't be
+    // resolved to the receiver's type syntactically, so the Rust extractor emits
+    // a bare `fn:method` sig; when the definition is a qualified `fn:Type.method`
+    // node the exact pass above misses it. Look up the still-unmatched sigs by
+    // leaf identifier and resolve only when the leaf is unique (precision).
+    let leaf_of = |sig: &str| -> String {
+        let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
+        body.rsplit('.').next().unwrap_or(body).to_string()
+    };
+    let unmatched_leaves: Vec<String> = {
+        let mut v: Vec<String> = unresolved
+            .iter()
+            .filter(|u| !by_sig.contains_key(u.callee_sig.as_str()))
+            .map(|u| leaf_of(&u.callee_sig))
+            .filter(|l| !l.is_empty())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let leaf_candidates = if unmatched_leaves.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .fn_nodes_by_leaf_name(&unmatched_leaves)
+            .unwrap_or_else(|e| {
+                tracing::warn!("resolve_unresolved_calls: leaf fallback query failed: {e}");
+                Vec::new()
+            })
+    };
+    // leaf → Vec<(NodeId, path)>
+    let mut by_leaf: std::collections::HashMap<String, Vec<(travsr_core::NodeId, &str)>> =
+        std::collections::HashMap::new();
+    for (id, sig, path) in &leaf_candidates {
+        by_leaf
+            .entry(leaf_of(sig))
+            .or_default()
+            .push((*id, path.as_str()));
+    }
+
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
+    let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
-        let Some(matches) = by_sig.get(u.callee_sig.as_str()) else {
-            continue;
+        // Exact signature first; fall back to a unique leaf-name match (R1).
+        let matches: &Vec<(travsr_core::NodeId, &str)> = match by_sig.get(u.callee_sig.as_str()) {
+            Some(m) => m,
+            None => match by_leaf.get(&leaf_of(&u.callee_sig)) {
+                Some(m) => m,
+                None => continue,
+            },
         };
         let filtered: Vec<_> = if let Some(hint) = &u.hint_crate {
             let hint_dash = hint.replace('_', "-");
@@ -1436,13 +1505,19 @@ fn resolve_unresolved_calls(
                     dst,
                     travsr_core::EdgeKind::RefCall,
                 ));
+                // #299: record the call-site occurrence. `u.src` is the caller
+                // function node (same file as the call), so nodes.path[src] is the
+                // occurrence file — exactly what reference_sites returns.
+                sites.push((u.src, dst, u.caller_line));
             }
         }
     }
 
     edges.sort_unstable_by_key(|e| (e.src.0, e.dst.0));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst);
-    edges
+    sites.sort_unstable_by_key(|(s, d, l)| (s.0, d.0, *l));
+    sites.dedup();
+    (edges, sites)
 }
 
 /// Factored out of `init_repo_with_progress` so the background refresh
@@ -1456,9 +1531,18 @@ fn write_phase_b_results(
     pb_edges: Vec<travsr_core::Edge>,
     pb_refs: Vec<travsr_core::ScipRef>,
     pb_outcome: travsr_plugin_host::PhaseBOutcome,
-) -> PhaseBReport {
+) -> (
+    PhaseBReport,
+    std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
+) {
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
+    // #299 F2: the alias map (SCIP id → unified TS id) produced by `unify_all`
+    // must be returned so the caller can remap `resolved_sites.dst` — those sites
+    // were resolved against the pre-unify store and may point at a SCIP node that
+    // unification drops. Empty for the no-attribution (old-style sidecar) path.
+    let mut alias_map: std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId> =
+        std::collections::HashMap::new();
     if pb_refs.is_empty() {
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
@@ -1469,7 +1553,7 @@ fn write_phase_b_results(
         // writing. Mutates pb_refs in-place to redirect callee_id to unified
         // TS nodes, and returns the alias map (SCIP id → TS id).
         let mut pb_refs_mut = pb_refs;
-        let alias_map = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
+        alias_map = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
         let pb_refs = pb_refs_mut;
 
         // Drop unified SCIP definition nodes: the tree-sitter node already
@@ -1545,7 +1629,15 @@ fn write_phase_b_results(
         let _ = store.set_meta("rust_lsif_degraded", "");
     }
 
-    PhaseBReport {
+    // #299 M1: mark the languages whose Phase B completed so `find_references`
+    // can tell a genuine "0 references" from "occurrence index never built for
+    // this language". Recorded here (single choke point for both the init and
+    // background paths). Failures to write the marker are non-fatal.
+    if let Err(e) = store.record_phase_b_languages(&pb_outcome.ran) {
+        tracing::warn!("recording phase B language marker: {e:#}");
+    }
+
+    let report = PhaseBReport {
         ran: pb_outcome.ran,
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
@@ -1553,7 +1645,32 @@ fn write_phase_b_results(
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,
         version_mismatch: pb_outcome.version_mismatch,
+    };
+    (report, alias_map)
+}
+
+/// #299 F2: remap `resolved_sites.dst` through the unification alias map and
+/// drop any site that collapses to a self-loop (`src == dst`).
+///
+/// The sites were resolved against the pre-`unify_all` store, so a `dst` that
+/// unification redirected to a tree-sitter node would otherwise record an
+/// occurrence against a node that no longer exists (mixed-language repos). A
+/// site whose `dst` remaps onto its own `src` mirrors the self-loop edge that
+/// `write_phase_b_results` already drops, so it is filtered here too.
+fn remap_resolved_sites(
+    sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
+    alias_map: &std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
+) -> Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> {
+    if alias_map.is_empty() {
+        return sites;
     }
+    sites
+        .into_iter()
+        .filter_map(|(src, dst, line)| {
+            let dst = alias_map.get(&dst).copied().unwrap_or(dst);
+            (src != dst).then_some((src, dst, line))
+        })
+        .collect()
 }
 
 /// Walk `repo_root` and return the set of language names (Language::as_str)
@@ -1819,7 +1936,7 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
 
-    let resolved = resolve_unresolved_calls(&s, &pb_unresolved);
+    let (resolved, resolved_sites) = resolve_unresolved_calls(&s, &pb_unresolved);
     tracing::debug!(
         resolved_cross_crate_edges = resolved.len(),
         "Phase B UnresolvedCall resolution complete"
@@ -1833,7 +1950,15 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         }
     }
 
-    let report = write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    let (report, alias_map) =
+        write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    // #299 WS-4: record cross-crate call occurrence lines after their edges land.
+    // #299 F2: remap dst ids through the unification alias map so a site never
+    // points at a SCIP node that unification dropped.
+    let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
+    if let Err(e) = s.record_edge_sites(&resolved_sites) {
+        tracing::warn!("recording cross-crate edge_sites: {e:#}");
+    }
 
     // C4: only advance phase_b_commit when no language crashed. A partial result
     // should not suppress the next background refresh so crashed languages can
@@ -2211,6 +2336,38 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    #[test]
+    fn remap_resolved_sites_redirects_and_drops_self_loops() {
+        // #299 F2: a resolved site whose dst unification redirected must be
+        // remapped; a site that collapses to src == dst after remapping is
+        // dropped (mirrors the self-loop edge write_phase_b_results discards).
+        use travsr_core::NodeId;
+        let src = NodeId(1);
+        let scip_dst = NodeId(2);
+        let ts_dst = NodeId(3);
+        let mut alias = std::collections::HashMap::new();
+        alias.insert(scip_dst, ts_dst);
+        // Also alias a node onto `src` to force a self-loop after remap.
+        let collapses = NodeId(4);
+        alias.insert(collapses, src);
+
+        let sites = vec![
+            (src, scip_dst, 10),  // dst remaps 2 → 3
+            (src, NodeId(9), 11), // dst not in alias — unchanged
+            (src, collapses, 12), // dst remaps 4 → 1 == src → dropped
+        ];
+        let out = remap_resolved_sites(sites, &alias);
+        assert_eq!(out, vec![(src, ts_dst, 10), (src, NodeId(9), 11)]);
+    }
+
+    #[test]
+    fn remap_resolved_sites_empty_alias_is_identity() {
+        use travsr_core::NodeId;
+        let sites = vec![(NodeId(1), NodeId(2), 5)];
+        let out = remap_resolved_sites(sites.clone(), &std::collections::HashMap::new());
+        assert_eq!(out, sites);
+    }
 
     // Rust tests run in parallel; TRAVSR_DISABLE_REGISTRY and HOME are
     // process-global env vars. Serialize every test that mutates them through

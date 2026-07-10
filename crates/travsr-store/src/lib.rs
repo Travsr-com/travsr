@@ -504,6 +504,28 @@ impl Migration for V19NodesSignatureIdx {
     }
 }
 
+/// V20 (#299 F7): one-time purge of orphaned `edge_sites` rows.
+///
+/// `edge_sites` has no FK cascade, and every ingestion path predating this
+/// migration deleted `edges` on re-index/G3 without touching `edge_sites`, so a
+/// row whose `src` or `dst` node was deleted or re-id'd lingered forever and
+/// surfaced in `find_references` as a phantom occurrence. Newer writes purge
+/// these owned/both-direction rows at the source (delete_file / reindex_replace),
+/// so this migration only needs to clean the historical backlog once.
+struct V20PurgeOrphanEdgeSites;
+impl Migration for V20PurgeOrphanEdgeSites {
+    fn version(&self) -> u32 {
+        20
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        store.exec_ddl(
+            "DELETE FROM edge_sites \
+             WHERE src NOT IN (SELECT id FROM nodes) \
+                OR dst NOT IN (SELECT id FROM nodes)",
+        )
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -526,6 +548,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V17NodeTombstones);
     r.register(V18EmbedText);
     r.register(V19NodesSignatureIdx);
+    r.register(V20PurgeOrphanEdgeSites);
     r
 }
 
@@ -1566,6 +1589,18 @@ impl SqliteStore {
             )
             .context("deleting both-direction edges for delete_file")?;
 
+            // #299 F7: purge the matching occurrence rows. `edge_sites` has no FK
+            // cascade (a cascade would over-delete inbound sites on unrelated
+            // re-indexes — see reindex_replace), so mirror the both-direction edge
+            // delete here: every occurrence into or out of this dead file is gone.
+            tx.execute(
+                "DELETE FROM edge_sites \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                    OR dst IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("deleting both-direction edge_sites for delete_file")?;
+
             // Retract FTS entries before deleting nodes.
             tx.execute(
                 "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
@@ -1664,6 +1699,20 @@ impl SqliteStore {
                 params![corpus, path],
             )
             .context("deleting owned edges for reindex_replace")?;
+
+            // #299 F7: purge OWNED occurrence rows only — an occurrence's `src` is
+            // the enclosing node in the *same* file, so `src ∈ this file` selects
+            // exactly the sites that live in this file and will be re-derived by
+            // the next Phase B pass. Inbound sites (references from other files to
+            // this file's symbols) are preserved, mirroring the owned-edge rule so
+            // a blank-line/body edit stays lossless. (A blanket FK cascade would
+            // wrongly nuke those inbound sites when the node is deleted+reinserted.)
+            tx.execute(
+                "DELETE FROM edge_sites \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("deleting owned edge_sites for reindex_replace")?;
 
             // Retract FTS for old nodes.
             tx.execute(
@@ -2104,7 +2153,7 @@ LIMIT 100",
                     "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line
 FROM nodes
 WHERE signature = ?1
-  AND kind != 'file'
+  AND kind NOT IN ('file', 'import')
   AND (
         ?2 IS NULL
      OR path = ?2
@@ -2275,6 +2324,78 @@ LIMIT 20",
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding nodes_by_signatures row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Function/method definition nodes whose *leaf identifier* (the segment
+    /// after the last `.`, or the whole name for an unqualified `fn:name`)
+    /// matches one of `names`.
+    ///
+    /// #299 R1: a Rust method call `recv.method()` cannot be resolved to the
+    /// receiver's type syntactically, so the native extractor emits a bare
+    /// `fn:method` `UnresolvedCall`. When the definition is a qualified
+    /// `fn:Type.method` / `method:Type.method` node, the exact-signature pass
+    /// misses it. This precise, index-time fallback recovers the qualified
+    /// node by leaf name; the caller resolves only when the match is unique so
+    /// no false edge is created. LIKE metacharacters (`_`, `%`) in identifiers
+    /// are escaped so `announce_all` is matched literally.
+    pub fn fn_nodes_by_leaf_name(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+            // Each name contributes 3 params (exact + 2 LIKE). Chunk so a large
+            // `names` slice never exceeds SQLite's SQLITE_MAX_VARIABLE_NUMBER
+            // (default 999 on older builds) or the expression-tree depth limit:
+            // 300 names → 900 params / 900 OR-terms per statement.
+            const NAMES_PER_CHUNK: usize = 300;
+            let mut out = Vec::new();
+            for chunk in names.chunks(NAMES_PER_CHUNK) {
+                let mut clauses: Vec<&str> = Vec::with_capacity(chunk.len() * 3);
+                let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 3);
+                for name in chunk {
+                    let esc = name
+                        .replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_");
+                    clauses.push("signature = ?");
+                    params.push(format!("fn:{name}"));
+                    clauses.push("signature LIKE ? ESCAPE '\\'");
+                    params.push(format!("fn:%.{esc}"));
+                    clauses.push("signature LIKE ? ESCAPE '\\'");
+                    params.push(format!("method:%.{esc}"));
+                }
+                // Kind set matches `fetch_all_fn_spans` (incl. the `fn` kind used
+                // by some Phase A parsers) so leaf-name resolution and span
+                // attribution consider the same node population.
+                let sql = format!(
+                    "SELECT id, signature, path FROM nodes \
+                     WHERE kind IN ('function','method','fn') AND ({})",
+                    clauses.join(" OR ")
+                );
+                let mut stmt = self
+                    .conn
+                    .prepare(&sql)
+                    .context("preparing fn_nodes_by_leaf_name")?;
+                let params_vec: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                let rows = stmt
+                    .query_map(params_vec.as_slice(), |row| {
+                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                        let sig: String = row.get(1)?;
+                        let path: String = row.get(2)?;
+                        Ok((id, sig, path))
+                    })
+                    .context("executing fn_nodes_by_leaf_name")?;
+                for row in rows {
+                    out.push(row.context("decoding fn_nodes_by_leaf_name row")?);
+                }
             }
             Ok(out)
         })()
@@ -2735,6 +2856,172 @@ LIMIT 20",
         }
 
         tx.commit().context("write_scip_attributed_batch: commit")
+    }
+
+    /// Occurrence sites (`path:line`) of every `ref/call` to `dst`, read from the
+    /// `edge_sites` occurrence store (issue #299 `find_references`).
+    ///
+    /// `edge_sites.src` is the enclosing-function (or file-fallback) node, which
+    /// by construction lives in the **same file** as the occurrence
+    /// (`find_narrowest_enclosing` only searches the reference file's spans, and
+    /// the fallback is that file's node). Therefore `nodes.path[src]` is exactly
+    /// the occurrence file. Rows are deduplicated by the `edge_sites` PK
+    /// `(src, dst, kind, line)` and returned in deterministic `(path, line)`
+    /// order for stable snapshots.
+    ///
+    /// An empty vec means no occurrence rows exist for `dst`; callers may then
+    /// fall back to structural `ref/call` edge enumeration (as `get_callers`
+    /// does) so a language not yet feeding `edge_sites` still degrades gracefully.
+    ///
+    /// O(k log k) where k = occurrence count (SQLite index scan + sort).
+    pub fn reference_sites(&self, dst: NodeId) -> anyhow::Result<Vec<travsr_core::RefSite>> {
+        let _span = tracing::debug_span!("store.reference_sites", dst = dst.0).entered();
+        let mut stmt = self
+            .conn
+            .prepare(
+                // DISTINCT: two different enclosing `src` nodes can reference
+                // `dst` on the same `path:line` (e.g. overlapping macro spans),
+                // which the `(src, dst, kind, line)` PK does not dedup. Collapse
+                // to unique occurrence locations before returning.
+                "SELECT DISTINCT n.path AS path, es.line AS line \
+                 FROM edge_sites es JOIN nodes n ON n.id = es.src \
+                 WHERE es.dst = ?1 AND es.kind = 'ref/call' \
+                 ORDER BY n.path, es.line",
+            )
+            .context("preparing reference_sites query")?;
+        let rows = stmt
+            .query_map(params![node_id_to_i64(dst)], |row| {
+                let path: String = row.get(0)?;
+                let line: i64 = row.get(1)?;
+                Ok((path, line))
+            })
+            .context("executing reference_sites query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, line) = row.context("decoding reference_sites row")?;
+            out.push(travsr_core::RefSite {
+                path,
+                // Clamp defensively — stored lines are already 1-based u32.
+                line: u32::try_from(line).unwrap_or(0),
+            });
+        }
+        tracing::debug!(sites_returned = out.len());
+        Ok(out)
+    }
+
+    /// Record the set of languages for which Phase B (semantic occurrence
+    /// analysis) completed in this repo. Unions with the previously recorded
+    /// set so a background refresh that runs only a subset of languages never
+    /// narrows the marker.
+    ///
+    /// #299 M1: this is the authoritative signal for
+    /// [`Self::language_has_edge_sites`] — "Phase B ran for this language" — and
+    /// is robust to the two failure modes of the edge_sites heuristic below:
+    /// a language whose definition nodes carry an empty `language` string, and a
+    /// language that ran Phase B but genuinely produced zero occurrences.
+    pub fn record_phase_b_languages(&mut self, langs: &[String]) -> anyhow::Result<()> {
+        if langs.is_empty() {
+            return Ok(());
+        }
+        let mut set: std::collections::BTreeSet<String> =
+            self.phase_b_completed_languages()?.into_iter().collect();
+        let mut changed = false;
+        for l in langs {
+            if !l.is_empty() && set.insert(l.clone()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let joined = set.into_iter().collect::<Vec<_>>().join(",");
+        self.set_meta("phase_b_ran_languages", &joined)
+            .context("record_phase_b_languages")?;
+        Ok(())
+    }
+
+    /// The set of languages for which Phase B completed (see
+    /// [`Self::record_phase_b_languages`]). Empty for legacy DBs indexed before
+    /// this marker existed.
+    pub fn phase_b_completed_languages(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .get_meta("phase_b_ran_languages")
+            .context("phase_b_completed_languages")?
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect())
+    }
+
+    /// Whether the occurrence index was built for `language` in this repo.
+    ///
+    /// #299 M1: lets `find_references` distinguish "the occurrence index was
+    /// never built for this language" (Phase B absent, failed, or a language
+    /// whose provider does not emit occurrence lines) from "this symbol
+    /// genuinely has no references" — the two must not render identically.
+    ///
+    /// Primary signal is the per-language Phase B completion marker (authoritative
+    /// and per-symbol-agnostic). Falls back to an `edge_sites` presence check for
+    /// legacy DBs written before the marker existed. The edge_sites heuristic
+    /// alone under-reports for languages whose definition nodes carry an empty
+    /// `language` string (the `file_node_for_attribution` fallback) or that ran
+    /// Phase B but produced zero occurrences, so the marker takes precedence.
+    pub fn language_has_edge_sites(&self, language: &str) -> anyhow::Result<bool> {
+        if self
+            .phase_b_completed_languages()?
+            .iter()
+            .any(|l| l == language)
+        {
+            return Ok(true);
+        }
+        let present: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM edge_sites es JOIN nodes n ON n.id = es.dst \
+                   WHERE es.kind = 'ref/call' AND n.language = ?1 AND n.language != '')",
+                params![language],
+                |row| row.get(0),
+            )
+            .context("querying language_has_edge_sites")?;
+        Ok(present != 0)
+    }
+
+    /// Record `ref/call` occurrence lines directly (issue #299 WS-4).
+    ///
+    /// Used for producers that already know the enclosing-caller node id and the
+    /// occurrence line — currently the daemon's cross-crate `UnresolvedCall`
+    /// resolution, where `src` is the caller function node and `line` is the
+    /// call-site line. Rows with `line == 0` (unknown) are skipped. Idempotent
+    /// via the `edge_sites` PK; safe to re-run on every reindex.
+    pub fn record_edge_sites(&mut self, sites: &[(NodeId, NodeId, u32)]) -> anyhow::Result<()> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .context("record_edge_sites: begin")?;
+        for &(src, dst, line) in sites {
+            if line == 0 {
+                continue;
+            }
+            // Skip self-loops so the occurrence store never diverges from the
+            // `ref/call` edge set: `write_phase_b_results` drops any edge that
+            // collapses to `src == dst` after alias remapping, so a site with the
+            // same collapse would otherwise be an occurrence with no backing edge
+            // (find_references would show it; get_callers / blast_radius would not).
+            if src == dst {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
+                params![node_id_to_i64(src), node_id_to_i64(dst), line as i64],
+            )
+            .context("record_edge_sites: insert")?;
+        }
+        tx.commit().context("record_edge_sites: commit")
     }
 
     /// G1: Register a mapping from a raw SCIP symbol string to a unified tree-sitter `NodeId`.
@@ -5152,6 +5439,335 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn reference_sites_returns_ordered_deduped_path_line() {
+        // #299: reference_sites joins edge_sites.src → nodes.path and returns
+        // deterministic (path, line) order, deduped by the edge_sites PK.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "file"),
+            "file",
+        );
+        let b = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "file"),
+            "file",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+            "fn",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&callee).unwrap();
+
+        // Out-of-order + a duplicate (a.rs:10 twice) to exercise ORDER BY + PK dedup.
+        store
+            .record_edge_sites(&[
+                (a.id, callee.id, 10),
+                (b.id, callee.id, 3),
+                (a.id, callee.id, 2),
+                (a.id, callee.id, 10),
+            ])
+            .unwrap();
+
+        let sites = store.reference_sites(callee.id).unwrap();
+        assert_eq!(
+            sites,
+            vec![
+                travsr_core::RefSite {
+                    path: "a.rs".into(),
+                    line: 2
+                },
+                travsr_core::RefSite {
+                    path: "a.rs".into(),
+                    line: 10
+                },
+                travsr_core::RefSite {
+                    path: "b.rs".into(),
+                    line: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_sites_empty_when_no_occurrences() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let unknown = travsr_core::VName::new("c", "", "x.rs", "rust", "fn:nope").id();
+        assert!(store.reference_sites(unknown).unwrap().is_empty());
+    }
+
+    #[test]
+    fn language_has_edge_sites_distinguishes_missing_index_from_zero_refs() {
+        // #299 M1: a language with a recorded ref/call occurrence reads true; a
+        // language whose def node exists but has no occurrence row reads false,
+        // so the reader can say "index unavailable" instead of "0 references".
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "main.rs", "rust", "file"),
+            "file",
+        );
+        let rust_fn = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "svc.rs", "rust", "fn:charge"),
+            "function",
+        );
+        // Java def node exists but never receives an occurrence row.
+        let java_fn = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "Svc.java", "java", "fn:charge"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&rust_fn).unwrap();
+        store.put_node(&java_fn).unwrap();
+
+        store
+            .record_edge_sites(&[(caller.id, rust_fn.id, 12)])
+            .unwrap();
+
+        assert!(store.language_has_edge_sites("rust").unwrap());
+        // Def node present, but no ref/call site -> index not built for java.
+        assert!(!store.language_has_edge_sites("java").unwrap());
+        // A language with no nodes at all is also "unavailable", not zero.
+        assert!(!store.language_has_edge_sites("go").unwrap());
+    }
+
+    #[test]
+    fn fn_nodes_by_leaf_name_matches_bare_and_qualified_leaves() {
+        // #299 R1: the daemon leaf-name fallback recovers a qualified
+        // fn:Type.method / method:Type.method node from a bare leaf, restricts
+        // to callable kinds, and escapes LIKE metacharacters so `_` is literal.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let nodes = [
+            ("a.rs", "fn:describe", "function"),
+            ("a.rs", "fn:Animal.describe", "function"),
+            ("b.rs", "method:Zoo.add", "method"),
+            ("c.rs", "fn:Zoo.announce_all", "method"),
+            // `_` must be escaped: an `X` in the same slot must NOT be matched
+            // when searching the underscore name.
+            ("c.rs", "fn:Zoo.announceXall", "method"),
+            // Non-callable kind with a matching leaf must be excluded.
+            ("d.rs", "class:describe", "class"),
+        ];
+        for (path, sig, kind) in nodes {
+            let n =
+                travsr_core::Node::new(travsr_core::VName::new("c", "", path, "rust", sig), kind);
+            store.put_node(&n).unwrap();
+        }
+
+        let mut got: Vec<String> = store
+            .fn_nodes_by_leaf_name(&["describe".to_string(), "add".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|(_, sig, _)| sig)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "fn:Animal.describe".to_string(),
+                "fn:describe".to_string(),
+                "method:Zoo.add".to_string(),
+            ]
+        );
+
+        // `announce_all` matches only the literal underscore node, never the
+        // `announceXall` wildcard trap -> proves the LIKE `_` is escaped.
+        let hit: Vec<String> = store
+            .fn_nodes_by_leaf_name(&["announce_all".to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|(_, sig, _)| sig)
+            .collect();
+        assert_eq!(hit, vec!["fn:Zoo.announce_all".to_string()]);
+
+        // Empty input short-circuits with no query.
+        assert!(store.fn_nodes_by_leaf_name(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_edge_sites_skips_zero_line() {
+        // line == 0 means "unknown occurrence line" and must not be stored.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "file"),
+            "file",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:f"),
+            "fn",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 0), (caller.id, callee.id, 5)])
+            .unwrap();
+        let sites = store.reference_sites(callee.id).unwrap();
+        assert_eq!(
+            sites,
+            vec![travsr_core::RefSite {
+                path: "a.rs".into(),
+                line: 5
+            }]
+        );
+    }
+
+    #[test]
+    fn record_edge_sites_skips_self_loop() {
+        // #299 F8: a site whose src == dst has no backing ref/call edge (edges
+        // drop self-loops), so recording it would diverge find_references from
+        // get_callers. It must be skipped.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:f"),
+            "function",
+        );
+        store.put_node(&n).unwrap();
+        store.record_edge_sites(&[(n.id, n.id, 5)]).unwrap();
+        assert!(store.reference_sites(n.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn language_has_edge_sites_trusts_phase_b_marker() {
+        // #299 M1: the per-language Phase B completion marker is authoritative —
+        // a language that ran Phase B but produced zero occurrences (or whose def
+        // nodes carry an empty language string) must still read "index built".
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // No edge_sites rows at all.
+        assert!(!store.language_has_edge_sites("kotlin").unwrap());
+        store
+            .record_phase_b_languages(&["kotlin".to_string(), "go".to_string()])
+            .unwrap();
+        assert!(store.language_has_edge_sites("kotlin").unwrap());
+        assert!(store.language_has_edge_sites("go").unwrap());
+        assert!(!store.language_has_edge_sites("rust").unwrap());
+        // Union semantics: a later subset run never narrows the recorded set.
+        store
+            .record_phase_b_languages(&["rust".to_string()])
+            .unwrap();
+        assert!(store.language_has_edge_sites("rust").unwrap());
+        assert!(store.language_has_edge_sites("kotlin").unwrap());
+        let mut langs = store.phase_b_completed_languages().unwrap();
+        langs.sort();
+        assert_eq!(langs, vec!["go", "kotlin", "rust"]);
+    }
+
+    #[test]
+    fn language_has_edge_sites_ignores_empty_language_dst() {
+        // #299 F6: an occurrence targeting a def node with an empty language
+        // string must not be counted as "index built" for the empty language.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "file"),
+            "file",
+        );
+        // Def node with an empty language (file_node_for_attribution style).
+        let blank = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "", "fn:f"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&blank).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, blank.id, 4)])
+            .unwrap();
+        // Querying the empty language must not report the index as built.
+        assert!(!store.language_has_edge_sites("").unwrap());
+    }
+
+    #[test]
+    fn fn_nodes_by_leaf_name_includes_fn_kind_and_chunks() {
+        // #299 F11: the `fn` kind (some Phase A parsers) must be matched, and a
+        // names slice larger than one chunk must still resolve every name.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let fnkind = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:Zoo.feed"),
+            "fn",
+        );
+        store.put_node(&fnkind).unwrap();
+        // 350 distinct leaf names (> NAMES_PER_CHUNK) including the real one.
+        let mut names: Vec<String> = (0..350).map(|i| format!("leaf{i}")).collect();
+        names.push("feed".to_string());
+        let got: Vec<String> = store
+            .fn_nodes_by_leaf_name(&names)
+            .unwrap()
+            .into_iter()
+            .map(|(_, sig, _)| sig)
+            .collect();
+        assert_eq!(got, vec!["fn:Zoo.feed".to_string()]);
+    }
+
+    #[test]
+    fn reindex_replace_purges_owned_edge_sites() {
+        // #299 F7: re-indexing a file clears its OWNED occurrence rows (src in the
+        // file) but preserves inbound sites (references from other files).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let owned_src = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:target"),
+            "function",
+        );
+        let external = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:ext"),
+            "function",
+        );
+        store.put_node(&owned_src).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&external).unwrap();
+        // Owned site (src in a.rs) + inbound site (src in b.rs → dst in a.rs).
+        store
+            .record_edge_sites(&[(owned_src.id, callee.id, 3), (external.id, callee.id, 9)])
+            .unwrap();
+
+        // Re-index a.rs with the same nodes.
+        store
+            .reindex_replace(
+                "c",
+                "a.rs",
+                &[owned_src.clone(), callee.clone()],
+                &[],
+                "hash1",
+            )
+            .unwrap();
+
+        let sites = store.reference_sites(callee.id).unwrap();
+        // The owned a.rs:3 site is gone; the inbound b.rs:9 site survives.
+        assert_eq!(
+            sites,
+            vec![travsr_core::RefSite {
+                path: "b.rs".into(),
+                line: 9
+            }]
+        );
+    }
+
+    #[test]
+    fn delete_file_purges_both_direction_edge_sites() {
+        // #299 F7: deleting a file removes every occurrence into or out of it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a_fn = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        );
+        let b_fn = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:b"),
+            "function",
+        );
+        store.put_node(&a_fn).unwrap();
+        store.put_node(&b_fn).unwrap();
+        // a.rs references b.rs (dst in a-file-to-delete would be inbound; here we
+        // also record b→a so both directions exist w.r.t. a.rs).
+        store
+            .record_edge_sites(&[(a_fn.id, b_fn.id, 2), (b_fn.id, a_fn.id, 7)])
+            .unwrap();
+        store.delete_file("c", "a.rs").unwrap();
+        // Every edge_sites row touching a.rs is gone; b→a (inbound) also removed.
+        assert!(store.reference_sites(a_fn.id).unwrap().is_empty());
+        assert!(store.reference_sites(b_fn.id).unwrap().is_empty());
     }
 
     #[test]

@@ -32,7 +32,9 @@ pub use ffi::{FfiMarker, FfiMarkerKind};
 pub use ffi_resolver::FfiConfig;
 pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
-pub use lsif::{ingest_rust, ingest_rust_raw, ingest_scip};
+pub use lsif::{
+    ingest_g2 as ingest_lsif_g2, ingest_rust, ingest_rust_raw, ingest_scip, LsifG2Output,
+};
 pub use ra_runner::run_ra_lsif;
 pub use runner::{run_lsif_emitter, run_lsif_py_emitter, run_scip_python};
 pub use travsr_analysis::ParseOutput;
@@ -75,7 +77,11 @@ pub fn go_parse(
 pub fn phase_b_native_dart(
     corpus: &str,
     root: &std::path::Path,
-) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+) -> anyhow::Result<(
+    Vec<travsr_core::Node>,
+    Vec<travsr_core::Edge>,
+    Vec<travsr_core::ScipRef>,
+)> {
     phase_b_dart::extract_native_phase_b(corpus, root)
 }
 
@@ -91,11 +97,7 @@ pub fn phase_b_native_rust(
     corpus: &str,
     root: &std::path::Path,
     files: Option<&[(std::path::PathBuf, String)]>,
-) -> anyhow::Result<(
-    Vec<travsr_core::Node>,
-    Vec<travsr_core::Edge>,
-    Vec<travsr_core::UnresolvedCall>,
-)> {
+) -> anyhow::Result<phase_b_rust::NativePhaseB> {
     phase_b_rust::extract_native_phase_b(corpus, root, files)
 }
 

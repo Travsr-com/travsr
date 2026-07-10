@@ -364,17 +364,18 @@ impl PluginIndexer {
                         match item.work {
                             LangWork::Dart => {
                                 match travsr_indexer::phase_b_native_dart(corpus, repo_root) {
-                                    Ok((nodes, edges)) => {
+                                    Ok((nodes, edges, refs)) => {
                                         tracing::debug!(
                                             nodes = nodes.len(),
                                             edges = edges.len(),
+                                            refs = refs.len(),
                                             "Phase B: native dart complete"
                                         );
                                         LangResult {
                                             lang,
                                             nodes,
                                             edges,
-                                            refs: Vec::new(),
+                                            refs,
                                             unresolved_calls: Vec::new(),
                                             ran: true,
                                             skipped_no_analyzer: false,
@@ -409,7 +410,7 @@ impl PluginIndexer {
                                             .map(|r| (repo_root.join(r), r.clone()))
                                             .collect()
                                     });
-                                let (mut nodes, mut edges, mut unresolved_calls) =
+                                let (mut nodes, mut edges, mut unresolved_calls, refs) =
                                     travsr_indexer::phase_b_native_rust(
                                         corpus,
                                         repo_root,
@@ -417,7 +418,7 @@ impl PluginIndexer {
                                     )
                                     .unwrap_or_else(|e| {
                                         tracing::warn!("rust native phase_b: {e}");
-                                        (vec![], vec![], vec![])
+                                        (vec![], vec![], vec![], vec![])
                                     });
                                 tracing::debug!(
                                     nodes = nodes.len(),
@@ -459,16 +460,31 @@ impl PluginIndexer {
                                 edges.sort_unstable_by_key(|e| (e.src, e.dst));
                                 edges
                                     .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                // Keep caller_line in the dedup key so two distinct
+                                // call sites of the same callee from one caller both
+                                // survive (#299 find_references needs every line).
                                 unresolved_calls.sort_unstable_by(|a, b| {
-                                    a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig))
+                                    a.src
+                                        .0
+                                        .cmp(&b.src.0)
+                                        .then(a.callee_sig.cmp(&b.callee_sig))
+                                        .then(a.caller_line.cmp(&b.caller_line))
                                 });
-                                unresolved_calls
-                                    .dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+                                unresolved_calls.dedup_by(|a, b| {
+                                    a.src == b.src
+                                        && a.callee_sig == b.callee_sig
+                                        && a.caller_line == b.caller_line
+                                });
                                 LangResult {
                                     lang,
                                     nodes,
                                     edges,
-                                    refs: Vec::new(),
+                                    // #299: native same-file call sites carry
+                                    // occurrence lines → edge_sites via the G2
+                                    // attributed-write path. rust-analyzer LSIF
+                                    // stays edge-only (synthetic moniker callee
+                                    // ids don't reconcile to tree-sitter nodes).
+                                    refs,
                                     unresolved_calls,
                                     ran: true,
                                     skipped_no_analyzer: false,
@@ -499,19 +515,23 @@ impl PluginIndexer {
                                     "Phase B: native typescript complete"
                                 );
                                 // LSIF enrichment via travsr-lsif-ts when tsconfig.json exists.
+                                // #299: ingest_lsif_g2 recovers per-occurrence lines as
+                                // ScipRefs (was: file-level edges). The callee id is the
+                                // emitter's travsr_vname (path+signature) → already a
+                                // tree-sitter node id, so it reconciles without an alias
+                                // pass, and write_scip_attributed_batch records edge_sites.
+                                let mut refs: Vec<travsr_core::ScipRef> = Vec::new();
                                 let tsconfig = repo_root.join("tsconfig.json");
                                 if tsconfig.exists() {
                                     match travsr_indexer::run_lsif_emitter(&tsconfig) {
                                         Ok(dump) => {
-                                            match travsr_indexer::ingest_lsif(&dump, corpus) {
-                                                Ok(lsif_out) => {
+                                            match travsr_indexer::ingest_lsif_g2(&dump, corpus) {
+                                                Ok(g2) => {
                                                     tracing::debug!(
-                                                        nodes = lsif_out.nodes.len(),
-                                                        edges = lsif_out.edges.len(),
-                                                        "Phase B: ts lsif enrichment merged"
+                                                        refs = g2.refs.len(),
+                                                        "Phase B: ts lsif occurrence refs merged"
                                                     );
-                                                    nodes.extend(lsif_out.nodes);
-                                                    edges.extend(lsif_out.edges);
+                                                    refs.extend(g2.refs);
                                                 }
                                                 Err(e) => tracing::warn!("ts lsif ingest: {e}"),
                                             }
@@ -530,7 +550,7 @@ impl PluginIndexer {
                                     lang,
                                     nodes,
                                     edges,
-                                    refs: Vec::new(),
+                                    refs,
                                     unresolved_calls: Vec::new(),
                                     ran: true,
                                     skipped_no_analyzer: false,
@@ -563,17 +583,18 @@ impl PluginIndexer {
                                 // LSIF enrichment via travsr-lsif-py (bundled, PATH-independent).
                                 // travsr-lsif-py resolves via current_exe walk-up so it works
                                 // even when the daemon's PATH has been stripped by the OS.
+                                // #299: ingest_lsif_g2 recovers occurrence lines as ScipRefs
+                                // (was: file-level edges) → edge_sites for find_references.
+                                let mut refs: Vec<travsr_core::ScipRef> = Vec::new();
                                 match travsr_indexer::run_lsif_py_emitter(repo_root) {
                                     Ok(Some(dump)) => {
-                                        match travsr_indexer::ingest_lsif(&dump, corpus) {
-                                            Ok(lsif_out) => {
+                                        match travsr_indexer::ingest_lsif_g2(&dump, corpus) {
+                                            Ok(g2) => {
                                                 tracing::debug!(
-                                                    nodes = lsif_out.nodes.len(),
-                                                    edges = lsif_out.edges.len(),
-                                                    "Phase B: python lsif enrichment merged"
+                                                    refs = g2.refs.len(),
+                                                    "Phase B: python lsif occurrence refs merged"
                                                 );
-                                                nodes.extend(lsif_out.nodes);
-                                                edges.extend(lsif_out.edges);
+                                                refs.extend(g2.refs);
                                             }
                                             Err(e) => tracing::warn!("python lsif ingest: {e}"),
                                         }
@@ -592,7 +613,7 @@ impl PluginIndexer {
                                     lang,
                                     nodes,
                                     edges,
-                                    refs: Vec::new(),
+                                    refs,
                                     unresolved_calls: Vec::new(),
                                     ran: true,
                                     skipped_no_analyzer: false,
@@ -783,9 +804,20 @@ impl PluginIndexer {
                 .then(a.callee_id.0.cmp(&b.callee_id.0))
         });
 
-        all_unresolved
-            .sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
-        all_unresolved.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+        // Dedup on (src, callee_sig, caller_line): the same textual call site
+        // captured twice collapses, but two distinct call sites of the same
+        // callee from the same caller are preserved so find_references (#299)
+        // reports every occurrence line, not just the first.
+        all_unresolved.sort_unstable_by(|a, b| {
+            a.src
+                .0
+                .cmp(&b.src.0)
+                .then(a.callee_sig.cmp(&b.callee_sig))
+                .then(a.caller_line.cmp(&b.caller_line))
+        });
+        all_unresolved.dedup_by(|a, b| {
+            a.src == b.src && a.callee_sig == b.callee_sig && a.caller_line == b.caller_line
+        });
 
         (all_nodes, all_edges, all_refs, all_unresolved, outcome)
     }

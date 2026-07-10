@@ -40,8 +40,24 @@ pub fn unify_all(
 
     for node in nodes {
         let scip_sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
-        let Some(parsed) = travsr_indexer::scip_unifier::scip_name_kind(scip_sym) else {
-            continue;
+        // Primary: SCIP descriptor grammar (go/java/ruby/c#/c/c++/… + rust/ts/py
+        // LSIF). Fallback: bespoke sidecars (kotlin/swift) whose signatures are
+        // Phase-A-style (`fn:Container.name`, `swift::Container.name`) and never
+        // parse as SCIP. The fallback is gated to those languages so native
+        // Phase A/rust nodes — whose signatures look identical — are never
+        // re-unified against themselves.
+        let parsed = match travsr_indexer::scip_unifier::scip_name_kind(scip_sym) {
+            Some(p) => p,
+            None if matches!(node.vname.language.as_str(), "kotlin" | "swift" | "dart") => {
+                match travsr_indexer::scip_unifier::native_name_kind(
+                    &node.vname.signature,
+                    &node.kind,
+                ) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            }
+            None => continue,
         };
         // No definition line means line-proximity matching is meaningless —
         // unwrapping to 0 would let any same-named node on lines 1..=5 of the

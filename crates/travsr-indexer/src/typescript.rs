@@ -293,10 +293,7 @@ fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<
                 .map(str::to_string);
             return name;
         }
-        match current.parent() {
-            Some(p) => current = p,
-            None => return None,
-        }
+        current = current.parent()?;
     }
 }
 

@@ -142,6 +142,61 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
     }
 }
 
+/// Parse a *bespoke-sidecar* node signature into a [`ScipName`] for G1
+/// unification.
+///
+/// Some Phase B providers (kotlin-language-server, the Swift index emitter) do
+/// not run a SCIP tool and therefore emit node signatures in the Phase A
+/// convention (`fn:Container.name`, `class:Type`) or a scheme-prefixed form
+/// (`swift::Container.name`) rather than a SCIP descriptor chain. These never
+/// parse via [`scip_name_kind`], so their definition node would survive as a
+/// duplicate of the tree-sitter node. This parser recovers `(container, name,
+/// kind)` from those signatures, using the caller-supplied `node_kind` (the
+/// Travsr node-kind string) as the authoritative kind class, so the same
+/// `candidate_signatures` / line-proximity matching used for SCIP languages
+/// can unify them.
+///
+/// Returns `None` when `node_kind` is not a function/type/term class or the
+/// signature has no usable leaf name.
+pub fn native_name_kind<'a>(signature: &'a str, node_kind: &str) -> Option<ScipName<'a>> {
+    let kind = match node_kind {
+        "function" | "method" | "constructor" => "function",
+        "class" | "struct" | "interface" | "trait" | "enum" | "type" | "protocol" | "object"
+        | "extension" => "class",
+        "field" | "variable" | "const" | "constant" | "property" | "var" | "static" => "variable",
+        _ => return None,
+    };
+
+    // Strip a leading scheme (`swift::`) or single-word kind prefix (`fn:`,
+    // `class:`, `var:`, ...). Only an all-alphabetic prefix is stripped so we
+    // never truncate a qualified name that legitimately contains a colon.
+    let body = if let Some(rest) = signature.strip_prefix("swift::") {
+        rest
+    } else if let Some((prefix, rest)) = signature.split_once(':') {
+        if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+            rest
+        } else {
+            signature
+        }
+    } else {
+        signature
+    };
+
+    // Split `Container.name` on the last `.`; a bare name has no container.
+    let (container, name) = match body.rsplit_once('.') {
+        Some((c, n)) if !c.is_empty() && !n.is_empty() => (Some(c), n),
+        _ => (None, body),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(ScipName {
+        container,
+        name,
+        kind,
+    })
+}
+
 /// Extract the raw SCIP symbol string from a node's VName signature.
 ///
 /// scip-reader packs signatures as `"scip:{rel_path}:{symbol}"`.
@@ -249,6 +304,50 @@ mod tests {
         // Non-SCIP signatures from builtin Phase B plugins must fall through.
         assert_eq!(scip_name_kind("fn:Type.method"), None);
         assert_eq!(scip_name_kind("class:Foo"), None);
+    }
+
+    #[test]
+    fn native_name_kind_kotlin_qualified_method() {
+        // kotlin sidecar node signature `fn:Container.method` → drop the `fn:`
+        // prefix, split the container, kind from the node kind.
+        assert_eq!(
+            native_name_kind("fn:Animal.describe", "function"),
+            Some(parsed(Some("Animal"), "describe", "function"))
+        );
+    }
+
+    #[test]
+    fn native_name_kind_swift_scheme_prefix() {
+        // swift `swift::Container.method` → strip the `swift::` scheme.
+        assert_eq!(
+            native_name_kind("swift::Animal.describe", "method"),
+            Some(parsed(Some("Animal"), "describe", "function"))
+        );
+        // swift top-level type `swift::Animal`, kind class.
+        assert_eq!(
+            native_name_kind("swift::Animal", "class"),
+            Some(parsed(None, "Animal", "class"))
+        );
+    }
+
+    #[test]
+    fn native_name_kind_dart_package_symbol() {
+        // dart `package:pkg/file.dart::Type.method` — the leaf name still resolves
+        // (the `fn:{name}` candidate matches the tree-sitter node).
+        let p = native_name_kind("package:pkg/animal.dart::Animal.describe", "function").unwrap();
+        assert_eq!(p.name, "describe");
+        assert_eq!(p.kind, "function");
+        assert!(candidate_signatures(&p).contains(&"fn:describe".to_string()));
+    }
+
+    #[test]
+    fn native_name_kind_bare_and_unknown_kind() {
+        assert_eq!(
+            native_name_kind("fn:describe", "function"),
+            Some(parsed(None, "describe", "function"))
+        );
+        // Unknown/non-def kinds fall through.
+        assert_eq!(native_name_kind("fn:describe", "file"), None);
     }
 
     #[test]

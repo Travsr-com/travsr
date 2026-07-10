@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use streaming_iterator::StreamingIterator as _;
-use travsr_core::{Edge, EdgeKind, Node, UnresolvedCall, VName};
+use travsr_core::{Edge, EdgeKind, Node, ScipRef, UnresolvedCall, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 // ── Tree-sitter query ─────────────────────────────────────────────────────────
@@ -57,12 +57,20 @@ const NOISE_NAMES: &[&str] = &[
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Native Rust Phase B output: `(nodes, edges, unresolved_calls, refs)`.
+/// `refs` carries same-file call occurrences (issue #299) for `edge_sites`.
+pub type NativePhaseB = (Vec<Node>, Vec<Edge>, Vec<UnresolvedCall>, Vec<ScipRef>);
+
 /// Extract native Phase B edges for a Rust corpus rooted at `root`.
 ///
-/// Returns `(nodes, edges, unresolved_calls)`:
+/// Returns `(nodes, edges, unresolved_calls, refs)`:
 ///   - crate nodes + `Depends` edges from Cargo.toml dependency graph
-///   - `RefCall` edges from tree-sitter call-site analysis
+///   - `Depends`/structural edges (same-file call edges are carried as `refs`)
 ///   - `UnresolvedCall`s for cross-crate calls that cannot be anchored locally
+///   - `ScipRef` occurrence records for same-file and struct/enum scoped calls
+///     (issue #299): carry the call-site line so the store's
+///     `write_scip_attributed_batch` records `edge_sites` rows, giving
+///     `find_references` exact `path:line` for Rust.
 ///
 /// Note: travsr-analysis does not have daemon plumbing, so `unresolved_calls`
 /// are returned to the caller but are NOT resolved against the store here.
@@ -75,10 +83,11 @@ pub fn extract_native_phase_b(
     corpus: &str,
     root: &Path,
     files: Option<&[(PathBuf, String)]>,
-) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<UnresolvedCall>)> {
+) -> anyhow::Result<NativePhaseB> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
+    let mut refs: Vec<ScipRef> = Vec::new();
 
     // Pass 1: crate dependency graph via Cargo.toml
     match extract_cargo_deps(corpus, root) {
@@ -95,7 +104,7 @@ pub fn extract_native_phase_b(
         Ok(q) => q,
         Err(e) => {
             tracing::warn!(err = %e, "rust call-site query compile failed — skipping Phase B calls");
-            return Ok((nodes, edges, unresolved));
+            return Ok((nodes, edges, unresolved, refs));
         }
     };
 
@@ -112,9 +121,9 @@ pub fn extract_native_phase_b(
 
     for (abs_path, vname_path) in file_pairs {
         match extract_file_call_edges(corpus, abs_path, vname_path, &language, &query) {
-            Ok((file_edges, file_unresolved)) => {
-                edges.extend(file_edges);
+            Ok((file_unresolved, file_refs)) => {
                 unresolved.extend(file_unresolved);
+                refs.extend(file_refs);
             }
             Err(e) => {
                 tracing::debug!(err = %e, path = %abs_path.display(), "rust call extraction skipped")
@@ -127,10 +136,32 @@ pub fn extract_native_phase_b(
     nodes.dedup_by_key(|n| n.id);
     edges.sort_unstable_by_key(|e| (e.src, e.dst));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
-    unresolved.sort_unstable_by(|a, b| a.src.0.cmp(&b.src.0).then(a.callee_sig.cmp(&b.callee_sig)));
-    unresolved.dedup_by(|a, b| a.src == b.src && a.callee_sig == b.callee_sig);
+    // Dedup on (src, callee_sig, caller_line) so two distinct call sites of the
+    // same callee from one caller both survive — find_references (#299) needs
+    // every occurrence line, not just the first.
+    unresolved.sort_unstable_by(|a, b| {
+        a.src
+            .0
+            .cmp(&b.src.0)
+            .then(a.callee_sig.cmp(&b.callee_sig))
+            .then(a.caller_line.cmp(&b.caller_line))
+    });
+    unresolved.dedup_by(|a, b| {
+        a.src == b.src && a.callee_sig == b.callee_sig && a.caller_line == b.caller_line
+    });
+    refs.sort_unstable_by(|a, b| {
+        a.caller_path
+            .cmp(&b.caller_path)
+            .then(a.caller_line.cmp(&b.caller_line))
+            .then(a.callee_id.0.cmp(&b.callee_id.0))
+    });
+    refs.dedup_by(|a, b| {
+        a.caller_path == b.caller_path
+            && a.caller_line == b.caller_line
+            && a.callee_id == b.callee_id
+    });
 
-    Ok((nodes, edges, unresolved))
+    Ok((nodes, edges, unresolved, refs))
 }
 
 // ── Cargo.toml dependency graph ───────────────────────────────────────────────
@@ -250,7 +281,7 @@ fn extract_file_call_edges(
     vname_path: &str,
     language: &tree_sitter::Language,
     query: &Query,
-) -> anyhow::Result<(Vec<Edge>, Vec<UnresolvedCall>)> {
+) -> anyhow::Result<(Vec<UnresolvedCall>, Vec<ScipRef>)> {
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
@@ -271,8 +302,13 @@ fn extract_file_call_edges(
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(query, tree.root_node(), source.as_slice());
 
-    let mut edges: Vec<Edge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
+    // #299 R1: the Rust extractor no longer guesses method-call callee ids
+    // (that produced orphaned edge_sites). Method / associated calls are now
+    // emitted as UnresolvedCall and resolved against the real node table by the
+    // daemon, so this file-local ScipRef vec stays empty and is kept only for
+    // the shared return shape.
+    let refs: Vec<ScipRef> = Vec::new();
 
     while let Some(m) = iter.next() {
         for &cap in m.captures {
@@ -286,6 +322,9 @@ fn extract_file_call_edges(
             if callee_name.len() < 2 {
                 continue;
             }
+
+            // 1-based call-site line (issue #299). tree-sitter rows are 0-based.
+            let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
 
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(cap.node, source.as_slice())
             else {
@@ -305,25 +344,22 @@ fn extract_file_call_edges(
             };
 
             match cap_name.as_str() {
-                "call.method" => {
-                    // Best-effort: resolve to same-file impl method — no cross-crate issue here
-                    let callee_id = match &caller_impl {
-                        Some(t) => VName::new(
-                            corpus,
-                            "",
-                            vname_path,
-                            "rust",
-                            format!("fn:{t}.{callee_name}"),
-                        )
-                        .id(),
-                        None => {
-                            VName::new(corpus, "", vname_path, "rust", format!("fn:{callee_name}"))
-                                .id()
-                        }
-                    };
-                    if caller_id != callee_id {
-                        edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
-                    }
+                // #299 R1: a method call `recv.method()` targets the receiver's
+                // type, which is not knowable syntactically (the enclosing impl
+                // is usually NOT the receiver's type — `zoo.add()` inside
+                // `Zoo::announce_all`, `a.describe()` where `a: Box<dyn Animal>`).
+                // Guessing `fn:{enclosing_impl}.{method}` produced a callee id
+                // that matched no node → orphaned edge_sites. Emit an
+                // UnresolvedCall keyed on the bare method name and let the daemon
+                // resolve it against the real global node table (exact `fn:method`
+                // or unique `fn:Type.method` leaf match), which knows every file.
+                "call.method" if !NOISE_NAMES.contains(&callee_name) => {
+                    unresolved.push(UnresolvedCall {
+                        src: caller_id,
+                        callee_sig: format!("fn:{callee_name}"),
+                        hint_crate: None,
+                        caller_line: occ_line,
+                    });
                 }
                 "call.scoped" => {
                     // Extract qualifying segment from the scoped path parent node
@@ -337,17 +373,18 @@ fn extract_file_call_edges(
 
                     match qual_raw {
                         Some(ref qual) if qual.starts_with(|c: char| c.is_uppercase()) => {
-                            // Uppercase qualifier → same-file struct/enum call; emit phantom edge
-                            let callee_id = VName::new(
-                                corpus,
-                                "",
-                                vname_path,
-                                "rust",
-                                format!("fn:{qual}.{callee_name}"),
-                            )
-                            .id();
-                            if caller_id != callee_id {
-                                edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
+                            // Uppercase qualifier → associated call `Type::method()`
+                            // (e.g. `Zoo::new()`, `Dog::new()`). The type may be defined
+                            // in another file, so a path-bound guessed id orphaned.
+                            // Emit an UnresolvedCall with the precise qualified sig and
+                            // let the daemon match `fn:{Type}.{method}` across all files.
+                            if !NOISE_NAMES.contains(&callee_name) {
+                                unresolved.push(UnresolvedCall {
+                                    src: caller_id,
+                                    callee_sig: format!("fn:{qual}.{callee_name}"),
+                                    hint_crate: None,
+                                    caller_line: occ_line,
+                                });
                             }
                         }
                         Some(ref qual) => {
@@ -357,6 +394,7 @@ fn extract_file_call_edges(
                                     src: caller_id,
                                     callee_sig: format!("fn:{callee_name}"),
                                     hint_crate: Some(qual.clone()),
+                                    caller_line: occ_line,
                                 });
                             }
                         }
@@ -367,6 +405,7 @@ fn extract_file_call_edges(
                                     src: caller_id,
                                     callee_sig: format!("fn:{callee_name}"),
                                     hint_crate: None,
+                                    caller_line: occ_line,
                                 });
                             }
                         }
@@ -380,6 +419,7 @@ fn extract_file_call_edges(
                         src: caller_id,
                         callee_sig: format!("fn:{callee_name}"),
                         hint_crate: None,
+                        caller_line: occ_line,
                     });
                 }
                 _ => {}
@@ -387,7 +427,98 @@ fn extract_file_call_edges(
         }
     }
 
-    Ok((edges, unresolved))
+    // #299 R1: recover calls that live inside macro invocations
+    // (`println!("{}", a.describe())`). tree-sitter keeps a macro's arguments as
+    // an unparsed `token_tree`, so the call-expression query above never sees
+    // them — yet these are real reference sites. Scan token_trees for the call
+    // shape and emit UnresolvedCalls (daemon unique-match resolution guards the
+    // false positives an untyped token scan can produce).
+    extract_macro_calls(
+        tree.root_node(),
+        source.as_slice(),
+        corpus,
+        vname_path,
+        &mut unresolved,
+    );
+
+    Ok((unresolved, refs))
+}
+
+/// Walk the tree and, inside every macro `token_tree`, recover call sites of the
+/// form `name ( … )` — a `name` identifier immediately followed by a nested
+/// `token_tree`. Classify by the token preceding `name`: `.` → method call,
+/// `::` → associated call (with the qualifier), otherwise a bare function call.
+/// Each becomes an [`UnresolvedCall`] resolved later against the real node table.
+fn extract_macro_calls(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    corpus: &str,
+    vname_path: &str,
+    out: &mut Vec<UnresolvedCall>,
+) {
+    if node.kind() == "token_tree" {
+        let mut c = node.walk();
+        let children: Vec<tree_sitter::Node<'_>> = node.children(&mut c).collect();
+        for i in 1..children.len() {
+            // A nested token_tree is a call's argument list.
+            if children[i].kind() != "token_tree" {
+                continue;
+            }
+            let name_node = children[i - 1];
+            if !matches!(name_node.kind(), "identifier" | "field_identifier") {
+                continue;
+            }
+            let Ok(callee_name) = name_node.utf8_text(source) else {
+                continue;
+            };
+            if callee_name.len() < 2 || NOISE_NAMES.contains(&callee_name) {
+                continue;
+            }
+            let occ_line = name_node.start_position().row.saturating_add(1) as u32;
+            let Some((caller_fn, caller_impl)) = find_enclosing_fn(name_node, source) else {
+                continue;
+            };
+            let caller_id = match &caller_impl {
+                Some(t) => VName::new(
+                    corpus,
+                    "",
+                    vname_path,
+                    "rust",
+                    format!("fn:{t}.{caller_fn}"),
+                )
+                .id(),
+                None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
+            };
+            // Classify by the token before the name.
+            let prev = (i >= 2).then(|| children[i - 2].kind());
+            let callee_sig = match prev {
+                Some("::") => {
+                    // Associated call `Type::method` — recover the qualifier.
+                    let qual = (i >= 3)
+                        .then(|| children[i - 3])
+                        .filter(|n| n.kind() == "identifier")
+                        .and_then(|n| n.utf8_text(source).ok());
+                    match qual {
+                        Some(q) => format!("fn:{q}.{callee_name}"),
+                        None => format!("fn:{callee_name}"),
+                    }
+                }
+                // `.` (method) or anything else (bare call) → resolve by name.
+                _ => format!("fn:{callee_name}"),
+            };
+            out.push(UnresolvedCall {
+                src: caller_id,
+                callee_sig,
+                hint_crate: None,
+                caller_line: occ_line,
+            });
+        }
+    }
+
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        extract_macro_calls(child, source, corpus, vname_path, out);
+    }
 }
 
 /// Walk up the tree-sitter AST to find the nearest enclosing `function_item`.
@@ -476,5 +607,82 @@ fn walk(root: &Path, dir: &Path, exts: &[&str], out: &mut Vec<(PathBuf, String)>
                 out.push((path, vname_path));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn parse_rust(source: &[u8]) -> tree_sitter::Tree {
+        let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    #[test]
+    fn extract_macro_calls_recovers_method_assoc_and_bare_calls() {
+        // #299 R1: tree-sitter does not expose call expressions inside a macro
+        // token_tree (`println!(z.describe())`), so the call sites are recovered
+        // by scanning the raw tokens. Verify the three classifications and that
+        // each site is attributed to its enclosing function with the right line.
+        let source = br#"
+fn run(z: &Zoo) {
+    println!("{}", z.describe());
+    println!("{}", Animal::speak());
+    println!("{}", greet());
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out: Vec<UnresolvedCall> = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "main.rs", &mut out);
+
+        let by_sig: HashMap<&str, &UnresolvedCall> =
+            out.iter().map(|u| (u.callee_sig.as_str(), u)).collect();
+
+        // Method call `z.describe()` (prev token `.`) → resolve by leaf name.
+        let describe = by_sig
+            .get("fn:describe")
+            .expect("method call recovered from macro");
+        assert_eq!(describe.caller_line, 3);
+        // Associated call `Animal::speak()` (prev `::`) keeps the qualifier.
+        let speak = by_sig
+            .get("fn:Animal.speak")
+            .expect("associated call recovered from macro");
+        assert_eq!(speak.caller_line, 4);
+        // Bare call `greet()`.
+        let greet = by_sig
+            .get("fn:greet")
+            .expect("bare call recovered from macro");
+        assert_eq!(greet.caller_line, 5);
+
+        // No guessed callee ids: every recovered call is attributed to `run`.
+        let run_id = VName::new("c", "", "main.rs", "rust", "fn:run").id();
+        for u in &out {
+            assert_eq!(u.src, run_id, "call {} not attributed to run", u.callee_sig);
+        }
+        // `println` itself (the macro name, outside the token_tree) is not a call.
+        assert!(!by_sig.contains_key("fn:println"));
+    }
+
+    #[test]
+    fn extract_macro_calls_skips_noise_and_short_names() {
+        // NOISE_NAMES and single-char identifiers inside a macro must not
+        // produce edges (they carry no cross-crate signal).
+        let source = br#"
+fn run() {
+    vec![x.clone(), y.new()];
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out: Vec<UnresolvedCall> = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "main.rs", &mut out);
+        assert!(
+            out.is_empty(),
+            "expected no calls, got {:?}",
+            out.iter().map(|u| &u.callee_sig).collect::<Vec<_>>()
+        );
     }
 }

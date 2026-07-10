@@ -116,9 +116,17 @@ fn escape_tags(s: &str) -> String {
 /// the footer being truncated or double-sanitized. Call [`wrap_envelope`] after
 /// appending the footer.
 pub(crate) fn sanitize_mcp_body_with_limit(raw: &str, limit: usize) -> String {
-    let truncated = truncate_to_byte_limit(raw, limit);
-    let stripped = strip_control_chars(truncated);
-    escape_tags(&stripped)
+    // Pre-truncate to bound the work of the strip/escape passes on huge inputs.
+    let pre = truncate_to_byte_limit(raw, limit);
+    let stripped = strip_control_chars(pre);
+    // Escape BEFORE the final truncation: `escape_tags` expands each `<`/`>` to
+    // 4 bytes, so a worst-case payload of all angle brackets grows ~4x. Escaping
+    // first and truncating after guarantees the returned body is ≤ `limit` bytes
+    // (the asserted invariant), instead of up to ~4x over it. A trailing entity
+    // (`&lt;`) cut mid-sequence degrades to inert literal text, never a control
+    // char or an unbalanced envelope tag.
+    let escaped = escape_tags(&stripped);
+    truncate_to_byte_limit(&escaped, limit).to_string()
 }
 
 /// Wrap content in the structural `<travsr-data>` envelope.
@@ -237,6 +245,23 @@ mod tests {
             "inner content must be ≤ {MAX_OUTPUT_BYTES} bytes, got {}",
             inner.len()
         );
+    }
+
+    #[test]
+    fn body_with_limit_honors_byte_ceiling_after_escaping() {
+        // #299 F13: escaping expands each `<`/`>` to 4 bytes. A payload of all
+        // angle brackets must still return ≤ limit bytes (truncation happens
+        // AFTER escaping), never ~4x over it.
+        let limit = 100;
+        let raw = "<".repeat(1_000); // 1000 bytes → 4000 bytes escaped
+        let out = sanitize_mcp_body_with_limit(&raw, limit);
+        assert!(
+            out.len() <= limit,
+            "escaped body must be ≤ {limit} bytes, got {}",
+            out.len()
+        );
+        // And what survives is well-formed escaped content (no raw '<').
+        assert!(!out.contains('<'));
     }
 
     #[test]

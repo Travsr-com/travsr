@@ -336,10 +336,7 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
             "mod_item" => return None,
             _ => {}
         }
-        match current.parent() {
-            Some(p) => current = p,
-            None => return None,
-        }
+        current = current.parent()?;
     }
 }
 

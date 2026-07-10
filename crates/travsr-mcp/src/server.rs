@@ -133,6 +133,16 @@ fn handle_tool_call(
             let symbol = args["symbol"].as_str().unwrap_or("");
             tools::get_callers(store, symbol)
         }
+        "find_references" => {
+            let symbol = args["symbol"].as_str().unwrap_or("");
+            let path = args["path"].as_str().filter(|s| !s.is_empty());
+            tools::find_references(store, symbol, path)
+        }
+        "find_pattern" => {
+            let pattern = args["pattern"].as_str().unwrap_or("");
+            let scope = args["scope"].as_str().filter(|s| !s.is_empty());
+            tools::find_pattern(store, pattern, scope)
+        }
         "get_blast_radius" => {
             let file = args["file"].as_str().unwrap_or("");
             let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
@@ -320,6 +330,32 @@ fn tools_list() -> serde_json::Value {
                         "symbol": { "type": "string", "description": "Symbol name to find callers of (partial match supported)" }
                     },
                     "required": ["symbol"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "find_references",
+                "description": "Enumerate every use site (incl. inline expressions, assignments, and type references) of a symbol as path:line. Works across every indexed language via the occurrence store; falls back to caller definitions when a language has no occurrence lines yet.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol to enumerate references of (bare name or full signature)" },
+                        "path": { "type": "string", "description": "Optional repo-relative file-path hint to disambiguate overloaded names" }
+                    },
+                    "required": ["symbol"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "find_pattern",
+                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Optionally scope to a path prefix or to files-importing(<symbol>) so results are confined to the graph-relevant file set.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Text or regex to search for" },
+                        "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" }
+                    },
+                    "required": ["pattern"],
                     "additionalProperties": false
                 }
             },
@@ -682,6 +718,18 @@ fn handle_tool_call_global(
         "get_callers" => {
             tools::get_callers_global(repos, args["symbol"].as_str().unwrap_or(""), repo_arg)
         }
+        "find_references" => tools::find_references_global(
+            repos,
+            args["symbol"].as_str().unwrap_or(""),
+            args["path"].as_str().filter(|s| !s.is_empty()),
+            repo_arg,
+        ),
+        "find_pattern" => tools::find_pattern_global(
+            repos,
+            args["pattern"].as_str().unwrap_or(""),
+            args["scope"].as_str().filter(|s| !s.is_empty()),
+            repo_arg,
+        ),
         "get_blast_radius" => {
             let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
                 "semantic" => tools::AnalysisMode::Semantic,
@@ -851,6 +899,34 @@ fn tools_list_global() -> serde_json::Value {
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["symbol"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "find_references",
+                "description": "Enumerate every use site (incl. inline expressions, assignments, and type references) of a symbol as path:line. Supply `repo` to scope; omit only if the symbol may exist in multiple repos.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol to enumerate references of (bare name or full signature)" },
+                        "path": { "type": "string", "description": "Optional repo-relative file-path hint to disambiguate overloaded names" },
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
+                    },
+                    "required": ["symbol"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "find_pattern",
+                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Optionally scope to a path prefix or files-importing(<symbol>). Supply `repo` to scope; omit only to search across all repos.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Text or regex to search for" },
+                        "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" },
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
+                    },
+                    "required": ["pattern"],
                     "additionalProperties": false
                 }
             },
@@ -1046,6 +1122,8 @@ mod tests {
     const ALL_TOOLS: &[&str] = &[
         "get_dependencies",
         "get_callers",
+        "find_references",
+        "find_pattern",
         "get_blast_radius",
         "get_lang_status",
         "search_symbol",
@@ -1189,6 +1267,8 @@ mod tests {
         let required_map = [
             ("get_dependencies", "file"),
             ("get_callers", "symbol"),
+            ("find_references", "symbol"),
+            ("find_pattern", "pattern"),
             ("get_blast_radius", "file"),
             ("search_symbol", "name"),
             ("get_execution_path", "source"),

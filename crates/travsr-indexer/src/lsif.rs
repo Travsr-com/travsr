@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use anyhow::Context as _;
-use travsr_core::{Edge, EdgeKind, VName};
+use travsr_core::{Edge, EdgeKind, Language, VName};
 
 use crate::ParseOutput;
 
@@ -61,6 +61,10 @@ struct LsifGraph {
     ref_result_to_rs: HashMap<u64, u64>,
     /// docId → repo-relative file path (from `document` vertices, relativised via project_root).
     doc_paths: HashMap<u64, String>,
+    /// range-vertex id → 1-based `start.line` (DEBT travsr-126, issue #299).
+    /// Populated so `ingest_g2` can recover the occurrence line of each
+    /// `item/references` `inVs` entry instead of dropping it.
+    range_lines: HashMap<u64, u32>,
 }
 
 fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
@@ -102,15 +106,37 @@ fn parse_graph(dump: &str, corpus: &str) -> anyhow::Result<LsifGraph> {
             }
 
             ("vertex", "resultSet") => {
-                // Non-standard field emitted by travsr-lsif-ts.
+                // Non-standard field emitted by the travsr LSIF emitters
+                // (travsr-lsif-ts, travsr-lsif-py).
                 if let Some(vname_obj) = obj.get("travsr_vname") {
                     let path = vname_obj["path"].as_str().unwrap_or("").to_string();
                     let sig = vname_obj["signature"].as_str().unwrap_or("").to_string();
                     if !path.is_empty() && !sig.is_empty() {
+                        // #299 P1: derive the node language from the file extension
+                        // (not a hardcoded "typescript") so the resultSet VName id
+                        // matches the Phase A node — otherwise Python (.py) refs
+                        // computed a `typescript`-tagged id that matched no node and
+                        // orphaned every occurrence. Mirrors Phase A's own
+                        // extension→language mapping. Falls back to typescript for
+                        // the graph-LSIF's original TS/JS producer.
+                        let lang = std::path::Path::new(&path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .and_then(Language::from_extension)
+                            .map(Language::as_str)
+                            .unwrap_or("typescript");
                         graph
                             .result_sets
-                            .insert(id, VName::new(corpus, "", path, "typescript", sig));
+                            .insert(id, VName::new(corpus, "", path, lang, sig));
                     }
+                }
+            }
+
+            ("vertex", "range") => {
+                // #299: record the 1-based start line so item/references inVs can
+                // be resolved to occurrence lines. 0-based → +1, saturating.
+                if let Some(l) = obj["start"]["line"].as_u64() {
+                    graph.range_lines.insert(id, (l as u32).saturating_add(1));
                 }
             }
 
@@ -198,6 +224,101 @@ pub fn ingest_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
     Ok(edges)
 }
 
+/// Output of the occurrence-aware graph-LSIF ingest ([`ingest_g2`], issue #299).
+///
+/// Carries [`ScipRef`](travsr_core::ScipRef) occurrence records instead of
+/// pre-built file-level edges, so the store's `write_scip_attributed_batch`
+/// performs the same enclosing-function attribution + `edge_sites` write used
+/// for SCIP-family languages. This is what makes `find_references` work for
+/// TypeScript / JavaScript / Python.
+#[derive(Debug, Default)]
+pub struct LsifG2Output {
+    /// Reference occurrences (`caller_path`, 1-based `caller_line`, `callee_id`)
+    /// for G2 call-site attribution. `callee_id` is the callee's tree-sitter
+    /// node id (built from the emitter's `travsr_vname` path + signature), so it
+    /// reconciles directly with Phase A nodes — no alias pass required.
+    pub refs: Vec<travsr_core::ScipRef>,
+}
+
+/// Occurrence-aware graph-LSIF ingestion (issue #299, resolves DEBT travsr-126).
+///
+/// Unlike [`ingest_raw`], which emits one file-level `RefCall` edge per
+/// `item/references` edge and discards the `inVs` range ids, this walks each
+/// `inVs` range to recover its `start.line` and emits one [`ScipRef`] per
+/// occurrence. The caller routes these through `write_scip_attributed_batch`
+/// which attributes each to its enclosing function and records an `edge_sites`
+/// row — giving `find_references` exact `path:line` sites for the graph-LSIF
+/// languages (TypeScript / JavaScript / Python).
+///
+/// O(N) over dump lines plus O(occurrences) for the emit pass.
+pub fn ingest_g2(dump: &str, corpus: &str) -> anyhow::Result<LsifG2Output> {
+    let graph = parse_graph(dump, corpus).context("parsing LSIF graph metadata")?;
+
+    let mut out = LsifG2Output::default();
+
+    for line in dump.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if obj["type"].as_str() != Some("edge") || obj["label"].as_str() != Some("item") {
+            continue;
+        }
+        if obj["property"].as_str() != Some("references") {
+            continue;
+        }
+
+        let ref_result_id = match obj["outV"].as_u64() {
+            Some(v) => v,
+            None => continue,
+        };
+        let caller_doc_id = match obj["document"].as_u64() {
+            Some(v) => v,
+            None => continue,
+        };
+        let caller_path = match graph.doc_paths.get(&caller_doc_id) {
+            Some(p) => p,
+            None => continue,
+        };
+        let rs_id = match graph.ref_result_to_rs.get(&ref_result_id) {
+            Some(id) => id,
+            None => continue,
+        };
+        let callee_vname = match graph.result_sets.get(rs_id) {
+            Some(v) => v,
+            None => continue,
+        };
+        let callee_id = callee_vname.id();
+
+        // One occurrence per range id in `inVs`. Range ids whose vertex carried
+        // no `start.line` are skipped (never fabricate a line). The store's
+        // `edge_sites` PK dedups identical (caller-fn, callee, line) rows.
+        let Some(in_vs) = obj["inVs"].as_array() else {
+            continue;
+        };
+        for range in in_vs {
+            let Some(range_id) = range.as_u64() else {
+                continue;
+            };
+            let Some(&caller_line) = graph.range_lines.get(&range_id) else {
+                continue;
+            };
+            out.refs.push(travsr_core::ScipRef {
+                caller_path: caller_path.clone(),
+                caller_line,
+                callee_id,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Make `abs_path` relative to `base`. Falls back to returning `abs_path`
@@ -258,6 +379,55 @@ mod tests {
         let callee_id = VName::new("", "", "svc.ts", "typescript", "fn:charge").id();
         assert_eq!(edges[0].src, caller_id);
         assert_eq!(edges[0].dst, callee_id);
+    }
+
+    #[test]
+    fn ingest_g2_recovers_occurrence_line_from_range() {
+        // #299: the `range` vertex (start.line 0) must surface as caller_line 1,
+        // and the ScipRef callee_id must match the callee's tree-sitter node id.
+        let dump = minimal_dump("svc.ts", "fn:charge", "caller.ts");
+        let out = ingest_g2(&dump, "").unwrap();
+        assert_eq!(out.refs.len(), 1);
+        assert_eq!(out.refs[0].caller_path, "caller.ts");
+        assert_eq!(out.refs[0].caller_line, 1); // 0-based range line 0 → 1-based 1
+        let callee_id = VName::new("", "", "svc.ts", "typescript", "fn:charge").id();
+        assert_eq!(out.refs[0].callee_id, callee_id);
+    }
+
+    #[test]
+    fn ingest_g2_emits_one_ref_per_inv_range() {
+        // A single item edge with multiple inVs ranges must yield one ScipRef per
+        // range at its own line — the DEBT-126 fix (was: one document-level edge).
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo","positionEncoding":"utf-16","toolInfo":{"name":"t","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///repo/a.ts"}
+{"id":3,"type":"vertex","label":"resultSet","travsr_vname":{"path":"b.ts","signature":"fn:foo"}}
+{"id":4,"type":"vertex","label":"referenceResult"}
+{"id":5,"type":"edge","label":"textDocument/references","outV":3,"inV":4}
+{"id":9,"type":"vertex","label":"range","start":{"line":4,"character":2},"end":{"line":4,"character":5}}
+{"id":10,"type":"vertex","label":"range","start":{"line":11,"character":0},"end":{"line":11,"character":3}}
+{"id":11,"type":"edge","label":"item","outV":4,"inVs":[9,10],"document":2,"property":"references"}
+"#;
+        let out = ingest_g2(dump, "").unwrap();
+        let mut lines: Vec<u32> = out.refs.iter().map(|r| r.caller_line).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![5, 12]); // 4→5, 11→12
+        assert!(out.refs.iter().all(|r| r.caller_path == "a.ts"));
+    }
+
+    #[test]
+    fn ingest_g2_skips_ranges_without_line() {
+        // An inVs entry pointing at a missing range vertex is skipped, not faked.
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo","positionEncoding":"utf-16","toolInfo":{"name":"t","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///repo/a.ts"}
+{"id":3,"type":"vertex","label":"resultSet","travsr_vname":{"path":"b.ts","signature":"fn:foo"}}
+{"id":4,"type":"vertex","label":"referenceResult"}
+{"id":5,"type":"edge","label":"textDocument/references","outV":3,"inV":4}
+{"id":11,"type":"edge","label":"item","outV":4,"inVs":[99],"document":2,"property":"references"}
+"#;
+        let out = ingest_g2(dump, "").unwrap();
+        assert!(out.refs.is_empty());
     }
 
     #[test]
