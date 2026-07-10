@@ -36,22 +36,50 @@ fn detect_dart_sdk() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    let is_sdk_root = |sdk: &Path| sdk.join("lib/_internal/allowed_experiments.json").exists();
+
     let dart_name = format!("dart{}", std::env::consts::EXE_SUFFIX);
     let path_var = std::env::var_os("PATH")?;
+    let mut first_dart: Option<PathBuf> = None;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(&dart_name);
         if !candidate.exists() {
             continue;
         }
+        if first_dart.is_none() {
+            first_dart = Some(candidate.clone());
+        }
         // `<sdk>/bin/dart` → `<sdk>`. Canonicalize to follow symlinks
         // (Homebrew: /opt/homebrew/bin/dart → …/dart-sdk/<ver>/libexec/bin/dart).
         let real = std::fs::canonicalize(&candidate).unwrap_or(candidate);
         if let Some(sdk) = real.parent().and_then(|p| p.parent()) {
-            if sdk.join("lib/_internal/allowed_experiments.json").exists() {
+            if is_sdk_root(sdk) {
                 return Some(sdk.to_path_buf());
             }
         }
     }
+    // Version-manager shims (asdf / mise / volta) are shell scripts, not symlinks
+    // into `<sdk>/bin/dart`, so the `parent().parent()` walk above lands on the
+    // shim directory, not the SDK. Ask the `dart` tool itself where its SDK is.
+    // (Without this the emitter falls back to a broken auto-detect → empty Dart
+    // Phase B, reintroducing the #299 E1 failure.)
+    if let Some(dart) = first_dart {
+        if let Ok(out) = std::process::Command::new(&dart)
+            .arg("--print-sdk-path")
+            .output()
+        {
+            if out.status.success() {
+                let sdk = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+                if !sdk.as_os_str().is_empty() && is_sdk_root(&sdk) {
+                    return Some(sdk);
+                }
+            }
+        }
+    }
+    tracing::warn!(
+        "Dart SDK not found on PATH; Dart Phase B call-site edges will be unavailable. \
+         Set DART_SDK to the SDK root (the directory containing lib/_internal) to enable it."
+    );
     None
 }
 

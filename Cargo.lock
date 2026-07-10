@@ -3312,6 +3312,7 @@ dependencies = [
  "dirs",
  "getrandom 0.2.17",
  "hmac",
+ "ignore",
  "reqwest",
  "serde",
  "serde_json",

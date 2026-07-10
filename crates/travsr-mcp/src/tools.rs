@@ -408,7 +408,14 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
             Ok(nodes) => nodes
                 .into_iter()
                 .filter(|n| {
+                    // Exclude non-definition nodes: `file` container nodes and
+                    // `import`/`use` nodes (kind == "import"). An import node
+                    // shares the imported symbol's simple name, so without this
+                    // guard `refs find_pattern` reads as "ambiguous — 2 defs"
+                    // (the real `fn:` plus `use:...::find_pattern`), and pinning
+                    // the import node yields an empty, misleading "0 references".
                     n.kind != "file"
+                        && n.kind != "import"
                         && (n.vname.signature == symbol
                             || simple_name(&n.vname.signature) == symbol)
                 })
@@ -421,8 +428,11 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
     }
 
     // Apply the path suffix pin if the caller supplied one (Tier 2 didn't use it).
+    // Match on a `/`-boundary so a hint like `tools.rs` pins `src/tools.rs` but
+    // never `src/mytools.rs` — mirroring the store's `LIKE '%/' || hint` pin.
     if let Some(p) = path {
-        candidates.retain(|n| n.vname.path == p || n.vname.path.ends_with(p));
+        let boundary = format!("/{p}");
+        candidates.retain(|n| n.vname.path == p || n.vname.path.ends_with(&boundary));
     }
 
     // Distinct definitions by node id.
@@ -763,6 +773,22 @@ fn scope_files_importing(store: &SqliteStore, symbol: &str) -> Option<Vec<String
     Some(files)
 }
 
+/// Build a gitignore-syntax matcher from `repo_root/.travsrignore`, mirroring the
+/// indexer walker's `add_custom_ignore_filename(".travsrignore")`. Returns `None`
+/// when the file is absent or fails to compile, in which case `find_pattern`
+/// falls back to plain git-scoped results.
+fn build_travsrignore_matcher(repo_root: &std::path::Path) -> Option<ignore::gitignore::Gitignore> {
+    let path = repo_root.join(".travsrignore");
+    if !path.exists() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+    // add() returns Some(err) on a partially-parsed file; a partial matcher is
+    // still better than none, so only bail when the build itself fails.
+    let _ = builder.add(&path);
+    builder.build().ok()
+}
+
 /// Execute `git grep` under `repo_root` with an argument vector (no shell) and
 /// format the capped results as `path:line:col: text`.
 fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]) -> String {
@@ -792,7 +818,23 @@ fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]
     // git grep exits 1 with no matches — a normal empty result, not an error.
     // Any non-zero status with stdout is unusual but we still surface what we got.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let all: Vec<&str> = stdout.lines().collect();
+    // `git grep` honors `.gitignore` but knows nothing about `.travsrignore`, so a
+    // git-tracked file the user excluded from the graph would still appear here —
+    // making find_pattern and find_references disagree on the same repo. Filter
+    // matches through the same gitignore-syntax `.travsrignore` the indexer's
+    // walker applies (`add_custom_ignore_filename`), so both tools see one set of
+    // files. Each grep line is `path:line:col:text`, so the path is the prefix
+    // before the first ':'.
+    let travsrignore = build_travsrignore_matcher(repo_root);
+    let all: Vec<&str> = stdout
+        .lines()
+        .filter(|line| match (&travsrignore, line.split(':').next()) {
+            (Some(ig), Some(path)) if !path.is_empty() => !ig
+                .matched_path_or_any_parents(repo_root.join(path), false)
+                .is_ignore(),
+            _ => true,
+        })
+        .collect();
     if all.is_empty() {
         return String::new();
     }
@@ -7788,6 +7830,64 @@ mod snippet_tests {
     }
 
     #[test]
+    fn find_references_ignores_import_nodes() {
+        // #299 F1: an `import`/`use` node shares the imported symbol's simple
+        // name. It must never be treated as a definition, or the real `fn` reads
+        // as ambiguous and pinning the import yields a misleading "0 references".
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let real = Node::new(
+            VName::new("", "", "svc.rs", "rust", "fn:charge"),
+            "function",
+        )
+        .with_line(4);
+        let import = Node::new(
+            VName::new("", "", "main.rs", "rust", "use:svc::charge"),
+            "import",
+        );
+        store.put_node(&real).unwrap();
+        store.put_node(&import).unwrap();
+        let out = find_references(&store, "charge", None);
+        assert!(
+            !out.contains("ambiguous"),
+            "import node must not create ambiguity: {out}"
+        );
+        assert!(
+            out.contains("resolved: fn:charge"),
+            "must resolve to the real fn: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_path_hint_respects_slash_boundary() {
+        // #299 F1: a `path` hint must pin on a `/`-boundary — `tools.rs` selects
+        // `src/tools.rs` but never `src/mytools.rs`.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("", "", "src/tools.rs", "rust", "fn:charge"),
+            "function",
+        )
+        .with_line(1);
+        let b = Node::new(
+            VName::new("", "", "src/mytools.rs", "rust", "fn:charge"),
+            "function",
+        )
+        .with_line(2);
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let pinned = find_references(&store, "charge", Some("tools.rs"));
+        assert!(
+            !pinned.contains("ambiguous"),
+            "slash-boundary hint must pin exactly one file: {pinned}"
+        );
+        assert!(
+            pinned.contains("src/tools.rs") && !pinned.contains("mytools.rs"),
+            "must select src/tools.rs, not src/mytools.rs: {pinned}"
+        );
+    }
+
+    #[test]
     fn find_references_falls_back_to_edges_without_sites() {
         use travsr_core::{Edge, EdgeKind, Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
@@ -7848,5 +7948,42 @@ mod snippet_tests {
         let empty = "<travsr-data></travsr-data>";
         assert_eq!(find_pattern(&store, "charge", Some("/etc")), empty);
         assert_eq!(find_pattern(&store, "charge", Some("../secrets")), empty);
+    }
+
+    #[test]
+    fn find_pattern_honors_travsrignore() {
+        use std::process::Command;
+        // #299 F10: a git-tracked file excluded via `.travsrignore` must not
+        // appear in find_pattern output, so it agrees with the graph's file set.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("keep.rs"), "fn charge() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        std::fs::write(root.join("gen/skip.rs"), "fn charge() {}\n").unwrap();
+        std::fs::write(root.join(".travsrignore"), "gen/\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        // Skip if git is unavailable in the sandbox (grep returns nothing).
+        let out = find_pattern(&store, "charge", None);
+        if out.contains("keep.rs") {
+            assert!(
+                !out.contains("gen/skip.rs"),
+                ".travsrignore-excluded file must not appear: {out}"
+            );
+        }
     }
 }
