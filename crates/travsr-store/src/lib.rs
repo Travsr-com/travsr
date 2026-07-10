@@ -2909,78 +2909,38 @@ LIMIT 20",
         Ok(out)
     }
 
-    /// Record the set of languages for which Phase B (semantic occurrence
-    /// analysis) completed in this repo. Unions with the previously recorded
-    /// set so a background refresh that runs only a subset of languages never
-    /// narrows the marker.
-    ///
-    /// #299 M1: this is the authoritative signal for
-    /// [`Self::language_has_edge_sites`] — "Phase B ran for this language" — and
-    /// is robust to the two failure modes of the edge_sites heuristic below:
-    /// a language whose definition nodes carry an empty `language` string, and a
-    /// language that ran Phase B but genuinely produced zero occurrences.
-    pub fn record_phase_b_languages(&mut self, langs: &[String]) -> anyhow::Result<()> {
-        if langs.is_empty() {
-            return Ok(());
-        }
-        let mut set: std::collections::BTreeSet<String> =
-            self.phase_b_completed_languages()?.into_iter().collect();
-        let mut changed = false;
-        for l in langs {
-            if !l.is_empty() && set.insert(l.clone()) {
-                changed = true;
-            }
-        }
-        if !changed {
-            return Ok(());
-        }
-        let joined = set.into_iter().collect::<Vec<_>>().join(",");
-        self.set_meta("phase_b_ran_languages", &joined)
-            .context("record_phase_b_languages")?;
-        Ok(())
-    }
-
-    /// The set of languages for which Phase B completed (see
-    /// [`Self::record_phase_b_languages`]). Empty for legacy DBs indexed before
-    /// this marker existed.
-    pub fn phase_b_completed_languages(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self
-            .get_meta("phase_b_ran_languages")
-            .context("phase_b_completed_languages")?
-            .unwrap_or_default()
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect())
-    }
-
-    /// Whether the occurrence index was built for `language` in this repo.
+    /// Whether the occurrence index was actually built for `language` in this
+    /// repo, i.e. at least one `ref/call` occurrence row has an endpoint in a
+    /// file of that language.
     ///
     /// #299 M1: lets `find_references` distinguish "the occurrence index was
-    /// never built for this language" (Phase B absent, failed, or a language
-    /// whose provider does not emit occurrence lines) from "this symbol
+    /// never built for this language" (Phase B absent, its analyzer tool not
+    /// installed, or the provider emits no occurrence lines) from "this symbol
     /// genuinely has no references" — the two must not render identically.
     ///
-    /// Primary signal is the per-language Phase B completion marker (authoritative
-    /// and per-symbol-agnostic). Falls back to an `edge_sites` presence check for
-    /// legacy DBs written before the marker existed. The edge_sites heuristic
-    /// alone under-reports for languages whose definition nodes carry an empty
-    /// `language` string (the `file_node_for_attribution` fallback) or that ran
-    /// Phase B but produced zero occurrences, so the marker takes precedence.
+    /// This is deliberately **evidence-based** (an occurrence row must exist)
+    /// rather than trusting a per-language "Phase B ran" marker: a sidecar can
+    /// run to completion yet produce nothing when its underlying analyzer is
+    /// missing (e.g. `scip-php` not installed), and a marker keyed on "ran"
+    /// would then falsely report a confident "0 references" for a language whose
+    /// references were never analyzed. Checking **either** endpoint (`src` OR
+    /// `dst`) also fixes the empty-`language` false-negative: an occurrence's
+    /// enclosing `src` node reliably carries the calling file's language even
+    /// when the `dst` definition node was stored with an empty `language`.
     pub fn language_has_edge_sites(&self, language: &str) -> anyhow::Result<bool> {
-        if self
-            .phase_b_completed_languages()?
-            .iter()
-            .any(|l| l == language)
-        {
-            return Ok(true);
+        if language.is_empty() {
+            // No occurrence index is ever "built for" the empty language; the
+            // empty string is the file-attribution fallback's default, not a
+            // real language the user can query.
+            return Ok(false);
         }
         let present: i64 = self
             .conn
             .query_row(
                 "SELECT EXISTS( \
-                   SELECT 1 FROM edge_sites es JOIN nodes n ON n.id = es.dst \
-                   WHERE es.kind = 'ref/call' AND n.language = ?1 AND n.language != '')",
+                   SELECT 1 FROM edge_sites es \
+                   JOIN nodes n ON n.id IN (es.src, es.dst) \
+                   WHERE es.kind = 'ref/call' AND n.language = ?1)",
                 params![language],
                 |row| row.get(0),
             )
@@ -5629,38 +5589,43 @@ mod tests {
     }
 
     #[test]
-    fn language_has_edge_sites_trusts_phase_b_marker() {
-        // #299 M1: the per-language Phase B completion marker is authoritative —
-        // a language that ran Phase B but produced zero occurrences (or whose def
-        // nodes carry an empty language string) must still read "index built".
+    fn language_has_edge_sites_is_evidence_based_not_marker_based() {
+        // #299 F6: "index built for a language" must require an actual occurrence
+        // row, not merely that Phase B was invoked. A sidecar can run to
+        // completion yet produce nothing when its analyzer tool is missing
+        // (e.g. scip-php absent) — that language must read false so
+        // find_references says "unavailable", not a confident "0 references".
         let mut store = SqliteStore::open_in_memory().unwrap();
-        // No edge_sites rows at all.
-        assert!(!store.language_has_edge_sites("kotlin").unwrap());
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "main.go", "go", "fn:main"),
+            "function",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "svc.go", "go", "fn:Charge"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
         store
-            .record_phase_b_languages(&["kotlin".to_string(), "go".to_string()])
+            .record_edge_sites(&[(caller.id, callee.id, 7)])
             .unwrap();
-        assert!(store.language_has_edge_sites("kotlin").unwrap());
+        // go has a real occurrence row -> built.
         assert!(store.language_has_edge_sites("go").unwrap());
-        assert!(!store.language_has_edge_sites("rust").unwrap());
-        // Union semantics: a later subset run never narrows the recorded set.
-        store
-            .record_phase_b_languages(&["rust".to_string()])
-            .unwrap();
-        assert!(store.language_has_edge_sites("rust").unwrap());
-        assert!(store.language_has_edge_sites("kotlin").unwrap());
-        let mut langs = store.phase_b_completed_languages().unwrap();
-        langs.sort();
-        assert_eq!(langs, vec!["go", "kotlin", "rust"]);
+        // php produced no occurrence rows (analyzer absent) -> not built,
+        // regardless of whether its Phase B sidecar "ran".
+        assert!(!store.language_has_edge_sites("php").unwrap());
     }
 
     #[test]
-    fn language_has_edge_sites_ignores_empty_language_dst() {
-        // #299 F6: an occurrence targeting a def node with an empty language
-        // string must not be counted as "index built" for the empty language.
+    fn language_has_edge_sites_detects_via_src_when_dst_language_empty() {
+        // #299 F6: an occurrence whose `dst` definition node carries an empty
+        // language must still count for the calling file's language, since the
+        // enclosing `src` node reliably carries it (fixes the empty-dst
+        // false-negative). And querying the empty language itself is always false.
         let mut store = SqliteStore::open_in_memory().unwrap();
         let caller = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "file"),
-            "file",
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:caller"),
+            "function",
         );
         // Def node with an empty language (file_node_for_attribution style).
         let blank = travsr_core::Node::new(
@@ -5672,7 +5637,9 @@ mod tests {
         store
             .record_edge_sites(&[(caller.id, blank.id, 4)])
             .unwrap();
-        // Querying the empty language must not report the index as built.
+        // rust is detected via the src endpoint even though dst language is empty.
+        assert!(store.language_has_edge_sites("rust").unwrap());
+        // The empty language itself is never "built".
         assert!(!store.language_has_edge_sites("").unwrap());
     }
 

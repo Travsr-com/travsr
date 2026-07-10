@@ -1629,14 +1629,6 @@ fn write_phase_b_results(
         let _ = store.set_meta("rust_lsif_degraded", "");
     }
 
-    // #299 M1: mark the languages whose Phase B completed so `find_references`
-    // can tell a genuine "0 references" from "occurrence index never built for
-    // this language". Recorded here (single choke point for both the init and
-    // background paths). Failures to write the marker are non-fatal.
-    if let Err(e) = store.record_phase_b_languages(&pb_outcome.ran) {
-        tracing::warn!("recording phase B language marker: {e:#}");
-    }
-
     let report = PhaseBReport {
         ran: pb_outcome.ran,
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
