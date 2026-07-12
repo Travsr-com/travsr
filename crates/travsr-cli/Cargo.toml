@@ -5,7 +5,7 @@ description = "Travsr command-line interface"
 # tracks its own line so `travsr --version` matches the published release, while
 # the SDK crates (core, error, plugin-protocol, plugin-sdk) stay at 0.7.0 for
 # travsr-lang / travsr-embed. Keep in sync with packages/travsr-npm/package.json.
-version = "0.10.0"
+version = "0.11.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

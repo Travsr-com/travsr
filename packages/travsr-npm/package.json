@@ -1,6 +1,6 @@
 {
   "name": "@travsr.com/travsr",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "The code graph that lives next to git.",
   "license": "Apache-2.0",
   "repository": {

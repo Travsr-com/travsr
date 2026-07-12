@@ -4,6 +4,21 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v0.11.0 - 2026-07-12
+
+### travsr binary
+
+- **`find_references` and `find_pattern` MCP tools.** All-language occurrence search over the graph: locate every use of a symbol, or match a structural pattern, across every indexed language.
+- **Graph garbage collection and `fsck`.** Tier 1-2 GC reclaims orphaned nodes and edges, and a new `travsr fsck` command checks and repairs graph integrity.
+- **Reindex resource governance.** A new `travsr-config` foundation adds capacity limits, cancellation, and live reconfiguration so large reindex jobs stay within bounded CPU and memory.
+- **`get_snippets` duplicate-signature disambiguation.** Four-tier resolution picks the right definition when several symbols share a signature.
+- **Evidence-based language edge detection.** `language_has_edge_sites` is now derived from observed edges instead of assumed, improving cross-language accuracy.
+- Fixes: LSIF emitter pipe-buffer deadlock and indexer sandbox hardening (#412); six deferred plugin-host / daemon items from PR #364 (#382).
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v0.10.0...v0.11.0
+
+---
+
 ## v0.10.0 - 2026-07-05
 
 ### travsr binary
