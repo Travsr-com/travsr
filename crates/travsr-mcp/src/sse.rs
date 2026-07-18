@@ -95,6 +95,10 @@ type RingBufferMap = DashMap<(TenantId, Uuid), VecDeque<RingEntry>>;
 pub fn router(state: Arc<AppState>) -> Router {
     use axum::routing::{get, post};
 
+    // RFC-021: background-warm the reranker (idempotent, non-blocking) so the
+    // first real request doesn't pay the model-load cost.
+    crate::rerank::warm_background();
+
     Router::new()
         .route("/sse", get(sse_handler))
         .route("/rpc", post(rpc_handler))

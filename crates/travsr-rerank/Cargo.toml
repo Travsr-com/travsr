@@ -1,0 +1,19 @@
+[package]
+name = "travsr-rerank"
+description = "In-process cross-encoder relevance arbiter (RFC-021): reranks graph-retrieved candidates against a natural-language query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tract-onnx = { workspace = true }
+tokenizers = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+rayon      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,494 @@
+{
+  "model": "arctic-embed-m-v1.5",
+  "generatedAt": "2026-07-18T17:03:33.037Z",
+  "coldMs": 7318,
+  "perf": {
+    "correctnessSummary": {
+      "answerable": 24,
+      "nonsense": 3,
+      "hit@1": 0.208,
+      "hit@3": 0.25,
+      "hit@5": 0.292,
+      "hit@10": 0.292,
+      "mrr": 0.24,
+      "abstainAccuracy": 1
+    }
+  },
+  "correctness": [
+    {
+      "id": "L1",
+      "category": "literal",
+      "query": "syncReplicaSet",
+      "expect": [
+        "syncReplicaSet",
+        "replica_set.go"
+      ],
+      "medianMs": 2435,
+      "nodes": 88,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "method:ReplicaSetController.syncReplicaSet",
+      "tokens": 3139
+    },
+    {
+      "id": "L2",
+      "category": "literal",
+      "query": "HorizontalController processNextWorkItem",
+      "expect": [
+        "HorizontalController",
+        "podautoscaler/horizontal.go"
+      ],
+      "medianMs": 4099,
+      "nodes": 93,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 4,
+      "topSig": "method:Controller.processNextWorkItem",
+      "tokens": 4084
+    },
+    {
+      "id": "L3",
+      "category": "literal",
+      "query": "SharedInformer interface",
+      "expect": [
+        "SharedInformer",
+        "shared_informer.go"
+      ],
+      "medianMs": 3647,
+      "nodes": 57,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "interface:SharedInformer",
+      "tokens": 1826
+    },
+    {
+      "id": "L4",
+      "category": "literal",
+      "query": "Scheduler ScheduleOne",
+      "expect": [
+        "ScheduleOne",
+        "schedule_one.go"
+      ],
+      "medianMs": 2770,
+      "nodes": 105,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "method:Scheduler.ScheduleOne",
+      "tokens": 3426
+    },
+    {
+      "id": "L5",
+      "category": "literal",
+      "query": "leaderElection",
+      "expect": [
+        "leaderElection",
+        "leaderelection.go"
+      ],
+      "medianMs": 1386,
+      "nodes": 68,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "go-pkg:staging/src/k8s.io/client-go/tools/leaderelection/leaderelection",
+      "tokens": 2602
+    },
+    {
+      "id": "L6",
+      "category": "literal",
+      "query": "iptables Proxier",
+      "expect": [
+        "Proxier",
+        "proxy/iptables/proxier.go"
+      ],
+      "medianMs": 1142,
+      "nodes": 42,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 2,
+      "topSig": "go-pkg:pkg/util/iptables/iptables",
+      "tokens": 1139
+    },
+    {
+      "id": "C1",
+      "category": "conceptual",
+      "query": "how does the horizontal pod autoscaler scale replicas based on metrics",
+      "expect": [
+        "HorizontalController",
+        "podautoscaler/horizontal.go"
+      ],
+      "medianMs": 4082,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 181
+    },
+    {
+      "id": "C2",
+      "category": "conceptual",
+      "query": "how are pending pods assigned to nodes",
+      "expect": [
+        "ScheduleOne",
+        "schedule_one.go",
+        "scheduler"
+      ],
+      "medianMs": 1020,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 146
+    },
+    {
+      "id": "C3",
+      "category": "conceptual",
+      "query": "controller reconciles desired number of pod replicas",
+      "expect": [
+        "syncReplicaSet",
+        "ReplicaSetController",
+        "replica_set.go"
+      ],
+      "medianMs": 3250,
+      "nodes": 77,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:Pod",
+      "tokens": 2640
+    },
+    {
+      "id": "C4",
+      "category": "conceptual",
+      "query": "elect a single active leader among controller manager replicas",
+      "expect": [
+        "leaderElection",
+        "leaderelection.go"
+      ],
+      "medianMs": 2821,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 172
+    },
+    {
+      "id": "C5",
+      "category": "conceptual",
+      "query": "program network rules for services on each node",
+      "expect": [
+        "proxy/iptables",
+        "Proxier"
+      ],
+      "medianMs": 1651,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 167
+    },
+    {
+      "id": "C6",
+      "category": "conceptual",
+      "query": "cache and watch kubernetes resources with event handlers",
+      "expect": [
+        "SharedInformer",
+        "shared_informer.go"
+      ],
+      "medianMs": 2281,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 194
+    },
+    {
+      "id": "C7",
+      "category": "conceptual",
+      "query": "kubelet brings a pod to its desired running state",
+      "expect": [
+        "SyncPod",
+        "pod_workers.go",
+        "kubelet"
+      ],
+      "medianMs": 3371,
+      "nodes": 101,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:Pod",
+      "tokens": 3245
+    },
+    {
+      "id": "C8",
+      "category": "conceptual",
+      "query": "update service endpoints when backing pods change",
+      "expect": [
+        "endpoints_controller.go",
+        "endpoint"
+      ],
+      "medianMs": 1949,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 155
+    },
+    {
+      "id": "X1",
+      "category": "cross",
+      "query": "how a replicaset change flows from informer watch to pod creation",
+      "expect": [
+        "shared_informer",
+        "syncReplicaSet",
+        "replica_set.go"
+      ],
+      "medianMs": 1762,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 165
+    },
+    {
+      "id": "X2",
+      "category": "cross",
+      "query": "scheduling a pod from the queue through the binding cycle",
+      "expect": [
+        "ScheduleOne",
+        "bindingCycle",
+        "schedule_one.go"
+      ],
+      "medianMs": 1588,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 149
+    },
+    {
+      "id": "N1",
+      "category": "nonsense",
+      "query": "quantum blockchain payment gateway subscription billing invoice",
+      "expect": [],
+      "medianMs": 1272,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 184
+    },
+    {
+      "id": "N2",
+      "category": "nonsense",
+      "query": "react redux frontend css animation component styling theme",
+      "expect": [],
+      "medianMs": 1861,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 163
+    },
+    {
+      "id": "N3",
+      "category": "nonsense",
+      "query": "audio waveform synthesizer midi signal processing reverb filter",
+      "expect": [],
+      "medianMs": 1887,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 147
+    },
+    {
+      "id": "G1",
+      "category": "salad",
+      "query": "delete all user accounts and drop the login database",
+      "expect": [],
+      "medianMs": 1856,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 153
+    },
+    {
+      "id": "G2",
+      "category": "salad",
+      "query": "get the customer's shopping cart total and apply a discount",
+      "expect": [],
+      "medianMs": 3994,
+      "nodes": 119,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:verifyTotalEvents",
+      "tokens": 4121
+    },
+    {
+      "id": "G3",
+      "category": "salad",
+      "query": "sync my music playlist across all my devices",
+      "expect": [],
+      "medianMs": 1597,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 131
+    },
+    {
+      "id": "G4",
+      "category": "salad",
+      "query": "watch a movie trailer and leave a star rating",
+      "expect": [],
+      "medianMs": 1878,
+      "nodes": 106,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:startEndpointWatcher",
+      "tokens": 3519
+    },
+    {
+      "id": "G5",
+      "category": "salad",
+      "query": "insert a new row into the customer spreadsheet",
+      "expect": [],
+      "medianMs": 1817,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 170
+    },
+    {
+      "id": "G6",
+      "category": "salad",
+      "query": "create a new email newsletter subscription",
+      "expect": [],
+      "medianMs": 1828,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 146
+    },
+    {
+      "id": "G7",
+      "category": "salad",
+      "query": "update my profile picture and bio on the dating app",
+      "expect": [],
+      "medianMs": 4145,
+      "nodes": 72,
+      "confidence": "weak",
+      "abstain": false,
+      "hitRank": 0,
+      "topSig": "fn:AppArmorProfile",
+      "tokens": 2336
+    },
+    {
+      "id": "G8",
+      "category": "salad",
+      "query": "list all my saved recipes in the cookbook app",
+      "expect": [],
+      "medianMs": 3072,
+      "nodes": 0,
+      "confidence": "unknown",
+      "abstain": true,
+      "hitRank": 0,
+      "topSig": null,
+      "tokens": 137
+    }
+  ],
+  "perfSweep": {
+    "500": {
+      "medianMs": 1028,
+      "p95Ms": 1148
+    },
+    "2000": {
+      "medianMs": 887,
+      "p95Ms": 930
+    },
+    "4000": {
+      "medianMs": 894,
+      "p95Ms": 1087
+    },
+    "8000": {
+      "medianMs": 828,
+      "p95Ms": 832
+    }
+  },
+  "snippetModes": {
+    "small_fn": {
+      "auto": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      },
+      "full": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      },
+      "skeleton": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      }
+    },
+    "large_fn": {
+      "auto": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      },
+      "full": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      },
+      "skeleton": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      }
+    },
+    "class": {
+      "auto": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      },
+      "full": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      },
+      "skeleton": {
+        "medianMs": 0,
+        "bytes": 58,
+        "tokens": 15
+      }
+    }
+  }
+}

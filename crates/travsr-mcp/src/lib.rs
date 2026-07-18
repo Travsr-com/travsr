@@ -12,6 +12,7 @@
 pub mod auth;
 mod protocol;
 pub mod query;
+mod rerank;
 mod sanitize;
 mod seed;
 mod server;
@@ -50,6 +51,9 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
     // Inject the embed KNN hook so get_context's semantic seed selection (Step 4)
     // works in standalone `travsr mcp --stdio` mode, not just daemon mode.
     inject_embed_hook(&mut store, db_path);
+    // RFC-021: background-warm the reranker (idempotent, non-blocking) so the
+    // first real query doesn't pay the model-load cost.
+    rerank::warm_background();
     server::run(&mut store)
 }
 
@@ -58,6 +62,7 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
 /// The registry is re-read on every tool call so repos added via `travsr init`
 /// after startup are picked up live without restarting the server.
 pub fn serve_stdio_global() -> anyhow::Result<()> {
+    rerank::warm_background();
     server::run_global()
 }
 

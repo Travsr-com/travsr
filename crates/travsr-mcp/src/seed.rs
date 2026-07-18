@@ -266,6 +266,11 @@ pub(crate) struct Seed {
     /// Raw score before normalisation. Reserved for response annotation.
     #[allow(dead_code)]
     pub score: f32,
+    /// RFC-021 Phase 2: absolute cross-encoder relevance score in `[0, 1]`,
+    /// `None` when the seed wasn't in the reranked top-K or the reranker is
+    /// absent/disabled/degraded for this query. Does not affect
+    /// `classify_confidence` yet (Phase 3) — attach + reorder only.
+    pub rerank_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,8 +478,14 @@ pub(crate) fn rrf_fuse(sources: &[&[(NodeId, f32)]], k: f32) -> Vec<(NodeId, f32
 
 // ── Confidence classifier ─────────────────────────────────────────────────────
 
+/// Today's cosine/coverage lattice, extracted verbatim (RFC-021 Phase 3). Used
+/// as the confidence path when the reranker has no opinion for this query
+/// (`rerank_score: None` — model absent, disabled, panicked, or degraded) so
+/// the reranker-off surface stays byte-for-byte identical to pre-RFC-021
+/// behaviour. Also the path for exact-symbol queries (G1): a literal named
+/// symbol is judged deterministically here, never by the NL-trained reranker.
 #[allow(clippy::too_many_arguments)]
-fn classify_confidence(
+fn classify_confidence_lexical_fallback(
     terms: &[ResolvedTerm],
     coverage: f32,
     top_bm25: f32,
@@ -634,6 +645,115 @@ fn classify_confidence(
         Confidence::Weak
     } else {
         Confidence::None
+    }
+}
+
+/// Absolute floor at/above which the reranker's opinion is a Strong match.
+/// Measured 2026-07-17 against `bench/queries.json` (N=27) with
+/// `crates/travsr-mcp/src/seed.rs::rerank_floor_sweep` — see RFC-021 §13.2 for
+/// the full measurement and its caveats. Override via
+/// `TRAVSR_RERANK_STRONG_FLOOR` (re-runnable per model, per the RFC).
+fn rerank_strong_floor() -> f32 {
+    std::env::var("TRAVSR_RERANK_STRONG_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| (0.0..=1.0).contains(&x))
+        .unwrap_or(0.8)
+}
+
+/// Absolute floor at/above which the reranker's opinion is at least a Weak
+/// match; below it the query abstains (`Confidence::None`) rather than
+/// surfacing a confident salad. See [`rerank_strong_floor`] for provenance.
+/// Override via `TRAVSR_RERANK_WEAK_FLOOR`.
+fn rerank_weak_floor() -> f32 {
+    std::env::var("TRAVSR_RERANK_WEAK_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| (0.0..=1.0).contains(&x))
+        .unwrap_or(0.5)
+}
+
+/// RFC-021 Phase 3: the reranker's absolute score is the sole seed-selection /
+/// abstention signal for NL queries. Two guards preserve the deterministic
+/// paths the reranker must never arbitrate:
+///
+/// - **G1 (exact-symbol bypass):** when the user named a genuinely *rare*
+///   symbol (an exact anchor exists **and** at least one resolved term is
+///   rare enough — `symbol_freq <= rare_anchor_max()` — to be a real,
+///   specific identifier, not a coincidence), confidence is judged
+///   deterministically by [`classify_confidence_lexical_fallback`] regardless
+///   of the rerank score. The cross-encoder is NL-trained and would
+///   false-abstain on a literal identifier query (e.g. `GetWarningsForPod`
+///   scores low against its own name, and is rare: `symbol_freq` 1) —
+///   trading salad for missed precise lookups.
+///
+///   Rarity, not mere coverage, is the load-bearing check: `"delete all user
+///   accounts and drop the database"` (the RFC's own reproduction query)
+///   resolves an exact anchor too — `drop`/`delete` coincidentally name
+///   `SqliteStore.drop`/`delete_file` — and coverage alone measured 3/5 =
+///   0.6, clearing the same `coverage_strong()` bar a genuine hit would (a
+///   coverage-only gate was tried and still let this exact query bypass to
+///   `Confidence::Strong` — Defect A reproduced through the G1 escape
+///   hatch). What actually separates the two cases is that `drop` is
+///   anything but rare — dozens of types implement `Drop` in this repo, so
+///   its `symbol_freq` is large — while `GetWarningsForPod` is unique.
+///   Requiring rarity is also embeddings-independent (G2): it reads only
+///   `ResolvedTerm.symbol_freq`, a structural fact from the graph, never an
+///   oracle/cosine.
+/// - **Reranker unavailable (`rerank_score: None`):** model absent, disabled
+///   (`TRAVSR_NO_RERANK`), load failed, panicked, or ran over budget — fall
+///   back to the identical pre-RFC-021 gate. No regression, no partial state.
+///
+/// Otherwise the four-arm absolute-floor gate is embeddings-independent by
+/// construction (embeddings remain a candidate *source* into RRF fusion, never
+/// a confidence input here) — G2: confidence is identical embed-on/off for
+/// the same query.
+#[allow(clippy::too_many_arguments)]
+fn classify_confidence(
+    terms: &[ResolvedTerm],
+    coverage: f32,
+    top_bm25: f32,
+    has_any_seeds: bool,
+    has_knn_seeds: bool,
+    knn_oracle: &HashMap<NodeId, f32>,
+    anchor_oracle: &HashMap<NodeId, f32>,
+    scored_ids: &std::collections::HashSet<NodeId>,
+    cal: &Calibration,
+    has_exact_anchor: bool,
+    rerank_score: Option<f32>,
+) -> Confidence {
+    let rare_max = rare_anchor_max();
+    let has_rare_anchor = terms
+        .iter()
+        .any(|t| t.resolved && t.symbol_freq <= rare_max);
+    if has_exact_anchor && has_rare_anchor {
+        return classify_confidence_lexical_fallback(
+            terms,
+            coverage,
+            top_bm25,
+            has_any_seeds,
+            has_knn_seeds,
+            knn_oracle,
+            anchor_oracle,
+            scored_ids,
+            cal,
+        );
+    }
+    match rerank_score {
+        Some(r) if r >= rerank_strong_floor() => Confidence::Strong,
+        Some(r) if r >= rerank_weak_floor() => Confidence::Weak,
+        Some(_) => Confidence::None,
+        None => classify_confidence_lexical_fallback(
+            terms,
+            coverage,
+            top_bm25,
+            has_any_seeds,
+            has_knn_seeds,
+            knn_oracle,
+            anchor_oracle,
+            scored_ids,
+            cal,
+        ),
     }
 }
 
@@ -872,6 +992,7 @@ fn anchor_callee_seeds(
             weight,
             source: SeedSource::Lexical,
             score: weight,
+            rerank_score: None,
         })
         .collect()
 }
@@ -1129,6 +1250,7 @@ pub(crate) fn build_seed_set(
                 weight,
                 source,
                 score: rrf_score,
+                rerank_score: None,
             }
         })
         .collect();
@@ -1280,6 +1402,71 @@ pub(crate) fn build_seed_set(
         }
     }
 
+    // ── RFC-021: cross-encoder rerank ────────────────────────────────────────
+    // Reranks the top-K fused candidates against the query text, attaches
+    // Seed.rerank_score, and reorders (exact anchors keep structural priority
+    // — they are the literally-named symbol; rerank orders everything else).
+    // `max_rerank_score` (None = reranker had no opinion for this query — see
+    // classify_confidence's fallback arm) feeds Phase 3's confidence gate. A
+    // no-op — every seed keeps `rerank_score: None`, original ordering, and
+    // `max_rerank_score` stays `None` — when the reranker is absent, disabled,
+    // or degraded for this query, so behaviour is byte-for-byte unchanged
+    // without it.
+    let mut max_rerank_score: Option<f32> = None;
+    if !seeds.is_empty() {
+        let topk = crate::rerank::rerank_topk();
+        let repo_root = match store.get_meta("repo_root") {
+            Ok(Some(r)) if !r.is_empty() => Some(std::path::PathBuf::from(r)),
+            _ => None,
+        };
+        let take_n = seeds.len().min(topk);
+        let candidate_ids: Vec<NodeId> = seeds[..take_n].iter().map(|s| s.node).collect();
+        if let Ok(candidate_nodes) = store.get_nodes(&candidate_ids) {
+            let node_by_id: HashMap<NodeId, &CoreNode> =
+                candidate_nodes.iter().map(|n| (n.id, n)).collect();
+            // Signature-first: truncation (travsr-rerank, OnlySecond) drops from
+            // the skeleton tail, never the signature.
+            let texts: Vec<String> = candidate_ids
+                .iter()
+                .map(|id| match node_by_id.get(id) {
+                    Some(n) => {
+                        let skeleton = repo_root
+                            .as_deref()
+                            .and_then(|root| travsr_analysis::snippet::snippet_for_node(n, root));
+                        match skeleton {
+                            Some(body) => format!("{}\n{}", n.vname.signature, body),
+                            None => n.vname.signature.clone(),
+                        }
+                    }
+                    None => String::new(),
+                })
+                .collect();
+            let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+            if let Some(scores) = crate::rerank::rerank(query, &text_refs) {
+                for (seed, score) in seeds[..take_n].iter_mut().zip(scores) {
+                    seed.rerank_score = Some(score);
+                }
+                seeds.sort_by(|a, b| {
+                    let a_exact = a.source == SeedSource::Exact;
+                    let b_exact = b.source == SeedSource::Exact;
+                    b_exact.cmp(&a_exact).then_with(|| {
+                        b.rerank_score
+                            .unwrap_or(f32::NEG_INFINITY)
+                            .partial_cmp(&a.rerank_score.unwrap_or(f32::NEG_INFINITY))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                });
+                max_rerank_score = Some(
+                    seeds
+                        .iter()
+                        .filter_map(|s| s.rerank_score)
+                        .fold(f32::NEG_INFINITY, f32::max),
+                );
+            }
+        }
+    }
+
     let confidence = classify_confidence(
         &terms,
         coverage,
@@ -1290,6 +1477,8 @@ pub(crate) fn build_seed_set(
         &augmented_oracle, // per-anchor agreement: neighbours ∪ scored anchors
         &scored_ids,
         &cal,
+        !exact_anchor_ids.is_empty(), // G1: exact-symbol queries stay deterministic
+        max_rerank_score,
     );
 
     SeedSet {
@@ -1520,7 +1709,7 @@ mod tests {
     #[test]
     fn confidence_none_on_empty() {
         let terms: Vec<ResolvedTerm> = vec![];
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.0,
             0.0,
@@ -1570,7 +1759,7 @@ mod tests {
 
         // Reference (bge-small) floors demand oracle_top >= 0.72 to promote → abstains
         // even though this is the model's *answerable* band. This is the bug.
-        let ref_c = classify_confidence(
+        let ref_c = classify_confidence_lexical_fallback(
             &[],
             0.0,
             0.0,
@@ -1590,7 +1779,17 @@ mod tests {
         // Auto-calibrated to this model's band → the same cosines clear the mapped
         // promote floor and the query is correctly Strong (not demoted to guesses).
         let cal = Calibration { lo: 0.45, hi: 0.62 };
-        let got = classify_confidence(&[], 0.0, 0.0, true, true, &oracle, &oracle, &scored, &cal);
+        let got = classify_confidence_lexical_fallback(
+            &[],
+            0.0,
+            0.0,
+            true,
+            true,
+            &oracle,
+            &oracle,
+            &scored,
+            &cal,
+        );
         assert_eq!(
             got,
             Confidence::Strong,
@@ -1607,7 +1806,7 @@ mod tests {
             idf_w: 0.98, // very rare → specific anchor
             top_node: Some(NodeId(42)),
         }];
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             1.0,
             0.0,
@@ -1630,7 +1829,7 @@ mod tests {
             idf_w: 0.0, // not resolved — idf_w irrelevant
             top_node: None,
         }];
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.8,
             2.0,
@@ -1670,7 +1869,7 @@ mod tests {
         ];
         // Confident oracle that AGREES the anchor is near the query (cosine 0.95).
         let oracle = HashMap::from([(tweak, 0.95_f32)]);
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             1.0,
             0.4,
@@ -1703,7 +1902,7 @@ mod tests {
         }];
         // Confident oracle whose top hit is a DIFFERENT node — anchor absent (cosine 0).
         let oracle = HashMap::from([(NodeId(999), 0.88_f32)]);
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             1.0,
             0.4,
@@ -1742,7 +1941,7 @@ mod tests {
         // Strong must come from the anchor path).
         let oracle = HashMap::from([(NodeId(999), 0.79_f32)]);
         let scored: std::collections::HashSet<NodeId> = [anchor].into_iter().collect();
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             1.0,
             0.4,
@@ -1775,7 +1974,7 @@ mod tests {
             top_node: Some(anchor),
         }];
         let oracle = HashMap::from([(NodeId(999), 0.79_f32)]);
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             1.0,
             0.4,
@@ -1817,7 +2016,7 @@ mod tests {
         let cluster = HashMap::from([(NodeId(999), 0.659_f32)]);
         let anchor_oracle = HashMap::from([(sem, 0.615_f32)]);
         let scored: std::collections::HashSet<NodeId> = [sem].into_iter().collect();
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.25,
             15.0,
@@ -1836,7 +2035,7 @@ mod tests {
 
         // Same shape, anchor now in the answerable band (0.71) → Strong.
         let anchor_ok = HashMap::from([(sem, 0.71_f32)]);
-        let c2 = classify_confidence(
+        let c2 = classify_confidence_lexical_fallback(
             &terms,
             0.25,
             15.0,
@@ -1886,7 +2085,7 @@ mod tests {
         ];
         // Confident oracle (top 0.773) that AGREES the anchor is near (cos 0.71 ≥ floor 0.643).
         let oracle = HashMap::from([(manifests, 0.71_f32), (NodeId(99), 0.773_f32)]);
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.333,
             19.0,
@@ -1929,7 +2128,7 @@ mod tests {
         ];
         // Confident oracle (top 0.659) whose neighbours do NOT include the anchor.
         let oracle = HashMap::from([(NodeId(99), 0.659_f32)]);
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.25,
             15.0,
@@ -1957,7 +2156,7 @@ mod tests {
             idf_w: 0.40, // too generic to count as specific anchor
             top_node: Some(NodeId(7)),
         }];
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.3,
             0.1,
@@ -1982,7 +2181,7 @@ mod tests {
             idf_w: 0.93, // rare → counts as specific anchor
             top_node: Some(NodeId(9)),
         }];
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.1,
             0.0,
@@ -2012,7 +2211,7 @@ mod tests {
             idf_w: 0.526, // real idf for "map" in a 6940-node corpus
             top_node: Some(NodeId(5)),
         }];
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.0,
             0.1,
@@ -2041,7 +2240,7 @@ mod tests {
             idf_w: 0.0,
             top_node: None,
         }];
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.0,
             0.0,
@@ -2083,7 +2282,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.0,
             0.0,
@@ -2117,7 +2316,7 @@ mod tests {
             [(NodeId(1), 0.64), (NodeId(2), 0.62), (NodeId(3), 0.60)]
                 .into_iter()
                 .collect();
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.0,
             0.0,
@@ -2150,7 +2349,7 @@ mod tests {
         }];
         // oracle present but far (top 0.49 < veto 0.55); anchor absent from oracle.
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.5,
             12.0,
@@ -2182,7 +2381,7 @@ mod tests {
         }];
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
         // Low coverage so it doesn't hit the Exact branch; must land on Weak, not None.
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.3,
             0.1,
@@ -2213,7 +2412,7 @@ mod tests {
         }];
         // Oracle present but weak (0.50 < veto 0.55) — would veto if lexical were weak.
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.50)].into_iter().collect();
-        let c = classify_confidence(
+        let c = classify_confidence_lexical_fallback(
             &terms,
             0.8,
             2.0,
@@ -2239,6 +2438,7 @@ mod tests {
             weight: 1.0,
             source,
             score: 1.0,
+            rerank_score: None,
         }
     }
 
@@ -2305,5 +2505,346 @@ mod tests {
             SEMANTIC_MIN_KEEP,
             "must keep top-{SEMANTIC_MIN_KEEP} by cosine, never empty"
         );
+    }
+
+    // ── RFC-021 Phase 3: absolute-floor classify_confidence gate ─────────────
+
+    #[test]
+    fn confidence_rerank_above_strong_floor_is_strong() {
+        let oracle: HashMap<NodeId, f32> = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+            false, // no exact anchor
+            Some(0.9),
+        );
+        assert_eq!(c, Confidence::Strong);
+    }
+
+    #[test]
+    fn confidence_rerank_between_floors_is_weak() {
+        let oracle: HashMap<NodeId, f32> = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+            false,
+            Some(0.65),
+        );
+        assert_eq!(c, Confidence::Weak);
+    }
+
+    /// The RFC-021 reproduction bug, at the unit level: the reranker ran and
+    /// scored the best candidate low — must abstain, not surface a confident
+    /// salad, regardless of how much lexical coverage the query happened to hit.
+    #[test]
+    fn confidence_rerank_below_weak_floor_abstains() {
+        let oracle: HashMap<NodeId, f32> = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+            false,
+            Some(0.1),
+        );
+        assert_eq!(
+            c,
+            Confidence::None,
+            "a low rerank score must abstain even with seeds present"
+        );
+    }
+
+    #[test]
+    fn confidence_rerank_none_falls_back_to_lexical_gate() {
+        // Reranker unavailable for this query (None) — must produce the exact
+        // same decision as calling the fallback directly with identical inputs.
+        let oracle: HashMap<NodeId, f32> = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let terms = [ResolvedTerm {
+            token: "build_seed_set".into(),
+            resolved: true,
+            symbol_freq: 1,
+            idf_w: 0.9,
+            top_node: Some(NodeId(1)),
+        }];
+        let via_gate = classify_confidence(
+            &terms,
+            1.0,
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+            false,
+            None,
+        );
+        let via_fallback = classify_confidence_lexical_fallback(
+            &terms,
+            1.0,
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+        );
+        assert_eq!(via_gate, via_fallback);
+        assert_eq!(via_gate, Confidence::Exact);
+    }
+
+    /// G1 (blocker): an exact-symbol query stays on the deterministic path even
+    /// when the (NL-trained) reranker scores the exact match's own name low —
+    /// the failure mode the RFC names explicitly (`GetWarningsForPod` scoring
+    /// low against its own literal query). Trading salad for a false-abstain on
+    /// a precise lookup is exactly what G1 forbids.
+    #[test]
+    fn confidence_g1_exact_anchor_bypasses_low_rerank_score() {
+        let oracle: HashMap<NodeId, f32> = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let terms = [ResolvedTerm {
+            token: "getwarningsforpod".into(),
+            resolved: true,
+            symbol_freq: 1,
+            idf_w: 0.9,
+            top_node: Some(NodeId(1)),
+        }];
+        let c = classify_confidence(
+            &terms,
+            1.0,
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+            true,       // has_exact_anchor
+            Some(0.02), // reranker scored the exact match low — must be ignored
+        );
+        assert_eq!(
+            c,
+            Confidence::Exact,
+            "exact-symbol queries must not be governed by the rerank floor"
+        );
+    }
+
+    /// The fix for the RFC-021 reproduction bug at the G1-boundary level: an
+    /// exact anchor resolves (`has_exact_anchor: true` — "drop" really is
+    /// `SqliteStore.drop`), and even measures decent coverage (3/5 in the
+    /// real repro — dozens of types implement `Drop`, so "drop" and "delete"
+    /// both resolve). A coverage-only gate was tried first and still let
+    /// this exact query bypass to `Confidence::Strong` (Defect A reproduced
+    /// through the G1 escape hatch) — coverage alone can't tell "the user
+    /// named a symbol" from "a common word coincidentally IS one." Rarity
+    /// can: `drop` is anything but rare (`symbol_freq` far above
+    /// `rare_anchor_max`), so G1 must NOT bypass here; the query falls
+    /// through to the rerank floor, where a low score correctly abstains.
+    #[test]
+    fn confidence_g1_requires_a_rare_anchor_not_just_any_exact_anchor() {
+        let oracle: HashMap<NodeId, f32> = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let terms = [ResolvedTerm {
+            token: "drop".into(),
+            resolved: true,
+            symbol_freq: 50, // common — dozens of Drop impls, nowhere near rare
+            idf_w: 0.6,
+            top_node: Some(NodeId(1)),
+        }];
+        let c = classify_confidence(
+            &terms,
+            0.6, // coverage alone clears coverage_strong — must not be enough on its own
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+            true,       // has_exact_anchor: "drop" really did resolve
+            Some(0.02), // reranker correctly scores the sentence irrelevant
+        );
+        assert_eq!(
+            c,
+            Confidence::None,
+            "a coincidental exact-anchor hit on a common word must not bypass the rerank floor"
+        );
+    }
+
+    /// G2: confidence must be identical whether embeddings ran or not, for the
+    /// same query — the reranker's floor gate never looks at knn_oracle /
+    /// anchor_oracle at all (only classify_confidence_lexical_fallback does,
+    /// and it's reached identically in both cases here since rerank_score is
+    /// held constant).
+    #[test]
+    fn confidence_g2_identical_embed_on_vs_off_for_same_rerank_score() {
+        let empty: HashMap<NodeId, f32> = HashMap::new();
+        let warm: HashMap<NodeId, f32> = [(NodeId(1), 0.95)].into_iter().collect();
+        let scored = std::collections::HashSet::new();
+        let with_embed_off = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            false,
+            &empty,
+            &empty,
+            &scored,
+            &Calibration::IDENTITY,
+            false,
+            Some(0.85),
+        );
+        let with_embed_on = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            true,
+            &warm,
+            &warm,
+            &scored,
+            &Calibration::IDENTITY,
+            false,
+            Some(0.85),
+        );
+        assert_eq!(
+            with_embed_off, with_embed_on,
+            "confidence must not depend on embedding presence when the reranker has an opinion"
+        );
+    }
+
+    // ── RFC-021 Phase 0: rerank floor-sweep (dev tool, not a CI test) ─────────
+    //
+    // Not run in CI: needs both a real cross-encoder model AND this repo's own
+    // real indexed graph.db (self-dogfooding — the labeled queries in
+    // bench/queries.json are written against travsr's own codebase). Gated on
+    // two env vars, skips gracefully when either is absent.
+    //
+    // Run with:
+    //   TRAVSR_RERANK_MODEL_DIR=<dir> TRAVSR_FLOOR_SWEEP_DB=<path/to/.travsr/graph.db> \
+    //     cargo test -p travsr-mcp --lib rerank_floor_sweep -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn rerank_floor_sweep() {
+        let Some(db_path) = std::env::var_os("TRAVSR_FLOOR_SWEEP_DB") else {
+            eprintln!("skipping: TRAVSR_FLOOR_SWEEP_DB not set");
+            return;
+        };
+        if std::env::var_os("TRAVSR_RERANK_MODEL_DIR").is_none() {
+            eprintln!("skipping: TRAVSR_RERANK_MODEL_DIR not set");
+            return;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct LabeledQuery {
+            id: String,
+            category: String,
+            query: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct QueryFile {
+            queries: Vec<LabeledQuery>,
+        }
+        let raw = include_str!("../../../bench/queries.json");
+        let parsed: QueryFile = serde_json::from_str(raw).expect("bench/queries.json must parse");
+
+        let store = SqliteStore::open(std::path::Path::new(&db_path)).expect("open graph.db");
+
+        // No KNN, no score_fn: the floor is measured on the reranker's own
+        // signal, independent of embeddings — matching G2 (confidence must be
+        // embed-on/off identical), so the calibration shouldn't secretly
+        // depend on whether embeddings happen to be indexed for this repo.
+        let mut scored: Vec<(String, String, f32)> = Vec::new(); // (id, category, max_rerank_score)
+        for q in &parsed.queries {
+            let seed_set = build_seed_set(
+                &store,
+                &q.query,
+                &travsr_retrieval::OpenFilter,
+                vec![],
+                &HashMap::new(),
+                None,
+            );
+            let max_score = seed_set
+                .seeds
+                .iter()
+                .filter_map(|s| s.rerank_score)
+                .fold(0.0_f32, f32::max);
+            scored.push((q.id.clone(), q.category.clone(), max_score));
+            eprintln!(
+                "{:<4} {:<10} max_rerank_score={:.4}",
+                q.id, q.category, max_score
+            );
+        }
+
+        let is_positive = |cat: &str| matches!(cat, "literal" | "conceptual" | "cross");
+        let is_negative = |cat: &str| matches!(cat, "nonsense" | "salad");
+        let n_pos = scored.iter().filter(|(_, c, _)| is_positive(c)).count();
+        let n_neg = scored.iter().filter(|(_, c, _)| is_negative(c)).count();
+
+        eprintln!(
+            "\nfloor sweep (N={}: {n_pos} positive, {n_neg} negative)",
+            scored.len()
+        );
+        eprintln!("floor | negative_abstention | positive_recall");
+        let mut best_floor: f32 = 0.0;
+        let mut steps = 0;
+        while steps <= 20 {
+            let floor = steps as f32 * 0.05;
+            steps += 1;
+            let neg_abstained = scored
+                .iter()
+                .filter(|(_, c, s)| is_negative(c) && *s < floor)
+                .count();
+            let pos_retained = scored
+                .iter()
+                .filter(|(_, c, s)| is_positive(c) && *s >= floor)
+                .count();
+            let neg_abstention = neg_abstained as f32 / n_neg.max(1) as f32;
+            let pos_recall = pos_retained as f32 / n_pos.max(1) as f32;
+            eprintln!("{floor:.2}  | {neg_abstention:.3}                | {pos_recall:.3}");
+            // Largest floor that still honors the recall gate — negative_abstention
+            // is monotonically non-decreasing in floor, so this is the ROC-optimal pick.
+            if pos_recall >= 0.90 {
+                best_floor = floor;
+            }
+        }
+        eprintln!("\nrecommended WEAK_FLOOR (>=90% positive recall): {best_floor:.2}");
+
+        // STRONG_FLOOR heuristic: median score among positives, NOT hit-verified
+        // (a coarser anchor than WEAK_FLOOR — see travsr-qa-engineer note in the
+        // RFC-021 Phase 0 discussion: this dataset only labels answerable/nonsense,
+        // not graded strong/weak, so this half of the pair is a starting heuristic).
+        let mut pos_scores: Vec<f32> = scored
+            .iter()
+            .filter(|(_, c, _)| is_positive(c))
+            .map(|(_, _, s)| *s)
+            .collect();
+        pos_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = pos_scores.get(pos_scores.len() / 2).copied().unwrap_or(0.0);
+        eprintln!("recommended STRONG_FLOOR (heuristic, median of positive scores): {median:.2}");
     }
 }
