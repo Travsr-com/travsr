@@ -291,7 +291,7 @@ The "in-process vs sidecar" fork is dissolved:
 | # | Gap | Decision |
 |---|---|---|
 | **G1 (BLOCKER)** | Cross-encoder is NL-trained → would **false-abstain on exact-symbol queries** (`GetWarningsForPod` scores low), trading salad for missed precise lookups. | **Reranker arbitrates NL/conceptual queries ONLY.** When `build_seed_set` resolves a `SeedSource::Exact` anchor (user named a real symbol), confidence is driven by the **deterministic exact match**; the reranker is bypassed for that decision (may still reorder the tail). The deterministic path stays deterministic. |
-| G2 | Embeddings-on must not change the confidence *decision*. | Embedding KNN is a candidate **source only** (raw cosine × kind_boost into RRF) → affects **recall, never confidence**. `Calibration`/`semantic_veto`/`confirm_anchor_floor`/`disjoint_rescue`/contamination-gate deleted from the confidence path. Confidence identical embed-on/off → kills the "some repos" inconsistency. |
+| G2 | Embeddings-on must not change the confidence *decision*. | Embedding KNN is a candidate **source only** (raw cosine × kind_boost into RRF) → affects **recall, never confidence**. `Calibration`/`semantic_veto`/`confirm_anchor_floor`/`disjoint_rescue`/contamination-gate deleted from the confidence path. **Amended 2026-07-18** (post-implementation review F7): precisely, the confidence *gate* reads no embedding signal — for an identical candidate set, confidence is identical embed-on/off. Embeddings can still change *which* candidates reach the top-K reranked set (recall), and hence `max_rerank_score`, hence the decision — that is by design (recall affects what gets judged; the judge is embed-independent), but it means "identical confidence embed-on/off" holds per-candidate-set, not universally across recall changes. |
 | G3 | `tract` must not leak toward `travsr-core`. | `travsr-rerank` depends only on `travsr-core` (`NodeId`) + `tract`; `travsr-mcp` depends on `travsr-rerank`. `travsr-core`/`travsr-retrieval` stay ML-free. No crate-rule violation. |
 | G4 | 45 MB model distribution for a default-on component. | Model ships **alongside the platform binary in GitHub Releases**, pulled by the existing binary-fetch (npm wrapper / brew). Offline installs get it with the binary; no npm-tarball bloat. `TRAVSR_NO_RERANK=1` → lexical fallback for minimal installs. |
 | G5 | In-process loses sidecar process isolation. | (a) inference on a dedicated **bounded blocking (HEAVY) pool**, never the async/MCP thread; (b) `catch_unwind` → a model panic degrades one query to the lexical gate, never crashes the daemon; (c) bounded K ≤ 40, seq ≤ 256; (d) **fail-open** on model-load failure. |
@@ -305,7 +305,7 @@ The "in-process vs sidecar" fork is dissolved:
 ### Amended acceptance criteria (additions to §12)
 - [ ] `travsr-rerank` crate with `Reranker` trait + `TractReranker`; `travsr-core`/`travsr-retrieval` remain ML-free.
 - [ ] Exact-symbol query (`SeedSource::Exact` present) is **not** governed by the rerank floor — deterministic exact-match confidence preserved (G1 regression test).
-- [ ] Confidence identical with embeddings on vs off for the same query (G2).
+- [ ] Confidence gate reads no embedding signal; for an identical candidate set, confidence is identical embed-on/off (G2).
 - [ ] Daemon survives a forced inference panic (fail-open to lexical gate); model-load failure does not break startup (G5).
 - [ ] `bench/` negative set added; floors recorded with model version in the manifest (G7).
 

@@ -69,6 +69,15 @@ fn rerank_model_dir() -> Option<PathBuf> {
 /// `None` once load has been attempted (missing config, missing files, or a
 /// load-time error) — cached permanently so a broken install doesn't retry an
 /// expensive failed load on every query.
+///
+/// Test-process caveat (RFC-021 F6): first initialization wins for the whole
+/// test binary — whichever test calls `reranker()` first (today, always with
+/// no model dir configured) permanently pins this to `None` for every test in
+/// this module, run in any order. A model-backed wrapper test would flake
+/// under the default parallel test harness; the right shape for that is
+/// extracting a `fn load_from(dir: Option<PathBuf>) -> Option<TractReranker>`
+/// out of the `get_or_init` closure and testing it directly, leaving this
+/// static untouched.
 static RERANKER: OnceLock<Option<TractReranker>> = OnceLock::new();
 static WARM_STARTED: std::sync::Once = std::sync::Once::new();
 
@@ -155,6 +164,11 @@ pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate process-global env vars; the default test
+    /// harness runs test fns on parallel threads and `set_var`/`remove_var`
+    /// are process-wide (RFC-021 F6).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn rerank_topk_default_is_thirty() {
         std::env::remove_var("TRAVSR_RERANK_TOPK");
@@ -169,6 +183,7 @@ mod tests {
 
     #[test]
     fn no_model_configured_is_none_not_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("TRAVSR_NO_RERANK");
         std::env::remove_var("TRAVSR_RERANK_MODEL_DIR");
         // Without TRAVSR_RERANK_MODEL_DIR, reranker() must degrade to None —
@@ -180,6 +195,7 @@ mod tests {
 
     #[test]
     fn disabled_flag_short_circuits_even_with_model_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("TRAVSR_NO_RERANK", "1");
         std::env::set_var("TRAVSR_RERANK_MODEL_DIR", "/nonexistent/path/for/test");
         let result = rerank("q", &["a"]);

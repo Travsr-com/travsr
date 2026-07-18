@@ -250,8 +250,8 @@ pub(crate) struct ResolvedTerm {
     pub symbol_freq: usize,
     /// IDF weight of this token: high = rare/specific, low = generic ("map", "get").
     pub idf_w: f32,
-    /// The top-ranked node ID for this token (if resolved). Reserved for Tier-0.5 reranking.
-    #[allow(dead_code)]
+    /// The top-ranked node ID for this token (if resolved). Ties G1 rarity to
+    /// the specific term that produced the exact anchor (RFC-021 F3).
     pub top_node: Option<NodeId>,
 }
 
@@ -673,14 +673,71 @@ fn rerank_weak_floor() -> f32 {
         .unwrap_or(0.5)
 }
 
+/// G1 bypass decision (RFC-021 F2/F3): true when the user named a genuinely
+/// *rare* symbol — an exact anchor exists **and** the specific term that
+/// produced that anchor (`ResolvedTerm.top_node`) is one of `exact_anchor_ids`
+/// **and** is rare enough (`symbol_freq <= rare_anchor_max()`) to be a real,
+/// specific identifier rather than a coincidence. Tying rarity to the
+/// anchor-producing term (not just any resolved term in the query) stops a
+/// salad query with one incidental rare resolved term plus an exact anchor on
+/// an unrelated common word from also bypassing. Single source of truth: the
+/// caller (`build_seed_set`) uses this both to decide whether to run rerank
+/// inference at all (unused when bypassing) and to gate
+/// [`classify_confidence`].
+fn compute_g1_bypass(
+    terms: &[ResolvedTerm],
+    exact_anchor_ids: &std::collections::HashSet<NodeId>,
+) -> bool {
+    let rare_max = rare_anchor_max();
+    terms.iter().any(|t| {
+        t.resolved
+            && t.symbol_freq <= rare_max
+            && t.top_node.is_some_and(|n| exact_anchor_ids.contains(&n))
+    })
+}
+
+/// RFC-021 F4: four-band seed ordering after rerank. A rank-31+ seed that was
+/// never judged by the reranker must not sink below a reranked seed the model
+/// scored near zero (judged garbage) — only below seeds it approved.
+///
+/// Band 0: exact anchors (structural priority, as before RFC-021).
+/// Band 1: reranked, at/above the weak floor (model-approved, best first).
+/// Band 2: unreranked tail (never judged): keeps RRF order via sort stability.
+/// Band 3: reranked, below the weak floor (model-rejected: judged garbage
+///         must not outrank seeds that were never judged).
+///
+/// `sort_by` is stable, so within band 2 every key is equal and the pre-sort
+/// (RRF) relative order is preserved for free.
+fn sort_seeds_post_rerank(seeds: &mut [Seed], weak_floor: f32) {
+    let band = |s: &Seed| -> u8 {
+        if s.source == SeedSource::Exact {
+            0
+        } else {
+            match s.rerank_score {
+                Some(r) if r >= weak_floor => 1,
+                None => 2,
+                Some(_) => 3,
+            }
+        }
+    };
+    seeds.sort_by(|a, b| {
+        band(a).cmp(&band(b)).then_with(|| {
+            b.rerank_score
+                .unwrap_or(f32::NEG_INFINITY)
+                .partial_cmp(&a.rerank_score.unwrap_or(f32::NEG_INFINITY))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+}
+
 /// RFC-021 Phase 3: the reranker's absolute score is the sole seed-selection /
 /// abstention signal for NL queries. Two guards preserve the deterministic
 /// paths the reranker must never arbitrate:
 ///
 /// - **G1 (exact-symbol bypass):** when the user named a genuinely *rare*
-///   symbol (an exact anchor exists **and** at least one resolved term is
-///   rare enough — `symbol_freq <= rare_anchor_max()` — to be a real,
-///   specific identifier, not a coincidence), confidence is judged
+///   symbol — an exact anchor exists **and** the specific term that produced
+///   that anchor is rare enough — `symbol_freq <= rare_anchor_max()` — to be
+///   a real, specific identifier, not a coincidence — confidence is judged
 ///   deterministically by [`classify_confidence_lexical_fallback`] regardless
 ///   of the rerank score. The cross-encoder is NL-trained and would
 ///   false-abstain on a literal identifier query (e.g. `GetWarningsForPod`
@@ -700,6 +757,12 @@ fn rerank_weak_floor() -> f32 {
 ///   Requiring rarity is also embeddings-independent (G2): it reads only
 ///   `ResolvedTerm.symbol_freq`, a structural fact from the graph, never an
 ///   oracle/cosine.
+///
+///   Rarity is tied to the anchor-producing term itself, not just any resolved
+///   term in the query, via [`compute_g1_bypass`] — see its doc for why. The
+///   caller (`build_seed_set`) computes this once and passes it in as
+///   `g1_bypass`, also using it to skip rerank inference entirely on bypassed
+///   queries (RFC-021 F2), since the model's opinion is unused either way.
 /// - **Reranker unavailable (`rerank_score: None`):** model absent, disabled
 ///   (`TRAVSR_NO_RERANK`), load failed, panicked, or ran over budget — fall
 ///   back to the identical pre-RFC-021 gate. No regression, no partial state.
@@ -719,14 +782,10 @@ fn classify_confidence(
     anchor_oracle: &HashMap<NodeId, f32>,
     scored_ids: &std::collections::HashSet<NodeId>,
     cal: &Calibration,
-    has_exact_anchor: bool,
+    g1_bypass: bool,
     rerank_score: Option<f32>,
 ) -> Confidence {
-    let rare_max = rare_anchor_max();
-    let has_rare_anchor = terms
-        .iter()
-        .any(|t| t.resolved && t.symbol_freq <= rare_max);
-    if has_exact_anchor && has_rare_anchor {
+    if g1_bypass {
         return classify_confidence_lexical_fallback(
             terms,
             coverage,
@@ -1402,6 +1461,11 @@ pub(crate) fn build_seed_set(
         }
     }
 
+    // G1: confidence will be decided by the deterministic lexical path
+    // regardless of what the reranker says, so the (NL-trained) reranker's
+    // opinion is unused: skip inference (RFC-021 F2).
+    let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+
     // ── RFC-021: cross-encoder rerank ────────────────────────────────────────
     // Reranks the top-K fused candidates against the query text, attaches
     // Seed.rerank_score, and reorders (exact anchors keep structural priority
@@ -1410,10 +1474,10 @@ pub(crate) fn build_seed_set(
     // classify_confidence's fallback arm) feeds Phase 3's confidence gate. A
     // no-op — every seed keeps `rerank_score: None`, original ordering, and
     // `max_rerank_score` stays `None` — when the reranker is absent, disabled,
-    // or degraded for this query, so behaviour is byte-for-byte unchanged
-    // without it.
+    // degraded for this query, or bypassed by G1, so behaviour is byte-for-byte
+    // unchanged without it.
     let mut max_rerank_score: Option<f32> = None;
-    if !seeds.is_empty() {
+    if !seeds.is_empty() && !g1_bypass {
         let topk = crate::rerank::rerank_topk();
         let repo_root = match store.get_meta("repo_root") {
             Ok(Some(r)) if !r.is_empty() => Some(std::path::PathBuf::from(r)),
@@ -1425,14 +1489,24 @@ pub(crate) fn build_seed_set(
             let node_by_id: HashMap<NodeId, &CoreNode> =
                 candidate_nodes.iter().map(|n| (n.id, n)).collect();
             // Signature-first: truncation (travsr-rerank, OnlySecond) drops from
-            // the skeleton tail, never the signature.
+            // the skeleton tail, never the signature. RFC-021 F5: cap the read at
+            // ~10 lines instead of the kind-default (up to 40) — travsr-rerank
+            // truncates candidate text to MAX_CANDIDATE_CHARS (480, ~10 lines at
+            // ~48 chars/line) before tokenization, so lines past that are always
+            // discarded; reading fewer lines here saves the per-candidate
+            // collection/format work without changing what the model sees.
+            const RERANK_SNIPPET_LINES: usize = 10;
             let texts: Vec<String> = candidate_ids
                 .iter()
                 .map(|id| match node_by_id.get(id) {
                     Some(n) => {
-                        let skeleton = repo_root
-                            .as_deref()
-                            .and_then(|root| travsr_analysis::snippet::snippet_for_node(n, root));
+                        let skeleton = repo_root.as_deref().and_then(|root| {
+                            travsr_analysis::snippet::snippet_for_node_capped(
+                                n,
+                                root,
+                                RERANK_SNIPPET_LINES,
+                            )
+                        });
                         match skeleton {
                             Some(body) => format!("{}\n{}", n.vname.signature, body),
                             None => n.vname.signature.clone(),
@@ -1447,16 +1521,7 @@ pub(crate) fn build_seed_set(
                 for (seed, score) in seeds[..take_n].iter_mut().zip(scores) {
                     seed.rerank_score = Some(score);
                 }
-                seeds.sort_by(|a, b| {
-                    let a_exact = a.source == SeedSource::Exact;
-                    let b_exact = b.source == SeedSource::Exact;
-                    b_exact.cmp(&a_exact).then_with(|| {
-                        b.rerank_score
-                            .unwrap_or(f32::NEG_INFINITY)
-                            .partial_cmp(&a.rerank_score.unwrap_or(f32::NEG_INFINITY))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                });
+                sort_seeds_post_rerank(&mut seeds, rerank_weak_floor());
                 max_rerank_score = Some(
                     seeds
                         .iter()
@@ -1477,7 +1542,7 @@ pub(crate) fn build_seed_set(
         &augmented_oracle, // per-anchor agreement: neighbours ∪ scored anchors
         &scored_ids,
         &cal,
-        !exact_anchor_ids.is_empty(), // G1: exact-symbol queries stay deterministic
+        g1_bypass, // G1: rare exact-symbol queries stay deterministic
         max_rerank_score,
     );
 
@@ -2633,6 +2698,12 @@ mod tests {
             idf_w: 0.9,
             top_node: Some(NodeId(1)),
         }];
+        let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+        assert!(
+            g1_bypass,
+            "rare term tied to its own exact anchor must bypass"
+        );
         let c = classify_confidence(
             &terms,
             1.0,
@@ -2643,7 +2714,7 @@ mod tests {
             &oracle,
             &scored,
             &Calibration::IDENTITY,
-            true,       // has_exact_anchor
+            g1_bypass,
             Some(0.02), // reranker scored the exact match low — must be ignored
         );
         assert_eq!(
@@ -2654,16 +2725,16 @@ mod tests {
     }
 
     /// The fix for the RFC-021 reproduction bug at the G1-boundary level: an
-    /// exact anchor resolves (`has_exact_anchor: true` — "drop" really is
-    /// `SqliteStore.drop`), and even measures decent coverage (3/5 in the
-    /// real repro — dozens of types implement `Drop`, so "drop" and "delete"
-    /// both resolve). A coverage-only gate was tried first and still let
-    /// this exact query bypass to `Confidence::Strong` (Defect A reproduced
-    /// through the G1 escape hatch) — coverage alone can't tell "the user
-    /// named a symbol" from "a common word coincidentally IS one." Rarity
-    /// can: `drop` is anything but rare (`symbol_freq` far above
-    /// `rare_anchor_max`), so G1 must NOT bypass here; the query falls
-    /// through to the rerank floor, where a low score correctly abstains.
+    /// exact anchor resolves ("drop" really is `SqliteStore.drop`), and even
+    /// measures decent coverage (3/5 in the real repro — dozens of types
+    /// implement `Drop`, so "drop" and "delete" both resolve). A
+    /// coverage-only gate was tried first and still let this exact query
+    /// bypass to `Confidence::Strong` (Defect A reproduced through the G1
+    /// escape hatch) — coverage alone can't tell "the user named a symbol"
+    /// from "a common word coincidentally IS one." Rarity can: `drop` is
+    /// anything but rare (`symbol_freq` far above `rare_anchor_max`), so
+    /// `compute_g1_bypass` must return false here; the query falls through
+    /// to the rerank floor, where a low score correctly abstains.
     #[test]
     fn confidence_g1_requires_a_rare_anchor_not_just_any_exact_anchor() {
         let oracle: HashMap<NodeId, f32> = HashMap::new();
@@ -2675,6 +2746,9 @@ mod tests {
             idf_w: 0.6,
             top_node: Some(NodeId(1)),
         }];
+        let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+        assert!(!g1_bypass, "a common exact anchor must not bypass");
         let c = classify_confidence(
             &terms,
             0.6, // coverage alone clears coverage_strong — must not be enough on its own
@@ -2685,13 +2759,65 @@ mod tests {
             &oracle,
             &scored,
             &Calibration::IDENTITY,
-            true,       // has_exact_anchor: "drop" really did resolve
+            g1_bypass,
             Some(0.02), // reranker correctly scores the sentence irrelevant
         );
         assert_eq!(
             c,
             Confidence::None,
             "a coincidental exact-anchor hit on a common word must not bypass the rerank floor"
+        );
+    }
+
+    /// RFC-021 F3: a salad query that resolves an exact anchor on a *common*
+    /// term but ALSO happens to resolve an unrelated *rare* term (whose own
+    /// top match is not among the exact anchors) must not bypass G1 either —
+    /// rarity has to be tied to the term that produced the anchor, not to any
+    /// resolved term in the query.
+    #[test]
+    fn confidence_g1_rarity_must_be_tied_to_the_anchor_term_not_any_resolved_term() {
+        let terms = [
+            ResolvedTerm {
+                token: "drop".into(),
+                resolved: true,
+                symbol_freq: 50, // common — this is the term that produced the exact anchor
+                idf_w: 0.6,
+                top_node: Some(NodeId(1)),
+            },
+            ResolvedTerm {
+                token: "incidental".into(),
+                resolved: true,
+                symbol_freq: 1, // rare, but resolves to an unrelated node — not an exact anchor
+                idf_w: 0.9,
+                top_node: Some(NodeId(2)),
+            },
+        ];
+        let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+        assert!(
+            !g1_bypass,
+            "rarity on an unrelated resolved term must not launder a common anchor into a bypass"
+        );
+
+        let oracle: HashMap<NodeId, f32> = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &terms,
+            0.6,
+            0.0,
+            true,
+            false,
+            &oracle,
+            &oracle,
+            &scored,
+            &Calibration::IDENTITY,
+            g1_bypass,
+            Some(0.02),
+        );
+        assert_eq!(
+            c,
+            Confidence::None,
+            "salad with an incidental rare term plus a common anchor must abstain, not bypass"
         );
     }
 
@@ -2734,6 +2860,30 @@ mod tests {
         assert_eq!(
             with_embed_off, with_embed_on,
             "confidence must not depend on embedding presence when the reranker has an opinion"
+        );
+    }
+
+    /// RFC-021 F4: a reranked-but-rejected seed (model scored it near zero —
+    /// judged garbage) must not outrank a seed the model never saw (rank 31+,
+    /// still carries whatever RRF standing it had). Only model-approved seeds
+    /// (>= weak floor) may outrank the unjudged tail.
+    #[test]
+    fn sort_seeds_post_rerank_unjudged_tail_outranks_judged_garbage() {
+        let weak = rerank_weak_floor();
+        let mut approved = seed(1, SeedSource::Lexical);
+        approved.rerank_score = Some(0.9);
+        let mut rejected = seed(2, SeedSource::Lexical);
+        rejected.rerank_score = Some(0.001);
+        let unjudged = seed(3, SeedSource::Lexical); // rerank_score: None (tail)
+
+        let mut seeds = vec![rejected.clone(), unjudged.clone(), approved.clone()];
+        sort_seeds_post_rerank(&mut seeds, weak);
+
+        let order: Vec<u64> = seeds.iter().map(|s| s.node.0).collect();
+        assert_eq!(
+            order,
+            vec![1, 3, 2],
+            "approved (band 1) > unjudged tail (band 2) > judged garbage (band 3)"
         );
     }
 
