@@ -1126,6 +1126,17 @@ pub(crate) fn build_seed_set(
             continue;
         }
         // Emit top-3 matches per token to represent the anchor fully.
+        // `added_for_this_token` guarantees this token at least one anchor slot even
+        // when the shared per-path budget is already exhausted by an EARLIER token —
+        // otherwise a common word processed first (e.g. "daemon") can fully starve a
+        // later, more specific token's match in the same file (e.g. "watch" ->
+        // handle_watch_event in crates/travsr-daemon/src/lib.rs, dropped purely
+        // because "daemon" already filled that path's 2-slot cap). Every candidate
+        // still has to pass noise/filter/token_is_sig_component first, so the bypass
+        // only ever fires for a genuine match — it just can't be starved by token
+        // processing order. Beyond its first slot, a token is capped exactly as
+        // before.
+        let mut added_for_this_token = 0usize;
         for node in exact_nodes.iter().take(3) {
             if is_noise_seed(node) {
                 continue;
@@ -1143,10 +1154,11 @@ pub(crate) fn build_seed_set(
             let path_count = anchor_path_counts
                 .entry(node.vname.path.clone())
                 .or_insert(0);
-            if *path_count >= MAX_SEEDS_PER_PATH {
+            if *path_count >= MAX_SEEDS_PER_PATH && added_for_this_token > 0 {
                 continue;
             }
             *path_count += 1;
+            added_for_this_token += 1;
             let w = idf_w * kind_boost(&node.kind, &node.vname.language);
             anchor_raw.push((node.id, w));
         }
@@ -2884,6 +2896,60 @@ mod tests {
             order,
             vec![1, 3, 2],
             "approved (band 1) > unjudged tail (band 2) > judged garbage (band 3)"
+        );
+    }
+
+    /// Regression test for a real repro found live on the travsr repo: "how
+    /// does the daemon watch for file changes" abstained because
+    /// `handle_watch_event` never made it into the anchor set. Root cause:
+    /// `anchor_path_counts` is one counter shared across every token in the
+    /// query — the earlier-processed "daemon" token filled
+    /// `crates/travsr-daemon/src/lib.rs`'s 2-slot budget before "watch" was
+    /// processed, so its perfectly valid match (`handle_watch_event`) was
+    /// dropped purely by token order, not relevance. A token that resolves a
+    /// genuine, all-checks-passed match must always get at least one anchor
+    /// slot, even when an earlier token already exhausted the shared
+    /// per-path budget.
+    #[test]
+    fn build_seed_set_later_token_not_starved_by_earlier_tokens_path_cap() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // Two "daemon" matches in the same file exhaust MAX_SEEDS_PER_PATH (2)
+        // before the "watch" token is processed.
+        let path = "crates/travsr-daemon/src/lib.rs";
+        let daemon_new = Node::new(
+            VName::new("corpus", "", path, "rust", "fn:daemon_new"),
+            "function",
+        );
+        let daemon_run = Node::new(
+            VName::new("corpus", "", path, "rust", "fn:daemon_run"),
+            "function",
+        );
+        let handle_watch = Node::new(
+            VName::new("corpus", "", path, "rust", "fn:handle_watch_event"),
+            "function",
+        );
+        store.put_node(&daemon_new).unwrap();
+        store.put_node(&daemon_run).unwrap();
+        store.put_node(&handle_watch).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "daemon watch",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        let seed_ids: std::collections::HashSet<NodeId> =
+            seed_set.seeds.iter().map(|s| s.node).collect();
+        assert!(
+            seed_ids.contains(&handle_watch.id),
+            "later token's genuine match must not be starved by an earlier \
+             token filling the shared path budget; seeds present: {:?}",
+            seed_set.seeds.iter().map(|s| s.node).collect::<Vec<_>>()
         );
     }
 
