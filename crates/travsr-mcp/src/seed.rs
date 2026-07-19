@@ -1174,6 +1174,23 @@ pub(crate) fn build_seed_set(
     // regardless of which one is actually the better match.
     anchor_raw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // G1: computed here, before semantic_validate, not after it. `anchor_raw`
+    // is exactly what will become the Exact-sourced seeds once RRF fusion
+    // runs, so its own node ids are the right (and only available) exact-id
+    // set at this point. This matters: `semantic_validate` (below) can drop
+    // an Exact seed whose cosine to the whole-query embedding is low even
+    // when the seed is a genuine, rare, literal match — e.g. "give me data
+    // about daemon" scored struct:Daemon's cosine below several unrelated
+    // "data"-flavoured seeds', and semantic_validate silently removed it
+    // before G1 (which exists precisely to protect rare exact matches from
+    // NL-trained signals) ever got a chance to see it, since the old
+    // g1_bypass was computed from the POST-semantic_validate seed list. G1's
+    // deterministic path must not depend on the NL embedding oracle agreeing
+    // first — that is exactly the failure mode it exists to prevent.
+    let early_exact_ids: std::collections::HashSet<NodeId> =
+        anchor_raw.iter().map(|&(id, _)| id).collect();
+    let g1_bypass = compute_g1_bypass(&terms, &early_exact_ids);
+
     // Count only tokens that resolve to specific-enough anchors (IDF ≥ threshold).
     // Generic tokens like "map" or "get" match hundreds of unrelated nodes and must
     // not inflate coverage — they are not evidence the query is grounded in this repo.
@@ -1377,7 +1394,17 @@ pub(crate) fn build_seed_set(
     // coincidence ("literal", "semantic") resolve to confident FTS anchors that
     // are semantically unrelated to intent; the whole-query embedding is the only
     // signal that detects this. No-op when embeddings are absent/degraded.
-    let mut seeds = semantic_validate(seeds, &augmented_oracle, &cal);
+    //
+    // Skipped entirely when G1 already bypassed: the user named a genuinely
+    // rare, specific symbol, and G1's whole point is that a deterministic
+    // exact match must not be second-guessed by an NL-trained embedding
+    // signal — cosine-based cutting here would otherwise remove the very
+    // seed G1 exists to protect.
+    let mut seeds = if g1_bypass {
+        seeds
+    } else {
+        semantic_validate(seeds, &augmented_oracle, &cal)
+    };
 
     // ── RFC-019: seed re-rank (contamination gate + anchor-callee seeding) ─────
     // Only when the query named an exact symbol (an exact anchor exists) — never on
@@ -1485,8 +1512,11 @@ pub(crate) fn build_seed_set(
 
     // G1: confidence will be decided by the deterministic lexical path
     // regardless of what the reranker says, so the (NL-trained) reranker's
-    // opinion is unused: skip inference (RFC-021 F2).
-    let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
+    // opinion is unused: skip inference (RFC-021 F2). `g1_bypass` was already
+    // computed above, before semantic_validate ran, and is reused here as-is
+    // — recomputing it from the post-semantic_validate `exact_anchor_ids`
+    // would reintroduce the bug this fix closes (semantic_validate silently
+    // removing the seed G1 was supposed to protect, before G1 ever saw it).
 
     // ── RFC-021: cross-encoder rerank ────────────────────────────────────────
     // Reranks the top-K fused candidates against the query text, attaches
@@ -3025,6 +3055,75 @@ mod tests {
             "the rarer, higher-weight match must rank first regardless of \
              which token resolved it earlier in query order; seeds: {:?}",
             seed_set.seeds.iter().map(|s| s.node).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression test for a third repro found live: "give me data about
+    /// daemon" abstained even after the RRF-sort fix. Root cause:
+    /// `semantic_validate` ran BEFORE `g1_bypass` was computed and dropped
+    /// the exact, rare "daemon" match because its cosine to the noisy,
+    /// filler-word-heavy whole-query embedding was lower than several
+    /// unrelated seeds' — exactly the failure mode G1 exists to prevent, but
+    /// G1 was only ever consulted afterward, too late to help. Fixed by
+    /// computing `g1_bypass` from `anchor_raw` right after it is built, and
+    /// skipping `semantic_validate` entirely when it is true.
+    #[test]
+    fn build_seed_set_g1_bypass_protects_exact_match_from_semantic_validate() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // Five unrelated exact matches, all scored high by the (simulated)
+        // embed oracle - enough to make it "confident" and, pre-fix, to push
+        // the rare daemon match out of semantic_validate's top-N cosine cut.
+        let fillers = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let mut oracle: HashMap<NodeId, f32> = HashMap::new();
+        for (i, f) in fillers.iter().enumerate() {
+            let n = Node::new(
+                VName::new(
+                    "corpus",
+                    "",
+                    format!("crates/x/{f}_{i}.rs"),
+                    "rust",
+                    format!("fn:{f}_helper"),
+                ),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+            oracle.insert(n.id, 0.85);
+        }
+        // "daemon": rare, genuine match, deliberately absent from the oracle
+        // (cosine treated as 0.0) - simulates the live repro where the exact
+        // match's own cosine to the whole conversational query scored low.
+        let daemon = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "crates/travsr-daemon/src/lib.rs",
+                "rust",
+                "fn:daemon_run",
+            ),
+            "function",
+        );
+        store.put_node(&daemon).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "alpha beta gamma delta epsilon daemon",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &oracle,
+            None,
+        );
+
+        assert!(
+            seed_set.seeds.iter().any(|s| s.node == daemon.id),
+            "G1's rare exact match must survive semantic_validate, not be cut \
+             by a low cosine to the noisy whole-query embedding; seeds: {:?}",
+            seed_set
+                .seeds
+                .iter()
+                .map(|s| (s.node, s.source))
+                .collect::<Vec<_>>()
         );
     }
 
