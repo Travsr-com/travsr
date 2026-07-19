@@ -1164,6 +1164,16 @@ pub(crate) fn build_seed_set(
         }
     }
 
+    // `rrf_fuse` (below) requires every source sorted descending by score —
+    // "position 0 = best" is its documented precondition, since it scores by
+    // list position, not by the weight itself. `anchor_raw` is built in
+    // token-processing order (all of one token's matches, then the next), not
+    // relevance order, so without this sort a token processed later in the
+    // query (e.g. "daemon") gets a worse RRF rank than an earlier token's
+    // weaker matches (e.g. "data") purely because it was appended later —
+    // regardless of which one is actually the better match.
+    anchor_raw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
     // Count only tokens that resolve to specific-enough anchors (IDF ≥ threshold).
     // Generic tokens like "map" or "get" match hundreds of unrelated nodes and must
     // not inflate coverage — they are not evidence the query is grounded in this repo.
@@ -2949,6 +2959,71 @@ mod tests {
             seed_ids.contains(&handle_watch.id),
             "later token's genuine match must not be starved by an earlier \
              token filling the shared path budget; seeds present: {:?}",
+            seed_set.seeds.iter().map(|s| s.node).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression test for a second, related repro found live: "give me data
+    /// about daemon" abstained even though "daemon" alone resolves cleanly
+    /// to real, well-connected content. Root cause: `anchor_raw` fed
+    /// `rrf_fuse` in raw token-processing order, not weight order —
+    /// `rrf_fuse`'s own documented precondition is that each source is
+    /// sorted descending by score (position 0 = best), since it scores by
+    /// list position. "data" (common, many matches) is processed before
+    /// "daemon" (rare, one specific match) purely because it appears earlier
+    /// in the query, so daemon's higher-weight match landed at a worse RRF
+    /// rank than data's lower-weight ones despite being more relevant.
+    #[test]
+    fn build_seed_set_anchor_raw_sorted_by_weight_before_rrf_fusion() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // "data": common, several lower-weight matches, each in its own path.
+        for i in 0..3 {
+            let n = Node::new(
+                VName::new(
+                    "corpus",
+                    "",
+                    format!("crates/x/data_{i}.rs"),
+                    "rust",
+                    format!("fn:data_helper_{i}"),
+                ),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+        }
+        // "daemon": rare, one specific, higher-weight match (lower symbol_freq
+        // means higher idf_w; same kind as the data matches so kind_boost is
+        // not a confounding variable).
+        let daemon = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "crates/travsr-daemon/src/lib.rs",
+                "rust",
+                "fn:daemon_run",
+            ),
+            "function",
+        );
+        store.put_node(&daemon).unwrap();
+
+        // "data" appears before "daemon" in the query, so it is processed
+        // first in the per-token anchor loop.
+        let seed_set = build_seed_set(
+            &store,
+            "data daemon",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert!(!seed_set.seeds.is_empty(), "expected at least one seed");
+        assert_eq!(
+            seed_set.seeds[0].node,
+            daemon.id,
+            "the rarer, higher-weight match must rank first regardless of \
+             which token resolved it earlier in query order; seeds: {:?}",
             seed_set.seeds.iter().map(|s| s.node).collect::<Vec<_>>()
         );
     }
