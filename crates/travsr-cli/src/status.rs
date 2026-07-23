@@ -37,9 +37,22 @@ pub fn run() -> anyhow::Result<()> {
         Some(pb) if !pb.is_empty() => "pending",
         _ => "not run",
     };
+    // RFC-021 P5: reranker state. Old daemons omit the field (serde default
+    // empty) — suppress the segment then so mixed CLI/daemon versions stay clean.
+    let rerank_segment = if payload.rerank.is_empty() {
+        String::new()
+    } else {
+        format!(" | rerank: {}", payload.rerank)
+    };
     println!(
-        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {} | phase_b: {}",
-        payload.nodes, payload.edges, payload.schema, payload.journal, last_commit, phase_b_state
+        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {} | phase_b: {}{}",
+        payload.nodes,
+        payload.edges,
+        payload.schema,
+        payload.journal,
+        last_commit,
+        phase_b_state,
+        rerank_segment
     );
 
     // RFC-014 #317 re-index policy: surface signature-format skew so the user

@@ -4238,8 +4238,11 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "rayon",
+ "serde",
+ "sha2",
  "tempfile",
  "tokenizers",
+ "toml",
  "tracing",
  "tract-onnx",
 ]

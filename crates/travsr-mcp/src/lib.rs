@@ -29,6 +29,12 @@ pub use sse::{router as sse_router, AppState};
 // which run the same occurrence-store read as the MCP tools against a locally
 // opened store. The rest of `tools` stays private (MCP-only surface).
 pub use tools::{find_pattern, find_references};
+// RFC-021 P5: model distribution. The daemon auto-fetches on warm; the
+// `travsr rerank` CLI subcommand drives the same install path. The rest of
+// `rerank` stays private (query-path internals).
+pub use rerank::{
+    install_model_blocking as install_rerank_model, model_installed as rerank_model_installed,
+};
 
 use std::path::Path;
 

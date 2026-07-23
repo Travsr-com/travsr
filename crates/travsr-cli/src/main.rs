@@ -21,6 +21,7 @@ mod progress;
 mod references;
 mod repo;
 mod repos;
+mod rerank;
 mod serve;
 mod status;
 mod synonym;
@@ -202,6 +203,11 @@ enum Command {
     Synonym {
         #[command(subcommand)]
         action: synonym::SynonymCommand,
+    },
+    /// Manage the RFC-021 cross-encoder reranker model.
+    Rerank {
+        #[command(subcommand)]
+        action: rerank::RerankCommand,
     },
     /// Manage embedding backends for semantic code search.
     Embed {
@@ -691,6 +697,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
+        Command::Rerank { action } => rerank::run(action)?,
         Command::Embed { action } => embed::run(action)?,
         Command::Config { action } => config::run(action)?,
         Command::Fsck { fix, json, force } => fsck::run(fix, json, force)?,

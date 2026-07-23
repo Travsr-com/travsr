@@ -19,12 +19,21 @@ use rayon::prelude::*;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 use tract_onnx::prelude::*;
 
+mod manifest;
+pub use manifest::{
+    ensure_manifest, warn_on_sha_mismatch, RerankManifest, DEFAULT_STRONG_FLOOR,
+    DEFAULT_WEAK_FLOOR, MODEL_ID,
+};
+
 /// Candidate text is truncated to this many tokens (signature-first at the
 /// call site; `OnlySecond` truncation here drops from the candidate side,
 /// never the query).
 const MAX_SEQ_LEN: usize = 256;
-const MODEL_FILE: &str = "model_fp16.onnx";
-const TOKENIZER_FILE: &str = "tokenizer.json";
+/// The two files a model directory must contain to load. Exported so consumers
+/// (default-dir discovery in `travsr-mcp`, the `travsr rerank install`
+/// downloader in `travsr-cli`) name the same files this crate loads.
+pub const MODEL_FILE: &str = "model_fp16.onnx";
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
 /// Hard char-level cap on a candidate's contribution to the tokenizer input,
 /// applied before pairing with the query. Deliberately NOT env-tunable: an

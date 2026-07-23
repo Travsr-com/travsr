@@ -320,6 +320,47 @@ impl SeedSet {
     pub(crate) fn is_empty(&self) -> bool {
         self.seeds.is_empty()
     }
+
+    /// RFC-021 F9: absolute cross-encoder scores for the seeds the reranker judged.
+    ///
+    /// Seeds absent from the map had no `rerank_score` — G1-bypassed, beyond the
+    /// reranked top-K, or the reranker was off/degraded — and fall back to their
+    /// normalized PPR score at display time (see [`display_score`]).
+    pub(crate) fn rerank_scores(&self) -> HashMap<NodeId, f32> {
+        self.seeds
+            .iter()
+            .filter_map(|s| s.rerank_score.map(|r| (s.node, r)))
+            .collect()
+    }
+}
+
+/// RFC-021 F9: the score shown next to a node in `ask` / `get_context` output.
+///
+/// Unifies both surfaces on a single `[0,1]` scale (cross-surface parity):
+/// - A reranked seed shows its absolute cross-encoder score, replacing the
+///   normalized-PPR "always 1.00" artefact.
+/// - A primary seed the reranker never scored (G1 bypass / reranker off) shows
+///   its own normalized PPR score, uncapped — it is still a genuine anchor.
+/// - An expanded (non-seed) neighbour shows its normalized PPR score capped at
+///   `expanded_cap` (the best seed's rerank score) so a neighbour can never
+///   outrank the seed it was pulled in by.
+pub(crate) fn display_score(
+    node: NodeId,
+    normalized_ppr: f32,
+    seed_rerank: &HashMap<NodeId, f32>,
+    is_primary_seed: bool,
+    expanded_cap: Option<f32>,
+) -> f32 {
+    if let Some(&r) = seed_rerank.get(&node) {
+        r
+    } else if is_primary_seed {
+        normalized_ppr
+    } else {
+        match expanded_cap {
+            Some(cap) => normalized_ppr.min(cap),
+            None => normalized_ppr,
+        }
+    }
 }
 
 // ── Stop-word list (code-aware: omit "get", "set", "run", "use") ─────────────
@@ -648,29 +689,38 @@ fn classify_confidence_lexical_fallback(
     }
 }
 
-/// Absolute floor at/above which the reranker's opinion is a Strong match.
-/// Measured 2026-07-17 against `bench/queries.json` (N=27) with
-/// `crates/travsr-mcp/src/seed.rs::rerank_floor_sweep` — see RFC-021 §13.2 for
-/// the full measurement and its caveats. Override via
-/// `TRAVSR_RERANK_STRONG_FLOOR` (re-runnable per model, per the RFC).
-fn rerank_strong_floor() -> f32 {
-    std::env::var("TRAVSR_RERANK_STRONG_FLOOR")
+/// Parse a floor env var into a valid `[0, 1]` probability, or `None` if unset
+/// or out of range. Shared by both floor accessors.
+fn floor_env(name: &str) -> Option<f32> {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&x: &f32| (0.0..=1.0).contains(&x))
-        .unwrap_or(0.8)
+}
+
+/// Absolute floor at/above which the reranker's opinion is a Strong match.
+///
+/// Resolution order (RFC-021 F8): explicit env override → the model's
+/// `model.toml` manifest → the compiled-in `travsr_rerank::DEFAULT_STRONG_FLOOR`.
+/// The manifest ships next to `model_fp16.onnx` so model + floors bump
+/// atomically; `TRAVSR_RERANK_STRONG_FLOOR` stays the top-priority tuning
+/// override (re-runnable per model via `rerank_floor_sweep`, per the RFC).
+/// Floors were measured 2026-07-17 (travsr) and re-validated 2026-07-22 on
+/// kubernetes — see RFC-021 §13.2 / §9.8.
+fn rerank_strong_floor() -> f32 {
+    floor_env("TRAVSR_RERANK_STRONG_FLOOR")
+        .or_else(|| crate::rerank::manifest_strong_floor().filter(|&x| (0.0..=1.0).contains(&x)))
+        .unwrap_or(travsr_rerank::DEFAULT_STRONG_FLOOR)
 }
 
 /// Absolute floor at/above which the reranker's opinion is at least a Weak
 /// match; below it the query abstains (`Confidence::None`) rather than
-/// surfacing a confident salad. See [`rerank_strong_floor`] for provenance.
-/// Override via `TRAVSR_RERANK_WEAK_FLOOR`.
+/// surfacing a confident salad. Same resolution order as
+/// [`rerank_strong_floor`]; override via `TRAVSR_RERANK_WEAK_FLOOR`.
 fn rerank_weak_floor() -> f32 {
-    std::env::var("TRAVSR_RERANK_WEAK_FLOOR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&x: &f32| (0.0..=1.0).contains(&x))
-        .unwrap_or(0.5)
+    floor_env("TRAVSR_RERANK_WEAK_FLOOR")
+        .or_else(|| crate::rerank::manifest_weak_floor().filter(|&x| (0.0..=1.0).contains(&x)))
+        .unwrap_or(travsr_rerank::DEFAULT_WEAK_FLOOR)
 }
 
 /// G1 bypass decision (RFC-021 F2/F3): true when the user named a genuinely
@@ -1854,6 +1904,27 @@ mod tests {
         let result = rrf_fuse(&[&a, &empty], 60.0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, NodeId(1));
+    }
+
+    #[test]
+    fn display_score_covers_seed_fallback_and_expanded_cap() {
+        // One reranked seed at 0.85 → that is also the expanded cap.
+        let mut rr: HashMap<NodeId, f32> = HashMap::new();
+        rr.insert(NodeId(1), 0.85);
+        let cap = rr.values().copied().reduce(f32::max);
+
+        // Reranked seed shows its absolute cross-encoder score, NOT the
+        // normalized-PPR 1.0 (this is the "always 1.00" artefact F9 kills).
+        assert_eq!(display_score(NodeId(1), 1.0, &rr, true, cap), 0.85);
+        // Primary seed the reranker never scored → its own normalized PPR, uncapped.
+        assert_eq!(display_score(NodeId(2), 0.9, &rr, true, cap), 0.9);
+        // Expanded neighbour above the cap is pulled down so it can't outrank its seed.
+        assert_eq!(display_score(NodeId(3), 1.0, &rr, false, cap), 0.85);
+        // Expanded neighbour already below the cap keeps its own score.
+        assert_eq!(display_score(NodeId(4), 0.3, &rr, false, cap), 0.3);
+        // No reranked seeds at all (ships-dark / reranker off) → cap is a no-op.
+        let empty: HashMap<NodeId, f32> = HashMap::new();
+        assert_eq!(display_score(NodeId(5), 0.7, &empty, false, None), 0.7);
     }
 
     #[test]
