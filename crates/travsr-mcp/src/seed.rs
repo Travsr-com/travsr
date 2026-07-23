@@ -928,6 +928,33 @@ fn semantic_validate(
     scored.into_iter().map(|(s, _)| s).collect()
 }
 
+/// RFC-021 / Issue D — apply `semantic_validate`'s whole-query cosine filter to
+/// the lexical/KNN recall tail **only**. `SeedSource::Exact` anchors (deterministic
+/// FTS name matches) bypass it entirely and always survive to the reranker, which
+/// RFC-021 §15 ratified as the *sole* relevance arbiter.
+///
+/// Why: `semantic_validate` scores an oracle-absent seed as cosine `0.0` and cuts
+/// it. For a conversational query like `"give me data about daemon"`, the *diluted*
+/// whole-query embedding scores the genuine `Daemon` exact anchors below the floor,
+/// so they were dropped before the cross-encoder ever judged them → false abstain.
+/// Letting exact anchors through fixes that without re-introducing the veto: salad
+/// (`"...drop the database"`) still abstains because the reranker scores the
+/// surviving exact `drop` seed low downstream, not because this stage dropped it.
+/// Lexical/KNN seeds (coincidental token-overlap like `"literal"`/`"semantic"`, and
+/// embedding neighbours) remain subject to the cosine cut, as before.
+fn semantic_validate_preserving_exact(
+    seeds: Vec<Seed>,
+    oracle: &HashMap<NodeId, f32>,
+    cal: &Calibration,
+) -> Vec<Seed> {
+    let (exact, tail): (Vec<Seed>, Vec<Seed>) = seeds
+        .into_iter()
+        .partition(|s| s.source == SeedSource::Exact);
+    let mut kept = semantic_validate(tail, oracle, cal);
+    kept.extend(exact);
+    kept
+}
+
 // ── RFC-019 seed re-rank helpers ──────────────────────────────────────────────
 
 /// Cosine at/above which a **structurally disjoint** non-exact seed is rescued from
@@ -1389,21 +1416,27 @@ pub(crate) fn build_seed_set(
     }
 
     // ── Tier-1 semantic validation ────────────────────────────────────────────
-    // When the embed oracle is confident, use the query cosine to demote lexical
+    // When the embed oracle is confident, use the query cosine to demote LEXICAL
     // anchors the embedding disagrees with. NL query words that are rare-by-
-    // coincidence ("literal", "semantic") resolve to confident FTS anchors that
-    // are semantically unrelated to intent; the whole-query embedding is the only
-    // signal that detects this. No-op when embeddings are absent/degraded.
+    // coincidence ("literal", "semantic") resolve to lexical anchors that are
+    // semantically unrelated to intent; the whole-query embedding detects this.
+    // No-op when embeddings are absent/degraded.
+    //
+    // RFC-021 / Issue D: exact anchors are EXEMPT (see
+    // `semantic_validate_preserving_exact`). A deterministic FTS name match must
+    // reach the reranker — the ratified relevance arbiter — and never be vetoed
+    // by a diluted whole-query embedding ("give me data about daemon" abstained
+    // because the `Daemon` exact anchors were cosine-cut before the cross-encoder
+    // saw them). Salad still abstains: the reranker judges the surviving exact
+    // seed low downstream.
     //
     // Skipped entirely when G1 already bypassed: the user named a genuinely
     // rare, specific symbol, and G1's whole point is that a deterministic
-    // exact match must not be second-guessed by an NL-trained embedding
-    // signal — cosine-based cutting here would otherwise remove the very
-    // seed G1 exists to protect.
+    // exact match must not be second-guessed by an NL-trained embedding signal.
     let mut seeds = if g1_bypass {
         seeds
     } else {
-        semantic_validate(seeds, &augmented_oracle, &cal)
+        semantic_validate_preserving_exact(seeds, &augmented_oracle, &cal)
     };
 
     // ── RFC-019: seed re-rank (contamination gate + anchor-callee seeding) ─────
@@ -2602,6 +2635,50 @@ mod tests {
     }
 
     #[test]
+    fn semantic_validate_preserving_exact_keeps_exact_below_floor() {
+        // RFC-021 / Issue D repro (hermetic). A moderately-common on-topic exact
+        // anchor ("daemon"-style: resolves to real Daemon symbols but is not rare
+        // enough for G1) that the DILUTED whole-query embedding leaves out of the
+        // oracle (cosine 0.0) must NOT be dropped here — it has to reach the
+        // reranker. Contrast `semantic_validate_cuts_salad_keeps_relevant`, which
+        // calls the raw `semantic_validate` and drops the exact-sourced seeds.
+        let mut seeds: Vec<Seed> = (1..=3).map(|i| seed(i, SeedSource::Exact)).collect();
+        // KNN tail the diluted query DOES score (off-topic neighbours it drifted to):
+        seeds.extend((10..=15).map(|i| seed(i, SeedSource::Knn)));
+        let oracle: HashMap<NodeId, f32> = (10..=15)
+            .map(|i| (NodeId(i), 0.68 - (i as f32 - 10.0) * 0.01))
+            .collect();
+
+        let out = semantic_validate_preserving_exact(seeds, &oracle, &Calibration::IDENTITY);
+        let kept: std::collections::HashSet<u64> = out.iter().map(|s| s.node.0).collect();
+        assert!(
+            kept.contains(&1) && kept.contains(&2) && kept.contains(&3),
+            "exact anchors (cosine 0, absent from oracle) must bypass the veto and \
+             reach the reranker; got {kept:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_validate_preserving_exact_still_cuts_lexical_tail() {
+        // The exemption is exact-only: a coincidental LEXICAL anchor the confident
+        // oracle disagrees with (cosine 0.0, absent) is still cut, so the reranker
+        // isn't handed the whole spurious-collision tail.
+        let mut seeds: Vec<Seed> = (1..=3).map(|i| seed(i, SeedSource::Lexical)).collect();
+        seeds.extend((10..=15).map(|i| seed(i, SeedSource::Knn)));
+        let oracle: HashMap<NodeId, f32> = (10..=15)
+            .map(|i| (NodeId(i), 0.68 - (i as f32 - 10.0) * 0.01))
+            .collect();
+
+        let out = semantic_validate_preserving_exact(seeds, &oracle, &Calibration::IDENTITY);
+        let kept: std::collections::HashSet<u64> = out.iter().map(|s| s.node.0).collect();
+        assert!(
+            kept.iter().all(|&id| id >= 10),
+            "lexical anchors the embedding rejects must still be cut; got {kept:?}"
+        );
+        assert_eq!(out.len(), 6, "only the 6 KNN seeds survive");
+    }
+
+    #[test]
     fn semantic_validate_never_empties_grounded_result() {
         // Confident oracle but only 2 seeds clear the floor — MIN_KEEP guarantees
         // we still return SEMANTIC_MIN_KEEP rather than emptying the result.
@@ -3129,14 +3206,19 @@ mod tests {
 
     // ── RFC-021 Phase 0: rerank floor-sweep (dev tool, not a CI test) ─────────
     //
-    // Not run in CI: needs both a real cross-encoder model AND this repo's own
-    // real indexed graph.db (self-dogfooding — the labeled queries in
-    // bench/queries.json are written against travsr's own codebase). Gated on
-    // two env vars, skips gracefully when either is absent.
+    // Not run in CI: needs both a real cross-encoder model AND a real indexed
+    // graph.db. By default it self-dogfoods against travsr's own codebase (the
+    // labeled queries compiled in from bench/queries.json). Gated on two env
+    // vars, skips gracefully when either is absent.
     //
-    // Run with:
+    // Run (travsr self-corpus):
     //   TRAVSR_RERANK_MODEL_DIR=<dir> TRAVSR_FLOOR_SWEEP_DB=<path/to/.travsr/graph.db> \
     //     cargo test -p travsr-mcp --lib rerank_floor_sweep -- --nocapture --ignored
+    //
+    // Run (cross-repo, e.g. kubernetes — RFC-021 §9.3 Task 4 floor-generalization
+    // gate): additionally point the query set at that repo's labeled file:
+    //   TRAVSR_FLOOR_SWEEP_QUERIES=bench/queries-k8s.json \
+    //   TRAVSR_FLOOR_SWEEP_DB=/path/to/kubernetes/.travsr/graph.db  (+ model dir)
     #[test]
     #[ignore]
     fn rerank_floor_sweep() {
@@ -3159,8 +3241,19 @@ mod tests {
         struct QueryFile {
             queries: Vec<LabeledQuery>,
         }
-        let raw = include_str!("../../../bench/queries.json");
-        let parsed: QueryFile = serde_json::from_str(raw).expect("bench/queries.json must parse");
+        // Query set: compiled-in travsr self-corpus by default; override with
+        // TRAVSR_FLOOR_SWEEP_QUERIES=<path> to calibrate against another repo's
+        // labeled set (e.g. bench/queries-k8s.json) — RFC-021 §9.3 Task 3, the
+        // cross-repo floor-generalization gate. The file must have the same
+        // {queries:[{id,category,query}]} shape and the same positive/negative
+        // category vocabulary (literal|conceptual|cross vs nonsense|salad).
+        let raw: String = match std::env::var_os("TRAVSR_FLOOR_SWEEP_QUERIES") {
+            Some(path) => std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read TRAVSR_FLOOR_SWEEP_QUERIES {path:?}: {e}")),
+            None => include_str!("../../../bench/queries.json").to_string(),
+        };
+        let parsed: QueryFile =
+            serde_json::from_str(&raw).expect("floor-sweep query file must parse");
 
         let store = SqliteStore::open(std::path::Path::new(&db_path)).expect("open graph.db");
 
