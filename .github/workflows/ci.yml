@@ -194,11 +194,17 @@ jobs:
         #   A) cargo tree: dep tree of travsr-mcp in default config (catches transitive pulls)
         #   B) cargo metadata: workspace-level non-optional dep set (catches accidental direct adds)
         run: |
-          if cargo tree -p travsr-mcp --no-default-features 2>/dev/null | grep -iE '\bort\b|\bonnx\b|\bcandle\b|\bfastembed\b|\busearch\b|\bsqlite-vec\b|\bvec0\b'; then
+          # tract-onnx is exempt: RFC-021 §15 ratified the in-process cross-encoder
+          # reranker (travsr-rerank) as a MANDATORY, non-optional dependency of
+          # travsr-mcp. tract is a pure-Rust inference engine (no ort/onnxruntime
+          # C++ runtime, no model server) — it is not an embedding dependency and
+          # does not violate the RFC-018 "ort/sqlite-vec live in travsr-embed" rule.
+          # The guard still bans the real embedding runtime (ort, sqlite-vec, etc.).
+          if cargo tree -p travsr-mcp --no-default-features 2>/dev/null | grep -iE '\bort\b|\bonnx\b|\bcandle\b|\bfastembed\b|\busearch\b|\bsqlite-vec\b|\bvec0\b' | grep -viE 'tract-onnx'; then
             echo "FAIL: travsr-mcp has embedding dependency in default config (TL2-A violation)"
             exit 1
           fi
-          echo "OK (TL2-A): travsr-mcp dep tree is embedding-free in default config"
+          echo "OK (TL2-A): travsr-mcp dep tree is embedding-free in default config (tract-onnx reranker exempt)"
           cargo metadata --no-deps --format-version 1 \
             | python3 -c "
           import sys, json
