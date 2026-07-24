@@ -455,12 +455,21 @@ mod tests {
     fn no_model_configured_is_none_not_panic() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("TRAVSR_NO_RERANK");
-        std::env::remove_var("TRAVSR_RERANK_MODEL_DIR");
-        // Without TRAVSR_RERANK_MODEL_DIR, reranker() must degrade to None —
-        // this is the "ships dark" default for every environment that hasn't
-        // opted in (including CI).
+        // Point discovery at a guaranteed-absent dir rather than *removing* the
+        // override: with RFC-021 P5 the model is default-installed at
+        // ~/.travsr/models/rerank on any machine that has run the daemon, so
+        // clearing the override would let reranker() find that real model and
+        // load Some — the assertion must stay hermetic regardless of local
+        // installs. A nonexistent dir exercises the identical "no usable model
+        // -> None" degrade path (loader fails -> cached None), which is the
+        // ships-dark contract this test guards.
+        std::env::set_var(
+            "TRAVSR_RERANK_MODEL_DIR",
+            "/nonexistent/travsr-rerank-none-test",
+        );
         assert!(reranker().is_none());
         assert_eq!(rerank("anything", &["a", "b"]), None);
+        std::env::remove_var("TRAVSR_RERANK_MODEL_DIR");
     }
 
     #[test]
