@@ -67,6 +67,15 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// strings) this char-level cut doesn't catch.
 const MAX_CANDIDATE_CHARS: usize = 480;
 
+/// Hard char-level cap on the query side of each pair. Truncation is
+/// `OnlySecond`, so the tokenizer only ever trims the candidate, never the
+/// query — without this a pathologically long NL query (MCP `get_context`/`ask`
+/// accept arbitrary text) would drive the batch's padded sequence length, and
+/// hence the `batch * seq_len` tensor allocations, unbounded, defeating the
+/// repo-agnostic cost bound this module exists to guarantee. A few hundred chars
+/// is ample for a real query; this is a short-passage relevance model regardless.
+const MAX_QUERY_CHARS: usize = 512;
+
 /// Truncates `text` to at most `max_chars` chars on a UTF-8-safe boundary.
 /// Pure and total — never panics on multi-byte input, unlike a naive byte
 /// slice.
@@ -143,6 +152,7 @@ impl TractReranker {
     /// K=1 took ~34ms and K=30 took ~983ms, perfectly linear — so [`Reranker::rerank`]
     /// splits larger batches across threads and calls this per-chunk.
     fn rerank_batch(&self, query: &str, candidates: &[&str]) -> Result<Vec<f32>> {
+        let query = truncate_candidate(query, MAX_QUERY_CHARS);
         let pairs: Vec<(String, String)> = candidates
             .iter()
             .map(|candidate| {
@@ -212,6 +222,18 @@ impl TractReranker {
                 .copied()
                 .collect(),
         };
+
+        // Fail closed to the lexical gate rather than silently misaligning scores
+        // to seeds if a swapped-in model has a non-1-logit head (e.g. num_labels=2
+        // yields 2*batch logits). The shipped model is hash-pinned to 1 logit; this
+        // only guards a dev/override model.
+        anyhow::ensure!(
+            logits.len() == candidates.len(),
+            "reranker produced {} logits for {} candidates (expected a single-logit \
+             classifier head)",
+            logits.len(),
+            candidates.len()
+        );
 
         Ok(logits.into_iter().map(sigmoid).collect())
     }

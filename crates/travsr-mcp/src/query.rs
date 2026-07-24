@@ -810,7 +810,10 @@ mod tests {
     #[test]
     fn ask_and_context_agree_on_confidence_and_abstain() {
         let (store, ..) = seeded_store();
-        for q in ["PaymentService", "xyzzyplughfrobnicate"] {
+        // "PaymentService?" carries trailing punctuation: both surfaces must
+        // normalize identically before build_seed_set (RFC-021 F9 parity fix), or
+        // the confidence label / abstain decision can diverge on punctuated NL.
+        for q in ["PaymentService", "PaymentService?", "xyzzyplughfrobnicate"] {
             let ask = ask_query(&store, q, None).unwrap();
             let ctx = crate::tools::get_context_raw(&store, q, 4000, false, None);
             // Abstain parity: get_context only prints the confidence header when it

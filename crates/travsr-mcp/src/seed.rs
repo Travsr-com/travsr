@@ -848,9 +848,15 @@ fn classify_confidence(
             cal,
         );
     }
+    // Guard against inverted floors (strong < weak) from a hand-broken manifest or
+    // env override: a Strong verdict must never fire below the Weak/abstain floor,
+    // so clamp strong up to at least weak. With correctly-ordered floors this is a
+    // no-op.
+    let weak = rerank_weak_floor();
+    let strong = rerank_strong_floor().max(weak);
     match rerank_score {
-        Some(r) if r >= rerank_strong_floor() => Confidence::Strong,
-        Some(r) if r >= rerank_weak_floor() => Confidence::Weak,
+        Some(r) if r >= strong => Confidence::Strong,
+        Some(r) if r >= weak => Confidence::Weak,
         Some(_) => Confidence::None,
         None => classify_confidence_lexical_fallback(
             terms,
@@ -1000,9 +1006,19 @@ fn semantic_validate_preserving_exact(
     let (exact, tail): (Vec<Seed>, Vec<Seed>) = seeds
         .into_iter()
         .partition(|s| s.source == SeedSource::Exact);
-    let mut kept = semantic_validate(tail, oracle, cal);
-    kept.extend(exact);
-    kept
+    let validated = semantic_validate(tail, oracle, cal);
+    // Prepend (not append) the untouched exact anchors. The caller reranks only
+    // the top-K front slice (`seeds[..min(len, TRAVSR_RERANK_TOPK)]`); on a dense
+    // repo where the surviving lexical/KNN tail is ≥ K, appending would push the
+    // exact anchors past that window so they never get a `rerank_score` and drop
+    // out of `max_rerank_score` — silently re-opening Issue D (a moderately-common
+    // named symbol falsely abstains) by a different mechanism than the veto this
+    // helper removed. Exact anchors are the literally-named symbol and must always
+    // reach the reranker; `sort_seeds_post_rerank` re-imposes final output order
+    // (exact → band 0) afterwards regardless of this input order.
+    let mut out = exact;
+    out.extend(validated);
+    out
 }
 
 // ── RFC-019 seed re-rank helpers ──────────────────────────────────────────────
@@ -1159,6 +1175,16 @@ pub(crate) fn build_seed_set(
     score_fn: Option<&dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>>,
 ) -> SeedSet {
     const MAX_SEEDS_PER_PATH: usize = 2;
+
+    // Cross-surface parity (RFC-021 F9): normalize once here so BOTH callers feed
+    // the identical cleaned query downstream. `ask_query` normalized upstream but
+    // `get_context` did not, so a punctuated query ("how does the daemon reindex?")
+    // reached the direct-cosine oracle (and FTS + reranker) as a different string
+    // on the two surfaces, diverging `max_rerank_score` and hence the confidence
+    // label. `normalize_nl_query` is idempotent, so the already-normalized ask path
+    // is unaffected.
+    let normalized_query = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let query = normalized_query.as_str();
 
     let intent = classify_intent(query);
     let content_tokens = tokenize_query(query);
@@ -2747,6 +2773,36 @@ mod tests {
             "lexical anchors the embedding rejects must still be cut; got {kept:?}"
         );
         assert_eq!(out.len(), 6, "only the 6 KNN seeds survive");
+    }
+
+    #[test]
+    fn semantic_validate_preserving_exact_keeps_exact_inside_rerank_window() {
+        // BLOCKER regression (dense-repo Issue D re-opener): `build_seed_set`
+        // reranks only the top-K front slice (`seeds[..min(len, TRAVSR_RERANK_TOPK
+        // = 30)]`). Build a surviving tail well past K so that appending the exact
+        // anchors (the pre-fix behaviour) would push them outside the window — they
+        // would then never get a `rerank_score` and would drop out of
+        // `max_rerank_score`, silently abstaining on exactly the moderately-common
+        // named-symbol / dense-repo case. Prepending must keep them at the front.
+        let mut seeds: Vec<Seed> = (1..=3).map(|i| seed(i, SeedSource::Exact)).collect();
+        // 40 KNN tail seeds the confident oracle all keeps (well over K = 30).
+        seeds.extend((100..140).map(|i| seed(i, SeedSource::Knn)));
+        let oracle: HashMap<NodeId, f32> = (100..140).map(|i| (NodeId(i), 0.68)).collect();
+
+        let out = semantic_validate_preserving_exact(seeds, &oracle, &Calibration::IDENTITY);
+
+        let window = out.len().min(30);
+        let exact_in_window = out[..window]
+            .iter()
+            .filter(|s| s.source == SeedSource::Exact)
+            .count();
+        assert_eq!(
+            exact_in_window,
+            3,
+            "all 3 exact anchors must sit within the top-{window} rerank window \
+             regardless of tail size; front sources: {:?}",
+            out.iter().take(6).map(|s| s.source).collect::<Vec<_>>()
+        );
     }
 
     #[test]

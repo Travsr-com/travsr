@@ -253,8 +253,17 @@ async fn download_verified(
 }
 
 fn write_atomic(dir: &std::path::Path, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Per-call sequence so two threads writing the same asset in one process
+    // (pid alone is not unique across threads) target distinct temp files and
+    // never interleave writes before the rename.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let dest = dir.join(name);
-    let tmp = dir.join(format!("{name}.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(
+        "{name}.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, bytes).map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
     if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
@@ -349,16 +358,31 @@ fn reranker() -> Option<&'static TractReranker> {
     RERANKER
         .get_or_init(|| {
             let dir = rerank_model_dir()?;
-            match TractReranker::load(&dir) {
-                Ok(r) => {
+            // catch_unwind around the load itself: `tract` has internal panics
+            // reachable via a malformed/truncated ONNX (a bad
+            // TRAVSR_RERANK_MODEL_DIR override, or a partially-written install).
+            // `OnceLock` does NOT cache a panicking initializer, so an escaping
+            // panic would both propagate through the current query and re-run the
+            // failed load on every subsequent one. Map a load panic to `None` so
+            // the fail-open decision is cached once and the daemon degrades to the
+            // lexical gate, matching the `Err` arm (RFC-021 G5/G6 fail-open).
+            match catch_unwind(AssertUnwindSafe(|| TractReranker::load(&dir))) {
+                Ok(Ok(r)) => {
                     tracing::info!(model_dir = %dir.display(), "RFC-021 reranker loaded");
                     Some(r)
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     tracing::warn!(
                         %error,
                         model_dir = %dir.display(),
                         "RFC-021 reranker load failed — falling back to lexical gate"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        model_dir = %dir.display(),
+                        "RFC-021 reranker load panicked — falling back to lexical gate"
                     );
                     None
                 }
@@ -453,7 +477,9 @@ mod tests {
 
     #[test]
     fn no_model_configured_is_none_not_panic() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("TRAVSR_NO_RERANK");
         // Point discovery at a guaranteed-absent dir rather than *removing* the
         // override: with RFC-021 P5 the model is default-installed at
@@ -474,7 +500,9 @@ mod tests {
 
     #[test]
     fn disabled_flag_short_circuits_even_with_model_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_NO_RERANK", "1");
         std::env::set_var("TRAVSR_RERANK_MODEL_DIR", "/nonexistent/path/for/test");
         let result = rerank("q", &["a"]);
@@ -485,7 +513,9 @@ mod tests {
 
     #[test]
     fn rerank_model_dir_prefers_env_override_verbatim() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_RERANK_MODEL_DIR", "/custom/model/dir");
         let dir = rerank_model_dir();
         std::env::remove_var("TRAVSR_RERANK_MODEL_DIR");
@@ -504,7 +534,9 @@ mod tests {
 
     #[test]
     fn rerank_status_off_when_disabled() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_NO_RERANK", "1");
         let s = rerank_status();
         std::env::remove_var("TRAVSR_NO_RERANK");
