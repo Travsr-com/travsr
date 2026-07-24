@@ -17,6 +17,12 @@ ignore = [
     # triggered by printing a null Atomic/Shared via {:p}; our code never does
     # this. Transitive dep via rayon (criterion dev-dep). Unblock on 0.9.19+.
     { id = "RUSTSEC-2026-0204", reason = "null-ptr fmt::Pointer path never reached; dev-dep via criterion/rayon" },
+    # paste is unmaintained/archived by its author (RUSTSEC-2024-0436). Pure
+    # compile-time token-pasting proc-macro, zero generated runtime logic
+    # beyond macro expansion. Pulled in transitively by tract-core/
+    # tract-linalg and by tokenizers (via macro_rules_attribute). No safe
+    # upgrade available.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro only, no runtime exposure" },
 ]
 
 [licenses]

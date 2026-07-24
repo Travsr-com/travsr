@@ -130,6 +130,10 @@ pub struct AskPayload {
     /// True when KNN embed seeds drove PPR instead of FTS. Absent in old JSON → false.
     #[serde(default)]
     pub embed_used: bool,
+    /// RFC-021 F9: honest confidence label ("exact"/"strong"/"weak"/"none") for
+    /// cross-surface parity with `get_context`. Absent in old JSON → empty.
+    #[serde(default)]
+    pub confidence: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -154,6 +158,12 @@ pub struct StatusPayload {
     /// LSIF because the OS sandbox was unavailable. Empty string = not degraded.
     #[serde(default)]
     pub rust_lsif_degraded: Option<String>,
+    /// RFC-021 P5: reranker state ("off"/"not installed"/"installed"/"ready"/
+    /// "load failed"). Reflects the answering process — the warm daemon reports
+    /// the loaded model; the cold CLI path reports on-disk presence. Absent in
+    /// old JSON → empty.
+    #[serde(default)]
+    pub rerank: String,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -174,6 +184,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         phase_b_commit: store.get_meta("phase_b_commit")?,
         phase_b_warnings: store.get_meta("phase_b_warnings")?,
         rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
+        rerank: crate::rerank::rerank_status().to_string(),
     })
 }
 
@@ -235,6 +246,9 @@ pub fn ask_query(
         .map(|f| f as &dyn Fn(&str, &[travsr_core::NodeId]) -> Vec<(travsr_core::NodeId, f32)>);
     let seed_set =
         crate::seed::build_seed_set(store, query, &OpenFilter, knn_pairs, &knn_oracle, score_ref);
+    // F9: honest confidence label, surfaced on every return for `ask`/CLI parity
+    // with get_context (which already prints it in its retrieval header).
+    let confidence = seed_set.confidence.label().to_string();
 
     // Abstain when confidence is None — prevents "confident salad" on no-match queries (R1).
     if seed_set.confidence == crate::seed::Confidence::None {
@@ -244,10 +258,15 @@ pub fn ask_query(
             rows: Vec::new(),
             total_tokens: 0,
             embed_used: false,
+            confidence,
         });
     }
 
+    // F9: seeds' absolute rerank scores + the primary-seed set (pre-enrichment),
+    // so display can show the cross-encoder judgment and cap expanded neighbours.
+    let seed_rerank = seed_set.rerank_scores();
     let raw_seeds = seed_set.ppr_seeds();
+    let primary_seed_ids: HashSet<NodeId> = raw_seeds.iter().map(|&(id, _)| id).collect();
 
     // Caller enrichment: depth-1 then depth-2 production callers at 0.35× weight per hop.
     let raw_seeds = crate::tools::enrich_seeds_with_callers(store, raw_seeds, 15); // depth-1
@@ -262,6 +281,7 @@ pub fn ask_query(
             rows: Vec::new(),
             total_tokens: 0,
             embed_used: false,
+            confidence: confidence.clone(),
         });
     }
 
@@ -274,6 +294,7 @@ pub fn ask_query(
             rows: Vec::new(),
             total_tokens: 0,
             embed_used: embed_contributed,
+            confidence: confidence.clone(),
         });
     }
 
@@ -296,7 +317,7 @@ pub fn ask_query(
     // a node with 5 in-edges retains ~38% — hub nodes are suppressed, not zeroed.
     let filtered_ids: Vec<_> = nodes.iter().map(|n| n.id).collect();
     let in_degrees = store.in_degrees(&filtered_ids)?;
-    let score_map: HashMap<NodeId, f32> = raw_score_map
+    let mut score_map: HashMap<NodeId, f32> = raw_score_map
         .into_iter()
         .map(|(id, s)| {
             let degree = in_degrees.get(&id).copied().unwrap_or(0);
@@ -305,6 +326,17 @@ pub fn ask_query(
         })
         .collect();
 
+    // F9: max-normalize damped PPR to [0,1] so `ask` and `get_context` display
+    // scores on the same scale (cross-surface parity) and expanded rows are
+    // comparable to the seeds' absolute rerank scores. Monotone → knapsack
+    // ordering is unaffected.
+    let max_score = score_map.values().copied().fold(0.0_f32, f32::max);
+    if max_score > 0.0 {
+        for v in score_map.values_mut() {
+            *v /= max_score;
+        }
+    }
+
     let items: Vec<_> = nodes
         .into_iter()
         .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
@@ -312,10 +344,18 @@ pub fn ask_query(
 
     let selected = knapsack(items, DEFAULT_TOKEN_BUDGET);
     let total_tokens: usize = selected.iter().map(token_cost).sum();
+    // F9: expanded neighbours cap at the best seed's rerank so none outranks its seed.
+    let expanded_cap = seed_rerank.values().copied().reduce(f32::max);
     let rows = selected
         .into_iter()
         .map(|n| AskRow {
-            score: score_map.get(&n.id).copied().unwrap_or(0.0),
+            score: crate::seed::display_score(
+                n.id,
+                score_map.get(&n.id).copied().unwrap_or(0.0),
+                &seed_rerank,
+                primary_seed_ids.contains(&n.id),
+                expanded_cap,
+            ),
             kind: n.kind,
             signature: n.vname.signature,
             path: n.vname.path,
@@ -329,6 +369,7 @@ pub fn ask_query(
         rows,
         total_tokens,
         embed_used: embed_contributed,
+        confidence,
     })
 }
 
@@ -759,5 +800,39 @@ mod tests {
         let payload = ask_query(&store, "PaymentService", None).unwrap();
         assert!(payload.matched);
         assert!(payload.total_tokens <= DEFAULT_TOKEN_BUDGET);
+    }
+
+    /// RFC-021 F9 (Phase 4): `ask` and `get_context` must agree on the confidence
+    /// label and the abstain decision for the same query — both read the same
+    /// `build_seed_set` confidence, so a divergence means a plumbing regression on
+    /// one surface. get_context prints it in its `| confidence: X ]` header;
+    /// abstaining queries emit no such header on either surface.
+    #[test]
+    fn ask_and_context_agree_on_confidence_and_abstain() {
+        let (store, ..) = seeded_store();
+        // "PaymentService?" carries trailing punctuation: both surfaces must
+        // normalize identically before build_seed_set (RFC-021 F9 parity fix), or
+        // the confidence label / abstain decision can diverge on punctuated NL.
+        for q in ["PaymentService", "PaymentService?", "xyzzyplughfrobnicate"] {
+            let ask = ask_query(&store, q, None).unwrap();
+            let ctx = crate::tools::get_context_raw(&store, q, 4000, false, None);
+            // Abstain parity: get_context only prints the confidence header when it
+            // did NOT abstain; ask sets matched=false on the same None decision.
+            let ctx_grounded = ctx.contains("| confidence:");
+            assert_eq!(
+                ask.matched, ctx_grounded,
+                "abstain decision diverged for {q:?}: ask.matched={} ctx=\n{ctx}",
+                ask.matched
+            );
+            // Label parity when both produced a grounded result.
+            if ask.matched {
+                let label = ctx
+                    .split("| confidence:")
+                    .nth(1)
+                    .and_then(|s| s.split_whitespace().next())
+                    .expect("grounded context has a confidence label");
+                assert_eq!(ask.confidence, label, "confidence label diverged for {q:?}");
+            }
+        }
     }
 }

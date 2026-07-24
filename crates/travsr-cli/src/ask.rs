@@ -99,6 +99,15 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     } else {
         ""
     };
-    println!("\n{n} nodes · ~{} tokens{embed_note}", payload.total_tokens);
+    // F9: surface the honest confidence label (parity with get_context's header).
+    let confidence_note = if payload.confidence.is_empty() {
+        String::new()
+    } else {
+        format!(" · confidence: {}", payload.confidence)
+    };
+    println!(
+        "\n{n} nodes · ~{} tokens{confidence_note}{embed_note}",
+        payload.total_tokens
+    );
     Ok(())
 }

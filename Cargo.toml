@@ -12,6 +12,7 @@ members = [
     "crates/travsr-indexer",
     "crates/travsr-store",
     "crates/travsr-retrieval",
+    "crates/travsr-rerank",
     "crates/travsr-mcp",
     "crates/travsr-daemon",
     "crates/travsr-cli",
@@ -33,6 +34,27 @@ travsr-ipc             = { path = "crates/travsr-ipc" }
 travsr-plugin-protocol = { path = "crates/travsr-plugin-protocol" }
 travsr-plugin-sdk      = { path = "crates/travsr-plugin-sdk" }
 travsr-plugin-host     = { path = "crates/travsr-plugin-host" }
+# Pinned to the 0.21.x line (declared rust_version 1.75, matching this
+# workspace's MSRV exactly). tract-onnx 0.22+ requires rust_version 1.85+
+# and 0.23+ requires 1.91+ — bumping past 0.21 would force a workspace-wide
+# MSRV bump for one leaf crate (travsr-rerank), which RFC-021 does not ask for.
+tract-onnx = "0.21"
+# tract's SimplePlan does not itself parallelize across the batch dimension
+# (measured: K=1 ~34ms, K=30 ~983ms — perfectly linear, zero batching
+# speedup); rayon splits the reranker's candidate batch across threads
+# instead. Already a transitive dep via tract itself; declared explicitly so
+# travsr-rerank doesn't rely on tract's internal dep graph staying that way.
+rayon = "1"
+# HuggingFace fast tokenizer — loads tokenizer.json from disk (WordPiece +
+# pair templating + truncation), same crate travsr-embed uses for its
+# tokenizer. default-features disabled: the defaults (progressbar, onig,
+# esaxx_fast) are training/CLI-only concerns we never touch (we only load +
+# encode), and `progressbar` (indicatif -> console -> time-core) requires
+# edition2024, breaking this workspace's 1.75 MSRV for no functional gain.
+# One of onig/fancy-regex is mandatory (pre-tokenizer regex splitting) -
+# fancy-regex is pure Rust, unlike onig which needs the Oniguruma C library
+# and complicates cross-compiling for OCI ARM64 (CLAUDE.md ARM64 mandate).
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }

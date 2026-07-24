@@ -3199,6 +3199,29 @@ fn get_context_body(
         .map(|(id, s, _, _)| (*id, *s))
         .collect();
 
+    // RFC-021 F9: the score shown per node. A reranked seed shows its absolute
+    // cross-encoder score (kills the normalized-PPR "always 1.00" artefact); a
+    // primary seed the reranker never scored shows its normalized PPR; an
+    // expanded neighbour caps at the best seed's rerank so it can't outrank its
+    // seed. Display-only — ordering/knapsack already ran on the PPR scores.
+    let seed_rerank = seed_set.rerank_scores();
+    let expanded_cap = seed_rerank.values().copied().reduce(f32::max);
+    let display_score_map: HashMap<NodeId, f32> = node_score_map
+        .iter()
+        .map(|(&id, &ppr)| {
+            (
+                id,
+                crate::seed::display_score(
+                    id,
+                    ppr,
+                    &seed_rerank,
+                    primary_seed_ids.contains(&id),
+                    expanded_cap,
+                ),
+            )
+        })
+        .collect();
+
     // Knapsack selection.
     let selected = knapsack(items, token_budget);
     let n_nodes = selected.len();
@@ -3388,7 +3411,7 @@ fn get_context_body(
                         format_node_line(
                             n,
                             role,
-                            node_score_map.get(&n.id).copied(),
+                            display_score_map.get(&n.id).copied(),
                             role_source
                                 .get(&n.id)
                                 .and_then(|s| seed_sig.get(s))
@@ -3431,7 +3454,7 @@ fn get_context_body(
             let header = format_node_line(
                 n,
                 role,
-                node_score_map.get(&n.id).copied(),
+                display_score_map.get(&n.id).copied(),
                 role_source
                     .get(&n.id)
                     .and_then(|s| seed_sig.get(s))
@@ -3502,7 +3525,7 @@ fn get_context_body(
                 format_node_line(
                     n,
                     role,
-                    node_score_map.get(&n.id).copied(),
+                    display_score_map.get(&n.id).copied(),
                     role_source
                         .get(&n.id)
                         .and_then(|s| seed_sig.get(s))

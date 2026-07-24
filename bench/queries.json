@@ -1,5 +1,5 @@
 {
-  "_comment": "Labeled query set for get_context correctness/usefulness benchmarking on the Travsr repo itself. category: literal (exact symbol exists), conceptual (NL, no literal symbol match), cross (spans files), nonsense (should abstain). expect: substrings; a result HITS if any returned node sig OR path contains any expect entry (case-insensitive).",
+  "_comment": "Labeled query set for get_context correctness/usefulness benchmarking on the Travsr repo itself. category: literal (exact symbol exists), conceptual (NL, no literal symbol match), cross (spans files), nonsense (off-domain, should abstain), salad (RFC-021: generic verb collides with a real symbol name but the query has no real meaning here — should ALSO abstain; kept distinct from nonsense so a regression in one doesn't hide in the other's aggregate). expect: substrings; a result HITS if any returned node sig OR path contains any expect entry (case-insensitive). RFC-021 Phase 0 floor-sweep note: N≈27 total (16 positive, 11 negative) is a repo-self-dogfood calibration sample, not a statistically powered study — floors derived from it should be revisited once real usage telemetry exists.",
   "queries": [
     { "id": "L1", "category": "literal", "query": "get_context_body", "expect": ["get_context_body"], "note": "core retrieval assembler" },
     { "id": "L2", "category": "literal", "query": "SnippetMode enum full skeleton auto", "expect": ["SnippetMode", "snippet_for_node_full"], "note": "the new mode feature" },
@@ -22,6 +22,15 @@
 
     { "id": "N1", "category": "nonsense", "query": "quantum blockchain payment gateway subscription billing", "expect": [], "note": "must abstain — no such domain here" },
     { "id": "N2", "category": "nonsense", "query": "recursive neural network crypto miner GPU scheduler", "expect": [], "note": "must abstain" },
-    { "id": "N3", "category": "nonsense", "query": "kubernetes pod autoscaler horizontal replica controller", "expect": [], "note": "must abstain — not this repo's domain" }
+    { "id": "N3", "category": "nonsense", "query": "kubernetes pod autoscaler horizontal replica controller", "expect": [], "note": "must abstain — not this repo's domain" },
+
+    { "id": "G1", "category": "salad", "query": "delete all user accounts and drop the database", "expect": [], "note": "RFC-021 repro — 'delete'/'drop' coincidentally match SqliteStore.delete_file / Rust Drop impls" },
+    { "id": "G2", "category": "salad", "query": "insert a credit card payment record and process billing", "expect": [], "note": "'insert' coincidentally matches store insert paths" },
+    { "id": "G3", "category": "salad", "query": "spawn a new kubernetes deployment and scale replicas", "expect": [], "note": "'spawn' coincidentally matches spawn_background_reindex_all / thread spawns" },
+    { "id": "G4", "category": "salad", "query": "get the current weather forecast for tomorrow", "expect": [], "note": "'get' coincidentally matches hundreds of get_* functions" },
+    { "id": "G5", "category": "salad", "query": "load the user's shopping cart and checkout", "expect": [], "note": "'load' coincidentally matches load_config and other load_* functions" },
+    { "id": "G6", "category": "salad", "query": "run a marathon training schedule generator", "expect": [], "note": "'run' coincidentally matches run_parallel_reindex_blocking and other run() methods" },
+    { "id": "G7", "category": "salad", "query": "build a birthday cake recipe calculator", "expect": [], "note": "'build' coincidentally matches build_seed_set / build_graph" },
+    { "id": "G8", "category": "salad", "query": "write a love poem and save it to my diary", "expect": [], "note": "'write' coincidentally matches write_scip_attributed_batch" }
   ]
 }

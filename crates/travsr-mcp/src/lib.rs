@@ -12,6 +12,7 @@
 pub mod auth;
 mod protocol;
 pub mod query;
+mod rerank;
 mod sanitize;
 mod seed;
 mod server;
@@ -28,6 +29,12 @@ pub use sse::{router as sse_router, AppState};
 // which run the same occurrence-store read as the MCP tools against a locally
 // opened store. The rest of `tools` stays private (MCP-only surface).
 pub use tools::{find_pattern, find_references};
+// RFC-021 P5: model distribution. The daemon auto-fetches on warm; the
+// `travsr rerank` CLI subcommand drives the same install path. The rest of
+// `rerank` stays private (query-path internals).
+pub use rerank::{
+    install_model_blocking as install_rerank_model, model_installed as rerank_model_installed,
+};
 
 use std::path::Path;
 
@@ -50,6 +57,9 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
     // Inject the embed KNN hook so get_context's semantic seed selection (Step 4)
     // works in standalone `travsr mcp --stdio` mode, not just daemon mode.
     inject_embed_hook(&mut store, db_path);
+    // RFC-021: background-warm the reranker (idempotent, non-blocking) so the
+    // first real query doesn't pay the model-load cost.
+    rerank::warm_background();
     server::run(&mut store)
 }
 
@@ -58,6 +68,7 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
 /// The registry is re-read on every tool call so repos added via `travsr init`
 /// after startup are picked up live without restarting the server.
 pub fn serve_stdio_global() -> anyhow::Result<()> {
+    rerank::warm_background();
     server::run_global()
 }
 

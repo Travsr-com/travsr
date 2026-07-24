@@ -95,6 +95,10 @@ type RingBufferMap = DashMap<(TenantId, Uuid), VecDeque<RingEntry>>;
 pub fn router(state: Arc<AppState>) -> Router {
     use axum::routing::{get, post};
 
+    // RFC-021: background-warm the reranker (idempotent, non-blocking) so the
+    // first real request doesn't pay the model-load cost.
+    crate::rerank::warm_background();
+
     Router::new()
         .route("/sse", get(sse_handler))
         .route("/rpc", post(rpc_handler))
@@ -508,8 +512,30 @@ async fn rpc_handler(
         .map(|r| r.clone())
         .unwrap_or_default();
 
-    // Dispatch tool call (same dispatch as server.rs global mode).
-    let response_payload = dispatch_tool_call(&req_value, &rpc_id, &repos);
+    // Dispatch tool call (same dispatch as server.rs global mode). Rerank and
+    // other blocking work must not run on the async/tokio worker thread (RFC-021
+    // §15 G5(a)); move the whole synchronous dispatch to a blocking pool.
+    let response_payload = {
+        let rpc_id_for_dispatch = rpc_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            dispatch_tool_call(&req_value, &rpc_id_for_dispatch, &repos)
+        })
+        .await
+        {
+            Ok(payload) => payload,
+            Err(join_err) => {
+                // A panic that previously unwound through rpc_handler now surfaces
+                // as JoinError; answer with a JSON-RPC internal error instead of
+                // dropping the request silently.
+                tracing::error!(%join_err, "tool dispatch panicked");
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": rpc_id,
+                    "error": { "code": -32603, "message": "internal error" }
+                })
+                .to_string()
+            }
+        }
+    };
 
     // Send response(s) via SSE.
     let response_str = response_payload;

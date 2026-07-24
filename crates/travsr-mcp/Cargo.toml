@@ -13,6 +13,7 @@ travsr-core = { path = "../travsr-core" }
 travsr-error = { workspace = true }
 travsr-analysis = { workspace = true }
 travsr-retrieval = { path = "../travsr-retrieval" }
+travsr-rerank = { path = "../travsr-rerank" }
 travsr-store = { path = "../travsr-store" }
 travsr-plugin-host = { path = "../travsr-plugin-host" }
 dirs = { workspace = true }

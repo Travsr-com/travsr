@@ -1,5 +1,5 @@
 {
-  "_comment": "Labeled query set for get_context correctness/usefulness benchmarking on the kubernetes/kubernetes repo (indexed at /Users/ak/Documents/k8/kubernetes, 131,873 symbols). category: literal (exact symbol exists), conceptual (NL, no literal symbol match), cross (spans files), nonsense (should abstain — domain outside k8s). expect: substrings; a result HITS if any returned node sig OR path contains any expect entry (case-insensitive). All expected symbols/paths verified present in the graph via `travsr ask`.",
+  "_comment": "Labeled query set for get_context correctness/usefulness benchmarking on the kubernetes/kubernetes repo (indexed at /Users/ak/Documents/k8/kubernetes, 131,873 symbols). category: literal (exact symbol exists), conceptual (NL, no literal symbol match), cross (spans files), nonsense (should abstain — domain outside k8s), salad (RFC-021 stress test — generic CRUD verbs that coincidentally match real k8s symbol names, e.g. DeletePod/GetSecret/SyncPod/WatchPod/CreateNamespace/Insert/UpdateStatus/ListOptions, paired with an off-domain object; expect:[] since the correct behavior is to abstain, matching the salad convention in bench/queries.json). expect: substrings; a result HITS if any returned node sig OR path contains any expect entry (case-insensitive). All expected symbols/paths verified present in the graph via `travsr ask`.",
   "queries": [
     { "id": "L1", "category": "literal", "query": "syncReplicaSet", "expect": ["syncReplicaSet", "replica_set.go"], "note": "ReplicaSetController.syncReplicaSet" },
     { "id": "L2", "category": "literal", "query": "HorizontalController processNextWorkItem", "expect": ["HorizontalController", "podautoscaler/horizontal.go"], "note": "HPA controller" },
@@ -22,6 +22,15 @@
 
     { "id": "N1", "category": "nonsense", "query": "quantum blockchain payment gateway subscription billing invoice", "expect": [], "note": "must abstain — no such domain in k8s" },
     { "id": "N2", "category": "nonsense", "query": "react redux frontend css animation component styling theme", "expect": [], "note": "must abstain — no frontend UI here" },
-    { "id": "N3", "category": "nonsense", "query": "audio waveform synthesizer midi signal processing reverb filter", "expect": [], "note": "must abstain — no audio DSP here" }
+    { "id": "N3", "category": "nonsense", "query": "audio waveform synthesizer midi signal processing reverb filter", "expect": [], "note": "must abstain — no audio DSP here" },
+
+    { "id": "G1", "category": "salad", "query": "delete all user accounts and drop the login database", "expect": [], "note": "'delete'/'drop' coincidentally match DeletePod / DeleteNamespace / dropImageVolumeWithDigest" },
+    { "id": "G2", "category": "salad", "query": "get the customer's shopping cart total and apply a discount", "expect": [], "note": "'get' coincidentally matches GetSecret / GetNode / getNodeInfo" },
+    { "id": "G3", "category": "salad", "query": "sync my music playlist across all my devices", "expect": [], "note": "'sync' coincidentally matches SyncPod" },
+    { "id": "G4", "category": "salad", "query": "watch a movie trailer and leave a star rating", "expect": [], "note": "'watch' coincidentally matches WatchPod / WatchResource" },
+    { "id": "G5", "category": "salad", "query": "insert a new row into the customer spreadsheet", "expect": [], "note": "'insert' coincidentally matches apimachinery sets.Insert" },
+    { "id": "G6", "category": "salad", "query": "create a new email newsletter subscription", "expect": [], "note": "'create' coincidentally matches CreatePod / CreateNamespace / DefaultCreateNamespace" },
+    { "id": "G7", "category": "salad", "query": "update my profile picture and bio on the dating app", "expect": [], "note": "'update' coincidentally matches UpdateStatus / updatePodCondition" },
+    { "id": "G8", "category": "salad", "query": "list all my saved recipes in the cookbook app", "expect": [], "note": "'list' coincidentally matches ListOptions / ListPodStats" }
   ]
 }

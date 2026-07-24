@@ -1,17 +1,17 @@
 {
   "model": "arctic-embed-m-v1.5",
-  "generatedAt": "2026-07-18T14:53:43.337Z",
-  "coldMs": 2058,
+  "generatedAt": "2026-07-17T16:46:52.276Z",
+  "coldMs": 1702,
   "perf": {
     "correctnessSummary": {
       "answerable": 24,
       "nonsense": 3,
-      "hit@1": 0.292,
-      "hit@3": 0.333,
-      "hit@5": 0.333,
-      "hit@10": 0.333,
-      "mrr": 0.312,
-      "abstainAccuracy": 0.667
+      "hit@1": 0.333,
+      "hit@3": 0.375,
+      "hit@5": 0.375,
+      "hit@10": 0.375,
+      "mrr": 0.353,
+      "abstainAccuracy": 0.333
     }
   },
   "correctness": [
@@ -22,7 +22,7 @@
       "expect": [
         "get_context_body"
       ],
-      "medianMs": 367,
+      "medianMs": 51,
       "nodes": 84,
       "confidence": "exact",
       "abstain": false,
@@ -38,7 +38,7 @@
         "SnippetMode",
         "snippet_for_node_full"
       ],
-      "medianMs": 241,
+      "medianMs": 89,
       "nodes": 18,
       "confidence": "exact",
       "abstain": false,
@@ -54,7 +54,7 @@
         "validate_mcp_list_arg",
         "validate_mcp_arg"
       ],
-      "medianMs": 570,
+      "medianMs": 74,
       "nodes": 44,
       "confidence": "exact",
       "abstain": false,
@@ -70,7 +70,7 @@
         "parseSnippetsResult",
         "parse.ts"
       ],
-      "medianMs": 508,
+      "medianMs": 40,
       "nodes": 6,
       "confidence": "exact",
       "abstain": false,
@@ -85,13 +85,13 @@
       "expect": [
         "snippet_line_cap"
       ],
-      "medianMs": 574,
-      "nodes": 58,
+      "medianMs": 94,
+      "nodes": 49,
       "confidence": "exact",
       "abstain": false,
       "hitRank": 1,
       "topSig": "fn:snippet_line_cap",
-      "tokens": 1879
+      "tokens": 1578
     },
     {
       "id": "L6",
@@ -101,13 +101,13 @@
         "ContextExplorerPanel",
         "contextExplorer"
       ],
-      "medianMs": 389,
-      "nodes": 8,
+      "medianMs": 42,
+      "nodes": 9,
       "confidence": "strong",
       "abstain": false,
       "hitRank": 1,
       "topSig": "method:ContextExplorerPanel.dispose",
-      "tokens": 305
+      "tokens": 376
     },
     {
       "id": "C1",
@@ -118,13 +118,13 @@
         "token_budget",
         "block_cost"
       ],
-      "medianMs": 346,
-      "nodes": 116,
+      "medianMs": 108,
+      "nodes": 115,
       "confidence": "exact",
       "abstain": false,
       "hitRank": 11,
       "topSig": "fn:get_context_body",
-      "tokens": 3552
+      "tokens": 3500
     },
     {
       "id": "C2",
@@ -136,7 +136,7 @@
         "strip_control_chars",
         "wrap_envelope"
       ],
-      "medianMs": 602,
+      "medianMs": 84,
       "nodes": 0,
       "confidence": "unknown",
       "abstain": true,
@@ -153,13 +153,13 @@
         "fetchSingleSnippet",
         "contextExplorer"
       ],
-      "medianMs": 319,
-      "nodes": 0,
-      "confidence": "unknown",
-      "abstain": true,
+      "medianMs": 119,
+      "nodes": 82,
+      "confidence": "strong",
+      "abstain": false,
       "hitRank": 0,
-      "topSig": null,
-      "tokens": 166
+      "topSig": "fn:get_lang_status",
+      "tokens": 2660
     },
     {
       "id": "C4",
@@ -170,13 +170,13 @@
         "embed_path_seeds",
         "seed"
       ],
-      "medianMs": 116,
-      "nodes": 0,
-      "confidence": "unknown",
-      "abstain": true,
-      "hitRank": 0,
-      "topSig": null,
-      "tokens": 98
+      "medianMs": 89,
+      "nodes": 1,
+      "confidence": "strong",
+      "abstain": false,
+      "hitRank": 1,
+      "topSig": "fn:seed",
+      "tokens": 54
     },
     {
       "id": "C5",
@@ -188,13 +188,13 @@
         "knn",
         "reindex"
       ],
-      "medianMs": 444,
+      "medianMs": 94,
       "nodes": 26,
       "confidence": "strong",
       "abstain": false,
       "hitRank": 0,
       "topSig": "fn:every_tool_has_input_schema_with_type_object",
-      "tokens": 832
+      "tokens": 843
     },
     {
       "id": "C6",
@@ -205,13 +205,13 @@
         "AstSkeleton",
         "render"
       ],
-      "medianMs": 355,
+      "medianMs": 100,
       "nodes": 66,
       "confidence": "exact",
       "abstain": false,
       "hitRank": 19,
       "topSig": "fn:print_summary",
-      "tokens": 1926
+      "tokens": 1933
     },
     {
       "id": "C7",
@@ -221,13 +221,13 @@
         "knapsack",
         "context_candidates"
       ],
-      "medianMs": 349,
+      "medianMs": 93,
       "nodes": 66,
       "confidence": "strong",
       "abstain": false,
       "hitRank": 1,
       "topSig": "fn:knapsack",
-      "tokens": 2105
+      "tokens": 2089
     },
     {
       "id": "C8",
@@ -238,7 +238,7 @@
         "MAX_ARG_BYTES",
         "path traversal"
       ],
-      "medianMs": 474,
+      "medianMs": 102,
       "nodes": 45,
       "confidence": "exact",
       "abstain": false,
@@ -256,13 +256,13 @@
         "get_snippets",
         "drainQueryQueue"
       ],
-      "medianMs": 228,
+      "medianMs": 103,
       "nodes": 13,
       "confidence": "strong",
       "abstain": false,
       "hitRank": 1,
       "topSig": "method:ContextExplorerPanel.scheduleQuery",
-      "tokens": 532
+      "tokens": 524
     },
     {
       "id": "X2",
@@ -272,33 +272,33 @@
         "snippet_line_cap",
         "snippet_for_node"
       ],
-      "medianMs": 344,
-      "nodes": 54,
+      "medianMs": 97,
+      "nodes": 55,
       "confidence": "exact",
       "abstain": false,
       "hitRank": 0,
       "topSig": "fn:make_node_with_kind_and_path",
-      "tokens": 1647
+      "tokens": 1675
     },
     {
       "id": "N1",
       "category": "nonsense",
       "query": "quantum blockchain payment gateway subscription billing",
       "expect": [],
-      "medianMs": 180,
+      "medianMs": 53,
       "nodes": 0,
       "confidence": "unknown",
       "abstain": true,
       "hitRank": 0,
       "topSig": null,
-      "tokens": 122
+      "tokens": 120
     },
     {
       "id": "N2",
       "category": "nonsense",
       "query": "recursive neural network crypto miner GPU scheduler",
       "expect": [],
-      "medianMs": 172,
+      "medianMs": 90,
       "nodes": 25,
       "confidence": "weak",
       "abstain": false,
@@ -311,59 +311,59 @@
       "category": "nonsense",
       "query": "kubernetes pod autoscaler horizontal replica controller",
       "expect": [],
-      "medianMs": 176,
-      "nodes": 0,
-      "confidence": "unknown",
-      "abstain": true,
+      "medianMs": 60,
+      "nodes": 60,
+      "confidence": "weak",
+      "abstain": false,
       "hitRank": 0,
-      "topSig": null,
-      "tokens": 135
+      "topSig": "fn:run_parallel_reindex",
+      "tokens": 2146
     },
     {
       "id": "G1",
       "category": "salad",
       "query": "delete all user accounts and drop the database",
       "expect": [],
-      "medianMs": 211,
-      "nodes": 0,
-      "confidence": "unknown",
-      "abstain": true,
+      "medianMs": 92,
+      "nodes": 75,
+      "confidence": "strong",
+      "abstain": false,
       "hitRank": 0,
-      "topSig": null,
-      "tokens": 136
+      "topSig": "fn:Guard.drop",
+      "tokens": 2381
     },
     {
       "id": "G2",
       "category": "salad",
       "query": "insert a credit card payment record and process billing",
       "expect": [],
-      "medianMs": 237,
-      "nodes": 0,
-      "confidence": "unknown",
-      "abstain": true,
+      "medianMs": 97,
+      "nodes": 82,
+      "confidence": "weak",
+      "abstain": false,
       "hitRank": 0,
-      "topSig": null,
-      "tokens": 180
+      "topSig": "fn:get_lang_status",
+      "tokens": 2688
     },
     {
       "id": "G3",
       "category": "salad",
       "query": "spawn a new kubernetes deployment and scale replicas",
       "expect": [],
-      "medianMs": 550,
-      "nodes": 0,
-      "confidence": "unknown",
-      "abstain": true,
+      "medianMs": 103,
+      "nodes": 121,
+      "confidence": "strong",
+      "abstain": false,
       "hitRank": 0,
-      "topSig": null,
-      "tokens": 149
+      "topSig": "fn:maybe_spawn_embed_phase_b_complete_detection",
+      "tokens": 3923
     },
     {
       "id": "G4",
       "category": "salad",
       "query": "get the current weather forecast for tomorrow",
       "expect": [],
-      "medianMs": 720,
+      "medianMs": 84,
       "nodes": 0,
       "confidence": "unknown",
       "abstain": true,
@@ -376,7 +376,7 @@
       "category": "salad",
       "query": "load the user's shopping cart and checkout",
       "expect": [],
-      "medianMs": 181,
+      "medianMs": 82,
       "nodes": 1,
       "confidence": "weak",
       "abstain": false,
@@ -389,20 +389,20 @@
       "category": "salad",
       "query": "run a marathon training schedule generator",
       "expect": [],
-      "medianMs": 335,
+      "medianMs": 82,
       "nodes": 0,
       "confidence": "unknown",
       "abstain": true,
       "hitRank": 0,
       "topSig": null,
-      "tokens": 128
+      "tokens": 125
     },
     {
       "id": "G7",
       "category": "salad",
       "query": "build a birthday cake recipe calculator",
       "expect": [],
-      "medianMs": 1450,
+      "medianMs": 90,
       "nodes": 104,
       "confidence": "weak",
       "abstain": false,
@@ -415,42 +415,42 @@
       "category": "salad",
       "query": "write a love poem and save it to my diary",
       "expect": [],
-      "medianMs": 542,
+      "medianMs": 82,
       "nodes": 0,
       "confidence": "unknown",
       "abstain": true,
       "hitRank": 0,
       "topSig": null,
-      "tokens": 123
+      "tokens": 124
     }
   ],
   "perfSweep": {
     "500": {
-      "medianMs": 481,
-      "p95Ms": 505
+      "medianMs": 92,
+      "p95Ms": 92
     },
     "2000": {
-      "medianMs": 1053,
-      "p95Ms": 1142
+      "medianMs": 90,
+      "p95Ms": 90
     },
     "4000": {
-      "medianMs": 531,
-      "p95Ms": 573
+      "medianMs": 91,
+      "p95Ms": 91
     },
     "8000": {
-      "medianMs": 576,
-      "p95Ms": 678
+      "medianMs": 88,
+      "p95Ms": 89
     }
   },
   "snippetModes": {
     "small_fn": {
       "auto": {
-        "medianMs": 1,
+        "medianMs": 0,
         "bytes": 1400,
         "tokens": 350
       },
       "full": {
-        "medianMs": 1,
+        "medianMs": 0,
         "bytes": 1400,
         "tokens": 350
       },
@@ -462,7 +462,7 @@
     },
     "large_fn": {
       "auto": {
-        "medianMs": 29,
+        "medianMs": 30,
         "bytes": 2035,
         "tokens": 509
       },
@@ -472,7 +472,7 @@
         "tokens": 6748
       },
       "skeleton": {
-        "medianMs": 30,
+        "medianMs": 29,
         "bytes": 2035,
         "tokens": 509
       }

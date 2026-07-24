@@ -1,0 +1,23 @@
+[package]
+name = "travsr-rerank"
+description = "In-process cross-encoder relevance arbiter (RFC-021): reranks graph-retrieved candidates against a natural-language query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tract-onnx = { workspace = true }
+tokenizers = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+rayon      = { workspace = true }
+# RFC-021 F8: per-model floor manifest (model.toml) — serialize/parse + the
+# model sha256 that pins floors to a specific model. tempfile backs the atomic
+# manifest write (used at runtime by the self-heal path, not just in tests).
+serde      = { workspace = true }
+toml       = { workspace = true }
+sha2       = { workspace = true }
+tempfile   = { workspace = true }

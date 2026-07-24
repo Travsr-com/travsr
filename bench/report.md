@@ -1,65 +1,73 @@
-# Travsr tool benchmark — `bge-small-en-v1.5`
+# Travsr tool benchmark — `arctic-embed-m-v1.5`
 
-_2026-07-01T10:14:46.269Z_ · repo: travsr (self) · cold first get_context: **407 ms**
+_2026-07-18T14:53:43.337Z_ · repo: travsr · cold first get_context: **2058 ms**
 
 ## 1. Correctness (get_context, budget 2000, 3× median)
 
 | metric | value |
 |---|---|
-| answerable queries | 16 |
-| hit@1 | 0.688 |
-| hit@3 | 0.813 |
-| hit@5 | 0.813 |
-| hit@10 | 0.938 |
-| MRR | 0.756 |
-| abstain accuracy (nonsense) | 0 (0/3) |
+| answerable queries | 24 |
+| hit@1 | 0.292 |
+| hit@3 | 0.333 |
+| hit@5 | 0.333 |
+| hit@10 | 0.333 |
+| MRR | 0.312 |
+| abstain accuracy (nonsense) | 0.667 (2/3) |
 
 ### Per-query
 
 | id | cat | rank | conf | nodes | tok | ms | top result |
 |---|---|---|---|---|---|---|---|
-| L1 | literal | 1 | exact | 34 | 948 | 19 | fn:get_context_body |
-| L2 | literal | 1 | exact | 20 | 473 | 38 | impl:SnippetMode |
-| L3 | literal | 1 | exact | 5 | 161 | 18 | fn:validate_mcp_list_arg |
-| L4 | literal | 1 | exact | 5 | 167 | 20 | fn:parseSnippetsResult |
-| L5 | literal | 1 | strong | 6 | 200 | 35 | fn:snippet_line_cap |
-| L6 | literal | 1 | strong | 17 | 606 | 18 | class:ContextExplorerPanel |
-| C1 | conceptual | 1 | strong | 74 | 1836 | 57 | fn:token_budget_keeps_bfs_prefix_and_reports_cut |
-| C2 | conceptual | 8 | strong | 55 | 1340 | 37 | fn:inline_approval_prompt |
-| C3 | conceptual | 7 | strong | 12 | 351 | 42 | fn:language_from_extension_covers_all_variants |
-| C4 | conceptual | 1 | strong | 55 | 1467 | 39 | fn:ppr |
-| C5 | conceptual | 3 | strong | 64 | 1620 | 58 | fn:normalize_nl_query |
-| C6 | conceptual | 2 | exact | 82 | 2113 | 57 | fn:print_summary |
-| C7 | conceptual | 1 | strong | 59 | 1576 | 42 | fn:knapsack |
-| C8 | conceptual | MISS | strong | 101 | 2552 | 51 | fn:try_new_rejects_too_long |
-| X1 | cross | 1 | strong | 11 | 353 | 46 | fn:get_context |
-| X2 | cross | 1 | strong | 14 | 376 | 45 | fn:snippet_line_cap |
-| N1 | nonsense | salad✗ | weak | 28 | 760 | 35 | fn:extract_bearer |
-| N2 | nonsense | salad✗ | weak | 64 | 1670 | 50 | fn:pcst_is_deterministic_on_tied_cost_topology |
-| N3 | nonsense | salad✗ | weak | 20 | 588 | 39 | fn:Daemon.run |
+| L1 | literal | 1 | exact | 84 | 2625 | 367 | fn:get_context_body |
+| L2 | literal | 3 | exact | 18 | 604 | 241 | fn:validate_capacity_bounds_and_auto |
+| L3 | literal | 1 | exact | 44 | 1389 | 570 | fn:validate_mcp_arg_with_limit |
+| L4 | literal | 1 | exact | 6 | 228 | 508 | fn:parseSnippetsResult |
+| L5 | literal | 1 | exact | 58 | 1879 | 574 | fn:snippet_line_cap |
+| L6 | literal | 1 | strong | 8 | 305 | 389 | method:ContextExplorerPanel.dispose |
+| C1 | conceptual | 11 | exact | 116 | 3552 | 346 | fn:get_context_body |
+| C2 | conceptual | MISS | unknown | 0 | 147 | 602 | — |
+| C3 | conceptual | MISS | unknown | 0 | 166 | 319 | — |
+| C4 | conceptual | MISS | unknown | 0 | 98 | 116 | — |
+| C5 | conceptual | MISS | strong | 26 | 832 | 444 | fn:every_tool_has_input_schema_with_type_object |
+| C6 | conceptual | 19 | exact | 66 | 1926 | 355 | fn:print_summary |
+| C7 | conceptual | 1 | strong | 66 | 2105 | 349 | fn:knapsack |
+| C8 | conceptual | MISS | exact | 45 | 1503 | 474 | fn:run_ra_lsif_timeout_kills_long_running_process |
+| X1 | cross | 1 | strong | 13 | 532 | 228 | method:ContextExplorerPanel.scheduleQuery |
+| X2 | cross | MISS | exact | 54 | 1647 | 344 | fn:make_node_with_kind_and_path |
+| N1 | nonsense | abstain✓ | unknown | 0 | 122 | 180 | — |
+| N2 | nonsense | salad✗ | weak | 25 | 846 | 172 | import:crypto |
+| N3 | nonsense | abstain✓ | unknown | 0 | 135 | 176 | — |
+| G1 | salad | MISS | unknown | 0 | 136 | 211 | — |
+| G2 | salad | MISS | unknown | 0 | 180 | 237 | — |
+| G3 | salad | MISS | unknown | 0 | 149 | 550 | — |
+| G4 | salad | MISS | unknown | 0 | 136 | 720 | — |
+| G5 | salad | MISS | weak | 1 | 121 | 181 | fn:load_config |
+| G6 | salad | MISS | unknown | 0 | 128 | 335 | — |
+| G7 | salad | MISS | weak | 104 | 3190 | 1450 | fn:Resolver.build |
+| G8 | salad | MISS | unknown | 0 | 123 | 542 | — |
 
 ## 2. Performance — get_context budget sweep (3× )
 
 | budget | median ms | p95 ms |
 |---|---|---|
-| 500 | 42 | 44 |
-| 2000 | 41 | 42 |
-| 4000 | 42 | 42 |
-| 8000 | 41 | 42 |
+| 500 | 481 | 505 |
+| 2000 | 1053 | 1142 |
+| 4000 | 531 | 573 |
+| 8000 | 576 | 678 |
 
 ## 3. Performance — get_snippets modes (3× median)
 
 | target | mode | median ms | bytes | ~tokens |
 |---|---|---|---|---|
-| small_fn | auto | 2 | 1400 | 350 |
-| small_fn | full | 2 | 1400 | 350 |
-| small_fn | skeleton | 28 | 1324 | 331 |
-| large_fn | auto | 28 | 2079 | 520 |
-| large_fn | full | 2 | 23856 | 5964 |
-| large_fn | skeleton | 29 | 2079 | 520 |
-| class | auto | 4 | 643 | 161 |
-| class | full | 2 | 9262 | 2316 |
-| class | skeleton | 4 | 643 | 161 |
+| small_fn | auto | 1 | 1400 | 350 |
+| small_fn | full | 1 | 1400 | 350 |
+| small_fn | skeleton | 29 | 1324 | 331 |
+| large_fn | auto | 29 | 2035 | 509 |
+| large_fn | full | 1 | 26990 | 6748 |
+| large_fn | skeleton | 30 | 2035 | 509 |
+| class | auto | 2 | 951 | 238 |
+| class | full | 0 | 9077 | 2269 |
+| class | skeleton | 2 | 951 | 238 |
 
 ## 4. Usefulness (LLM-judge)
 
