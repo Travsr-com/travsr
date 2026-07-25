@@ -37,5 +37,6 @@ across re-indexes and blocking DEBT-014 (#23).
 - `all_edges()` return type changed from `Vec<(NodeId, NodeId, String)>` to
   `Vec<(NodeId, NodeId, String, String)>` — all existing callers needed updating.
 - The `Store` trait does not expose `put_edge_lsif`; it is a concrete method on
-  `SqliteStore` only. If a second backend is added (Kùzu), it must implement the
-  same precedence logic independently.
+  `SqliteStore` only. If a second backend is ever added, it must implement the
+  same precedence logic independently. (Kùzu, once planned as that backend, was
+  dropped in #457 — see ADR-018.)

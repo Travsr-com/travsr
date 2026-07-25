@@ -100,7 +100,7 @@ use travsr_store::Store;
 ///
 /// # Parameters
 ///
-/// - `store` — any `Store` implementor (SQLite or Kùzu)
+/// - `store` — any `Store` implementor (e.g. SQLite)
 /// - `seeds` — query nodes to personalise toward; must be non-empty
 /// - `k` — number of top nodes to return (0 = return all scored nodes)
 ///

@@ -1,5 +1,7 @@
 # Issue #323 — Read-Path Perf Audit Implementation Plan
 
+> **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend. The Kùzu migration-path notes below are kept for historical context. See ADR-018.
+
 > **Status:** Draft — awaiting sign-off
 > **Author:** Engineering (Tech Lead + Senior SWE personas)
 > **Date:** 2026-06-15

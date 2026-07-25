@@ -1,5 +1,7 @@
 # RFC-011: Two-Transport Language Plugin Architecture
 
+> **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend. Kùzu references below are kept for historical context. See ADR-018.
+
 **Status:** Proposed
 **Author:** Principal Architect
 **Date:** 2026-05-30

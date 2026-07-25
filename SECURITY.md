@@ -44,7 +44,6 @@ We follow a **90-day responsible disclosure** policy:
 ### CVE Monitoring
 - [OSV Scanner](https://google.github.io/osv-scanner/) runs nightly against `Cargo.lock`
   and `packages/travsr-lsif-ts/package-lock.json` (`.github/workflows/osv-scan.yml`)
-- Kùzu (C++ native dependency) is included in the scan
 
 ### npm Dependencies
 - `npm audit --audit-level=high` runs on every PR for `packages/travsr-lsif-ts`

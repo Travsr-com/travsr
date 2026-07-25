@@ -15,7 +15,6 @@ mod init;
 mod install;
 mod lang;
 mod logo;
-mod migrate;
 mod pattern;
 mod progress;
 mod references;
@@ -178,12 +177,6 @@ enum Command {
         from_hook: bool,
         /// Paths to re-index (used when calling hook-run directly, without --from-hook).
         paths: Vec<String>,
-    },
-    /// Migrate the graph store to a different backend (e.g. kuzu).
-    Migrate {
-        /// Target backend. Currently supported: kuzu
-        #[arg(long = "to", value_name = "BACKEND")]
-        to: String,
     },
     /// Start the SSE/HTTP MCP server for cloud and team deployments.
     Serve {
@@ -362,6 +355,7 @@ fn init_tracing() {
 
     #[cfg(feature = "otlp")]
     {
+        use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_otlp::WithExportConfig as _;
         use tracing_subscriber::prelude::*;
 
@@ -691,7 +685,6 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Command::Migrate { to } => migrate::run_to(&to)?,
         Command::Serve { port, tenants_dir } => {
             serve::run(port, tenants_dir).await?;
         }

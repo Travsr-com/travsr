@@ -19,7 +19,7 @@ cargo fmt --all
 ```
 feature/<crate>-<short-description>   e.g. feature/travsr-retrieval-ppr
 fix/<crate>-<short-description>       e.g. fix/travsr-indexer-tsx-parsing
-rfc/<number>-<title>                  e.g. rfc/005-kuzudb-migration
+rfc/<number>-<title>                  e.g. rfc/003-multilang-indexer
 ```
 
 ## Pull Request Requirements

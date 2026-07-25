@@ -4,6 +4,14 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## Unreleased
+
+### Removed
+
+- **Kùzu storage backend dropped (#457).** The optional, feature-gated Kùzu backend (`--features kuzu`), the `travsr migrate --to kuzu` command and its SQLite→Kùzu migration + integrity manifest, the SQLite/Kùzu parity harness, the nightly Kùzu CI workflow, and the `kuzu` dependency have all been removed. SQLite+WAL is the storage backend for both MVP and production; RocksDB remains a possible future hyperscale backend. See `docs/adrs/ADR-018-drop-kuzu-backend.md`.
+
+---
+
 ## v0.11.0 - 2026-07-12
 
 ### travsr binary

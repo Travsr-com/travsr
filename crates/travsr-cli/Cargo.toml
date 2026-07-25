@@ -54,9 +54,6 @@ tracing-opentelemetry = { workspace = true, optional = true }
 
 [features]
 default = []
-# Enables the Kùzu production backend. Requires CMake + C++ toolchain.
-# Propagates to travsr-store/kuzu which builds the Kùzu C++ library.
-kuzu = ["travsr-store/kuzu"]
 # Enable OTLP trace export via gRPC. Off by default — requires a running
 # OTLP collector (e.g. OpenTelemetry Collector, Jaeger, Tempo).
 # Configure endpoint via TRAVSR_OTLP_ENDPOINT env var (default: http://localhost:4317).

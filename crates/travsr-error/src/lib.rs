@@ -76,7 +76,7 @@ impl TravsrError {
 
 // ── Sub-error types ───────────────────────────────────────────────────────────
 
-/// Errors originating in the storage layer (SQLite, Kùzu, RocksDB).
+/// Errors originating in the storage layer (SQLite, RocksDB).
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("database error: {0}")]

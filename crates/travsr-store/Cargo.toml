@@ -1,6 +1,6 @@
 [package]
 name = "travsr-store"
-description = "Storage abstraction for the Travsr graph (SQLite / Kùzu / RocksDB)"
+description = "Storage abstraction for the Travsr graph (SQLite / RocksDB)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,22 +10,14 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Enable the Kùzu production storage backend. Builds the Kùzu C++ library
-# from source (requires CMake + a C++ toolchain). Off by default so that
-# normal `cargo build/test` is unaffected by the heavy compile step.
-kuzu = ["dep:kuzu"]
 
 [dependencies]
 travsr-error = { workspace = true }
 travsr-core = { path = "../travsr-core" }
 rusqlite    = { workspace = true }
 anyhow      = { workspace = true }
-serde       = { workspace = true }
 serde_json  = { workspace = true }
-sha2        = { workspace = true }
-thiserror   = { workspace = true }
 tracing     = { workspace = true }
-kuzu        = { version = "0.11", optional = true }
 fs2         = { workspace = true }
 
 [dev-dependencies]
