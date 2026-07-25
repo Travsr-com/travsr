@@ -3140,6 +3140,78 @@ mod tests {
         );
         assert_ne!(last, pb, "mismatch means Phase B stale");
     }
+
+    /// #464: an out-of-band graph.db writer (`fsck --fix` from a separate
+    /// process/connection) never advances `last_commit`/`phase_b_commit`, so
+    /// the warm query cache must key on the read connection's `data_version`
+    /// to avoid serving pre-delete results indefinitely.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn query_cache_invalidated_by_out_of_band_delete() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        // Three files so deleting one stays under the 50% mass-delete breaker.
+        std::fs::write(
+            tmp.path().join("prime.ts"),
+            "export function isPrime(n: number): boolean { return n > 1; }",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("a.ts"), "export class Alpha { run() {} }").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "export class Beta { run() {} }").unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        // The daemon's long-lived read connection (R5 #342).
+        let read_store = SqliteStore::open_read_only(&db_path).unwrap();
+        let mut cache = query_cache::QueryCache::new(8);
+
+        let markers = |s: &SqliteStore| {
+            (
+                s.get_meta("last_commit").ok().flatten().unwrap_or_default(),
+                s.get_meta("phase_b_commit")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                s.data_version().unwrap_or(0),
+            )
+        };
+
+        let args = serde_json::json!({ "query": "isPrime" });
+        let (last, pb, dv) = markers(&read_store);
+        let warm = run_query(&read_store, "ask", args.clone()).unwrap();
+        assert_eq!(
+            warm["matched"],
+            serde_json::json!(true),
+            "pre-delete ask must hit"
+        );
+        cache.put("ask", &args, &last, &pb, dv, warm.clone());
+
+        // Out-of-band repair: delete the file on disk, then fsck --fix from a
+        // separate connection — exactly the reproduction in #464.
+        std::fs::remove_file(tmp.path().join("prime.ts")).unwrap();
+        let report = fsck_repo(tmp.path(), true, false).unwrap();
+        assert_eq!(report.ghost_paths, vec!["prime.ts".to_string()]);
+
+        // Commit markers did not move…
+        let (last2, pb2, dv2) = markers(&read_store);
+        assert_eq!((last.as_str(), pb.as_str()), (last2.as_str(), pb2.as_str()));
+        // …but data_version did, so the cached pre-delete entry stops matching.
+        assert_ne!(dv, dv2, "out-of-band write must bump data_version");
+        assert!(
+            cache.get("ask", &args, &last2, &pb2, dv2).is_none(),
+            "stale warm-cache entry must not be served after fsck --fix"
+        );
+        // A fresh query through the same warm read connection sees the deletion.
+        let fresh = run_query(&read_store, "ask", args).unwrap();
+        assert_eq!(
+            fresh["matched"],
+            serde_json::json!(false),
+            "deleted node must not resurface"
+        );
+    }
 }
 
 // ControlMessage and ControlResponse are now in travsr_ipc — no local defs needed.
@@ -3973,16 +4045,32 @@ fn handle_control_message(
                 .ok()
                 .flatten()
                 .unwrap_or_default();
+            // #464: also key on the read connection's SQLite data_version so
+            // out-of-band graph.db writers (fsck --fix, manual sqlite3) that
+            // never bump the commit markers still invalidate cached results.
+            // Read once and reuse for the put: if the DB changes mid-query, the
+            // entry is stamped with the pre-change version and simply stops
+            // matching on the next lookup — conservative, never stale.
+            let data_version = s.data_version().unwrap_or(0);
             {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit) {
+                if let Some(cached) =
+                    c.get(&tool, &args, &last_commit, &phase_b_commit, data_version)
+                {
                     return (ControlResponse::query_result(cached), false);
                 }
             }
             match run_query(&s, &tool, args.clone()) {
                 Ok(value) => {
                     let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-                    c.put(&tool, &args, &last_commit, &phase_b_commit, value.clone());
+                    c.put(
+                        &tool,
+                        &args,
+                        &last_commit,
+                        &phase_b_commit,
+                        data_version,
+                        value.clone(),
+                    );
                     (ControlResponse::query_result(value), false)
                 }
                 Err(e) => (ControlResponse::err(format!("query failed: {e:#}")), false),

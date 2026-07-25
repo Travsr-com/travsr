@@ -999,6 +999,22 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Return SQLite's `PRAGMA data_version` as seen by this connection.
+    ///
+    /// The value increments whenever the database file is modified by *another*
+    /// connection — including a separate process such as `travsr fsck --fix` or
+    /// a manual `sqlite3` edit. It does NOT change for writes made through this
+    /// connection itself, so callers holding a read-only connection observe
+    /// every out-of-band mutation (issue #464: the daemon's query cache keys on
+    /// this so direct `graph.db` writers structurally invalidate cached results).
+    pub fn data_version(&self) -> Result<u64, StoreError> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .context("querying data_version")
+            .map(|v| v as u64)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Return the live journal mode reported by SQLite. Useful in tests.
     pub fn journal_mode(&self) -> Result<String, StoreError> {
         self.conn

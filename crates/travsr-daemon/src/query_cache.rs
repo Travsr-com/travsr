@@ -1,18 +1,21 @@
 //! In-daemon LRU result cache for read-only CLI queries (#318 O2).
 //!
-//! Keyed by `(tool, args, last_commit, phase_b_commit)`. The git commit hook
-//! advances `last_commit` and the background Phase B pass advances
-//! `phase_b_commit` (#318 O3), so *any* graph mutation changes the key. That
-//! makes invalidation structural: stale entries simply stop matching and age
-//! out via LRU eviction — there is no explicit `invalidate()` to forget to call
-//! on a mutation path.
+//! Keyed by `(tool, args, last_commit, phase_b_commit, data_version)`. The git
+//! commit hook advances `last_commit` and the background Phase B pass advances
+//! `phase_b_commit` (#318 O3); `data_version` is SQLite's `PRAGMA data_version`
+//! as seen by the daemon's read connection, which increments on *any* write to
+//! `graph.db` from another connection — including out-of-band writers such as
+//! `travsr fsck --fix` that never touch the commit markers (#464). Together,
+//! any graph mutation changes the key. That makes invalidation structural:
+//! stale entries simply stop matching and age out via LRU eviction — there is
+//! no explicit `invalidate()` to forget to call on a mutation path.
 //!
 //! The cache is not thread-safe on its own; the daemon wraps it in a `Mutex`.
 
 use std::collections::HashMap;
 
-/// Cache key: the query identity plus the two commit markers that bound graph
-/// freshness.
+/// Cache key: the query identity plus the markers that bound graph freshness —
+/// the two commit markers and the read connection's SQLite `data_version`.
 ///
 /// `args` is the canonical JSON serialization of the query args. A
 /// `serde_json::Value` object serializes its keys in sorted (`BTreeMap`) order,
@@ -24,6 +27,7 @@ struct CacheKey {
     args: String,
     last_commit: String,
     phase_b_commit: String,
+    data_version: u64,
 }
 
 /// Bounded LRU over serialized query results.
@@ -53,12 +57,14 @@ impl QueryCache {
         args: &serde_json::Value,
         last_commit: &str,
         phase_b_commit: &str,
+        data_version: u64,
     ) -> CacheKey {
         CacheKey {
             tool: tool.to_string(),
             args: serde_json::to_string(args).unwrap_or_default(),
             last_commit: last_commit.to_string(),
             phase_b_commit: phase_b_commit.to_string(),
+            data_version,
         }
     }
 
@@ -69,8 +75,9 @@ impl QueryCache {
         args: &serde_json::Value,
         last_commit: &str,
         phase_b_commit: &str,
+        data_version: u64,
     ) -> Option<serde_json::Value> {
-        let k = Self::key(tool, args, last_commit, phase_b_commit);
+        let k = Self::key(tool, args, last_commit, phase_b_commit, data_version);
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         let entry = self.entries.get_mut(&k)?;
@@ -86,9 +93,10 @@ impl QueryCache {
         args: &serde_json::Value,
         last_commit: &str,
         phase_b_commit: &str,
+        data_version: u64,
         value: serde_json::Value,
     ) {
-        let k = Self::key(tool, args, last_commit, phase_b_commit);
+        let k = Self::key(tool, args, last_commit, phase_b_commit, data_version);
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         self.entries.insert(k, (value, tick));
@@ -123,10 +131,10 @@ mod tests {
     fn hit_after_put_same_key() {
         let mut c = QueryCache::new(8);
         let args = json!({"seed": "Foo", "direction": "both"});
-        assert!(c.get("graph", &args, "abc", "abc").is_none());
-        c.put("graph", &args, "abc", "abc", json!({"nodes": 3}));
+        assert!(c.get("graph", &args, "abc", "abc", 1).is_none());
+        c.put("graph", &args, "abc", "abc", 1, json!({"nodes": 3}));
         assert_eq!(
-            c.get("graph", &args, "abc", "abc"),
+            c.get("graph", &args, "abc", "abc", 1),
             Some(json!({"nodes": 3}))
         );
     }
@@ -136,9 +144,16 @@ mod tests {
         // Same logical args built in different key order must collide — the
         // canonical (sorted) JSON serialization guarantees this.
         let mut c = QueryCache::new(8);
-        c.put("graph", &json!({"a": 1, "b": 2}), "c1", "c1", json!("hit"));
+        c.put(
+            "graph",
+            &json!({"a": 1, "b": 2}),
+            "c1",
+            "c1",
+            1,
+            json!("hit"),
+        );
         assert_eq!(
-            c.get("graph", &json!({"b": 2, "a": 1}), "c1", "c1"),
+            c.get("graph", &json!({"b": 2, "a": 1}), "c1", "c1", 1),
             Some(json!("hit"))
         );
     }
@@ -149,13 +164,34 @@ mod tests {
         // Phase B) must miss — structural invalidation.
         let mut c = QueryCache::new(8);
         let args = json!({"seed": "Foo"});
-        c.put("graph", &args, "c1", "p1", json!("old"));
+        c.put("graph", &args, "c1", "p1", 1, json!("old"));
         assert!(
-            c.get("graph", &args, "c2", "p1").is_none(),
+            c.get("graph", &args, "c2", "p1", 1).is_none(),
             "last_commit moved"
         );
-        assert!(c.get("graph", &args, "c1", "p2").is_none(), "phase_b moved");
-        assert_eq!(c.get("graph", &args, "c1", "p1"), Some(json!("old")));
+        assert!(
+            c.get("graph", &args, "c1", "p2", 1).is_none(),
+            "phase_b moved"
+        );
+        assert_eq!(c.get("graph", &args, "c1", "p1", 1), Some(json!("old")));
+    }
+
+    #[test]
+    fn data_version_advance_misses() {
+        // #464: an out-of-band write to graph.db (fsck --fix, manual sqlite3)
+        // bumps the read connection's data_version without touching either
+        // commit marker — the cached entry must stop matching.
+        let mut c = QueryCache::new(8);
+        let args = json!({"query": "isPrime"});
+        c.put("ask", &args, "c1", "p1", 1, json!("pre-delete"));
+        assert!(
+            c.get("ask", &args, "c1", "p1", 2).is_none(),
+            "data_version moved"
+        );
+        assert_eq!(
+            c.get("ask", &args, "c1", "p1", 1),
+            Some(json!("pre-delete"))
+        );
     }
 
     #[test]
@@ -164,20 +200,20 @@ mod tests {
         let a = json!({"k": "a"});
         let b = json!({"k": "b"});
         let d = json!({"k": "d"});
-        c.put("graph", &a, "c", "c", json!(1));
-        c.put("graph", &b, "c", "c", json!(2));
+        c.put("graph", &a, "c", "c", 1, json!(1));
+        c.put("graph", &b, "c", "c", 1, json!(2));
         // Touch `a` so `b` becomes the LRU victim.
-        assert!(c.get("graph", &a, "c", "c").is_some());
-        c.put("graph", &d, "c", "c", json!(3));
+        assert!(c.get("graph", &a, "c", "c", 1).is_some());
+        c.put("graph", &d, "c", "c", 1, json!(3));
         assert_eq!(c.len(), 2);
         assert!(
-            c.get("graph", &b, "c", "c").is_none(),
+            c.get("graph", &b, "c", "c", 1).is_none(),
             "b should be evicted"
         );
         assert!(
-            c.get("graph", &a, "c", "c").is_some(),
+            c.get("graph", &a, "c", "c", 1).is_some(),
             "a was kept (recent)"
         );
-        assert!(c.get("graph", &d, "c", "c").is_some(), "d is newest");
+        assert!(c.get("graph", &d, "c", "c", 1).is_some(), "d is newest");
     }
 }
