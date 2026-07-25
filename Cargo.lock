@@ -4142,7 +4142,6 @@ dependencies = [
  "anyhow",
  "fs2",
  "rusqlite",
- "serde",
  "serde_json",
  "tempfile",
  "tracing",
