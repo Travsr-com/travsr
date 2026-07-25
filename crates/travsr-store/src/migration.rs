@@ -2,22 +2,14 @@
 //!
 //! ## Why this exists
 //! The original `SqliteStore::migrate()` was a private method that applied
-//! a static `&[&str]` of SQL strings. Kùzu uses Cypher DDL — not SQL — so
-//! that approach cannot be shared. This module decouples migration logic from
-//! the backend implementation so both SQLite and Kùzu (and any future engine)
-//! register their own migration structs and share the same versioned runner.
+//! a static `&[&str]` of SQL strings. This module decouples migration logic
+//! from the backend implementation so SQLite (and any future engine) registers
+//! its own migration structs and shares the same versioned runner.
 //!
 //! ## Design
 //! - `Migration` — one schema change, identified by a monotonic version number
 //! - `StoreMigratable` — extends `Store` with DDL execution + version tracking
 //! - `MigrationRunner` — applies pending migrations in version order; idempotent
-//!
-//! ## Kùzu wiring (feature = "kuzu")
-//! When the `kuzu` feature lands, `KuzuStore` implements `StoreMigratable`
-//! (`exec_ddl` calls `Connection::query`, `schema_version`/`set_schema_version`
-//! read/write the Kùzu meta node table) and registers Cypher DDL migrations
-//! via a `kuzu_migration_runner()` factory. No changes to this module are
-//! required — the trait and runner are backend-agnostic by construction.
 
 use anyhow::{Context as _, Result};
 
@@ -28,7 +20,7 @@ use crate::Store;
 /// A single schema migration identified by a monotonically increasing version.
 ///
 /// Implementations are backend-specific: SQLite migrations call `exec_ddl`
-/// with SQL strings; Kùzu migrations call it with Cypher DDL.
+/// with SQL strings.
 ///
 /// Version numbers start at 1. Version 0 means "no migrations applied yet"
 /// (fresh database). Every `Migration` must have a unique, stable `version()`.
@@ -49,8 +41,7 @@ use crate::Store;
 ///
 /// If strict atomicity is required in the future, extend `StoreMigratable` with
 /// `begin_tx(&mut self) -> Result<()>` / `commit_tx(&mut self) -> Result<()>`
-/// and wrap each migration in a DDL transaction (supported by both SQLite and
-/// Kùzu).
+/// and wrap each migration in a DDL transaction.
 pub trait Migration: Send + Sync {
     /// The schema version this migration upgrades TO.
     fn version(&self) -> u32;
@@ -81,9 +72,6 @@ pub trait Migration: Send + Sync {
 /// - **SQLite** — `exec_ddl` calls `rusqlite::Connection::execute_batch`;
 ///   `schema_version`/`set_schema_version` read/write the `meta` table;
 ///   `column_exists` queries `pragma_table_info`.
-/// - **Kùzu** — `exec_ddl` calls `kuzu::Connection::query` with Cypher DDL;
-///   version is stored in the Kùzu `meta` node table; Cypher DDL is natively
-///   idempotent so the default `column_exists` returning `false` is sufficient.
 ///
 /// # Note on supertrait bound
 /// `StoreMigratable: Store` is broader than strictly required by the runner

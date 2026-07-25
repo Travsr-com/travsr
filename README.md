@@ -247,41 +247,7 @@ travsr embed init                    Initialize the embedding index for this rep
 travsr embed status                  Show embedding index status
 travsr embed reindex                 Rebuild the embedding index
 travsr embed switch <model>          Switch to a different embedding model
-travsr migrate --to kuzu             Migrate the graph store from SQLite to Kuzu backend
 ```
-
-### travsr migrate
-
-Migrate an existing SQLite graph to the Kùzu production backend. The SQLite
-database is never deleted; both backends coexist and `travsr status` continues
-to read from SQLite after migration.
-
-```bash
-# Requires a kuzu-enabled build (see Build from Source below)
-travsr migrate --to kuzu
-```
-
-```
-sqlite source : .travsr/graph.db
-  nodes       : 18432
-  edges       : 94107
-  sha256      : a3f2...
-
-migrating to kuzu at .travsr/graph.kuzu …
-
-migration complete.
-  kuzu path   : .travsr/graph.kuzu
-  nodes       : 18432
-  edges       : 94107
-  sha256      : a3f2...
-
-tip: SQLite graph is unchanged; `travsr status` reads graph.db
-     and shows the same counts as before.
-```
-
-The migration computes a SHA-256 integrity manifest of every node and edge
-before and after the copy. If the digests don't match, the staging directory is
-removed and the SQLite store is left intact.
 
 ### travsr graph
 
@@ -358,18 +324,16 @@ The extension uses your installed `travsr` binary. Set `travsr.binaryPath` in VS
 
 ---
 
-## Storage Backends
+## Storage Backend
 
 | Backend | Flag | Notes | Status |
 |---|---|---|---|
 | SQLite + WAL | _(default)_ | Zero setup, works everywhere | Available |
-| Kuzu | `--features kuzu` | Native property-graph engine, production workloads | Available |
 
-SQLite is the default and requires no additional dependencies. Kuzu is available
-behind a feature flag and requires CMake and a C++ toolchain to build.
-
-To migrate an existing SQLite graph to Kùzu, build with `--features kuzu` and
-run `travsr migrate --to kuzu`.
+SQLite + WAL is the storage backend and requires no additional dependencies.
+Kùzu was previously offered as an optional backend but was dropped
+(see `docs/adrs/ADR-018-drop-kuzu-backend.md`). RocksDB remains a possible future
+hyperscale backend.
 
 ---
 
@@ -388,12 +352,6 @@ git commit
         └─▶ travsr hook-run <changed files>
               └─▶ SHA-256 delta: only re-indexes changed files
                     └─▶ graph.db updated, last_commit SHA recorded
-
-travsr migrate --to kuzu   (optional, kuzu build only)
-  └─▶ SHA-256 manifest of all edges computed from SQLite
-        └─▶ nodes + edges bulk-copied to .travsr/graph.kuzu.new (staging)
-              └─▶ post-copy manifest compared; mismatch aborts, SQLite intact
-                    └─▶ atomic rename: graph.kuzu.new → graph.kuzu
 ```
 
 **Graph stays current via the post-commit hook.** Every committed change is
@@ -455,11 +413,8 @@ license policy, banned crates). A nightly OSV scan checks for new CVEs against
 git clone https://github.com/Travsr-com/travsr
 cd travsr
 
-# Default build (SQLite backend only)
+# Build (SQLite backend)
 cargo build --release   # requires Rust 1.75+
-
-# With Kùzu production backend (requires CMake + C++ toolchain)
-cargo build --release --features kuzu
 
 # Override the npm-installed binary with a local build
 cp target/release/travsr $(which travsr)
@@ -489,13 +444,6 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 - **Stale entries in `travsr repos` (Exists = no)**
   Safe to ignore; they are skipped automatically. They appear when a repo
   was deleted or moved after being indexed.
-
-- **`travsr migrate`: kuzu feature not enabled**
-  Rebuild with `cargo build --features kuzu` (requires CMake and a C++ toolchain).
-
-- **`travsr migrate`: Kùzu store already exists**
-  Migration was already completed. Run `travsr status` to verify counts.
-  Remove `.travsr/graph.kuzu` manually only if you need to re-migrate.
 
 - **Binary not found after npm install?**
   Set `TRAVSR_BINARY=/path/to/travsr` to use a local build instead.

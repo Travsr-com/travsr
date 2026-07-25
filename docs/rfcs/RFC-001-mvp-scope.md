@@ -1,5 +1,7 @@
 # RFC-001: MVP Scope (Phase 1)
 
+> **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend (RocksDB remains a possible future hyperscale option). Kùzu references below are kept for historical context. See ADR-018.
+
 | Field    | Value           |
 |----------|-----------------|
 | Status   | Draft           |

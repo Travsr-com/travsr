@@ -1,27 +1,16 @@
 //! travsr-store — pluggable graph storage backend.
 //!
-//! The MVP uses SQLite (WAL) via `rusqlite`; production replaces this with
-//! Kùzu, and hyperscale moves to RocksDB. All backends implement the
-//! `Store` trait below.
+//! The MVP uses SQLite (WAL) via `rusqlite`; hyperscale later moves to RocksDB.
+//! All backends implement the `Store` trait below.
 
 #![forbid(unsafe_code)]
 
 pub mod fts_tokenize;
 pub mod migration;
-pub mod migration_manifest;
 pub mod registry;
 mod seed_lexicon;
 
-#[cfg(feature = "kuzu")]
-pub mod kuzu_store;
-#[cfg(feature = "kuzu")]
-pub use kuzu_store::KuzuStore;
-
 pub use migration::{Migration, MigrationRunner, StoreMigratable};
-pub use migration_manifest::compute_manifest_sqlite;
-#[cfg(feature = "kuzu")]
-pub use migration_manifest::{compute_manifest_kuzu, migrate_sqlite_to_kuzu};
-pub use migration_manifest::{Manifest, ManifestEntry, MigrationError};
 
 use std::path::Path;
 use std::sync::Arc;

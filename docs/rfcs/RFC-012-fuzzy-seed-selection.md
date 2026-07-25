@@ -1,5 +1,7 @@
 # RFC-012: Fuzzy Seed Selection
 
+> **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend. The `kuzu`-feature analogy below refers to a removed feature and is kept for historical context. See ADR-018.
+
 | Field | Value |
 |---|---|
 | **Status** | Draft |

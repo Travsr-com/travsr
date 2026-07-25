@@ -1,5 +1,7 @@
 # RFC-008: Multi-Language Extension Architecture
 
+> **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend. Kùzu references below are kept for historical context. See ADR-018.
+
 **Status:** Draft
 **Author:** Tech Lead
 **Date:** 2026-05-27

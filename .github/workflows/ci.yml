@@ -140,8 +140,6 @@ jobs:
           key: msrv
 
       - name: Check workspace compiles on MSRV
-        # Exclude --all-features: the `kuzu` feature requires CMake + C++
-        # toolchain and is separately tested in release.yml kuzu-proof-build.
         run: cargo check --workspace
 
   deny:

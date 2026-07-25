@@ -1,5 +1,7 @@
 # RFC-010: 0-1 Knapsack Token-Budget Enforcer
 
+> **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend. The `KuzuStore` stub requirements below no longer apply and are kept for historical context. See ADR-018.
+
 | Field | Value |
 |---|---|
 | **Status** | Draft |

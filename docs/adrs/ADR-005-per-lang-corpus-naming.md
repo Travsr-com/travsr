@@ -88,7 +88,7 @@ CREATE INDEX idx_nodes_language ON nodes(language);
 CREATE INDEX idx_nodes_package  ON nodes(package);
 ```
 
-The defaults backfill existing v3 databases without churn (every node pre-Phase-3 is TypeScript with no specific package identity — empty string is the safe sentinel). Parity test (QA-010) must be extended to assert SQLite ↔ Kùzu equality on both new columns.
+The defaults backfill existing v3 databases without churn (every node pre-Phase-3 is TypeScript with no specific package identity — empty string is the safe sentinel). (The SQLite ↔ Kùzu parity test QA-010 referenced here no longer applies: Kùzu was dropped in #457 — see ADR-018.)
 
 ---
 

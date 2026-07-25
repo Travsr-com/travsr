@@ -1,13 +1,12 @@
 name: Phase 2 Exit Criteria
 
 # Runs alongside CI on every push to master and every PR.
-# All four Phase 2 exit criteria must pass before merging Phase 3 work.
+# All Phase 2 exit criteria must pass before merging Phase 3 work.
 #
 # Exit criteria (Issue #33 / S7-2):
 #   1. PPR returns documented top-k on the 1k-file TypeScript fixture
 #   2. Indexer ingests LSIF dump in < 30 s on the fixture
-#   3. Kùzu backend passes the same correctness suite as SQLite
-#   4. Bench: query p95 under 50 ms (via scripts/check-p95.sh)
+#   3. Bench: query p95 under 50 ms (via scripts/check-p95.sh)
 
 on:
   push:
@@ -46,39 +45,7 @@ jobs:
       - name: LSIF ingest 1k symbols < 30 s
         run: cargo test -p travsr-indexer --test lsif_1k -- --nocapture
 
-  # ── Criterion 3: Kùzu backend parity ────────────────────────────────────────
-  # Gated on the `kuzu` feature; skipped when Kùzu is not enabled.
-  # The parity harness asserts SQLite ≡ Kùzu for all Store trait operations.
-  #
-  # Kùzu builds its C++ library from source (CMake + g++) via build.rs.
-  # ubuntu-latest ships cmake and build-essential (g++) pre-installed — no
-  # extra installation step needed. Issue #112 verified kuzu 0.11.3 API:
-  # QueryResult::next() returns Option<Vec<kuzu::Value>> (owned, Sized) —
-  # the code compiles correctly against 0.11.3.
-  kuzu-parity:
-    name: Kùzu backend parity
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: phase2-kuzu
-
-      - name: Run Kùzu parity + unit tests (--features kuzu)
-        # Runs both the parity integration test and the kuzu_store unit tests
-        # (mod tests inside kuzu_store.rs). `--test parity` would skip the
-        # unit tests; without `--test`, cargo runs all test targets together.
-        run: cargo test -p travsr-store --features kuzu -- --nocapture
-
-  # ── Criterion 4: bench p95 < 50 ms ─────────────────────────────────────────
+  # ── Criterion 3: bench p95 < 50 ms ─────────────────────────────────────────
   bench-gate:
     name: Bench p95 < 50 ms
     runs-on: ubuntu-latest

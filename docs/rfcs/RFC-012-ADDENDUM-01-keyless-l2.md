@@ -1,5 +1,7 @@
 # RFC-012 · Addendum 01 — Key-Free L2 Query Understanding
 
+> **Superseded in part (#457):** Kùzu was dropped as a storage backend; SQLite+WAL is the only backend (RocksDB remains a possible future hyperscale option). The storage-tier portability discussion below referencing Kùzu is kept for historical context. See ADR-018.
+
 | Field | Value |
 |---|---|
 | **Status** | Draft (ratification gate before fold-in to RFC-012) |
