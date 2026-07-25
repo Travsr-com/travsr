@@ -2446,6 +2446,24 @@ pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
     false
 }
 
+/// #462: nodes that are never useful as `get_context` *relevance results*, even
+/// though they are legitimate graph nodes the ingest/`is_noise_node` layer keeps
+/// (so `get_callers`/`get_dependencies` can still reach them). Applied to the
+/// final candidate list (seeds + PPR expansion) so CI/workflow package nodes and
+/// bare file nodes stop leaking into the context as budget filler. A superset of
+/// [`is_noise_seed`]; unlike a score floor it is purely structural, so it can
+/// never evict a genuine answer regardless of that answer's relevance score.
+fn is_context_result_noise(node: &CoreNode) -> bool {
+    is_noise_seed(node)
+        // CI/workflow dependency package nodes (pkg:actions/*, pkg:<dep>@<sha>) —
+        // real ExternalDependency nodes, but never an answer to a code query.
+        || node.kind == "package"
+        || node.vname.signature.starts_with("pkg:")
+        // Bare file nodes carry no symbol body; a symbol from the file is a
+        // better relevance result than the file container itself.
+        || node.kind == "file"
+}
+
 /// Derive PPR seeds from symbol-level KNN results with score-based selection.
 ///
 /// Strategy:
@@ -3161,11 +3179,33 @@ fn get_context_body(
         items
     };
 
+    // #462: context-noise filter on the FINAL candidate list (seeds + PPR
+    // expansion). `is_noise_seed` already runs on seeds, but the expansion tail
+    // ([via: context/dependency]) is never re-filtered, so CI/workflow package
+    // nodes (pkg:actions/*), bare file nodes, and vendored/test-dir nodes leak
+    // into the output as near-zero-score budget filler. Score-independent and
+    // universal (applies to every query), so it cannot evict a real answer.
+    let items: Vec<(CoreNode, f32)> = items
+        .into_iter()
+        .filter(|(n, _)| !is_context_result_noise(n))
+        .collect();
+
     // Issue B: relevance floor — drop score-0 tail before knapsack so zero-signal nodes
     // cannot consume token budget and push genuinely relevant nodes into overflow.
     // Safety valve: always keep the top MIN_KEEP items so thin-but-legitimate results
     // are never emptied. Floor is env-overridable for tuning without a rebuild.
-    const REL_FLOOR_DEFAULT: f32 = 0.01;
+    // #462: 0.03 (3% of the top node's normalized score) trims the long
+    // near-zero PPR-expansion tail that padded the token budget. Relative to each
+    // query's own top score and guarded by MIN_KEEP, so it adapts to weak/low-
+    // scoring conceptual queries without evicting the answer (hit-rate is
+    // identical at 0.01 vs 0.05 on travsr and kubernetes benches). 0.03 rather
+    // than 0.05: measured on multi-concept queries, the 0.01->0.03 cut removes
+    // ~82% off-topic nodes (near-pure noise, on-topic density 26%->29%), while
+    // 0.03->0.05 starts removing on-topic nodes at the set's own density rate
+    // (thinning secondary context, e.g. the "reindex" half of a "watch + reindex"
+    // query). 0.03 keeps the precision gain without over-pruning richness. Was
+    // 0.01, which was too permissive to remove the tail at all.
+    const REL_FLOOR_DEFAULT: f32 = 0.03;
     const MIN_KEEP: usize = 8;
     let rel_floor = std::env::var("TRAVSR_CONTEXT_REL_FLOOR")
         .ok()
@@ -4569,6 +4609,44 @@ mod tests {
     }
 
     // ── search_symbol / get_callers path:line tests ───────────────────────────
+
+    #[test]
+    fn context_result_noise_drops_ci_packages_files_and_tests_keeps_real_symbols() {
+        use travsr_core::{Node, VName};
+        let node = |path: &str, kind: &str, sig: &str| {
+            Node::new(VName::new("", "", path, "rust", sig), kind)
+        };
+        // Dropped: CI/workflow package nodes (both by kind and by pkg: signature).
+        assert!(is_context_result_noise(&node(
+            "",
+            "package",
+            "pkg:actions/checkout@abc123"
+        )));
+        assert!(is_context_result_noise(&node(
+            "",
+            "function",
+            "pkg:some/dep@1.0"
+        )));
+        // Dropped: bare file nodes.
+        assert!(is_context_result_noise(&node("src/foo.rs", "file", "file")));
+        // Dropped: everything is_noise_seed rejects (e.g. integration-test dir).
+        assert!(is_context_result_noise(&node(
+            "tests/it.rs",
+            "function",
+            "fn:it_works"
+        )));
+        // Kept: real source symbols (the answers we must never evict).
+        assert!(!is_context_result_noise(&node(
+            "crates/travsr-mcp/src/tools.rs",
+            "function",
+            "fn:get_context_body"
+        )));
+        assert!(!is_context_result_noise(&node(
+            "src/daemon.rs",
+            "struct",
+            "struct:Daemon"
+        )));
+    }
 
     #[test]
     fn search_symbol_emits_path_line_when_present() {
