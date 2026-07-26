@@ -130,6 +130,41 @@ fn semantic_veto_floor() -> f32 {
         .unwrap_or(0.55)
 }
 
+/// Reference-scale (bge) recall floor (#462): the cosine just above the
+/// off-domain/salad band, below which a KNN neighbour is treated as noise. Above
+/// it, a neighbour is a genuine (weak) semantic match that must NOT be
+/// truncated by `semantic_validate` (WS1) nor thrown away as `Confidence::None`
+/// (WS2). Authored in the bge reference scale like every other floor here and
+/// mapped into the active model's band via [`Calibration`]. Kept just above
+/// `REF_LO` (the nonsense/salad p95 anchor) so it clears salads by a small,
+/// per-model margin — the k8s/arctic band separates conceptual golds (≥0.44)
+/// from salads (≤0.41) at ~0.42, exactly `Calibration::map(0.65)` there.
+const SEMANTIC_RECALL_FLOOR_REF: f32 = 0.65;
+
+/// Un-calibrated / bge-reference fallback for [`semantic_recall_floor`]. bge's
+/// salad neighbours reach ~0.75 (RFC-019's 0.751 collision), so on an
+/// un-calibrated index — where `map` is the identity and cannot place the floor
+/// inside a measured band — the recall floor must stay at the conservative
+/// high-confidence bar (the pre-#462 `EMBED_SCORE_THRESHOLD`). This preserves
+/// bge / un-calibrated behaviour byte-for-byte; only a genuinely calibrated model
+/// (arctic et al.) gets the aggressive mapped floor.
+const RECALL_FLOOR_IDENTITY: f32 = 0.75;
+
+/// Absolute cosine recall floor in the ACTIVE model's scale (#462). Single source
+/// of truth shared by `embed_path_seeds` (KNN seed admission, WS1b),
+/// `semantic_validate` (anti-truncation, WS1) and `classify_confidence` (abstain
+/// rescue, WS2). `TRAVSR_SEMANTIC_RECALL_FLOOR` overrides with an absolute value.
+pub(crate) fn semantic_recall_floor(cal: &Calibration) -> f32 {
+    if let Some(x) = floor_env("TRAVSR_SEMANTIC_RECALL_FLOOR") {
+        return x;
+    }
+    if *cal == Calibration::IDENTITY {
+        RECALL_FLOOR_IDENTITY
+    } else {
+        cal.map(SEMANTIC_RECALL_FLOOR_REF)
+    }
+}
+
 /// Per-(model, corpus) semantic-floor calibration.
 ///
 /// Every absolute cosine floor in this module (`SEMANTIC_ORACLE_MIN`,
@@ -835,8 +870,8 @@ fn classify_confidence(
     g1_bypass: bool,
     rerank_score: Option<f32>,
 ) -> Confidence {
-    if g1_bypass {
-        return classify_confidence_lexical_fallback(
+    let base = if g1_bypass {
+        classify_confidence_lexical_fallback(
             terms,
             coverage,
             top_bm25,
@@ -846,30 +881,51 @@ fn classify_confidence(
             anchor_oracle,
             scored_ids,
             cal,
-        );
+        )
+    } else {
+        // Guard against inverted floors (strong < weak) from a hand-broken manifest
+        // or env override: a Strong verdict must never fire below the Weak/abstain
+        // floor, so clamp strong up to at least weak. With correctly-ordered floors
+        // this is a no-op.
+        let weak = rerank_weak_floor();
+        let strong = rerank_strong_floor().max(weak);
+        match rerank_score {
+            Some(r) if r >= strong => Confidence::Strong,
+            Some(r) if r >= weak => Confidence::Weak,
+            Some(_) => Confidence::None,
+            None => classify_confidence_lexical_fallback(
+                terms,
+                coverage,
+                top_bm25,
+                has_any_seeds,
+                has_knn_seeds,
+                knn_oracle,
+                anchor_oracle,
+                scored_ids,
+                cal,
+            ),
+        }
+    };
+
+    // #462 WS2 — calibrated abstain rescue. The NL-trained cross-encoder
+    // systematically UNDER-scores conceptual CODE matches (a query described in
+    // prose vs. an identifier-dense function body), so a query whose gold sits at
+    // embed-KNN rank #1 with a healthy cosine can still fall below the rerank weak
+    // floor and abstain (`Confidence::None`). When the embedding itself is confident
+    // — its top neighbour clears the model-relative recall floor — do not throw the
+    // result away; surface it as Weak (labelled "no strong match" downstream) so the
+    // AI still gets the semantic hit, flagged as approximate. Salad-safe by
+    // construction: off-domain top cosines sit BELOW the recall floor (the floor is
+    // anchored just above the measured nonsense/salad p95), so this never rescues a
+    // salad. No-op on bge/un-calibrated (recall floor 0.75 ≈ the answerable band,
+    // which the existing semantic_strong/promote paths already reach).
+    if base == Confidence::None {
+        let oracle_top = knn_oracle.values().copied().fold(0.0_f32, f32::max);
+        if oracle_top >= semantic_recall_floor(cal) {
+            return Confidence::Weak;
+        }
     }
-    // Guard against inverted floors (strong < weak) from a hand-broken manifest or
-    // env override: a Strong verdict must never fire below the Weak/abstain floor,
-    // so clamp strong up to at least weak. With correctly-ordered floors this is a
-    // no-op.
-    let weak = rerank_weak_floor();
-    let strong = rerank_strong_floor().max(weak);
-    match rerank_score {
-        Some(r) if r >= strong => Confidence::Strong,
-        Some(r) if r >= weak => Confidence::Weak,
-        Some(_) => Confidence::None,
-        None => classify_confidence_lexical_fallback(
-            terms,
-            coverage,
-            top_bm25,
-            has_any_seeds,
-            has_knn_seeds,
-            knn_oracle,
-            anchor_oracle,
-            scored_ids,
-            cal,
-        ),
-    }
+    base
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -959,7 +1015,16 @@ fn semantic_validate(
     if top < cal.map(SEMANTIC_ORACLE_MIN) {
         return seeds; // oracle not confident — trust lexical evidence
     }
+    // The relative floor is anchored on the ORACLE top, which may be a non-seed
+    // over-fetch neighbour (or a noise node) far above the best actual seed. When
+    // it is, a genuine top-KNN seed can fall below `floor` and, with ≥MIN other
+    // seeds above it, be truncated out entirely (#462 WS1: the rank-1/2 conceptual
+    // gold "DROP@semantic_validate"). Guard by never cutting a seed that clears the
+    // model-relative recall floor — the same "this is a real semantic match" bar
+    // `embed_path_seeds` admits KNN on. `keep_floor` only ever LOWERS the cut, so
+    // on bge/un-calibrated (recall ≈ 0.75 ≥ floor) it is a no-op.
     let floor = (top - cal.map_delta(SEMANTIC_REL_DELTA)).max(cal.map(SEMANTIC_ABS_FLOOR));
+    let keep_floor = floor.min(semantic_recall_floor(cal));
 
     let mut scored: Vec<(Seed, f32)> = seeds
         .into_iter()
@@ -969,14 +1034,14 @@ fn semantic_validate(
         })
         .collect();
 
-    let n_above = scored.iter().filter(|(_, c)| *c >= floor).count();
+    let n_above = scored.iter().filter(|(_, c)| *c >= keep_floor).count();
     if n_above < SEMANTIC_MIN_KEEP {
         // Graceful: too few clear the floor — keep the top-N by cosine so a
         // grounded result is never emptied by an over-harsh oracle.
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(SEMANTIC_MIN_KEEP);
     } else {
-        scored.retain(|(_, c)| *c >= floor);
+        scored.retain(|(_, c)| *c >= keep_floor);
         // Reshuffle: most semantically-relevant first.
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
@@ -1542,8 +1607,29 @@ pub(crate) fn build_seed_set(
         // kept, and the gate never fires on pure-NL queries (no exact anchor), so
         // conceptual retrieval is untouched.
         let rescue = cal.map(disjoint_rescue_cos());
+        let recall = semantic_recall_floor(&cal);
         seeds.retain(|s| {
             if s.source == SeedSource::Exact {
+                return true;
+            }
+            // #462 WS1: a conceptual query's exact anchor is COINCIDENTAL — a common
+            // word ("pod", "pending", "scale") that happens to name a symbol — so the
+            // anchor's structural neighbourhood need not contain the semantically
+            // correct answer. A KNN seed that clears the model recall floor is the
+            // embedding's genuine opinion and must not be dropped as "contamination"
+            // just for being structurally disjoint from that coincidental anchor.
+            // Guarded by `!g1_bypass`: when the user named a genuinely RARE symbol the
+            // strict RFC-019 structural gate still governs, so token-collision false
+            // positives (RemovePod ≈0.751 for `GetWarningsForPod`) stay dropped.
+            // Salad-safe by the same floor: off-domain KNN neighbours sit below the
+            // recall floor, so this never re-admits a salad seed.
+            if !g1_bypass
+                && s.source == SeedSource::Knn
+                && augmented_oracle
+                    .get(&s.node)
+                    .map(|&c| c >= recall)
+                    .unwrap_or(false)
+            {
                 return true;
             }
             let disjoint = !neighborhood.contains(&s.node);
@@ -1593,6 +1679,20 @@ pub(crate) fn build_seed_set(
         }
     }
 
+    // #462 WS3 — the set of exact anchors that are genuinely SPECIFIC: the top
+    // node of a resolved, high-IDF term. A conceptual query ("how are pending pods
+    // assigned to nodes") resolves exact anchors on COINCIDENTAL common words
+    // ("pod", "node") whose IDF is low; those must NOT be floated above the
+    // semantically-correct KNN gold, or they sink the real answer down the ranking
+    // (the "gold surfaces but ranks low" residual). A literal query's named symbol
+    // is high-IDF, so it stays specific and keeps its float — literal ranking is
+    // unchanged. `g1_bypass` (rare named symbol) is always specific.
+    let specific_anchor_ids: std::collections::HashSet<NodeId> = terms
+        .iter()
+        .filter(|t| t.resolved && t.idf_w >= idf_min)
+        .filter_map(|t| t.top_node)
+        .collect();
+
     let max_non_exact = seeds
         .iter()
         .filter(|s| s.source != SeedSource::Exact)
@@ -1610,9 +1710,11 @@ pub(crate) fn build_seed_set(
             (oracle_top - cal.map_delta(SEMANTIC_REL_DELTA)).max(cal.map(SEMANTIC_ABS_FLOOR));
         for s in seeds.iter_mut() {
             if s.source == SeedSource::Exact {
+                // WS3: coincidental low-IDF anchors don't float on conceptual queries.
+                let specific = g1_bypass || specific_anchor_ids.contains(&s.node);
                 let agrees = !oracle_confident
                     || augmented_oracle.get(&s.node).copied().unwrap_or(0.0) >= cos_floor;
-                if agrees {
+                if specific && agrees {
                     s.weight = s.weight.max(floor);
                 }
             }
@@ -2825,6 +2927,124 @@ mod tests {
             out.len(),
             SEMANTIC_MIN_KEEP,
             "must keep top-{SEMANTIC_MIN_KEEP} by cosine, never empty"
+        );
+    }
+
+    // ── #462: calibrated recall floor + WS1 anti-truncation + WS2 rescue ─────
+
+    /// Arctic-embed-m band measured on kubernetes (lo = nonsense p95, hi =
+    /// self-match p50). Conceptual golds sit ~0.44–0.65, salads ≤0.41.
+    const ARCTIC: Calibration = Calibration {
+        lo: 0.337,
+        hi: 0.532,
+    };
+
+    #[test]
+    fn recall_floor_identity_is_conservative_calibrated_is_lower() {
+        // Un-calibrated / bge: keep the pre-#462 high-confidence bar (bge salad
+        // neighbours reach ~0.75, so the floor must stay high there).
+        assert_eq!(semantic_recall_floor(&Calibration::IDENTITY), 0.75);
+        // A calibrated model maps the floor into its own (compressed) band, landing
+        // just above the salad p95 — well below the identity bar.
+        let arctic = semantic_recall_floor(&ARCTIC);
+        assert!(
+            (0.40..=0.45).contains(&arctic),
+            "arctic recall floor should sit ~0.42 (above salads ≤0.41, below golds ≥0.44); got {arctic}"
+        );
+    }
+
+    #[test]
+    fn semantic_validate_keeps_genuine_seed_below_relative_floor() {
+        // WS1: the relative floor is anchored on the ORACLE top, which here is a
+        // non-seed over-fetch neighbour (NodeId 99, cos 0.65). That pushes the
+        // relative floor to ~0.535, above the genuine rank-low gold (NodeId 1, cos
+        // 0.45) — the pre-#462 code truncated it out because 5 other seeds cleared
+        // the relative floor. The recall-floor guard (0.42 on arctic) must keep it.
+        let mut seeds: Vec<Seed> = vec![seed(1, SeedSource::Knn)]; // the gold
+        seeds.extend((2..=6).map(|i| seed(i, SeedSource::Knn))); // 5 stronger seeds
+        let mut oracle: HashMap<NodeId, f32> = (2..=6).map(|i| (NodeId(i), 0.60)).collect();
+        oracle.insert(NodeId(1), 0.45); // gold: genuine match, below relative floor
+        oracle.insert(NodeId(99), 0.65); // non-seed neighbour drives the oracle top
+        let out = semantic_validate(seeds, &oracle, &ARCTIC);
+        let kept: std::collections::HashSet<u64> = out.iter().map(|s| s.node.0).collect();
+        assert!(
+            kept.contains(&1),
+            "a genuine semantic seed clearing the recall floor must not be truncated \
+             just because the oracle top is a stronger non-seed neighbour; got {kept:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_validate_still_cuts_below_recall_floor() {
+        // The guard only protects seeds ABOVE the recall floor — a genuine-noise
+        // seed (cos 0.30 < 0.42 arctic) is still cut, so the anti-truncation change
+        // doesn't reopen the salad it was designed to drop.
+        let mut seeds: Vec<Seed> = vec![seed(1, SeedSource::Lexical)]; // noise
+        seeds.extend((2..=8).map(|i| seed(i, SeedSource::Knn)));
+        let mut oracle: HashMap<NodeId, f32> = (2..=8).map(|i| (NodeId(i), 0.60)).collect();
+        oracle.insert(NodeId(1), 0.30); // below arctic recall floor → must be cut
+        let out = semantic_validate(seeds, &oracle, &ARCTIC);
+        let kept: std::collections::HashSet<u64> = out.iter().map(|s| s.node.0).collect();
+        assert!(
+            !kept.contains(&1),
+            "a below-recall-floor noise seed must still be cut; got {kept:?}"
+        );
+    }
+
+    #[test]
+    fn confidence_ws2_rescues_abstain_when_embedding_confident() {
+        // WS2: the reranker under-scored the candidate (0.1, below the weak floor)
+        // so the base verdict is None — but the embedding's top neighbour (0.50)
+        // clears the arctic recall floor (~0.42), so the result is rescued to Weak
+        // rather than thrown away.
+        let knn: HashMap<NodeId, f32> = [(NodeId(1), 0.50)].into_iter().collect();
+        let empty = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            true,
+            &knn,
+            &empty,
+            &scored,
+            &ARCTIC,
+            false,
+            Some(0.1),
+        );
+        assert_eq!(
+            c,
+            Confidence::Weak,
+            "a confident embedding must rescue a reranker abstain to Weak"
+        );
+    }
+
+    #[test]
+    fn confidence_ws2_does_not_rescue_off_domain() {
+        // Salad-safety: the reranker abstains AND the top embed neighbour (0.30) is
+        // below the recall floor — no rescue, stays None. This is the guardrail that
+        // keeps salad false-positives at zero.
+        let knn: HashMap<NodeId, f32> = [(NodeId(1), 0.30)].into_iter().collect();
+        let empty = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            true,
+            &knn,
+            &empty,
+            &scored,
+            &ARCTIC,
+            false,
+            Some(0.1),
+        );
+        assert_eq!(
+            c,
+            Confidence::None,
+            "an off-domain query below the recall floor must still abstain"
         );
     }
 

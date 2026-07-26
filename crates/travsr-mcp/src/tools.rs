@@ -2220,9 +2220,6 @@ type EmbedSeedResult = (
 const MIN_EMBED_SEEDS: usize = 5;
 /// Maximum number of PPR seeds from KNN — never include more than this.
 const MAX_EMBED_SEEDS: usize = 20;
-/// Cosine-similarity threshold: nodes scoring at or above this are included
-/// even when `seeds.len() >= MIN_EMBED_SEEDS`, up to `MAX_EMBED_SEEDS`.
-const EMBED_SCORE_THRESHOLD: f32 = 0.75;
 /// Maximum seeds per unique file path — prevents all seeds clustering in one file.
 const MAX_SEEDS_PER_PATH: usize = 2;
 /// PPR seed weight for an exact FTS substring match (query token in signature or path).
@@ -2530,6 +2527,17 @@ pub(crate) fn embed_path_seeds(
     let node_map: std::collections::HashMap<NodeId, CoreNode> =
         nodes.into_iter().map(|n| (n.id, n)).collect();
 
+    // #462 WS1b — calibrated KNN admission. The old fixed `EMBED_SCORE_THRESHOLD`
+    // (0.75) is a bge-scale cosine: no arctic conceptual match ever reaches it
+    // (arctic golds top out ~0.65), so beyond the MIN floor every semantic neighbour
+    // was dropped and the gold survived only if it happened to rank in the first
+    // MIN — the "DROP@embed_path_seeds" losses in the WS0 trace. Gate on the
+    // model-relative recall floor instead: identity/bge keeps the exact 0.75 bar
+    // (byte-for-byte unchanged), while a calibrated model admits any neighbour above
+    // its own measured salad band, up to MAX_EMBED_SEEDS.
+    let cal = crate::seed::Calibration::load(store);
+    let recall_floor = crate::seed::semantic_recall_floor(&cal);
+
     let mut path_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut seeds: Vec<(CoreNode, f32)> = Vec::with_capacity(MAX_EMBED_SEEDS);
@@ -2537,8 +2545,8 @@ pub(crate) fn embed_path_seeds(
     let mut n_eligible: usize = 0;
 
     for &(id, score) in &knn_pairs {
-        // Include if: we still owe MIN seeds, OR this node scores above threshold.
-        if seeds.len() >= MIN_EMBED_SEEDS && score < EMBED_SCORE_THRESHOLD {
+        // Include if: we still owe MIN seeds, OR this node clears the recall floor.
+        if seeds.len() >= MIN_EMBED_SEEDS && score < recall_floor {
             continue;
         }
         let node = match node_map.get(&id) {
@@ -3592,6 +3600,161 @@ fn get_context_body(
             format!("{retrieval_header}{sanitized}\n\n{footer}\n{signals}")
         }
     }
+}
+
+/// DIAGNOSTIC (Phase 0, #462 conceptual-recall investigation).
+///
+/// Returns the RAW embed-KNN ranking for `query` — up to `k` nodes as
+/// `rank\tcosine\tsig\tpath`, ranked purely by query↔node cosine, BEFORE any
+/// FTS fusion, rerank, or abstain gate. Lets a harness measure where a known gold
+/// symbol sits in pure semantic recall (Branch 1 "recoverable but lost downstream"
+/// vs Branch 2 "embedding blind"). Intentionally NOT registered in tools/list —
+/// call by name via tools/call. Zero effect on any shipping path.
+pub fn embed_knn_probe(store: &SqliteStore, query: &str, k: u32) -> String {
+    if validate_mcp_arg(query).is_err() {
+        return String::new();
+    }
+    let knn = match store.embed_knn_fn() {
+        Some(f) => f,
+        None => return "[embed KNN unavailable — embeddings not wired]".to_string(),
+    };
+    let pairs = knn(query, k);
+    if pairs.is_empty() {
+        return "[no KNN results]".to_string();
+    }
+    let ids: Vec<NodeId> = pairs.iter().map(|&(id, _)| id).collect();
+    let nodes = store.get_nodes(&ids).unwrap_or_default();
+    let by_id: HashMap<NodeId, &CoreNode> = nodes.iter().map(|n| (n.id, n)).collect();
+    let mut out = String::new();
+    for (i, (id, cos)) in pairs.iter().enumerate() {
+        if let Some(n) = by_id.get(id) {
+            let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+            out.push_str(&format!(
+                "{}\t{:.4}\t{}\t{}{}\n",
+                i + 1,
+                cos,
+                n.vname.signature,
+                n.vname.path,
+                loc
+            ));
+        }
+    }
+    out
+}
+
+/// WS0 diagnostic helper: short tag for a seed's retrieval source.
+fn seed_source_label(source: crate::seed::SeedSource) -> &'static str {
+    match source {
+        crate::seed::SeedSource::Exact => "exact",
+        crate::seed::SeedSource::Lexical => "lexical",
+        crate::seed::SeedSource::Knn => "knn",
+    }
+}
+
+/// DIAGNOSTIC (WS0, #462 conceptual-recall investigation).
+///
+/// Traces one query through the seed cascade and dumps every stage so a harness
+/// can localize where a known gold symbol is lost: GATE (survived into the seed
+/// set but the query abstained) vs DROP-@-stage (evicted before the confidence
+/// gate). Mirrors [`embed_knn_probe`]: hidden — NOT in tools/list, called by name,
+/// zero effect on any shipping path.
+///
+/// Output is line-oriented TSV; a line's first field tags its stage:
+/// - `CAL   <lo> <hi>`                         — active model calibration anchors
+/// - `CONF  <label>`                           — final `SeedSet.confidence`
+/// - `RAWKNN <rank> <cos> <sig> <path:line>`   — raw embed-KNN (top 50), pre-cascade
+/// - `KNNSEED <cos> <sig> <path:line>`         — seeds selected by `embed_path_seeds`
+///   (post 0.75-threshold / MIN/MAX / noise / path-dedup — the first hard filter)
+/// - `FINAL <source> <weight> <rerank> <sig> <path:line>` — surviving `build_seed_set`
+///   seeds (post semantic_validate / scope gate / rerank reorder)
+///
+/// A gold present in RAWKNN but absent from KNNSEED dropped at `embed_path_seeds`;
+/// present in KNNSEED but absent from FINAL dropped at semantic_validate/scope;
+/// present in FINAL with `CONF none` is a GATE (abstain) case.
+pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
+    if validate_mcp_arg(query).is_err() {
+        return String::new();
+    }
+    let knn_fn = match store.embed_knn_fn() {
+        Some(f) => f,
+        None => return "[embed KNN unavailable — embeddings not wired]".to_string(),
+    };
+    let mut out = String::new();
+
+    // Calibration anchors for the active model (identity for bge/un-calibrated).
+    let cal = crate::seed::Calibration::load(store);
+    out.push_str(&format!("CAL\t{:.4}\t{:.4}\n", cal.lo, cal.hi));
+
+    let fmt_loc = |n: &CoreNode| n.line.map(|l| format!(":{l}")).unwrap_or_default();
+
+    // Stage 1: raw embed-KNN (top 50), identical source to embed_knn_probe.
+    let raw = knn_fn(query, 50);
+    {
+        let ids: Vec<NodeId> = raw.iter().map(|&(id, _)| id).collect();
+        let nodes = store.get_nodes(&ids).unwrap_or_default();
+        let by_id: HashMap<NodeId, &CoreNode> = nodes.iter().map(|n| (n.id, n)).collect();
+        for (i, (id, cos)) in raw.iter().enumerate() {
+            if let Some(n) = by_id.get(id) {
+                out.push_str(&format!(
+                    "RAWKNN\t{}\t{:.4}\t{}\t{}{}\n",
+                    i + 1,
+                    cos,
+                    n.vname.signature,
+                    n.vname.path,
+                    fmt_loc(n)
+                ));
+            }
+        }
+    }
+
+    // Stage 2: seeds selected by embed_path_seeds (the first hard KNN filter).
+    let (knn_selected, _n_elig, _ms, knn_oracle) =
+        embed_path_seeds(store, query, &knn_fn, &OpenFilter);
+    for (n, cos) in &knn_selected {
+        out.push_str(&format!(
+            "KNNSEED\t{:.4}\t{}\t{}{}\n",
+            cos,
+            n.vname.signature,
+            n.vname.path,
+            fmt_loc(n)
+        ));
+    }
+
+    // Stage 3: full build_seed_set — final surviving seeds + confidence.
+    let score_fn = store.embed_score_fn();
+    let score_ref = score_fn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>);
+    let seed_set = crate::seed::build_seed_set(
+        store,
+        query,
+        &OpenFilter,
+        knn_selected,
+        &knn_oracle,
+        score_ref,
+    );
+    out.push_str(&format!("CONF\t{}\n", seed_set.confidence.label()));
+    let final_ids: Vec<NodeId> = seed_set.seeds.iter().map(|s| s.node).collect();
+    let final_nodes = store.get_nodes(&final_ids).unwrap_or_default();
+    let by_id: HashMap<NodeId, &CoreNode> = final_nodes.iter().map(|n| (n.id, n)).collect();
+    for s in &seed_set.seeds {
+        if let Some(n) = by_id.get(&s.node) {
+            let rr = s
+                .rerank_score
+                .map(|r| format!("{r:.4}"))
+                .unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "FINAL\t{}\t{:.4}\t{}\t{}\t{}{}\n",
+                seed_source_label(s.source),
+                s.weight,
+                rr,
+                n.vname.signature,
+                n.vname.path,
+                fmt_loc(n)
+            ));
+        }
+    }
+    out
 }
 
 /// Global variant of `get_context` — searches one named repo or all registered repos.
