@@ -204,6 +204,22 @@ fn handle_tool_call(
                 }
             }
         }
+        // DIAGNOSTIC (#462 Phase 0): raw embed-KNN ranking. Hidden — not in
+        // tools/list; call by name. No shipping path depends on it.
+        "embed_knn_probe" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let k = args["k"]
+                .as_u64()
+                .or_else(|| args["k"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(200) as u32;
+            tools::embed_knn_probe(store, query, k)
+        }
+        // DIAGNOSTIC (#462 WS0): per-query seed-cascade trace (GATE vs DROP-@-stage).
+        // Hidden — not in tools/list; call by name. No shipping path depends on it.
+        "seed_trace" => {
+            let query = args["query"].as_str().unwrap_or("");
+            tools::seed_trace(store, query)
+        }
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
             let direction = args["direction"].as_str().unwrap_or("both");

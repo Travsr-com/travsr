@@ -2220,9 +2220,6 @@ type EmbedSeedResult = (
 const MIN_EMBED_SEEDS: usize = 5;
 /// Maximum number of PPR seeds from KNN — never include more than this.
 const MAX_EMBED_SEEDS: usize = 20;
-/// Cosine-similarity threshold: nodes scoring at or above this are included
-/// even when `seeds.len() >= MIN_EMBED_SEEDS`, up to `MAX_EMBED_SEEDS`.
-const EMBED_SCORE_THRESHOLD: f32 = 0.75;
 /// Maximum seeds per unique file path — prevents all seeds clustering in one file.
 const MAX_SEEDS_PER_PATH: usize = 2;
 /// PPR seed weight for an exact FTS substring match (query token in signature or path).
@@ -2446,6 +2443,24 @@ pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
     false
 }
 
+/// #462: nodes that are never useful as `get_context` *relevance results*, even
+/// though they are legitimate graph nodes the ingest/`is_noise_node` layer keeps
+/// (so `get_callers`/`get_dependencies` can still reach them). Applied to the
+/// final candidate list (seeds + PPR expansion) so CI/workflow package nodes and
+/// bare file nodes stop leaking into the context as budget filler. A superset of
+/// [`is_noise_seed`]; unlike a score floor it is purely structural, so it can
+/// never evict a genuine answer regardless of that answer's relevance score.
+fn is_context_result_noise(node: &CoreNode) -> bool {
+    is_noise_seed(node)
+        // CI/workflow dependency package nodes (pkg:actions/*, pkg:<dep>@<sha>) —
+        // real ExternalDependency nodes, but never an answer to a code query.
+        || node.kind == "package"
+        || node.vname.signature.starts_with("pkg:")
+        // Bare file nodes carry no symbol body; a symbol from the file is a
+        // better relevance result than the file container itself.
+        || node.kind == "file"
+}
+
 /// Derive PPR seeds from symbol-level KNN results with score-based selection.
 ///
 /// Strategy:
@@ -2512,6 +2527,17 @@ pub(crate) fn embed_path_seeds(
     let node_map: std::collections::HashMap<NodeId, CoreNode> =
         nodes.into_iter().map(|n| (n.id, n)).collect();
 
+    // #462 WS1b — calibrated KNN admission. The old fixed `EMBED_SCORE_THRESHOLD`
+    // (0.75) is a bge-scale cosine: no arctic conceptual match ever reaches it
+    // (arctic golds top out ~0.65), so beyond the MIN floor every semantic neighbour
+    // was dropped and the gold survived only if it happened to rank in the first
+    // MIN — the "DROP@embed_path_seeds" losses in the WS0 trace. Gate on the
+    // model-relative recall floor instead: identity/bge keeps the exact 0.75 bar
+    // (byte-for-byte unchanged), while a calibrated model admits any neighbour above
+    // its own measured salad band, up to MAX_EMBED_SEEDS.
+    let cal = crate::seed::Calibration::load(store);
+    let recall_floor = crate::seed::semantic_recall_floor(&cal);
+
     let mut path_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut seeds: Vec<(CoreNode, f32)> = Vec::with_capacity(MAX_EMBED_SEEDS);
@@ -2519,8 +2545,8 @@ pub(crate) fn embed_path_seeds(
     let mut n_eligible: usize = 0;
 
     for &(id, score) in &knn_pairs {
-        // Include if: we still owe MIN seeds, OR this node scores above threshold.
-        if seeds.len() >= MIN_EMBED_SEEDS && score < EMBED_SCORE_THRESHOLD {
+        // Include if: we still owe MIN seeds, OR this node clears the recall floor.
+        if seeds.len() >= MIN_EMBED_SEEDS && score < recall_floor {
             continue;
         }
         let node = match node_map.get(&id) {
@@ -2650,6 +2676,7 @@ fn format_node_line(
     role: &str,
     score: Option<f32>,
     via_source: Option<&str>,
+    source: Option<&str>,
 ) -> String {
     let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
     let score_str = score
@@ -2663,7 +2690,13 @@ fn format_node_line(
         Some(src) if role == "caller" || role == "dependency" => {
             format!("[via: {role} of {src}]")
         }
-        _ => format!("[via: {role}]"),
+        // #462: surface the seed's match source (exact-name / semantic / lexical)
+        // so a name-only anchor at a high rank with a low semantic score reads as
+        // honest provenance, not a bug. Display-only — never affects ordering.
+        _ => match source {
+            Some(s) => format!("[via: {role} · {s}]"),
+            None => format!("[via: {role}]"),
+        },
     };
     if n.package.is_empty() {
         format!(
@@ -3161,11 +3194,84 @@ fn get_context_body(
         items
     };
 
+    // #462: context-noise filter on the FINAL candidate list (seeds + PPR
+    // expansion). `is_noise_seed` already runs on seeds, but the expansion tail
+    // ([via: context/dependency]) is never re-filtered, so CI/workflow package
+    // nodes (pkg:actions/*), bare file nodes, and vendored/test-dir nodes leak
+    // into the output as near-zero-score budget filler. Score-independent and
+    // universal (applies to every query), so it cannot evict a real answer.
+    // Safety valve: never let this structural filter EMPTY the candidate list. If
+    // every candidate is a file/package node (a query whose only answer is a
+    // container), keep the unfiltered list so the caller still gets a result — this
+    // stage runs before the MIN_KEEP relevance-floor guard below, so it needs its own.
+    let items: Vec<(CoreNode, f32)> = if items.iter().any(|(n, _)| !is_context_result_noise(n)) {
+        items
+            .into_iter()
+            .filter(|(n, _)| !is_context_result_noise(n))
+            .collect()
+    } else {
+        items
+    };
+
+    // PROTOTYPE (#462 precision@1): seed-quality ordering blend.
+    // Output is ordered by normalized PPR, so a semantically strong seed can be
+    // buried below graph-central expansion nodes (probe-cascade-k8s: 7/10 golds
+    // BURIED@ppr_knapsack). Add a fraction of each seed's own semantic quality —
+    // max(direct query cosine, rerank score), each normalized within the seed
+    // set — back into its ordering score so a seed can never sink below its own
+    // relevance. `display_score` is display-only, so the fix must land on the
+    // ordering score here, not there. Applied to all intents: it only lifts a
+    // seed by its OWN relevance, so exact/literal anchors (already top cosine) are
+    // undisturbed. Not gated on QueryIntent::Conceptual — that variant is never
+    // assigned by classify_intent (dead); a real conceptual router is future work.
+    // env TRAVSR_SEED_ORDER_BLEND=alpha; 0 (default) → byte-identical baseline.
+    let seed_order_blend = std::env::var("TRAVSR_SEED_ORDER_BLEND")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0);
+    let items: Vec<(CoreNode, f32)> = if seed_order_blend > 0.0 {
+        let seed_ids: Vec<NodeId> = seed_set.seeds.iter().map(|s| s.node).collect();
+        let cos: HashMap<NodeId, f32> = score_ref
+            .map(|f| f(query, &seed_ids).into_iter().collect())
+            .unwrap_or_default();
+        let rr = seed_set.rerank_scores();
+        let max_cos = cos.values().copied().fold(0.0_f32, f32::max).max(1e-6);
+        let max_rr = rr.values().copied().fold(0.0_f32, f32::max).max(1e-6);
+        let quality: HashMap<NodeId, f32> = seed_ids
+            .iter()
+            .map(|id| {
+                let c = cos.get(id).copied().unwrap_or(0.0) / max_cos;
+                let r = rr.get(id).copied().unwrap_or(0.0) / max_rr;
+                (*id, c.max(r))
+            })
+            .collect();
+        items
+            .into_iter()
+            .map(|(n, s)| {
+                let q = quality.get(&n.id).copied().unwrap_or(0.0);
+                (n, s + seed_order_blend * q)
+            })
+            .collect()
+    } else {
+        items
+    };
+
     // Issue B: relevance floor — drop score-0 tail before knapsack so zero-signal nodes
     // cannot consume token budget and push genuinely relevant nodes into overflow.
     // Safety valve: always keep the top MIN_KEEP items so thin-but-legitimate results
     // are never emptied. Floor is env-overridable for tuning without a rebuild.
-    const REL_FLOOR_DEFAULT: f32 = 0.01;
+    // #462: 0.03 (3% of the top node's normalized score) trims the long
+    // near-zero PPR-expansion tail that padded the token budget. Relative to each
+    // query's own top score and guarded by MIN_KEEP, so it adapts to weak/low-
+    // scoring conceptual queries without evicting the answer (hit-rate is
+    // identical at 0.01 vs 0.05 on travsr and kubernetes benches). 0.03 rather
+    // than 0.05: measured on multi-concept queries, the 0.01->0.03 cut removes
+    // ~82% off-topic nodes (near-pure noise, on-topic density 26%->29%), while
+    // 0.03->0.05 starts removing on-topic nodes at the set's own density rate
+    // (thinning secondary context, e.g. the "reindex" half of a "watch + reindex"
+    // query). 0.03 keeps the precision gain without over-pruning richness. Was
+    // 0.01, which was too permissive to remove the tail at all.
+    const REL_FLOOR_DEFAULT: f32 = 0.03;
     const MIN_KEEP: usize = 8;
     let rel_floor = std::env::var("TRAVSR_CONTEXT_REL_FLOOR")
         .ok()
@@ -3221,6 +3327,23 @@ fn get_context_body(
             )
         })
         .collect();
+
+    // #462: node → match source (exact-name / semantic / lexical) for the
+    // `[via: seed · <source>]` provenance tag. Strongest source wins if a node
+    // was reached by more than one seed path. Display-only.
+    let seed_source_map: HashMap<NodeId, crate::seed::SeedSource> = {
+        let mut m: HashMap<NodeId, crate::seed::SeedSource> = HashMap::new();
+        for s in &seed_set.seeds {
+            m.entry(s.node)
+                .and_modify(|cur| {
+                    if seed_source_rank(s.source) > seed_source_rank(*cur) {
+                        *cur = s.source;
+                    }
+                })
+                .or_insert(s.source);
+        }
+        m
+    };
 
     // Knapsack selection.
     let selected = knapsack(items, token_budget);
@@ -3416,6 +3539,7 @@ fn get_context_body(
                                 .get(&n.id)
                                 .and_then(|s| seed_sig.get(s))
                                 .map(String::as_str),
+                            seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
                         )
                     })
                     .collect();
@@ -3459,6 +3583,7 @@ fn get_context_body(
                     .get(&n.id)
                     .and_then(|s| seed_sig.get(s))
                     .map(String::as_str),
+                seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
             );
             // Use skeleton when the body exceeds the kind-aware line cap.
             let n_height = n
@@ -3530,6 +3655,7 @@ fn get_context_body(
                         .get(&n.id)
                         .and_then(|s| seed_sig.get(s))
                         .map(String::as_str),
+                    seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
                 )
             })
             .collect();
@@ -3552,6 +3678,181 @@ fn get_context_body(
             format!("{retrieval_header}{sanitized}\n\n{footer}\n{signals}")
         }
     }
+}
+
+/// DIAGNOSTIC (Phase 0, #462 conceptual-recall investigation).
+///
+/// Returns the RAW embed-KNN ranking for `query` — up to `k` nodes as
+/// `rank\tcosine\tsig\tpath`, ranked purely by query↔node cosine, BEFORE any
+/// FTS fusion, rerank, or abstain gate. Lets a harness measure where a known gold
+/// symbol sits in pure semantic recall (Branch 1 "recoverable but lost downstream"
+/// vs Branch 2 "embedding blind"). Intentionally NOT registered in tools/list —
+/// call by name via tools/call. Zero effect on any shipping path.
+pub fn embed_knn_probe(store: &SqliteStore, query: &str, k: u32) -> String {
+    if validate_mcp_arg(query).is_err() {
+        return String::new();
+    }
+    let knn = match store.embed_knn_fn() {
+        Some(f) => f,
+        None => return "[embed KNN unavailable — embeddings not wired]".to_string(),
+    };
+    let pairs = knn(query, k);
+    if pairs.is_empty() {
+        return "[no KNN results]".to_string();
+    }
+    let ids: Vec<NodeId> = pairs.iter().map(|&(id, _)| id).collect();
+    let nodes = store.get_nodes(&ids).unwrap_or_default();
+    let by_id: HashMap<NodeId, &CoreNode> = nodes.iter().map(|n| (n.id, n)).collect();
+    let mut out = String::new();
+    for (i, (id, cos)) in pairs.iter().enumerate() {
+        if let Some(n) = by_id.get(id) {
+            let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+            out.push_str(&format!(
+                "{}\t{:.4}\t{}\t{}{}\n",
+                i + 1,
+                cos,
+                n.vname.signature,
+                n.vname.path,
+                loc
+            ));
+        }
+    }
+    out
+}
+
+/// WS0 diagnostic helper: short tag for a seed's retrieval source.
+fn seed_source_label(source: crate::seed::SeedSource) -> &'static str {
+    match source {
+        crate::seed::SeedSource::Exact => "exact",
+        crate::seed::SeedSource::Lexical => "lexical",
+        crate::seed::SeedSource::Knn => "knn",
+    }
+}
+
+/// #462: human-facing match-source tag for `get_context` node lines. Distinct
+/// from the terse [`seed_source_label`] used in the `seed_trace` diagnostic.
+fn seed_source_display(source: crate::seed::SeedSource) -> &'static str {
+    match source {
+        crate::seed::SeedSource::Exact => "exact-name",
+        crate::seed::SeedSource::Knn => "semantic",
+        crate::seed::SeedSource::Lexical => "lexical",
+    }
+}
+
+/// Precedence for "strongest source wins" when a node is reached by more than one
+/// seed path: exact-name > semantic > lexical.
+fn seed_source_rank(source: crate::seed::SeedSource) -> u8 {
+    match source {
+        crate::seed::SeedSource::Exact => 3,
+        crate::seed::SeedSource::Knn => 2,
+        crate::seed::SeedSource::Lexical => 1,
+    }
+}
+
+/// DIAGNOSTIC (WS0, #462 conceptual-recall investigation).
+///
+/// Traces one query through the seed cascade and dumps every stage so a harness
+/// can localize where a known gold symbol is lost: GATE (survived into the seed
+/// set but the query abstained) vs DROP-@-stage (evicted before the confidence
+/// gate). Mirrors [`embed_knn_probe`]: hidden — NOT in tools/list, called by name,
+/// zero effect on any shipping path.
+///
+/// Output is line-oriented TSV; a line's first field tags its stage:
+/// - `CAL   <lo> <hi>`                         — active model calibration anchors
+/// - `CONF  <label>`                           — final `SeedSet.confidence`
+/// - `RAWKNN <rank> <cos> <sig> <path:line>`   — raw embed-KNN (top 50), pre-cascade
+/// - `KNNSEED <cos> <sig> <path:line>`         — seeds selected by `embed_path_seeds`
+///   (post 0.75-threshold / MIN/MAX / noise / path-dedup — the first hard filter)
+/// - `FINAL <source> <weight> <rerank> <sig> <path:line>` — surviving `build_seed_set`
+///   seeds (post semantic_validate / scope gate / rerank reorder)
+///
+/// A gold present in RAWKNN but absent from KNNSEED dropped at `embed_path_seeds`;
+/// present in KNNSEED but absent from FINAL dropped at semantic_validate/scope;
+/// present in FINAL with `CONF none` is a GATE (abstain) case.
+pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
+    if validate_mcp_arg(query).is_err() {
+        return String::new();
+    }
+    let knn_fn = match store.embed_knn_fn() {
+        Some(f) => f,
+        None => return "[embed KNN unavailable — embeddings not wired]".to_string(),
+    };
+    let mut out = String::new();
+
+    // Calibration anchors for the active model (identity for bge/un-calibrated).
+    let cal = crate::seed::Calibration::load(store);
+    out.push_str(&format!("CAL\t{:.4}\t{:.4}\n", cal.lo, cal.hi));
+
+    let fmt_loc = |n: &CoreNode| n.line.map(|l| format!(":{l}")).unwrap_or_default();
+
+    // Stage 1: raw embed-KNN (top 50), identical source to embed_knn_probe.
+    let raw = knn_fn(query, 50);
+    {
+        let ids: Vec<NodeId> = raw.iter().map(|&(id, _)| id).collect();
+        let nodes = store.get_nodes(&ids).unwrap_or_default();
+        let by_id: HashMap<NodeId, &CoreNode> = nodes.iter().map(|n| (n.id, n)).collect();
+        for (i, (id, cos)) in raw.iter().enumerate() {
+            if let Some(n) = by_id.get(id) {
+                out.push_str(&format!(
+                    "RAWKNN\t{}\t{:.4}\t{}\t{}{}\n",
+                    i + 1,
+                    cos,
+                    n.vname.signature,
+                    n.vname.path,
+                    fmt_loc(n)
+                ));
+            }
+        }
+    }
+
+    // Stage 2: seeds selected by embed_path_seeds (the first hard KNN filter).
+    let (knn_selected, _n_elig, _ms, knn_oracle) =
+        embed_path_seeds(store, query, &knn_fn, &OpenFilter);
+    for (n, cos) in &knn_selected {
+        out.push_str(&format!(
+            "KNNSEED\t{:.4}\t{}\t{}{}\n",
+            cos,
+            n.vname.signature,
+            n.vname.path,
+            fmt_loc(n)
+        ));
+    }
+
+    // Stage 3: full build_seed_set — final surviving seeds + confidence.
+    let score_fn = store.embed_score_fn();
+    let score_ref = score_fn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>);
+    let seed_set = crate::seed::build_seed_set(
+        store,
+        query,
+        &OpenFilter,
+        knn_selected,
+        &knn_oracle,
+        score_ref,
+    );
+    out.push_str(&format!("CONF\t{}\n", seed_set.confidence.label()));
+    let final_ids: Vec<NodeId> = seed_set.seeds.iter().map(|s| s.node).collect();
+    let final_nodes = store.get_nodes(&final_ids).unwrap_or_default();
+    let by_id: HashMap<NodeId, &CoreNode> = final_nodes.iter().map(|n| (n.id, n)).collect();
+    for s in &seed_set.seeds {
+        if let Some(n) = by_id.get(&s.node) {
+            let rr = s
+                .rerank_score
+                .map(|r| format!("{r:.4}"))
+                .unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "FINAL\t{}\t{:.4}\t{}\t{}\t{}{}\n",
+                seed_source_label(s.source),
+                s.weight,
+                rr,
+                n.vname.signature,
+                n.vname.path,
+                fmt_loc(n)
+            ));
+        }
+    }
+    out
 }
 
 /// Global variant of `get_context` — searches one named repo or all registered repos.
@@ -4569,6 +4870,44 @@ mod tests {
     }
 
     // ── search_symbol / get_callers path:line tests ───────────────────────────
+
+    #[test]
+    fn context_result_noise_drops_ci_packages_files_and_tests_keeps_real_symbols() {
+        use travsr_core::{Node, VName};
+        let node = |path: &str, kind: &str, sig: &str| {
+            Node::new(VName::new("", "", path, "rust", sig), kind)
+        };
+        // Dropped: CI/workflow package nodes (both by kind and by pkg: signature).
+        assert!(is_context_result_noise(&node(
+            "",
+            "package",
+            "pkg:actions/checkout@abc123"
+        )));
+        assert!(is_context_result_noise(&node(
+            "",
+            "function",
+            "pkg:some/dep@1.0"
+        )));
+        // Dropped: bare file nodes.
+        assert!(is_context_result_noise(&node("src/foo.rs", "file", "file")));
+        // Dropped: everything is_noise_seed rejects (e.g. integration-test dir).
+        assert!(is_context_result_noise(&node(
+            "tests/it.rs",
+            "function",
+            "fn:it_works"
+        )));
+        // Kept: real source symbols (the answers we must never evict).
+        assert!(!is_context_result_noise(&node(
+            "crates/travsr-mcp/src/tools.rs",
+            "function",
+            "fn:get_context_body"
+        )));
+        assert!(!is_context_result_noise(&node(
+            "src/daemon.rs",
+            "struct",
+            "struct:Daemon"
+        )));
+    }
 
     #[test]
     fn search_symbol_emits_path_line_when_present() {
@@ -6381,7 +6720,7 @@ mod snippet_tests {
 
         // Package-less header (make_fn_node leaves package empty): the path
         // carries ":1" and the only trailer is " [via: ..] [score: ..]".
-        let header = format_node_line(&node_a, "seed", Some(0.80), None);
+        let header = format_node_line(&node_a, "seed", Some(0.80), None, None);
         assert!(
             header.contains("a.ts:1"),
             "sanity: real header must carry the line locator: {header}"
@@ -6398,7 +6737,7 @@ mod snippet_tests {
 
         // Package-present header exercises the " [package: ..]" terminator too.
         let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
-        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None);
+        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None, None);
         assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
         let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
         assert!(
@@ -6772,8 +7111,8 @@ mod snippet_tests {
 
         let result = get_context_body(&store, "seed_target", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("[via: seed]"),
-            "direct match must be labelled [via: seed]: {result}"
+            result.contains("[via: seed · exact-name]"),
+            "direct exact match must be labelled [via: seed · exact-name]: {result}"
         );
     }
 
@@ -6822,8 +7161,8 @@ mod snippet_tests {
 
         let result = get_context_body(&store, "seed_fn", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("[via: seed]"),
-            "seed node must be labelled [via: seed]: {result}"
+            result.contains("[via: seed"),
+            "seed node must be labelled [via: seed · <source>]: {result}"
         );
         // RFC-019: caller/dependency roles now name their source seed.
         assert!(
@@ -6850,8 +7189,8 @@ mod snippet_tests {
 
         let result = get_context_body(&store, "seed_fn2", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("[via: seed]"),
-            "seed node must be labelled [via: seed]: {result}"
+            result.contains("[via: seed"),
+            "seed node must be labelled [via: seed · <source>]: {result}"
         );
         // RFC-019: caller/dependency roles now name their source seed.
         assert!(
