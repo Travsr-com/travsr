@@ -2676,6 +2676,7 @@ fn format_node_line(
     role: &str,
     score: Option<f32>,
     via_source: Option<&str>,
+    source: Option<&str>,
 ) -> String {
     let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
     let score_str = score
@@ -2689,7 +2690,13 @@ fn format_node_line(
         Some(src) if role == "caller" || role == "dependency" => {
             format!("[via: {role} of {src}]")
         }
-        _ => format!("[via: {role}]"),
+        // #462: surface the seed's match source (exact-name / semantic / lexical)
+        // so a name-only anchor at a high rank with a low semantic score reads as
+        // honest provenance, not a bug. Display-only — never affects ordering.
+        _ => match source {
+            Some(s) => format!("[via: {role} · {s}]"),
+            None => format!("[via: {role}]"),
+        },
     };
     if n.package.is_empty() {
         format!(
@@ -3198,6 +3205,49 @@ fn get_context_body(
         .filter(|(n, _)| !is_context_result_noise(n))
         .collect();
 
+    // PROTOTYPE (#462 precision@1): seed-quality ordering blend.
+    // Output is ordered by normalized PPR, so a semantically strong seed can be
+    // buried below graph-central expansion nodes (probe-cascade-k8s: 7/10 golds
+    // BURIED@ppr_knapsack). Add a fraction of each seed's own semantic quality —
+    // max(direct query cosine, rerank score), each normalized within the seed
+    // set — back into its ordering score so a seed can never sink below its own
+    // relevance. `display_score` is display-only, so the fix must land on the
+    // ordering score here, not there. Applied to all intents: it only lifts a
+    // seed by its OWN relevance, so exact/literal anchors (already top cosine) are
+    // undisturbed. Not gated on QueryIntent::Conceptual — that variant is never
+    // assigned by classify_intent (dead); a real conceptual router is future work.
+    // env TRAVSR_SEED_ORDER_BLEND=alpha; 0 (default) → byte-identical baseline.
+    let seed_order_blend = std::env::var("TRAVSR_SEED_ORDER_BLEND")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0);
+    let items: Vec<(CoreNode, f32)> = if seed_order_blend > 0.0 {
+        let seed_ids: Vec<NodeId> = seed_set.seeds.iter().map(|s| s.node).collect();
+        let cos: HashMap<NodeId, f32> = score_ref
+            .map(|f| f(query, &seed_ids).into_iter().collect())
+            .unwrap_or_default();
+        let rr = seed_set.rerank_scores();
+        let max_cos = cos.values().copied().fold(0.0_f32, f32::max).max(1e-6);
+        let max_rr = rr.values().copied().fold(0.0_f32, f32::max).max(1e-6);
+        let quality: HashMap<NodeId, f32> = seed_ids
+            .iter()
+            .map(|id| {
+                let c = cos.get(id).copied().unwrap_or(0.0) / max_cos;
+                let r = rr.get(id).copied().unwrap_or(0.0) / max_rr;
+                (*id, c.max(r))
+            })
+            .collect();
+        items
+            .into_iter()
+            .map(|(n, s)| {
+                let q = quality.get(&n.id).copied().unwrap_or(0.0);
+                (n, s + seed_order_blend * q)
+            })
+            .collect()
+    } else {
+        items
+    };
+
     // Issue B: relevance floor — drop score-0 tail before knapsack so zero-signal nodes
     // cannot consume token budget and push genuinely relevant nodes into overflow.
     // Safety valve: always keep the top MIN_KEEP items so thin-but-legitimate results
@@ -3269,6 +3319,23 @@ fn get_context_body(
             )
         })
         .collect();
+
+    // #462: node → match source (exact-name / semantic / lexical) for the
+    // `[via: seed · <source>]` provenance tag. Strongest source wins if a node
+    // was reached by more than one seed path. Display-only.
+    let seed_source_map: HashMap<NodeId, crate::seed::SeedSource> = {
+        let mut m: HashMap<NodeId, crate::seed::SeedSource> = HashMap::new();
+        for s in &seed_set.seeds {
+            m.entry(s.node)
+                .and_modify(|cur| {
+                    if seed_source_rank(s.source) > seed_source_rank(*cur) {
+                        *cur = s.source;
+                    }
+                })
+                .or_insert(s.source);
+        }
+        m
+    };
 
     // Knapsack selection.
     let selected = knapsack(items, token_budget);
@@ -3464,6 +3531,7 @@ fn get_context_body(
                                 .get(&n.id)
                                 .and_then(|s| seed_sig.get(s))
                                 .map(String::as_str),
+                            seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
                         )
                     })
                     .collect();
@@ -3507,6 +3575,7 @@ fn get_context_body(
                     .get(&n.id)
                     .and_then(|s| seed_sig.get(s))
                     .map(String::as_str),
+                seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
             );
             // Use skeleton when the body exceeds the kind-aware line cap.
             let n_height = n
@@ -3578,6 +3647,7 @@ fn get_context_body(
                         .get(&n.id)
                         .and_then(|s| seed_sig.get(s))
                         .map(String::as_str),
+                    seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
                 )
             })
             .collect();
@@ -3648,6 +3718,26 @@ fn seed_source_label(source: crate::seed::SeedSource) -> &'static str {
         crate::seed::SeedSource::Exact => "exact",
         crate::seed::SeedSource::Lexical => "lexical",
         crate::seed::SeedSource::Knn => "knn",
+    }
+}
+
+/// #462: human-facing match-source tag for `get_context` node lines. Distinct
+/// from the terse [`seed_source_label`] used in the `seed_trace` diagnostic.
+fn seed_source_display(source: crate::seed::SeedSource) -> &'static str {
+    match source {
+        crate::seed::SeedSource::Exact => "exact-name",
+        crate::seed::SeedSource::Knn => "semantic",
+        crate::seed::SeedSource::Lexical => "lexical",
+    }
+}
+
+/// Precedence for "strongest source wins" when a node is reached by more than one
+/// seed path: exact-name > semantic > lexical.
+fn seed_source_rank(source: crate::seed::SeedSource) -> u8 {
+    match source {
+        crate::seed::SeedSource::Exact => 3,
+        crate::seed::SeedSource::Knn => 2,
+        crate::seed::SeedSource::Lexical => 1,
     }
 }
 
@@ -6622,7 +6712,7 @@ mod snippet_tests {
 
         // Package-less header (make_fn_node leaves package empty): the path
         // carries ":1" and the only trailer is " [via: ..] [score: ..]".
-        let header = format_node_line(&node_a, "seed", Some(0.80), None);
+        let header = format_node_line(&node_a, "seed", Some(0.80), None, None);
         assert!(
             header.contains("a.ts:1"),
             "sanity: real header must carry the line locator: {header}"
@@ -6639,7 +6729,7 @@ mod snippet_tests {
 
         // Package-present header exercises the " [package: ..]" terminator too.
         let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
-        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None);
+        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None, None);
         assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
         let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
         assert!(
@@ -7013,8 +7103,8 @@ mod snippet_tests {
 
         let result = get_context_body(&store, "seed_target", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("[via: seed]"),
-            "direct match must be labelled [via: seed]: {result}"
+            result.contains("[via: seed · exact-name]"),
+            "direct exact match must be labelled [via: seed · exact-name]: {result}"
         );
     }
 
@@ -7063,8 +7153,8 @@ mod snippet_tests {
 
         let result = get_context_body(&store, "seed_fn", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("[via: seed]"),
-            "seed node must be labelled [via: seed]: {result}"
+            result.contains("[via: seed"),
+            "seed node must be labelled [via: seed · <source>]: {result}"
         );
         // RFC-019: caller/dependency roles now name their source seed.
         assert!(
@@ -7091,8 +7181,8 @@ mod snippet_tests {
 
         let result = get_context_body(&store, "seed_fn2", 4096, &OpenFilter, false, None, None);
         assert!(
-            result.contains("[via: seed]"),
-            "seed node must be labelled [via: seed]: {result}"
+            result.contains("[via: seed"),
+            "seed node must be labelled [via: seed · <source>]: {result}"
         );
         // RFC-019: caller/dependency roles now name their source seed.
         assert!(
