@@ -855,7 +855,11 @@ fn sort_seeds_post_rerank(seeds: &mut [Seed], weak_floor: f32) {
 /// Otherwise the four-arm absolute-floor gate is embeddings-independent by
 /// construction (embeddings remain a candidate *source* into RRF fusion, never
 /// a confidence input here) — G2: confidence is identical embed-on/off for
-/// the same query.
+/// the same query. One deliberate, bounded exception (#462 WS2): on a
+/// *calibrated* model a non-`g1_bypass` query that would abstain is rescued to
+/// Weak when the embed-KNN top clears the model-relative recall floor. G2 still
+/// holds exactly on identity/bge and on every `g1_bypass` query, where that
+/// rescue is inert by construction.
 #[allow(clippy::too_many_arguments)]
 fn classify_confidence(
     terms: &[ResolvedTerm],
@@ -917,9 +921,12 @@ fn classify_confidence(
     // AI still gets the semantic hit, flagged as approximate. Salad-safe by
     // construction: off-domain top cosines sit BELOW the recall floor (the floor is
     // anchored just above the measured nonsense/salad p95), so this never rescues a
-    // salad. No-op on bge/un-calibrated (recall floor 0.75 ≈ the answerable band,
-    // which the existing semantic_strong/promote paths already reach).
-    if base == Confidence::None {
+    // salad. Calibrated-only and never on a `g1_bypass` query: the rescue reads an
+    // embedding signal, so gating it to calibrated models keeps identity/bge
+    // byte-for-byte (G2 holds there exactly), and skipping `g1_bypass` preserves G1's
+    // deterministic, embeddings-independent lexical verdict — an embedding must never
+    // override the rare-named-symbol decision G1 exists to protect.
+    if base == Confidence::None && !g1_bypass && *cal != Calibration::IDENTITY {
         let oracle_top = knn_oracle.values().copied().fold(0.0_f32, f32::max);
         if oracle_top >= semantic_recall_floor(cal) {
             return Confidence::Weak;
@@ -1021,10 +1028,17 @@ fn semantic_validate(
     // seeds above it, be truncated out entirely (#462 WS1: the rank-1/2 conceptual
     // gold "DROP@semantic_validate"). Guard by never cutting a seed that clears the
     // model-relative recall floor — the same "this is a real semantic match" bar
-    // `embed_path_seeds` admits KNN on. `keep_floor` only ever LOWERS the cut, so
-    // on bge/un-calibrated (recall ≈ 0.75 ≥ floor) it is a no-op.
+    // `embed_path_seeds` admits KNN on. `keep_floor` only ever LOWERS the cut.
+    // Calibrated-only: skipped on identity/bge so truncation stays byte-for-byte —
+    // the 0.75 identity recall floor does NOT coincide with the relative `floor` for
+    // strong-oracle queries (top > 0.88, where floor > 0.75), so applying it there
+    // would silently change the un-validated reference path.
     let floor = (top - cal.map_delta(SEMANTIC_REL_DELTA)).max(cal.map(SEMANTIC_ABS_FLOOR));
-    let keep_floor = floor.min(semantic_recall_floor(cal));
+    let keep_floor = if *cal == Calibration::IDENTITY {
+        floor
+    } else {
+        floor.min(semantic_recall_floor(cal))
+    };
 
     let mut scored: Vec<(Seed, f32)> = seeds
         .into_iter()
@@ -1622,8 +1636,12 @@ pub(crate) fn build_seed_set(
             // strict RFC-019 structural gate still governs, so token-collision false
             // positives (RemovePod ≈0.751 for `GetWarningsForPod`) stay dropped.
             // Salad-safe by the same floor: off-domain KNN neighbours sit below the
-            // recall floor, so this never re-admits a salad seed.
-            if !g1_bypass
+            // recall floor, so this never re-admits a salad seed. Calibrated-only:
+            // on identity/bge the pre-existing `rescue` bar (0.85) still governs, so
+            // the strict RFC-019 gate stays byte-for-byte and the [recall, rescue)
+            // (0.75–0.85) token-collision band is NOT re-admitted on the reference path.
+            if cal != Calibration::IDENTITY
+                && !g1_bypass
                 && s.source == SeedSource::Knn
                 && augmented_oracle
                     .get(&s.node)
@@ -1684,9 +1702,11 @@ pub(crate) fn build_seed_set(
     // assigned to nodes") resolves exact anchors on COINCIDENTAL common words
     // ("pod", "node") whose IDF is low; those must NOT be floated above the
     // semantically-correct KNN gold, or they sink the real answer down the ranking
-    // (the "gold surfaces but ranks low" residual). A literal query's named symbol
-    // is high-IDF, so it stays specific and keeps its float — literal ranking is
-    // unchanged. `g1_bypass` (rare named symbol) is always specific.
+    // (the "gold surfaces but ranks low" residual). A literal query on a high-IDF
+    // named symbol stays specific and keeps its float. Two literal edges ARE narrowed
+    // (ranking only — the anchor is never dropped, just not floated): a mid-IDF anchor
+    // (idf_w in [0.15, idf_min)) and the secondary (non-`top_node`) exact anchors of a
+    // high-IDF term. `g1_bypass` (rare named symbol) is always specific.
     let specific_anchor_ids: std::collections::HashSet<NodeId> = terms
         .iter()
         .filter(|t| t.resolved && t.idf_w >= idf_min)
@@ -3045,6 +3065,64 @@ mod tests {
             c,
             Confidence::None,
             "an off-domain query below the recall floor must still abstain"
+        );
+    }
+
+    #[test]
+    fn confidence_ws2_no_rescue_on_identity() {
+        // WS2 is calibrated-only. On an un-calibrated / bge (identity) index a
+        // reranker abstain (0.1) is NOT rescued even when the embed top (0.80) clears
+        // the identity recall floor (0.75). This keeps the reference path byte-for-byte
+        // and preserves the documented G2 invariant (confidence identical embed-on/off)
+        // exactly there — the embedding must not become a confidence input on bge.
+        let knn: HashMap<NodeId, f32> = [(NodeId(1), 0.80)].into_iter().collect();
+        let empty = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            true,
+            &knn,
+            &empty,
+            &scored,
+            &Calibration::IDENTITY,
+            false,
+            Some(0.1),
+        );
+        assert_eq!(
+            c,
+            Confidence::None,
+            "WS2 must not rescue on an un-calibrated/identity index (G2 holds there)"
+        );
+    }
+
+    #[test]
+    fn confidence_ws2_no_rescue_on_g1_bypass() {
+        // WS2 never rescues a g1_bypass (rare-named-symbol) query, even on a calibrated
+        // model with a confident embed top (0.50 ≥ arctic recall ~0.42): G1's
+        // deterministic lexical verdict must never be overridden by an embedding signal.
+        let knn: HashMap<NodeId, f32> = [(NodeId(1), 0.50)].into_iter().collect();
+        let empty = HashMap::new();
+        let scored = std::collections::HashSet::new();
+        let c = classify_confidence(
+            &[],
+            0.0,
+            0.0,
+            true,
+            true,
+            &knn,
+            &empty,
+            &scored,
+            &ARCTIC,
+            true,
+            Some(0.1),
+        );
+        assert_eq!(
+            c,
+            Confidence::None,
+            "WS2 must not override the deterministic G1 verdict on a g1_bypass query"
         );
     }
 

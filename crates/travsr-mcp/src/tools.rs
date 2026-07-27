@@ -3200,10 +3200,18 @@ fn get_context_body(
     // nodes (pkg:actions/*), bare file nodes, and vendored/test-dir nodes leak
     // into the output as near-zero-score budget filler. Score-independent and
     // universal (applies to every query), so it cannot evict a real answer.
-    let items: Vec<(CoreNode, f32)> = items
-        .into_iter()
-        .filter(|(n, _)| !is_context_result_noise(n))
-        .collect();
+    // Safety valve: never let this structural filter EMPTY the candidate list. If
+    // every candidate is a file/package node (a query whose only answer is a
+    // container), keep the unfiltered list so the caller still gets a result — this
+    // stage runs before the MIN_KEEP relevance-floor guard below, so it needs its own.
+    let items: Vec<(CoreNode, f32)> = if items.iter().any(|(n, _)| !is_context_result_noise(n)) {
+        items
+            .into_iter()
+            .filter(|(n, _)| !is_context_result_noise(n))
+            .collect()
+    } else {
+        items
+    };
 
     // PROTOTYPE (#462 precision@1): seed-quality ordering blend.
     // Output is ordered by normalized PPR, so a semantically strong seed can be
