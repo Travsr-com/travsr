@@ -122,12 +122,24 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
     let name = parsed.name;
     match parsed.kind {
         "function" => {
-            let mut sigs = Vec::with_capacity(3);
+            let mut sigs = Vec::with_capacity(6);
             if let Some(c) = parsed.container {
                 sigs.push(format!("method:{c}.{name}"));
                 sigs.push(format!("fn:{c}.{name}"));
             }
             sigs.push(format!("fn:{name}"));
+            // #449: ObjC multi-part selectors (`setWidth:height:`): Phase A
+            // anchors the method signature on the leading selector keyword
+            // (`fn:setWidth`), so add leading-keyword candidates too.
+            if let Some((leading, _)) = name.split_once(':') {
+                if !leading.is_empty() {
+                    if let Some(c) = parsed.container {
+                        sigs.push(format!("method:{c}.{leading}"));
+                        sigs.push(format!("fn:{c}.{leading}"));
+                    }
+                    sigs.push(format!("fn:{leading}"));
+                }
+            }
             sigs
         }
         "class" => ["class", "struct", "interface", "trait", "enum", "type"]
@@ -363,6 +375,41 @@ mod tests {
     fn candidates_function_bare() {
         let sigs = candidate_signatures(&parsed(None, "HandleRequest", "function"));
         assert_eq!(sigs, vec!["fn:HandleRequest"]);
+    }
+
+    #[test]
+    fn objc_method_symbol_parses_as_function() {
+        // #449: travsr-lang-objectivec emits `Class#selector().`, SCIP-conformant
+        // since the emitter appends the method suffix.
+        assert_eq!(
+            scip_name_kind("objc . corp 0.0.0 ClassC#registerEnvironments()."),
+            Some(parsed(Some("ClassC"), "registerEnvironments", "function"))
+        );
+        assert_eq!(
+            scip_name_kind("objc . corp 0.0.0 Foo#setWidth:height:()."),
+            Some(parsed(Some("Foo"), "setWidth:height:", "function"))
+        );
+    }
+
+    #[test]
+    fn candidates_selector_adds_leading_keyword() {
+        // #449: Phase A objc anchors method sigs on the leading selector keyword
+        // (`fn:setWidth`), so colon-bearing names add leading-keyword candidates.
+        let sigs = candidate_signatures(&parsed(Some("Foo"), "setWidth:height:", "function"));
+        assert_eq!(
+            sigs,
+            vec![
+                "method:Foo.setWidth:height:",
+                "fn:Foo.setWidth:height:",
+                "fn:setWidth:height:",
+                "method:Foo.setWidth",
+                "fn:Foo.setWidth",
+                "fn:setWidth"
+            ]
+        );
+        // Colon-free names are unchanged.
+        let sigs = candidate_signatures(&parsed(Some("Foo"), "run", "function"));
+        assert_eq!(sigs, vec!["method:Foo.run", "fn:Foo.run", "fn:run"]);
     }
 
     #[test]

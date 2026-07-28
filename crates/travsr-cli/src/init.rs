@@ -93,9 +93,14 @@ fn hint_embed_missing() {
     }
 }
 
-/// After indexing, scan for supported languages and suggest `travsr lang detect`
-/// if any are present but not yet registered.
+/// After indexing, scan for supported languages and name the exact
+/// per-language install command if any are present but not yet registered.
+/// On a TTY, offer to run the interactive `travsr lang detect` flow inline
+/// (#449: call/reference indexing for these languages needs the sidecar, and
+/// the generic tip was too easy to miss).
 fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::IsTerminal as _;
+
     let detected = crate::lang::detect_languages_in(repo_root);
     if detected.is_empty() {
         return Ok(());
@@ -108,11 +113,27 @@ fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
         .cloned()
         .collect();
 
-    if !unregistered.is_empty() {
-        println!(
-            "tip: detected {} in this repo — run `travsr lang detect` to set up semantic indexing",
-            unregistered.join(", ")
-        );
+    if unregistered.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "tip: {} found in this repo but semantic (call/reference) indexing is not set up:",
+        unregistered.join(", ")
+    );
+    for lang in &unregistered {
+        println!("       travsr lang install {lang}");
+    }
+
+    if std::io::stdin().is_terminal() {
+        use std::io::Write as _;
+        print!("Set up now? [y/N]: ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim().eq_ignore_ascii_case("y") {
+            return crate::lang::run(crate::lang::LangCommand::Detect);
+        }
     }
 
     Ok(())

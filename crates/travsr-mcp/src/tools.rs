@@ -305,6 +305,43 @@ fn simple_name(signature: &str) -> String {
         .to_string()
 }
 
+/// Whether `signature` carries `container` as the qualifier immediately
+/// before `member`, joined by `.` or `#` (the two separators used across
+/// Phase A/B signature conventions: `swift::ClassC.shared`, `method:ClassC.shared`,
+/// `scip:...ClassC#shared.`).
+///
+/// #449: a plain `signature.contains("{container}.{member}")` check is not
+/// enough. `"AppConfig.shared"` contains `"Config.shared"` as a substring, so
+/// a query for `Config.shared` would wrongly match `AppConfig`'s field. The
+/// match is anchored on its left boundary: the byte immediately before
+/// `container` (if any) must not be an identifier character, so the container
+/// name in the signature can't be a longer identifier's suffix. No right-hand
+/// boundary is required, since a SCIP variable signature legitimately
+/// continues past `member` with a trailing `.` (`ClassC#shared.`).
+fn has_qualified_container(signature: &str, container: &str, member: &str) -> bool {
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    b".#".iter().any(|&sep| {
+        let needle = format!("{container}{}{member}", sep as char);
+        signature
+            .find(&needle)
+            .is_some_and(|pos| pos == 0 || !is_ident_byte(signature.as_bytes()[pos - 1]))
+    })
+}
+
+/// Whether `signature` carries ANY container qualifier before its bare name,
+/// as opposed to a genuinely unqualified signature like `var:shared`.
+///
+/// #449: the dotted-tier "unique bare member" fallback must only ever match
+/// signatures with no recorded container at all, never a signature that
+/// happens to be qualified with some OTHER container. Without this check, a
+/// query for `Config.shared` would resolve to the sole `AppConfig.shared` in
+/// the store (mistaking "no match for MY container" for "no container
+/// recorded"), even though `AppConfig` plainly is not `Config`.
+fn has_any_container(signature: &str) -> bool {
+    let after_kind = signature.rsplit(':').next().unwrap_or(signature);
+    after_kind.rsplit_once(['.', '#']).is_some()
+}
+
 /// Global variant of `get_dependencies` — searches one named repo or all registered repos.
 ///
 /// When `repo` is `Some`, only that repo's db is queried. When `None`, all
@@ -425,6 +462,51 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
                 Vec::new()
             }
         };
+    }
+
+    // Tier 3 (#449): dotted static/member access like `ClassC.shared` or
+    // `Type.method`. Stored signatures qualify the member (`swift::ClassC.shared`,
+    // `method:ClassC.shared`, `scip:...ClassC#shared.`) but never equal the
+    // dotted query, and `simple_name` reduces them to the bare member, so both
+    // tiers above miss. Split at the last `.`, search the member, and keep
+    // candidates whose signature carries the container qualifier; fall back to
+    // a bare-member match only when it is unique AND genuinely unqualified
+    // (never a match with some OTHER, unrelated container).
+    if candidates.is_empty() {
+        if let Some((container, member)) = symbol.rsplit_once('.') {
+            if !container.is_empty() && !member.is_empty() {
+                let found = store.search_nodes_by_name(member).unwrap_or_else(|e| {
+                    tracing::warn!("find_references dotted search '{member}': {e}");
+                    Vec::new()
+                });
+                let matches: Vec<CoreNode> = found
+                    .into_iter()
+                    .filter(|n| {
+                        n.kind != "file"
+                            && n.kind != "import"
+                            && simple_name(&n.vname.signature) == member
+                    })
+                    .collect();
+                let qualified: Vec<CoreNode> = matches
+                    .iter()
+                    .filter(|n| has_qualified_container(&n.vname.signature, container, member))
+                    .cloned()
+                    .collect();
+                candidates = if !qualified.is_empty() {
+                    qualified
+                } else {
+                    let bare: Vec<CoreNode> = matches
+                        .into_iter()
+                        .filter(|n| !has_any_container(&n.vname.signature))
+                        .collect();
+                    if bare.len() == 1 {
+                        bare
+                    } else {
+                        Vec::new()
+                    }
+                };
+            }
+        }
     }
 
     // Apply the path suffix pin if the caller supplied one (Tier 2 didn't use it).
@@ -8246,6 +8328,131 @@ mod snippet_tests {
         assert!(
             pinned.contains("src/tools.rs") && !pinned.contains("mytools.rs"),
             "must select src/tools.rs, not src/mytools.rs: {pinned}"
+        );
+    }
+
+    #[test]
+    fn find_references_dotted_qualified_resolves() {
+        // #449: `ClassC.shared`, the stored Phase B signature qualifies the
+        // member (`swift::ClassC.shared`); the dotted tier must pick it over a
+        // same-named member of another type.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let shared_c = Node::new(
+            VName::new("", "", "ClassC.swift", "swift", "swift::ClassC.shared"),
+            "field",
+        )
+        .with_line(2);
+        let shared_d = Node::new(
+            VName::new("", "", "ClassD.swift", "swift", "swift::ClassD.shared"),
+            "field",
+        )
+        .with_line(2);
+        let caller = Node::new(
+            VName::new("", "", "Caller.swift", "swift", "fn:useShared"),
+            "function",
+        );
+        store.put_node(&shared_c).unwrap();
+        store.put_node(&shared_d).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, shared_c.id, 7)])
+            .unwrap();
+
+        let out = find_references(&store, "ClassC.shared", None);
+        assert!(
+            out.contains("resolved: swift::ClassC.shared"),
+            "dotted query must resolve to the qualified node: {out}"
+        );
+        assert!(out.contains("Caller.swift:7"), "site missing: {out}");
+        assert!(
+            !out.contains("ClassD.shared"),
+            "must not match the other container: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_dotted_container_suffix_does_not_collide() {
+        // #449: a naive substring match on "{container}.{member}" would let
+        // "AppConfig.shared" satisfy a query for "Config.shared" (the longer
+        // signature contains the shorter one as a substring). The container
+        // match must be boundary-anchored so unrelated types whose name
+        // happens to end with the queried container are never mistaken for it.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let app_config_shared = Node::new(
+            VName::new(
+                "",
+                "",
+                "AppConfig.swift",
+                "swift",
+                "swift::AppConfig.shared",
+            ),
+            "field",
+        )
+        .with_line(2);
+        store.put_node(&app_config_shared).unwrap();
+
+        let out = find_references(&store, "Config.shared", None);
+        assert!(
+            !out.contains("resolved:"),
+            "must not resolve to AppConfig.shared via substring collision: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_dotted_unique_bare_member_resolves() {
+        // #449: when no stored signature carries the container qualifier (Phase A
+        // swift emits `var:shared`), a dotted query still resolves when the bare
+        // member match is unique.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let shared = Node::new(
+            VName::new("", "", "ClassC.swift", "swift", "var:shared"),
+            "field",
+        )
+        .with_line(2);
+        let caller = Node::new(
+            VName::new("", "", "Caller.swift", "swift", "fn:useShared"),
+            "function",
+        );
+        store.put_node(&shared).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, shared.id, 4)])
+            .unwrap();
+
+        let out = find_references(&store, "ClassC.shared", None);
+        assert!(
+            out.contains("resolved: var:shared"),
+            "unique bare member must resolve: {out}"
+        );
+        assert!(out.contains("Caller.swift:4"), "site missing: {out}");
+    }
+
+    #[test]
+    fn find_references_dotted_ambiguous_bare_member_is_none() {
+        // #449: two bare same-named members and no qualifier match, resolving
+        // either would be a guess, so the dotted tier must yield nothing.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("", "", "ClassC.swift", "swift", "var:shared"),
+            "field",
+        )
+        .with_line(2);
+        let b = Node::new(
+            VName::new("", "", "ClassD.swift", "swift", "var:shared"),
+            "field",
+        )
+        .with_line(2);
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+
+        let out = find_references(&store, "ClassC.shared", None);
+        assert!(
+            !out.contains("resolved:"),
+            "ambiguous bare members must not resolve: {out}"
         );
     }
 

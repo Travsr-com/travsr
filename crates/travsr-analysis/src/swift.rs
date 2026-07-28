@@ -17,6 +17,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (function_declaration name: (simple_identifier) @fn.name)
 (init_declaration)    @init
 (import_declaration)  @import
+(property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name))
 "#,
     capture_kinds: &[
         ("class.name", "class", "class"),
@@ -25,6 +26,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("init", "init", "fn"),
         ("import", "import", "import"),
+        // #449: properties (`static let shared`) gives `ClassC.shared` a
+        // tree-sitter node so the Phase B field node unifies onto it and dotted
+        // queries resolve.
+        ("var.name", "field", "var"),
     ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_swift::LANGUAGE),
 };
@@ -63,5 +68,24 @@ mod tests {
         assert!(kinds.contains(&"protocol"));
         assert!(kinds.contains(&"function"));
         assert!(kinds.contains(&"import"));
+    }
+
+    #[test]
+    fn parse_property_declaration() {
+        // #449: `static let shared` must produce a field node (sig `var:shared`)
+        // so Phase B `swift::ClassC.shared` unifies and dotted queries resolve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("singleton.swift");
+        std::fs::write(
+            &path,
+            "class ClassC {\n    static let shared = ClassC()\n    var count: Int = 0\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "singleton.swift").unwrap();
+        let fields: Vec<&travsr_core::Node> =
+            out.nodes.iter().filter(|n| n.kind == "field").collect();
+        let sigs: Vec<&str> = fields.iter().map(|n| n.vname.signature.as_str()).collect();
+        assert!(sigs.contains(&"var:shared"), "got field sigs: {sigs:?}");
+        assert!(sigs.contains(&"var:count"), "got field sigs: {sigs:?}");
     }
 }
