@@ -305,6 +305,43 @@ fn simple_name(signature: &str) -> String {
         .to_string()
 }
 
+/// Whether `signature` carries `container` as the qualifier immediately
+/// before `member`, joined by `.` or `#` (the two separators used across
+/// Phase A/B signature conventions: `swift::ClassC.shared`, `method:ClassC.shared`,
+/// `scip:...ClassC#shared.`).
+///
+/// #449: a plain `signature.contains("{container}.{member}")` check is not
+/// enough. `"AppConfig.shared"` contains `"Config.shared"` as a substring, so
+/// a query for `Config.shared` would wrongly match `AppConfig`'s field. The
+/// match is anchored on its left boundary: the byte immediately before
+/// `container` (if any) must not be an identifier character, so the container
+/// name in the signature can't be a longer identifier's suffix. No right-hand
+/// boundary is required, since a SCIP variable signature legitimately
+/// continues past `member` with a trailing `.` (`ClassC#shared.`).
+fn has_qualified_container(signature: &str, container: &str, member: &str) -> bool {
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    [b'.', b'#'].iter().any(|&sep| {
+        let needle = format!("{container}{}{member}", sep as char);
+        signature
+            .find(&needle)
+            .is_some_and(|pos| pos == 0 || !is_ident_byte(signature.as_bytes()[pos - 1]))
+    })
+}
+
+/// Whether `signature` carries ANY container qualifier before its bare name,
+/// as opposed to a genuinely unqualified signature like `var:shared`.
+///
+/// #449: the dotted-tier "unique bare member" fallback must only ever match
+/// signatures with no recorded container at all, never a signature that
+/// happens to be qualified with some OTHER container. Without this check, a
+/// query for `Config.shared` would resolve to the sole `AppConfig.shared` in
+/// the store (mistaking "no match for MY container" for "no container
+/// recorded"), even though `AppConfig` plainly is not `Config`.
+fn has_any_container(signature: &str) -> bool {
+    let after_kind = signature.rsplit(':').next().unwrap_or(signature);
+    after_kind.rsplit_once(['.', '#']).is_some()
+}
+
 /// Global variant of `get_dependencies` — searches one named repo or all registered repos.
 ///
 /// When `repo` is `Some`, only that repo's db is queried. When `None`, all
@@ -433,7 +470,8 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
     // dotted query, and `simple_name` reduces them to the bare member, so both
     // tiers above miss. Split at the last `.`, search the member, and keep
     // candidates whose signature carries the container qualifier; fall back to
-    // a bare-member match only when it is unique.
+    // a bare-member match only when it is unique AND genuinely unqualified
+    // (never a match with some OTHER, unrelated container).
     if candidates.is_empty() {
         if let Some((container, member)) = symbol.rsplit_once('.') {
             if !container.is_empty() && !member.is_empty() {
@@ -441,25 +479,31 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
                     tracing::warn!("find_references dotted search '{member}': {e}");
                     Vec::new()
                 });
-                let qual_dot = format!("{container}.{member}");
-                let qual_hash = format!("{container}#{member}");
-                let (qualified, bare): (Vec<CoreNode>, Vec<CoreNode>) = found
+                let matches: Vec<CoreNode> = found
                     .into_iter()
                     .filter(|n| {
                         n.kind != "file"
                             && n.kind != "import"
                             && simple_name(&n.vname.signature) == member
                     })
-                    .partition(|n| {
-                        n.vname.signature.contains(&qual_dot)
-                            || n.vname.signature.contains(&qual_hash)
-                    });
+                    .collect();
+                let qualified: Vec<CoreNode> = matches
+                    .iter()
+                    .filter(|n| has_qualified_container(&n.vname.signature, container, member))
+                    .cloned()
+                    .collect();
                 candidates = if !qualified.is_empty() {
                     qualified
-                } else if bare.len() == 1 {
-                    bare
                 } else {
-                    Vec::new()
+                    let bare: Vec<CoreNode> = matches
+                        .into_iter()
+                        .filter(|n| !has_any_container(&n.vname.signature))
+                        .collect();
+                    if bare.len() == 1 {
+                        bare
+                    } else {
+                        Vec::new()
+                    }
                 };
             }
         }
@@ -8324,6 +8368,35 @@ mod snippet_tests {
         assert!(
             !out.contains("ClassD.shared"),
             "must not match the other container: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_dotted_container_suffix_does_not_collide() {
+        // #449: a naive substring match on "{container}.{member}" would let
+        // "AppConfig.shared" satisfy a query for "Config.shared" (the longer
+        // signature contains the shorter one as a substring). The container
+        // match must be boundary-anchored so unrelated types whose name
+        // happens to end with the queried container are never mistaken for it.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let app_config_shared = Node::new(
+            VName::new(
+                "",
+                "",
+                "AppConfig.swift",
+                "swift",
+                "swift::AppConfig.shared",
+            ),
+            "field",
+        )
+        .with_line(2);
+        store.put_node(&app_config_shared).unwrap();
+
+        let out = find_references(&store, "Config.shared", None);
+        assert!(
+            !out.contains("resolved:"),
+            "must not resolve to AppConfig.shared via substring collision: {out}"
         );
     }
 
