@@ -320,7 +320,7 @@ fn simple_name(signature: &str) -> String {
 /// continues past `member` with a trailing `.` (`ClassC#shared.`).
 fn has_qualified_container(signature: &str, container: &str, member: &str) -> bool {
     let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    [b'.', b'#'].iter().any(|&sep| {
+    b".#".iter().any(|&sep| {
         let needle = format!("{container}{}{member}", sep as char);
         signature
             .find(&needle)
