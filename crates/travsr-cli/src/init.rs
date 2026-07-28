@@ -96,7 +96,7 @@ fn hint_embed_missing() {
 /// After indexing, scan for supported languages and name the exact
 /// per-language install command if any are present but not yet registered.
 /// On a TTY, offer to run the interactive `travsr lang detect` flow inline
-/// (#449 — call/reference indexing for these languages needs the sidecar, and
+/// (#449: call/reference indexing for these languages needs the sidecar, and
 /// the generic tip was too easy to miss).
 fn hint_lang_detect(repo_root: &std::path::Path) -> anyhow::Result<()> {
     use std::io::IsTerminal as _;

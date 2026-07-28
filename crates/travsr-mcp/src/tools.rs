@@ -430,7 +430,7 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
     // Tier 3 (#449): dotted static/member access like `ClassC.shared` or
     // `Type.method`. Stored signatures qualify the member (`swift::ClassC.shared`,
     // `method:ClassC.shared`, `scip:...ClassC#shared.`) but never equal the
-    // dotted query, and `simple_name` reduces them to the bare member — so both
+    // dotted query, and `simple_name` reduces them to the bare member, so both
     // tiers above miss. Split at the last `.`, search the member, and keep
     // candidates whose signature carries the container qualifier; fall back to
     // a bare-member match only when it is unique.
@@ -8289,7 +8289,7 @@ mod snippet_tests {
 
     #[test]
     fn find_references_dotted_qualified_resolves() {
-        // #449: `ClassC.shared` — the stored Phase B signature qualifies the
+        // #449: `ClassC.shared`, the stored Phase B signature qualifies the
         // member (`swift::ClassC.shared`); the dotted tier must pick it over a
         // same-named member of another type.
         use travsr_core::{Node, VName};
@@ -8359,7 +8359,7 @@ mod snippet_tests {
 
     #[test]
     fn find_references_dotted_ambiguous_bare_member_is_none() {
-        // #449: two bare same-named members and no qualifier match — resolving
+        // #449: two bare same-named members and no qualifier match, resolving
         // either would be a guess, so the dotted tier must yield nothing.
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();

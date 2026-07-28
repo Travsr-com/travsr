@@ -26,7 +26,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("init", "init", "fn"),
         ("import", "import", "import"),
-        // #449: properties (`static let shared`) — gives `ClassC.shared` a
+        // #449: properties (`static let shared`) gives `ClassC.shared` a
         // tree-sitter node so the Phase B field node unifies onto it and dotted
         // queries resolve.
         ("var.name", "field", "var"),

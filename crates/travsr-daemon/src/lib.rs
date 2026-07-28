@@ -1614,7 +1614,7 @@ fn write_phase_b_results(
         warnings.push(format!("needs_approval:{lang}"));
     }
     // #449: a language present in the repo whose sidecar is not installed or
-    // not registered used to be skipped silently — the user saw "0 references"
+    // not registered used to be skipped silently, and the user saw "0 references"
     // with no hint that Phase B never ran. Surface both skip classes so
     // `travsr status` can print the exact `travsr lang install <lang>` fix.
     for lang in &pb_outcome.skipped_unregistered {
@@ -2374,7 +2374,7 @@ mod tests {
     // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────
     //
     // Phase A nodes are computed for real via travsr_analysis::swift::parse
-    // against inline fixture sources (self-contained — no dependency on the
+    // against inline fixture sources (self-contained, no dependency on the
     // sibling travsr-lang repo's fixtures). Phase B definitions/references are
     // transcribed verbatim from a real `swift-index-emitter` run against those
     // same sources, built from the fixed Sources/main.swift (travsr-lang PR for
@@ -2477,7 +2477,7 @@ mod tests {
         // #449 fix: bare `ClassC.shared`/`registerEnvironments` member accesses
         // now exist at all, and constructor calls (`Controller()`, `ClassA(...)`)
         // target the type symbol directly rather than a synthetic `.init`
-        // member — so `find_references("ClassA")` sees them without the caller
+        // member, so `find_references("ClassA")` sees them without the caller
         // needing to know about `.init`.
         let refs_raw: &[(&str, u32, &str)] = &[
             ("Caller.swift", 2, "swift::ClassC.shared"),
@@ -2531,7 +2531,7 @@ mod tests {
         );
 
         // Literal repro: "registerEnvironments (@objc static func) called from
-        // Objective-C ... reports 0 references" — this covers the Swift-side
+        // Objective-C ... reports 0 references". This covers the Swift-side
         // call; the ObjC bridged call is macOS-only, verified separately by
         // the scip-reader unit tests (objc_ref_without_def_becomes_unresolved_call).
         let fr_register = travsr_mcp::find_references(&store, "registerEnvironments", None);

@@ -96,13 +96,13 @@ pub fn run() -> anyhow::Result<()> {
                         "warning: '{lang}' requires elevated sandbox approval — run `travsr lang approve {lang}`"
                     ),
                     // #449: languages present in the repo whose Phase B sidecar
-                    // never ran — previously a silent skip that left the user
+                    // never ran, previously a silent skip that left the user
                     // with "0 references" and no explanation.
                     ["skipped_unregistered", lang] => eprintln!(
-                        "warning: '{lang}' sources found but semantic indexing is not set up — run `travsr lang install {lang}`"
+                        "warning: '{lang}' sources found but semantic indexing is not set up. Run `travsr lang install {lang}`"
                     ),
                     ["skipped_no_analyzer", lang] => eprintln!(
-                        "warning: '{lang}' is registered but its analyzer binary is missing — run `travsr lang install {lang}`"
+                        "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
                     ),
                     _ => {}
                 }

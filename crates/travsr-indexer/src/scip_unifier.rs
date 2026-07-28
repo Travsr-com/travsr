@@ -128,7 +128,7 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
                 sigs.push(format!("fn:{c}.{name}"));
             }
             sigs.push(format!("fn:{name}"));
-            // #449: ObjC multi-part selectors (`setWidth:height:`) — Phase A
+            // #449: ObjC multi-part selectors (`setWidth:height:`): Phase A
             // anchors the method signature on the leading selector keyword
             // (`fn:setWidth`), so add leading-keyword candidates too.
             if let Some((leading, _)) = name.split_once(':') {
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn objc_method_symbol_parses_as_function() {
-        // #449: travsr-lang-objectivec emits `Class#selector().` — SCIP-conformant
+        // #449: travsr-lang-objectivec emits `Class#selector().`, SCIP-conformant
         // since the emitter appends the method suffix.
         assert_eq!(
             scip_name_kind("objc . corp 0.0.0 ClassC#registerEnvironments()."),
