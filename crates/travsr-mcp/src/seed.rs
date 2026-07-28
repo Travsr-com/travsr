@@ -1365,6 +1365,13 @@ pub(crate) fn build_seed_set(
     // Track per-path counts across anchor resolution too.
     let mut anchor_path_counts: HashMap<String, usize> = HashMap::new();
 
+    // #463 anchor-ordering config is read once here, not per token: both are
+    // `std::env::var` reads (global lock + String alloc) and cannot change within a
+    // single query, so hoisting them out of the loop keeps the seed hot path free of
+    // per-token env lookups (matches `idf_min = idf_coverage_min()` below).
+    let anchor_kind_priority = anchor_kind_priority();
+    let anchor_reorder_window = anchor_reorder_window();
+
     for token in &content_tokens {
         let exact_nodes = store.search_nodes_by_name(token).unwrap_or_default();
         let freq = store.symbol_frequency(token).unwrap_or(n_total);
@@ -1400,8 +1407,8 @@ pub(crate) fn build_seed_set(
         // #463: prefer logic-bearing definitions among the top name-matches before the
         // bounded emit (on by default; `TRAVSR_ANCHOR_KIND_PRIORITY=0` restores the
         // original FTS-rank order). See [`order_anchor_candidates`].
-        let ordered: Vec<&CoreNode> = if anchor_kind_priority() {
-            order_anchor_candidates(&exact_nodes, anchor_reorder_window())
+        let ordered: Vec<&CoreNode> = if anchor_kind_priority {
+            order_anchor_candidates(&exact_nodes, anchor_reorder_window)
         } else {
             exact_nodes.iter().take(3).collect()
         };
