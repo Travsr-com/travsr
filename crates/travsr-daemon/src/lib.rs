@@ -1613,6 +1613,16 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_needs_approval {
         warnings.push(format!("needs_approval:{lang}"));
     }
+    // #449: a language present in the repo whose sidecar is not installed or
+    // not registered used to be skipped silently — the user saw "0 references"
+    // with no hint that Phase B never ran. Surface both skip classes so
+    // `travsr status` can print the exact `travsr lang install <lang>` fix.
+    for lang in &pb_outcome.skipped_unregistered {
+        warnings.push(format!("skipped_unregistered:{lang}"));
+    }
+    for lang in &pb_outcome.skipped_no_analyzer {
+        warnings.push(format!("skipped_no_analyzer:{lang}"));
+    }
     if !warnings.is_empty() {
         let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
     } else {
@@ -2359,6 +2369,176 @@ mod tests {
         let sites = vec![(NodeId(1), NodeId(2), 5)];
         let out = remap_resolved_sites(sites.clone(), &std::collections::HashMap::new());
         assert_eq!(out, sites);
+    }
+
+    // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────
+    //
+    // Phase A nodes are computed for real via travsr_analysis::swift::parse
+    // against inline fixture sources (self-contained — no dependency on the
+    // sibling travsr-lang repo's fixtures). Phase B definitions/references are
+    // transcribed verbatim from a real `swift-index-emitter` run against those
+    // same sources, built from the fixed Sources/main.swift (travsr-lang PR for
+    // #449). Exercises the true write_phase_b_results -> unify_all ->
+    // write_scip_attributed_batch -> find_references pipeline end to end, and
+    // pins the exact repro from the issue: `find_references("ClassA")` must
+    // show the `ClassA(controller:)` constructor call site, not "0 references".
+    #[test]
+    fn e2e_449_swift_full_pipeline_resolves_literal_repro() {
+        use travsr_core::{Node, ScipRef, VName};
+
+        let corpus = "";
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sources: &[(&str, &str)] = &[
+            (
+                "ClassA.swift",
+                "class Controller {\n    var name: String = \"\"\n}\n\n\
+                 class ClassA {\n    let controller: Controller\n\n    \
+                 init(controller: Controller) {\n        self.controller = controller\n    }\n\
+                 \n    func start() {\n        print(controller.name)\n    }\n}\n",
+            ),
+            (
+                "ClassB.swift",
+                "class ClassB {\n    func makeA() -> ClassA {\n        \
+                 let controller = Controller()\n        \
+                 let a = ClassA(controller: controller)\n        a.start()\n        return a\n    }\n}\n",
+            ),
+            (
+                "ClassC.swift",
+                "import Foundation\n\n@objc class ClassC: NSObject {\n    \
+                 @objc static let shared = ClassC()\n\n    var environments: [String] = []\n\n    \
+                 @objc static func registerEnvironments() {\n        \
+                 ClassC.shared.environments.append(\"default\")\n    }\n}\n",
+            ),
+            (
+                "Caller.swift",
+                "func configure() {\n    let c = ClassC.shared\n    \
+                 c.environments.append(\"staging\")\n    ClassC.registerEnvironments()\n}\n",
+            ),
+        ];
+        for (name, src) in sources {
+            std::fs::write(fixture_dir.path().join(name), src).unwrap();
+        }
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // ── Real Phase A (tree-sitter) for every fixture file ───────────────
+        for (file, _) in sources {
+            let abs = fixture_dir.path().join(file);
+            let out = travsr_analysis::swift::parse(corpus, &abs, file).unwrap();
+            for n in &out.nodes {
+                store.put_node(n).unwrap();
+            }
+            for e in &out.edges {
+                store.put_edge(e).unwrap();
+            }
+        }
+
+        // ── Real Phase B definitions, transcribed verbatim from an actual
+        // swift-index-emitter run against these exact sources ──────────────
+        let defs: &[(&str, &str, &str, u32, u32)] = &[
+            ("Caller.swift", "swift::configure", "function", 1, 5),
+            ("Caller.swift", "swift::c", "variable", 2, 2),
+            ("ClassA.swift", "swift::Controller", "class", 1, 3),
+            ("ClassA.swift", "swift::Controller.name", "field", 2, 2),
+            ("ClassA.swift", "swift::ClassA", "class", 5, 15),
+            ("ClassA.swift", "swift::ClassA.controller", "field", 6, 6),
+            ("ClassA.swift", "swift::ClassA.init", "constructor", 8, 10),
+            ("ClassA.swift", "swift::ClassA.start", "function", 12, 14),
+            ("ClassB.swift", "swift::ClassB", "class", 1, 8),
+            ("ClassB.swift", "swift::ClassB.makeA", "function", 2, 7),
+            ("ClassB.swift", "swift::ClassB.controller", "field", 3, 3),
+            ("ClassB.swift", "swift::ClassB.a", "field", 4, 4),
+            ("ClassC.swift", "swift::ClassC", "class", 3, 11),
+            ("ClassC.swift", "swift::ClassC.shared", "field", 4, 4),
+            ("ClassC.swift", "swift::ClassC.environments", "field", 6, 6),
+            (
+                "ClassC.swift",
+                "swift::ClassC.registerEnvironments",
+                "function",
+                8,
+                10,
+            ),
+        ];
+        let mut def_ids: std::collections::HashMap<&str, travsr_core::NodeId> =
+            std::collections::HashMap::new();
+        let mut pb_nodes: Vec<Node> = Vec::new();
+        for (path, sym, kind, line, end_line) in defs {
+            let vname = VName::new(corpus, "", *path, "swift", *sym);
+            let id = vname.id();
+            def_ids.insert(sym, id);
+            pb_nodes.push(
+                Node::new(vname, *kind)
+                    .with_line(*line)
+                    .with_end_line(*end_line),
+            );
+        }
+
+        // References, transcribed verbatim from a real emitter run AFTER the
+        // #449 fix: bare `ClassC.shared`/`registerEnvironments` member accesses
+        // now exist at all, and constructor calls (`Controller()`, `ClassA(...)`)
+        // target the type symbol directly rather than a synthetic `.init`
+        // member — so `find_references("ClassA")` sees them without the caller
+        // needing to know about `.init`.
+        let refs_raw: &[(&str, u32, &str)] = &[
+            ("Caller.swift", 2, "swift::ClassC.shared"),
+            ("Caller.swift", 4, "swift::ClassC.registerEnvironments"),
+            ("ClassA.swift", 9, "swift::ClassA.controller"),
+            ("ClassB.swift", 3, "swift::Controller"),
+            ("ClassB.swift", 4, "swift::ClassA"),
+            ("ClassC.swift", 4, "swift::ClassC"),
+            ("ClassC.swift", 9, "swift::ClassC.shared"),
+        ];
+        let mut pb_refs: Vec<ScipRef> = Vec::new();
+        for (path, line, sym) in refs_raw {
+            let Some(&callee_id) = def_ids.get(sym) else {
+                panic!("ref symbol {sym} has no definition");
+            };
+            pb_refs.push(ScipRef {
+                caller_path: path.to_string(),
+                caller_line: *line,
+                callee_id,
+            });
+        }
+
+        let (_report, _alias) = write_phase_b_results(
+            &mut store,
+            corpus,
+            pb_nodes,
+            Vec::new(),
+            pb_refs,
+            travsr_plugin_host::PhaseBOutcome::default(),
+        );
+
+        // Literal repro from issue #449: "ClassA (Swift class instantiated via
+        // ClassA(controller:) from many files) reports 0 references."
+        let fr_class_a = travsr_mcp::find_references(&store, "ClassA", None);
+        assert!(
+            fr_class_a.contains("1 reference(s)") && fr_class_a.contains("ClassB.swift:4"),
+            "find_references(\"ClassA\") must show the constructor call site: {fr_class_a}"
+        );
+        assert!(
+            !fr_class_a.contains("0 reference(s)"),
+            "must not regress to the reported '0 references' bug: {fr_class_a}"
+        );
+
+        // Literal repro: "ClassC.shared (dotted static access) does not even resolve."
+        let fr_shared = travsr_mcp::find_references(&store, "ClassC.shared", None);
+        assert!(
+            fr_shared.contains("2 reference(s)")
+                && fr_shared.contains("Caller.swift:2")
+                && fr_shared.contains("ClassC.swift:9"),
+            "find_references(\"ClassC.shared\") must resolve and list both sites: {fr_shared}"
+        );
+
+        // Literal repro: "registerEnvironments (@objc static func) called from
+        // Objective-C ... reports 0 references" — this covers the Swift-side
+        // call; the ObjC bridged call is macOS-only, verified separately by
+        // the scip-reader unit tests (objc_ref_without_def_becomes_unresolved_call).
+        let fr_register = travsr_mcp::find_references(&store, "registerEnvironments", None);
+        assert!(
+            fr_register.contains("1 reference(s)") && fr_register.contains("Caller.swift:4"),
+            "find_references(\"registerEnvironments\") must resolve: {fr_register}"
+        );
     }
 
     // Rust tests run in parallel; TRAVSR_DISABLE_REGISTRY and HOME are

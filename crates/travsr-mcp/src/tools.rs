@@ -427,6 +427,44 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
         };
     }
 
+    // Tier 3 (#449): dotted static/member access like `ClassC.shared` or
+    // `Type.method`. Stored signatures qualify the member (`swift::ClassC.shared`,
+    // `method:ClassC.shared`, `scip:...ClassC#shared.`) but never equal the
+    // dotted query, and `simple_name` reduces them to the bare member — so both
+    // tiers above miss. Split at the last `.`, search the member, and keep
+    // candidates whose signature carries the container qualifier; fall back to
+    // a bare-member match only when it is unique.
+    if candidates.is_empty() {
+        if let Some((container, member)) = symbol.rsplit_once('.') {
+            if !container.is_empty() && !member.is_empty() {
+                let found = store.search_nodes_by_name(member).unwrap_or_else(|e| {
+                    tracing::warn!("find_references dotted search '{member}': {e}");
+                    Vec::new()
+                });
+                let qual_dot = format!("{container}.{member}");
+                let qual_hash = format!("{container}#{member}");
+                let (qualified, bare): (Vec<CoreNode>, Vec<CoreNode>) = found
+                    .into_iter()
+                    .filter(|n| {
+                        n.kind != "file"
+                            && n.kind != "import"
+                            && simple_name(&n.vname.signature) == member
+                    })
+                    .partition(|n| {
+                        n.vname.signature.contains(&qual_dot)
+                            || n.vname.signature.contains(&qual_hash)
+                    });
+                candidates = if !qualified.is_empty() {
+                    qualified
+                } else if bare.len() == 1 {
+                    bare
+                } else {
+                    Vec::new()
+                };
+            }
+        }
+    }
+
     // Apply the path suffix pin if the caller supplied one (Tier 2 didn't use it).
     // Match on a `/`-boundary so a hint like `tools.rs` pins `src/tools.rs` but
     // never `src/mytools.rs` — mirroring the store's `LIKE '%/' || hint` pin.
@@ -8246,6 +8284,102 @@ mod snippet_tests {
         assert!(
             pinned.contains("src/tools.rs") && !pinned.contains("mytools.rs"),
             "must select src/tools.rs, not src/mytools.rs: {pinned}"
+        );
+    }
+
+    #[test]
+    fn find_references_dotted_qualified_resolves() {
+        // #449: `ClassC.shared` — the stored Phase B signature qualifies the
+        // member (`swift::ClassC.shared`); the dotted tier must pick it over a
+        // same-named member of another type.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let shared_c = Node::new(
+            VName::new("", "", "ClassC.swift", "swift", "swift::ClassC.shared"),
+            "field",
+        )
+        .with_line(2);
+        let shared_d = Node::new(
+            VName::new("", "", "ClassD.swift", "swift", "swift::ClassD.shared"),
+            "field",
+        )
+        .with_line(2);
+        let caller = Node::new(
+            VName::new("", "", "Caller.swift", "swift", "fn:useShared"),
+            "function",
+        );
+        store.put_node(&shared_c).unwrap();
+        store.put_node(&shared_d).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, shared_c.id, 7)])
+            .unwrap();
+
+        let out = find_references(&store, "ClassC.shared", None);
+        assert!(
+            out.contains("resolved: swift::ClassC.shared"),
+            "dotted query must resolve to the qualified node: {out}"
+        );
+        assert!(out.contains("Caller.swift:7"), "site missing: {out}");
+        assert!(
+            !out.contains("ClassD.shared"),
+            "must not match the other container: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_dotted_unique_bare_member_resolves() {
+        // #449: when no stored signature carries the container qualifier (Phase A
+        // swift emits `var:shared`), a dotted query still resolves when the bare
+        // member match is unique.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let shared = Node::new(
+            VName::new("", "", "ClassC.swift", "swift", "var:shared"),
+            "field",
+        )
+        .with_line(2);
+        let caller = Node::new(
+            VName::new("", "", "Caller.swift", "swift", "fn:useShared"),
+            "function",
+        );
+        store.put_node(&shared).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, shared.id, 4)])
+            .unwrap();
+
+        let out = find_references(&store, "ClassC.shared", None);
+        assert!(
+            out.contains("resolved: var:shared"),
+            "unique bare member must resolve: {out}"
+        );
+        assert!(out.contains("Caller.swift:4"), "site missing: {out}");
+    }
+
+    #[test]
+    fn find_references_dotted_ambiguous_bare_member_is_none() {
+        // #449: two bare same-named members and no qualifier match — resolving
+        // either would be a guess, so the dotted tier must yield nothing.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("", "", "ClassC.swift", "swift", "var:shared"),
+            "field",
+        )
+        .with_line(2);
+        let b = Node::new(
+            VName::new("", "", "ClassD.swift", "swift", "var:shared"),
+            "field",
+        )
+        .with_line(2);
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+
+        let out = find_references(&store, "ClassC.shared", None);
+        assert!(
+            !out.contains("resolved:"),
+            "ambiguous bare members must not resolve: {out}"
         );
     }
 
