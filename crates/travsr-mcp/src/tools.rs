@@ -3461,22 +3461,13 @@ fn get_context_body(
         })
         .collect();
 
-    // #462: node → match source (exact-name / semantic / lexical) for the
-    // `[via: seed · <source>]` provenance tag. Strongest source wins if a node
-    // was reached by more than one seed path. Display-only.
-    let seed_source_map: HashMap<NodeId, crate::seed::SeedSource> = {
-        let mut m: HashMap<NodeId, crate::seed::SeedSource> = HashMap::new();
-        for s in &seed_set.seeds {
-            m.entry(s.node)
-                .and_modify(|cur| {
-                    if seed_source_rank(s.source) > seed_source_rank(*cur) {
-                        *cur = s.source;
-                    }
-                })
-                .or_insert(s.source);
-        }
-        m
-    };
+    // #462: node → match source (exact-name / semantic / lexical), strongest
+    // source winning when a node was reached by more than one seed path. Drives
+    // the `[via: seed · <source>]` provenance tag and the RFC-022 §14 match-source
+    // bucket. Shared with `ask` (query.rs) via `strongest_seed_sources` so both
+    // surfaces classify a node identically. Display-only.
+    let seed_source_map: HashMap<NodeId, crate::seed::SeedSource> =
+        crate::seed::strongest_seed_sources(&seed_set.seeds);
 
     // Knapsack selection.
     let selected = knapsack(items, token_budget);
@@ -3901,16 +3892,6 @@ fn seed_source_display(source: crate::seed::SeedSource) -> &'static str {
         crate::seed::SeedSource::Exact => "exact-name",
         crate::seed::SeedSource::Knn => "semantic",
         crate::seed::SeedSource::Lexical => "lexical",
-    }
-}
-
-/// Precedence for "strongest source wins" when a node is reached by more than one
-/// seed path: exact-name > semantic > lexical.
-fn seed_source_rank(source: crate::seed::SeedSource) -> u8 {
-    match source {
-        crate::seed::SeedSource::Exact => 3,
-        crate::seed::SeedSource::Knn => 2,
-        crate::seed::SeedSource::Lexical => 1,
     }
 }
 

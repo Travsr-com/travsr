@@ -554,6 +554,39 @@ pub(crate) fn match_source(is_primary_seed: bool, is_exact_source: bool) -> Matc
     }
 }
 
+/// Precedence of a [`SeedSource`] when a node is reached by several seeds. Exact
+/// (literal-name / FTS) is the most trustworthy, then embedding-KNN, then
+/// fuzzy-lexical. The strongest source decides both the node's displayed
+/// `[via: · source]` provenance badge and its RFC-022 §14 match-source bucket.
+pub(crate) fn seed_source_rank(source: SeedSource) -> u8 {
+    match source {
+        SeedSource::Exact => 3,
+        SeedSource::Knn => 2,
+        SeedSource::Lexical => 1,
+    }
+}
+
+/// RFC-022 §14: collapse a seed set to `node -> strongest [`SeedSource`]`.
+///
+/// This is the single classifier both `get_context` (`tools.rs`) and `ask`
+/// (`query.rs`) key their match-source bucket off, so a node lands in the same
+/// section on either surface. Because [`Exact`](SeedSource::Exact) outranks every
+/// other source, a node reached by an exact anchor *and* a weaker source still
+/// buckets as Exact — the two surfaces cannot drift even if the ranking changes.
+pub(crate) fn strongest_seed_sources(seeds: &[Seed]) -> HashMap<NodeId, SeedSource> {
+    let mut m: HashMap<NodeId, SeedSource> = HashMap::new();
+    for s in seeds {
+        m.entry(s.node)
+            .and_modify(|cur| {
+                if seed_source_rank(s.source) > seed_source_rank(*cur) {
+                    *cur = s.source;
+                }
+            })
+            .or_insert(s.source);
+    }
+    m
+}
+
 /// RFC-022 §14 gate — **default on**. Match-source grouping (Exact → Semantic →
 /// Relevant sections, with the seed source hoisted into the header) is the format
 /// every consumer now parses: the VS Code Context Explorer, the `ask` CLI table,
@@ -2792,6 +2825,52 @@ mod tests {
     fn rerank_doc_defaults_off() {
         // Prototype ships gated; default path is unchanged.
         assert!(!rerank_doc_enabled());
+    }
+
+    // ── RFC-022 §14: shared node→strongest-source classifier ─────────────────
+
+    fn seed_with(node: NodeId, source: SeedSource) -> Seed {
+        Seed {
+            node,
+            weight: 1.0,
+            source,
+            score: 0.0,
+            rerank_score: None,
+        }
+    }
+
+    #[test]
+    fn strongest_seed_sources_exact_wins_over_weaker_sources() {
+        // A node reached by an exact anchor AND a weaker source must classify as
+        // Exact — this is the invariant get_context and ask both key off, so the
+        // two surfaces cannot disagree on a node's match-source bucket.
+        let seeds = vec![
+            seed_with(NodeId(1), SeedSource::Knn),
+            seed_with(NodeId(1), SeedSource::Exact), // same node, stronger source
+            seed_with(NodeId(1), SeedSource::Lexical),
+            seed_with(NodeId(2), SeedSource::Lexical),
+            seed_with(NodeId(3), SeedSource::Knn),
+        ];
+        let m = strongest_seed_sources(&seeds);
+        assert_eq!(m.get(&NodeId(1)), Some(&SeedSource::Exact), "exact wins");
+        assert_eq!(m.get(&NodeId(2)), Some(&SeedSource::Lexical));
+        assert_eq!(m.get(&NodeId(3)), Some(&SeedSource::Knn));
+        // Order-independent: reversing the input yields the same strongest map.
+        let mut rev = seeds.clone();
+        rev.reverse();
+        assert_eq!(strongest_seed_sources(&rev), m);
+
+        // The classifier both surfaces then apply: strongest==Exact ⇒ Exact bucket.
+        let is_exact = |id: NodeId| matches!(m.get(&id), Some(SeedSource::Exact));
+        assert_eq!(match_source(true, is_exact(NodeId(1))), MatchSource::Exact);
+        assert_eq!(
+            match_source(true, is_exact(NodeId(3))),
+            MatchSource::Semantic
+        );
+        assert_eq!(
+            match_source(false, is_exact(NodeId(1))),
+            MatchSource::Relevant
+        );
     }
 
     // ── #393 score-aware scope gate ──────────────────────────────────────────

@@ -358,16 +358,13 @@ pub fn ask_query(
     let emit_match_source = crate::seed::match_source_grouping_enabled();
     // Nodes whose strongest seed source is an exact literal-name / FTS match →
     // the "exact" match-source bucket (RFC-022 §14). Everything else that is a
-    // primary seed is "semantic"; non-seeds are "relevant".
-    let exact_seed_ids: HashSet<NodeId> = if emit_match_source {
-        seed_set
-            .seeds
-            .iter()
-            .filter(|s| matches!(s.source, crate::seed::SeedSource::Exact))
-            .map(|s| s.node)
-            .collect()
+    // primary seed is "semantic"; non-seeds are "relevant". Uses the same
+    // node→strongest-source classifier as get_context (`strongest_seed_sources`)
+    // so a node buckets identically on both surfaces.
+    let strongest_source: HashMap<NodeId, crate::seed::SeedSource> = if emit_match_source {
+        crate::seed::strongest_seed_sources(&seed_set.seeds)
     } else {
-        HashSet::new()
+        HashMap::new()
     };
     let rows = selected
         .into_iter()
@@ -382,7 +379,11 @@ pub fn ask_query(
                     expanded_cap,
                 ),
                 match_source: emit_match_source.then(|| {
-                    crate::seed::match_source(is_primary, exact_seed_ids.contains(&n.id))
+                    let is_exact = matches!(
+                        strongest_source.get(&n.id),
+                        Some(crate::seed::SeedSource::Exact)
+                    );
+                    crate::seed::match_source(is_primary, is_exact)
                         .label()
                         .to_string()
                 }),
