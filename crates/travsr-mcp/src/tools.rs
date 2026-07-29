@@ -2461,6 +2461,46 @@ fn is_context_result_noise(node: &CoreNode) -> bool {
         || node.kind == "file"
 }
 
+/// RFC-022 D3 (RC-3): conservative test-symbol detector for the *anchor* pool.
+///
+/// Inline `#[test]` functions live in ordinary `src/` files, so the path-based
+/// checks in [`is_noise_seed`] never see them, yet their descriptive names
+/// (`..._prefers_logic_bearing_over_field_only`) literally contain query words and
+/// out-anchor the real implementation. This recognises only the common
+/// cross-language test-*naming* markers (`test_foo`, `foo_test`, Go `TestFoo` /
+/// `BenchmarkFoo` / `FuzzFoo`) — deliberately narrow so a real function is never
+/// demoted; a marker-less descriptively-named inline test is not caught here (that
+/// needs an indexer-emitted test flag, tracked separately).
+pub(crate) fn is_test_symbol(node: &CoreNode) -> bool {
+    if node.kind != "function" && node.kind != "method" {
+        return false;
+    }
+    // Bare symbol name: drop the "fn:"/"method:" kind prefix and any "Type#" receiver.
+    let sig = node.vname.signature.as_str();
+    let name = sig.rsplit(['#', ':']).next().unwrap_or(sig);
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("test_")
+        || lower.ends_with("_test")
+        || lower.contains("_test_")
+        || (name.starts_with("Test") && name[4..].chars().next().is_some_and(char::is_uppercase))
+        || (name.starts_with("Benchmark")
+            && name[9..].chars().next().is_some_and(char::is_uppercase))
+        || (name.starts_with("Fuzz") && name[4..].chars().next().is_some_and(char::is_uppercase))
+}
+
+/// RFC-022 D3 (RC-3): noise predicate for *anchor-pool* candidates at emit time.
+///
+/// Anchors are the most-trusted seeds — they are floated to the top of the ranking
+/// and can trigger the deterministic G1 bypass — so the bar to enter the anchor
+/// pool is stricter than for a general PPR seed. Rejects everything
+/// [`is_context_result_noise`] rejects (CI/workflow `pkg:` nodes, bare file nodes,
+/// build/cache/test-dir paths) plus in-src test symbols ([`is_test_symbol`]). A
+/// rejected candidate can still enter retrieval via the lexical/KNN seed paths
+/// (kept by [`is_noise_seed`]); it just cannot be an anchor.
+pub(crate) fn is_anchor_noise(node: &CoreNode) -> bool {
+    is_context_result_noise(node) || is_test_symbol(node)
+}
+
 /// Derive PPR seeds from symbol-level KNN results with score-based selection.
 ///
 /// Strategy:
@@ -2510,10 +2550,6 @@ pub(crate) fn embed_path_seeds(
     if knn_pairs.is_empty() {
         return (vec![], 0, knn_elapsed_ms, std::collections::HashMap::new());
     }
-    // Cosine oracle: every over-fetched candidate, used downstream to validate
-    // lexical anchors against the embedding's notion of relevance.
-    let cosine_oracle: std::collections::HashMap<NodeId, f32> =
-        knn_pairs.iter().map(|&(id, s)| (id, s)).collect();
 
     // Fetch node metadata for noise filter + RBAC + path dedup.
     let all_ids: Vec<NodeId> = knn_pairs.iter().map(|&(id, _)| id).collect();
@@ -2521,11 +2557,30 @@ pub(crate) fn embed_path_seeds(
         Ok(ns) => ns,
         Err(e) => {
             tracing::warn!("embed_path_seeds get_nodes error: {e}");
-            return (vec![], 0, knn_elapsed_ms, cosine_oracle);
+            return (vec![], 0, knn_elapsed_ms, std::collections::HashMap::new());
         }
     };
     let node_map: std::collections::HashMap<NodeId, CoreNode> =
         nodes.into_iter().map(|n| (n.id, n)).collect();
+
+    // Cosine oracle: every over-fetched candidate that is a genuine relevance
+    // target — used downstream to validate lexical anchors AND to ground
+    // confidence. RFC-022 D3 (RC-3): exclude CI/workflow `pkg:` package nodes and
+    // bare file nodes here, not just from the seed list. Arctic embeds a salad
+    // query ("shopping cart checkout payment flow") near `pkg:actions/checkout`
+    // (cosine ~0.40, above the calibrated recall floor); letting that cosine into
+    // the oracle falsely grounds the query to Exact — a salad leak that also breaks
+    // the G2 invariant (embed-on would disagree with embed-off, which abstains). A
+    // package/file node is never a valid answer, so it must not vote on confidence.
+    let cosine_oracle: std::collections::HashMap<NodeId, f32> = knn_pairs
+        .iter()
+        .filter(|&&(id, _)| {
+            node_map
+                .get(&id)
+                .is_some_and(|n| !is_context_result_noise(n))
+        })
+        .map(|&(id, s)| (id, s))
+        .collect();
 
     // #462 WS1b — calibrated KNN admission. The old fixed `EMBED_SCORE_THRESHOLD`
     // (0.75) is a bge-scale cosine: no arctic conceptual match ever reaches it
@@ -2553,8 +2608,10 @@ pub(crate) fn embed_path_seeds(
             Some(n) => n,
             None => continue,
         };
-        // Skip Cargo dependency nodes and test/bench fixtures unconditionally.
-        if is_noise_seed(node) {
+        // Skip Cargo dependency nodes, CI/workflow package nodes, bare file nodes,
+        // and test/bench fixtures unconditionally. RFC-022 D3: same bar as the
+        // oracle above — a `pkg:`/file node is never a valid semantic seed.
+        if is_context_result_noise(node) {
             continue;
         }
         if !filter.allow(id, id, Some(node.vname.corpus.as_str())) {
@@ -7283,6 +7340,58 @@ mod snippet_tests {
         );
     }
 
+    // ── RFC-022 D3: anchor-pool noise (test symbols + CI package nodes) ───────
+
+    #[test]
+    fn is_test_symbol_catches_marker_names_not_real_functions() {
+        let test_fns = [
+            ("function", "fn:test_builds_the_seed_set"),
+            ("function", "fn:seed_set_test"),
+            ("function", "fn:TestReconcile"),     // Go
+            ("function", "fn:BenchmarkKnapsack"), // Go
+            ("method", "method:TestJig#TestRun"),
+        ];
+        for (kind, sig) in test_fns {
+            let n = make_node_with_kind_and_path(kind, "crates/x/src/lib.rs", sig);
+            assert!(is_test_symbol(&n), "{sig} should read as a test symbol");
+        }
+        // Real functions that merely mention/contain "test"-ish substrings must not match.
+        for sig in [
+            "fn:build_seed_set",
+            "fn:Testament",
+            "fn:latest_snapshot",
+            "struct:Tester",
+        ] {
+            let n = make_node_with_kind_and_path("function", "crates/x/src/lib.rs", sig);
+            assert!(!is_test_symbol(&n), "{sig} must not read as a test symbol");
+        }
+    }
+
+    #[test]
+    fn is_anchor_noise_excludes_ci_package_but_not_real_impl() {
+        // CI/workflow package node — never a valid anchor.
+        let pkg = make_node_with_kind_and_path(
+            "package",
+            ".github/workflows/ci.yml",
+            "pkg:actions/checkout@v4",
+        );
+        assert!(
+            is_anchor_noise(&pkg),
+            "pkg:actions/* must be excluded from anchors"
+        );
+        // In-src test — excluded from anchors even though is_noise_seed keeps it as a seed.
+        let t = make_node_with_kind_and_path(
+            "function",
+            "crates/x/src/lib.rs",
+            "fn:test_reticulates_splines",
+        );
+        assert!(is_anchor_noise(&t) && !is_noise_seed(&t));
+        // A genuine implementation is a valid anchor.
+        let impl_fn =
+            make_node_with_kind_and_path("function", "crates/x/src/lib.rs", "fn:build_seed_set");
+        assert!(!is_anchor_noise(&impl_fn), "real impl must be anchorable");
+    }
+
     #[test]
     fn is_noise_seed_excludes_root_fixtures_dir() {
         let n = make_node_with_kind_and_path(
@@ -7483,6 +7592,9 @@ mod snippet_tests {
             "crates/travsr-mcp/tests/conformance.rs",
             "fn:run_mcp",
         );
+        // RFC-022 D3: a CI/workflow package node — must be filtered from BOTH the
+        // seed list and the cosine oracle even at a high KNN cosine.
+        let pkg_node = make_node_with_kind_and_path("package", "", "pkg:actions/checkout@v4");
         let impl_node = make_node_with_kind_and_path(
             "function",
             "crates/travsr-mcp/src/tools.rs",
@@ -7491,19 +7603,36 @@ mod snippet_tests {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let crate_id = store.put_node(&crate_node).unwrap();
         let test_id = store.put_node(&test_node).unwrap();
+        let pkg_id = store.put_node(&pkg_node).unwrap();
         let impl_id = store.put_node(&impl_node).unwrap();
 
-        // KNN returns all three with high scores.
-        let knn: EmbedKnnFn<'_> =
-            &|_q, _k| vec![(crate_id, 0.95), (test_id, 0.90), (impl_id, 0.85)];
+        // KNN returns all four with high scores (pkg highest, as arctic does for salad).
+        let knn: EmbedKnnFn<'_> = &|_q, _k| {
+            vec![
+                (pkg_id, 0.97),
+                (crate_id, 0.95),
+                (test_id, 0.90),
+                (impl_id, 0.85),
+            ]
+        };
 
-        let (seeds, n_eligible, _, _) = embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        let (seeds, n_eligible, _, oracle) =
+            embed_path_seeds(&store, "get_context", knn, &OpenFilter);
         assert!(
             seeds.iter().all(|(node, _)| node.id == impl_id),
             "only the src impl node should be a seed; got: {seeds:?}"
         );
         assert_eq!(seeds.len(), 1, "exactly one seed expected");
         assert_eq!(n_eligible, 1, "n_eligible should match non-noise seeds");
+        // The package node must not be in the confidence-grounding oracle.
+        assert!(
+            !oracle.contains_key(&pkg_id),
+            "pkg node must be excluded from the cosine oracle"
+        );
+        assert!(
+            oracle.contains_key(&impl_id),
+            "real impl must remain in oracle"
+        );
     }
 
     // ── #367 degraded-state notes ─────────────────────────────────────────────

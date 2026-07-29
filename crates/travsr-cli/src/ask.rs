@@ -67,10 +67,12 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Match the pre-#318 messages exactly (query echoed after `:`-stripping).
     let display_query = query_str.strip_prefix(':').unwrap_or(query_str).trim();
     if !payload.matched {
-        println!("no symbols matching '{display_query}'");
+        // `ask` is natural-language, graph-grounded retrieval — not a symbol-name
+        // lookup — so an abstention means "no confidently relevant code found",
+        // not "that symbol does not exist". Word it that way to avoid the misread.
+        println!("no grounded match for '{display_query}' in this repo (try rephrasing, or search a symbol name directly)");
         return Ok(());
     }
     if payload.no_results {

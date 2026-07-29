@@ -1,0 +1,68 @@
+{
+  "_comment": "Seeded conceptual-retrieval test cases for the TRAVSR repo itself (self-index). Companion to queries-seeded-k8s.json but grounded in this repo's real symbols. Purpose: exercise get_context / ask_query end-to-end across EVERY retrieval scenario and edge case, and pin the #462 WS4 anchor-gated rerank recall-floor rescue (grounded prose that used to abstain must now surface as `weak`, while salad/nonsense must still abstain). Every `expect` token is a real symbol or file verified against .travsr/graph.db on 2026-07-29.",
+  "_schema": {
+    "id": "stable case id (prefix encodes category)",
+    "category": "one of: literal | conceptual | cross | fuzzy | rare | generic | nonsense | salad | degenerate",
+    "query": "the raw query text sent to get_context / ask",
+    "expect": "array of symbol names and/or file paths; a run HITS if any appears in a returned seed row (name-or-path substring, as scored by run-seeded-*.mjs)",
+    "seeds": "candidate symbol NAMES an agent would decompose from the query text alone (arm C of the seeded experiment) — empty for nonsense/salad",
+    "expect_abstain": "true when the correct behavior is Confidence::None (no grounded answer). Absent = should return a grounded result.",
+    "min_confidence": "optional lower bound the run should meet: strong | weak. Absent = unscored on confidence.",
+    "note": "the specific scenario / edge case this row covers"
+  },
+  "queries": [
+    { "id": "L1", "category": "literal", "query": "build_seed_set", "expect": ["build_seed_set", "seed.rs"], "seeds": ["build_seed_set"], "min_confidence": "strong", "note": "single exact identifier -> Strong/Exact lookup" },
+    { "id": "L2", "category": "literal", "query": "classify_confidence", "expect": ["classify_confidence", "seed.rs"], "seeds": ["classify_confidence"], "min_confidence": "strong", "note": "exact identifier that the reranker also scores highly" },
+    { "id": "L3", "category": "literal", "query": "order_anchor_candidates", "expect": ["order_anchor_candidates", "seed.rs"], "seeds": ["order_anchor_candidates"], "min_confidence": "strong", "note": "exact identifier (#463 helper)" },
+    { "id": "L4", "category": "literal", "query": "ppr_weighted", "expect": ["ppr_weighted", "ppr.rs"], "seeds": ["ppr_weighted"], "min_confidence": "strong", "note": "exact identifier in a non-mcp crate (travsr-retrieval)" },
+    { "id": "L5", "category": "literal", "query": "SqliteStore search_nodes_by_name", "expect": ["search_nodes_by_name", "SqliteStore", "store/src/lib.rs"], "seeds": ["SqliteStore", "search_nodes_by_name"], "min_confidence": "strong", "note": "type + method, multi-token literal" },
+    { "id": "L6", "category": "literal", "query": "WatchEvent", "expect": ["WatchEvent", "watcher.rs"], "seeds": ["WatchEvent"], "min_confidence": "strong", "note": "exact enum name" },
+    { "id": "L7", "category": "literal", "query": "get_blast_radius", "expect": ["get_blast_radius", "tools.rs"], "seeds": ["get_blast_radius"], "min_confidence": "strong", "note": "exact MCP tool fn name" },
+
+    { "id": "C1", "category": "conceptual", "query": "how does the daemon work", "expect": ["Daemon", "daemon/src/lib.rs"], "seeds": ["Daemon", "run"], "note": "prose about a named component; head noun is an exact anchor" },
+    { "id": "C2", "category": "conceptual", "query": "how is the seed set built for a query", "expect": ["build_seed_set", "seed.rs"], "seeds": ["build_seed_set", "seed"], "note": "prose -> the pipeline's entry function" },
+    { "id": "C3", "category": "conceptual", "query": "how does the system decide when to abstain instead of guessing", "expect": ["classify_confidence", "seed.rs"], "seeds": ["classify_confidence", "confidence", "abstain"], "note": "abstract behavior -> confidence classifier; identifier not in query text" },
+    { "id": "C4", "category": "conceptual", "query": "how are candidate anchors ordered before reranking", "expect": ["order_anchor_candidates", "seed.rs"], "seeds": ["order_anchor_candidates", "anchor"], "note": "prose -> #463 ordering helper" },
+    { "id": "C5", "category": "conceptual", "query": "how does personalized pagerank rank graph nodes", "expect": ["ppr_weighted", "ppr.rs"], "seeds": ["ppr_weighted", "pagerank"], "note": "algorithm-by-description in a separate crate" },
+    { "id": "C6", "category": "conceptual", "query": "how does the cross encoder score search results", "expect": ["rerank", "Reranker", "rerank.rs"], "seeds": ["rerank", "Reranker"], "note": "synonym (cross encoder) for the reranker" },
+    { "id": "C7", "category": "conceptual", "query": "how is a natural language query split into tokens", "expect": ["tokenize_query", "seed.rs"], "seeds": ["tokenize_query", "token"], "note": "prose -> tokenizer" },
+    { "id": "C8", "category": "conceptual", "query": "how does the file watcher detect changes on disk", "expect": ["WatcherHandle", "WatchEvent", "watcher.rs"], "seeds": ["watcher", "WatchEvent"], "note": "prose -> watcher subsystem" },
+    { "id": "C9", "category": "conceptual", "query": "how is the blast radius of a change computed", "expect": ["get_blast_radius", "tools.rs"], "seeds": ["blast_radius"], "note": "prose whose head noun is a compiled-away identifier" },
+    { "id": "C10", "category": "conceptual", "query": "how do incremental reindex and full rebuild stay consistent", "expect": ["incremental_delete_matches_full_rebuild", "daemon/src/lib.rs"], "seeds": ["incremental", "reindex"], "note": "invariant-by-description; correctness property" },
+    { "id": "C11", "category": "conceptual", "query": "how are the nearest embedding neighbors looked up", "expect": ["embed_knn", "knn", "embed_supervisor.rs", "store/src/lib.rs"], "seeds": ["embed_knn", "knn"], "note": "prose -> KNN hook path" },
+    { "id": "C12", "category": "conceptual", "query": "how are semantic similarity floors calibrated per embedding model", "expect": ["Calibration", "semantic_recall_floor", "seed.rs"], "seeds": ["Calibration", "calibrate"], "note": "prose -> per-model floor calibration" },
+    { "id": "C13", "category": "conceptual", "query": "how does the indexer parse a source file into nodes", "expect": ["parse_file", "Indexer", "indexer/src/lib.rs"], "seeds": ["Indexer", "parse_file"], "note": "prose -> indexer parse entry" },
+    { "id": "C14", "category": "conceptual", "query": "how is the query intent classified", "expect": ["classify_intent", "seed.rs"], "seeds": ["classify_intent", "intent"], "note": "prose -> deterministic intent classifier" },
+    { "id": "C15", "category": "conceptual", "query": "how are results trimmed to fit a token budget", "expect": ["knapsack", "apply_token_budget", "knapsack.rs"], "seeds": ["knapsack", "token_budget"], "note": "prose -> budget knapsack" },
+
+    { "id": "W1", "category": "conceptual", "query": "how daemon is implemented", "expect": ["Daemon", "daemon/src/lib.rs"], "seeds": ["Daemon"], "min_confidence": "weak", "note": "#462 WS4 rescue target: prose collapses the reranker (~0.35) but a genuine `daemon` anchor grounds it -> must surface as weak, not abstain" },
+    { "id": "W2", "category": "conceptual", "query": "what does the daemon do", "expect": ["Daemon", "daemon/src/lib.rs"], "seeds": ["Daemon"], "min_confidence": "weak", "note": "#462 WS4 rescue target: meta question, near-zero lexical overlap with the struct body" },
+    { "id": "W3", "category": "conceptual", "query": "how does the linear projection head transform seed embeddings", "expect": [], "seeds": ["projection"], "expect_abstain": true, "note": "#462 WS4 boundary: concept was REJECTED and never shipped -> no grounded symbol, rerank stays below the recall floor -> must abstain (guards the rescue from firing on absent concepts)" },
+
+    { "id": "X1", "category": "cross", "query": "how does a query go from raw text to a ranked, budgeted context", "expect": ["build_seed_set", "ppr_weighted", "rerank", "knapsack", "get_context"], "seeds": ["tokenize_query", "build_seed_set", "ppr_weighted", "rerank", "knapsack"], "note": "multi-hop pipeline spanning mcp + retrieval crates" },
+    { "id": "X2", "category": "cross", "query": "how do embeddings feed into seed selection and confidence", "expect": ["embed_knn", "build_seed_set", "classify_confidence"], "seeds": ["embed_knn", "build_seed_set", "classify_confidence"], "note": "two subsystems joined by one query" },
+    { "id": "X3", "category": "cross", "query": "how does the daemon answer an MCP get_context request", "expect": ["Daemon", "get_context", "ask_query"], "seeds": ["Daemon", "get_context", "ask_query"], "note": "daemon serving path across daemon + mcp" },
+
+    { "id": "F1", "category": "fuzzy", "query": "score how rare or specific a search term is", "expect": ["idf_weight", "seed.rs"], "seeds": ["idf", "rarity", "specificity"], "note": "concept described with NO repo identifier -> idf weighting" },
+    { "id": "F2", "category": "fuzzy", "query": "prefer a definition with a real body over a fields-only struct", "expect": ["order_anchor_candidates", "kind_logic_rank", "seed.rs"], "seeds": ["logic bearing", "body", "definition"], "note": "describes the #463 logic-bearing preference without naming it" },
+    { "id": "F3", "category": "fuzzy", "query": "stop the model from returning a confident answer to a meaningless question", "expect": ["classify_confidence", "is_noise_seed", "seed.rs"], "seeds": ["abstain", "confidence", "noise"], "note": "describes the abstention guard by intent" },
+
+    { "id": "R1", "category": "rare", "query": "anchor_rescued_confidence", "expect": ["anchor_rescued_confidence", "seed.rs"], "seeds": ["anchor_rescued_confidence"], "min_confidence": "strong", "note": "genuinely unique identifier -> G1 rare-symbol bypass (deterministic, reranker-independent)" },
+    { "id": "R2", "category": "rare", "query": "semantic_recall_floor", "expect": ["semantic_recall_floor", "seed.rs"], "seeds": ["semantic_recall_floor"], "min_confidence": "strong", "note": "rare exact anchor; must not be false-abstained by the NL reranker" },
+
+    { "id": "G1", "category": "generic", "query": "run", "expect": ["run", "Daemon"], "seeds": ["run"], "note": "very common token -> low IDF; must not starve nor emit a confident salad" },
+    { "id": "G2", "category": "generic", "query": "get map handle", "expect": [], "seeds": ["get", "map", "handle"], "expect_abstain": true, "note": "three high-frequency generic tokens, no specific anchor -> low coverage, should abstain" },
+
+    { "id": "N1", "category": "nonsense", "query": "how to bake a chocolate cake", "expect": [], "seeds": [], "expect_abstain": true, "note": "off-domain, zero coverage -> abstain" },
+    { "id": "N2", "category": "nonsense", "query": "what is the meaning of life", "expect": [], "seeds": [], "expect_abstain": true, "note": "off-domain; a resolved token or two but rerank ~3e-5 -> abstain" },
+    { "id": "N3", "category": "nonsense", "query": "book a flight to paris next tuesday", "expect": [], "seeds": [], "expect_abstain": true, "note": "off-domain natural language -> abstain" },
+    { "id": "N4", "category": "nonsense", "query": "implement a distributed raft consensus protocol with leader election", "expect": [], "seeds": [], "expect_abstain": true, "note": "plausible engineering prose but absent from this repo -> abstain (must not hallucinate a match)" },
+
+    { "id": "S1", "category": "salad", "query": "delete all user accounts and drop the database", "expect": [], "seeds": [], "expect_abstain": true, "note": "salad: drop/delete resolve incidental exact anchors, but rerank ~0.001 -> WS4 recall floor keeps it abstained (RFC-021 reproduction query)" },
+    { "id": "S2", "category": "salad", "query": "shopping cart checkout payment flow", "expect": [], "seeds": [], "expect_abstain": true, "note": "salad: e-commerce concept absent; guards against a g1_bypass false-Exact leak (G5)" },
+    { "id": "S3", "category": "salad", "query": "render the login page as a react component with a redux store", "expect": [], "seeds": [], "expect_abstain": true, "note": "frontend salad; `store`/`render` may resolve incidentally -> must abstain" },
+
+    { "id": "D1", "category": "degenerate", "query": "", "expect": [], "seeds": [], "expect_abstain": true, "note": "empty query -> explicit empty/abstain, never a crash" },
+    { "id": "D2", "category": "degenerate", "query": "the of and is", "expect": [], "seeds": [], "expect_abstain": true, "note": "all stop-words -> zero content tokens -> abstain" }
+  ]
+}

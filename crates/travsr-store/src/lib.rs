@@ -2511,7 +2511,117 @@ LIMIT 20",
                         .context("executing write_embed_texts_batch update")?;
                 }
             }
+            // RFC-022 D1 (RC-1): fold the freshly-written `embed_text` into each
+            // node's FTS content so a conceptual query can match the doc/skeleton's
+            // natural-language terms (the compound symbol the bare signature hides).
+            // Rebuilds the FTS row in the same tx (retract-old + insert-widened),
+            // preserving the contentless-FTS5 + vocab invariants. Keeps the
+            // always-fresh guarantee: the FTS index tracks embed_text as it lands.
+            // Gated OFF by default (pending Phase-4 calibration); when disabled the
+            // FTS row is left signature-only (byte-for-byte the pre-D1 behaviour).
+            if Self::fts_embed_widen_enabled() {
+                let mut sel = tx
+                    .prepare("SELECT path, language, signature, kind FROM nodes WHERE id = ?1")
+                    .context("preparing embed-fts node lookup")?;
+                for (id, text) in pairs {
+                    let parts: Option<(String, String, String, String)> = sel
+                        .query_row(params![node_id_to_i64(*id)], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        })
+                        .optional()
+                        .context("looking up node parts for embed-fts")?;
+                    if let Some((path, language, signature, kind)) = parts {
+                        let toks = Self::fts_tokens_with_embed_from_parts(
+                            &signature,
+                            &path,
+                            &kind,
+                            &language,
+                            Some(text),
+                        );
+                        Self::put_node_fts_tokens(&tx, *id, &toks)?;
+                    }
+                }
+            }
             tx.commit().context("committing write_embed_texts_batch tx")
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// RFC-022 D1 (RC-1): reconcile the FTS content of every already-`embed_text`-
+    /// populated node with the current [`fts_embed_widen_enabled`] setting. When the
+    /// widening is ON, rebuilds each node's `nodes_fts` row to fold in the doc/
+    /// skeleton tokens; when OFF, rebuilds them signature-only (the downgrade path,
+    /// so toggling the flag back off fully restores the pre-D1 index). Pure FTS work
+    /// — never recomputes embeddings or skeletons. A `fts_embed_text_version` meta
+    /// key records the applied state (`"1"` = widened, `"0"` = signature-only) so the
+    /// reconcile runs only when the state actually changes (idempotent,
+    /// always-fresh-preserving). Returns the number of nodes rebuilt; 0 when current.
+    pub fn backfill_fts_embed_text(&mut self) -> Result<usize, StoreError> {
+        let widen = Self::fts_embed_widen_enabled();
+        let target_version = if widen { "1" } else { "0" };
+        (|| -> AnyResult<usize> {
+            let current: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'fts_embed_text_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("reading fts_embed_text_version")?;
+            // No-op when already in the desired state. Treat a never-set version as
+            // signature-only ("0"): if the widening is off and was never applied,
+            // there is nothing to reconcile.
+            let effective = current.as_deref().unwrap_or("0");
+            if effective == target_version {
+                return Ok(0);
+            }
+            let rows: Vec<(i64, String, String, String, String, String)> = {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, path, language, signature, kind, embed_text \
+                         FROM nodes WHERE embed_text IS NOT NULL AND embed_text != ''",
+                    )
+                    .context("preparing backfill_fts_embed_text scan")?;
+                let mapped = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })
+                    .context("scanning nodes for embed-fts backfill")?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            let tx = self
+                .conn
+                .transaction()
+                .context("begin backfill_fts_embed_text tx")?;
+            for (id_i64, path, language, signature, kind, embed_text) in &rows {
+                // widen → fold in embed_text; downgrade → signature-only (None).
+                let embed = if widen {
+                    Some(embed_text.as_str())
+                } else {
+                    None
+                };
+                let toks =
+                    Self::fts_tokens_with_embed_from_parts(signature, path, kind, language, embed);
+                Self::put_node_fts_tokens(&tx, i64_to_node_id(*id_i64), &toks)?;
+            }
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES('fts_embed_text_version', ?1) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![target_version],
+            )
+            .context("recording fts_embed_text_version")?;
+            tx.commit()
+                .context("committing backfill_fts_embed_text tx")?;
+            Ok(rows.len())
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }
@@ -3255,12 +3365,98 @@ impl SqliteStore {
         )
     }
 
+    /// Maximum number of `embed_text` tokens folded into the FTS content (RFC-022
+    /// D1). Bounds index growth on long bodies while capturing the doc/skeleton's
+    /// leading natural-language terms, which is where the conceptual signal lives.
+    const MAX_EMBED_FTS_TOKENS: usize = 48;
+
+    /// RFC-022 D1 (RC-1) recall widening: fold `embed_text` (doc + skeleton) tokens
+    /// into the FTS content. **Default OFF** — measured net-neutral-to-negative on
+    /// the seeded fixture on its own (the confidence gate, not recall, is the binding
+    /// constraint for conceptual queries, and the extra recall adds precision noise
+    /// that needs the companion RRF rebalance/generic-cap before it pays off). Ships
+    /// behind this flag per the RFC's phased rollout (§8: each phase default-off
+    /// until its bench passes; Phase 4 flips defaults after calibration). Enable with
+    /// `TRAVSR_FTS_EMBED_WIDEN=1`; the [`backfill_fts_embed_text`] downgrade path
+    /// rebuilds signature-only FTS when it is turned back off.
+    fn fts_embed_widen_enabled() -> bool {
+        matches!(
+            std::env::var("TRAVSR_FTS_EMBED_WIDEN").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    }
+
+    /// RFC-022 D1 (RC-1): FTS token string widened with a node's `embed_text`
+    /// skeleton, built from raw columns so callers holding a row (e.g.
+    /// [`write_embed_texts_batch`]) need not reconstruct a `Node`. The bare
+    /// signature names a compound symbol (`ppr_weighted`) with tokens a conceptual
+    /// query never uses ("personalized pagerank"); the doc / AST-skeleton
+    /// `embed_text` carries exactly those words, so folding a bounded slice of it
+    /// into the FTS content lets the sparse leg reward multi-term conceptual matches.
+    /// Falls back to signature-only tokens when `embed_text` is absent, so
+    /// un-embedded repos and the reference path are unchanged.
+    fn fts_tokens_with_embed_from_parts(
+        signature: &str,
+        path: &str,
+        kind: &str,
+        language: &str,
+        embed_text: Option<&str>,
+    ) -> String {
+        let base = format!(
+            "{} {} {} {}",
+            tokenize_identifier(signature),
+            tokenize_identifier(path),
+            kind.to_ascii_lowercase(),
+            language.to_ascii_lowercase(),
+        );
+        match embed_text {
+            Some(t) if !t.trim().is_empty() => {
+                let bounded = Self::embed_fts_tokens(t);
+                if bounded.is_empty() {
+                    base
+                } else {
+                    format!("{base} {bounded}")
+                }
+            }
+            _ => base,
+        }
+    }
+
+    /// Extract a bounded, doc-first FTS token slice from an `embed_text` skeleton
+    /// (RFC-022 D1). The skeleton layout is
+    /// `function: … | module: … | params: … | returns: … | calls: … | doc: <prose>`;
+    /// the `doc:` prose carries the natural-language terms a conceptual query uses
+    /// ("Personalized PageRank" for `ppr_weighted`), but it trails a potentially long
+    /// `calls:` list, so a naive head-slice would drop it. Emit the doc tokens FIRST,
+    /// then the structural remainder, capped at [`MAX_EMBED_FTS_TOKENS`] — so the
+    /// conceptual signal is always captured while index growth stays bounded.
+    fn embed_fts_tokens(embed_text: &str) -> String {
+        let (rest, doc) = match embed_text.split_once("| doc:") {
+            Some((r, d)) => (r, d),
+            None => (embed_text, ""),
+        };
+        let doc_toks = tokenize_identifier(doc);
+        let rest_toks = tokenize_identifier(rest);
+        doc_toks
+            .split_whitespace()
+            .chain(rest_toks.split_whitespace())
+            .take(Self::MAX_EMBED_FTS_TOKENS)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Upsert a node's FTS entry.  Handles the contentless-FTS5 invariant:
     /// a row must be explicitly deleted (with its original tokens) before
     /// re-inserting, otherwise the index silently accumulates stale entries.
     fn put_node_fts(conn: &Connection, node: &Node) -> AnyResult<()> {
-        let id_i64 = node_id_to_i64(node.id);
-        let new_tokens = Self::node_fts_tokens(node);
+        Self::put_node_fts_tokens(conn, node.id, &Self::node_fts_tokens(node))
+    }
+
+    /// Core of [`put_node_fts`] parameterised on the final token string, so callers
+    /// that widen the content (e.g. [`write_embed_texts_batch`] folding in
+    /// `embed_text`, RFC-022 D1) reuse the identical retract/insert/vocab dance.
+    fn put_node_fts_tokens(conn: &Connection, id: NodeId, new_tokens: &str) -> AnyResult<()> {
+        let id_i64 = node_id_to_i64(id);
 
         // Fetch old tokens (if any) so we can retract the stale FTS row.
         let old_tokens: Option<String> = conn
@@ -3299,7 +3495,7 @@ impl SqliteStore {
         .context("upserting nodes_fts_map")?;
 
         // Increment vocab refcounts for new tokens (v10 L2-A).
-        Self::vocab_increment(conn, &new_tokens)?;
+        Self::vocab_increment(conn, new_tokens)?;
 
         Ok(())
     }
@@ -6748,6 +6944,112 @@ mod tests {
             !store.has_refcall_edges_for_language("rust"),
             "different lang must return false"
         );
+    }
+
+    #[test]
+    fn embed_fts_tokens_puts_doc_prose_first() {
+        // RFC-022 D1: the doc prose trails a long `calls:` list in the skeleton, so
+        // a naive head-slice would drop it. `embed_fts_tokens` must emit doc tokens
+        // first so the conceptual signal survives the per-node cap.
+        let skeleton = "function: fn:ppr_weighted | module: crates/travsr-retrieval/src/ppr.rs \
+             | calls: is_empty ok vec sum map iter collect ppr hashmap len entry \
+             | doc: reticulation of splines across seeds";
+        let toks = SqliteStore::embed_fts_tokens(skeleton);
+        let first = toks.split_whitespace().next().unwrap_or("");
+        assert_eq!(
+            first, "reticulation",
+            "doc prose must lead the embed FTS tokens; got: {toks}"
+        );
+    }
+
+    #[test]
+    fn embed_text_widening_matches_doc_only_terms() {
+        // RFC-022 D1 (RC-1): a conceptual query term that appears ONLY in the doc
+        // ("reticulation"), never in the signature ("ppr_weighted"), must resolve the
+        // symbol once its embed_text is folded into FTS via write_embed_texts_batch.
+        std::env::set_var("TRAVSR_FTS_EMBED_WIDEN", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-retrieval/src/ppr.rs",
+                "rust",
+                "fn:ppr_weighted",
+            ),
+            "function",
+        );
+        let id = store.put_node(&node).unwrap();
+        // Before embed_text: "reticulation" (doc-only) does not resolve the symbol.
+        let before = store.search_nodes_fuzzy("reticulation").unwrap();
+        assert!(
+            !before
+                .iter()
+                .any(|n| n.vname.signature == "fn:ppr_weighted"),
+            "doc-only term must not match on signature-only FTS"
+        );
+        // Populate embed_text (as the daemon does) — this widens the FTS content.
+        store
+            .write_embed_texts_batch(&[(
+                id,
+                "function: fn:ppr_weighted | doc: reticulation of splines across seeds".to_string(),
+            )])
+            .unwrap();
+        let after = store.search_nodes_fuzzy("reticulation").unwrap();
+        assert!(
+            after.iter().any(|n| n.vname.signature == "fn:ppr_weighted"),
+            "after embed_text widening, the doc term must resolve the symbol"
+        );
+    }
+
+    #[test]
+    fn backfill_fts_embed_text_is_idempotent_and_widens() {
+        // Backfill an index whose embed_text was set directly (bypassing the FTS
+        // widening), then assert the doc term resolves and a second run is a no-op.
+        std::env::set_var("TRAVSR_FTS_EMBED_WIDEN", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-retrieval/src/ppr.rs",
+                "rust",
+                "fn:ppr_weighted",
+            ),
+            "function",
+        );
+        let id = store.put_node(&node).unwrap();
+        // Set embed_text WITHOUT the FTS widening path (simulates a pre-D1 index).
+        store
+            .conn
+            .execute(
+                "UPDATE nodes SET embed_text = ?2 WHERE id = ?1",
+                params![
+                    node_id_to_i64(id),
+                    "function: fn:ppr_weighted | doc: reticulation of splines"
+                ],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .search_nodes_fuzzy("reticulation")
+                .unwrap()
+                .iter()
+                .any(|n| n.vname.signature == "fn:ppr_weighted"),
+            "pre-backfill: doc term must not resolve"
+        );
+        let n1 = store.backfill_fts_embed_text().unwrap();
+        assert_eq!(n1, 1, "backfill should rebuild the one embed_text node");
+        assert!(
+            store
+                .search_nodes_fuzzy("reticulation")
+                .unwrap()
+                .iter()
+                .any(|n| n.vname.signature == "fn:ppr_weighted"),
+            "post-backfill: doc term must resolve"
+        );
+        let n2 = store.backfill_fts_embed_text().unwrap();
+        assert_eq!(n2, 0, "second backfill is a meta-gated no-op");
     }
 
     #[test]
