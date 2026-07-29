@@ -2728,12 +2728,19 @@ fn build_degraded_notes(store: &SqliteStore, has_embed: bool, embed_warming: boo
 /// - Omits `[package: ]` entirely when the package field is empty.
 /// - R7: appends `[score: N.NN]` when a score is available so the AI can
 ///   weight nodes by relevance without a second round-trip.
+/// - RFC-022 §14: when `omit_via` is true the `[via: …]` provenance badge is
+///   dropped entirely. Used for primary seeds rendered under a match-source
+///   section header (Exact / Semantic) — the header already carries the source,
+///   so a per-row badge would double-encode it and cost tokens. Relevant (non-seed)
+///   rows keep their `[via: caller of X]` badge, which names the *source seed* the
+///   header does not carry, so they pass `omit_via = false`.
 fn format_node_line(
     n: &CoreNode,
     role: &str,
     score: Option<f32>,
     via_source: Option<&str>,
     source: Option<&str>,
+    omit_via: bool,
 ) -> String {
     let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
     let score_str = score
@@ -2743,26 +2750,35 @@ fn format_node_line(
     // contamination is diagnosable — a caller of a good seed and a caller of a
     // false seed no longer print the identical `[via: caller]`. Seed/context roles
     // have no single source, so they render unchanged.
-    let via = match via_source {
-        Some(src) if role == "caller" || role == "dependency" => {
-            format!("[via: {role} of {src}]")
-        }
-        // #462: surface the seed's match source (exact-name / semantic / lexical)
-        // so a name-only anchor at a high rank with a low semantic score reads as
-        // honest provenance, not a bug. Display-only — never affects ordering.
-        _ => match source {
-            Some(s) => format!("[via: {role} · {s}]"),
-            None => format!("[via: {role}]"),
-        },
+    //
+    // RFC-022 §14: `omit_via` suppresses the badge for section-headed seeds. The
+    // segment carries its own leading space so an omitted badge leaves no stray
+    // whitespace — off-path output stays byte-for-byte identical.
+    let via = if omit_via {
+        String::new()
+    } else {
+        let badge = match via_source {
+            Some(src) if role == "caller" || role == "dependency" => {
+                format!("[via: {role} of {src}]")
+            }
+            // #462: surface the seed's match source (exact-name / semantic / lexical)
+            // so a name-only anchor at a high rank with a low semantic score reads as
+            // honest provenance, not a bug. Display-only — never affects ordering.
+            _ => match source {
+                Some(s) => format!("[via: {role} · {s}]"),
+                None => format!("[via: {role}]"),
+            },
+        };
+        format!(" {badge}")
     };
     if n.package.is_empty() {
         format!(
-            "{} ({}) — {}{loc} {via}{score_str}",
+            "{} ({}) — {}{loc}{via}{score_str}",
             n.vname.signature, n.kind, n.vname.path
         )
     } else {
         format!(
-            "{} ({}) — {}{loc} [package: {}] {via}{score_str}",
+            "{} ({}) — {}{loc} [package: {}]{via}{score_str}",
             n.vname.signature, n.kind, n.vname.path, n.package
         )
     }
@@ -2777,6 +2793,17 @@ fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
         crate::seed::MatchSource::Semantic => "## semantic — cross-encoder ranked",
         crate::seed::MatchSource::Relevant => "## relevant — graph-adjacent context",
     }
+}
+
+/// RFC-022 §14: whether a node's `[via: …]` badge should be suppressed.
+///
+/// Only in grouped mode, and only for primary seeds (Exact / Semantic) — their
+/// source is amortized into the section header, so a per-row badge double-encodes
+/// it. Relevant (non-seed) rows keep the badge because it names the *source seed*
+/// (`caller of X`), which the header does not carry. Off-path (`grouped == false`)
+/// always returns false → byte-for-byte identical output.
+fn omit_seed_via(grouped: bool, ms: crate::seed::MatchSource) -> bool {
+    grouped && ms != crate::seed::MatchSource::Relevant
 }
 
 /// RFC-022 §14: assemble the node body for `get_context`.
@@ -3651,6 +3678,7 @@ fn get_context_body(
                             .copied()
                             .unwrap_or(NodeRole::Context)
                             .label();
+                        let (ms, score) = entry_meta(n.id);
                         let line = format_node_line(
                             n,
                             role,
@@ -3660,8 +3688,8 @@ fn get_context_body(
                                 .and_then(|s| seed_sig.get(s))
                                 .map(String::as_str),
                             seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
+                            omit_seed_via(group_output, ms),
                         );
-                        let (ms, score) = entry_meta(n.id);
                         (ms, score, line)
                     })
                     .collect();
@@ -3701,6 +3729,7 @@ fn get_context_body(
                 .copied()
                 .unwrap_or(NodeRole::Context)
                 .label();
+            let (ms, score) = entry_meta(n.id);
             let header = format_node_line(
                 n,
                 role,
@@ -3710,6 +3739,7 @@ fn get_context_body(
                     .and_then(|s| seed_sig.get(s))
                     .map(String::as_str),
                 seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
+                omit_seed_via(group_output, ms),
             );
             // Use skeleton when the body exceeds the kind-aware line cap.
             let n_height = n
@@ -3740,7 +3770,6 @@ fn get_context_body(
             } else {
                 header
             };
-            let (ms, score) = entry_meta(n.id);
             blocks.push((ms, score, block));
         }
 
@@ -3777,6 +3806,7 @@ fn get_context_body(
                     .copied()
                     .unwrap_or(NodeRole::Context)
                     .label();
+                let (ms, score) = entry_meta(n.id);
                 let line = format_node_line(
                     n,
                     role,
@@ -3786,8 +3816,8 @@ fn get_context_body(
                         .and_then(|s| seed_sig.get(s))
                         .map(String::as_str),
                     seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
+                    omit_seed_via(group_output, ms),
                 );
-                let (ms, score) = entry_meta(n.id);
                 (ms, score, line)
             })
             .collect();
@@ -6855,7 +6885,7 @@ mod snippet_tests {
 
         // Package-less header (make_fn_node leaves package empty): the path
         // carries ":1" and the only trailer is " [via: ..] [score: ..]".
-        let header = format_node_line(&node_a, "seed", Some(0.80), None, None);
+        let header = format_node_line(&node_a, "seed", Some(0.80), None, None, false);
         assert!(
             header.contains("a.ts:1"),
             "sanity: real header must carry the line locator: {header}"
@@ -6872,12 +6902,72 @@ mod snippet_tests {
 
         // Package-present header exercises the " [package: ..]" terminator too.
         let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
-        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None, None);
+        let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None, None, false);
         assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
         let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
         assert!(
             result_pkg.contains("/* a */") && !result_pkg.contains("/* b */"),
             "package-present header must also resolve a.ts only: {result_pkg}"
+        );
+    }
+
+    // RFC-022 §14 (A4): grouped mode hoists the seed source into the section
+    // header, so a primary-seed (Exact/Semantic) line drops its `[via: …]` badge
+    // while a Relevant (non-seed) line keeps `[via: caller of X]`. Off-path
+    // (grouped=false) output is byte-for-byte identical to the pre-§14 format.
+    #[test]
+    fn grouped_mode_omits_via_on_seeds_keeps_it_on_relevant() {
+        let seed = make_fn_node("a.ts", "fn:run", 1, 1);
+
+        // Seed under a section header, grouped ON → no `[via:]`, no stray space.
+        let exact = omit_seed_via(true, crate::seed::MatchSource::Exact);
+        let semantic = omit_seed_via(true, crate::seed::MatchSource::Semantic);
+        assert!(exact && semantic, "seeds are hoisted in grouped mode");
+        let seed_line =
+            format_node_line(&seed, "seed", Some(0.80), None, Some("exact-name"), exact);
+        assert!(
+            !seed_line.contains("[via:"),
+            "grouped seed line must drop the via badge: {seed_line}"
+        );
+        assert!(
+            !seed_line.contains("  "),
+            "dropped badge must not leave a double space: {seed_line:?}"
+        );
+        assert!(
+            seed_line.contains("[score: 0.80]"),
+            "score still renders on a hoisted seed line: {seed_line}"
+        );
+
+        // Relevant (non-seed) row keeps its provenance badge even grouped ON.
+        assert!(!omit_seed_via(true, crate::seed::MatchSource::Relevant));
+        let rel_line = format_node_line(
+            &seed,
+            "caller",
+            Some(0.10),
+            Some("fn:handler"),
+            None,
+            omit_seed_via(true, crate::seed::MatchSource::Relevant),
+        );
+        assert!(
+            rel_line.contains("[via: caller of fn:handler]"),
+            "relevant row must keep the source-seed badge: {rel_line}"
+        );
+
+        // Off-path (grouped=false) is byte-for-byte identical for every source.
+        for ms in [
+            crate::seed::MatchSource::Exact,
+            crate::seed::MatchSource::Semantic,
+            crate::seed::MatchSource::Relevant,
+        ] {
+            assert!(
+                !omit_seed_via(false, ms),
+                "grouping off never omits the badge"
+            );
+        }
+        let flat = format_node_line(&seed, "seed", Some(0.80), None, Some("exact-name"), false);
+        assert_eq!(
+            flat, "fn:run (function) — a.ts:1 [via: seed · exact-name] [score: 0.80]",
+            "flag-off render must match the frozen pre-§14 format byte-for-byte"
         );
     }
 

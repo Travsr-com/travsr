@@ -554,13 +554,16 @@ pub(crate) fn match_source(is_primary_seed: bool, is_exact_source: bool) -> Matc
     }
 }
 
-/// RFC-022 §14 prototype gate. `TRAVSR_MATCH_SOURCE=1` turns on match-source
-/// grouping of `get_context` / `ask` output (display-only). Default off →
-/// byte-for-byte identical output, so every existing test and frozen bench holds.
+/// RFC-022 §14 gate — **default on**. Match-source grouping (Exact → Semantic →
+/// Relevant sections, with the seed source hoisted into the header) is the format
+/// every consumer now parses: the VS Code Context Explorer, the `ask` CLI table,
+/// and the k8s bench harness. `TRAVSR_MATCH_SOURCE=0` is the kill-switch that
+/// restores the flat, byte-for-byte pre-§14 output for a release cycle while the
+/// grouped format is validated in the field; any other value (or unset) keeps it on.
 pub(crate) fn match_source_grouping_enabled() -> bool {
     std::env::var("TRAVSR_MATCH_SOURCE")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 // ── Stop-word list (code-aware: omit "get", "set", "run", "use") ─────────────
