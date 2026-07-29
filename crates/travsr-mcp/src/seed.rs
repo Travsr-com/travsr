@@ -1023,6 +1023,34 @@ fn rerank_ppr_multiplier(rerank: f32, weak_floor: f32) -> f32 {
     m.clamp(FLOOR, CEIL)
 }
 
+// ── RFC-022 (prototype): doc-aware reranker candidate text ────────────────────
+//
+// The cross-encoder candidate is `signature + docblock-stripped body` — the leading
+// doc comment (the natural-language description a conceptual query actually matches,
+// e.g. "Personalized PageRank …") is the one thing NOT fed to the model, which is a
+// direct contributor to its prose→code collapse. This prototype prepends the node's
+// doc prose (from `embed_text`) so the model sees that NL surface. Default OFF
+// (`TRAVSR_RERANK_DOC=1`); a no-op when `embed_text` is unpopulated, so the reference
+// path is byte-for-byte unchanged.
+
+/// Whether the doc-aware reranker candidate prototype is active. Default OFF.
+fn rerank_doc_enabled() -> bool {
+    matches!(
+        std::env::var("TRAVSR_RERANK_DOC").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Extract the natural-language doc prose from an `embed_text` skeleton
+/// (`… | doc: <prose>`). Returns the prose (trimmed), or empty when there is no
+/// `doc:` segment (the node has no doc comment).
+fn rerank_doc_text(embed_text: &str) -> String {
+    match embed_text.split_once("| doc:") {
+        Some((_, doc)) => doc.trim().to_string(),
+        None => String::new(),
+    }
+}
+
 /// G1 bypass decision (RFC-021 F2/F3): true when the user named a genuinely
 /// *rare* symbol — an exact anchor exists **and** the specific term that
 /// produced that anchor (`ResolvedTerm.top_node`) is one of `exact_anchor_ids`
@@ -2135,20 +2163,38 @@ pub(crate) fn build_seed_set(
             // discarded; reading fewer lines here saves the per-candidate
             // collection/format work without changing what the model sees.
             const RERANK_SNIPPET_LINES: usize = 10;
+            // RFC-022 prototype: fetch the candidates' doc/skeleton prose so it can be
+            // prepended to the cross-encoder text (see `rerank_doc_enabled`). Only
+            // queried when the flag is on, so the default path is unchanged.
+            let doc_texts: HashMap<NodeId, String> = if rerank_doc_enabled() {
+                store.get_embed_texts(&candidate_ids).unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
             let texts: Vec<String> = candidate_ids
                 .iter()
                 .map(|id| match node_by_id.get(id) {
                     Some(n) => {
-                        let skeleton = repo_root.as_deref().and_then(|root| {
+                        let sig = &n.vname.signature;
+                        let body = repo_root.as_deref().and_then(|root| {
                             travsr_analysis::snippet::snippet_for_node_capped(
                                 n,
                                 root,
                                 RERANK_SNIPPET_LINES,
                             )
                         });
-                        match skeleton {
-                            Some(body) => format!("{}\n{}", n.vname.signature, body),
-                            None => n.vname.signature.clone(),
+                        // Doc prose (prototype): placed AFTER the signature and BEFORE
+                        // the body so `OnlySecond` tail-truncation drops the body first
+                        // and preserves the NL doc the model needs for conceptual queries.
+                        let doc = doc_texts
+                            .get(id)
+                            .map(|t| rerank_doc_text(t))
+                            .filter(|d| !d.is_empty());
+                        match (doc, body) {
+                            (Some(d), Some(b)) => format!("{sig}\n{d}\n{b}"),
+                            (Some(d), None) => format!("{sig}\n{d}"),
+                            (None, Some(b)) => format!("{sig}\n{b}"),
+                            (None, None) => sig.clone(),
                         }
                     }
                     None => String::new(),
@@ -2653,6 +2699,26 @@ mod tests {
     fn rerank_ppr_weight_defaults_on() {
         // Rollback escape hatch: default (unset) is ON.
         assert!(rerank_ppr_weight_enabled());
+    }
+
+    // ── RFC-022 prototype: doc-aware reranker candidate ──────────────────────
+
+    #[test]
+    fn rerank_doc_text_extracts_prose_or_empty() {
+        assert_eq!(
+            rerank_doc_text(
+                "function: fn:ppr_weighted | calls: ppr | doc: Personalized PageRank on seeds"
+            ),
+            "Personalized PageRank on seeds",
+        );
+        // No doc segment → empty (node has no doc comment).
+        assert_eq!(rerank_doc_text("function: fn:x | calls: y"), "");
+    }
+
+    #[test]
+    fn rerank_doc_defaults_off() {
+        // Prototype ships gated; default path is unchanged.
+        assert!(!rerank_doc_enabled());
     }
 
     // ── #393 score-aware scope gate ──────────────────────────────────────────

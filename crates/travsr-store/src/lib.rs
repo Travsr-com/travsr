@@ -2486,6 +2486,42 @@ LIMIT 20",
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// RFC-022 (reranker-doc prototype): fetch stored `embed_text` for a set of
+    /// nodes, skipping rows whose `embed_text` is NULL or empty. Returns
+    /// `id -> embed_text`. Used to surface a node's doc/skeleton prose to the
+    /// cross-encoder, which otherwise sees a docblock-stripped code body only.
+    pub fn get_embed_texts(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<std::collections::HashMap<NodeId, String>, StoreError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        (|| -> AnyResult<std::collections::HashMap<NodeId, String>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT embed_text FROM nodes WHERE id = ?1")
+                .context("preparing get_embed_texts stmt")?;
+            let mut out = std::collections::HashMap::with_capacity(ids.len());
+            for &id in ids {
+                let text: Option<String> = stmt
+                    .query_row(params![node_id_to_i64(id)], |r| {
+                        r.get::<_, Option<String>>(0)
+                    })
+                    .optional()
+                    .context("reading embed_text")?
+                    .flatten();
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        out.insert(id, t);
+                    }
+                }
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Batch-update the `embed_text` column for a set of nodes.
     ///
     /// Called by the daemon after Phase A indexing to store pre-computed
