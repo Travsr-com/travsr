@@ -80,6 +80,84 @@ fn rrf_k() -> f32 {
         .unwrap_or(60.0)
 }
 
+// ── #463 seed diversity: logic-bearing exact-anchor ordering ─────────────────
+//
+// Per-token exact-anchor resolution emits the top FTS name-matches as anchors that
+// reach the cross-encoder. `search_nodes_by_name`'s rank is dominated by name-match
+// POSITION (exact > `:suffix` > prefix > substring), with kind only a minor
+// tiebreaker WITHIN a band — so a field-only/container node (`struct:Daemon`, fields
+// only) outranks the logic-bearing definition of the same symbol (`impl:Daemon`,
+// `Daemon::run`) whenever the struct's signature is the closer literal match, and the
+// reranker then judges the bare struct, not the code that answers the query.
+//
+// #463 reorders a SMALL name-match head so a body-bearing definition is preferred
+// before the bounded emit, WITHOUT widening the pool to path-substring collisions.
+// Measured net-positive with zero salad-abstention regression on travsr + kubernetes
+// (the RFC-021 §9.8 guardrail): hit@5 +0.04 (travsr) / +0.17 (k8s), MRR +0.06 / +0.02,
+// salads still 100% abstained on both. On by default; `TRAVSR_ANCHOR_KIND_PRIORITY=0`
+// restores the original FTS-rank order (rollback escape hatch).
+
+/// Whether the per-token anchor emit reorders its name-match head by logic-bearing
+/// kind first (#463). On by default; disabled only by an explicit falsey env value
+/// (`0` / `false` / `off`), which restores the pre-#463 FTS-rank order byte-for-byte.
+fn anchor_kind_priority() -> bool {
+    !matches!(
+        std::env::var("TRAVSR_ANCHOR_KIND_PRIORITY").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Size of the name-match head reconsidered by [`order_anchor_candidates`] before the
+/// bounded emit. Kept small so name-match quality still gates the pool — a body-bearing
+/// def only jumps ahead of a field/struct that was ALSO a top name-match, never a
+/// path-substring collision far down the FTS list. Default 6; override via
+/// `TRAVSR_ANCHOR_REORDER_WINDOW` (clamped to ≥ 3 so the emitted top-3 always has a
+/// reorderable window).
+fn anchor_reorder_window() -> usize {
+    std::env::var("TRAVSR_ANCHOR_REORDER_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n >= 3)
+        .unwrap_or(6)
+}
+
+/// Logic-bearing rank for #463 anchor reordering: 0 = has a body (impl/method/fn),
+/// 1 = container/type, 2 = leaf (field/var/const/import). Lower sorts first.
+fn kind_logic_rank(kind: &str) -> u8 {
+    match kind {
+        "method" | "function" | "constructor" | "impl" => 0,
+        "field" | "var" | "variable" | "property" | "constant" | "static" | "import"
+        | "file-module" => 2,
+        _ => 1,
+    }
+}
+
+/// Line-span of a node (0 when unknown). Secondary #463 ordering key — among equally
+/// logic-bearing candidates a larger body is the better "answer" for a vague query.
+fn span_size(node: &CoreNode) -> u32 {
+    match (node.line, node.end_line) {
+        (Some(a), Some(b)) if b >= a => b - a,
+        _ => 0,
+    }
+}
+
+/// #463: order a token's FTS name-match candidates so logic-bearing definitions
+/// (impl/method/fn) precede field-only/container nodes, tie-broken by larger span,
+/// operating only on the top-`window` name-matches. The sort is **stable**, so within
+/// an equal `(kind_logic_rank, span)` key the original FTS rank is preserved. Returns
+/// borrows into the head of `exact_nodes` (never more than `window`).
+///
+/// `O(window log window)`.
+fn order_anchor_candidates(exact_nodes: &[CoreNode], window: usize) -> Vec<&CoreNode> {
+    let mut head: Vec<&CoreNode> = exact_nodes.iter().take(window).collect();
+    head.sort_by(|a, b| {
+        kind_logic_rank(&a.kind)
+            .cmp(&kind_logic_rank(&b.kind))
+            .then_with(|| span_size(b).cmp(&span_size(a)))
+    });
+    head
+}
+
 /// Oracle top-cosine at/above which a confident embedding cluster *alone* (no
 /// lexical anchor) is a Strong match. Sits in the measured gap between
 /// answerable (oracle_top ≥ 0.77) and nonsense (≤ 0.64) queries on bge-small.
@@ -1287,6 +1365,13 @@ pub(crate) fn build_seed_set(
     // Track per-path counts across anchor resolution too.
     let mut anchor_path_counts: HashMap<String, usize> = HashMap::new();
 
+    // #463 anchor-ordering config is read once here, not per token: both are
+    // `std::env::var` reads (global lock + String alloc) and cannot change within a
+    // single query, so hoisting them out of the loop keeps the seed hot path free of
+    // per-token env lookups (matches `idf_min = idf_coverage_min()` below).
+    let anchor_kind_priority = anchor_kind_priority();
+    let anchor_reorder_window = anchor_reorder_window();
+
     for token in &content_tokens {
         let exact_nodes = store.search_nodes_by_name(token).unwrap_or_default();
         let freq = store.symbol_frequency(token).unwrap_or(n_total);
@@ -1319,7 +1404,15 @@ pub(crate) fn build_seed_set(
         // processing order. Beyond its first slot, a token is capped exactly as
         // before.
         let mut added_for_this_token = 0usize;
-        for node in exact_nodes.iter().take(3) {
+        // #463: prefer logic-bearing definitions among the top name-matches before the
+        // bounded emit (on by default; `TRAVSR_ANCHOR_KIND_PRIORITY=0` restores the
+        // original FTS-rank order). See [`order_anchor_candidates`].
+        let ordered: Vec<&CoreNode> = if anchor_kind_priority {
+            order_anchor_candidates(&exact_nodes, anchor_reorder_window)
+        } else {
+            exact_nodes.iter().take(3).collect()
+        };
+        for node in ordered.into_iter().take(3) {
             if is_noise_seed(node) {
                 continue;
             }
@@ -1893,6 +1986,120 @@ pub(crate) fn abstain_message(seed_set: &SeedSet, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #463 logic-bearing exact-anchor ordering ─────────────────────────────
+
+    /// Build an exact-anchor candidate node with a known kind and span.
+    fn anchor_node(kind: &str, sig: &str, line: u32, end_line: u32) -> CoreNode {
+        CoreNode::new(
+            travsr_core::VName::new("corp", "", "crates/x/src/lib.rs", "rust", sig),
+            kind,
+        )
+        .with_line(line)
+        .with_end_line(end_line)
+    }
+
+    #[test]
+    fn kind_logic_rank_orders_body_then_container_then_leaf() {
+        for k in ["method", "function", "constructor", "impl"] {
+            assert_eq!(kind_logic_rank(k), 0, "{k} should be body-bearing");
+        }
+        for k in [
+            "struct",
+            "class",
+            "enum",
+            "trait",
+            "interface",
+            "type",
+            "module",
+        ] {
+            assert_eq!(kind_logic_rank(k), 1, "{k} should be a container/type");
+        }
+        for k in ["field", "var", "constant", "static", "import"] {
+            assert_eq!(kind_logic_rank(k), 2, "{k} should be a leaf");
+        }
+        // The strict ordering the reorder relies on.
+        assert!(kind_logic_rank("method") < kind_logic_rank("struct"));
+        assert!(kind_logic_rank("struct") < kind_logic_rank("field"));
+    }
+
+    #[test]
+    fn span_size_is_line_count_or_zero() {
+        assert_eq!(span_size(&anchor_node("impl", "impl:Daemon", 10, 40)), 30);
+        // Missing lines and inverted spans collapse to 0 — never panic / underflow.
+        let no_lines = CoreNode::new(
+            travsr_core::VName::new("corp", "", "p", "rust", "fn:x"),
+            "function",
+        );
+        assert_eq!(span_size(&no_lines), 0);
+        assert_eq!(span_size(&anchor_node("function", "fn:x", 40, 10)), 0);
+    }
+
+    #[test]
+    fn order_anchor_candidates_prefers_logic_bearing_over_field_only() {
+        // FTS returns the field-only struct FIRST (closer literal name match) and the
+        // logic-bearing impl/method after — exactly the `Daemon` case from #463.
+        let nodes = vec![
+            anchor_node("struct", "struct:Daemon", 1, 3),
+            anchor_node("impl", "impl:Daemon", 5, 60),
+            anchor_node("method", "fn:Daemon.run", 20, 55),
+        ];
+        let ordered = order_anchor_candidates(&nodes, 6);
+        // Body-bearing definitions now lead (largest-span first); the struct sinks last.
+        assert_eq!(ordered[0].kind, "impl");
+        assert_eq!(ordered[1].kind, "method");
+        assert_eq!(ordered[2].kind, "struct");
+    }
+
+    #[test]
+    fn order_anchor_candidates_breaks_kind_ties_by_larger_span() {
+        let nodes = vec![
+            anchor_node("function", "fn:small", 10, 15), // span 5
+            anchor_node("function", "fn:big", 10, 90),   // span 80
+        ];
+        let ordered = order_anchor_candidates(&nodes, 6);
+        assert_eq!(ordered[0].vname.signature, "fn:big");
+        assert_eq!(ordered[1].vname.signature, "fn:small");
+    }
+
+    #[test]
+    fn order_anchor_candidates_is_stable_within_equal_keys() {
+        // Two leaves with identical (rank, span): FTS order must be preserved.
+        let nodes = vec![
+            anchor_node("field", "field:a", 1, 1),
+            anchor_node("field", "field:b", 1, 1),
+        ];
+        let ordered = order_anchor_candidates(&nodes, 6);
+        assert_eq!(ordered[0].vname.signature, "field:a");
+        assert_eq!(ordered[1].vname.signature, "field:b");
+    }
+
+    #[test]
+    fn order_anchor_candidates_respects_window_bound() {
+        // A logic-bearing node BELOW the window must not be pulled up — name-match
+        // quality (FTS rank) still gates the pool; only the head is reordered.
+        let nodes = vec![
+            anchor_node("struct", "struct:Foo", 1, 2),
+            anchor_node("field", "field:Foo", 3, 4),
+            anchor_node("field", "field:Bar", 5, 6),
+            anchor_node("method", "fn:Foo.run", 7, 40), // past the window-3 head
+        ];
+        let ordered = order_anchor_candidates(&nodes, 3);
+        assert_eq!(ordered.len(), 3, "window bounds the reordered set");
+        assert!(
+            ordered.iter().all(|n| n.kind != "method"),
+            "the out-of-window method must not be pulled into the head"
+        );
+        // Within the window the container still leads the two fields.
+        assert_eq!(ordered[0].kind, "struct");
+    }
+
+    #[test]
+    fn anchor_kind_priority_defaults_on_when_unset() {
+        // The knob is a rollback escape hatch: default (unset) is ON. The test harness
+        // does not set TRAVSR_ANCHOR_KIND_PRIORITY, so this reads the shipped default.
+        assert!(anchor_kind_priority());
+    }
 
     // ── #393 score-aware scope gate ──────────────────────────────────────────
 
