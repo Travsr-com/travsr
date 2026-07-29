@@ -11,7 +11,7 @@ use travsr_core::{EdgeKind, Node as CoreNode, NodeId};
 use travsr_retrieval::EdgeFilter;
 use travsr_store::{SqliteStore, Store};
 
-use crate::tools::{is_noise_seed, kind_boost};
+use crate::tools::{is_anchor_noise, is_noise_seed, kind_boost};
 
 // ── Tunable constants (all env-overridable) ──────────────────────────────────
 
@@ -21,6 +21,23 @@ fn rare_anchor_max() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3)
+}
+
+/// RFC-022 D4 (RC-4): minimum share of the query's total IDF mass a rare exact
+/// anchor's term must carry for the deterministic G1 bypass to fire — i.e. for the
+/// term to be the query's *subject* rather than an incidental rare word. A literal
+/// symbol lookup (`GetWarningsForPod`, `SqliteStore search_nodes_by_name`)
+/// concentrates its IDF in the named symbol(s); a conceptual query that merely
+/// contains a rare word (`how are results **trimmed** to fit a token budget`,
+/// `shopping cart **checkout** payment flow`) spreads its IDF across several tokens,
+/// so no single term clears the share. Default 0.55; override via
+/// `TRAVSR_G1_SUBJECT_IDF_SHARE`.
+fn g1_subject_idf_share() -> f32 {
+    std::env::var("TRAVSR_G1_SUBJECT_IDF_SHARE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| (0.0..=1.0).contains(&x))
+        .unwrap_or(0.55)
 }
 
 /// Coverage threshold for Exact / Strong confidence.
@@ -476,6 +493,112 @@ pub(crate) fn display_score(
     }
 }
 
+/// RFC-022 §14: the provenance bucket a returned node is grouped under.
+///
+/// A clean per-node partition keyed on how the node entered the result — its seed
+/// provenance — so the section header carries a trustworthy "how sure are we"
+/// signal:
+/// - [`Exact`](MatchSource::Exact): a primary seed whose strongest [`SeedSource`]
+///   is [`Exact`](SeedSource::Exact) — a literal symbol / FTS name match. Highest
+///   structural certainty.
+/// - [`Semantic`](MatchSource::Semantic): a primary seed reached by embedding-KNN
+///   or fuzzy-lexical retrieval (not an exact name). Sorted by the shown score,
+///   which for a reranked seed is its cross-encoder score (RC-2 transparency).
+/// - [`Relevant`](MatchSource::Relevant): a non-seed node PPR/traversal reached —
+///   supporting structure.
+///
+/// Display-only: this classifies the *already-selected* knapsack set for grouped
+/// presentation and never influences which nodes are selected or their score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchSource {
+    Exact,
+    Semantic,
+    Relevant,
+}
+
+impl MatchSource {
+    /// Lowercase tag used in the `--format json` `match_source` field and the CLI
+    /// section headers. Stable — bench parsers and the VS Code Context Explorer
+    /// key off these exact strings.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            MatchSource::Exact => "exact",
+            MatchSource::Semantic => "semantic",
+            MatchSource::Relevant => "relevant",
+        }
+    }
+
+    /// Section order: certainties → strong candidates → context, so "just give me
+    /// the best node" is answered by the top section.
+    pub(crate) fn trust_rank(self) -> u8 {
+        match self {
+            MatchSource::Exact => 0,
+            MatchSource::Semantic => 1,
+            MatchSource::Relevant => 2,
+        }
+    }
+}
+
+/// RFC-022 §14: classify a selected node into its match-source bucket by seed
+/// provenance. `is_primary_seed` is membership in the pre-enrichment primary-seed
+/// set; `is_exact_source` is whether that seed's strongest [`SeedSource`] is
+/// [`Exact`](SeedSource::Exact) (a literal-name / FTS match). A seed is therefore
+/// either Exact or Semantic; a non-seed is always Relevant.
+pub(crate) fn match_source(is_primary_seed: bool, is_exact_source: bool) -> MatchSource {
+    if !is_primary_seed {
+        MatchSource::Relevant
+    } else if is_exact_source {
+        MatchSource::Exact
+    } else {
+        MatchSource::Semantic
+    }
+}
+
+/// Precedence of a [`SeedSource`] when a node is reached by several seeds. Exact
+/// (literal-name / FTS) is the most trustworthy, then embedding-KNN, then
+/// fuzzy-lexical. The strongest source decides both the node's displayed
+/// `[via: · source]` provenance badge and its RFC-022 §14 match-source bucket.
+pub(crate) fn seed_source_rank(source: SeedSource) -> u8 {
+    match source {
+        SeedSource::Exact => 3,
+        SeedSource::Knn => 2,
+        SeedSource::Lexical => 1,
+    }
+}
+
+/// RFC-022 §14: collapse a seed set to `node -> strongest [`SeedSource`]`.
+///
+/// This is the single classifier both `get_context` (`tools.rs`) and `ask`
+/// (`query.rs`) key their match-source bucket off, so a node lands in the same
+/// section on either surface. Because [`Exact`](SeedSource::Exact) outranks every
+/// other source, a node reached by an exact anchor *and* a weaker source still
+/// buckets as Exact — the two surfaces cannot drift even if the ranking changes.
+pub(crate) fn strongest_seed_sources(seeds: &[Seed]) -> HashMap<NodeId, SeedSource> {
+    let mut m: HashMap<NodeId, SeedSource> = HashMap::new();
+    for s in seeds {
+        m.entry(s.node)
+            .and_modify(|cur| {
+                if seed_source_rank(s.source) > seed_source_rank(*cur) {
+                    *cur = s.source;
+                }
+            })
+            .or_insert(s.source);
+    }
+    m
+}
+
+/// RFC-022 §14 gate — **default on**. Match-source grouping (Exact → Semantic →
+/// Relevant sections, with the seed source hoisted into the header) is the format
+/// every consumer now parses: the VS Code Context Explorer, the `ask` CLI table,
+/// and the k8s bench harness. `TRAVSR_MATCH_SOURCE=0` is the kill-switch that
+/// restores the flat, byte-for-byte pre-§14 output for a release cycle while the
+/// grouped format is validated in the field; any other value (or unset) keeps it on.
+pub(crate) fn match_source_grouping_enabled() -> bool {
+    std::env::var("TRAVSR_MATCH_SOURCE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 // ── Stop-word list (code-aware: omit "get", "set", "run", "use") ─────────────
 
 const STOP_WORDS: &[&str] = &[
@@ -628,6 +751,58 @@ pub(crate) fn rrf_fuse(sources: &[&[(NodeId, f32)]], k: f32) -> Vec<(NodeId, f32
             .then_with(|| a.0.cmp(&b.0))
     });
     result
+}
+
+/// RFC-022 D1.3/D1.4: weighted Reciprocal Rank Fusion. Identical to [`rrf_fuse`] but
+/// each source carries a weight scaling its per-rank contribution, so the sparse
+/// BM25 and dense embed legs stay first-class (D1.3) while low-IDF per-token exact
+/// anchors — a precision source that otherwise floods the fused top-N with short
+/// single-token matches (`var:query`, `fn:set`) and buries the compound symbol
+/// (`build_seed_set`) — are capped below them (D1.4). Multi-source reward is
+/// preserved: a candidate in several sources still accumulates their summed
+/// contributions. `sources` = `(weight, ranked_list)`; each list sorted desc by score.
+pub(crate) fn rrf_fuse_weighted(sources: &[(f32, &[(NodeId, f32)])], k: f32) -> Vec<(NodeId, f32)> {
+    let mut scores: HashMap<NodeId, f32> = HashMap::new();
+    for (weight, source) in sources {
+        for (rank, &(node_id, _score)) in source.iter().enumerate() {
+            *scores.entry(node_id).or_insert(0.0) += weight / (k + rank as f32 + 1.0);
+        }
+    }
+    let mut result: Vec<(NodeId, f32)> = scores.into_iter().collect();
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    result
+}
+
+/// Whether RFC-022 D1.3/D1.4 weighted seed fusion is active. **Default OFF** (part of
+/// the D1 recall phase, pending calibration); enable with `TRAVSR_RRF_WEIGHTED=1`.
+fn rrf_weighted_enabled() -> bool {
+    matches!(
+        std::env::var("TRAVSR_RRF_WEIGHTED").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Per-source RRF weights for [`rrf_fuse_weighted`] (RFC-022 D1.3/D1.4). Specific
+/// (high-IDF) exact anchors lead; BM25 + embed are first-class; generic (mid-IDF)
+/// per-token anchors are capped so they cannot crowd out the recall legs.
+fn rrf_source_weights() -> (f32, f32, f32, f32) {
+    let g = |name: &str, d: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|x: &f32| *x >= 0.0)
+            .unwrap_or(d)
+    };
+    (
+        g("TRAVSR_RRF_W_SPECIFIC_ANCHOR", 2.0),
+        g("TRAVSR_RRF_W_BM25", 1.0),
+        g("TRAVSR_RRF_W_EMBED", 1.0),
+        g("TRAVSR_RRF_W_GENERIC_ANCHOR", 0.4),
+    )
 }
 
 // ── Confidence classifier ─────────────────────────────────────────────────────
@@ -836,6 +1011,152 @@ fn rerank_weak_floor() -> f32 {
         .unwrap_or(travsr_rerank::DEFAULT_WEAK_FLOOR)
 }
 
+// ── #462 WS4: anchor-gated rerank recall-floor rescue ─────────────────────────
+//
+// The RFC-021 cross-encoder (an MS MARCO web-passage ranker) systematically
+// COLLAPSES on natural "how/what is X …" questions about a symbol: the prose
+// scaffolding shares no tokens with X's code body, so the model scores the correct
+// definition near zero even when a strong LEXICAL anchor names X. Measured on this
+// repo (arctic + ms-marco): `"daemon"` scores struct:Daemon 0.92, but
+// `"how daemon is implemented"` / `"what does the daemon do"` score every daemon
+// definition 0.09–0.35 — below the 0.5 Weak floor — so the query abstains despite a
+// genuine exact anchor. Neither the reranker nor the WS2 embedding-oracle rescue
+// recovers it (both under-score prose→code); the lexical anchor is the only signal
+// that stays correct.
+//
+// WS4 is the LEXICAL sibling of the WS2 embedding-oracle rescue: when an otherwise
+// `None` query is grounded by a genuine exact anchor AND its best rerank score sits
+// far above the salad-noise band (even though below the Weak floor), surface it as
+// Weak instead of discarding it. Salad-safe by measurement: salad/nonsense queries
+// rerank at ≤ ~1e-3 (`"delete all user accounts and drop the database"` = 0.0012,
+// `"what is the meaning of life"` = 3e-5), ~100x below the recall floor, while the
+// grounded prose queries sit ~2x above it. Embeddings-independent (reads only the
+// rerank score + lexical anchors, never a cosine), so the G2 invariant holds and no
+// calibration gating is needed — unlike WS2. On by default; `TRAVSR_ANCHOR_RESCUE=0`
+// restores the pre-WS4 abstention byte-for-byte.
+
+/// Whether the #462 WS4 anchor-gated rerank recall-floor rescue is active. On by
+/// default; disabled only by an explicit falsey env value (`0` / `false` / `off`).
+fn anchor_rescue_enabled() -> bool {
+    !matches!(
+        std::env::var("TRAVSR_ANCHOR_RESCUE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Rerank recall floor for the #462 WS4 rescue: a cross-encoder score at/above this
+/// — even though below the Weak floor — is treated as a real (if approximate) hit
+/// when a genuine exact anchor grounds the query. Default 0.15 sits ~100x above the
+/// measured salad/nonsense rerank ceiling (~1e-3) and ~2x below the measured
+/// grounded-prose band (~0.30). Override via `TRAVSR_RERANK_RECALL_FLOOR`.
+fn rerank_recall_floor() -> f32 {
+    floor_env("TRAVSR_RERANK_RECALL_FLOOR").unwrap_or(0.15)
+}
+
+/// #462 WS4: apply the anchor-gated rerank recall-floor rescue to a base verdict.
+///
+/// Rescues `None → Weak` iff **all** hold: the base verdict abstained; the query is
+/// not a `g1_bypass` deterministic-path query; the query has non-zero grounded
+/// coverage (`coverage_ok` — at least one resolved token clears the IDF-coverage
+/// bar); a genuine exact lexical anchor grounds the query (`exact_anchor_present`);
+/// and the best rerank score clears `recall_floor`. Never promotes to Strong, and
+/// never touches a non-`None` verdict. Pure, so it is unit-testable without a store.
+///
+/// RFC-022 D5 (RC-5): `coverage_ok` closes the WS4 over-rescue. Generic tokens
+/// (`get`/`map`/`handle`) still emit an exact anchor (`idf_w >= 0.15`) yet count
+/// zero toward coverage (`idf_w < idf_coverage_min`), so `exact_anchor_present`
+/// alone let a `coverage=0.000` query be rescued. Requiring `coverage_ok`
+/// (`n_resolved >= 1`) means `get map handle` abstains while W1/W2
+/// (`coverage` 0.5–1.0) still rescue.
+fn anchor_rescued_confidence(
+    base: Confidence,
+    g1_bypass: bool,
+    max_rerank: Option<f32>,
+    exact_anchor_present: bool,
+    coverage_ok: bool,
+    recall_floor: f32,
+) -> Confidence {
+    if base == Confidence::None
+        && !g1_bypass
+        && coverage_ok
+        && exact_anchor_present
+        && max_rerank.is_some_and(|r| r >= recall_floor)
+    {
+        Confidence::Weak
+    } else {
+        base
+    }
+}
+
+// ── RFC-022 D2: rerank-weighted PPR personalisation (RC-2, keystone) ──────────
+//
+// The cross-encoder scores the fused seeds but PPR personalisation used only the
+// idf/bm25/cosine `weight`, so a correct #1 seed the reranker loved (`impl:Daemon`,
+// rr 0.666 for "how does the daemon work") was out-voted in the walk by a cluster of
+// near-zero-rerank "work" junk (`worktree_resolves_to_main_worktree`, `LangWork`,
+// `WorkItem`) and vanished from the rows. Folding the reranker's judgment into each
+// NON-exact seed's teleportation weight makes the walk concentrate mass where the
+// model saw relevance. Exact anchors keep their structural float untouched (they are
+// the literally-named symbol); only the non-exact cluster is scaled. Embeddings-
+// independent (reads the cross-encoder score, never a cosine) so the G2 invariant
+// holds; inert on g1_bypass queries (rerank is skipped there) and when the reranker
+// is absent (`rerank_score: None` → weight unchanged). `TRAVSR_RERANK_PPR_WEIGHT=0`
+// restores the pre-D2 weighting byte-for-byte.
+
+/// Whether RFC-022 D2 rerank-weighted PPR is active. On by default; disabled only by
+/// an explicit falsey env value (`0` / `false` / `off`).
+fn rerank_ppr_weight_enabled() -> bool {
+    !matches!(
+        std::env::var("TRAVSR_RERANK_PPR_WEIGHT").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Map a cross-encoder rerank score to a PPR teleportation-weight multiplier
+/// (RFC-022 D2). Piecewise-linear and monotone: a near-zero score (model judged the
+/// seed junk) crushes its mass toward `FLOOR`; a score at the weak floor is neutral
+/// (×1.0); a strong score up-weights toward `CEIL`. Bounded so it re-weights the
+/// walk without letting a single seed dominate. Pure — unit-testable.
+fn rerank_ppr_multiplier(rerank: f32, weak_floor: f32) -> f32 {
+    const FLOOR: f32 = 0.1;
+    const CEIL: f32 = 2.0;
+    let wf = weak_floor.clamp(1e-3, 0.999);
+    let m = if rerank <= wf {
+        FLOOR + (1.0 - FLOOR) * (rerank / wf).clamp(0.0, 1.0)
+    } else {
+        1.0 + (CEIL - 1.0) * ((rerank - wf) / (1.0 - wf)).clamp(0.0, 1.0)
+    };
+    m.clamp(FLOOR, CEIL)
+}
+
+// ── RFC-022 (prototype): doc-aware reranker candidate text ────────────────────
+//
+// The cross-encoder candidate is `signature + docblock-stripped body` — the leading
+// doc comment (the natural-language description a conceptual query actually matches,
+// e.g. "Personalized PageRank …") is the one thing NOT fed to the model, which is a
+// direct contributor to its prose→code collapse. This prototype prepends the node's
+// doc prose (from `embed_text`) so the model sees that NL surface. Default OFF
+// (`TRAVSR_RERANK_DOC=1`); a no-op when `embed_text` is unpopulated, so the reference
+// path is byte-for-byte unchanged.
+
+/// Whether the doc-aware reranker candidate prototype is active. Default OFF.
+fn rerank_doc_enabled() -> bool {
+    matches!(
+        std::env::var("TRAVSR_RERANK_DOC").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Extract the natural-language doc prose from an `embed_text` skeleton
+/// (`… | doc: <prose>`). Returns the prose (trimmed), or empty when there is no
+/// `doc:` segment (the node has no doc comment).
+fn rerank_doc_text(embed_text: &str) -> String {
+    match embed_text.split_once("| doc:") {
+        Some((_, doc)) => doc.trim().to_string(),
+        None => String::new(),
+    }
+}
+
 /// G1 bypass decision (RFC-021 F2/F3): true when the user named a genuinely
 /// *rare* symbol — an exact anchor exists **and** the specific term that
 /// produced that anchor (`ResolvedTerm.top_node`) is one of `exact_anchor_ids`
@@ -851,12 +1172,53 @@ fn compute_g1_bypass(
     terms: &[ResolvedTerm],
     exact_anchor_ids: &std::collections::HashSet<NodeId>,
 ) -> bool {
-    let rare_max = rare_anchor_max();
-    terms.iter().any(|t| {
+    g1_bypass_decision(
+        terms,
+        exact_anchor_ids,
+        rare_anchor_max(),
+        g1_subject_idf_share(),
+    )
+}
+
+/// Pure core of [`compute_g1_bypass`] (RFC-021 G1 + RFC-022 D4). Split out so the
+/// subject-dominance gate is unit-testable without env or a store.
+///
+/// A term is a *rare exact anchor* when it resolved to a genuinely rare symbol
+/// (`symbol_freq <= rare_max`) whose top node is one of the emitted exact anchors.
+/// The deterministic bypass fires only when (a) at least one rare exact anchor
+/// exists **and** (b) the rare exact anchors *collectively* carry at least
+/// `subject_share` of the query's total IDF mass — i.e. the named rare symbol(s)
+/// are the query's subject, not incidental rare words.
+///
+/// This keeps genuine literal lookups intact — a single rare token, or an
+/// all-symbol query like `SqliteStore search_nodes_by_name`, puts ~all IDF in the
+/// anchors (share ≈ 1.0) — while a conceptual query that merely *contains* a rare
+/// word (`how are results trimmed to fit a token budget`) spreads IDF across many
+/// non-anchor tokens, dropping the anchor share below the bar so the query flows to
+/// the reranker/recall path instead of a false deterministic Exact (RC-4).
+fn g1_bypass_decision(
+    terms: &[ResolvedTerm],
+    exact_anchor_ids: &std::collections::HashSet<NodeId>,
+    rare_max: usize,
+    subject_share: f32,
+) -> bool {
+    let is_rare_anchor = |t: &ResolvedTerm| {
         t.resolved
             && t.symbol_freq <= rare_max
             && t.top_node.is_some_and(|n| exact_anchor_ids.contains(&n))
-    })
+    };
+    if !terms.iter().any(&is_rare_anchor) {
+        return false;
+    }
+    let total_idf: f32 = terms.iter().map(|t| t.idf_w).sum();
+    if total_idf <= 0.0 {
+        return false;
+    }
+    let anchor_idf: f32 = terms
+        .iter()
+        .map(|t| if is_rare_anchor(t) { t.idf_w } else { 0.0 })
+        .sum();
+    anchor_idf >= subject_share * total_idf
 }
 
 /// RFC-021 F4: four-band seed ordering after rerank. A rank-31+ seed that was
@@ -1368,9 +1730,15 @@ pub(crate) fn build_seed_set(
     // #463 anchor-ordering config is read once here, not per token: both are
     // `std::env::var` reads (global lock + String alloc) and cannot change within a
     // single query, so hoisting them out of the loop keeps the seed hot path free of
-    // per-token env lookups (matches `idf_min = idf_coverage_min()` below).
+    // per-token env lookups.
     let anchor_kind_priority = anchor_kind_priority();
     let anchor_reorder_window = anchor_reorder_window();
+    // IDF-coverage bar, hoisted (reused for n_resolved below). RFC-022 D1.4: an
+    // anchor from a token clearing this bar is "specific"; one from a mid-IDF token
+    // (`idf_w ∈ [0.15, idf_min)`) is "generic" and is down-weighted in weighted RRF.
+    let idf_min = idf_coverage_min();
+    let mut specific_token_anchor_ids: std::collections::HashSet<NodeId> =
+        std::collections::HashSet::new();
 
     for token in &content_tokens {
         let exact_nodes = store.search_nodes_by_name(token).unwrap_or_default();
@@ -1413,7 +1781,10 @@ pub(crate) fn build_seed_set(
             exact_nodes.iter().take(3).collect()
         };
         for node in ordered.into_iter().take(3) {
-            if is_noise_seed(node) {
+            // RFC-022 D3: stricter anchor-pool gate than the general `is_noise_seed`
+            // — also drops CI/workflow `pkg:` nodes and in-src test symbols so they
+            // cannot out-anchor the real implementation or trigger a false G1 bypass.
+            if is_anchor_noise(node) {
                 continue;
             }
             if !filter.allow(node.id, node.id, Some(node.vname.corpus.as_str())) {
@@ -1436,6 +1807,11 @@ pub(crate) fn build_seed_set(
             added_for_this_token += 1;
             let w = idf_w * kind_boost(&node.kind, &node.vname.language);
             anchor_raw.push((node.id, w));
+            // RFC-022 D1.4: a node anchored by ANY specific (high-IDF) token is a
+            // specific anchor; the weighted-RRF split below caps only the remainder.
+            if idf_w >= idf_min {
+                specific_token_anchor_ids.insert(node.id);
+            }
         }
     }
 
@@ -1469,7 +1845,6 @@ pub(crate) fn build_seed_set(
     // Count only tokens that resolve to specific-enough anchors (IDF ≥ threshold).
     // Generic tokens like "map" or "get" match hundreds of unrelated nodes and must
     // not inflate coverage — they are not evidence the query is grounded in this repo.
-    let idf_min = idf_coverage_min();
     let n_resolved = terms
         .iter()
         .filter(|t| t.resolved && t.idf_w >= idf_min)
@@ -1587,7 +1962,29 @@ pub(crate) fn build_seed_set(
 
     // ── RRF fusion ────────────────────────────────────────────────────────────
     let k = rrf_k();
-    let rrf_result = rrf_fuse(&[&anchor_raw, &lexical_raw, &knn_raw], k);
+    let rrf_result = if rrf_weighted_enabled() {
+        // RFC-022 D1.3/D1.4: split the exact-anchor source into specific (high-IDF)
+        // vs generic (mid-IDF), then fuse with per-source weights so BM25/embed stay
+        // first-class and generic per-token anchors cannot flood the fused top-N.
+        // `anchor_raw` is already sorted desc by weight, so each split preserves that
+        // order (rrf_fuse_weighted's position precondition).
+        let (specific_anchor_raw, generic_anchor_raw): (Vec<_>, Vec<_>) = anchor_raw
+            .iter()
+            .cloned()
+            .partition(|(id, _)| specific_token_anchor_ids.contains(id));
+        let (w_spec, w_bm25, w_embed, w_generic) = rrf_source_weights();
+        rrf_fuse_weighted(
+            &[
+                (w_spec, &specific_anchor_raw),
+                (w_bm25, &lexical_raw),
+                (w_embed, &knn_raw),
+                (w_generic, &generic_anchor_raw),
+            ],
+            k,
+        )
+    } else {
+        rrf_fuse(&[&anchor_raw, &lexical_raw, &knn_raw], k)
+    };
 
     // Convert RRF result back to Seed structs, resolving weights from the
     // anchor/lexical maps (RRF score used as final ordering, original weights for PPR).
@@ -1872,20 +2269,38 @@ pub(crate) fn build_seed_set(
             // discarded; reading fewer lines here saves the per-candidate
             // collection/format work without changing what the model sees.
             const RERANK_SNIPPET_LINES: usize = 10;
+            // RFC-022 prototype: fetch the candidates' doc/skeleton prose so it can be
+            // prepended to the cross-encoder text (see `rerank_doc_enabled`). Only
+            // queried when the flag is on, so the default path is unchanged.
+            let doc_texts: HashMap<NodeId, String> = if rerank_doc_enabled() {
+                store.get_embed_texts(&candidate_ids).unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
             let texts: Vec<String> = candidate_ids
                 .iter()
                 .map(|id| match node_by_id.get(id) {
                     Some(n) => {
-                        let skeleton = repo_root.as_deref().and_then(|root| {
+                        let sig = &n.vname.signature;
+                        let body = repo_root.as_deref().and_then(|root| {
                             travsr_analysis::snippet::snippet_for_node_capped(
                                 n,
                                 root,
                                 RERANK_SNIPPET_LINES,
                             )
                         });
-                        match skeleton {
-                            Some(body) => format!("{}\n{}", n.vname.signature, body),
-                            None => n.vname.signature.clone(),
+                        // Doc prose (prototype): placed AFTER the signature and BEFORE
+                        // the body so `OnlySecond` tail-truncation drops the body first
+                        // and preserves the NL doc the model needs for conceptual queries.
+                        let doc = doc_texts
+                            .get(id)
+                            .map(|t| rerank_doc_text(t))
+                            .filter(|d| !d.is_empty());
+                        match (doc, body) {
+                            (Some(d), Some(b)) => format!("{sig}\n{d}\n{b}"),
+                            (Some(d), None) => format!("{sig}\n{d}"),
+                            (None, Some(b)) => format!("{sig}\n{b}"),
+                            (None, None) => sig.clone(),
                         }
                     }
                     None => String::new(),
@@ -1908,6 +2323,25 @@ pub(crate) fn build_seed_set(
         }
     }
 
+    // RFC-022 D2 (keystone): fold the cross-encoder's judgment into the PPR
+    // personalisation weight so the reranker DRIVES node selection, not just seed
+    // ordering (RC-2). Only non-exact seeds are scaled — exact anchors keep the
+    // structural float applied above; un-reranked seeds (`rerank_score: None`, e.g.
+    // beyond the reranked top-K) are untouched. Runs after the rerank block so every
+    // scored seed already carries its `rerank_score`. Affects ONLY PPR ordering, not
+    // the confidence gate below (G2 preserved). Inert without a reranker or on
+    // g1_bypass (no `rerank_score` set), and behind `TRAVSR_RERANK_PPR_WEIGHT`.
+    if rerank_ppr_weight_enabled() {
+        let weak_floor = rerank_weak_floor();
+        for s in seeds.iter_mut() {
+            if s.source != SeedSource::Exact {
+                if let Some(r) = s.rerank_score {
+                    s.weight *= rerank_ppr_multiplier(r, weak_floor);
+                }
+            }
+        }
+    }
+
     let confidence = classify_confidence(
         &terms,
         coverage,
@@ -1921,6 +2355,71 @@ pub(crate) fn build_seed_set(
         g1_bypass, // G1: rare exact-symbol queries stay deterministic
         max_rerank_score,
     );
+
+    // #462 WS4: anchor-gated rerank recall-floor rescue. `early_exact_ids` is the
+    // exact-anchor set that fed RRF — every id in it came from a token that cleared the
+    // `idf_w >= 0.15` + `token_is_sig_component` anchor-emit gates, so a non-empty set
+    // means the query is grounded by at least one genuine, specific lexical anchor.
+    // (Checking a term's *raw* `top_node` instead is wrong: #463 reordering and the
+    // noise/component filters mean the emitted anchor for "daemon" — impl/struct:Daemon
+    // — is a different node than the raw FTS #1 match, so that check reads false even
+    // when the query is clearly anchored.) Rescues an otherwise-`None` prose query so
+    // grounded when the cross-encoder still sees moderate relevance. See
+    // [`anchor_rescued_confidence`].
+    let confidence = if anchor_rescue_enabled() {
+        let exact_anchor_present = !early_exact_ids.is_empty();
+        // RFC-022 D5: gate the rescue on non-zero grounded coverage. `n_resolved`
+        // counts only tokens clearing the IDF-coverage bar, so `coverage_ok` is
+        // false for an all-generic query (`get map handle`) that emits anchors but
+        // resolves no specific token — those must stay abstained.
+        let coverage_ok = n_resolved >= 1;
+        anchor_rescued_confidence(
+            confidence,
+            g1_bypass,
+            max_rerank_score,
+            exact_anchor_present,
+            coverage_ok,
+            rerank_recall_floor(),
+        )
+    } else {
+        confidence
+    };
+
+    // RFC-022 Phase 0: seed-pipeline diagnostic behind `tracing::debug!`
+    // (target `travsr::seed`), replacing the temporary `TRAVSR_DEBUG_SEED`
+    // `eprintln` RCA block. The per-seed dump needs a `get_nodes` round-trip, so
+    // the whole block is gated on `DEBUG` being enabled to keep the hot path free
+    // of that cost when tracing is off.
+    if tracing::enabled!(target: "travsr::seed", tracing::Level::DEBUG) {
+        tracing::debug!(
+            target: "travsr::seed",
+            ?query, ?content_tokens, coverage, n_resolved, g1_bypass,
+            ?max_rerank_score, ?intent, ?confidence,
+            "seed pipeline state",
+        );
+        for t in &terms {
+            let anchored = t.top_node.is_some_and(|n| early_exact_ids.contains(&n));
+            tracing::debug!(
+                target: "travsr::seed",
+                token = %t.token, resolved = t.resolved, idf = t.idf_w,
+                freq = t.symbol_freq, anchored, "term",
+            );
+        }
+        let top_ids: Vec<NodeId> = seeds.iter().take(10).map(|s| s.node).collect();
+        if let Ok(ns) = store.get_nodes(&top_ids) {
+            let by: HashMap<NodeId, &CoreNode> = ns.iter().map(|n| (n.id, n)).collect();
+            for s in seeds.iter().take(10) {
+                if let Some(n) = by.get(&s.node) {
+                    tracing::debug!(
+                        target: "travsr::seed",
+                        kind = %n.kind, sig = %n.vname.signature,
+                        rerank = ?s.rerank_score, source = ?s.source,
+                        path = %n.vname.path, "seed",
+                    );
+                }
+            }
+        }
+    }
 
     SeedSet {
         intent,
@@ -2101,6 +2600,279 @@ mod tests {
         assert!(anchor_kind_priority());
     }
 
+    // ── #462 WS4 anchor-gated rerank recall-floor rescue ─────────────────────
+
+    #[test]
+    fn ws4_rescues_grounded_prose_query_below_weak_floor() {
+        // "how daemon is implemented": genuine exact anchor + rerank 0.346 (below the
+        // 0.5 weak floor but far above salad noise) → surface as Weak, not abstain.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, Some(0.346), true, true, 0.15),
+            Confidence::Weak,
+        );
+    }
+
+    #[test]
+    fn ws4_does_not_rescue_salad_below_recall_floor() {
+        // "delete all user accounts and drop the database": exact anchors DO exist
+        // (drop/delete/user), but the reranker scores its best seed 0.0012 — far below
+        // the recall floor. The rerank floor, not the anchor, is what keeps salad None.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, Some(0.0012), true, true, 0.15),
+            Confidence::None,
+        );
+    }
+
+    #[test]
+    fn ws4_requires_a_genuine_exact_anchor() {
+        // Moderate rerank but no lexical grounding → stay None (that path is WS2's job,
+        // via the embedding oracle, not WS4's).
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, Some(0.4), false, true, 0.15),
+            Confidence::None,
+        );
+    }
+
+    #[test]
+    fn ws4_requires_nonzero_coverage() {
+        // RFC-022 D5 (RC-5): `get map handle` emits exact anchors on generic tokens but
+        // resolves no IDF-coverage-clearing token (`coverage_ok = false`), so it must
+        // stay None even with a moderate rerank score above the recall floor.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, Some(0.4), true, false, 0.15),
+            Confidence::None,
+        );
+        // With coverage restored (a specific token resolved), the same inputs rescue.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, Some(0.4), true, true, 0.15),
+            Confidence::Weak,
+        );
+    }
+
+    #[test]
+    fn ws4_never_fires_on_g1_bypass() {
+        // g1_bypass owns the deterministic lexical verdict; WS4 must not second-guess it.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, true, Some(0.9), true, true, 0.15),
+            Confidence::None,
+        );
+    }
+
+    #[test]
+    fn ws4_inert_without_a_rerank_score() {
+        // No cross-encoder signal (model absent / g1_bypass skip / over budget) → the
+        // rescue reads no relevance evidence and leaves the verdict untouched.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, None, true, true, 0.15),
+            Confidence::None,
+        );
+    }
+
+    #[test]
+    fn ws4_never_downgrades_or_promotes_a_decided_verdict() {
+        // Only `None` is rescued; every already-decided verdict passes through unchanged
+        // (WS4 can never promote to Strong nor demote a real hit).
+        for base in [Confidence::Weak, Confidence::Strong, Confidence::Exact] {
+            assert_eq!(
+                anchor_rescued_confidence(base, false, Some(0.05), true, true, 0.15),
+                base,
+                "{base:?} must pass through WS4 unchanged",
+            );
+        }
+    }
+
+    #[test]
+    fn ws4_boundary_is_inclusive_at_the_recall_floor() {
+        // A score exactly at the floor rescues; a hair below stays None.
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, Some(0.15), true, true, 0.15),
+            Confidence::Weak,
+        );
+        assert_eq!(
+            anchor_rescued_confidence(Confidence::None, false, Some(0.1499), true, true, 0.15),
+            Confidence::None,
+        );
+    }
+
+    #[test]
+    fn ws4_defaults_on_with_a_sane_recall_floor() {
+        // The knob is a rollback escape hatch: default (unset) is ON, and the floor sits
+        // in the measured gap between salad noise (~1e-3) and the grounded band (~0.30).
+        assert!(anchor_rescue_enabled());
+        let f = rerank_recall_floor();
+        assert!(
+            f > 0.01 && f < rerank_weak_floor(),
+            "recall floor {f} out of band"
+        );
+    }
+
+    // ── RFC-022 D4: g1_bypass subject-dominance ──────────────────────────────
+
+    fn rt(token: &str, freq: usize, idf: f32, node: Option<NodeId>) -> ResolvedTerm {
+        ResolvedTerm {
+            token: token.to_string(),
+            resolved: node.is_some(),
+            symbol_freq: freq,
+            idf_w: idf,
+            top_node: node,
+        }
+    }
+
+    #[test]
+    fn g1_bypass_fires_on_single_rare_subject() {
+        // A lone rare exact anchor owns 100% of the query IDF → bypass (literal lookup).
+        let anchors: std::collections::HashSet<NodeId> = [NodeId(7)].into_iter().collect();
+        let terms = vec![rt("getwarningsforpod", 1, 0.95, Some(NodeId(7)))];
+        assert!(g1_bypass_decision(&terms, &anchors, 3, 0.55));
+    }
+
+    #[test]
+    fn g1_bypass_fires_on_all_symbol_literal_query() {
+        // Two rare exact anchors, no filler: anchors carry all the IDF → bypass.
+        // (Protects "SqliteStore search_nodes_by_name"-style literal lookups.)
+        let anchors: std::collections::HashSet<NodeId> =
+            [NodeId(1), NodeId(2)].into_iter().collect();
+        let terms = vec![
+            rt("sqlitestore", 2, 0.9, Some(NodeId(1))),
+            rt("search_nodes_by_name", 1, 0.92, Some(NodeId(2))),
+        ];
+        assert!(g1_bypass_decision(&terms, &anchors, 3, 0.55));
+    }
+
+    #[test]
+    fn g1_bypass_suppressed_for_incidental_rare_word() {
+        // "how are results trimmed to fit a token budget": only "trimmed" is a rare
+        // anchor; the surrounding conceptual tokens carry enough IDF that the anchor
+        // share falls below the subject bar → no bypass (RC-4), so the query reaches
+        // the reranker/recall path where `knapsack` can surface.
+        let anchors: std::collections::HashSet<NodeId> = [NodeId(9)].into_iter().collect();
+        let terms = vec![
+            rt("results", 4000, 0.05, None),
+            rt("trimmed", 3, 0.85, Some(NodeId(9))),
+            rt("fit", 4000, 0.05, None),
+            rt("token", 400, 0.35, None),
+            rt("budget", 300, 0.4, None),
+        ];
+        assert!(!g1_bypass_decision(&terms, &anchors, 3, 0.55));
+    }
+
+    #[test]
+    fn g1_bypass_requires_the_anchor_to_be_emitted() {
+        // A rare resolved term whose top_node was NOT emitted as an exact anchor
+        // (filtered as noise / not a signature component) can never bypass.
+        let anchors: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        let terms = vec![rt("checkout", 2, 0.9, Some(NodeId(5)))];
+        assert!(!g1_bypass_decision(&terms, &anchors, 3, 0.55));
+    }
+
+    // ── RFC-022 D2: rerank-weighted PPR multiplier ───────────────────────────
+
+    #[test]
+    fn rerank_ppr_multiplier_anchors_at_floor_neutral_and_ceil() {
+        let wf = 0.5;
+        // Junk (rr 0) → crushed to the floor.
+        assert!((rerank_ppr_multiplier(0.0, wf) - 0.1).abs() < 1e-6);
+        // At the weak floor → neutral (×1.0).
+        assert!((rerank_ppr_multiplier(wf, wf) - 1.0).abs() < 1e-6);
+        // Perfect (rr 1) → ceiling.
+        assert!((rerank_ppr_multiplier(1.0, wf) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rerank_ppr_multiplier_is_monotone_and_clamped() {
+        let wf = 0.5;
+        let mut prev = rerank_ppr_multiplier(0.0, wf);
+        let mut r = 0.05;
+        while r <= 1.0 {
+            let m = rerank_ppr_multiplier(r, wf);
+            assert!(
+                m + 1e-6 >= prev,
+                "multiplier must be monotone non-decreasing"
+            );
+            assert!(
+                (0.1..=2.0).contains(&m),
+                "multiplier must stay in [FLOOR, CEIL]"
+            );
+            prev = m;
+            r += 0.05;
+        }
+        // Out-of-range inputs clamp rather than explode.
+        assert!((rerank_ppr_multiplier(-1.0, wf) - 0.1).abs() < 1e-6);
+        assert!((rerank_ppr_multiplier(5.0, wf) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rerank_ppr_weight_defaults_on() {
+        // Rollback escape hatch: default (unset) is ON.
+        assert!(rerank_ppr_weight_enabled());
+    }
+
+    // ── RFC-022 prototype: doc-aware reranker candidate ──────────────────────
+
+    #[test]
+    fn rerank_doc_text_extracts_prose_or_empty() {
+        assert_eq!(
+            rerank_doc_text(
+                "function: fn:ppr_weighted | calls: ppr | doc: Personalized PageRank on seeds"
+            ),
+            "Personalized PageRank on seeds",
+        );
+        // No doc segment → empty (node has no doc comment).
+        assert_eq!(rerank_doc_text("function: fn:x | calls: y"), "");
+    }
+
+    #[test]
+    fn rerank_doc_defaults_off() {
+        // Prototype ships gated; default path is unchanged.
+        assert!(!rerank_doc_enabled());
+    }
+
+    // ── RFC-022 §14: shared node→strongest-source classifier ─────────────────
+
+    fn seed_with(node: NodeId, source: SeedSource) -> Seed {
+        Seed {
+            node,
+            weight: 1.0,
+            source,
+            score: 0.0,
+            rerank_score: None,
+        }
+    }
+
+    #[test]
+    fn strongest_seed_sources_exact_wins_over_weaker_sources() {
+        // A node reached by an exact anchor AND a weaker source must classify as
+        // Exact — this is the invariant get_context and ask both key off, so the
+        // two surfaces cannot disagree on a node's match-source bucket.
+        let seeds = vec![
+            seed_with(NodeId(1), SeedSource::Knn),
+            seed_with(NodeId(1), SeedSource::Exact), // same node, stronger source
+            seed_with(NodeId(1), SeedSource::Lexical),
+            seed_with(NodeId(2), SeedSource::Lexical),
+            seed_with(NodeId(3), SeedSource::Knn),
+        ];
+        let m = strongest_seed_sources(&seeds);
+        assert_eq!(m.get(&NodeId(1)), Some(&SeedSource::Exact), "exact wins");
+        assert_eq!(m.get(&NodeId(2)), Some(&SeedSource::Lexical));
+        assert_eq!(m.get(&NodeId(3)), Some(&SeedSource::Knn));
+        // Order-independent: reversing the input yields the same strongest map.
+        let mut rev = seeds.clone();
+        rev.reverse();
+        assert_eq!(strongest_seed_sources(&rev), m);
+
+        // The classifier both surfaces then apply: strongest==Exact ⇒ Exact bucket.
+        let is_exact = |id: NodeId| matches!(m.get(&id), Some(SeedSource::Exact));
+        assert_eq!(match_source(true, is_exact(NodeId(1))), MatchSource::Exact);
+        assert_eq!(
+            match_source(true, is_exact(NodeId(3))),
+            MatchSource::Semantic
+        );
+        assert_eq!(
+            match_source(false, is_exact(NodeId(1))),
+            MatchSource::Relevant
+        );
+    }
+
     // ── #393 score-aware scope gate ──────────────────────────────────────────
 
     #[test]
@@ -2222,6 +2994,38 @@ mod tests {
         let result1 = rrf_fuse(&[&a, &b], 60.0);
         let result2 = rrf_fuse(&[&a, &b], 60.0);
         assert_eq!(result1, result2, "RRF must be deterministic");
+    }
+
+    #[test]
+    fn rrf_fuse_weighted_caps_generic_anchor_flood() {
+        // RFC-022 D1.4: a generic per-token anchor at rank 0 must not outrank a BM25
+        // match at rank 0 once the generic source is down-weighted. `gold` (the
+        // compound BM25 match) beats `junk` (a generic single-token anchor).
+        let generic_anchor: Vec<(NodeId, f32)> = vec![(NodeId(99), 1.0)]; // junk, rank 0
+        let bm25: Vec<(NodeId, f32)> = vec![(NodeId(7), 1.0)]; // gold, rank 0
+        let out = rrf_fuse_weighted(&[(0.4, &generic_anchor), (1.0, &bm25)], 60.0);
+        assert_eq!(
+            out[0].0,
+            NodeId(7),
+            "down-weighted generic anchor must not lead"
+        );
+        assert!(out[0].1 > out[1].1);
+    }
+
+    #[test]
+    fn rrf_fuse_weighted_multi_source_still_rewarded() {
+        // A candidate in two weighted sources accumulates both contributions and beats
+        // a single-source candidate of equal per-source rank.
+        let s1: Vec<(NodeId, f32)> = vec![(NodeId(1), 1.0), (NodeId(2), 0.9)];
+        let s2: Vec<(NodeId, f32)> = vec![(NodeId(1), 1.0)];
+        let out = rrf_fuse_weighted(&[(1.0, &s1), (1.0, &s2)], 60.0);
+        assert_eq!(out[0].0, NodeId(1), "multi-source candidate must lead");
+    }
+
+    #[test]
+    fn rrf_weighted_defaults_off() {
+        // D1 recall phase ships gated: weighted fusion is opt-in until calibrated.
+        assert!(!rrf_weighted_enabled());
     }
 
     #[test]

@@ -12,6 +12,7 @@
 import * as vscode from "vscode";
 import type { McpClient } from "./mcp";
 import { parseContextResult, isParsed, parseSnippetsResult } from "./context/parse";
+import { stripEnvelope } from "./commands";
 
 // ── Keyword set (salvaged from contextProvider.ts) ────────────────────────────
 
@@ -162,9 +163,7 @@ export class ContextExplorerPanel {
         // A newer query arrived while we waited — discard this result and loop.
         if (gen !== this.queryGeneration || this.disposed) continue;
 
-        const stripped = raw
-          .replace(/^<travsr-data>\n?/, "")
-          .replace(/\n?<\/travsr-data>$/, "");
+        const stripped = stripEnvelope(raw);
 
         const result = parseContextResult(stripped);
         if (!isParsed(result)) {
@@ -172,7 +171,20 @@ export class ContextExplorerPanel {
           continue;
         }
 
-        result.nodes.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        // RFC-022 §14: when the backend groups by match-source (flag-on), keep the
+        // Exact → Semantic → Relevant section order and sort by score *within* a
+        // section — a flat score-sort would shuffle the sections together. Flag-off
+        // (no matchSource) keeps the original flat score-sort.
+        if (result.nodes.some((n) => n.matchSource)) {
+          const rank: Record<string, number> = { exact: 0, semantic: 1, relevant: 2 };
+          result.nodes.sort(
+            (a, b) =>
+              (rank[a.matchSource ?? "relevant"] ?? 3) - (rank[b.matchSource ?? "relevant"] ?? 3) ||
+              (b.score ?? 0) - (a.score ?? 0)
+          );
+        } else {
+          result.nodes.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        }
         void this.panel.webview.postMessage({ command: "render", data: result, rawText: stripped });
 
         // Phase 2: snippets — use a real AbortSignal so a new query cancels this.
@@ -202,10 +214,7 @@ export class ContextExplorerPanel {
           30_000
         );
         if (!snippetSignal.aborted && gen === this.queryGeneration && !this.disposed) {
-          const snippetStripped = (snippetRaw ?? "")
-            .replace(/^<travsr-data>\n?/, "")
-            .replace(/\n?<\/travsr-data>$/, "");
-          const snippetMap = parseSnippetsResult(snippetStripped);
+          const snippetMap = parseSnippetsResult(stripEnvelope(snippetRaw ?? ""));
           void this.panel.webview.postMessage({
             command: "enrichSnippets",
             snippets: Object.fromEntries(snippetMap),
@@ -233,10 +242,7 @@ export class ContextExplorerPanel {
         30_000
       );
       if (this.disposed) return;
-      const stripped = (raw ?? "")
-        .replace(/^<travsr-data>\n?/, "")
-        .replace(/\n?<\/travsr-data>$/, "");
-      const map = parseSnippetsResult(stripped);
+      const map = parseSnippetsResult(stripEnvelope(raw ?? ""));
       const snippet = map.get(sig) ?? [...map.values()][0] ?? "";
       void this.panel.webview.postMessage({ command: "snippetFetched", sig, mode, snippet });
     } catch {
@@ -418,6 +424,15 @@ body{background:var(--bg);color:var(--fg);font-family:var(--font-sans);
 .fb-toggle input{accent-color:var(--node);cursor:pointer}
 .fb-count{margin-left:auto;font-size:10.5px;color:var(--fg-subtle);font-variant-numeric:tabular-nums}
 .scroll-area>#node-list{display:flex;flex-direction:column;gap:8px}
+/* ── RFC-022 §14 match-source section header ── */
+.section-head{
+  font-family:var(--font-sans);font-size:10px;font-weight:700;letter-spacing:.07em;
+  text-transform:uppercase;color:var(--fg-muted);
+  padding:8px 2px 5px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:7px}
+.section-head::before{content:'';width:6px;height:6px;border-radius:var(--r-full);
+  background:var(--accent);flex-shrink:0}
+.section-head:first-child{padding-top:2px}
 .node{
   border:1px solid var(--border);border-radius:var(--r-md);background:var(--bg-elev);
   overflow:hidden;transition:border-color .15s;flex-shrink:0}
@@ -478,6 +493,9 @@ body{background:var(--bg);color:var(--fg);font-family:var(--font-sans);
 .legend-box .items{display:flex;gap:14px;flex-wrap:wrap}
 .legend-box .it{font-size:11px;color:var(--fg-muted);display:flex;align-items:center;gap:6px}
 .legend-box .why{color:var(--fg-subtle)}
+.ms-tag{display:inline-block;font-size:8px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.04em;padding:2px 7px;border-radius:var(--r-full);flex-shrink:0;
+  color:var(--accent);background:var(--green-deep)}
 
 /* ── misc states ── */
 .empty{color:var(--fg-subtle);font-size:12px;padding:28px 0;text-align:center;flex-shrink:0}
@@ -524,9 +542,11 @@ pre.raw-fallback{
 
 <!-- provenance legend (shown once results arrive) -->
 <div class="legend-box" id="legend-box" style="display:none">
-  <div class="t">Why each node is here (provenance, not similarity)</div>
+  <div class="t">How each node was matched (match source), then its graph provenance</div>
   <div class="items">
-    <div class="it"><span class="via seed">seed</span><span class="why">matched your query</span></div>
+    <div class="it"><span class="ms-tag">Exact</span><span class="why">literal symbol / FTS name match</span></div>
+    <div class="it"><span class="ms-tag">Semantic</span><span class="why">cross-encoder ranked by relevance</span></div>
+    <div class="it"><span class="ms-tag">Relevant</span><span class="why">graph-adjacent context (see via)</span></div>
     <div class="it"><span class="via caller">caller</span><span class="why">calls a seed</span></div>
     <div class="it"><span class="via dependency">dependency</span><span class="why">imported / used by a seed</span></div>
     <div class="it"><span class="via context">context</span><span class="why">on the path between them</span></div>
@@ -592,11 +612,22 @@ function kindIco(kind){
 }
 
 function viaClass(via){
-  const v = via.toLowerCase();
-  if(v==='seed') return 'seed';
-  if(v==='caller') return 'caller';
-  if(v.includes('dep')) return 'dependency';
+  // RFC-019 renders relevant rows as "caller of X" / "dependency of X", so match
+  // on the leading role, not exact equality. Tolerant of undefined (hoisted seed).
+  const v = String(via||'').toLowerCase();
+  if(v.startsWith('seed')) return 'seed';
+  if(v.startsWith('caller')) return 'caller';
+  if(v.startsWith('dep')) return 'dependency';
   return 'context';
+}
+
+// RFC-022 §14: labelled section header for a match-source group. Real heading for
+// the a11y outline; the source it names is dropped from each row's via badge below.
+function sectionHead(ms){
+  const label = ms==='exact' ? 'Exact · literal / FTS match'
+    : ms==='semantic' ? 'Semantic · cross-encoder ranked'
+    : 'Relevant · graph-adjacent context';
+  return \`<div class="section-head" role="heading" aria-level="3">\${label}</div>\`;
 }
 
 // Strip structural type prefixes (fn:, method:, class:, etc.) so the badge
@@ -782,8 +813,15 @@ function renderNodeList(){
       ? '<p class="empty">No snippets loaded yet — they arrive a moment after the results.</p>'
       : '<p class="empty">No nodes.</p>';
   }
+  let lastSection = null;
   for(let i=0;i<nodes.length;i++){
     const n = nodes[i];
+    // RFC-022 §14: emit a labelled header when the match-source section changes.
+    // Absent on flag-off/flat results, so the existing single list is unchanged.
+    if(n.matchSource && n.matchSource !== lastSection){
+      lastSection = n.matchSource;
+      html += sectionHead(n.matchSource);
+    }
     const sig = n.sig;
     const mode = state.mode[sig] || 'auto';
     // undefined = never fetched, '' = fetched but no body, string = snippet.
@@ -823,7 +861,7 @@ function renderNodeList(){
       <span class="loc" data-path="\${esc(n.path)}" data-line="\${n.line??''}">\${pathLine}</span>
     </div>
     \${pinBadge}\${snipBadge}
-    <span class="via \${viaClass(n.via)}" title="\${esc(n.via)}">\${esc(shortVia(n.via))}</span>
+    \${n.via ? \`<span class="via \${viaClass(n.via)}" title="\${esc(n.via)}">\${esc(shortVia(n.via))}</span>\` : ''}
     \${scoreHtml}
     <span class="chev">▸</span>
   </div>

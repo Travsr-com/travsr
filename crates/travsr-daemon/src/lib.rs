@@ -620,6 +620,15 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
     let mut store = travsr_store::SqliteStore::open(db_path)
         .context("opening store for embed_text regeneration")?;
 
+    // RFC-022 D1 (RC-1): one-time FTS-content widening backfill for indexes built
+    // before the `embed_text`-in-FTS change landed. Idempotent (meta-gated), so it
+    // is a cheap no-op after the first run and preserves the always-fresh invariant.
+    match store.backfill_fts_embed_text() {
+        Ok(n) if n > 0 => tracing::info!(nodes = n, "backfilled embed_text into FTS content"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("embed-text FTS backfill failed: {e}"),
+    }
+
     let stored_id = store.get_meta("embed_text_model_id").ok().flatten();
     if stored_id.as_deref() == Some(active_id.as_str()) {
         // Model unchanged — still populate embed_text for any nodes indexed since

@@ -99,14 +99,21 @@ const estTokens = (t) => Math.round(strip(t).length / 4);
 const median = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
 const p95 = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))]; };
 
-// Parse get_context node lines: "sig (kind) — path:line [via: role] [score: N]"
+// Parse get_context node lines: "sig (kind) — path:line [via: role] [score: N]".
+// RFC-022 §14 (default-on): tolerate match-source grouping — skip "## exact/
+// semantic/relevant" section headers, record the section as matchSource, and
+// accept rows with no `[via:]` badge (hoisted onto Exact/Semantic headers) by
+// terminating the path at the first bracketed tag OR end of line.
 function parseNodes(text) {
   const out = [];
+  let section = null;
   for (const line of strip(text).split("\n")) {
-    if (!line.includes(" — ") || !line.includes("[via")) continue;
-    const m = /^(\S+)\s+\(([^)]+)\)\s+—\s+(.+?)(?:\s+\[via)/.exec(line);
+    const sec = /^##\s+(exact|semantic|relevant)\b/.exec(line);
+    if (sec) { section = sec[1]; continue; }
+    if (!line.includes(" — ")) continue;
+    const m = /^(\S+)\s+\(([^)]+)\)\s+—\s+(.+?)(?:\s+\[|$)/.exec(line);
     if (!m) continue;
-    out.push({ sig: m[1], kind: m[2], path: m[3].replace(/:\d+$/, "") });
+    out.push({ sig: m[1], kind: m[2], path: m[3].replace(/:\d+$/, ""), matchSource: section });
   }
   return out;
 }

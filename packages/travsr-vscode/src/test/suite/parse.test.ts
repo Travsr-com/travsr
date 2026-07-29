@@ -85,6 +85,25 @@ foo (function) — src/foo.ts:10 [via: seed] [score: 0.80]
 [note: embedding in progress — run \`travsr embed status\` to check; results improve as index builds]
 `;
 
+// RFC-022 §14 flag-on shape: match-source sections (## exact/semantic/relevant),
+// seed lines with the `[via:]` badge hoisted into the header (absent on the line),
+// and relevant rows that keep `[via: caller of X]` (the source seed the header
+// does not carry). N>4 so grouping is active. Metadata-only footer.
+const GROUPED_FIXTURE = `[index commit: 36acbbcb753, embeddings: on]
+[retrieval: exact+semantic | coverage 4/6 | confidence: strong ]
+
+## exact — literal symbol / FTS match (not reranked)
+fn:knapsack (function) — crates/travsr-retrieval/src/knapsack.rs:53 [score: 0.98]
+fn:solve (function) — crates/travsr-retrieval/src/knapsack.rs:71 [score: 0.90]
+## semantic — cross-encoder ranked
+fn:token_budget (function) — crates/travsr-retrieval/src/budget.rs:12 [score: 0.55]
+## relevant — graph-adjacent context
+fn:seeded_store (function) — crates/travsr-mcp/src/query.rs:682 [via: dependency of fn:token_budget] [score: 0.00]
+method:SqliteStore.open (method) — crates/travsr-store/src/lib.rs:744 [via: caller of fn:knapsack] [score: 0.00]
+
+[5 nodes, ~150 tokens]
+`;
+
 const MALFORMED_FIXTURE = `not a valid get_context response at all`;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -185,6 +204,46 @@ suite("context/parse: parseContextResult", () => {
     assert.strictEqual(p.notes.length, 1);
     assert.ok(p.notes[0].includes("embedding in progress"));
     assert.ok(p.notes[0].includes("travsr embed status"));
+  });
+
+  test("parses a grouped (match-source) result with hoisted via badges", () => {
+    const r = parseContextResult(GROUPED_FIXTURE);
+    assert.ok(isParsed(r), "grouped result should parse");
+    const p = r as ParsedContext;
+
+    // Section headers are consumed, not emitted as nodes.
+    assert.strictEqual(p.nodes.length, 5, "five nodes, no header rows");
+    assert.strictEqual(p.footer.nodes, 5);
+
+    // matchSource stamped per node from the preceding section header.
+    const bySource = (s: string) => p.nodes.filter((n) => n.matchSource === s);
+    assert.strictEqual(bySource("exact").length, 2);
+    assert.strictEqual(bySource("semantic").length, 1);
+    assert.strictEqual(bySource("relevant").length, 2);
+
+    // Exact/Semantic seed lines: via hoisted into the header → undefined on the row.
+    const knapsack = p.nodes.find((n) => n.sig === "fn:knapsack");
+    assert.ok(knapsack, "knapsack node present");
+    assert.strictEqual(knapsack?.matchSource, "exact");
+    assert.strictEqual(knapsack?.via, undefined, "hoisted seed line carries no via");
+    assert.ok(Math.abs((knapsack?.score ?? 0) - 0.98) < 0.001, "score still parses");
+
+    const budget = p.nodes.find((n) => n.sig === "fn:token_budget");
+    assert.strictEqual(budget?.matchSource, "semantic");
+    assert.strictEqual(budget?.via, undefined);
+
+    // Relevant rows keep the source-seed via badge.
+    const store = p.nodes.find((n) => n.sig === "method:SqliteStore.open");
+    assert.strictEqual(store?.matchSource, "relevant");
+    assert.strictEqual(store?.via, "caller of fn:knapsack");
+  });
+
+  test("flag-off fixtures keep via and carry no matchSource (backward compat)", () => {
+    const r = parseContextResult(STRONG_FIXTURE);
+    assert.ok(isParsed(r));
+    const p = r as ParsedContext;
+    assert.strictEqual(p.nodes[0].via, "seed", "flag-off via preserved");
+    assert.strictEqual(p.nodes[0].matchSource, undefined, "no section → no matchSource");
   });
 
   test("falls back to { raw } on malformed input", () => {

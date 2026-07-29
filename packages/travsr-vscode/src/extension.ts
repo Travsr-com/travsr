@@ -35,7 +35,7 @@ import {
   EVT_MCP_INVOKED,
   EVT_DAEMON_FAILED,
 } from "./telemetry";
-import { registerParityCommands, refreshOpenPanels } from "./commands";
+import { registerParityCommands, refreshOpenPanels, stripEnvelope } from "./commands";
 import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
 import { registerMcpServerCommand } from "./mcpRegister";
 import { registerContextCodeAction } from "./contextCodeAction";
@@ -766,10 +766,7 @@ interface FileListOpts {
 
 /** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
 export function parseEnvelope(raw: string): string[] {
-  const inner = raw
-    .replace(/^<travsr-data>\n?/, "")
-    .replace(/\n?<\/travsr-data>$/, "");
-  return inner.split("\n").map((l) => l.trim()).filter(Boolean);
+  return stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
 }
 
 export function buildFileListHtml(

@@ -99,9 +99,10 @@ enum Command {
     },
     /// Print index and graph status.
     Status,
-    /// Look up callers and dependencies for a symbol name.
+    /// Ask a natural-language question about the codebase (graph-grounded
+    /// retrieval). Also accepts a bare symbol name.
     Ask {
-        /// Symbol name to search for (partial match supported).
+        /// Natural-language question, or a symbol name, to retrieve context for.
         query: String,
         /// Output format: table (default) or json.
         #[arg(long, value_enum, default_value = "table")]

@@ -117,6 +117,12 @@ pub struct AskRow {
     #[serde(default)]
     pub line: Option<u32>,
     pub score: f32,
+    /// RFC-022 §14: match-source bucket ("exact"/"semantic"/"relevant") for
+    /// provenance grouping. Populated only under `TRAVSR_MATCH_SOURCE=1`; `None`
+    /// (skipped in JSON) otherwise, so default output is byte-for-byte unchanged.
+    /// Never reorders `rows` — grouping is a text-surface concern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_source: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -346,20 +352,46 @@ pub fn ask_query(
     let total_tokens: usize = selected.iter().map(token_cost).sum();
     // F9: expanded neighbours cap at the best seed's rerank so none outranks its seed.
     let expanded_cap = seed_rerank.values().copied().reduce(f32::max);
+    // RFC-022 §14: emit the match-source tag only under the flag. `rows` order is
+    // never changed here — grouping is a text-surface concern (CLI table), so the
+    // JSON `rows` array stays in knapsack order and hit@k is unaffected.
+    let emit_match_source = crate::seed::match_source_grouping_enabled();
+    // Nodes whose strongest seed source is an exact literal-name / FTS match →
+    // the "exact" match-source bucket (RFC-022 §14). Everything else that is a
+    // primary seed is "semantic"; non-seeds are "relevant". Uses the same
+    // node→strongest-source classifier as get_context (`strongest_seed_sources`)
+    // so a node buckets identically on both surfaces.
+    let strongest_source: HashMap<NodeId, crate::seed::SeedSource> = if emit_match_source {
+        crate::seed::strongest_seed_sources(&seed_set.seeds)
+    } else {
+        HashMap::new()
+    };
     let rows = selected
         .into_iter()
-        .map(|n| AskRow {
-            score: crate::seed::display_score(
-                n.id,
-                score_map.get(&n.id).copied().unwrap_or(0.0),
-                &seed_rerank,
-                primary_seed_ids.contains(&n.id),
-                expanded_cap,
-            ),
-            kind: n.kind,
-            signature: n.vname.signature,
-            path: n.vname.path,
-            line: n.line,
+        .map(|n| {
+            let is_primary = primary_seed_ids.contains(&n.id);
+            AskRow {
+                score: crate::seed::display_score(
+                    n.id,
+                    score_map.get(&n.id).copied().unwrap_or(0.0),
+                    &seed_rerank,
+                    is_primary,
+                    expanded_cap,
+                ),
+                match_source: emit_match_source.then(|| {
+                    let is_exact = matches!(
+                        strongest_source.get(&n.id),
+                        Some(crate::seed::SeedSource::Exact)
+                    );
+                    crate::seed::match_source(is_primary, is_exact)
+                        .label()
+                        .to_string()
+                }),
+                kind: n.kind,
+                signature: n.vname.signature,
+                path: n.vname.path,
+                line: n.line,
+            }
         })
         .collect();
 
