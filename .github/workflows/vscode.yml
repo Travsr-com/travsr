@@ -45,15 +45,6 @@ jobs:
           - os: windows-latest
             vscodeVersion: 'insiders'
             experimental: true
-          # macOS runners intermittently fail to launch the freshly downloaded
-          # rolling "stable" VS Code build (spawn .../MacOS/Electron ENOENT)
-          # before any test runs. Known @vscode/test-electron macOS-runner flake,
-          # not a test failure: all pinned macOS versions and every ubuntu/windows
-          # job pass. Keep it in the matrix for signal but do not let the flake
-          # block the PR. Drop this once the runner/test-electron issue is fixed.
-          - os: macos-latest
-            vscodeVersion: 'stable'
-            experimental: true
         exclude:
           # VS Code 1.85.0 on Windows has known runner/Electron instability
           - os: windows-latest

@@ -373,7 +373,7 @@
     "@types/mocha": "^10.0.6",
     "@types/node": "^25.8.0",
     "@types/vscode": "^1.85.0",
-    "@vscode/test-electron": "^2.3.9",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.1",
     "mocha": "^10.3.0",
     "ovsx": "0.9.5",
