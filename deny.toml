@@ -23,6 +23,15 @@ ignore = [
     # tract-linalg and by tokenizers (via macro_rules_attribute). No safe
     # upgrade available.
     { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro only, no runtime exposure" },
+    # tract-nnef read_tensor integer-overflow OOB read on model load
+    # (RUSTSEC-2026-0217). Reachable only when parsing an attacker-controlled
+    # NNEF .dat model. travsr-rerank loads ONNX (not NNEF), and only its own
+    # sha256-pinned bundled cross-encoder model (RFC-021 F8) — never a
+    # user-supplied or network-fetched model — so the vulnerable path is not
+    # reachable. Unblock on tract-nnef >= 0.21.16 (patched in the 0.21.x line;
+    # deferred here because the bump pulls transitive downgrades that need a
+    # full reranker + MSRV revalidation).
+    { id = "RUSTSEC-2026-0217", reason = "NNEF .dat parser OOB read; travsr loads ONNX only + own sha256-pinned model, attacker-controlled-model path unreachable" },
 ]
 
 [licenses]
