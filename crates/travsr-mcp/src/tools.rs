@@ -2768,6 +2768,55 @@ fn format_node_line(
     }
 }
 
+/// RFC-022 §14: one-line section header printed once per match-source group in
+/// the grouped `get_context` body. Amortizes the provenance label across the group
+/// (vs a per-row badge) and disambiguates the Exact section's non-rerank score.
+fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
+    match ms {
+        crate::seed::MatchSource::Exact => "## exact — literal symbol / FTS match (not reranked)",
+        crate::seed::MatchSource::Semantic => "## semantic — cross-encoder ranked",
+        crate::seed::MatchSource::Relevant => "## relevant — graph-adjacent context",
+    }
+}
+
+/// RFC-022 §14: assemble the node body for `get_context`.
+///
+/// `entries` is one `(match_source, display_score, rendered_line)` per selected
+/// node, in knapsack order. When `grouped` is false the rendered lines are joined
+/// verbatim (byte-for-byte identical to the pre-§14 output). When true, the nodes
+/// are partitioned into Exact → Semantic → Relevant sections (each preceded by a
+/// one-line header) and sorted within a section by descending display score.
+/// Display-only: the knapsack set is unchanged — only presentation order differs.
+fn assemble_context_body(
+    entries: Vec<(crate::seed::MatchSource, f32, String)>,
+    sep: &str,
+    grouped: bool,
+) -> String {
+    if !grouped {
+        return entries
+            .into_iter()
+            .map(|(_, _, line)| line)
+            .collect::<Vec<_>>()
+            .join(sep);
+    }
+    let mut entries = entries;
+    entries.sort_by(|a, b| {
+        a.0.trust_rank()
+            .cmp(&b.0.trust_rank())
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut out: Vec<String> = Vec::with_capacity(entries.len() + 3);
+    let mut cur: Option<crate::seed::MatchSource> = None;
+    for (ms, _score, line) in entries {
+        if cur != Some(ms) {
+            out.push(match_source_header(ms).to_string());
+            cur = Some(ms);
+        }
+        out.push(line);
+    }
+    out.join(sep)
+}
+
 /// Derive FTS seeds with confidence-based weights for weighted PPR personalisation.
 ///
 /// - Exact substring match (`search_nodes_by_name`) → `FTS_EXACT_WEIGHT` (1.0)
@@ -3407,6 +3456,20 @@ fn get_context_body(
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
+    // RFC-022 §14: match-source grouping of the (already-selected) node set.
+    // Display-only — `selected`/knapsack are untouched; this only decides how the
+    // rendered lines are ordered/headed. Gated behind the flag; and collapsed to a
+    // flat list for small N (≤4), where per-section headers cost more than they save.
+    let group_output = crate::seed::match_source_grouping_enabled() && n_nodes > 4;
+    let entry_meta = |id: NodeId| -> (crate::seed::MatchSource, f32) {
+        let is_exact = matches!(
+            seed_source_map.get(&id),
+            Some(crate::seed::SeedSource::Exact)
+        );
+        let ms = crate::seed::match_source(primary_seed_ids.contains(&id), is_exact);
+        (ms, display_score_map.get(&id).copied().unwrap_or(0.0))
+    };
+
     // Build overflow list: candidates that didn't fit within the token budget.
     let overflow_msg: Option<String> = if n_nodes < n_candidates {
         let selected_set: std::collections::HashSet<NodeId> =
@@ -3580,7 +3643,7 @@ fn get_context_body(
                 tracing::warn!(
                     "get_context: repo_root not in meta — falling back to metadata-only"
                 );
-                let lines: Vec<String> = selected
+                let entries: Vec<(crate::seed::MatchSource, f32, String)> = selected
                     .iter()
                     .map(|n| {
                         let role = roles
@@ -3588,7 +3651,7 @@ fn get_context_body(
                             .copied()
                             .unwrap_or(NodeRole::Context)
                             .label();
-                        format_node_line(
+                        let line = format_node_line(
                             n,
                             role,
                             display_score_map.get(&n.id).copied(),
@@ -3597,10 +3660,15 @@ fn get_context_body(
                                 .and_then(|s| seed_sig.get(s))
                                 .map(String::as_str),
                             seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
-                        )
+                        );
+                        let (ms, score) = entry_meta(n.id);
+                        (ms, score, line)
                     })
                     .collect();
-                let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
+                let sanitized = sanitize_mcp_body_with_limit(
+                    &assemble_context_body(entries, "\n", group_output),
+                    char_cap,
+                );
                 let notes = build_degraded_notes(store, has_embed, embed_warming);
                 let footer = format!(
                     "[{n_nodes} nodes, ~{total_tokens} tokens — run `travsr init` to enable inline snippets]"
@@ -3624,7 +3692,8 @@ fn get_context_body(
 
         let mut snip_tokens: usize = 0;
         let mut n_with_snippet: usize = 0;
-        let mut blocks: Vec<String> = Vec::with_capacity(selected.len());
+        let mut blocks: Vec<(crate::seed::MatchSource, f32, String)> =
+            Vec::with_capacity(selected.len());
 
         for n in &selected {
             let role = roles
@@ -3671,10 +3740,14 @@ fn get_context_body(
             } else {
                 header
             };
-            blocks.push(block);
+            let (ms, score) = entry_meta(n.id);
+            blocks.push((ms, score, block));
         }
 
-        let sanitized = sanitize_mcp_body_with_limit(&blocks.join("\n\n"), char_cap);
+        let sanitized = sanitize_mcp_body_with_limit(
+            &assemble_context_body(blocks, "\n\n", group_output),
+            char_cap,
+        );
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,
@@ -3696,7 +3769,7 @@ fn get_context_body(
         }
     } else {
         // Metadata-only path with role annotations.
-        let lines: Vec<String> = selected
+        let entries: Vec<(crate::seed::MatchSource, f32, String)> = selected
             .iter()
             .map(|n| {
                 let role = roles
@@ -3704,7 +3777,7 @@ fn get_context_body(
                     .copied()
                     .unwrap_or(NodeRole::Context)
                     .label();
-                format_node_line(
+                let line = format_node_line(
                     n,
                     role,
                     display_score_map.get(&n.id).copied(),
@@ -3713,10 +3786,15 @@ fn get_context_body(
                         .and_then(|s| seed_sig.get(s))
                         .map(String::as_str),
                     seed_source_map.get(&n.id).map(|s| seed_source_display(*s)),
-                )
+                );
+                let (ms, score) = entry_meta(n.id);
+                (ms, score, line)
             })
             .collect();
-        let sanitized = sanitize_mcp_body_with_limit(&lines.join("\n"), char_cap);
+        let sanitized = sanitize_mcp_body_with_limit(
+            &assemble_context_body(entries, "\n", group_output),
+            char_cap,
+        );
         let signals = build_context_signals_with_r2(
             phase_b,
             has_embed,

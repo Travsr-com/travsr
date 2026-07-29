@@ -31,6 +31,18 @@ struct Row {
     score: String,
 }
 
+fn to_row(r: &query::AskRow) -> Row {
+    Row {
+        kind: r.kind.clone(),
+        signature: r.signature.clone(),
+        path: match r.line {
+            Some(l) => format!("{}:{}", r.path, l),
+            None => r.path.clone(),
+        },
+        score: format!("{:.3}", r.score),
+    }
+}
+
 pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if query_str.trim().is_empty() {
         anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
@@ -80,22 +92,37 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let rows: Vec<Row> = payload
-        .rows
-        .into_iter()
-        .map(|r| Row {
-            kind: r.kind,
-            signature: r.signature,
-            path: match r.line {
-                Some(l) => format!("{}:{}", r.path, l),
-                None => r.path,
-            },
-            score: format!("{:.3}", r.score),
-        })
-        .collect();
-
-    let n = rows.len();
-    println!("{}", Table::new(rows));
+    let n = payload.rows.len();
+    // RFC-022 §14: when match-source grouping is on (rows carry `match_source`)
+    // and the result is large enough (N>4) that section headers pay for themselves,
+    // print one table per Exact → Semantic → Relevant section. Otherwise a single
+    // flat table (unchanged default). This never reorders the JSON `rows` (that
+    // path returned above); it only regroups the human table.
+    let grouped = n > 4 && payload.rows.iter().any(|r| r.match_source.is_some());
+    if grouped {
+        for tag in ["exact", "semantic", "relevant"] {
+            let mut section: Vec<&query::AskRow> = payload
+                .rows
+                .iter()
+                .filter(|r| r.match_source.as_deref() == Some(tag))
+                .collect();
+            if section.is_empty() {
+                continue;
+            }
+            section.sort_by(|a, b| b.score.total_cmp(&a.score));
+            let rows: Vec<Row> = section.iter().map(|r| to_row(r)).collect();
+            let header = match tag {
+                "exact" => "── exact — literal symbol / FTS match (not reranked) ──",
+                "semantic" => "── semantic — cross-encoder ranked ──",
+                _ => "── relevant — graph-adjacent context ──",
+            };
+            println!("{header}");
+            println!("{}", Table::new(rows));
+        }
+    } else {
+        let rows: Vec<Row> = payload.rows.iter().map(to_row).collect();
+        println!("{}", Table::new(rows));
+    }
     let embed_note = if payload.embed_used {
         " · [embed-enhanced]"
     } else {

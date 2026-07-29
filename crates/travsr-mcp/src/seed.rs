@@ -493,6 +493,76 @@ pub(crate) fn display_score(
     }
 }
 
+/// RFC-022 §14: the provenance bucket a returned node is grouped under.
+///
+/// A clean per-node partition keyed on how the node entered the result — its seed
+/// provenance — so the section header carries a trustworthy "how sure are we"
+/// signal:
+/// - [`Exact`](MatchSource::Exact): a primary seed whose strongest [`SeedSource`]
+///   is [`Exact`](SeedSource::Exact) — a literal symbol / FTS name match. Highest
+///   structural certainty.
+/// - [`Semantic`](MatchSource::Semantic): a primary seed reached by embedding-KNN
+///   or fuzzy-lexical retrieval (not an exact name). Sorted by the shown score,
+///   which for a reranked seed is its cross-encoder score (RC-2 transparency).
+/// - [`Relevant`](MatchSource::Relevant): a non-seed node PPR/traversal reached —
+///   supporting structure.
+///
+/// Display-only: this classifies the *already-selected* knapsack set for grouped
+/// presentation and never influences which nodes are selected or their score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchSource {
+    Exact,
+    Semantic,
+    Relevant,
+}
+
+impl MatchSource {
+    /// Lowercase tag used in the `--format json` `match_source` field and the CLI
+    /// section headers. Stable — bench parsers and the VS Code Context Explorer
+    /// key off these exact strings.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            MatchSource::Exact => "exact",
+            MatchSource::Semantic => "semantic",
+            MatchSource::Relevant => "relevant",
+        }
+    }
+
+    /// Section order: certainties → strong candidates → context, so "just give me
+    /// the best node" is answered by the top section.
+    pub(crate) fn trust_rank(self) -> u8 {
+        match self {
+            MatchSource::Exact => 0,
+            MatchSource::Semantic => 1,
+            MatchSource::Relevant => 2,
+        }
+    }
+}
+
+/// RFC-022 §14: classify a selected node into its match-source bucket by seed
+/// provenance. `is_primary_seed` is membership in the pre-enrichment primary-seed
+/// set; `is_exact_source` is whether that seed's strongest [`SeedSource`] is
+/// [`Exact`](SeedSource::Exact) (a literal-name / FTS match). A seed is therefore
+/// either Exact or Semantic; a non-seed is always Relevant.
+pub(crate) fn match_source(is_primary_seed: bool, is_exact_source: bool) -> MatchSource {
+    if !is_primary_seed {
+        MatchSource::Relevant
+    } else if is_exact_source {
+        MatchSource::Exact
+    } else {
+        MatchSource::Semantic
+    }
+}
+
+/// RFC-022 §14 prototype gate. `TRAVSR_MATCH_SOURCE=1` turns on match-source
+/// grouping of `get_context` / `ask` output (display-only). Default off →
+/// byte-for-byte identical output, so every existing test and frozen bench holds.
+pub(crate) fn match_source_grouping_enabled() -> bool {
+    std::env::var("TRAVSR_MATCH_SOURCE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 // ── Stop-word list (code-aware: omit "get", "set", "run", "use") ─────────────
 
 const STOP_WORDS: &[&str] = &[
