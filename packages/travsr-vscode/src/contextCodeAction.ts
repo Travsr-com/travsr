@@ -15,6 +15,7 @@
 import * as vscode from "vscode";
 import type { McpClient } from "./mcp";
 import { getSymbolAt, getSymbolAtCursor } from "./contextExplorer";
+import { stripEnvelope } from "./commands";
 import { BLAST_RADIUS_SELECTOR } from "./codelens";
 
 const COPY_COMMAND = "travsr.copyContextForChat";
@@ -56,6 +57,12 @@ export class ContextChatCodeActionProvider implements vscode.CodeActionProvider 
  * Run `get_context` for a symbol and copy the formatted block to the clipboard.
  * `symbol` is provided by the CodeAction; when invoked from the palette it falls
  * back to the symbol under the active cursor.
+ *
+ * The copied text is the raw `get_context` body verbatim (only the SEC-001
+ * `<travsr-data>` envelope is stripped). RFC-022 §14: when match-source grouping
+ * is on the body carries `## exact / ## semantic / ## relevant` section headers —
+ * this is the intended agent-facing format, so it flows through unchanged and the
+ * pasted context tells the downstream model how confidently each node matched.
  */
 export async function copyContextForChat(client: McpClient, symbol?: string): Promise<void> {
   const editor = vscode.window.activeTextEditor;
@@ -88,7 +95,7 @@ export async function copyContextForChat(client: McpClient, symbol?: string): Pr
     return;
   }
 
-  const body = raw.trim();
+  const body = stripEnvelope(raw).trim();
   if (!body) {
     // Aborted, empty, or daemon unavailable — don't clobber the clipboard silently.
     void vscode.window.showWarningMessage(`Travsr: no context returned for "${query}".`);

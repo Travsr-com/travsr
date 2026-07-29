@@ -23,13 +23,23 @@ export interface ContextHeader {
   confidence: string;
 }
 
+/** RFC-022 §14 match-source bucket a node is grouped under (flag-on only). */
+export type MatchSource = "exact" | "semantic" | "relevant";
+
 export interface ContextNode {
   sig: string;
   kind: string;
   path: string;
   line?: number;
   pkg?: string;
-  via: string;
+  /**
+   * Provenance badge (`seed`, `caller of X`, …). Optional: RFC-022 §14 grouped
+   * mode hoists the source of Exact/Semantic seed rows into the section header,
+   * so those rows carry no `[via:]` badge (`via === undefined`).
+   */
+  via?: string;
+  /** RFC-022 §14 section this node was grouped under (flag-on only). */
+  matchSource?: MatchSource;
   score?: number;
   snippet?: string;
 }
@@ -69,6 +79,9 @@ const FOOTER_RE =
 // Simple metadata-only footer: [N nodes, ~T tokens] or [N nodes, ~T tokens — …]
 const FOOTER_RE_SIMPLE = /^\[(\d+)\s+nodes?,\s*~(\d+)\s+tokens[^\]]*\]$/;
 const NOTE_RE = /^\[note:\s*.+\]$/;
+// RFC-022 §14 match-source section header: "## exact — literal symbol / FTS …".
+// Consumed (not emitted); stamps matchSource on the node rows that follow it.
+const SECTION_RE = /^##\s+(exact|semantic|relevant)\b/;
 
 function parseHeader(line1: string, line2: string): ContextHeader | null {
   const m1 = FRESHNESS_RE.exec(line1.trim());
@@ -100,11 +113,12 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
   const scoreM = /\s+\[score:\s*([\d.]+)\]$/.exec(rest);
   if (scoreM) { score = parseFloat(scoreM[1]); rest = rest.slice(0, -scoreM[0].length); }
 
-  // Extract required [via: role]
+  // Extract optional [via: role]. RFC-022 §14: grouped Exact/Semantic seed rows
+  // hoist their source into the section header and carry no badge, so a missing
+  // `[via:]` is valid (via = undefined) — it must not drop the row.
+  let via: string | undefined;
   const viaM = /\s+\[via:\s*([^\]]+)\]$/.exec(rest);
-  if (!viaM) return null;
-  const via = viaM[1].trim();
-  rest = rest.slice(0, -viaM[0].length);
+  if (viaM) { via = viaM[1].trim(); rest = rest.slice(0, -viaM[0].length); }
 
   // Extract optional [package: pkg]
   let pkg: string | undefined;
@@ -228,6 +242,9 @@ export function parseContextResult(text: string): ContextResult {
   const nodes: ContextNode[] = [];
   const notes: string[] = [];
   let footer: ContextFooter | undefined;
+  // RFC-022 §14: the match-source section the current node rows belong to, set by
+  // the most recent "## <source>" header. undefined for flag-off/flat output.
+  let currentSection: MatchSource | undefined;
 
   let i = 2; // skip the two header lines
   while (i < lines.length) {
@@ -235,6 +252,14 @@ export function parseContextResult(text: string): ContextResult {
     const trimmed = line.trim();
 
     if (!trimmed) { i++; continue; }
+
+    // Match-source section header (flag-on): switch section, consume the line.
+    const sectionM = SECTION_RE.exec(trimmed);
+    if (sectionM) {
+      currentSection = sectionM[1] as MatchSource;
+      i++;
+      continue;
+    }
 
     // Footer line — full snippet format
     const footerM = FOOTER_RE.exec(trimmed);
@@ -295,7 +320,7 @@ export function parseContextResult(text: string): ContextResult {
           }
           if (snippetLines.length > 0) snippet = snippetLines.join("\n");
         }
-        nodes.push({ ...node, snippet });
+        nodes.push({ ...node, snippet, matchSource: currentSection });
         continue;
       }
     }
