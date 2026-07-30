@@ -365,10 +365,10 @@ jobs:
       always() &&
       github.event_name == 'workflow_dispatch' &&
       needs.channel.result == 'success' &&
-      (needs.gate-fuzz.result == 'success' || needs.gate-fuzz.result == 'skipped') &&
-      (needs.gate-osv.result == 'success' || needs.gate-osv.result == 'skipped') &&
-      (needs.gate-accuracy.result == 'success' || needs.gate-accuracy.result == 'skipped') &&
-      (needs.gate-ab-eval.result == 'success' || needs.gate-ab-eval.result == 'skipped')
+      (needs['gate-fuzz'].result == 'success' || needs['gate-fuzz'].result == 'skipped') &&
+      (needs['gate-osv'].result == 'success' || needs['gate-osv'].result == 'skipped') &&
+      (needs['gate-accuracy'].result == 'success' || needs['gate-accuracy'].result == 'skipped') &&
+      (needs['gate-ab-eval'].result == 'success' || needs['gate-ab-eval'].result == 'skipped')
     needs: [channel, gate-fuzz, gate-osv, gate-accuracy, gate-ab-eval]
     runs-on: ubuntu-latest
     environment:
@@ -382,6 +382,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # actions/checkout skips tags by default even with fetch-depth: 0 —
+          # without this, resolving $FROM below fails with "unknown revision".
+          fetch-tags: true
 
       - name: Download source release assets
         env:
