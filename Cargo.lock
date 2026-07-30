@@ -3824,6 +3824,7 @@ name = "travsr-analysis"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "proptest",
  "quick-xml",
  "serde_json",
  "streaming-iterator",

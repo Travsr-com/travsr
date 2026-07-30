@@ -1716,9 +1716,10 @@ fn collect_present_languages_and_paths(
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         if let Some(lang) = Language::from_extension(ext) {
-            // Data formats index in Phase A only — exclude from the Phase B
-            // present_languages set so P1 never attempts a nonexistent tool.
-            if !lang.is_data_format() {
+            // Data formats and prose (#376) index in Phase A only — exclude
+            // from the Phase B present_languages set so P1 never attempts a
+            // nonexistent tool.
+            if !lang.is_phase_a_only() {
                 langs.insert(lang.as_str().to_string());
             }
             paths.push(p);
@@ -3132,6 +3133,179 @@ mod tests {
             inc_edges, full_edges,
             "incremental delete + reindex must yield same edge count as full rebuild \
              (incremental={inc_edges}, full={full_edges})"
+        );
+    }
+
+    /// #376 Phase 1: `travsr init` on a docs fixture produces exactly one
+    /// `file` node and one `doc-chunk` node per heading section, with the
+    /// signature format matching the plan's anchor scheme.
+    #[test]
+    fn init_repo_indexes_markdown_docs_with_exact_counts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(
+            tmp.path().join("guide.md"),
+            "## Overview\nSome explanatory content here.\n## Setup\nMore content, also here.\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        let stats = init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+        assert!(stats.files_indexed >= 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let file_nodes = store.nodes_by_kind("file").unwrap();
+        let doc_nodes = store.nodes_by_kind("doc-chunk").unwrap();
+
+        assert_eq!(
+            file_nodes
+                .iter()
+                .filter(|n| n.vname.path == "guide.md")
+                .count(),
+            1
+        );
+        assert_eq!(doc_nodes.len(), 2, "one doc-chunk per top-level heading");
+        let sigs: std::collections::HashSet<_> = doc_nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains("doc:overview"));
+        assert!(sigs.contains("doc:setup"));
+    }
+
+    /// #376 Phase 1: editing a `.md` file incrementally (reindex_files) must
+    /// leave the graph in the same state as a full rebuild from scratch —
+    /// same highest-risk invariant `incremental_delete_matches_full_rebuild`
+    /// checks for code, applied to prose.
+    #[test]
+    fn markdown_full_vs_incremental_equality() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let doc_path = tmp.path().join("guide.md");
+        std::fs::write(&doc_path, "## Overview\nOriginal content.\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Incremental path: edit the file on disk, then reindex just it.
+        std::fs::write(
+            &doc_path,
+            "## Overview\nEdited content.\n## New Section\nA whole new section.\n",
+        )
+        .unwrap();
+        {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&doc_path), tmp.path(), &mut store).unwrap();
+        }
+        let (inc_nodes, inc_edges) = {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            (store.node_count().unwrap(), store.edge_count().unwrap())
+        };
+
+        // Full-rebuild path: wipe .travsr and re-init on the same (edited) tree.
+        std::fs::remove_dir_all(tmp.path().join(".travsr")).unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+        let (full_nodes, full_edges) = {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            (store.node_count().unwrap(), store.edge_count().unwrap())
+        };
+
+        assert_eq!(
+            inc_nodes, full_nodes,
+            "incremental doc edit + reindex must yield same node count as full rebuild \
+             (incremental={inc_nodes}, full={full_nodes})"
+        );
+        assert_eq!(
+            inc_edges, full_edges,
+            "incremental doc edit + reindex must yield same edge count as full rebuild \
+             (incremental={inc_edges}, full={full_edges})"
+        );
+    }
+
+    /// #376 Phase 1: deleting a `.md` file must tombstone its doc-chunk nodes
+    /// exactly like any other file kind — no ghost doc-chunk nodes survive.
+    #[test]
+    fn markdown_delete_tombstones_doc_chunk_nodes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let doc_path = tmp.path().join("guide.md");
+        std::fs::write(&doc_path, "## Overview\nSome content.\n").unwrap();
+        std::fs::write(tmp.path().join("other.md"), "## Kept\nStays around.\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        std::fs::remove_file(&doc_path).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        reindex_files(std::slice::from_ref(&doc_path), tmp.path(), &mut store).unwrap();
+
+        let doc_nodes = store.nodes_by_kind("doc-chunk").unwrap();
+        assert!(
+            doc_nodes.iter().all(|n| n.vname.path != "guide.md"),
+            "deleted file's doc-chunk nodes must be tombstoned, not left as ghosts"
+        );
+        assert!(
+            doc_nodes.iter().any(|n| n.vname.path == "other.md"),
+            "unrelated file's doc-chunk nodes must survive the delete"
+        );
+    }
+
+    /// #376 Phase 1: `.travsrignore` applies to `.md` files exactly like any
+    /// other extension (no markdown-specific ignore code exists — the walker
+    /// is extension-agnostic), and a negation pattern re-includes a file an
+    /// earlier broader rule excluded.
+    #[test]
+    fn travsrignore_excludes_and_negation_reincludes_markdown() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("drafts")).unwrap();
+        std::fs::write(
+            tmp.path().join("drafts/wip.md"),
+            "## Draft\nNot ready yet.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("drafts/important.md"),
+            "## Important\nMust still be indexed.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".travsrignore"),
+            "drafts/*.md\n!drafts/important.md\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let file_nodes = store.nodes_by_kind("file").unwrap();
+        let paths: std::collections::HashSet<_> =
+            file_nodes.iter().map(|n| n.vname.path.as_str()).collect();
+
+        assert!(
+            !paths.contains("drafts/wip.md"),
+            "wip.md must be excluded by the broad .travsrignore rule"
+        );
+        assert!(
+            paths.contains("drafts/important.md"),
+            "important.md must be re-included by the negation rule"
         );
     }
 

@@ -2403,6 +2403,20 @@ pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
     if travsr_core::is_noise_node(node) {
         return true;
     }
+    // #376 Phase 1: doc-chunk nodes are legitimate content — this is not a
+    // "noise" exclusion in the path-based sense every other check below is —
+    // but this is the one gate every candidate source in `build_seed_set`
+    // (fuzzy/name FTS, embed-path seeds, anchors) is proven to pass through,
+    // so it is the correct place for a temporary kind gate. Retrieval for
+    // doc-chunk nodes (the floored, dedicated `docs` section, §4) is Phase 2;
+    // until it lands, a doc chunk must never surface via the generic
+    // lexical/PPR path with no floor and no ranking — confirmed empirically:
+    // without this, `## Payment Architecture` outranked nothing but still
+    // leaked into a `PaymentService` query's "relevant" section at score
+    // 0.000. Remove this arm when Phase 2's dedicated docs path ships.
+    if node.kind == "doc-chunk" {
+        return true;
+    }
     if node.kind == "crate" {
         return true;
     }
@@ -5135,6 +5149,29 @@ mod tests {
             "struct",
             "struct:Daemon"
         )));
+    }
+
+    /// #376 Phase 1 regression: doc-chunk nodes must never surface via the
+    /// generic lexical/PPR seed path before Phase 2's dedicated docs section
+    /// exists. Confirmed empirically to leak without this guard — a fixture
+    /// repo's `## Payment Architecture` doc surfaced under a `PaymentService`
+    /// query at score 0.000 via plain word overlap, with no floor and no
+    /// ranking, before `is_noise_seed` gained the `doc-chunk` check.
+    #[test]
+    fn doc_chunk_nodes_are_noise_until_phase_2_docs_retrieval_lands() {
+        use travsr_core::{Node, VName};
+        let doc_node = Node::new(
+            VName::new("", "", "docs/architecture.md", "markdown", "doc:overview"),
+            "doc-chunk",
+        );
+        assert!(
+            is_noise_seed(&doc_node),
+            "doc-chunk must be excluded from every seed/candidate path in build_seed_set"
+        );
+        assert!(
+            is_context_result_noise(&doc_node),
+            "doc-chunk must be excluded from get_context's result set too"
+        );
     }
 
     #[test]

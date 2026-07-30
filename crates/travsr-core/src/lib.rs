@@ -141,6 +141,9 @@ pub enum Language {
     Yaml,
     Toml,
     Xml,
+    // Prose — Phase A only, never Phase B (#376). No Tree-sitter grammar and
+    // no call-site semantics, so a Phase B sidecar has nothing to contribute.
+    Markdown,
 }
 
 impl Language {
@@ -168,6 +171,7 @@ impl Language {
             "yml" | "yaml" => Some(Self::Yaml),
             "toml" => Some(Self::Toml),
             "xml" | "xsd" | "xsl" => Some(Self::Xml),
+            "md" | "markdown" | "mdx" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -194,6 +198,7 @@ impl Language {
             Self::Yaml => "yaml",
             Self::Toml => "toml",
             Self::Xml => "xml",
+            Self::Markdown => "markdown",
         }
     }
 
@@ -223,6 +228,7 @@ impl Language {
             "yaml" => Some(Self::Yaml),
             "toml" => Some(Self::Toml),
             "xml" => Some(Self::Xml),
+            "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -234,6 +240,17 @@ impl Language {
     /// from the `language_as_str_covered_by_catalog` coverage gate.
     pub fn is_data_format(self) -> bool {
         matches!(self, Self::Json | Self::Yaml | Self::Toml | Self::Xml)
+    }
+
+    /// Returns `true` for every variant that has no Phase B tool at all —
+    /// data/config formats plus prose (#376's [`Self::Markdown`]).
+    ///
+    /// Superset of [`Self::is_data_format`]. Phase B dispatch, the
+    /// `present_languages` coverage gate, and the embed-catalog coverage test
+    /// all key off this rather than `is_data_format` so that adding a future
+    /// Phase-A-only variant only requires touching this one match arm.
+    pub fn is_phase_a_only(self) -> bool {
+        self.is_data_format() || matches!(self, Self::Markdown)
     }
 }
 
@@ -1283,6 +1300,12 @@ mod tests {
         assert_eq!(Language::from_extension("xml"), Some(Language::Xml));
         assert_eq!(Language::from_extension("xsd"), Some(Language::Xml));
         assert_eq!(Language::from_extension("xsl"), Some(Language::Xml));
+        assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
+        assert_eq!(
+            Language::from_extension("markdown"),
+            Some(Language::Markdown)
+        );
+        assert_eq!(Language::from_extension("mdx"), Some(Language::Markdown));
         assert_eq!(Language::from_extension(""), None);
     }
 
@@ -1298,6 +1321,7 @@ mod tests {
             Language::Yaml,
             Language::Toml,
             Language::Xml,
+            Language::Markdown,
         ] {
             let s = lang.as_str();
             assert_eq!(
@@ -1318,6 +1342,7 @@ mod tests {
         assert_eq!(Language::Yaml.as_str(), "yaml");
         assert_eq!(Language::Toml.as_str(), "toml");
         assert_eq!(Language::Xml.as_str(), "xml");
+        assert_eq!(Language::Markdown.as_str(), "markdown");
     }
 
     #[test]
@@ -1357,6 +1382,27 @@ mod tests {
         assert!(!Language::Rust.is_data_format());
         assert!(!Language::TypeScript.is_data_format());
         assert!(!Language::Python.is_data_format());
+        // Markdown is Phase-A-only but is prose, not a data/config format —
+        // it must stay out of is_data_format() (whose callers key skeleton
+        // text on "language path", wrong for prose) while still tripping
+        // is_phase_a_only() (whose callers gate Phase B dispatch).
+        assert!(!Language::Markdown.is_data_format());
+    }
+
+    #[test]
+    fn is_phase_a_only_covers_data_formats_and_markdown_not_code() {
+        for lang in [
+            Language::Json,
+            Language::Yaml,
+            Language::Toml,
+            Language::Xml,
+            Language::Markdown,
+        ] {
+            assert!(lang.is_phase_a_only(), "{lang:?} must be Phase-A-only");
+        }
+        for lang in [Language::Rust, Language::TypeScript, Language::Python] {
+            assert!(!lang.is_phase_a_only(), "{lang:?} must not be Phase-A-only");
+        }
     }
 
     // Regression: two symbols in different languages (same file path, same sig)

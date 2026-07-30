@@ -320,6 +320,37 @@ pub fn embed_texts_for_file(
     if !canon_abs.starts_with(canon_root) {
         return Vec::new();
     }
+    // Markdown doc-chunks have no tree-sitter grammar either — reconstruct
+    // embed text by re-running the pure, deterministic chunker fresh from
+    // disk and matching each chunk's re-derived NodeId back to the requested
+    // node. `markdown::chunk_markdown` is a pure function of file bytes, so
+    // this always agrees with the anchors baked into `nodes.signature` at
+    // index time without storing embed text anywhere. File-kind nodes are
+    // skipped: the plain `.md` file node deliberately gets no embed_text so
+    // `NODE_ELIGIBLE` keeps it out of the vector index (#376 §3.1).
+    if nodes.iter().any(|n| n.vname.language == "markdown") {
+        let Ok(text) = std::fs::read_to_string(&canon_abs) else {
+            return Vec::new();
+        };
+        let corpus = nodes[0].vname.corpus.as_str();
+        let mut by_id: std::collections::HashMap<travsr_core::NodeId, String> =
+            std::collections::HashMap::new();
+        for chunk in crate::markdown::chunk_markdown(&text, rel_path) {
+            let vname = travsr_core::VName::new(
+                corpus,
+                "",
+                rel_path,
+                "markdown",
+                format!("doc:{}", chunk.anchor),
+            );
+            by_id.insert(vname.id(), chunk.embed_text);
+        }
+        return nodes
+            .iter()
+            .filter(|n| n.kind == "doc-chunk")
+            .filter_map(|n| by_id.remove(&n.id).map(|text| (n.id, text)))
+            .collect();
+    }
     // Data formats have no tree-sitter grammar — emit path-based embed text directly.
     if nodes.iter().any(|n| {
         travsr_core::Language::from_str(n.vname.language.as_str())

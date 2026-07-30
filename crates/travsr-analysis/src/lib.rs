@@ -41,6 +41,9 @@ pub mod swift;
 // ── Data/config format parsers — Phase A only, no Phase B tool ───────────────
 pub mod data_format;
 
+// ── Prose parser — Phase A only, no Phase B tool (#376) ──────────────────────
+pub mod markdown;
+
 // ── Phase B call-site parsers ─────────────────────────────────────────────────
 pub mod phase_b_dart;
 pub mod phase_b_python;

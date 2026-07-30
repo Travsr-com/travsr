@@ -62,6 +62,14 @@ pub struct PluginIndexer {
     pub corpus: String,
     dispatcher: Dispatcher,
     cache: ParseCache,
+    /// Extra `docs.exclude` path-substring patterns (#376 §3.3), additive to
+    /// `travsr_analysis::markdown`'s built-in default exclusion list. Read
+    /// once from `TRAVSR_DOCS_EXCLUDE` (comma-separated) at construction —
+    /// same env-var-config convention as `TRAVSR_DISABLE_REGISTRY` elsewhere
+    /// in this crate's callers, chosen over threading a new travsr-config
+    /// dependency through `travsr-daemon` (which doesn't depend on it today)
+    /// for a single low-traffic override.
+    doc_excludes: Vec<String>,
 }
 
 impl PluginIndexer {
@@ -73,6 +81,7 @@ impl PluginIndexer {
             corpus,
             dispatcher,
             cache: ParseCache::new(),
+            doc_excludes: doc_excludes_from_env(),
         }
     }
 
@@ -106,15 +115,28 @@ impl PluginIndexer {
         {
             Some(r) => r,
             None => {
-                // Data formats have no sidecar plugin — fall back to the
-                // built-in Level 1 file-node emitter (Phase A only).
+                // Data formats and prose (#376) have no sidecar plugin — fall
+                // back to the built-in Level 1 emitters (Phase A only).
                 let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if Language::from_extension(ext).is_some_and(|l| l.is_data_format()) {
+                let lang = Language::from_extension(ext);
+                if lang.is_some_and(|l| l.is_data_format()) {
                     return travsr_analysis::data_format::parse(&corpus, abs_path, vname_path)
                         .map_err(|e| IndexError::Parse {
                             file: abs_path.display().to_string(),
                             message: e.to_string(),
                         });
+                }
+                if lang == Some(Language::Markdown) {
+                    return travsr_analysis::markdown::parse(
+                        &corpus,
+                        abs_path,
+                        vname_path,
+                        &self.doc_excludes,
+                    )
+                    .map_err(|e| IndexError::Parse {
+                        file: abs_path.display().to_string(),
+                        message: e.to_string(),
+                    });
                 }
                 return Ok(ParseOutput::default());
             }
@@ -122,6 +144,15 @@ impl PluginIndexer {
 
         self.cache.insert(key, resp.clone());
         Ok(response_to_output(resp))
+    }
+
+    /// Add extra path-substring patterns (`docs.exclude`, #376 §3.3) beyond
+    /// whatever `TRAVSR_DOCS_EXCLUDE` already supplied. Mainly for tests that
+    /// want a deterministic exclusion list independent of the process
+    /// environment.
+    pub fn with_doc_excludes(mut self, mut patterns: Vec<String>) -> Self {
+        self.doc_excludes.append(&mut patterns);
+        self
     }
 
     /// Phase B: semantic indexing for all registered languages.
@@ -832,6 +863,24 @@ impl PluginIndexer {
     }
 }
 
+/// Parse `TRAVSR_DOCS_EXCLUDE` (comma-separated path substrings, #376 §3.3)
+/// once per [`PluginIndexer`] construction. Empty/unset is the common case
+/// and yields an empty `Vec` — the built-in default exclusion list in
+/// `travsr_analysis::markdown` already does the heavy lifting; this only
+/// carries a user's *additional* patterns.
+fn doc_excludes_from_env() -> Vec<String> {
+    std::env::var("TRAVSR_DOCS_EXCLUDE")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,10 +915,11 @@ mod tests {
             Language::Yaml,
             Language::Toml,
             Language::Xml,
+            Language::Markdown,
         ];
         for v in variants {
-            if v.is_data_format() {
-                // Phase-A-only formats intentionally absent from the Phase B catalog.
+            if v.is_phase_a_only() {
+                // Phase-A-only formats/prose intentionally absent from the Phase B catalog.
                 continue;
             }
             assert!(
