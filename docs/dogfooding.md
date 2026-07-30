@@ -26,7 +26,7 @@ no-op timeout guard — install bubblewrap if you move to Linux in the future.
 
 ```bash
 # Option A — npm (downloads the prebuilt binary for your platform)
-npm install -g travsr
+npm install -g @travsr.com/travsr
 
 # Option B — build from source (requires Rust 1.75+)
 git clone https://github.com/raj-rkv/travsr.git

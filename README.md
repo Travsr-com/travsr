@@ -51,6 +51,25 @@ Restart Claude Desktop. Ask: *"Who calls PaymentService.charge?"*
 
 ---
 
+## Release channels
+
+Every release ships to three npm dist-tags. `^`-range installs never resolve to
+a pre-release, so `latest` is always what you get unless you opt in explicitly:
+
+```bash
+npm i -g @travsr.com/travsr@latest   # stable (default if you omit the tag)
+npm i -g @travsr.com/travsr@rc       # release candidate — final gates in flight
+npm i -g @travsr.com/travsr@beta     # earliest builds, opt-in testing only
+```
+
+A `beta` and its later-promoted `rc`/`latest` releases are byte-identical
+binaries — promotion re-publishes the same signed artifact under a new tag
+rather than rebuilding, so what you tested on `beta` is exactly what ships to
+`latest`. Every tarball is cosign-signed and SLSA-attested regardless of
+channel; see [SECURITY.md](SECURITY.md) for verification steps.
+
+---
+
 ## Multi-repo support
 
 Travsr maintains a global registry at `~/.travsr/registry.json`. Every

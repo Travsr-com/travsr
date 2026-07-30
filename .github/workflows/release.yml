@@ -1,18 +1,151 @@
 name: Release
 
+# Two entry points:
+#   1. push a tag        -> build fresh artifacts, sign, publish to the tag's channel.
+#   2. workflow_dispatch  -> promote an already-published channel's artifacts to the
+#                            next channel WITHOUT rebuilding (see the `promote` job).
+# Promotion reuses artifacts rather than rebuilding because Rust builds here are not
+# bit-reproducible across runs (runner image / cross toolchain drift) — rebuilding on
+# every promotion would mean "stable" is never actually the bits that were beta-tested.
+
 on:
   push:
     tags:
-      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      promote_from:
+        description: 'Existing release tag to promote (e.g. v0.12.0-beta.1)'
+        required: true
+      promote_to:
+        description: 'New tag to publish (e.g. v0.12.0-rc.1)'
+        required: true
 
 permissions:
   contents: write
-  id-token: write    # required for cosign keyless signing and SLSA provenance
-  attestations: write # required for actions/attest-build-provenance
+  id-token: write        # required for cosign keyless signing and SLSA provenance
+  attestations: write     # required for actions/attest-build-provenance
+  actions: read           # preflight: read check-run status on the tagged commit
+  checks: read            # preflight: read check-run status on the tagged commit
+  issues: write           # gate-fuzz: fuzz.yml files an issue on a crash
+  security-events: write  # gate-osv: osv-scanner-reusable.yml
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.promote_to || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  # ── Parse the tag (push) or promote_to (dispatch) into a channel ──────────
+  channel:
+    name: detect channel
+    runs-on: ubuntu-latest
+    outputs:
+      ref:         ${{ steps.d.outputs.ref }}
+      channel:     ${{ steps.d.outputs.channel }}
+      npm_tag:     ${{ steps.d.outputs.npm_tag }}
+      prerelease:  ${{ steps.d.outputs.prerelease }}
+      environment: ${{ steps.d.outputs.environment }}
+    steps:
+      - id: d
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REF="${{ github.event.inputs.promote_to }}"
+          else
+            REF="${{ github.ref_name }}"
+          fi
+          V="${REF#v}"
+          case "$V" in
+            *-beta.[0-9]*) CH=beta;   TAG=beta;   PRE=true;  ENV=release-beta ;;
+            *-rc.[0-9]*)   CH=rc;     TAG=rc;     PRE=true;  ENV=release-rc ;;
+            *-*)           echo "unsupported pre-release suffix: $V" >&2; exit 1 ;;
+            *)             CH=stable; TAG=latest; PRE=false; ENV=release ;;
+          esac
+          {
+            echo "ref=$REF"
+            echo "channel=$CH"
+            echo "npm_tag=$TAG"
+            echo "prerelease=$PRE"
+            echo "environment=$ENV"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── Push path only: guard rails before we build anything ───────────────────
+  verify-version:
+    name: verify tag matches travsr-cli and npm version
+    if: github.event_name == 'push'
+    needs: [channel]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag base version must equal travsr-cli and npm version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ needs.channel.outputs.ref }}"
+          BASE="${BASE#v}"
+          BASE="${BASE%%-*}"
+          CARGO=$(grep -m1 '^version = ' crates/travsr-cli/Cargo.toml | cut -d'"' -f2)
+          NPM=$(node -p "require('./packages/travsr-npm/package.json').version")
+          [ "$BASE" = "$CARGO" ] || { echo "tag base $BASE != crates/travsr-cli/Cargo.toml $CARGO" >&2; exit 1; }
+          [ "$BASE" = "$NPM" ]   || { echo "tag base $BASE != packages/travsr-npm/package.json $NPM" >&2; exit 1; }
+          echo "OK: tag base $BASE matches travsr-cli and npm versions"
+
+  preflight:
+    name: preflight (CI green on tagged commit)
+    if: github.event_name == 'push'
+    needs: [channel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - name: Required checks must be green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQUIRED=(
+            "rustfmt"
+            "clippy"
+            "test (ubuntu-latest)"
+            "test (macos-latest)"
+            "test (windows-latest)"
+            "lsif-ts (build + test)"
+            "MSRV (rust 1.75)"
+            "cargo-deny"
+            "plugin-hashes.lock"
+            "TL1/TL2 — zero LLM/embedding deps in travsr-mcp"
+            "Phase 2 correctness suite"
+            "Bench p95 < 50 ms"
+            "RBAC Leak Suite"
+            "criterion regression check"
+          )
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+            --jq '.check_runs[] | select(.conclusion == "success") | .name' > passed.txt
+          MISSING=0
+          for name in "${REQUIRED[@]}"; do
+            if ! grep -qxF "$name" passed.txt; then
+              echo "MISSING/FAILED required check: $name"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "One or more required checks are not green on ${GITHUB_SHA}. A release tag must point at a commit where CI already passed on master/main." >&2
+            exit 1
+          fi
+          echo "OK: all required checks green on ${GITHUB_SHA}"
+
+  # ── Push path only: build, sign, publish fresh artifacts ───────────────────
   build:
     name: build (${{ matrix.artifact }})
+    if: github.event_name == 'push'
+    needs: [channel, verify-version, preflight]
     strategy:
       fail-fast: false
       matrix:
@@ -136,9 +269,11 @@ jobs:
 
   publish:
     name: publish
-    needs: [build]
+    if: github.event_name == 'push'
+    needs: [channel, build]
     runs-on: ubuntu-latest
-    environment: release
+    environment:
+      name: ${{ needs.channel.outputs.environment }}
     permissions:
       contents: write
       id-token: write
@@ -169,6 +304,8 @@ jobs:
             dist/*.bundle
             SHA256SUMS
           generate_release_notes: true
+          prerelease: ${{ needs.channel.outputs.prerelease }}
+          make_latest: ${{ needs.channel.outputs.channel == 'stable' }}
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -180,9 +317,207 @@ jobs:
         working-directory: packages/travsr-npm
         run: npm ci --ignore-scripts
 
+      - name: Set npm version from tag
+        working-directory: packages/travsr-npm
+        run: npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
+
       - name: Publish npm wrapper (OIDC trusted publishing)
         working-directory: packages/travsr-npm
         # --provenance attaches a Sigstore-verifiable build provenance attestation
         # to the published tarball; OIDC auth + provenance is the npm-recommended
-        # publishing posture for CI.
-        run: npm publish --access public --provenance
+        # publishing posture for CI. --tag routes the version to the channel's
+        # npm dist-tag instead of the registry default (latest).
+        run: npm publish --access public --provenance --tag "${{ needs.channel.outputs.npm_tag }}"
+
+  # ── Promotion gates: reused CI suites, required past beta / into stable ───
+  gate-fuzz:
+    name: "gate: fuzz suite"
+    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel != 'beta'
+    needs: [channel]
+    uses: ./.github/workflows/fuzz.yml
+
+  gate-osv:
+    name: "gate: OSV scan"
+    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel != 'beta'
+    needs: [channel]
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/osv-scan.yml
+
+  gate-accuracy:
+    name: "gate: accuracy nightly"
+    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel != 'beta'
+    needs: [channel]
+    uses: ./.github/workflows/accuracy-nightly.yml
+
+  gate-ab-eval:
+    name: "gate: A/B eval"
+    if: github.event_name == 'workflow_dispatch' && needs.channel.outputs.channel == 'stable'
+    needs: [channel]
+    uses: ./.github/workflows/ab-eval.yml
+
+  # ── Dispatch path only: promote a channel's artifacts, no rebuild ──────────
+  promote:
+    name: promote (reuse signed artifacts)
+    if: |
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      needs.channel.result == 'success' &&
+      (needs.gate-fuzz.result == 'success' || needs.gate-fuzz.result == 'skipped') &&
+      (needs.gate-osv.result == 'success' || needs.gate-osv.result == 'skipped') &&
+      (needs.gate-accuracy.result == 'success' || needs.gate-accuracy.result == 'skipped') &&
+      (needs.gate-ab-eval.result == 'success' || needs.gate-ab-eval.result == 'skipped')
+    needs: [channel, gate-fuzz, gate-osv, gate-accuracy, gate-ab-eval]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.channel.outputs.environment }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download source release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          gh release download "${{ github.event.inputs.promote_from }}" -D src \
+            --pattern '*.tar.gz' --pattern '*.bundle' --pattern 'SHA256SUMS'
+
+      - name: Rename assets to the target tag and regenerate SHA256SUMS
+        # Renaming does not touch signed content: cosign signs the blob's digest,
+        # not its filename, and the digests themselves are unchanged by this step.
+        shell: bash
+        run: |
+          set -euo pipefail
+          FROM="${{ github.event.inputs.promote_from }}"
+          TO="${{ github.event.inputs.promote_to }}"
+          mkdir -p dist
+          shopt -s nullglob
+          for f in "src/travsr-${FROM}-"*.tar.gz "src/travsr-${FROM}-"*.tar.gz.bundle; do
+            base="$(basename "$f")"
+            cp "$f" "dist/${base/travsr-$FROM-/travsr-$TO-}"
+          done
+          (cd dist && sha256sum *.tar.gz > ../SHA256SUMS)
+
+      - name: Assert promoted tarballs are bit-identical to the source release
+        shell: bash
+        run: |
+          set -euo pipefail
+          FROM="${{ github.event.inputs.promote_from }}"
+          TO="${{ github.event.inputs.promote_to }}"
+          for t in dist/*.tar.gz; do
+            name="$(basename "$t")"
+            orig="src/${name/travsr-$TO-/travsr-$FROM-}"
+            new_hash=$(sha256sum "$t" | cut -d' ' -f1)
+            old_hash=$(sha256sum "$orig" | cut -d' ' -f1)
+            if [ "$new_hash" != "$old_hash" ]; then
+              echo "PROMOTION ABORTED: $name digest differs from $FROM" >&2
+              exit 1
+            fi
+          done
+          echo "OK: all promoted tarballs match ${FROM} byte-for-byte"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify reused signatures still validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in dist/*.tar.gz; do
+            cosign verify-blob --bundle "${t}.bundle" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp 'https://github.com/Travsr-com/travsr/.github/workflows/release.yml' \
+              "$t"
+          done
+
+      - name: Create the promoted tag on the same commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          FROM="${{ github.event.inputs.promote_from }}"
+          TO="${{ github.event.inputs.promote_to }}"
+          SHA=$(git rev-list -n1 "$FROM")
+          git tag "$TO" "$SHA"
+          # Pushed via the default GITHUB_TOKEN: GitHub does not start new
+          # workflow runs for events triggered by that token, so this tag push
+          # does NOT re-enter the `push: tags:` build path. Promotion never rebuilds.
+          git push origin "$TO"
+
+      - name: Create promoted GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.promote_to }}
+          files: |
+            dist/*.tar.gz
+            dist/*.bundle
+            SHA256SUMS
+          generate_release_notes: true
+          prerelease: ${{ needs.channel.outputs.prerelease }}
+          make_latest: ${{ needs.channel.outputs.channel == 'stable' }}
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install npm dependencies
+        working-directory: packages/travsr-npm
+        run: npm ci --ignore-scripts
+
+      - name: Set npm version to the promoted tag
+        working-directory: packages/travsr-npm
+        run: npm version --no-git-tag-version --allow-same-version "$(echo "${{ github.event.inputs.promote_to }}" | sed 's/^v//')"
+
+      - name: Publish npm wrapper under the target channel's dist-tag
+        working-directory: packages/travsr-npm
+        run: npm publish --access public --provenance --tag "${{ needs.channel.outputs.npm_tag }}"
+
+  # ── Distribution smoke test: the actual "testing environment" a channel feeds ──
+  smoke:
+    name: smoke install (${{ matrix.os }})
+    if: |
+      always() &&
+      (needs.publish.result == 'success' || needs.promote.result == 'success')
+    needs: [channel, publish, promote]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install cosign (so postinstall takes the verify path, not the degraded one)
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install travsr from the ${{ needs.channel.outputs.npm_tag }} channel
+        shell: bash
+        run: npm i -g "@travsr.com/travsr@${{ needs.channel.outputs.npm_tag }}"
+
+      - name: Verify binary runs
+        shell: bash
+        run: travsr --version
+
+      - name: Smoke test travsr init
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir smoke-repo && cd smoke-repo
+          git init -q
+          git -c user.email=ci@travsr.com -c user.name=ci commit --allow-empty -q -m init
+          travsr init

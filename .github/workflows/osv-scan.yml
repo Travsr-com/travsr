@@ -7,6 +7,7 @@ on:
   schedule:
     - cron: '0 3 * * *'   # 03:00 UTC daily
   workflow_dispatch:        # manual trigger from GitHub Actions UI
+  workflow_call:            # invoked as a release-promotion gate by release.yml
 
 permissions:
   contents: read
