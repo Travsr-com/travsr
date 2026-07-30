@@ -70,6 +70,7 @@ identity is the GitHub Actions OIDC token issued for this repository's
 
 ```sh
 # Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/
+# Works the same for any channel — stable (0.12.0), rc (0.12.0-rc.1), or beta (0.12.0-beta.1).
 VERSION=0.3.0
 TARGET=x86_64-unknown-linux-gnu
 
@@ -97,6 +98,9 @@ gh attestation verify "travsr-v${VERSION}-${TARGET}.tar.gz" \
 
 ### npm postinstall
 
-The `travsr` npm package automatically verifies the cosign signature during
-`npm install` if `cosign` is installed on the host. If cosign is not present,
-installation falls back to SHA256 verification only with a warning.
+The `@travsr.com/travsr` npm package automatically verifies the cosign signature
+during `npm install` if `cosign` is installed on the host. If cosign is not
+present, installation falls back to SHA256 verification only with a warning.
+This applies to every channel — `npm i -g @travsr.com/travsr@beta` and `@rc`
+verify identically to `@latest`, since beta/rc/stable reuse the same signed
+artifact rather than each being signed separately.

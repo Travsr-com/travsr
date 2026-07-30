@@ -14,6 +14,7 @@ on:
   schedule:
     - cron: '45 2 * * *'   # 02:45 UTC every day (after the accuracy nightly)
   workflow_dispatch:        # manual trigger from GitHub Actions UI
+  workflow_call:            # invoked as a release-promotion gate by release.yml
 
 permissions:
   contents: read

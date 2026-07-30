@@ -6,6 +6,8 @@ on:
     - cron: '0 2 * * *'
   # Manual trigger for ad-hoc runs (e.g. after changing a parser).
   workflow_dispatch:
+  # Invoked as a release-promotion gate by release.yml (beta -> rc and beyond).
+  workflow_call:
 
 permissions:
   contents: read

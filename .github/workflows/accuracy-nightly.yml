@@ -15,6 +15,7 @@ on:
   schedule:
     - cron: '30 2 * * *'   # 02:30 UTC every day
   workflow_dispatch:        # manual trigger from GitHub Actions UI
+  workflow_call:            # invoked as a release-promotion gate by release.yml
 
 permissions:
   contents: read
