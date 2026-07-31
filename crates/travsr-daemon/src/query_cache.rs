@@ -1,21 +1,30 @@
 //! In-daemon LRU result cache for read-only CLI queries (#318 O2).
 //!
-//! Keyed by `(tool, args, last_commit, phase_b_commit, data_version)`. The git
-//! commit hook advances `last_commit` and the background Phase B pass advances
-//! `phase_b_commit` (#318 O3); `data_version` is SQLite's `PRAGMA data_version`
-//! as seen by the daemon's read connection, which increments on *any* write to
-//! `graph.db` from another connection — including out-of-band writers such as
-//! `travsr fsck --fix` that never touch the commit markers (#464). Together,
-//! any graph mutation changes the key. That makes invalidation structural:
-//! stale entries simply stop matching and age out via LRU eviction — there is
-//! no explicit `invalidate()` to forget to call on a mutation path.
+//! Keyed by `(tool, args, last_commit, phase_b_commit, data_version,
+//! embed_data_version)`. The git commit hook advances `last_commit` and the
+//! background Phase B pass advances `phase_b_commit` (#318 O3); `data_version`
+//! is SQLite's `PRAGMA data_version` as seen by the daemon's read connection,
+//! which increments on *any* write to `graph.db` from another connection —
+//! including out-of-band writers such as `travsr fsck --fix` that never touch
+//! the commit markers (#464). `embed_data_version` is the same pragma on the
+//! sibling `embed.db`: `ask` results depend on stored embeddings (KNN +
+//! RFC-019 cosine oracle), and an embed reindex rewrites embed.db without any
+//! graph.db write, so graph state alone cannot see it. The daemon passes
+//! `None` both while no embed.db exists and for tools that never read
+//! embed.db (`graph`, `status`), so the embed sidecar's batched writes cannot
+//! thrash entries that don't depend on them.
+//! Together, any graph or embed mutation changes the key. That makes
+//! invalidation structural: stale entries simply stop matching and age out via
+//! LRU eviction — there is no explicit `invalidate()` to forget to call on a
+//! mutation path.
 //!
 //! The cache is not thread-safe on its own; the daemon wraps it in a `Mutex`.
 
 use std::collections::HashMap;
 
 /// Cache key: the query identity plus the markers that bound graph freshness —
-/// the two commit markers and the read connection's SQLite `data_version`.
+/// the two commit markers and the SQLite `data_version` of graph.db and
+/// embed.db as seen by the daemon's persistent read connections.
 ///
 /// `args` is the canonical JSON serialization of the query args. A
 /// `serde_json::Value` object serializes its keys in sorted (`BTreeMap`) order,
@@ -28,6 +37,11 @@ struct CacheKey {
     last_commit: String,
     phase_b_commit: String,
     data_version: u64,
+    /// `None` while no embed.db exists (FTS-only mode) and for tools that
+    /// never read embed.db; `Some(version)` for embed-dependent tools once the
+    /// sidecar has created it. The two states must not collide, so this stays
+    /// an `Option` rather than a sentinel value.
+    embed_data_version: Option<u64>,
 }
 
 /// Bounded LRU over serialized query results.
@@ -58,6 +72,7 @@ impl QueryCache {
         last_commit: &str,
         phase_b_commit: &str,
         data_version: u64,
+        embed_data_version: Option<u64>,
     ) -> CacheKey {
         CacheKey {
             tool: tool.to_string(),
@@ -65,6 +80,7 @@ impl QueryCache {
             last_commit: last_commit.to_string(),
             phase_b_commit: phase_b_commit.to_string(),
             data_version,
+            embed_data_version,
         }
     }
 
@@ -76,8 +92,16 @@ impl QueryCache {
         last_commit: &str,
         phase_b_commit: &str,
         data_version: u64,
+        embed_data_version: Option<u64>,
     ) -> Option<serde_json::Value> {
-        let k = Self::key(tool, args, last_commit, phase_b_commit, data_version);
+        let k = Self::key(
+            tool,
+            args,
+            last_commit,
+            phase_b_commit,
+            data_version,
+            embed_data_version,
+        );
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         let entry = self.entries.get_mut(&k)?;
@@ -94,9 +118,17 @@ impl QueryCache {
         last_commit: &str,
         phase_b_commit: &str,
         data_version: u64,
+        embed_data_version: Option<u64>,
         value: serde_json::Value,
     ) {
-        let k = Self::key(tool, args, last_commit, phase_b_commit, data_version);
+        let k = Self::key(
+            tool,
+            args,
+            last_commit,
+            phase_b_commit,
+            data_version,
+            embed_data_version,
+        );
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         self.entries.insert(k, (value, tick));
@@ -131,10 +163,10 @@ mod tests {
     fn hit_after_put_same_key() {
         let mut c = QueryCache::new(8);
         let args = json!({"seed": "Foo", "direction": "both"});
-        assert!(c.get("graph", &args, "abc", "abc", 1).is_none());
-        c.put("graph", &args, "abc", "abc", 1, json!({"nodes": 3}));
+        assert!(c.get("graph", &args, "abc", "abc", 1, None).is_none());
+        c.put("graph", &args, "abc", "abc", 1, None, json!({"nodes": 3}));
         assert_eq!(
-            c.get("graph", &args, "abc", "abc", 1),
+            c.get("graph", &args, "abc", "abc", 1, None),
             Some(json!({"nodes": 3}))
         );
     }
@@ -150,10 +182,11 @@ mod tests {
             "c1",
             "c1",
             1,
+            None,
             json!("hit"),
         );
         assert_eq!(
-            c.get("graph", &json!({"b": 2, "a": 1}), "c1", "c1", 1),
+            c.get("graph", &json!({"b": 2, "a": 1}), "c1", "c1", 1, None),
             Some(json!("hit"))
         );
     }
@@ -164,16 +197,19 @@ mod tests {
         // Phase B) must miss — structural invalidation.
         let mut c = QueryCache::new(8);
         let args = json!({"seed": "Foo"});
-        c.put("graph", &args, "c1", "p1", 1, json!("old"));
+        c.put("graph", &args, "c1", "p1", 1, None, json!("old"));
         assert!(
-            c.get("graph", &args, "c2", "p1", 1).is_none(),
+            c.get("graph", &args, "c2", "p1", 1, None).is_none(),
             "last_commit moved"
         );
         assert!(
-            c.get("graph", &args, "c1", "p2", 1).is_none(),
+            c.get("graph", &args, "c1", "p2", 1, None).is_none(),
             "phase_b moved"
         );
-        assert_eq!(c.get("graph", &args, "c1", "p1", 1), Some(json!("old")));
+        assert_eq!(
+            c.get("graph", &args, "c1", "p1", 1, None),
+            Some(json!("old"))
+        );
     }
 
     #[test]
@@ -183,14 +219,37 @@ mod tests {
         // commit marker — the cached entry must stop matching.
         let mut c = QueryCache::new(8);
         let args = json!({"query": "isPrime"});
-        c.put("ask", &args, "c1", "p1", 1, json!("pre-delete"));
+        c.put("ask", &args, "c1", "p1", 1, None, json!("pre-delete"));
         assert!(
-            c.get("ask", &args, "c1", "p1", 2).is_none(),
+            c.get("ask", &args, "c1", "p1", 2, None).is_none(),
             "data_version moved"
         );
         assert_eq!(
-            c.get("ask", &args, "c1", "p1", 1),
+            c.get("ask", &args, "c1", "p1", 1, None),
             Some(json!("pre-delete"))
+        );
+    }
+
+    #[test]
+    fn embed_data_version_advance_misses() {
+        // #464 follow-up: an embed reindex rewrites embed.db without any
+        // graph.db write — commit markers and graph data_version are all
+        // unchanged, so only the embed component can invalidate the entry.
+        let mut c = QueryCache::new(8);
+        let args = json!({"query": "isPrime"});
+        c.put("ask", &args, "c1", "p1", 1, Some(7), json!("old embeddings"));
+        assert!(
+            c.get("ask", &args, "c1", "p1", 1, Some(8)).is_none(),
+            "embed data_version moved"
+        );
+        // embed.db appearing where there was none is also a state change.
+        assert!(
+            c.get("ask", &args, "c1", "p1", 1, None).is_none(),
+            "Some(v) vs None must not collide"
+        );
+        assert_eq!(
+            c.get("ask", &args, "c1", "p1", 1, Some(7)),
+            Some(json!("old embeddings"))
         );
     }
 
@@ -200,20 +259,20 @@ mod tests {
         let a = json!({"k": "a"});
         let b = json!({"k": "b"});
         let d = json!({"k": "d"});
-        c.put("graph", &a, "c", "c", 1, json!(1));
-        c.put("graph", &b, "c", "c", 1, json!(2));
+        c.put("graph", &a, "c", "c", 1, None, json!(1));
+        c.put("graph", &b, "c", "c", 1, None, json!(2));
         // Touch `a` so `b` becomes the LRU victim.
-        assert!(c.get("graph", &a, "c", "c", 1).is_some());
-        c.put("graph", &d, "c", "c", 1, json!(3));
+        assert!(c.get("graph", &a, "c", "c", 1, None).is_some());
+        c.put("graph", &d, "c", "c", 1, None, json!(3));
         assert_eq!(c.len(), 2);
         assert!(
-            c.get("graph", &b, "c", "c", 1).is_none(),
+            c.get("graph", &b, "c", "c", 1, None).is_none(),
             "b should be evicted"
         );
         assert!(
-            c.get("graph", &a, "c", "c", 1).is_some(),
+            c.get("graph", &a, "c", "c", 1, None).is_some(),
             "a was kept (recent)"
         );
-        assert!(c.get("graph", &d, "c", "c", 1).is_some(), "d is newest");
+        assert!(c.get("graph", &d, "c", "c", 1, None).is_some(), "d is newest");
     }
 }

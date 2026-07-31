@@ -644,6 +644,13 @@ pub struct SqliteStore {
     /// in-memory stores. Used by `embed_progress` to ATTACH embed.db and count
     /// embedded nodes without polluting the graph.db WAL with embedding BLOBs.
     embed_db_path: Option<std::path::PathBuf>,
+    /// #464 follow-up: persistent read-only connection to the sibling embed.db,
+    /// lazily opened on first [`Self::embed_data_version`] call. Persistent
+    /// because `PRAGMA data_version` only moves relative to prior reads on the
+    /// SAME connection — a fresh connection per call would never observe a
+    /// change. `RefCell` keeps the lazy open behind `&self`; the store is not
+    /// `Sync` anyway (callers wrap it in a `Mutex`).
+    embed_meta_conn: std::cell::RefCell<Option<Connection>>,
 }
 
 impl Drop for SqliteStore {
@@ -673,6 +680,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
+                embed_meta_conn: std::cell::RefCell::new(None),
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -736,6 +744,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
+                embed_meta_conn: std::cell::RefCell::new(None),
             };
             let current = store
                 .schema_version()
@@ -763,6 +772,7 @@ impl SqliteStore {
                 embed_score_hook: None,
                 embed_readiness: None,
                 embed_db_path: None,
+                embed_meta_conn: std::cell::RefCell::new(None),
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -1012,6 +1022,48 @@ impl SqliteStore {
             .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
             .context("querying data_version")
             .map(|v| v as u64)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Return `PRAGMA data_version` of the sibling `embed.db`, or `Ok(None)`
+    /// when no embed.db exists (FTS-only mode — there is no embed state to
+    /// version).
+    ///
+    /// `ask` results depend on embed.db (KNN + RFC-019 cosine oracle), which
+    /// the embed sidecar rewrites without ever touching graph.db — so
+    /// graph.db's [`Self::data_version`] alone cannot invalidate cached `ask`
+    /// answers after a `travsr embed reindex`. The daemon's query cache keys
+    /// on this value alongside the graph one (#464 follow-up).
+    ///
+    /// The pragma is read on a persistent, lazily-opened read-only connection:
+    /// `data_version` only moves relative to prior reads on the SAME
+    /// connection. If embed.db disappears after the connection was opened, the
+    /// connection is dropped and `Ok(None)` is returned, so a later re-created
+    /// embed.db is picked up with a fresh connection.
+    pub fn embed_data_version(&self) -> Result<Option<u64>, StoreError> {
+        let Some(path) = self.embed_db_path.as_deref() else {
+            return Ok(None); // in-memory store — no embed sidecar
+        };
+        let mut slot = self.embed_meta_conn.borrow_mut();
+        if !path.exists() {
+            *slot = None;
+            return Ok(None);
+        }
+        if slot.is_none() {
+            let conn = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .with_context(|| format!("opening embed.db read-only at {}", path.display()))
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+            *slot = Some(conn);
+        }
+        slot.as_ref()
+            .expect("embed_meta_conn initialized above")
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .context("querying embed.db data_version")
+            .map(|v| Some(v as u64))
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -5173,6 +5225,48 @@ mod tests {
         let embed_db = tmp.path().join("nope.db");
         let out = score_candidates(&[1.0, 0.0], &embed_db, "m", &[NodeId(1)]).unwrap();
         assert!(out.is_empty(), "absent embed.db → empty, degrades to FTS");
+    }
+
+    /// #464 follow-up: embed.db writes must be observable through the store's
+    /// persistent embed metadata connection so the daemon's query cache can
+    /// key `ask` results on embed state, not just graph.db.
+    #[test]
+    fn embed_data_version_tracks_out_of_band_embed_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("graph.db")).unwrap();
+
+        // No embed.db yet (FTS-only) → None, not an error.
+        assert_eq!(store.embed_data_version().unwrap(), None);
+
+        // The sidecar creates embed.db out-of-band.
+        let embed_db = tmp.path().join("embed.db");
+        let writer = Connection::open(&embed_db).unwrap();
+        writer
+            .execute_batch("CREATE TABLE node_embeddings (node_id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let v1 = store
+            .embed_data_version()
+            .unwrap()
+            .expect("embed.db now exists");
+
+        // A write from another connection (the sidecar) must bump the version
+        // seen by the store's persistent read connection.
+        writer
+            .execute("INSERT INTO node_embeddings VALUES (1)", [])
+            .unwrap();
+        let v2 = store
+            .embed_data_version()
+            .unwrap()
+            .expect("embed.db still exists");
+        assert_ne!(v1, v2, "sidecar write must bump embed data_version");
+
+        // No intervening write → the version is stable, so cached entries
+        // keyed on it keep hitting.
+        assert_eq!(
+            store.embed_data_version().unwrap(),
+            Some(v2),
+            "stable when unchanged"
+        );
     }
 
     #[test]

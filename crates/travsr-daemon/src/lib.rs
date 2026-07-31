@@ -1871,18 +1871,26 @@ fn run_background_phase_b(
     store: &std::sync::Mutex<SqliteStore>,
     sched: &phase_b_sched::PhaseBScheduler,
 ) {
-    // Delegate to an inner fn so we can capture its bool result and always call
-    // finish_with_result, even on early returns — without unsafe raw pointers.
-    let succeeded = run_background_phase_b_inner(repo_root, store);
-    sched.finish_with_result(succeeded);
+    // Delegate to an inner fn so we can capture its outcome and always call
+    // finish_with_outcome, even on early returns — without unsafe raw pointers.
+    let outcome = run_background_phase_b_inner(repo_root, store);
+    sched.finish_with_outcome(outcome);
 }
 
 /// Inner worker for [`run_background_phase_b`].
 ///
-/// Returns `true` when at least some semantic work succeeded (LSIF edges
-/// produced, or ≥1 sidecar ran without crashing). `false` means every sidecar
-/// crashed, which increments the retry-cap counter in `PhaseBScheduler`.
-fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<SqliteStore>) -> bool {
+/// Returns [`Success`](phase_b_sched::RunOutcome::Success) when no language
+/// crashed (`phase_b_commit` advanced, or was already fresh),
+/// [`Partial`](phase_b_sched::RunOutcome::Partial) when some semantic work
+/// succeeded but ≥1 sidecar crashed (the marker did NOT advance, so the
+/// scheduler applies its partial-crash back-off instead of re-running every
+/// tick), and [`AllCrashed`](phase_b_sched::RunOutcome::AllCrashed) when every
+/// sidecar crashed, which increments the retry-cap counter in
+/// `PhaseBScheduler`.
+fn run_background_phase_b_inner(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+) -> phase_b_sched::RunOutcome {
     // Brief lock: read the corpus and the two freshness markers. Bail early if
     // the semantic data already matches HEAD (e.g. a commit touched no indexed
     // files, or another run already caught up).
@@ -1898,7 +1906,7 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         if last.is_empty() || last == phase_b {
             // Already up to date — not a failure, treat as success so the
             // retry counter is not incremented.
-            return true;
+            return phase_b_sched::RunOutcome::Success;
         }
         (corpus, last)
     };
@@ -1959,13 +1967,24 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         let _ = s.set_meta("phase_b_commit", &target_sha);
     }
 
-    let succeeded = !report.ran.is_empty() || !lsif_edges.is_empty() || report.crashed.is_empty();
+    let outcome = if report.crashed.is_empty() {
+        phase_b_sched::RunOutcome::Success
+    } else if !report.ran.is_empty() || !lsif_edges.is_empty() {
+        // phase_b_commit stayed behind (C4) so the tick will re-arm; the
+        // scheduler's partial-crash back-off throttles the retries so they
+        // cannot thrash graph.db and the warm query cache (#464 follow-up).
+        phase_b_sched::RunOutcome::Partial
+    } else {
+        phase_b_sched::RunOutcome::AllCrashed
+    };
+    let succeeded = outcome != phase_b_sched::RunOutcome::AllCrashed;
 
     tracing::info!(
         commit = %target_sha,
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
         crashed = report.crashed.len(),
+        outcome = ?outcome,
         "background phase B refresh complete"
     );
 
@@ -2017,7 +2036,7 @@ fn run_background_phase_b_inner(repo_root: &Path, store: &std::sync::Mutex<Sqlit
         }
     }
 
-    succeeded
+    outcome
 }
 
 /// Re-index a set of changed files into `store`.
@@ -3175,19 +3194,20 @@ mod tests {
                     .ok()
                     .flatten()
                     .unwrap_or_default(),
-                s.data_version().unwrap_or(0),
+                s.data_version().unwrap(),
+                s.embed_data_version().unwrap(),
             )
         };
 
         let args = serde_json::json!({ "query": "isPrime" });
-        let (last, pb, dv) = markers(&read_store);
+        let (last, pb, dv, edv) = markers(&read_store);
         let warm = run_query(&read_store, "ask", args.clone()).unwrap();
         assert_eq!(
             warm["matched"],
             serde_json::json!(true),
             "pre-delete ask must hit"
         );
-        cache.put("ask", &args, &last, &pb, dv, warm.clone());
+        cache.put("ask", &args, &last, &pb, dv, edv, warm.clone());
 
         // Out-of-band repair: delete the file on disk, then fsck --fix from a
         // separate connection — exactly the reproduction in #464.
@@ -3196,12 +3216,12 @@ mod tests {
         assert_eq!(report.ghost_paths, vec!["prime.ts".to_string()]);
 
         // Commit markers did not move…
-        let (last2, pb2, dv2) = markers(&read_store);
+        let (last2, pb2, dv2, edv2) = markers(&read_store);
         assert_eq!((last.as_str(), pb.as_str()), (last2.as_str(), pb2.as_str()));
         // …but data_version did, so the cached pre-delete entry stops matching.
         assert_ne!(dv, dv2, "out-of-band write must bump data_version");
         assert!(
-            cache.get("ask", &args, &last2, &pb2, dv2).is_none(),
+            cache.get("ask", &args, &last2, &pb2, dv2, edv2).is_none(),
             "stale warm-cache entry must not be served after fsck --fix"
         );
         // A fresh query through the same warm read connection sees the deletion.
@@ -4045,32 +4065,64 @@ fn handle_control_message(
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            // #464: also key on the read connection's SQLite data_version so
-            // out-of-band graph.db writers (fsck --fix, manual sqlite3) that
-            // never bump the commit markers still invalidate cached results.
-            // Read once and reuse for the put: if the DB changes mid-query, the
+            // #464: also key on the SQLite data_version of graph.db (and of
+            // the sibling embed.db, which `ask` depends on) so out-of-band
+            // writers (fsck --fix, manual sqlite3, embed reindex) that never
+            // bump the commit markers still invalidate cached results.
+            // Read once and reuse for the put: if a DB changes mid-query, the
             // entry is stamped with the pre-change version and simply stops
             // matching on the next lookup — conservative, never stale.
-            let data_version = s.data_version().unwrap_or(0);
-            {
+            // On a pragma failure the cache is bypassed entirely (no lookup,
+            // no store) rather than collapsing to a sentinel value: a sentinel
+            // could collide across two consecutive errors bracketing a
+            // mutation and serve one stale hit.
+            // Only `ask` reads embed.db (KNN + RFC-019 cosine oracle) — keying
+            // graph/status entries on embed state would let the embed
+            // sidecar's batched reindex writes thrash unrelated cache entries.
+            let embed_version = if tool == "ask" {
+                s.embed_data_version()
+            } else {
+                Ok(None)
+            };
+            let versions = match (s.data_version(), embed_version) {
+                (Ok(graph), Ok(embed)) => Some((graph, embed)),
+                (graph, embed) => {
+                    let err = graph
+                        .err()
+                        .map(|e| e.to_string())
+                        .or_else(|| embed.err().map(|e| e.to_string()))
+                        .unwrap_or_default();
+                    tracing::warn!(error = %err, "data_version pragma failed — bypassing query cache");
+                    None
+                }
+            };
+            if let Some((data_version, embed_data_version)) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(cached) =
-                    c.get(&tool, &args, &last_commit, &phase_b_commit, data_version)
-                {
+                if let Some(cached) = c.get(
+                    &tool,
+                    &args,
+                    &last_commit,
+                    &phase_b_commit,
+                    data_version,
+                    embed_data_version,
+                ) {
                     return (ControlResponse::query_result(cached), false);
                 }
             }
             match run_query(&s, &tool, args.clone()) {
                 Ok(value) => {
-                    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-                    c.put(
-                        &tool,
-                        &args,
-                        &last_commit,
-                        &phase_b_commit,
-                        data_version,
-                        value.clone(),
-                    );
+                    if let Some((data_version, embed_data_version)) = versions {
+                        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+                        c.put(
+                            &tool,
+                            &args,
+                            &last_commit,
+                            &phase_b_commit,
+                            data_version,
+                            embed_data_version,
+                            value.clone(),
+                        );
+                    }
                     (ControlResponse::query_result(value), false)
                 }
                 Err(e) => (ControlResponse::err(format!("query failed: {e:#}")), false),
