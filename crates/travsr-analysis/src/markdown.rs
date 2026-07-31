@@ -130,6 +130,31 @@ pub struct Chunk {
 
 // ── Exclusions (§3.3) ────────────────────────────────────────────────────────
 
+/// Substring match for a directory-scoped exclusion pattern (one ending in
+/// `/`), anchored to a path-segment boundary on **both** ends: the character
+/// before the match must be `/` or start-of-string, matching the trailing
+/// `/` already in `pattern`. Plain [`str::contains`] only anchors the
+/// trailing side, so `"api/"` would also match inside `"cri-api/"` or
+/// `"downwardapi/"` — real kubernetes directories, not the generated-OpenAPI-
+/// reference `api/` the pattern is meant to catch. Patterns with no trailing
+/// `/` (filename substrings like `"pull_request_template"`) are unambiguous
+/// without this and fall through to a plain substring check.
+fn contains_path_segment(lower: &str, pattern: &str) -> bool {
+    if !pattern.ends_with('/') {
+        return lower.contains(pattern);
+    }
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(pattern) {
+        let abs = from + pos;
+        if abs == 0 || bytes[abs - 1] == b'/' {
+            return true;
+        }
+        from = abs + 1;
+    }
+    false
+}
+
 /// Default filename/path exclusions. Bench-measured to remove 93.3% of doc
 /// bytes on kubernetes (mostly `CHANGELOG/`) and 12.2% on travsr, both with
 /// near-zero decision-relevant content. Excluded files still get their `file`
@@ -162,11 +187,12 @@ fn is_excluded(vname_path: &str, extra: &[String]) -> bool {
         return true;
     }
 
-    // Directory-scoped patterns. Trailing "/" anchors each to a path segment
-    // boundary so e.g. "reference/" doesn't also (mostly) fire on unrelated
-    // segments; ".app/" specifically catches downloaded app bundles vendored
-    // into a repo (travsr's own worst false-positive hit was a VS Code.app
-    // SKILL.md dragged in by `.vscode-test/`).
+    // Directory-scoped patterns, matched via `contains_path_segment` so the
+    // trailing "/" anchors each to a real path-segment boundary — "api/"
+    // fires on "pkg/api/README.md" but not "cri-api/README.md" or
+    // "downwardapi/README.md". ".app/" specifically catches downloaded app
+    // bundles vendored into a repo (travsr's own worst false-positive hit
+    // was a VS Code.app SKILL.md dragged in by `.vscode-test/`).
     const EXCLUDED_PATH_SUBSTRINGS: &[&str] = &[
         "changelog/",
         "pull_request_template",
@@ -178,13 +204,16 @@ fn is_excluded(vname_path: &str, extra: &[String]) -> bool {
         ".app/",
         "bench/",
     ];
-    if EXCLUDED_PATH_SUBSTRINGS.iter().any(|p| lower.contains(p)) {
+    if EXCLUDED_PATH_SUBSTRINGS
+        .iter()
+        .any(|p| contains_path_segment(&lower, p))
+    {
         return true;
     }
 
     extra
         .iter()
-        .any(|p| !p.is_empty() && lower.contains(p.to_lowercase().as_str()))
+        .any(|p| !p.is_empty() && contains_path_segment(&lower, p.to_lowercase().as_str()))
 }
 
 fn strip_bom(text: &str) -> &str {
@@ -1218,6 +1247,24 @@ mod tests {
     #[test]
     fn ordinary_doc_is_not_excluded() {
         assert!(!is_excluded("docs/rfcs/RFC-012-plan.md", &[]));
+    }
+
+    #[test]
+    fn api_dir_pattern_is_anchored_to_path_segment_boundary() {
+        // A real "api/" directory segment (generated OpenAPI reference) is
+        // still excluded.
+        assert!(is_excluded("pkg/generated/api/README.md", &[]));
+        assert!(is_excluded("api/README.md", &[]));
+        // Directory names that merely end in "api" are not "api/" as a path
+        // segment and must survive: staging/src/k8s.io/cri-api/README.md and
+        // similar kubernetes docs were silently dropped by a plain
+        // `contains("api/")` check before this was anchored.
+        assert!(!is_excluded("staging/src/k8s.io/cri-api/README.md", &[]));
+        assert!(!is_excluded("pkg/volume/downwardapi/README.md", &[]));
+        assert!(!is_excluded(
+            "staging/src/k8s.io/kube-openapi/README.md",
+            &[]
+        ));
     }
 
     #[test]
