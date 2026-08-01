@@ -371,8 +371,11 @@ fn init_tracing() {
             .with_tonic()
             .with_endpoint(&endpoint)
             .build()
-            .map(|exporter| SdkTracerProvider::builder().with_batch_exporter(exporter).build())
-        {
+            .map(|exporter| {
+                SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .build()
+            }) {
             Ok(tracer_provider) => {
                 let otel_layer =
                     tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("travsr"));
