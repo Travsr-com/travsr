@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 travsr-mcp = { path = "../crates/travsr-mcp" }
+travsr-analysis = { path = "../crates/travsr-analysis" }
 travsr-indexer = { path = "../crates/travsr-indexer" }
 travsr-retrieval = { path = "../crates/travsr-retrieval" }
 travsr-store = { path = "../crates/travsr-store" }
@@ -110,6 +111,12 @@ doc = false
 [[bin]]
 name = "fuzz_dart_parser"
 path = "fuzz_targets/fuzz_dart_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_markdown_chunker"
+path = "fuzz_targets/fuzz_markdown_chunker.rs"
 test = false
 doc = false
 

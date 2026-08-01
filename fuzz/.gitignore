@@ -1,0 +1,5 @@
+# `fuzz/` is its own cargo workspace (see the [workspace] stanza in Cargo.toml),
+# so the root .gitignore's target/ rule does not reach its build output.
+target/
+artifacts/
+coverage/

@@ -1398,5 +1398,53 @@ mod tests {
                 chunk_markdown(&text, "docs/x.md")
             );
         }
+
+        /// An anchor becomes the VName `signature`, so two chunks sharing one
+        /// collapse to a single `NodeId`: the second overwrites the first and a
+        /// whole doc section becomes permanently unretrievable, silently.
+        ///
+        /// `prop_spans_always_partition_the_document` cannot catch this — it
+        /// generates `Heading {i}`, which is unique by construction. The pool
+        /// below is chosen so collisions are the common case rather than a rare
+        /// draw: exact repeats (the `~2` disambiguator), strings differing only
+        /// in case/punctuation (slug collapsing), pairs that are equal after the
+        /// 48-char per-segment truncation, and headings that *already contain*
+        /// the `~2`/`#2` disambiguators the chunker appends.
+        #[test]
+        fn prop_anchors_are_unique_under_collision_pressure(
+            picks in proptest::collection::vec(0usize..8, 1..14),
+            levels in proptest::collection::vec(1u8..4, 1..14),
+        ) {
+            const POOL: [&str; 8] = [
+                "Decision",
+                "decision",
+                "De-cision!",
+                "Decision~2",
+                "Decision#2",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-one",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-two",
+                "_preamble",
+            ];
+            let mut text = String::new();
+            let n = picks.len().min(levels.len());
+            for i in 0..n {
+                text.push_str(&"#".repeat(levels[i].max(1) as usize));
+                text.push(' ');
+                text.push_str(POOL[picks[i] % POOL.len()]);
+                text.push('\n');
+                text.push_str("body text for this section\n");
+            }
+
+            let chunks = chunk_markdown(&text, "docs/x.md");
+            let mut seen = std::collections::HashSet::new();
+            for c in &chunks {
+                proptest::prop_assert!(
+                    seen.insert(c.anchor.clone()),
+                    "duplicate anchor {:?} collapses two chunks onto one NodeId; doc was:\n{}",
+                    c.anchor,
+                    text
+                );
+            }
+        }
     }
 }
