@@ -4,7 +4,7 @@
 //
 // Gate 1: doc hit@1 >= 0.60, hit@3 >= 0.90 on bench/queries-docs-{repo}.json
 // Gate 2: zero regression in code hit@1/hit@10 on bench/queries-seeded-{repo}.json
-//         (TRAVSR_DOCS_ENABLED=1 vs unset, same indexed corpus, no reindex between)
+//         (TRAVSR_DOCS_ENABLED=1 vs =0, same indexed corpus, no reindex between)
 // Gate 3: zero regression on the abstain arm (nonsense/salad/degenerate categories)
 // Gate 4: enabling the docs lane adds no second query-embedding inference
 //         (plan §4.4's "one inference, two searches" contract)
@@ -82,6 +82,65 @@ function readEmbedTrace() {
     out.push({ space: f[1], outcome: f[2], query: f.slice(3).join("\t") });
   }
   return out;
+}
+
+// `node bench/run-phase2-gate.mjs --self-test` — asserts Gate 4's classifier
+// without needing an index, a sidecar or a daemon (O3).
+//
+// A gate that has never failed is unproven (§18.5's negative control), and the
+// classifier is the piece that decides whether a red run is a real defect or
+// machine load, so both of its branches need a case that pins them. Cheap
+// enough to run as a CI pre-step, which also catches a syntax error in this
+// file before an hour of indexing.
+if (process.argv.includes("--self-test")) {
+  const cases = [
+    {
+      name: "one inference is never an extra",
+      row: { id: "a", embedInferences: 1, queryTexts: ["q"] },
+      expect: null,
+    },
+    {
+      name: "two inferences, one text => TTL expiry, not a failure",
+      row: { id: "b", embedInferences: 2, queryTexts: ["q"], ms: 7000 },
+      expect: "ttl-expiry",
+    },
+    {
+      name: "two inferences, two texts => normalization divergence, fails",
+      row: { id: "c", embedInferences: 2, queryTexts: ["q", "q?"], ms: 40 },
+      expect: "normalization",
+    },
+  ];
+  let bad = 0;
+  for (const c of cases) {
+    const got = classifyExtraInference({ spacesSearched: [], ...c.row });
+    const kind = got === null ? null : got.kind;
+    const ok = kind === c.expect;
+    if (!ok) bad++;
+    console.error(`${ok ? "ok  " : "FAIL"}  ${c.name} (got ${kind}, want ${c.expect})`);
+  }
+  // The gate-level consequence, not just the classifier's label: a TTL expiry
+  // must leave Gate 4 passing and a divergence must not.
+  const base = { spacesSearched: ["code", "docs"], embedMemoHits: 1, queryTexts: ["q"] };
+  const probe = [{ ...base, id: "p", embedInferences: 1 }];
+  const ttl = summarizeInference([{ ...base, id: "t", embedInferences: 2, ms: 7000 }], probe);
+  const diverged = summarizeInference(
+    [{ ...base, id: "d", embedInferences: 2, queryTexts: ["q", "q?"] }],
+    probe
+  );
+  if (!ttl.pass) {
+    bad++;
+    console.error("FAIL  a TTL expiry alone must not fail Gate 4");
+  } else {
+    console.error("ok    a TTL expiry alone does not fail Gate 4");
+  }
+  if (diverged.pass) {
+    bad++;
+    console.error("FAIL  a normalization divergence must fail Gate 4");
+  } else {
+    console.error("ok    a normalization divergence fails Gate 4");
+  }
+  console.error(bad === 0 ? "\nself-test: PASS" : `\nself-test: FAIL (${bad})`);
+  process.exit(bad === 0 ? 0 : 1);
 }
 
 class Mcp {
@@ -240,12 +299,25 @@ function docHitRank(docEntries, q) {
   return 0;
 }
 
+// The off arm must say "0", not "" (#376 O1).
+//
+// Since the docs knobs resolve through the layered config (env > repo > global
+// > default), an *empty* env var reads as **unset** and falls through to
+// `.travsr/config.toml` — so a machine with `docs.enabled = true` configured
+// would run this harness's "off" arm with the lane on, and gates 2, 3 and 5d
+// would compare on-vs-on while reporting off-vs-on. "0" is non-empty, so it
+// occupies the highest layer and forces the lane off whatever the files say.
+//
+// This is not hypothetical: it is how the leak was found. Gate 5d failed with
+// 26 `ask` queries rendering docs in the off arm, on a checkout whose repo
+// config had been switched on by hand.
+const DOCS_OFF = { TRAVSR_DOCS_ENABLED: "0" };
+const DOCS_ON = { TRAVSR_DOCS_ENABLED: "1" };
+
 // ── run one arm (docs on/off) over the seeded query set ─────────────────────
 async function runSeeded(docsEnabled) {
   const { queries } = JSON.parse(readFileSync(seededPath, "utf8"));
-  const mcp = new Mcp(
-    docsEnabled ? { TRAVSR_DOCS_ENABLED: "1" } : { TRAVSR_DOCS_ENABLED: "" }
-  );
+  const mcp = new Mcp(docsEnabled ? DOCS_ON : DOCS_OFF);
   await mcp.init();
   await mcp.call("get_context", { query: "warmup", token_budget: BUDGET });
 
@@ -322,6 +394,10 @@ async function runDocs() {
       embedInferences: trace.filter((t) => t.outcome === "miss").length,
       embedMemoHits: trace.filter((t) => t.outcome === "hit").length,
       spacesSearched: [...new Set(trace.map((t) => t.space))].sort(),
+      // O3: the distinct query texts the sidecar actually received for this
+      // query. This is what makes Gate 4 timing-independent — see
+      // `summarizeInference`.
+      queryTexts: [...new Set(trace.map((t) => t.query))],
     });
   }
 
@@ -338,18 +414,21 @@ async function runDocs() {
   for (const q of queries.slice(0, 3)) {
     const raw = `${q.query}?`;
     const traceStart = readEmbedTrace().length;
-    await mcp.call("get_context", { query: raw, token_budget: BUDGET });
+    const { ms } = await mcp.call("get_context", { query: raw, token_budget: BUDGET });
     await settle(50);
     const trace = readEmbedTrace().slice(traceStart);
+    const normalizedSeen = [...new Set(trace.map((t) => t.query))];
     probeRows.push({
       id: `${q.id}-punct`,
       query: raw,
+      ms: Math.round(ms),
       embedInferences: trace.filter((t) => t.outcome === "miss").length,
       embedMemoHits: trace.filter((t) => t.outcome === "hit").length,
       spacesSearched: [...new Set(trace.map((t) => t.space))].sort(),
       // The text the sidecar actually received, for eyeballing that
-      // normalization ran at all.
-      normalizedSeen: [...new Set(trace.map((t) => t.query))],
+      // normalization ran at all. Same field Gate 4 classifies on.
+      normalizedSeen,
+      queryTexts: normalizedSeen,
     });
   }
 
@@ -366,19 +445,56 @@ async function runDocs() {
 // ever searched both spaces (docs lane off, no doc index, sidecar too old, or
 // the debug env not reaching the sidecar) there is nothing to prove and the
 // gate must not report green.
+// O3 (§20.4): a second inference has two possible causes, and only one of them
+// is a defect. The gate must separate them or it cannot run nightly.
+//
+//   • **Normalization divergence** — the two lanes handed the sidecar
+//     *different* query text, so the memo could not hit at any speed. This is
+//     the real §4.4 contract violation, and it is what Gate 4 exists to catch.
+//   • **Memo TTL expiry** — both lanes sent byte-identical text, but the
+//     cross-encoder pass between them took longer than the sidecar's memo TTL.
+//     That is a property of machine load, and it is exactly what flipped this
+//     gate on k8s (§18.6: five queries at 6.1-7.1 s against a then-5 s TTL).
+//     The TTL fix widened the margin 12x; it did not make the count
+//     load-independent, so asserting on the raw count would flake nightly and
+//     train everyone to ignore a red gate.
+//
+// The two are told apart with **no reference to wall-clock at all**: the trace
+// records the text the sidecar actually received, so a query whose trace holds
+// more than one distinct text diverged, and one whose trace holds exactly one
+// text did not. A single-text query with two inferences can only be expiry.
+//
+// TTL expiries are still reported, and still count against `slowQueries` for
+// the perf record (O8), but they do not fail the gate.
+function classifyExtraInference(row) {
+  if (row.embedInferences <= 1) return null;
+  const distinctTexts = (row.queryTexts ?? []).length;
+  return {
+    id: row.id,
+    inferences: row.embedInferences,
+    spaces: row.spacesSearched,
+    ms: row.ms ?? null,
+    queryTexts: row.queryTexts ?? [],
+    // >1 distinct text is a divergence no TTL can explain. Exactly 1 means the
+    // lanes agreed and the entry simply aged out.
+    kind: distinctTexts > 1 ? "normalization" : "ttl-expiry",
+  };
+}
+
 function summarizeInference(rows, probeRows) {
   const all = [...rows, ...probeRows];
   const observed = all.filter((r) => r.embedInferences + r.embedMemoHits > 0);
   const bothSpaces = all.filter((r) => r.spacesSearched.length === 2);
-  const violations = observed
-    .filter((r) => r.embedInferences > 1)
-    .map((r) => ({ id: r.id, inferences: r.embedInferences, spaces: r.spacesSearched }));
+  const extras = observed.map(classifyExtraInference).filter(Boolean);
+  const violations = extras.filter((e) => e.kind === "normalization");
+  const ttlExpiries = extras.filter((e) => e.kind === "ttl-expiry");
   const vacuous = bothSpaces.length === 0;
   // The probe must have actually run and searched both spaces, or the
   // normalization-divergence case went unexercised and the gate is only
   // proving the easy path.
   const probeCovered = probeRows.some((r) => r.spacesSearched.length === 2);
   return {
+    // Only normalization divergence fails the gate — see the note above.
     pass: !vacuous && probeCovered && violations.length === 0,
     vacuous,
     probeCovered,
@@ -387,10 +503,13 @@ function summarizeInference(rows, probeRows) {
     totalInferences: all.reduce((a, r) => a + r.embedInferences, 0),
     totalMemoHits: all.reduce((a, r) => a + r.embedMemoHits, 0),
     violations,
+    ttlExpiries,
     punctuatedProbe: probeRows,
     threshold:
-      "<=1 query-embedding inference per query; >=1 query searching both spaces; " +
-      "punctuated probe exercised (scored sets contain no sentence punctuation)",
+      "zero normalization divergences (a query whose trace holds >1 distinct " +
+      "text); >=1 query searching both spaces; punctuated probe exercised " +
+      "(scored sets contain no sentence punctuation). Memo TTL expiries are " +
+      "reported, not failed: they track machine load, not the §4.4 contract.",
   };
 }
 // ── Gate 5: the `ask` surface ───────────────────────────────────────────────
@@ -601,7 +720,7 @@ function summarizeDocs(rows) {
 // ── main ──────────────────────────────────────────────────────────────────
 console.error(`=== #376 Phase 2 gate — ${LABEL} (repo: ${REPO}) ===`);
 
-console.error("\n[off] running queries-seeded with TRAVSR_DOCS_ENABLED unset...");
+console.error("\n[off] running queries-seeded with TRAVSR_DOCS_ENABLED=0...");
 const offRows = await runSeeded(false);
 docsEnabledGlobal = false;
 const offSummary = summarizeCode(offRows);
@@ -659,9 +778,9 @@ let askError = null;
 let askDaemonReadyMs = null;
 
 try {
-  console.error("\n[ask/off] restarting daemon with TRAVSR_DOCS_ENABLED unset...");
+  console.error("\n[ask/off] restarting daemon with TRAVSR_DOCS_ENABLED=0...");
   await daemonStop();
-  harnessDaemon = (await daemonStart({ TRAVSR_DOCS_ENABLED: "" })).child;
+  harnessDaemon = (await daemonStart(DOCS_OFF)).child;
   const askOffRows = await runAskSeeded();
   docsEnabledGlobal = false;
   askOffSummary = summarizeCode(askOffRows);
@@ -674,7 +793,7 @@ try {
   console.error("\n[ask/on] restarting daemon with TRAVSR_DOCS_ENABLED=1...");
   harnessDaemon.kill();
   await daemonStop();
-  const started = await daemonStart({ TRAVSR_DOCS_ENABLED: "1" });
+  const started = await daemonStart(DOCS_ON);
   harnessDaemon = started.child;
   askDaemonReadyMs = started.readyMs;
   const askOnRows = await runAskSeeded();
@@ -788,6 +907,19 @@ if (inference.vacuous) {
   console.error(
     `  !! VACUOUS: no query searched both spaces — the docs lane never ran, or the sidecar ` +
       `predates TRAVSR_EMBED_QUERY_CACHE_DEBUG. Gate 4 proves nothing in this state.`
+  );
+}
+// O3: reported, never failed. A run with many of these is a perf signal (O8),
+// not a §4.4 contract breach — but staying silent about them would hide the
+// machine-load story that made this gate look flaky in the first place.
+if (inference.ttlExpiries.length > 0) {
+  const slowest = inference.ttlExpiries
+    .map((e) => `${e.id}${e.ms === null ? "" : ` ${e.ms}ms`}`)
+    .join(", ");
+  console.error(
+    `  note: ${inference.ttlExpiries.length} query/queries re-embedded after the sidecar's ` +
+      `memo TTL expired (identical text both lanes, so not a normalization divergence): ${slowest}. ` +
+      `Not a gate failure; it tracks cross-encoder cost under load (plan §20.4 O8).`
   );
 }
 if (!inference.vacuous && !inference.probeCovered) {

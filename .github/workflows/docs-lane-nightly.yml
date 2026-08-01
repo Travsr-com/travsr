@@ -1,0 +1,109 @@
+name: Docs lane nightly
+
+# Nightly regression gate for the #376 documentation-prose retrieval lane
+# (plan §20.4 O3 — the five gates in bench/run-phase2-gate.mjs were hand-run
+# and appeared in no workflow, so nothing but a person remembering protected
+# anything §18 measured).
+#
+# The five gates, all asserted by the harness, which exits non-zero on any
+# failure:
+#   1. doc hit@1 >= 0.60 / hit@3 >= 0.90
+#   2. zero code-retrieval regression, docs off vs on
+#   3. zero abstention regression, docs off vs on
+#   4. no second query-embedding inference (§4.4 "one inference, two searches")
+#   5. the `ask` surface matches `get_context` on doc presence and top-1
+#
+# ## Why this can run nightly without flaking
+#
+# Gate 4 used to assert on a raw inference count, which is a function of machine
+# load: the memo entry between the two lanes' KNN calls expires if the
+# cross-encoder pass between them outlives the sidecar's TTL, and that is what
+# flipped the gate red on kubernetes under load (§18.6). It now classifies a
+# second inference by *what the sidecar received* rather than by how long the
+# query took — more than one distinct query text is a real normalization
+# divergence and fails; a single text means the entry merely aged out, which is
+# reported as a perf note and does not fail. No wall-clock threshold remains in
+# the pass/fail decision.
+#
+# ## Release ordering caveat — read before debugging a red run
+#
+# `travsr embed init` installs the *released* sidecar. The doc space
+# (`hnsw-docs.usearch`), the `text_hash` freshness column and the query-embed
+# trace this gate reads all ship in travsr-embed >= 1.2.0. Against an older
+# released sidecar there is no doc space at all, so the harness reports
+# `vacuous: true` and Gate 4 fails by design rather than by regression — a
+# vacuous gate must never look green. If this job is red with `vacuous: true`
+# in the log, the paired travsr-embed release has not landed yet; that is the
+# fix, not anything in this repo.
+
+on:
+  schedule:
+    - cron: '15 3 * * *'   # 03:15 UTC, after the accuracy and A/B nightlies
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-lane:
+    name: docs lane gates (self-index)
+    runs-on: ubuntu-latest
+    # Indexing plus a full embed pass over this repo dominates the runtime;
+    # doc chunks embed roughly an order of magnitude slower than code
+    # skeletons because prose fills the token window (plan §8.7).
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Runs in milliseconds and needs no index, so a broken harness or a
+      # regressed Gate 4 classifier fails here rather than after an hour of
+      # indexing. Also the negative control: it asserts the gate can still fail.
+      - name: Self-test the gate harness
+        run: node bench/run-phase2-gate.mjs --self-test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The gates are measured against arctic-embed-m-v1.5 and only that model:
+      # DOC_FLOOR and DOC_RERANK_FLOOR are raw score thresholds in one model's
+      # space (plan §13 item 2 is the open portability question). Pinning it
+      # here keeps a backend default change from being misread as an accuracy
+      # regression.
+      - name: Install embedding backend (arctic-embed-m-v1.5)
+        run: ./target/release/travsr embed init --backend arctic-embed-m-v1.5
+
+      - name: Index this repo
+        run: ./target/release/travsr init
+
+      - name: Build embeddings (code + doc spaces)
+        run: ./target/release/travsr embed reindex
+
+      - name: Report index state
+        run: |
+          ./target/release/travsr status || true
+          ./target/release/travsr embed status || true
+
+      - name: Run the five docs-lane gates
+        env:
+          BENCH_LABEL: travsr
+        run: node bench/run-phase2-gate.mjs
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-lane-gate-report
+          path: bench/report-phase2-gate-travsr.json
+          retention-days: 90
