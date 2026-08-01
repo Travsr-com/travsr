@@ -23,15 +23,18 @@ ignore = [
     # tract-linalg and by tokenizers (via macro_rules_attribute). No safe
     # upgrade available.
     { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro only, no runtime exposure" },
-    # tract-nnef read_tensor integer-overflow OOB read on model load
-    # (RUSTSEC-2026-0217). Reachable only when parsing an attacker-controlled
-    # NNEF .dat model. travsr-rerank loads ONNX (not NNEF), and only its own
-    # sha256-pinned bundled cross-encoder model (RFC-021 F8) — never a
-    # user-supplied or network-fetched model — so the vulnerable path is not
-    # reachable. Unblock on tract-nnef >= 0.21.16 (patched in the 0.21.x line;
-    # deferred here because the bump pulls transitive downgrades that need a
-    # full reranker + MSRV revalidation).
-    { id = "RUSTSEC-2026-0217", reason = "NNEF .dat parser OOB read; travsr loads ONNX only + own sha256-pinned model, attacker-controlled-model path unreachable" },
+    # time 0.3.41 RFC 2822 parser stack exhaustion (RUSTSEC-2026-0009).
+    # tract-linalg 0.21.17 pins `time <0.3.42`, so bumping tract-onnx/tract-nnef
+    # off RUSTSEC-2026-0217 forces this transitive downgrade from the
+    # previously-safe 0.3.47. Every reachable path to `time` in this workspace
+    # is either (a) inside tract-linalg's own build script via liquid/
+    # liquid-core codegen templates (compile-time only, no runtime/attacker
+    # input), or (b) tracing-appender's log-file rotation, which only parses
+    # its own self-generated "[year]-[month]-[day]" filenames — never the
+    # vulnerable RFC 2822 format. No code path in this workspace parses
+    # attacker-controlled RFC 2822 input. Unblock when tract-linalg loosens
+    # its `time` upper bound.
+    { id = "RUSTSEC-2026-0009", reason = "RFC 2822 stack-exhaustion path unreachable: time only used by tract-linalg's build-script codegen and tracing-appender's self-generated filename parsing, never on attacker input" },
 ]
 
 [licenses]
