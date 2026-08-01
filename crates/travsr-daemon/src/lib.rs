@@ -3194,20 +3194,22 @@ mod tests {
                     .ok()
                     .flatten()
                     .unwrap_or_default(),
-                s.data_version().unwrap(),
-                s.embed_data_version().unwrap(),
+                query_cache::DataVersions {
+                    graph: s.data_version().unwrap(),
+                    embed: s.embed_data_version().unwrap(),
+                },
             )
         };
 
         let args = serde_json::json!({ "query": "isPrime" });
-        let (last, pb, dv, edv) = markers(&read_store);
+        let (last, pb, dv) = markers(&read_store);
         let warm = run_query(&read_store, "ask", args.clone()).unwrap();
         assert_eq!(
             warm["matched"],
             serde_json::json!(true),
             "pre-delete ask must hit"
         );
-        cache.put("ask", &args, &last, &pb, dv, edv, warm.clone());
+        cache.put("ask", &args, &last, &pb, dv, warm.clone());
 
         // Out-of-band repair: delete the file on disk, then fsck --fix from a
         // separate connection — exactly the reproduction in #464.
@@ -3216,12 +3218,15 @@ mod tests {
         assert_eq!(report.ghost_paths, vec!["prime.ts".to_string()]);
 
         // Commit markers did not move…
-        let (last2, pb2, dv2, edv2) = markers(&read_store);
+        let (last2, pb2, dv2) = markers(&read_store);
         assert_eq!((last.as_str(), pb.as_str()), (last2.as_str(), pb2.as_str()));
         // …but data_version did, so the cached pre-delete entry stops matching.
-        assert_ne!(dv, dv2, "out-of-band write must bump data_version");
+        assert_ne!(
+            dv.graph, dv2.graph,
+            "out-of-band write must bump data_version"
+        );
         assert!(
-            cache.get("ask", &args, &last2, &pb2, dv2, edv2).is_none(),
+            cache.get("ask", &args, &last2, &pb2, dv2).is_none(),
             "stale warm-cache entry must not be served after fsck --fix"
         );
         // A fresh query through the same warm read connection sees the deletion.
@@ -4085,7 +4090,7 @@ fn handle_control_message(
                 Ok(None)
             };
             let versions = match (s.data_version(), embed_version) {
-                (Ok(graph), Ok(embed)) => Some((graph, embed)),
+                (Ok(graph), Ok(embed)) => Some(query_cache::DataVersions { graph, embed }),
                 (graph, embed) => {
                     let err = graph
                         .err()
@@ -4096,30 +4101,22 @@ fn handle_control_message(
                     None
                 }
             };
-            if let Some((data_version, embed_data_version)) = versions {
+            if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(cached) = c.get(
-                    &tool,
-                    &args,
-                    &last_commit,
-                    &phase_b_commit,
-                    data_version,
-                    embed_data_version,
-                ) {
+                if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
                     return (ControlResponse::query_result(cached), false);
                 }
             }
             match run_query(&s, &tool, args.clone()) {
                 Ok(value) => {
-                    if let Some((data_version, embed_data_version)) = versions {
+                    if let Some(versions) = versions {
                         let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                         c.put(
                             &tool,
                             &args,
                             &last_commit,
                             &phase_b_commit,
-                            data_version,
-                            embed_data_version,
+                            versions,
                             value.clone(),
                         );
                     }

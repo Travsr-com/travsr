@@ -22,6 +22,19 @@
 
 use std::collections::HashMap;
 
+/// The two `PRAGMA data_version` readings that, together with the commit
+/// markers, bound result freshness (#464 and follow-up).
+#[derive(Clone, Copy)]
+pub struct DataVersions {
+    /// graph.db's `data_version` as seen by the daemon's read connection.
+    pub graph: u64,
+    /// embed.db's `data_version`. `None` while no embed.db exists (FTS-only
+    /// mode) and for tools that never read embed.db; `Some(version)` for
+    /// embed-dependent tools once the sidecar has created it. The two states
+    /// must not collide, so this stays an `Option` rather than a sentinel.
+    pub embed: Option<u64>,
+}
+
 /// Cache key: the query identity plus the markers that bound graph freshness —
 /// the two commit markers and the SQLite `data_version` of graph.db and
 /// embed.db as seen by the daemon's persistent read connections.
@@ -37,10 +50,6 @@ struct CacheKey {
     last_commit: String,
     phase_b_commit: String,
     data_version: u64,
-    /// `None` while no embed.db exists (FTS-only mode) and for tools that
-    /// never read embed.db; `Some(version)` for embed-dependent tools once the
-    /// sidecar has created it. The two states must not collide, so this stays
-    /// an `Option` rather than a sentinel value.
     embed_data_version: Option<u64>,
 }
 
@@ -71,16 +80,15 @@ impl QueryCache {
         args: &serde_json::Value,
         last_commit: &str,
         phase_b_commit: &str,
-        data_version: u64,
-        embed_data_version: Option<u64>,
+        versions: DataVersions,
     ) -> CacheKey {
         CacheKey {
             tool: tool.to_string(),
             args: serde_json::to_string(args).unwrap_or_default(),
             last_commit: last_commit.to_string(),
             phase_b_commit: phase_b_commit.to_string(),
-            data_version,
-            embed_data_version,
+            data_version: versions.graph,
+            embed_data_version: versions.embed,
         }
     }
 
@@ -91,17 +99,9 @@ impl QueryCache {
         args: &serde_json::Value,
         last_commit: &str,
         phase_b_commit: &str,
-        data_version: u64,
-        embed_data_version: Option<u64>,
+        versions: DataVersions,
     ) -> Option<serde_json::Value> {
-        let k = Self::key(
-            tool,
-            args,
-            last_commit,
-            phase_b_commit,
-            data_version,
-            embed_data_version,
-        );
+        let k = Self::key(tool, args, last_commit, phase_b_commit, versions);
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         let entry = self.entries.get_mut(&k)?;
@@ -117,18 +117,10 @@ impl QueryCache {
         args: &serde_json::Value,
         last_commit: &str,
         phase_b_commit: &str,
-        data_version: u64,
-        embed_data_version: Option<u64>,
+        versions: DataVersions,
         value: serde_json::Value,
     ) {
-        let k = Self::key(
-            tool,
-            args,
-            last_commit,
-            phase_b_commit,
-            data_version,
-            embed_data_version,
-        );
+        let k = Self::key(tool, args, last_commit, phase_b_commit, versions);
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         self.entries.insert(k, (value, tick));
@@ -159,14 +151,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Graph-only data versions (no embed.db), the common case in these tests.
+    fn dv(graph: u64) -> DataVersions {
+        DataVersions { graph, embed: None }
+    }
+
     #[test]
     fn hit_after_put_same_key() {
         let mut c = QueryCache::new(8);
         let args = json!({"seed": "Foo", "direction": "both"});
-        assert!(c.get("graph", &args, "abc", "abc", 1, None).is_none());
-        c.put("graph", &args, "abc", "abc", 1, None, json!({"nodes": 3}));
+        assert!(c.get("graph", &args, "abc", "abc", dv(1)).is_none());
+        c.put("graph", &args, "abc", "abc", dv(1), json!({"nodes": 3}));
         assert_eq!(
-            c.get("graph", &args, "abc", "abc", 1, None),
+            c.get("graph", &args, "abc", "abc", dv(1)),
             Some(json!({"nodes": 3}))
         );
     }
@@ -181,12 +178,11 @@ mod tests {
             &json!({"a": 1, "b": 2}),
             "c1",
             "c1",
-            1,
-            None,
+            dv(1),
             json!("hit"),
         );
         assert_eq!(
-            c.get("graph", &json!({"b": 2, "a": 1}), "c1", "c1", 1, None),
+            c.get("graph", &json!({"b": 2, "a": 1}), "c1", "c1", dv(1)),
             Some(json!("hit"))
         );
     }
@@ -197,19 +193,16 @@ mod tests {
         // Phase B) must miss — structural invalidation.
         let mut c = QueryCache::new(8);
         let args = json!({"seed": "Foo"});
-        c.put("graph", &args, "c1", "p1", 1, None, json!("old"));
+        c.put("graph", &args, "c1", "p1", dv(1), json!("old"));
         assert!(
-            c.get("graph", &args, "c2", "p1", 1, None).is_none(),
+            c.get("graph", &args, "c2", "p1", dv(1)).is_none(),
             "last_commit moved"
         );
         assert!(
-            c.get("graph", &args, "c1", "p2", 1, None).is_none(),
+            c.get("graph", &args, "c1", "p2", dv(1)).is_none(),
             "phase_b moved"
         );
-        assert_eq!(
-            c.get("graph", &args, "c1", "p1", 1, None),
-            Some(json!("old"))
-        );
+        assert_eq!(c.get("graph", &args, "c1", "p1", dv(1)), Some(json!("old")));
     }
 
     #[test]
@@ -219,13 +212,13 @@ mod tests {
         // commit marker — the cached entry must stop matching.
         let mut c = QueryCache::new(8);
         let args = json!({"query": "isPrime"});
-        c.put("ask", &args, "c1", "p1", 1, None, json!("pre-delete"));
+        c.put("ask", &args, "c1", "p1", dv(1), json!("pre-delete"));
         assert!(
-            c.get("ask", &args, "c1", "p1", 2, None).is_none(),
+            c.get("ask", &args, "c1", "p1", dv(2)).is_none(),
             "data_version moved"
         );
         assert_eq!(
-            c.get("ask", &args, "c1", "p1", 1, None),
+            c.get("ask", &args, "c1", "p1", dv(1)),
             Some(json!("pre-delete"))
         );
     }
@@ -237,18 +230,29 @@ mod tests {
         // unchanged, so only the embed component can invalidate the entry.
         let mut c = QueryCache::new(8);
         let args = json!({"query": "isPrime"});
-        c.put("ask", &args, "c1", "p1", 1, Some(7), json!("old embeddings"));
+        let embedded = |embed: u64| DataVersions {
+            graph: 1,
+            embed: Some(embed),
+        };
+        c.put(
+            "ask",
+            &args,
+            "c1",
+            "p1",
+            embedded(7),
+            json!("old embeddings"),
+        );
         assert!(
-            c.get("ask", &args, "c1", "p1", 1, Some(8)).is_none(),
+            c.get("ask", &args, "c1", "p1", embedded(8)).is_none(),
             "embed data_version moved"
         );
         // embed.db appearing where there was none is also a state change.
         assert!(
-            c.get("ask", &args, "c1", "p1", 1, None).is_none(),
+            c.get("ask", &args, "c1", "p1", dv(1)).is_none(),
             "Some(v) vs None must not collide"
         );
         assert_eq!(
-            c.get("ask", &args, "c1", "p1", 1, Some(7)),
+            c.get("ask", &args, "c1", "p1", embedded(7)),
             Some(json!("old embeddings"))
         );
     }
@@ -259,20 +263,20 @@ mod tests {
         let a = json!({"k": "a"});
         let b = json!({"k": "b"});
         let d = json!({"k": "d"});
-        c.put("graph", &a, "c", "c", 1, None, json!(1));
-        c.put("graph", &b, "c", "c", 1, None, json!(2));
+        c.put("graph", &a, "c", "c", dv(1), json!(1));
+        c.put("graph", &b, "c", "c", dv(1), json!(2));
         // Touch `a` so `b` becomes the LRU victim.
-        assert!(c.get("graph", &a, "c", "c", 1, None).is_some());
-        c.put("graph", &d, "c", "c", 1, None, json!(3));
+        assert!(c.get("graph", &a, "c", "c", dv(1)).is_some());
+        c.put("graph", &d, "c", "c", dv(1), json!(3));
         assert_eq!(c.len(), 2);
         assert!(
-            c.get("graph", &b, "c", "c", 1, None).is_none(),
+            c.get("graph", &b, "c", "c", dv(1)).is_none(),
             "b should be evicted"
         );
         assert!(
-            c.get("graph", &a, "c", "c", 1, None).is_some(),
+            c.get("graph", &a, "c", "c", dv(1)).is_some(),
             "a was kept (recent)"
         );
-        assert!(c.get("graph", &d, "c", "c", 1, None).is_some(), "d is newest");
+        assert!(c.get("graph", &d, "c", "c", dv(1)).is_some(), "d is newest");
     }
 }
