@@ -1194,13 +1194,21 @@ impl SqliteStore {
         // If this drifts from the sidecar, `embedded` (which counts every row in
         // node_embeddings) can exceed `total_symbols`, showing >100% progress and
         // suppressing the auto-reindex trigger for pending file nodes.
+        //
+        // #376 W1: the trailing clause mirrors the sidecar's exclusion of
+        // doc-chunks with no prose. Without it those nodes count as pending
+        // forever, so the daemon's tick would re-spawn a sidecar on every pass
+        // that can never make progress on them.
+        //
         // Two forms: bare columns for `FROM nodes`, and `n.`-qualified for the JOIN.
-        const KIND_FILTER: &str = "(kind NOT IN \
+        const KIND_FILTER: &str = "((kind NOT IN \
              ('file', 'file-module', 'import', 'module', 'field', 'variable') \
-             OR embed_text IS NOT NULL)";
-        const KIND_FILTER_N: &str = "(n.kind NOT IN \
+             OR embed_text IS NOT NULL) \
+             AND NOT (kind = 'doc-chunk' AND embed_text IS NULL))";
+        const KIND_FILTER_N: &str = "((n.kind NOT IN \
              ('file', 'file-module', 'import', 'module', 'field', 'variable') \
-             OR n.embed_text IS NOT NULL)";
+             OR n.embed_text IS NOT NULL) \
+             AND NOT (n.kind = 'doc-chunk' AND n.embed_text IS NULL))";
 
         (|| -> AnyResult<(u64, u64, u64, u64)> {
             let total_symbols: i64 = self
@@ -4964,6 +4972,78 @@ LIMIT 100",
         Ok(())
     }
 
+    /// Number of node deletions the embed sidecar has not consumed yet (#376 W2).
+    ///
+    /// The daemon's embed tick decides there is work to do from `embed_progress`,
+    /// which is presence-only: a node whose content changed still *has* an
+    /// embedding row, so coverage reads 100 % and no pass is ever spawned. The
+    /// tombstone log is the only record that those vectors no longer match their
+    /// nodes, and until a pass runs it is also the only thing keeping them from
+    /// being deleted. Measured on this repo before the fix: 154 pending
+    /// tombstones, 152 of them still holding a live vector, with coverage at
+    /// 100 % and therefore no spawn scheduled — ever.
+    pub fn pending_tombstones(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
+                .context("counting node_tombstones")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Doc-chunk nodes that have no `embed_text` yet (#376 W1).
+    ///
+    /// Kept separate from [`nodes_missing_embed_text`] because the daemon runs
+    /// this one on the auto-embed path, where the full regeneration is
+    /// deliberately avoided (it parses every source file in the repo and blocks
+    /// for minutes). Markdown chunks are re-derived by a pure function of the
+    /// file's bytes, so the doc-only subset is cheap enough to run before every
+    /// spawn — and without it a doc chunk indexed by `travsr init` stays
+    /// ineligible, i.e. silently absent from doc retrieval.
+    pub fn doc_nodes_missing_embed_text(&self) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line \
+                     FROM nodes WHERE embed_text IS NULL AND kind = 'doc-chunk'",
+                )
+                .context("preparing doc_nodes_missing_embed_text query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing doc_nodes_missing_embed_text query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding doc_nodes_missing_embed_text row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// SC-H1: cap the `node_tombstones` table so it cannot grow unbounded.
     ///
     /// Tombstones are at-least-once: the embed sidecar consumes and acks them
@@ -5440,6 +5520,83 @@ mod tests {
             VName::new("test-corpus", "main", "src/foo.ts", "typescript", sig),
             "function",
         )
+    }
+
+    fn doc_chunk(path: &str, anchor: &str) -> Node {
+        Node::new(
+            VName::new("test-corpus", "", path, "markdown", anchor),
+            "doc-chunk",
+        )
+    }
+
+    /// #376 W1: this filter must stay identical to the sidecar's NODE_ELIGIBLE.
+    /// A doc-chunk with no prose is not embeddable (its vector would be built
+    /// from the heading trail alone), so counting it as pending would make the
+    /// daemon spawn a sidecar on every tick that can never close the gap.
+    #[test]
+    fn embed_progress_excludes_doc_chunks_without_prose() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let with_prose = doc_chunk("docs/a.md", "doc:intro");
+        let without_prose = doc_chunk("docs/b.md", "doc:intro");
+        let code = sample_node("fn:handler");
+        store.put_node(&with_prose).unwrap();
+        store.put_node(&without_prose).unwrap();
+        store.put_node(&code).unwrap();
+        store
+            .write_embed_texts_batch(&[(with_prose.id, "doc: a > intro | body".to_string())])
+            .unwrap();
+
+        let (total, _embedded, _p1_total, _p1_done) = store.embed_progress("m", 0).unwrap();
+        assert_eq!(
+            total, 2,
+            "embeddable = {{doc-chunk with prose, function}}, not the prose-less chunk"
+        );
+    }
+
+    /// #376 W2: the count the daemon's embed tick uses to notice that content
+    /// changed. Coverage alone cannot see this — the changed nodes still have
+    /// their (now wrong) embedding rows.
+    #[test]
+    fn pending_tombstones_counts_unconsumed_deletions() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(store.pending_tombstones().unwrap(), 0);
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        assert_eq!(
+            store.pending_tombstones().unwrap(),
+            0,
+            "writes do not count"
+        );
+
+        store.delete_nodes_for_path("src/foo.ts").unwrap();
+        assert_eq!(
+            store.pending_tombstones().unwrap(),
+            2,
+            "one tombstone per deleted node, unconsumed until a sidecar pass runs"
+        );
+    }
+
+    /// #376 W1: the daemon fills these in before spawning; code nodes are
+    /// deliberately out of scope (their regeneration parses the whole repo).
+    #[test]
+    fn doc_nodes_missing_embed_text_returns_only_prose_less_doc_chunks() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let filled = doc_chunk("docs/a.md", "doc:intro");
+        let empty = doc_chunk("docs/b.md", "doc:setup");
+        let code = sample_node("fn:handler");
+        store.put_node(&filled).unwrap();
+        store.put_node(&empty).unwrap();
+        store.put_node(&code).unwrap();
+        store
+            .write_embed_texts_batch(&[(filled.id, "doc: a > intro | body".to_string())])
+            .unwrap();
+
+        let missing = store.doc_nodes_missing_embed_text().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].id, empty.id);
+        assert_eq!(missing[0].vname.path, "docs/b.md");
     }
 
     // ── RFC-019 direct-cosine oracle helpers ──────────────────────────────
