@@ -9,6 +9,20 @@
 // Gate 4: enabling the docs lane adds no second query-embedding inference
 //         (plan §4.4's "one inference, two searches" contract)
 //
+// Gate 5: the `ask` surface renders the docs lane, at parity with get_context
+//         (#516 added a second surface that gates 1-4 never touch)
+//
+// Gate 5 exists because gates 1-4 all call get_context over MCP, while #516
+// added `travsr ask` as a second surface that renders docs through a different
+// path: CLI -> daemon control socket -> ask_query -> docs_section, with its own
+// hook arming, its own renderer and its own abstain return. #516 itself was
+// found only by running that surface by hand — the daemon never called
+// set_embed_doc_knn_hook, so `ask` saw None, which is indistinguishable from
+// "sidecar too old" or "no doc-chunk nodes" and renders as no section, with no
+// warning and no error. A gate that scores one surface cannot see that class of
+// bug at all, so Gate 5 scores `ask` directly and compares it against
+// get_context query by query.
+//
 // Gate 4 was previously "combined KNN latency within 10% of the code-only
 // baseline", whose stated purpose in plan §7 was precisely to prove §4.4's
 // one-inference claim. Wall-clock cannot prove that: it is dominated by the
@@ -22,8 +36,17 @@
 // Usage:
 //   BENCH_REPO=/Users/ak/Documents/k8/kubernetes BENCH_LABEL=k8s node bench/run-phase2-gate.mjs
 //   BENCH_LABEL=travsr node bench/run-phase2-gate.mjs   (defaults BENCH_REPO to this repo)
+//
+// Exit code is 0 only when every gate passes — this is a gate, not a report.
+//
+// !! Gate 5 restarts the daemon for the repo under test. `docs_enabled()` is
+// read by whichever process performs retrieval, and for `ask` that is the
+// daemon, not the CLI: `TRAVSR_DOCS_ENABLED=1 travsr ask ...` sets it on the
+// wrong process and silently does nothing. Any daemon running when this script
+// starts is stopped and a plain one is started again at the end (its original
+// environment cannot be recovered — the script says so when it happens).
 
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -144,6 +167,17 @@ const median = (a) => {
 //   "sig (kind) — path:line [via: role]"
 // Doc-section lines (build_docs_section, tools.rs) look like
 //   "path § Heading > Trail:line-line"  (no "(kind)", no em-dash)
+// One doc-entry parser for both surfaces. get_context prints these lines inside
+// its "## docs" section and `ask` returns the same strings in AskPayload.docs
+// (both come from build_docs_section / docs_section, same renderer). Gate 5
+// compares the two surfaces entry by entry, so they must be parsed by identical
+// code — a parity gate whose sides use different parsers manufactures its own
+// disagreements.
+function parseDocLine(line) {
+  const m = /^(.+?)\s+§\s+(.+)$/.exec(line);
+  return m ? { path: m[1].trim(), heading: m[2].trim() } : null;
+}
+
 function parseSections(text) {
   const sections = { exact: [], semantic: [], docs: [], relevant: [] };
   let cur = null;
@@ -155,8 +189,8 @@ function parseSections(text) {
     }
     if (!cur || !line.trim()) continue;
     if (cur === "docs") {
-      const m = /^(.+?)\s+§\s+(.+)$/.exec(line);
-      if (m) sections.docs.push({ path: m[1].trim(), heading: m[2].trim() });
+      const entry = parseDocLine(line);
+      if (entry) sections.docs.push(entry);
       continue;
     }
     if (!line.includes(" — ")) continue;
@@ -283,6 +317,8 @@ async function runDocs() {
       rank,
       ms: Math.round(ms),
       nDocs: sections.docs.length,
+      // Gate 5 compares this against the `ask` surface's leading entry.
+      topEntry: sections.docs[0] ?? null,
       embedInferences: trace.filter((t) => t.outcome === "miss").length,
       embedMemoHits: trace.filter((t) => t.outcome === "hit").length,
       spacesSearched: [...new Set(trace.map((t) => t.space))].sort(),
@@ -357,6 +393,193 @@ function summarizeInference(rows, probeRows) {
       "punctuated probe exercised (scored sets contain no sentence punctuation)",
   };
 }
+// ── Gate 5: the `ask` surface ───────────────────────────────────────────────
+//
+// `ask` is answered by the daemon whenever one is running, and by a read-only
+// cold path otherwise. Only the daemon path can render docs
+// (`try_inject_embed_hook_readonly` is an intentional no-op, plan §17.6), and
+// the daemon reads TRAVSR_DOCS_ENABLED from *its own* environment. So the arm
+// has to own the daemon: stop whatever is running, start one with the env this
+// arm needs, and put a plain one back afterwards.
+
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    execFile(
+      cmd,
+      args,
+      { cwd: REPO, timeout: opts.timeoutMs ?? 120000, maxBuffer: 32 * 1024 * 1024, env: { ...process.env, ...(opts.env ?? {}) } },
+      (err, stdout, stderr) => resolve({ code: err?.code ?? 0, stdout: stdout ?? "", stderr: stderr ?? "", err })
+    );
+  });
+}
+
+async function daemonRunning() {
+  const { code, stdout } = await run(BIN, ["daemon", "status"], { timeoutMs: 20000 });
+  return code === 0 && /daemon:\s*running/i.test(stdout);
+}
+
+async function daemonStop() {
+  await run(BIN, ["daemon", "stop"], { timeoutMs: 30000 });
+  // `stop` returns as soon as it has signalled; wait for the socket to actually
+  // go away, or the next `start` races a dying process for it.
+  for (let i = 0; i < 40; i++) {
+    if (!(await daemonRunning())) return true;
+    await settle(250);
+  }
+  return false;
+}
+
+// Start a daemon with `env` and wait until it actually answers `ask`. Daemon
+// readiness is not socket-up: the control socket stays unbound during the
+// initial watcher scan (10-30 s on a large repo), and an `ask` issued in that
+// window falls back to the cold path, which renders no docs — indistinguishable
+// from a broken lane. So readiness is proven by a real `ask` round trip.
+async function daemonStart(env, { readyTimeoutMs = 180000 } = {}) {
+  const child = spawn(BIN, ["daemon", "start", "--foreground"], {
+    cwd: REPO,
+    stdio: ["ignore", "ignore", "ignore"],
+    env: { ...process.env, ...env },
+    detached: false,
+  });
+  const t0 = performance.now();
+  let lastErr = "";
+  while (performance.now() - t0 < readyTimeoutMs) {
+    if (child.exitCode !== null) {
+      throw new Error(`daemon exited during startup (code ${child.exitCode})`);
+    }
+    if (await daemonRunning()) {
+      const probe = await askOnce("warmup");
+      if (probe.ok) return { child, readyMs: Math.round(performance.now() - t0) };
+      lastErr = probe.error;
+    }
+    await settle(500);
+  }
+  throw new Error(`daemon did not become ready within ${readyTimeoutMs}ms: ${lastErr}`);
+}
+
+async function askOnce(query) {
+  const t0 = performance.now();
+  const { code, stdout, stderr } = await run(BIN, ["ask", query, "--format", "json"], { timeoutMs: 120000 });
+  const ms = performance.now() - t0;
+  if (code !== 0) return { ok: false, ms, error: (stderr || stdout).trim().slice(0, 300) };
+  try {
+    return { ok: true, ms, payload: JSON.parse(stdout) };
+  } catch (e) {
+    return { ok: false, ms, error: `unparseable --format json output: ${stdout.slice(0, 200)}` };
+  }
+}
+
+// AskPayload.rows -> the shape hitRank() already understands, so the code-side
+// scoring is literally the same function on both surfaces.
+function askCodeNodes(payload) {
+  return (payload.rows ?? []).map((r) => ({
+    sig: r.signature,
+    kind: r.kind,
+    path: (r.path ?? "").replace(/:\d+.*$/, ""),
+  }));
+}
+
+// Mirrors isAbstain()'s meaning on the structured payload: `matched:false` is
+// the abstain return, and confidence "none" is the same judgement by another
+// name. An empty row set counts too, matching the MCP side.
+function askIsAbstain(payload) {
+  return (
+    payload.matched === false ||
+    (payload.rows ?? []).length === 0 ||
+    (payload.confidence ?? "").toLowerCase() === "none"
+  );
+}
+
+async function runAskSeeded() {
+  const { queries } = JSON.parse(readFileSync(seededPath, "utf8"));
+  const rows = [];
+  for (const q of queries) {
+    const r = await askOnce(q.query);
+    if (!r.ok) {
+      rows.push({ id: q.id, category: q.category, expect: q.expect, rank: 0, abstain: true, ms: Math.round(r.ms), error: r.error, docsInBody: 0 });
+      continue;
+    }
+    const nodes = askCodeNodes(r.payload);
+    rows.push({
+      id: q.id,
+      category: q.category,
+      expect: q.expect,
+      rank: q.expect.length ? hitRank(nodes, q.expect) : 0,
+      abstain: askIsAbstain(r.payload),
+      ms: Math.round(r.ms),
+      docsInBody: (r.payload.docs ?? []).length,
+    });
+  }
+  return rows;
+}
+
+async function runAskDocs() {
+  const { queries } = JSON.parse(readFileSync(docsPath, "utf8"));
+  const rows = [];
+  for (const q of queries) {
+    const r = await askOnce(q.query);
+    if (!r.ok) {
+      rows.push({ id: q.id, query: q.query, rank: 0, nDocs: 0, ms: Math.round(r.ms), error: r.error, entries: [] });
+      continue;
+    }
+    const entries = (r.payload.docs ?? []).map(parseDocLine).filter(Boolean);
+    rows.push({
+      id: q.id,
+      query: q.query,
+      rank: docHitRank(entries, q),
+      nDocs: entries.length,
+      ms: Math.round(r.ms),
+      matched: r.payload.matched === true,
+      entries,
+    });
+  }
+  return rows;
+}
+
+// Per-query comparison against the get_context arm. Two failure shapes, both
+// real regressions and both invisible to gates 1-4:
+//   presence — one surface rendered a docs section and the other did not (the
+//              #516 shape: a surface whose hook was never armed just goes quiet)
+//   top1     — both rendered, but disagree on the leading entry (a renderer,
+//              floor or budget divergence between the surfaces)
+// Ranks below 1 are deliberately not compared: `ask` is fixed at
+// DEFAULT_TOKEN_BUDGET (4096) while the MCP arm runs at BENCH_BUDGET, so the
+// tail of the list is legitimately budget-sensitive. Top-1 is not.
+function compareSurfaces(mcpRows, askRows) {
+  const byId = new Map(mcpRows.map((r) => [r.id, r]));
+  const disagreements = [];
+  let comparable = 0;
+  for (const a of askRows) {
+    const m = byId.get(a.id);
+    if (!m) continue;
+    comparable++;
+    const mTop = m.topEntry ?? null;
+    const aTop = a.entries[0] ?? null;
+    if (!!mTop !== !!aTop) {
+      disagreements.push({ id: a.id, kind: "presence", getContext: mTop, ask: aTop });
+      continue;
+    }
+    if (!mTop) continue;
+    const same =
+      mTop.path === aTop.path && normHeading(mTop.heading) === normHeading(aTop.heading);
+    if (!same) disagreements.push({ id: a.id, kind: "top1", getContext: mTop, ask: aTop });
+  }
+  return { comparable, disagreements };
+}
+
+function summarizeAskDocs(rows) {
+  const n = rows.length;
+  const hit = (k) => rows.filter((r) => r.rank >= 1 && r.rank <= k).length;
+  return {
+    n,
+    "hit@1": +(hit(1) / Math.max(1, n)).toFixed(3),
+    "hit@3": +(hit(3) / Math.max(1, n)).toFixed(3),
+    medianMs: Math.round(median(rows.map((r) => r.ms))),
+    queriesWithDocs: rows.filter((r) => r.nDocs > 0).length,
+    errors: rows.filter((r) => r.error).length,
+  };
+}
+
 function summarizeDocs(rows) {
   const n = rows.length;
   const hit = (k) => rows.filter((r) => r.rank >= 1 && r.rank <= k).length;
@@ -388,12 +611,114 @@ const { rows: docsRows, probeRows } = await runDocs();
 const docsSummary = summarizeDocs(docsRows);
 console.error(JSON.stringify(docsSummary, null, 2));
 
+// ── Gate 5: the `ask` surface ───────────────────────────────────────────────
+// Owns the daemon for the duration. `daemonWasRunning` decides what to restore.
+const daemonWasRunning = await daemonRunning();
+let harnessDaemon = null;
+let restored = false;
+
+async function restoreDaemon() {
+  if (restored) return;
+  restored = true;
+  try {
+    if (harnessDaemon) harnessDaemon.kill();
+  } catch {}
+  await daemonStop();
+  if (daemonWasRunning) {
+    await run(BIN, ["daemon", "start"], { timeoutMs: 60000 });
+    console.error(
+      "[ask] restarted the daemon that was running before this run. Its original " +
+        "environment could not be recovered, so any env it was started with is gone."
+    );
+  }
+}
+
+// A killed harness must not leave a docs-enabled daemon behind: it would change
+// what every later `travsr ask` on this machine returns, with nothing on screen
+// to say why.
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    void restoreDaemon().finally(() => process.exit(130));
+  });
+}
+
+let askSummary = null;
+let askOffSummary = null;
+let askOnSummary = null;
+let askDocsRowsOut = [];
+let askOffLeak = 0;
+let surfaceCmp = { comparable: 0, disagreements: [] };
+let askError = null;
+let askDaemonReadyMs = null;
+
+try {
+  console.error("\n[ask/off] restarting daemon with TRAVSR_DOCS_ENABLED unset...");
+  await daemonStop();
+  harnessDaemon = (await daemonStart({ TRAVSR_DOCS_ENABLED: "" })).child;
+  const askOffRows = await runAskSeeded();
+  docsEnabledGlobal = false;
+  askOffSummary = summarizeCode(askOffRows);
+  // With the lane off, no query on any surface may render a docs section —
+  // the feature ships default-OFF, so a single leaked line is a shipped-state
+  // bug, not a ranking nit.
+  askOffLeak = askOffRows.filter((r) => r.docsInBody > 0).length;
+  console.error(JSON.stringify(askOffSummary, null, 2));
+
+  console.error("\n[ask/on] restarting daemon with TRAVSR_DOCS_ENABLED=1...");
+  harnessDaemon.kill();
+  await daemonStop();
+  const started = await daemonStart({ TRAVSR_DOCS_ENABLED: "1" });
+  harnessDaemon = started.child;
+  askDaemonReadyMs = started.readyMs;
+  const askOnRows = await runAskSeeded();
+  docsEnabledGlobal = true;
+  askOnSummary = summarizeCode(askOnRows);
+  console.error(JSON.stringify(askOnSummary, null, 2));
+
+  console.error("\n[ask/docs] running queries-docs through `travsr ask --format json`...");
+  askDocsRowsOut = await runAskDocs();
+  askSummary = summarizeAskDocs(askDocsRowsOut);
+  console.error(JSON.stringify(askSummary, null, 2));
+  surfaceCmp = compareSurfaces(docsRows, askDocsRowsOut);
+} catch (e) {
+  askError = String(e?.message ?? e);
+  console.error(`[ask] arm failed: ${askError}`);
+} finally {
+  await restoreDaemon();
+}
+
 // ── gate verdicts ───────────────────────────────────────────────────────────
 const gate1 = docsSummary["hit@1"] >= 0.6 && docsSummary["hit@3"] >= 0.9;
 const gate2 = onSummary["hit@1"] === offSummary["hit@1"] && onSummary["hit@10"] === offSummary["hit@10"];
 const gate3 = onSummary.abstainRate === offSummary.abstainRate;
 const inference = summarizeInference(docsRows, probeRows);
 const gate4 = inference.pass;
+
+// Gate 5 has four conditions, and every one of them is a bug this project has
+// actually shipped at least once:
+//   5a  doc hit@1/hit@3 on `ask`, same thresholds as Gate 1 — the surface has
+//       to be useful, not merely non-empty.
+//   5b  vacuity — if no query produced a docs section on `ask`, the arm proves
+//       nothing and must not report green. This is #516's exact shape: silent
+//       None, no error, no section.
+//   5c  cross-surface parity — presence and top-1 agreement with get_context.
+//   5d  no code regression on `ask` between docs off and on, mirroring gates
+//       2 and 3 on the second surface.
+const askVacuous = !askSummary || askSummary.queriesWithDocs === 0;
+const askCodeStable =
+  !!askOffSummary &&
+  !!askOnSummary &&
+  askOnSummary["hit@1"] === askOffSummary["hit@1"] &&
+  askOnSummary["hit@10"] === askOffSummary["hit@10"] &&
+  askOnSummary.abstainRate === askOffSummary.abstainRate;
+const askHit = !!askSummary && askSummary["hit@1"] >= 0.6 && askSummary["hit@3"] >= 0.9;
+const gate5 =
+  !askError &&
+  !askVacuous &&
+  askHit &&
+  askCodeStable &&
+  askOffLeak === 0 &&
+  surfaceCmp.disagreements.length === 0;
 
 // Not a gate. The docs lane runs a second cross-encoder pass per query (§12),
 // which dominates the wall-clock delta and is an accepted cost pending the
@@ -413,6 +738,23 @@ const report = {
   gate2_codeRegression: { pass: gate2, off: offSummary, on: onSummary, perQueryRegressions },
   gate3_abstainRegression: { pass: gate3, offAbstainRate: offSummary.abstainRate, onAbstainRate: onSummary.abstainRate },
   gate4_singleInference: inference,
+  gate5_askSurface: {
+    pass: gate5,
+    error: askError,
+    vacuous: askVacuous,
+    docs: askSummary,
+    codeOff: askOffSummary,
+    codeOn: askOnSummary,
+    codeStable: askCodeStable,
+    docsLeakedWhileOff: askOffLeak,
+    surfaceParity: surfaceCmp,
+    daemonReadyMs: askDaemonReadyMs,
+    daemonWasRunningBefore: daemonWasRunning,
+    threshold:
+      "ask hit@1>=0.60, hit@3>=0.90; >=1 query rendering docs; zero presence/top-1 " +
+      "disagreement with get_context; zero code hit/abstain movement docs off vs on",
+    rows: askDocsRowsOut,
+  },
   crossEncoderCost: {
     gating: false,
     accepted: true,
@@ -451,6 +793,42 @@ for (const v of inference.violations) {
   console.error(`  !! ${v.id}: ${v.inferences} query-embedding inferences (spaces: ${v.spaces.join(",")})`);
 }
 console.error(
+  `Gate 5 (ask surface):       ${gate5 ? "PASS" : "FAIL"}  ` +
+    (askSummary
+      ? `(hit@1=${askSummary["hit@1"]}, hit@3=${askSummary["hit@3"]}, ` +
+        `${askSummary.queriesWithDocs}/${askSummary.n} queries rendered docs, ` +
+        `${surfaceCmp.disagreements.length} surface disagreement(s))`
+      : `(arm did not complete)`)
+);
+if (askError) {
+  console.error(`  !! ask arm failed: ${askError}`);
+}
+if (!askError && askVacuous) {
+  console.error(
+    `  !! VACUOUS: no query rendered a docs section on the ask surface. Either the ` +
+      `daemon-side hook is not armed (#516's shape), the sidecar predates the doc space, ` +
+      `or the repo has no doc-chunk nodes. Gate 5 proves nothing in this state.`
+  );
+}
+if (askOffLeak > 0) {
+  console.error(
+    `  !! ${askOffLeak} quer(ies) rendered a docs section on \`ask\` with the lane OFF — ` +
+      `the feature ships default-off, so this is a shipped-state leak.`
+  );
+}
+if (!askCodeStable && askOffSummary && askOnSummary) {
+  console.error(
+    `  !! ask code results moved when the docs lane was enabled: ` +
+      `hit@1 ${askOffSummary["hit@1"]}->${askOnSummary["hit@1"]}, ` +
+      `hit@10 ${askOffSummary["hit@10"]}->${askOnSummary["hit@10"]}, ` +
+      `abstain ${askOffSummary.abstainRate}->${askOnSummary.abstainRate}`
+  );
+}
+for (const d of surfaceCmp.disagreements) {
+  const fmt = (e) => (e ? `${e.path} § ${e.heading}` : "(no docs section)");
+  console.error(`  !! ${d.id} [${d.kind}]: get_context=${fmt(d.getContext)} | ask=${fmt(d.ask)}`);
+}
+console.error(
   `\n[not a gate] cross-encoder cost: ratio=${latencyRatio.toFixed(3)} ` +
     `(off=${offSummary.medianMs}ms on=${onSummary.medianMs}ms) — accepted, §12 selective reranking is the follow-up`
 );
@@ -459,3 +837,9 @@ if (perQueryRegressions.length) {
   for (const r of perQueryRegressions) console.error(`  ${r.id}: rank ${r.offRank}->${r.onRank}, abstain ${r.offAbstain}->${r.onAbstain}`);
 }
 console.error(`\nwrote bench/report-phase2-gate-${LABEL}.json`);
+
+// This is a gate: a non-zero exit is the whole point of running it in CI or
+// from a wrapper. Reporting FAIL on stderr and exiting 0 is how a gate rots.
+const allPass = gate1 && gate2 && gate3 && gate4 && gate5;
+console.error(`\nOVERALL: ${allPass ? "PASS" : "FAIL"}`);
+process.exitCode = allPass ? 0 : 1;
