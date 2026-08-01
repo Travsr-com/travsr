@@ -4012,6 +4012,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "travsr-analysis",
+ "travsr-config",
  "travsr-core",
  "travsr-error",
  "travsr-plugin-host",

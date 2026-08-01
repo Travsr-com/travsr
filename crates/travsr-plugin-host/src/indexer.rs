@@ -63,13 +63,23 @@ pub struct PluginIndexer {
     dispatcher: Dispatcher,
     cache: ParseCache,
     /// Extra `docs.exclude` path-substring patterns (#376 §3.3), additive to
-    /// `travsr_analysis::markdown`'s built-in default exclusion list. Read
-    /// once from `TRAVSR_DOCS_EXCLUDE` (comma-separated) at construction —
-    /// same env-var-config convention as `TRAVSR_DISABLE_REGISTRY` elsewhere
-    /// in this crate's callers, chosen over threading a new travsr-config
-    /// dependency through `travsr-daemon` (which doesn't depend on it today)
-    /// for a single low-traffic override.
+    /// `travsr_analysis::markdown`'s built-in default exclusion list. These are
+    /// the patterns supplied *explicitly* by a caller via
+    /// [`PluginIndexer::with_doc_excludes`]; the layered-config ones are
+    /// resolved separately into [`Self::config_doc_excludes`].
     doc_excludes: Vec<String>,
+    /// #376 O1: the `docs.exclude` config key resolved across
+    /// `env > repo > global`, cached after the first markdown file this indexer
+    /// sees.
+    ///
+    /// Resolved lazily, and the repo layer located by walking up from the file
+    /// being parsed, because `PluginIndexer` is constructed from seven different
+    /// places across `travsr-daemon` and `travsr-cli` and none of them carries a
+    /// repo root. Threading one through all seven would work until someone added
+    /// an eighth and it silently read only the env layer — the class of silent
+    /// divergence this whole item exists to remove. Self-locating is correct at
+    /// every construction site by construction.
+    config_doc_excludes: Option<Vec<String>>,
 }
 
 impl PluginIndexer {
@@ -81,7 +91,8 @@ impl PluginIndexer {
             corpus,
             dispatcher,
             cache: ParseCache::new(),
-            doc_excludes: doc_excludes_from_env(),
+            doc_excludes: Vec::new(),
+            config_doc_excludes: None,
         }
     }
 
@@ -127,11 +138,9 @@ impl PluginIndexer {
                         });
                 }
                 if lang == Some(Language::Markdown) {
+                    let excludes = self.doc_excludes_for(abs_path);
                     return travsr_analysis::markdown::parse(
-                        &corpus,
-                        abs_path,
-                        vname_path,
-                        &self.doc_excludes,
+                        &corpus, abs_path, vname_path, &excludes,
                     )
                     .map_err(|e| IndexError::Parse {
                         file: abs_path.display().to_string(),
@@ -147,12 +156,30 @@ impl PluginIndexer {
     }
 
     /// Add extra path-substring patterns (`docs.exclude`, #376 §3.3) beyond
-    /// whatever `TRAVSR_DOCS_EXCLUDE` already supplied. Mainly for tests that
-    /// want a deterministic exclusion list independent of the process
-    /// environment.
+    /// whatever the layered config supplies. Mainly for tests that want a
+    /// deterministic exclusion list, and for callers with patterns that are not
+    /// user configuration.
     pub fn with_doc_excludes(mut self, mut patterns: Vec<String>) -> Self {
         self.doc_excludes.append(&mut patterns);
         self
+    }
+
+    /// The full `docs.exclude` pattern list for a file: the caller's explicit
+    /// patterns plus the layered-config ones, which are resolved once and then
+    /// reused for every subsequent file (#376 O1).
+    fn doc_excludes_for(&mut self, abs_path: &Path) -> Vec<String> {
+        if self.config_doc_excludes.is_none() {
+            let repo_root = find_repo_root(abs_path);
+            self.config_doc_excludes = Some(travsr_config::effective_list(
+                "docs.exclude",
+                repo_root.as_deref(),
+            ));
+        }
+        let mut all = self.doc_excludes.clone();
+        if let Some(cfg) = &self.config_doc_excludes {
+            all.extend(cfg.iter().cloned());
+        }
+        all
     }
 
     /// Phase B: semantic indexing for all registered languages.
@@ -863,22 +890,19 @@ impl PluginIndexer {
     }
 }
 
-/// Parse `TRAVSR_DOCS_EXCLUDE` (comma-separated path substrings, #376 §3.3)
-/// once per [`PluginIndexer`] construction. Empty/unset is the common case
-/// and yields an empty `Vec` — the built-in default exclusion list in
-/// `travsr_analysis::markdown` already does the heavy lifting; this only
-/// carries a user's *additional* patterns.
-fn doc_excludes_from_env() -> Vec<String> {
-    std::env::var("TRAVSR_DOCS_EXCLUDE")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+/// Locate the repo whose `.travsr/config.toml` governs `abs_path`, by walking
+/// up from the file being indexed until a `.travsr` directory appears (#376 O1).
+///
+/// `.travsr` rather than `.git`: it is the directory that holds both the index
+/// and the per-repo config, so it is exactly the marker that answers "which
+/// repo's config applies to this file". A file outside any indexed repo yields
+/// `None`, which degrades to the env and global layers.
+fn find_repo_root(abs_path: &Path) -> Option<PathBuf> {
+    abs_path
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join(".travsr").is_dir())
+        .map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -959,6 +983,57 @@ mod tests {
         );
         assert!(outcome.ran.is_empty(), "expected no langs ran");
         assert!(outcome.crashed.is_empty(), "expected no crashes");
+    }
+
+    /// #376 O1: `find_repo_root` must locate the `.travsr`-bearing ancestor of
+    /// the file being indexed, so a `PluginIndexer` built anywhere still reads
+    /// the right repo's `docs.exclude`. A file outside any indexed repo yields
+    /// `None` (env + global layers only), never a panic.
+    #[test]
+    fn find_repo_root_walks_up_to_the_travsr_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".travsr")).expect("mk .travsr");
+        std::fs::create_dir_all(root.join("docs").join("adrs")).expect("mk docs");
+        let file = root.join("docs").join("adrs").join("ADR-001.md");
+        std::fs::write(&file, "# hi").expect("write");
+
+        assert_eq!(
+            find_repo_root(&file).as_deref(),
+            Some(root),
+            "must find the .travsr-bearing ancestor"
+        );
+
+        // A `.travsr` *file* (not a directory) must not be mistaken for a root.
+        let other = tempfile::tempdir().expect("tempdir2");
+        std::fs::write(other.path().join(".travsr"), "not a dir").expect("write");
+        let stray = other.path().join("README.md");
+        std::fs::write(&stray, "# hi").expect("write");
+        assert_eq!(find_repo_root(&stray), None);
+    }
+
+    /// Explicit `with_doc_excludes` patterns and layered-config ones are
+    /// additive, and the resolution happens once per indexer rather than per
+    /// file.
+    #[test]
+    fn doc_excludes_merge_explicit_and_config_layers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".travsr")).expect("mk .travsr");
+        let file = root.join("README.md");
+        std::fs::write(&file, "# hi").expect("write");
+
+        let mut indexer =
+            PluginIndexer::new("test-corpus").with_doc_excludes(vec!["explicit/".to_string()]);
+        let resolved = indexer.doc_excludes_for(&file);
+        assert!(
+            resolved.contains(&"explicit/".to_string()),
+            "caller-supplied patterns must survive the merge: {resolved:?}"
+        );
+        assert!(
+            indexer.config_doc_excludes.is_some(),
+            "config layer must be resolved and cached after the first file"
+        );
     }
 
     /// P2 determinism: two calls with the same (empty) present_languages gate

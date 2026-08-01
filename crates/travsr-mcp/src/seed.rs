@@ -631,28 +631,55 @@ pub(crate) fn doc_floor() -> f32 {
         .unwrap_or(0.42)
 }
 
-/// Plan §4.2: "cap the section at 3 entries." Implemented as an env var
-/// (`docs.max_results` in the plan's §5 table) rather than a `travsr-config`
-/// key — see the Phase 1 completion notes on why travsr-mcp/travsr-daemon
-/// don't wire that dependency for a handful of scalar overrides.
-pub(crate) fn docs_max_results() -> usize {
-    std::env::var("TRAVSR_DOCS_MAX_RESULTS")
+/// The repo root this process is serving, as recorded in `graph.db` meta at
+/// index time — the same lookup `tools.rs` uses to resolve snippet paths. It is
+/// how a retrieval-side config read finds the *repo's* `.travsr/config.toml`
+/// without threading a path through every call site (the `Calibration::load`
+/// precedent).
+///
+/// `None` degrades to global-config-and-env only, which is correct: an
+/// in-memory or path-less store has no repo layer to read.
+fn config_repo_root(store: &SqliteStore) -> Option<std::path::PathBuf> {
+    store
+        .get_meta("repo_root")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Plan §4.2: "cap the section at 3 entries."
+///
+/// #376 O1: resolved through the layered config (`env > repo > global >
+/// default`), not the environment alone. See [`docs_enabled`] for why that
+/// distinction is load-bearing rather than cosmetic.
+pub(crate) fn docs_max_results(store: &SqliteStore) -> usize {
+    travsr_config::effective("docs.max_results", config_repo_root(store).as_deref())
+        .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&x| x > 0)
         .unwrap_or(3)
 }
 
-/// Plan §7: Phase 2 ships **default OFF** — flips on only after all four
-/// gates pass on both bench repos (doc hit@1/hit@3, zero code regression,
-/// zero abstain regression, latency parity), with the report committed as
-/// `bench/report-docs-<repo>.md`. Distinct from hook *availability*
-/// (`doc_knn` being `Some`): this is the feature flag, that is the capability
-/// gate (old sidecar, or a repo with no doc-chunk nodes at all).
-pub(crate) fn docs_enabled() -> bool {
-    std::env::var("TRAVSR_DOCS_ENABLED")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+/// Plan §7: the docs lane's feature flag. Distinct from hook *availability*
+/// (`doc_knn` being `Some`): this is the flag, that is the capability gate (old
+/// sidecar, or a repo with no doc-chunk nodes at all).
+///
+/// # Why this is a config key and not an env var (#376 O1 / G1)
+///
+/// Retrieval happens in whichever process holds the index — the **daemon** for
+/// `travsr ask`, the MCP server for `get_context`. `TRAVSR_DOCS_ENABLED=1`
+/// exported in a user's shell therefore reaches the CLI, which is not the
+/// process that reads this, and does nothing at all with no error and no
+/// warning (plan §18.7, and §20.3 F-D which added the CLI-side note). A config
+/// key is read by whichever process performs the retrieval, from a file both
+/// processes can see, which is the only form of this switch that works.
+///
+/// Env still wins when set (it is the highest stored layer), so every existing
+/// script, test and bench harness that exports the variable in the *daemon's*
+/// environment keeps its current behaviour byte-for-byte.
+pub(crate) fn docs_enabled(store: &SqliteStore) -> bool {
+    travsr_config::effective_bool("docs.enabled", config_repo_root(store).as_deref())
+        .unwrap_or(false)
 }
 
 /// The single lock serializing every test that mutates the process-global
@@ -671,10 +698,11 @@ pub(crate) static DOCS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// Plan §4.3: percentage of `token_budget` the docs section may claim — a
 /// clamp applied to the *measured* doc-block token cost, never a reservation
 /// (a docs-free repo/query must stay byte-identical to pre-Phase-2 output).
-pub(crate) fn docs_budget_pct() -> f32 {
-    std::env::var("TRAVSR_DOCS_BUDGET_PCT")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
+///
+/// #376 O1: layered like the other two user-facing docs knobs.
+pub(crate) fn docs_budget_pct(store: &SqliteStore) -> f32 {
+    travsr_config::effective("docs.budget_pct", config_repo_root(store).as_deref())
+        .and_then(|v| v.trim().parse::<f32>().ok())
         .filter(|&x| x > 0.0 && x <= 100.0)
         .unwrap_or(20.0)
 }
@@ -688,14 +716,17 @@ pub(crate) fn docs_budget_pct() -> f32 {
 /// `tools::rerank_doc_candidates`'s cosine fallback when the reranker has no
 /// opinion (§4.2: below the floor this returns an empty `Vec`, and the caller
 /// must render no docs section at all — "absent, not empty-ish").
-pub(crate) fn cosine_floor_select(candidates: Vec<(NodeId, f32)>) -> Vec<(NodeId, f32)> {
+pub(crate) fn cosine_floor_select(
+    store: &SqliteStore,
+    candidates: Vec<(NodeId, f32)>,
+) -> Vec<(NodeId, f32)> {
     let floor = doc_floor();
     let mut hits: Vec<(NodeId, f32)> = candidates
         .into_iter()
         .filter(|&(_, score)| score >= floor)
         .collect();
     hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    hits.truncate(docs_max_results());
+    hits.truncate(docs_max_results(store));
     hits
 }
 
@@ -787,10 +818,11 @@ pub(crate) const DOC_RERANK_FLOOR: f32 = 0.05;
 /// The query is normalized through [`doc_lane_query`] first — see that
 /// function for why that is load-bearing rather than cosmetic.
 pub(crate) fn doc_lane_candidates(
+    store: &SqliteStore,
     query: &str,
     doc_knn: Option<DocKnnFn<'_>>,
 ) -> Vec<(NodeId, f32)> {
-    if !docs_enabled() {
+    if !docs_enabled(store) {
         return vec![];
     }
     let Some(knn) = doc_knn else {
@@ -5006,13 +5038,78 @@ mod tests {
         assert_eq!(doc_floor(), 0.42);
     }
 
+    /// A store plus a hermetic config environment for the docs knobs (#376 O1).
+    ///
+    /// The knobs now resolve through `travsr_config` (`env > repo > global >
+    /// default`), so a test that merely cleared the env var would still read the
+    /// developer's real `~/.travsr/config.toml` — a machine with
+    /// `docs.enabled = true` set globally would flip these assertions. Both file
+    /// layers are redirected into a fresh tempdir: `HOME` for the global layer,
+    /// and the store's `repo_root` meta for the repo layer.
+    ///
+    /// Callers **must** hold [`DOCS_ENV_LOCK`]: `HOME` is process-global, and
+    /// that is the same lock the env knobs are already serialized on.
+    struct DocsConfigEnv {
+        dir: tempfile::TempDir,
+        prev_home: Option<std::ffi::OsString>,
+        store: SqliteStore,
+    }
+
+    impl DocsConfigEnv {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let prev_home = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir.path().join("home"));
+
+            let repo = dir.path().join("repo");
+            std::fs::create_dir_all(repo.join(".travsr")).expect("mk repo/.travsr");
+            let mut store = SqliteStore::open_in_memory().expect("store");
+            store
+                .set_meta("repo_root", &repo.to_string_lossy())
+                .expect("set repo_root");
+
+            for k in [
+                "TRAVSR_DOCS_ENABLED",
+                "TRAVSR_DOCS_MAX_RESULTS",
+                "TRAVSR_DOCS_BUDGET_PCT",
+            ] {
+                std::env::remove_var(k);
+            }
+            Self {
+                dir,
+                prev_home,
+                store,
+            }
+        }
+
+        fn repo_root(&self) -> std::path::PathBuf {
+            self.dir.path().join("repo")
+        }
+
+        /// Write a key into the *repo* layer, the one a user gets from
+        /// `travsr config set <key> <value>` inside a repo.
+        fn set_repo(&self, key: &str, value: &str) {
+            travsr_config::set(key, value, travsr_config::Scope::Repo(self.repo_root()))
+                .expect("config set");
+        }
+    }
+
+    impl Drop for DocsConfigEnv {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     #[test]
     fn docs_max_results_default_is_3() {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("TRAVSR_DOCS_MAX_RESULTS");
-        assert_eq!(docs_max_results(), 3);
+        let env = DocsConfigEnv::new();
+        assert_eq!(docs_max_results(&env.store), 3);
     }
 
     #[test]
@@ -5020,10 +5117,10 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("TRAVSR_DOCS_ENABLED");
-        assert!(!docs_enabled());
+        let env = DocsConfigEnv::new();
+        assert!(!docs_enabled(&env.store));
         std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
-        assert!(docs_enabled());
+        assert!(docs_enabled(&env.store));
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
     }
 
@@ -5032,8 +5129,71 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("TRAVSR_DOCS_BUDGET_PCT");
-        assert_eq!(docs_budget_pct(), 20.0);
+        let env = DocsConfigEnv::new();
+        assert_eq!(docs_budget_pct(&env.store), 20.0);
+    }
+
+    /// #376 O1 / G1, the item this plumbing exists for: the switch must be
+    /// operable from `travsr config set` with **no environment variable at
+    /// all**, because the process that reads it (the daemon for `ask`, the MCP
+    /// server for `get_context`) does not inherit the user's shell env.
+    #[test]
+    fn docs_knobs_are_settable_from_repo_config_without_any_env_var() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
+
+        assert!(!docs_enabled(&env.store), "default off");
+        env.set_repo("docs.enabled", "true");
+        assert!(
+            docs_enabled(&env.store),
+            "repo config must turn the lane on"
+        );
+
+        env.set_repo("docs.max_results", "7");
+        assert_eq!(docs_max_results(&env.store), 7);
+        env.set_repo("docs.budget_pct", "35");
+        assert_eq!(docs_budget_pct(&env.store), 35.0);
+    }
+
+    /// Env stays the highest stored layer, so every existing script and bench
+    /// harness that exports the variable in the *daemon's* environment keeps
+    /// working byte-for-byte after O1.
+    #[test]
+    fn env_still_overrides_repo_config() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
+        env.set_repo("docs.enabled", "true");
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "0");
+        assert!(
+            !docs_enabled(&env.store),
+            "env must win over the repo config layer"
+        );
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        assert!(docs_enabled(&env.store), "and the repo layer applies again");
+    }
+
+    /// A malformed value must fall through to the built-in default rather than
+    /// guessing: a typo in `config.toml` cannot silently flip the lane on, and
+    /// cannot brick retrieval either.
+    #[test]
+    fn garbage_config_value_falls_back_to_default() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
+        // `set` would reject this, so write the file directly — the case is a
+        // hand-edited config.toml, which is exactly how it reaches us.
+        std::fs::write(
+            env.repo_root().join(".travsr").join("config.toml"),
+            "[docs]\nenabled = \"ture\"\nmax_results = \"lots\"\n",
+        )
+        .expect("write config");
+        assert!(!docs_enabled(&env.store));
+        assert_eq!(docs_max_results(&env.store), 3);
     }
 
     /// docs.enabled=false (the Phase 2 ship default) must return no doc
@@ -5044,9 +5204,9 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        let env = DocsConfigEnv::new();
         let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
-        assert!(doc_lane_candidates("query", Some(hook)).is_empty());
+        assert!(doc_lane_candidates(&env.store, "query", Some(hook)).is_empty());
     }
 
     #[test]
@@ -5054,8 +5214,9 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
         std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
-        assert!(doc_lane_candidates("query", None).is_empty());
+        assert!(doc_lane_candidates(&env.store, "query", None).is_empty());
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
     }
 
@@ -5068,6 +5229,7 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
         std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
 
         let hook: DocKnnFn<'_> = &|_q, _k| {
@@ -5078,7 +5240,7 @@ mod tests {
                 (NodeId(4), 0.70),
             ]
         };
-        let hits = doc_lane_candidates("query", Some(hook));
+        let hits = doc_lane_candidates(&env.store, "query", Some(hook));
         assert_eq!(
             hits,
             vec![
@@ -5158,6 +5320,7 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
         std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
 
         let seen = std::sync::Mutex::new(String::new());
@@ -5166,7 +5329,7 @@ mod tests {
             vec![]
         };
         let raw = "how does the knapsack enforce the token budget?";
-        let _ = doc_lane_candidates(raw, Some(hook));
+        let _ = doc_lane_candidates(&env.store, raw, Some(hook));
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
@@ -5189,6 +5352,7 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
         std::env::set_var("TRAVSR_DOC_FLOOR", "0.5");
         std::env::set_var("TRAVSR_DOCS_MAX_RESULTS", "2");
 
@@ -5198,7 +5362,7 @@ mod tests {
             (NodeId(3), 0.40), // below floor
             (NodeId(4), 0.70),
         ];
-        let hits = cosine_floor_select(candidates);
+        let hits = cosine_floor_select(&env.store, candidates);
         assert_eq!(
             hits,
             vec![(NodeId(2), 0.90), (NodeId(4), 0.70)],
@@ -5214,10 +5378,11 @@ mod tests {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
         std::env::set_var("TRAVSR_DOC_FLOOR", "0.42");
 
         let candidates = vec![(NodeId(1), 0.30), (NodeId(2), 0.38)];
-        assert!(cosine_floor_select(candidates).is_empty());
+        assert!(cosine_floor_select(&env.store, candidates).is_empty());
 
         std::env::remove_var("TRAVSR_DOC_FLOOR");
     }
