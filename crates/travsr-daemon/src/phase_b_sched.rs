@@ -18,6 +18,24 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Outcome of a background Phase B run, reported via
+/// [`PhaseBScheduler::finish_with_outcome`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunOutcome {
+    /// No language crashed — `phase_b_commit` advanced (or was already fresh).
+    Success,
+    /// At least one language produced results but another crashed.
+    /// `phase_b_commit` did NOT advance (C4), so the daemon's tick re-arms the
+    /// scheduler immediately and, without a gate, Phase B would re-run every
+    /// ~5–30 s — each run writing graph.db, which since #464 also bumps
+    /// `data_version` and thrashes the warm query cache. Triggers exponential
+    /// back-off instead of the all-crash retry cap: partial progress means the
+    /// toolchain still works and retrying (slowly) is worthwhile.
+    Partial,
+    /// Every sidecar crashed. Counts toward the `MAX_FAILURES` retry cap.
+    AllCrashed,
+}
+
 /// Pending-run state (FT-M6). `deadline` is the debounce target (pushed forward
 /// by each commit); `first_arm` is when the *current* pending window opened and
 /// is NOT pushed forward: it anchors the max-staleness ceiling so a fast commit
@@ -44,12 +62,24 @@ pub struct PhaseBScheduler {
     /// until the daemon is restarted, preventing an infinite crash-retry loop when
     /// all Phase B sidecars are broken (e.g. tools not installed).
     consecutive_failures: AtomicU32,
+    /// Consecutive partial-crash runs (some languages ran, ≥1 crashed). Drives
+    /// the exponential re-run back-off; reset by the first clean run.
+    consecutive_partials: AtomicU32,
+    /// Claim gate set after a partial-crash run: `try_claim` refuses to start a
+    /// run before this instant. Cleared on a clean run or `reset_failures`.
+    backoff_until: Mutex<Option<Instant>>,
 }
 
 impl PhaseBScheduler {
     const MAX_FAILURES: u32 = 3;
     /// Default ceiling when constructed via `new`. 10× the 30 s debounce.
     const DEFAULT_MAX_DEFER: Duration = Duration::from_secs(300);
+    /// First delay after a partial-crash run; doubles per consecutive partial.
+    const PARTIAL_BACKOFF_BASE: Duration = Duration::from_secs(60);
+    /// Ceiling for the partial-crash back-off (15 min): keep retrying so a
+    /// fixed toolchain is picked up, but stop thrashing graph.db and the warm
+    /// query cache in the meantime.
+    const PARTIAL_BACKOFF_CAP: Duration = Duration::from_secs(900);
 }
 
 impl PhaseBScheduler {
@@ -66,14 +96,19 @@ impl PhaseBScheduler {
             debounce,
             max_defer,
             consecutive_failures: AtomicU32::new(0),
+            consecutive_partials: AtomicU32::new(0),
+            backoff_until: Mutex::new(None),
         }
     }
 
-    /// Reset the consecutive-failure counter. Called by `travsr daemon restart`
-    /// so a user can recover without restarting the whole machine.
+    /// Reset the consecutive-failure counter and the partial-crash back-off.
+    /// Called by `travsr daemon restart` so a user can recover without
+    /// restarting the whole machine.
     #[allow(dead_code)]
     pub fn reset_failures(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.consecutive_partials.store(0, Ordering::Relaxed);
+        *self.backoff_until.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Arm (or re-arm) a re-run for `debounce` from now. Called after a
@@ -123,6 +158,15 @@ impl PhaseBScheduler {
         if self.consecutive_failures.load(Ordering::Relaxed) >= Self::MAX_FAILURES {
             return false;
         }
+        // Partial-crash back-off (#464 follow-up): after a partial run
+        // `phase_b_commit` lags HEAD, so the daemon tick re-arms every 5 s —
+        // without this gate Phase B would re-run continuously, each run
+        // writing graph.db and invalidating the warm query cache.
+        if let Some(until) = *self.backoff_until.lock().unwrap_or_else(|e| e.into_inner()) {
+            if now < until {
+                return false;
+            }
+        }
         let mut d = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
         let due = match *d {
             Some(st) => {
@@ -154,20 +198,55 @@ impl PhaseBScheduler {
     }
 
     /// Release the single-flight slot when a background run finishes.
-    /// Use [`finish_with_result`] when the caller can report success/failure.
+    /// Use [`finish_with_outcome`](Self::finish_with_outcome) when the caller
+    /// can report how the run went.
     #[allow(dead_code)]
     pub fn finish(&self) {
         self.running.store(false, Ordering::Release);
     }
 
-    /// Release the slot and record whether the run produced any output.
-    /// `succeeded` should be `true` when at least one language ran without
-    /// crashing — even partial success resets the failure counter.
+    /// Release the slot and record a binary success/failure. Kept for callers
+    /// that cannot distinguish partial crashes; maps to
+    /// [`RunOutcome::Success`] / [`RunOutcome::AllCrashed`].
+    #[allow(dead_code)]
     pub fn finish_with_result(&self, succeeded: bool) {
-        if succeeded {
-            self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.finish_with_outcome(if succeeded {
+            RunOutcome::Success
         } else {
-            self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            RunOutcome::AllCrashed
+        });
+    }
+
+    /// Release the slot and record the run's [`RunOutcome`].
+    pub fn finish_with_outcome(&self, outcome: RunOutcome) {
+        self.finish_with_outcome_at(outcome, Instant::now());
+    }
+
+    /// [`finish_with_outcome`](Self::finish_with_outcome) with an injectable
+    /// clock for deterministic tests.
+    pub fn finish_with_outcome_at(&self, outcome: RunOutcome, now: Instant) {
+        match outcome {
+            RunOutcome::Success => {
+                self.consecutive_failures.store(0, Ordering::Relaxed);
+                self.consecutive_partials.store(0, Ordering::Relaxed);
+                *self.backoff_until.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            RunOutcome::Partial => {
+                // Partial progress means the toolchain is not entirely broken:
+                // keep the all-crash retry cap out of the way, but gate the
+                // next claim behind an exponentially growing delay (60 s,
+                // 120 s, … capped at 15 min) so the re-armed run cannot
+                // thrash graph.db and the warm query cache.
+                self.consecutive_failures.store(0, Ordering::Relaxed);
+                let n = self.consecutive_partials.fetch_add(1, Ordering::Relaxed);
+                let delay = Self::PARTIAL_BACKOFF_BASE
+                    .saturating_mul(1u32 << n.min(31))
+                    .min(Self::PARTIAL_BACKOFF_CAP);
+                *self.backoff_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(now + delay);
+            }
+            RunOutcome::AllCrashed => {
+                self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.running.store(false, Ordering::Release);
     }
@@ -269,6 +348,106 @@ mod tests {
         // Scheduler is claimable again after a new mark.
         s.mark_dirty();
         assert!(s.try_claim());
+    }
+
+    #[test]
+    fn partial_crash_backs_off_exponentially() {
+        // #464 follow-up: a partial crash leaves phase_b_commit stale, so the
+        // daemon tick re-arms immediately — the back-off gate must refuse the
+        // claim until the delay elapses, doubling per consecutive partial.
+        // Virtual clock anchored in the future so mark_dirty's real-clock
+        // debounce deadline (0 s) is always already past.
+        let s = PhaseBScheduler::new(Duration::from_secs(0));
+        let t0 = Instant::now() + Duration::from_secs(1000);
+
+        s.mark_dirty();
+        assert!(s.try_claim_at(t0));
+        s.finish_with_outcome_at(RunOutcome::Partial, t0);
+
+        // First back-off: 60 s.
+        s.mark_dirty();
+        assert!(
+            !s.try_claim_at(t0 + Duration::from_secs(59)),
+            "claim gated during first back-off"
+        );
+        let t1 = t0 + Duration::from_secs(60);
+        assert!(s.try_claim_at(t1), "claimable once back-off elapses");
+        s.finish_with_outcome_at(RunOutcome::Partial, t1);
+
+        // Second consecutive partial: 120 s.
+        s.mark_dirty();
+        assert!(
+            !s.try_claim_at(t1 + Duration::from_secs(119)),
+            "back-off doubles on the second consecutive partial"
+        );
+        assert!(s.try_claim_at(t1 + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn partial_backoff_is_capped() {
+        let s = PhaseBScheduler::new(Duration::from_secs(0));
+        let t0 = Instant::now() + Duration::from_secs(1000);
+        // Drive the counter far past the doubling range.
+        for _ in 0..10 {
+            s.mark_dirty();
+            // Claim far in the future so any pending back-off has elapsed.
+            assert!(s.try_claim_at(t0 + Duration::from_secs(100_000)));
+            s.finish_with_outcome_at(RunOutcome::Partial, t0);
+        }
+        // Even after many partials the gate lifts at the 900 s cap.
+        s.mark_dirty();
+        assert!(!s.try_claim_at(t0 + Duration::from_secs(899)));
+        assert!(s.try_claim_at(t0 + Duration::from_secs(900)));
+    }
+
+    #[test]
+    fn clean_run_clears_partial_backoff() {
+        let s = PhaseBScheduler::new(Duration::from_secs(0));
+        let t0 = Instant::now() + Duration::from_secs(1000);
+        s.mark_dirty();
+        assert!(s.try_claim_at(t0));
+        s.finish_with_outcome_at(RunOutcome::Partial, t0);
+        // A later clean run (e.g. the user installed the missing tool and the
+        // capped retry succeeded) clears the gate and the counter.
+        s.mark_dirty();
+        assert!(s.try_claim_at(t0 + Duration::from_secs(60)));
+        s.finish_with_outcome_at(RunOutcome::Success, t0 + Duration::from_secs(60));
+        s.mark_dirty();
+        assert!(
+            s.try_claim_at(t0 + Duration::from_secs(61)),
+            "no residual back-off after a clean run"
+        );
+    }
+
+    #[test]
+    fn partial_does_not_trip_all_crash_cap() {
+        // Partials must never accumulate into the MAX_FAILURES hard stop —
+        // they throttle retries, not disable them.
+        let s = PhaseBScheduler::new(Duration::from_secs(0));
+        let t0 = Instant::now() + Duration::from_secs(1000);
+        for i in 0..(PhaseBScheduler::MAX_FAILURES + 2) {
+            s.mark_dirty();
+            assert!(
+                s.try_claim_at(t0 + Duration::from_secs(100_000 * (i as u64 + 1))),
+                "partial #{i} must still be claimable after back-off"
+            );
+            s.finish_with_outcome_at(RunOutcome::Partial, t0);
+        }
+        assert_eq!(s.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn reset_failures_clears_partial_backoff() {
+        let s = PhaseBScheduler::new(Duration::from_secs(0));
+        let t0 = Instant::now() + Duration::from_secs(1000);
+        s.mark_dirty();
+        assert!(s.try_claim_at(t0));
+        s.finish_with_outcome_at(RunOutcome::Partial, t0);
+        s.mark_dirty();
+        assert!(!s.try_claim_at(t0 + Duration::from_secs(1)), "gated");
+        // `travsr daemon restart` recovery path.
+        s.reset_failures();
+        assert!(s.try_claim_at(t0 + Duration::from_secs(1)), "gate cleared");
     }
 
     #[test]
