@@ -11,7 +11,7 @@ pub mod types;
 pub use codec::{decode_message, encode_message, write_message};
 pub use embed::{
     EmbedHandshakeRequest, EmbedHandshakeResponse, EmbedPlugin, EmbedPluginRequest,
-    EmbedPluginResponse, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse,
+    EmbedPluginResponse, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse, Space,
     EMBED_PROTOCOL_VERSION,
 };
 pub use ffi_marker::{FfiMarker, FfiMarkerKind};

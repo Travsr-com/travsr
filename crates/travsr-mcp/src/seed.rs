@@ -513,6 +513,10 @@ pub(crate) fn display_score(
 pub(crate) enum MatchSource {
     Exact,
     Semantic,
+    /// #376 Phase 2: a doc-chunk hit from the dedicated, floored doc-space
+    /// lane (§4). Never a member of the code seed set — it does not go
+    /// through `match_source()` below, only through `doc_lane_seeds()`.
+    Docs,
     Relevant,
 }
 
@@ -524,17 +528,21 @@ impl MatchSource {
         match self {
             MatchSource::Exact => "exact",
             MatchSource::Semantic => "semantic",
+            MatchSource::Docs => "docs",
             MatchSource::Relevant => "relevant",
         }
     }
 
-    /// Section order: certainties → strong candidates → context, so "just give me
-    /// the best node" is answered by the top section.
+    /// Section order: certainties → strong candidates → design intent →
+    /// context (plan §4.1). Docs sits below code sections so code always
+    /// leads when it has an answer, and above Relevant because graph-adjacent
+    /// filler is less informative than a floored, on-topic doc section.
     pub(crate) fn trust_rank(self) -> u8 {
         match self {
             MatchSource::Exact => 0,
             MatchSource::Semantic => 1,
-            MatchSource::Relevant => 2,
+            MatchSource::Docs => 2,
+            MatchSource::Relevant => 3,
         }
     }
 }
@@ -597,6 +605,211 @@ pub(crate) fn match_source_grouping_enabled() -> bool {
     std::env::var("TRAVSR_MATCH_SOURCE")
         .map(|v| v != "0")
         .unwrap_or(true)
+}
+
+// ── #376 Phase 2: docs lane ───────────────────────────────────────────────────
+//
+// A dedicated, dense-only, floored retrieval path for `kind == "doc-chunk"`
+// nodes (plan §4). Deliberately NOT part of `build_seed_set`/`match_source`:
+// docs never compete with code for a seed slot, are never PPR-expanded, and
+// never influence `Confidence`/abstention — see §4.3. `is_noise_seed`
+// (`tools.rs`) permanently excludes `kind == "doc-chunk"` from the generic
+// seed pipeline for exactly this reason; this module is the *only* path a
+// doc-chunk node can reach a `get_context`/`ask` response through.
+
+/// Plan §4.2: env-overridable like every other retrieval constant in this
+/// module. 0.42 measured in the plan's offline prototype (§8.3): across both
+/// bench repos no nonsense/salad query produced a doc cosine above 0.382,
+/// while gold p10 was 0.439 (k8s) / 0.469 (travsr) — 0.42 sits inside that
+/// separation gap and is reported to transfer across repos (§8.3, tentative
+/// pending a third corpus).
+pub(crate) fn doc_floor() -> f32 {
+    std::env::var("TRAVSR_DOC_FLOOR")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|&x| (0.0..=1.0).contains(&x))
+        .unwrap_or(0.42)
+}
+
+/// Plan §4.2: "cap the section at 3 entries." Implemented as an env var
+/// (`docs.max_results` in the plan's §5 table) rather than a `travsr-config`
+/// key — see the Phase 1 completion notes on why travsr-mcp/travsr-daemon
+/// don't wire that dependency for a handful of scalar overrides.
+pub(crate) fn docs_max_results() -> usize {
+    std::env::var("TRAVSR_DOCS_MAX_RESULTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&x| x > 0)
+        .unwrap_or(3)
+}
+
+/// Plan §7: Phase 2 ships **default OFF** — flips on only after all four
+/// gates pass on both bench repos (doc hit@1/hit@3, zero code regression,
+/// zero abstain regression, latency parity), with the report committed as
+/// `bench/report-docs-<repo>.md`. Distinct from hook *availability*
+/// (`doc_knn` being `Some`): this is the feature flag, that is the capability
+/// gate (old sidecar, or a repo with no doc-chunk nodes at all).
+pub(crate) fn docs_enabled() -> bool {
+    std::env::var("TRAVSR_DOCS_ENABLED")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+}
+
+/// Plan §4.3: percentage of `token_budget` the docs section may claim — a
+/// clamp applied to the *measured* doc-block token cost, never a reservation
+/// (a docs-free repo/query must stay byte-identical to pre-Phase-2 output).
+pub(crate) fn docs_budget_pct() -> f32 {
+    std::env::var("TRAVSR_DOCS_BUDGET_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|&x| x > 0.0 && x <= 100.0)
+        .unwrap_or(20.0)
+}
+
+/// Plan §4.2: "Dense-only. No BM25 leg, no RRF" (§8.1 measured BM25 worse on
+/// both repos and RRF actively hurting on travsr).
+///
+/// Pure floor+sort+cap: filters `candidates` to those at or above
+/// [`doc_floor`], sorts by descending score, and caps at [`docs_max_results`].
+/// Used both as the pre-reranker filter shape and, unchanged, as
+/// `tools::rerank_doc_candidates`'s cosine fallback when the reranker has no
+/// opinion (§4.2: below the floor this returns an empty `Vec`, and the caller
+/// must render no docs section at all — "absent, not empty-ish").
+pub(crate) fn cosine_floor_select(candidates: Vec<(NodeId, f32)>) -> Vec<(NodeId, f32)> {
+    let floor = doc_floor();
+    let mut hits: Vec<(NodeId, f32)> = candidates
+        .into_iter()
+        .filter(|&(_, score)| score >= floor)
+        .collect();
+    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(docs_max_results());
+    hits
+}
+
+pub(crate) type DocKnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
+
+// ── #376 Phase 2 prototype: cross-encoder reranking of the docs lane ─────────
+//
+// `doc_lane_seeds` above gates confidence on raw embedding cosine, which is
+// tied to whichever embedding backend is active (§8.3's DOC_FLOOR was
+// measured against arctic-embed-m-v1.5 only — a different backend's cosine
+// scale is unvalidated, the same failure class the code lane's `Calibration`
+// exists to fix). The code lane's cross-encoder (RFC-021) sidesteps this
+// entirely: its floors are pinned to the reranker MODEL, not the embedding
+// backend, and there is exactly one reranker shared across every embedding
+// backend — so a reranker-gated docs lane needs no per-embedding-model
+// calibration. It also plausibly improves precision on genuinely prose-heavy
+// text (an MS-MARCO passage ranker's home turf), unlike the code lane where
+// query-prose-vs-code-body token mismatch is a known collapse mode.
+//
+// `doc_lane_candidates` fetches a larger, unfiltered pool; the caller
+// (`tools::build_docs_section`) reranks it and falls back to `doc_floor`-style
+// cosine filtering when the reranker is unavailable/disabled/over-budget —
+// same fail-open contract as the code lane's `crate::rerank::rerank`.
+
+/// Candidate pool size for doc-lane reranking — the doc-corpus analogue of
+/// `crate::rerank::rerank_topk()` (code lane, default 30). Doc corpora are
+/// 2-4 orders of magnitude smaller than code corpora (plan §4.4), so a
+/// smaller default keeps rerank cost trivial while still giving the
+/// cross-encoder enough candidates to recover a hit that ranked below the
+/// raw-cosine top 3.
+pub(crate) fn doc_rerank_overfetch() -> usize {
+    std::env::var("TRAVSR_DOC_RERANK_OVERFETCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&x| x > 0)
+        .unwrap_or(20)
+}
+
+/// Rerank-score floor for the docs lane (plan §14.1).
+///
+/// Deliberately **not** the code lane's WEAK floor. An earlier revision reused
+/// `manifest_weak_floor()` / `DEFAULT_WEAK_FLOOR` (0.5) on the reasoning that a
+/// floor is a property of the reranker model rather than of the content being
+/// scored. The floor sweep in §14.1 disproved that: 0.5 was measured against
+/// *code* candidates, and applied to doc prose it discarded gold hits for no
+/// benefit. Measured negative-arm ceilings (every `nonsense`/`salad` query from
+/// `queries-seeded-{repo}.json` run through this lane) were 0.0023 on travsr and
+/// 0.0003 on k8s — the cross-encoder already separates unrelated prose from real
+/// doc content almost perfectly on its own, so the floor only needs to clear
+/// that noise ceiling, not to do the ranking.
+///
+/// [`DOC_RERANK_FLOOR`] gives ~20x margin over the measured ceiling. hit@k is
+/// flat across roughly `[0.01, 0.26]` and decreases monotonically above it (a
+/// floor gates presence, never rank, so raising it past the noise ceiling can
+/// only ever remove gold hits). Live-verified at this value: travsr 1.0/1.0,
+/// k8s 0.70/0.90 (§14.3).
+///
+/// Resolution is env → this default. It deliberately does **not** consult
+/// `crate::rerank::manifest_weak_floor()`, which an earlier revision did:
+/// `RerankManifest` (`travsr-rerank/src/manifest.rs`) carries only
+/// `strong_floor`/`weak_floor`, both authored against *code* candidates, and
+/// has no doc-specific field. Reading `weak_floor` here therefore resolved to
+/// 0.5 on every machine with the reranker installed — i.e. every real user —
+/// silently reinstating the borrowed floor regardless of this constant, and
+/// making §14.3's live-verified numbers reachable only via the env override.
+/// Add a `doc_weak_floor` field to the manifest before reintroducing a
+/// manifest leg here.
+///
+/// **Model scope:** validated on `ms-marco-MiniLM-L-6-v2` only. A swapped
+/// reranker can shift the negative-arm ceiling this value is calibrated
+/// against (§13 item 2 measured `bge-reranker-base` at nonsense p95 0.0094 /
+/// distractor p95 0.0393, against 0.0000 for both MS MARCO models), so a
+/// non-default reranker must re-measure the negative arm before relying on it.
+pub(crate) fn doc_rerank_floor() -> f32 {
+    floor_env("TRAVSR_DOC_RERANK_FLOOR").unwrap_or(DOC_RERANK_FLOOR)
+}
+
+/// Compiled default for [`doc_rerank_floor`]. See that function for the
+/// measurement behind the value.
+pub(crate) const DOC_RERANK_FLOOR: f32 = 0.05;
+
+/// Raw candidate pool for the docs lane: same gating as [`doc_lane_seeds`]
+/// (`docs_enabled` + hook presence) but **no cosine floor** and a larger `k`
+/// — the confidence call belongs to the reranker downstream, not to raw
+/// cosine, so filtering here would only throw away recall the reranker could
+/// have recovered. Sorted by cosine descending purely so a reranker-unavailable
+/// fallback still has a sane order to filter/cap from.
+///
+/// The query is normalized through [`doc_lane_query`] first — see that
+/// function for why that is load-bearing rather than cosmetic.
+pub(crate) fn doc_lane_candidates(
+    query: &str,
+    doc_knn: Option<DocKnnFn<'_>>,
+) -> Vec<(NodeId, f32)> {
+    if !docs_enabled() {
+        return vec![];
+    }
+    let Some(knn) = doc_knn else {
+        return vec![];
+    };
+    let k = doc_rerank_overfetch() as u32;
+    let mut hits = knn(&doc_lane_query(query), k);
+    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    hits
+}
+
+/// The exact text the docs lane sends to `knn` — identical to what the code
+/// lane sends (`tools::embed_path_seeds` normalizes with the same function
+/// before its own KNN call).
+///
+/// This is a latency contract, not a formatting nicety. Plan §4.4 promised
+/// "one inference, two searches"; the shipped protocol dropped the planned
+/// `KnnRequest.spaces: Vec<Space>` fusion in favour of one round trip per
+/// space, and restored the guarantee with a **single-slot, exact-text** memo
+/// of the last query embedding inside the sidecar
+/// (`travsr-embed`'s `embed_query_cached`). That memo only hits when both
+/// lanes present byte-identical text. While this lane sent the raw query and
+/// the code lane sent the normalized one, every query carrying sentence
+/// punctuation (a trailing `?` is the common case) missed the memo and paid a
+/// second full query-embedding inference — 200-270ms against a 600ms circuit
+/// breaker — silently, since nothing measured inference count.
+///
+/// Keep these two call sites using the same normalizer. `TRAVSR_EMBED_QUERY_CACHE_DEBUG`
+/// on the sidecar reports hit/miss per KNN, and `bench/run-phase2-gate.mjs`'s
+/// single-inference gate asserts it.
+pub(crate) fn doc_lane_query(query: &str) -> String {
+    travsr_store::fts_tokenize::normalize_nl_query(query)
 }
 
 // ── Stop-word list (code-aware: omit "get", "set", "run", "use") ─────────────
@@ -4765,5 +4978,246 @@ mod tests {
         pos_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = pos_scores.get(pos_scores.len() / 2).copied().unwrap_or(0.0);
         eprintln!("recommended STRONG_FLOOR (heuristic, median of positive scores): {median:.2}");
+    }
+
+    // ── #376 Phase 2: docs lane ──────────────────────────────────────────────
+
+    /// Serializes tests that mutate process-global env vars (docs.* knobs are
+    /// all env-var-driven — see the Phase 1 completion notes on why
+    /// travsr-config isn't wired for travsr-mcp).
+    static DOCS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn doc_floor_default_is_0_42() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+        assert_eq!(doc_floor(), 0.42);
+    }
+
+    #[test]
+    fn docs_max_results_default_is_3() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOCS_MAX_RESULTS");
+        assert_eq!(docs_max_results(), 3);
+    }
+
+    #[test]
+    fn docs_enabled_defaults_to_false() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        assert!(!docs_enabled());
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+        assert!(docs_enabled());
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+    }
+
+    #[test]
+    fn docs_budget_pct_default_is_20() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOCS_BUDGET_PCT");
+        assert_eq!(docs_budget_pct(), 20.0);
+    }
+
+    /// docs.enabled=false (the Phase 2 ship default) must return no doc
+    /// results regardless of what the hook would otherwise say — the feature
+    /// flag, not hook availability, gates the lane.
+    #[test]
+    fn doc_lane_candidates_disabled_by_default_returns_empty() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
+        assert!(doc_lane_candidates("query", Some(hook)).is_empty());
+    }
+
+    #[test]
+    fn doc_lane_candidates_none_hook_returns_empty() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+        assert!(doc_lane_candidates("query", None).is_empty());
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+    }
+
+    /// Unlike the old cosine-floor lane, the candidate pool applies **no
+    /// floor** — the reranker downstream makes the confidence call — but is
+    /// still sorted by cosine descending so a reranker-unavailable fallback
+    /// has a sane order.
+    #[test]
+    fn doc_lane_candidates_returns_unfiltered_sorted_pool() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+
+        let hook: DocKnnFn<'_> = &|_q, _k| {
+            vec![
+                (NodeId(1), 0.55),
+                (NodeId(2), 0.90),
+                (NodeId(3), 0.10), // would be below the old DOC_FLOOR — kept here
+                (NodeId(4), 0.70),
+            ]
+        };
+        let hits = doc_lane_candidates("query", Some(hook));
+        assert_eq!(
+            hits,
+            vec![
+                (NodeId(2), 0.90),
+                (NodeId(4), 0.70),
+                (NodeId(1), 0.55),
+                (NodeId(3), 0.10),
+            ],
+            "must keep every candidate, sorted descending, no floor applied"
+        );
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+    }
+
+    #[test]
+    fn doc_rerank_overfetch_default_is_20() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOC_RERANK_OVERFETCH");
+        assert_eq!(doc_rerank_overfetch(), 20);
+    }
+
+    /// The compiled default is the §14.1 sweep result (0.05), **not** the code
+    /// lane's WEAK floor (0.5) it originally borrowed. Guards against a revert
+    /// to the borrowed value, which cost travsr a gold hit (1.0 → 0.9 hit@1)
+    /// and k8s a hit@3 point for no measured benefit.
+    #[test]
+    fn doc_rerank_floor_default_is_the_swept_value_not_the_code_lane_weak_floor() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOC_RERANK_FLOOR");
+        // Must hold whether or not a reranker model is installed on this
+        // machine: the manifest's `weak_floor` is a code-lane number and must
+        // never leak into this lane (that leak made the shipped default 0.5
+        // for every real user while the tests, which have no model dir, saw
+        // 0.05 and passed).
+        let resolved = doc_rerank_floor();
+        assert_eq!(resolved, 0.05, "§14.1 swept value");
+        assert!(
+            resolved < travsr_rerank::DEFAULT_WEAK_FLOOR,
+            "the docs lane floor is deliberately below the code lane's WEAK floor \
+             ({resolved} vs {}) — §14.1 measured the doc negative-arm ceiling at \
+             ~0.002, not ~0.5; borrowing the code floor cost travsr a gold hit",
+            travsr_rerank::DEFAULT_WEAK_FLOOR
+        );
+    }
+
+    /// §4.4 latency contract: the docs lane must present the sidecar with
+    /// byte-identical query text to the code lane, or the sidecar's
+    /// single-slot exact-text memo (`embed_query_cached`) misses and the query
+    /// pays a second full embedding inference. `tools::embed_path_seeds`
+    /// normalizes with `normalize_nl_query` before its KNN call; this asserts
+    /// the docs lane derives the same string, including for the punctuated
+    /// queries that made the two diverge in the first place.
+    #[test]
+    fn doc_lane_query_matches_the_code_lane_normalization() {
+        for raw in [
+            "how does the knapsack enforce the token budget?",
+            "why did we choose PPR over BFS ?",
+            "what are the rules about unwrap and error handling in library code",
+            "  leading and trailing  ",
+        ] {
+            assert_eq!(
+                doc_lane_query(raw),
+                travsr_store::fts_tokenize::normalize_nl_query(raw),
+                "docs lane must send exactly what embed_path_seeds sends for {raw:?}"
+            );
+        }
+    }
+
+    /// The normalization is actually applied at the KNN boundary, not merely
+    /// available as a helper — captures the text the hook receives.
+    #[test]
+    fn doc_lane_candidates_sends_the_normalized_query_to_knn() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+
+        let seen = std::sync::Mutex::new(String::new());
+        let hook: DocKnnFn<'_> = &|q, _k| {
+            *seen.lock().unwrap() = q.to_string();
+            vec![]
+        };
+        let raw = "how does the knapsack enforce the token budget?";
+        let _ = doc_lane_candidates(raw, Some(hook));
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            travsr_store::fts_tokenize::normalize_nl_query(raw),
+            "raw query reached the sidecar — the memo cache would miss and re-embed"
+        );
+        assert_ne!(sent, raw, "test query must exercise a normalization change");
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+    }
+
+    /// Below-floor candidates are dropped entirely (§4.2: absent, not
+    /// empty-ish), above-floor candidates are sorted descending and capped.
+    /// This is the reranker-unavailable fallback path
+    /// (`tools::rerank_doc_candidates`), so it must reproduce the pre-rerank
+    /// Phase 2 behaviour exactly.
+    #[test]
+    fn cosine_floor_select_applies_floor_sort_and_cap() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOC_FLOOR", "0.5");
+        std::env::set_var("TRAVSR_DOCS_MAX_RESULTS", "2");
+
+        let candidates = vec![
+            (NodeId(1), 0.55),
+            (NodeId(2), 0.90),
+            (NodeId(3), 0.40), // below floor
+            (NodeId(4), 0.70),
+        ];
+        let hits = cosine_floor_select(candidates);
+        assert_eq!(
+            hits,
+            vec![(NodeId(2), 0.90), (NodeId(4), 0.70)],
+            "must drop below-floor node 3, sort descending, cap at 2"
+        );
+
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+        std::env::remove_var("TRAVSR_DOCS_MAX_RESULTS");
+    }
+
+    #[test]
+    fn cosine_floor_select_below_floor_everywhere_is_empty() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOC_FLOOR", "0.42");
+
+        let candidates = vec![(NodeId(1), 0.30), (NodeId(2), 0.38)];
+        assert!(cosine_floor_select(candidates).is_empty());
+
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+    }
+
+    /// MatchSource::Docs must sit between Semantic and Relevant (plan §4.1
+    /// section order: exact, semantic, docs, relevant).
+    #[test]
+    fn match_source_docs_trust_rank_between_semantic_and_relevant() {
+        assert!(MatchSource::Semantic.trust_rank() < MatchSource::Docs.trust_rank());
+        assert!(MatchSource::Docs.trust_rank() < MatchSource::Relevant.trust_rank());
+        assert_eq!(MatchSource::Docs.label(), "docs");
     }
 }

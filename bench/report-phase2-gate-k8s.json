@@ -1,0 +1,366 @@
+{
+  "generatedAt": "2026-08-01T10:18:16.001Z",
+  "repo": "k8s",
+  "gate1_docHit": {
+    "pass": true,
+    "n": 20,
+    "hit@1": 0.7,
+    "hit@3": 0.9,
+    "medianMs": 3023,
+    "threshold": "hit@1>=0.60, hit@3>=0.90"
+  },
+  "gate2_codeRegression": {
+    "pass": true,
+    "off": {
+      "n": 16,
+      "hit@1": 0.313,
+      "hit@3": 0.5,
+      "hit@10": 0.813,
+      "abstainN": 11,
+      "abstainCorrect": 11,
+      "abstainRate": 1,
+      "medianMs": 2688,
+      "docsLeaked": 0
+    },
+    "on": {
+      "n": 16,
+      "hit@1": 0.313,
+      "hit@3": 0.5,
+      "hit@10": 0.813,
+      "abstainN": 11,
+      "abstainCorrect": 11,
+      "abstainRate": 1,
+      "medianMs": 3702,
+      "docsLeaked": 0
+    },
+    "perQueryRegressions": []
+  },
+  "gate3_abstainRegression": {
+    "pass": true,
+    "offAbstainRate": 1,
+    "onAbstainRate": 1
+  },
+  "gate4_singleInference": {
+    "pass": true,
+    "vacuous": false,
+    "probeCovered": true,
+    "queriesTraced": 23,
+    "queriesSearchingBothSpaces": 23,
+    "totalInferences": 23,
+    "totalMemoHits": 23,
+    "violations": [],
+    "punctuatedProbe": [
+      {
+        "id": "D1-punct",
+        "query": "why does the apiserver use a watch cache instead of reading from etcd every time?",
+        "embedInferences": 1,
+        "embedMemoHits": 1,
+        "spacesSearched": [
+          "code",
+          "docs"
+        ],
+        "normalizedSeen": [
+          "why does the apiserver use a watch cache instead of reading from etcd every time"
+        ]
+      },
+      {
+        "id": "D2-punct",
+        "query": "at what point in the request flow is the body deserialized relative to authentication?",
+        "embedInferences": 1,
+        "embedMemoHits": 1,
+        "spacesSearched": [
+          "code",
+          "docs"
+        ],
+        "normalizedSeen": [
+          "at what point in the request flow is the body deserialized relative to authentication"
+        ]
+      },
+      {
+        "id": "D3-punct",
+        "query": "how does the apiserver resolve conflicting concurrent writes?",
+        "embedInferences": 1,
+        "embedMemoHits": 1,
+        "spacesSearched": [
+          "code",
+          "docs"
+        ],
+        "normalizedSeen": [
+          "how does the apiserver resolve conflicting concurrent writes"
+        ]
+      }
+    ],
+    "threshold": "<=1 query-embedding inference per query; >=1 query searching both spaces; punctuated probe exercised (scored sets contain no sentence punctuation)"
+  },
+  "crossEncoderCost": {
+    "gating": false,
+    "accepted": true,
+    "offMedianMs": 2688,
+    "onMedianMs": 3702,
+    "ratio": 1.377,
+    "cause": "second full cross-encoder pass per query (docs lane), plan §12",
+    "followUp": "selective/hybrid reranking — only invoke the cross-encoder when raw cosine is ambiguous (§12)"
+  },
+  "docsRows": [
+    {
+      "id": "D1",
+      "query": "why does the apiserver use a watch cache instead of reading from etcd every time",
+      "rank": 1,
+      "ms": 4266,
+      "nDocs": 1,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D2",
+      "query": "at what point in the request flow is the body deserialized relative to authentication",
+      "rank": 1,
+      "ms": 3083,
+      "nDocs": 1,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D3",
+      "query": "how does the apiserver resolve conflicting concurrent writes",
+      "rank": 1,
+      "ms": 4210,
+      "nDocs": 1,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D4",
+      "query": "what is responsible for registering API groups and their storage strategy",
+      "rank": 1,
+      "ms": 4158,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D5",
+      "query": "how are long running streaming protocols like exec and attach handled",
+      "rank": 1,
+      "ms": 3848,
+      "nDocs": 2,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D6",
+      "query": "how is the apiserver assembled from delegated servers",
+      "rank": 3,
+      "ms": 2769,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D7",
+      "query": "how does the apiserver expose discovery and OpenAPI schemas",
+      "rank": 1,
+      "ms": 2532,
+      "nDocs": 2,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D8",
+      "query": "how does client-go surface warnings and apply client side rate limiting",
+      "rank": 1,
+      "ms": 3385,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D9",
+      "query": "when should I use a dynamic client instead of a typed client",
+      "rank": 2,
+      "ms": 2629,
+      "nDocs": 2,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D10",
+      "query": "how does server side apply work from the client library",
+      "rank": 1,
+      "ms": 2506,
+      "nDocs": 1,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D11",
+      "query": "what generates the typed clientsets informers and listers",
+      "rank": 3,
+      "ms": 2114,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D12",
+      "query": "what are the standard controller patterns for a workqueue based reconciler",
+      "rank": 1,
+      "ms": 2540,
+      "nDocs": 1,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D13",
+      "query": "how does client-go build its REST configuration",
+      "rank": 0,
+      "ms": 3005,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D14",
+      "query": "which netfilter hooks does kube-proxy attach to and at what priority",
+      "rank": 1,
+      "ms": 2593,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D15",
+      "query": "explain netfilter chains tables and traversal order",
+      "rank": 0,
+      "ms": 2388,
+      "nDocs": 0,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D16",
+      "query": "how do I add my own rules alongside kube-proxy nftables mode",
+      "rank": 2,
+      "ms": 3023,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D17",
+      "query": "how does the kubelet discover device plugins over a unix socket",
+      "rank": 1,
+      "ms": 3376,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D18",
+      "query": "what is the design of the ipvs based proxy mode",
+      "rank": 1,
+      "ms": 2386,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D19",
+      "query": "how is the container runtime interface API versioned across releases",
+      "rank": 1,
+      "ms": 4532,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "D20",
+      "query": "how does the scheduler performance integration test harness work",
+      "rank": 1,
+      "ms": 3692,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    }
+  ]
+}

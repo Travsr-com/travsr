@@ -12,6 +12,7 @@ mod seed_lexicon;
 
 pub use migration::{Migration, MigrationRunner, StoreMigratable};
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -640,6 +641,13 @@ pub struct SqliteStore {
     /// change. `RefCell` keeps the lazy open behind `&self`; the store is not
     /// `Sync` anyway (callers wrap it in a `Mutex`).
     embed_meta_conn: std::cell::RefCell<Option<Connection>>,
+    /// #376 Phase 2: optional doc-space semantic hook, injected beside
+    /// `embed_knn_hook` by the same injector. Same shape as `EmbedKnnHook`
+    /// (reused, not a distinct type — both are `Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError>`)
+    /// but a separate field/slot since the two spaces are independent round
+    /// trips (see `travsr-plugin-host::EmbedSupervisor::doc_knn_hook`).
+    /// `None` by default — zero cost when docs are disabled or unsupported.
+    embed_doc_knn_hook: Option<EmbedKnnHook>,
 }
 
 impl Drop for SqliteStore {
@@ -670,6 +678,7 @@ impl SqliteStore {
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
                 embed_meta_conn: std::cell::RefCell::new(None),
+                embed_doc_knn_hook: None,
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -734,6 +743,7 @@ impl SqliteStore {
                 embed_readiness: None,
                 embed_db_path: Some(path.with_file_name("embed.db")),
                 embed_meta_conn: std::cell::RefCell::new(None),
+                embed_doc_knn_hook: None,
             };
             let current = store
                 .schema_version()
@@ -762,6 +772,7 @@ impl SqliteStore {
                 embed_readiness: None,
                 embed_db_path: None,
                 embed_meta_conn: std::cell::RefCell::new(None),
+                embed_doc_knn_hook: None,
             };
             sqlite_migration_runner()
                 .run(&mut store)
@@ -831,6 +842,68 @@ impl SqliteStore {
         Some(move |query: &str, k: u32| -> Vec<(NodeId, f32)> {
             hook(query, k).unwrap_or_default()
         })
+    }
+
+    /// #376 Phase 2: inject the doc-space semantic hook beside `set_embed_knn_hook`.
+    /// Called by the same injector, only when `EmbedSupervisor::doc_knn_hook`
+    /// returned `Some` (sidecar supports it and repo has a doc-space index).
+    pub fn set_embed_doc_knn_hook(&mut self, hook: EmbedKnnHook) {
+        self.embed_doc_knn_hook = Some(hook);
+    }
+
+    /// Return a callable wrapper around the doc-space hook, or `None` when
+    /// absent (docs disabled, old sidecar, or repo has no doc-chunk nodes).
+    /// Mirrors [`Self::embed_knn_fn`] exactly — same swallow-errors-to-empty
+    /// contract.
+    pub fn embed_doc_knn_fn(&self) -> Option<impl Fn(&str, u32) -> Vec<(NodeId, f32)>> {
+        let hook = self.embed_doc_knn_hook.clone()?;
+        Some(move |query: &str, k: u32| -> Vec<(NodeId, f32)> {
+            hook(query, k).unwrap_or_default()
+        })
+    }
+
+    /// #376 Phase 2 cross-encoder prototype: fetch `embed_text` (the
+    /// anchor-prefixed doc prose, plan §3.2) for a batch of node ids, so the
+    /// docs lane can rerank KNN candidates against the query text instead of
+    /// gating purely on raw embedding cosine. Chunked like [`Self::get_nodes`]
+    /// to stay under `SQLITE_MAX_VARIABLE_NUMBER`. An id with no row, or a
+    /// NULL `embed_text` (deleted between KNN and this call, or a non-doc
+    /// node), is silently omitted rather than erroring — the caller treats a
+    /// missing entry as "no text to rerank against."
+    pub fn get_nodes_embed_text(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, String>, StoreError> {
+        const CHUNK: usize = 999;
+        let mut out = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, embed_text FROM nodes \
+                 WHERE id IN ({placeholders}) AND embed_text IS NOT NULL"
+            );
+            (|| -> AnyResult<()> {
+                let mut stmt = self
+                    .conn
+                    .prepare(&sql)
+                    .context("preparing get_nodes_embed_text query")?;
+                let id_params: Vec<i64> = chunk.iter().map(|id| node_id_to_i64(*id)).collect();
+                let rows = stmt
+                    .query_map(params_from_iter(id_params.iter()), |row| {
+                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                        let text: String = row.get(1)?;
+                        Ok((id, text))
+                    })
+                    .context("executing get_nodes_embed_text query")?;
+                for r in rows {
+                    let (id, text) = r.context("decoding get_nodes_embed_text row")?;
+                    out.insert(id, text);
+                }
+                Ok(())
+            })()
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+        Ok(out)
     }
 
     /// Inject the RFC-019 direct-cosine oracle hook. Injected beside

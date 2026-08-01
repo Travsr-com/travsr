@@ -120,6 +120,13 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     let slot: Arc<Mutex<Option<EmbedKnnHook>>> = Arc::new(Mutex::new(None));
     let slot_bg = Arc::clone(&slot);
 
+    // #376 Phase 2: parallel slot for the doc-space hook, armed by the same
+    // background thread right after the code hook. Stays `None` forever when
+    // the sidecar predates doc-space support or the repo has no doc-chunk
+    // nodes — `EmbedSupervisor::doc_knn_hook` returns `None` in both cases.
+    let doc_slot: Arc<Mutex<Option<EmbedKnnHook>>> = Arc::new(Mutex::new(None));
+    let doc_slot_bg = Arc::clone(&doc_slot);
+
     // RFC-019: parallel slot for the query-embedding hook, armed by the same
     // background init thread. None = sidecar still warming (no direct-cosine
     // scoring yet, so the classifier/ranker use the FTS-only path).
@@ -157,7 +164,17 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
                         if let Ok(mut guard) = slot_bg.lock() {
                             *guard = Some(hook);
                         }
-                        // Signal arm-complete AFTER the slot is populated so any
+                        // #376 Phase 2: arm the doc hook alongside the code hook.
+                        // `None` when the sidecar predates doc-space support or
+                        // has no doc-space index — `doc_slot` then simply stays
+                        // empty forever, and `doc_lane_seeds` (seed.rs) treats an
+                        // absent hook as "docs unavailable", not an error.
+                        if let Some(doc_hook) = supervisor.doc_knn_hook(mid.clone()) {
+                            if let Ok(mut guard) = doc_slot_bg.lock() {
+                                *guard = Some(doc_hook);
+                            }
+                        }
+                        // Signal arm-complete AFTER the slots are populated so any
                         // thread woken by `mark_ready` sees `Some(hook)`.
                         readiness_bg.mark_ready();
                         tracing::info!(
@@ -184,6 +201,21 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     });
     store.set_embed_readiness(readiness);
     store.set_embed_knn_hook(meta);
+
+    // #376 Phase 2: doc-space meta-hook, same lazy-slot shape as `meta` above.
+    // While `doc_slot` is `None` (sidecar warming, unsupported, or no doc-chunk
+    // nodes) this returns an empty vec — `doc_lane_seeds` then emits no docs
+    // section, never a stall or an error.
+    let meta_doc: EmbedKnnHook = Arc::new(move |query: &str, k: u32| {
+        let guard = doc_slot
+            .lock()
+            .map_err(|_| StoreError::Database("embed doc hook slot poisoned".into()))?;
+        match guard.as_ref() {
+            None => Ok(vec![]),
+            Some(hook) => hook(query, k),
+        }
+    });
+    store.set_embed_doc_knn_hook(meta_doc);
 
     // RFC-019: meta direct-cosine oracle hook. Reads the lazily-armed query hook;
     // while the sidecar warms (slot None) it scores nothing, so the classifier and

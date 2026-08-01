@@ -1324,13 +1324,13 @@ pub fn probe_top1_cosines(db_path: &Path, queries: &[String]) -> Option<Vec<f32>
 
     // Warm the model + HNSW once so the first real probe isn't charged cold-start
     // latency inside its watchdog window.
-    let _ = sidecar.knn("warmup", 1, &model_id);
+    let _ = sidecar.knn("warmup", 1, &model_id, travsr_plugin_protocol::Space::Code);
 
     let cosines = queries
         .iter()
         .map(|q| {
             sidecar
-                .knn(q, 5, &model_id)
+                .knn(q, 5, &model_id, travsr_plugin_protocol::Space::Code)
                 .ok()
                 .and_then(|pairs| {
                     pairs

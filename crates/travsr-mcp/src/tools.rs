@@ -2403,17 +2403,21 @@ pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
     if travsr_core::is_noise_node(node) {
         return true;
     }
-    // #376 Phase 1: doc-chunk nodes are legitimate content — this is not a
-    // "noise" exclusion in the path-based sense every other check below is —
-    // but this is the one gate every candidate source in `build_seed_set`
-    // (fuzzy/name FTS, embed-path seeds, anchors) is proven to pass through,
-    // so it is the correct place for a temporary kind gate. Retrieval for
-    // doc-chunk nodes (the floored, dedicated `docs` section, §4) is Phase 2;
-    // until it lands, a doc chunk must never surface via the generic
-    // lexical/PPR path with no floor and no ranking — confirmed empirically:
-    // without this, `## Payment Architecture` outranked nothing but still
-    // leaked into a `PaymentService` query's "relevant" section at score
-    // 0.000. Remove this arm when Phase 2's dedicated docs path ships.
+    // #376: doc-chunk nodes are legitimate content — this is not a "noise"
+    // exclusion in the path-based sense every other check below is — but this
+    // is the one gate every candidate source in `build_seed_set` (fuzzy/name
+    // FTS, embed-path seeds, anchors) is proven to pass through, so it is the
+    // correct permanent place to keep doc-chunk nodes out of the generic,
+    // unfloored lexical/PPR path. Confirmed empirically in Phase 1: without
+    // this, `## Payment Architecture` outranked nothing but still leaked into
+    // a `PaymentService` query's "relevant" section at score 0.000.
+    //
+    // Phase 2 shipped `MatchSource::Docs` (§4) as a fully separate lane —
+    // `build_docs_section`/`crate::seed::doc_lane_seeds`, its own floored
+    // doc-space KNN, never `build_seed_set` — so this arm does NOT make Docs
+    // unreachable; it is what keeps the two paths from ever colliding.
+    // **Do not remove this arm.** Removing it reopens the exact unfloored
+    // leak Phase 1 fixed, now that doc-chunk nodes exist in the graph.
     if node.kind == "doc-chunk" {
         return true;
     }
@@ -2887,6 +2891,13 @@ fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
     match ms {
         crate::seed::MatchSource::Exact => "## exact — literal symbol / FTS match (not reranked)",
         crate::seed::MatchSource::Semantic => "## semantic — cross-encoder ranked",
+        // #376 Phase 2 (§4.1): no raw cosine printed in this section — see
+        // build_docs_section's doc comment for why (doc cosines and code
+        // cosines are not commensurable; a printed number invites exactly the
+        // cross-section comparison this header exists to prevent).
+        crate::seed::MatchSource::Docs => {
+            "## docs (documentation prose: claims about the code, verify behaviour against the code itself)"
+        }
         crate::seed::MatchSource::Relevant => "## relevant — graph-adjacent context",
     }
 }
@@ -2938,6 +2949,198 @@ fn assemble_context_body(
         out.push(line);
     }
     out.join(sep)
+}
+
+/// #376 Phase 2 (§3.2): humanize a doc-chunk's slug signature
+/// (`doc:retrieval-design/token-budget`) into a readable heading trail
+/// ("Retrieval Design > Token Budget") for display, without re-parsing the
+/// source markdown file at query time. Cosmetic only — the anchor itself
+/// (not this string) is the identity-bearing part of the node.
+fn humanize_doc_anchor(sig: &str) -> String {
+    let anchor = sig.strip_prefix("doc:").unwrap_or(sig);
+    if anchor == "_preamble" {
+        return "(preamble)".to_string();
+    }
+    anchor
+        .split('/')
+        .map(|segment| {
+            segment
+                .split('-')
+                .filter(|w| !w.is_empty())
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
+/// #376 Phase 2 (§4): build the docs section's rendered lines and their
+/// measured token cost, already floor-filtered and capped by
+/// `crate::seed::doc_lane_seeds`. Returns `(vec![], 0)` whenever the lane is
+/// off, unavailable, or produced no hits — the caller must then render no
+/// docs section at all (§4.2: "absent, not empty-ish").
+///
+/// **Print no raw cosine inside the section** (§4.1): §8.3 measured doc
+/// cosines (gold p50 0.550-0.557) above each repo's code-band ceiling
+/// (0.514-0.532) — the two are not commensurable, so printing a number would
+/// invite exactly the cross-section comparison the separate section exists to
+/// prevent. The header alone carries the epistemic weight. The `f32` in each
+/// returned tuple is used only to sort entries within the section (highest
+/// first) and to clamp the token budget below — never rendered.
+///
+/// §4.3 budget carve: entries are kept in descending-score order while their
+/// cumulative token cost stays within `docs.budget_pct` of `token_budget`;
+/// the first entry that would exceed it, and everything after, is dropped.
+/// This is a clamp on *measured* cost, never a reservation — a docs-free
+/// query has `doc_tokens == 0` and is byte-identical to pre-Phase-2 output.
+/// #376 Phase 2 prototype: score `candidates` (an over-fetched, unfiltered
+/// pool from `crate::seed::doc_lane_candidates`) with the RFC-021
+/// cross-encoder against `query`, then floor-filter/sort/cap by that score.
+///
+/// Falls back to the pre-rerank raw-cosine behaviour (`doc_floor` +
+/// `docs_max_results`, applied to the same candidate pool already fetched —
+/// no second sidecar round trip) whenever the reranker has no opinion: no
+/// candidate has `embed_text` (should not happen for real doc-chunk nodes,
+/// but a store lookup failure or a node deleted between KNN and this call
+/// must degrade gracefully, not silently drop a real hit), or
+/// `crate::rerank::rerank` itself returns `None` (model absent, disabled,
+/// panicked, or over the circuit-breaker budget — same fail-open contract
+/// the code lane already relies on).
+fn rerank_doc_candidates(
+    store: &SqliteStore,
+    query: &str,
+    candidates: Vec<(NodeId, f32)>,
+) -> Vec<(NodeId, f32)> {
+    let cap = crate::seed::docs_max_results();
+
+    let ids: Vec<NodeId> = candidates.iter().map(|&(id, _)| id).collect();
+    let text_map = store.get_nodes_embed_text(&ids).unwrap_or_default();
+    let with_text: Vec<(NodeId, &str)> = candidates
+        .iter()
+        .filter_map(|&(id, _)| text_map.get(&id).map(|t| (id, t.as_str())))
+        .collect();
+    if with_text.is_empty() {
+        return crate::seed::cosine_floor_select(candidates);
+    }
+
+    let texts: Vec<&str> = with_text.iter().map(|&(_, t)| t).collect();
+    let Some(scores) = crate::rerank::rerank(query, &texts) else {
+        return crate::seed::cosine_floor_select(candidates);
+    };
+    if scores.len() != with_text.len() {
+        return crate::seed::cosine_floor_select(candidates);
+    }
+
+    if std::env::var("TRAVSR_DOC_RERANK_DEBUG").is_ok() {
+        debug_dump_doc_rerank_scores(store, query, &with_text, &scores);
+    }
+
+    let floor = crate::seed::doc_rerank_floor();
+    let mut scored: Vec<(NodeId, f32)> = with_text
+        .iter()
+        .zip(scores.iter())
+        .filter(|&(_, &s)| s >= floor)
+        .map(|(&(id, _), &s)| (id, s))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(cap);
+    scored
+}
+
+/// Floor-sweep instrumentation for #376 §13.1 (doc-specific rerank floor).
+/// Dumps every pre-floor candidate's raw rerank score to stderr so an offline
+/// script can measure gold/negative separation the way §8.3 measured the
+/// cosine floor. Gated behind `TRAVSR_DOC_RERANK_DEBUG`, costs nothing
+/// otherwise. Temporary: remove once the floor decision lands.
+fn debug_dump_doc_rerank_scores(
+    store: &SqliteStore,
+    query: &str,
+    with_text: &[(NodeId, &str)],
+    scores: &[f32],
+) {
+    let ids: Vec<NodeId> = with_text.iter().map(|&(id, _)| id).collect();
+    let Ok(nodes) = store.get_nodes(&ids) else {
+        return;
+    };
+    let score_map: HashMap<NodeId, f32> = with_text
+        .iter()
+        .map(|&(id, _)| id)
+        .zip(scores.iter().copied())
+        .collect();
+    for n in &nodes {
+        let Some(&score) = score_map.get(&n.id) else {
+            continue;
+        };
+        eprintln!(
+            "DOC_RERANK_DEBUG\t{query}\t{}\t{}\t{score}",
+            n.vname.path,
+            humanize_doc_anchor(&n.vname.signature)
+        );
+    }
+}
+
+fn build_docs_section(
+    store: &SqliteStore,
+    query: &str,
+    token_budget: usize,
+) -> (Vec<(crate::seed::MatchSource, f32, String)>, usize) {
+    let doc_knn = store.embed_doc_knn_fn();
+    let doc_knn_ref = doc_knn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, u32) -> Vec<(NodeId, f32)>);
+    let candidates = crate::seed::doc_lane_candidates(query, doc_knn_ref);
+    if candidates.is_empty() {
+        return (vec![], 0);
+    }
+
+    let hits = rerank_doc_candidates(store, query, candidates);
+    if hits.is_empty() {
+        return (vec![], 0);
+    }
+
+    let ids: Vec<NodeId> = hits.iter().map(|&(id, _)| id).collect();
+    let Ok(nodes) = store.get_nodes(&ids) else {
+        return (vec![], 0);
+    };
+    let score_map: HashMap<NodeId, f32> = hits.into_iter().collect();
+    let mut entries: Vec<(crate::seed::MatchSource, f32, String)> = nodes
+        .iter()
+        .filter_map(|n| {
+            let score = *score_map.get(&n.id)?;
+            let loc = match (n.line, n.end_line) {
+                (Some(s), Some(e)) if s != e => format!(":{s}-{e}"),
+                (Some(s), _) => format!(":{s}"),
+                _ => String::new(),
+            };
+            let line = format!(
+                "{} § {}{loc}",
+                n.vname.path,
+                humanize_doc_anchor(&n.vname.signature)
+            );
+            Some((crate::seed::MatchSource::Docs, score, line))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let budget_cap = ((crate::seed::docs_budget_pct() / 100.0) * token_budget as f32) as usize;
+    let mut doc_tokens = 0usize;
+    let mut kept = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let cost = entry.2.len() / TOKEN_CHARS_PER_TOKEN + 1;
+        if doc_tokens + cost > budget_cap {
+            break;
+        }
+        doc_tokens += cost;
+        kept.push(entry);
+    }
+    (kept, doc_tokens)
 }
 
 /// Derive FTS seeds with confidence-based weights for weighted PPR personalisation.
@@ -3267,6 +3470,13 @@ fn get_context_body(
         "exact+lexical"
     };
 
+    // #376 Phase 2: docs lane runs independently of the code seed pipeline and
+    // of `Confidence` — computed once here so both the abstain early-return
+    // below and the normal-flow render further down can use it. `doc_tokens`
+    // is already clamped to `docs.budget_pct` of `token_budget` (§4.3), so
+    // subtracting it from the code lane's knapsack budget is always safe.
+    let (docs_entries, doc_tokens) = build_docs_section(store, query, token_budget);
+
     // Abstain path: no grounded match → return resolution map, never a confident salad.
     if seed_set.confidence == crate::seed::Confidence::None {
         let mut msg = crate::seed::abstain_message(&seed_set, query);
@@ -3292,6 +3502,22 @@ fn get_context_body(
                     .collect();
                 msg.push_str(&lines.join("\n"));
             }
+        }
+        // #376 Phase 2 (§4.3): "doc hits may appear below the abstain message
+        // under the same section header, but may never convert an abstain
+        // into a confident answer." The code lane still abstains — this only
+        // appends a cited doc section beneath it.
+        if !docs_entries.is_empty() {
+            msg.push_str("\n\n");
+            msg.push_str(match_source_header(crate::seed::MatchSource::Docs));
+            msg.push('\n');
+            msg.push_str(
+                &docs_entries
+                    .iter()
+                    .map(|(_, _, line)| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
         }
         return msg;
     }
@@ -3565,8 +3791,11 @@ fn get_context_body(
     let seed_source_map: HashMap<NodeId, crate::seed::SeedSource> =
         crate::seed::strongest_seed_sources(&seed_set.seeds);
 
-    // Knapsack selection.
-    let selected = knapsack(items, token_budget);
+    // Knapsack selection. #376 Phase 2 (§4.3): the code lane's budget is the
+    // total minus what the docs section already measured and clamped — a
+    // docs-free query has `doc_tokens == 0`, so this is byte-identical to the
+    // pre-Phase-2 call.
+    let selected = knapsack(items, token_budget.saturating_sub(doc_tokens));
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
@@ -3757,7 +3986,7 @@ fn get_context_body(
                 tracing::warn!(
                     "get_context: repo_root not in meta — falling back to metadata-only"
                 );
-                let entries: Vec<(crate::seed::MatchSource, f32, String)> = selected
+                let mut entries: Vec<(crate::seed::MatchSource, f32, String)> = selected
                     .iter()
                     .map(|n| {
                         let role = roles
@@ -3780,6 +4009,7 @@ fn get_context_body(
                         (ms, score, line)
                     })
                     .collect();
+                entries.extend(docs_entries.clone());
                 let sanitized = sanitize_mcp_body_with_limit(
                     &assemble_context_body(entries, "\n", group_output),
                     char_cap,
@@ -3859,6 +4089,7 @@ fn get_context_body(
             };
             blocks.push((ms, score, block));
         }
+        blocks.extend(docs_entries.clone());
 
         let sanitized = sanitize_mcp_body_with_limit(
             &assemble_context_body(blocks, "\n\n", group_output),
@@ -3885,7 +4116,7 @@ fn get_context_body(
         }
     } else {
         // Metadata-only path with role annotations.
-        let entries: Vec<(crate::seed::MatchSource, f32, String)> = selected
+        let mut entries: Vec<(crate::seed::MatchSource, f32, String)> = selected
             .iter()
             .map(|n| {
                 let role = roles
@@ -3908,6 +4139,7 @@ fn get_context_body(
                 (ms, score, line)
             })
             .collect();
+        entries.extend(docs_entries);
         let sanitized = sanitize_mcp_body_with_limit(
             &assemble_context_body(entries, "\n", group_output),
             char_cap,
@@ -5151,14 +5383,16 @@ mod tests {
         )));
     }
 
-    /// #376 Phase 1 regression: doc-chunk nodes must never surface via the
-    /// generic lexical/PPR seed path before Phase 2's dedicated docs section
-    /// exists. Confirmed empirically to leak without this guard — a fixture
-    /// repo's `## Payment Architecture` doc surfaced under a `PaymentService`
-    /// query at score 0.000 via plain word overlap, with no floor and no
-    /// ranking, before `is_noise_seed` gained the `doc-chunk` check.
+    /// #376: doc-chunk nodes must never surface via the generic lexical/PPR
+    /// seed path — permanent, not just until Phase 2's dedicated docs section
+    /// existed (it now does; see `build_docs_section`/`doc_lane_seeds`, a
+    /// fully separate lane that never touches `build_seed_set`). Confirmed
+    /// empirically to leak without this guard — a fixture repo's
+    /// `## Payment Architecture` doc surfaced under a `PaymentService` query
+    /// at score 0.000 via plain word overlap, with no floor and no ranking,
+    /// before `is_noise_seed` gained the `doc-chunk` check.
     #[test]
-    fn doc_chunk_nodes_are_noise_until_phase_2_docs_retrieval_lands() {
+    fn doc_chunk_nodes_are_permanently_excluded_from_generic_seed_path() {
         use travsr_core::{Node, VName};
         let doc_node = Node::new(
             VName::new("", "", "docs/architecture.md", "markdown", "doc:overview"),
@@ -8869,5 +9103,133 @@ mod snippet_tests {
                 ".travsrignore-excluded file must not appear: {out}"
             );
         }
+    }
+
+    // ── #376 Phase 2: docs section ───────────────────────────────────────────
+
+    /// Serializes tests that mutate process-global env vars (docs.* knobs).
+    static DOCS_SECTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn humanize_doc_anchor_formats_trail() {
+        assert_eq!(
+            humanize_doc_anchor("doc:retrieval-design/token-budget"),
+            "Retrieval Design > Token Budget"
+        );
+        assert_eq!(humanize_doc_anchor("doc:_preamble"), "(preamble)");
+        assert_eq!(humanize_doc_anchor("doc:decision"), "Decision");
+    }
+
+    fn doc_chunk_node(path: &str, sig: &str, line: u32, end_line: u32) -> CoreNode {
+        travsr_core::Node::new(
+            travsr_core::VName::new("", "", path, "markdown", sig),
+            "doc-chunk",
+        )
+        .with_line(line)
+        .with_end_line(end_line)
+    }
+
+    #[test]
+    fn build_docs_section_disabled_by_default_is_empty() {
+        let _guard = DOCS_SECTION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let (entries, tokens) = build_docs_section(&store, "how are floors calibrated", 4000);
+        assert!(entries.is_empty());
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn build_docs_section_renders_floored_hits_with_no_score_in_text() {
+        let _guard = DOCS_SECTION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+        std::env::set_var("TRAVSR_DOC_FLOOR", "0.42");
+        std::env::set_var("TRAVSR_DOCS_MAX_RESULTS", "3");
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n1 = doc_chunk_node(
+            "docs/plans/model-relative-semantic-floors.md",
+            "doc:auto-calibrated-floors",
+            10,
+            40,
+        );
+        store.put_node(&n1).unwrap();
+        let id1 = n1.id;
+
+        let hook: travsr_store::EmbedKnnHook =
+            std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.71)]));
+        store.set_embed_doc_knn_hook(hook);
+
+        let (entries, tokens) =
+            build_docs_section(&store, "how are semantic floors calibrated", 4000);
+        assert_eq!(entries.len(), 1);
+        let (ms, _score, line) = &entries[0];
+        assert_eq!(*ms, crate::seed::MatchSource::Docs);
+        assert!(
+            line.contains("docs/plans/model-relative-semantic-floors.md"),
+            "line must show the source path: {line}"
+        );
+        assert!(
+            line.contains("Auto Calibrated Floors"),
+            "line must show a humanized trail: {line}"
+        );
+        assert!(
+            line.contains(":10-40"),
+            "line must show the chunk's line span: {line}"
+        );
+        assert!(
+            !line.contains("0.71") && !line.contains("0.7"),
+            "docs section must never print a raw cosine (§4.1): {line}"
+        );
+        assert!(tokens > 0);
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+        std::env::remove_var("TRAVSR_DOCS_MAX_RESULTS");
+    }
+
+    /// §4.3 budget carve: a docs.budget_pct that cannot fit even the highest
+    /// scored entry must yield no entries — dropped, not truncated mid-line.
+    #[test]
+    fn build_docs_section_budget_cap_can_drop_all_entries() {
+        let _guard = DOCS_SECTION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+        std::env::set_var("TRAVSR_DOC_FLOOR", "0.42");
+        std::env::set_var("TRAVSR_DOCS_BUDGET_PCT", "0.001");
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n1 = doc_chunk_node(
+            "docs/plans/some-very-long-plan-file-name.md",
+            "doc:a-fairly-long-heading-trail-that-costs-several-tokens",
+            10,
+            40,
+        );
+        store.put_node(&n1).unwrap();
+        let id1 = n1.id;
+        let hook: travsr_store::EmbedKnnHook =
+            std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.9)]));
+        store.set_embed_doc_knn_hook(hook);
+
+        let (entries, tokens) = build_docs_section(&store, "query", 4000);
+        assert!(entries.is_empty());
+        assert_eq!(tokens, 0);
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+        std::env::remove_var("TRAVSR_DOCS_BUDGET_PCT");
+    }
+
+    /// Permanent gate (not the retired Phase-1 lever): doc-chunk nodes never
+    /// enter `get_context`'s knapsack-selected set, only `build_docs_section`.
+    #[test]
+    fn is_context_result_noise_still_excludes_doc_chunk_after_phase_2() {
+        let n = doc_chunk_node("docs/x.md", "doc:section", 1, 5);
+        assert!(is_context_result_noise(&n));
     }
 }

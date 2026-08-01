@@ -1,0 +1,394 @@
+{
+  "generatedAt": "2026-08-01T10:04:49.588Z",
+  "repo": "travsr",
+  "gate1_docHit": {
+    "pass": true,
+    "n": 20,
+    "hit@1": 1,
+    "hit@3": 1,
+    "medianMs": 908,
+    "threshold": "hit@1>=0.60, hit@3>=0.90"
+  },
+  "gate2_codeRegression": {
+    "pass": true,
+    "off": {
+      "n": 33,
+      "hit@1": 0.545,
+      "hit@3": 0.667,
+      "hit@10": 0.697,
+      "abstainN": 11,
+      "abstainCorrect": 10,
+      "abstainRate": 0.909,
+      "medianMs": 340,
+      "docsLeaked": 0
+    },
+    "on": {
+      "n": 33,
+      "hit@1": 0.545,
+      "hit@3": 0.667,
+      "hit@10": 0.697,
+      "abstainN": 11,
+      "abstainCorrect": 10,
+      "abstainRate": 0.909,
+      "medianMs": 810,
+      "docsLeaked": 0
+    },
+    "perQueryRegressions": []
+  },
+  "gate3_abstainRegression": {
+    "pass": true,
+    "offAbstainRate": 0.909,
+    "onAbstainRate": 0.909
+  },
+  "gate4_singleInference": {
+    "pass": false,
+    "vacuous": false,
+    "probeCovered": true,
+    "queriesTraced": 23,
+    "queriesSearchingBothSpaces": 23,
+    "totalInferences": 26,
+    "totalMemoHits": 20,
+    "violations": [
+      {
+        "id": "T1-punct",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ]
+      },
+      {
+        "id": "T2-punct",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ]
+      },
+      {
+        "id": "T3-punct",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ]
+      }
+    ],
+    "punctuatedProbe": [
+      {
+        "id": "T1-punct",
+        "query": "why did we choose personalized pagerank over breadth first search for retrieval?",
+        "embedInferences": 2,
+        "embedMemoHits": 0,
+        "spacesSearched": [
+          "code",
+          "docs"
+        ],
+        "normalizedSeen": [
+          "why did we choose personalized pagerank over breadth first search for retrieval",
+          "why did we choose personalized pagerank over breadth first search for retrieval?"
+        ]
+      },
+      {
+        "id": "T2-punct",
+        "query": "what is our policy when LSIF and tree-sitter disagree about an edge?",
+        "embedInferences": 2,
+        "embedMemoHits": 0,
+        "spacesSearched": [
+          "code",
+          "docs"
+        ],
+        "normalizedSeen": [
+          "what is our policy when LSIF and tree-sitter disagree about an edge",
+          "what is our policy when LSIF and tree-sitter disagree about an edge?"
+        ]
+      },
+      {
+        "id": "T3-punct",
+        "query": "what are the rules about unwrap and error handling in library code?",
+        "embedInferences": 2,
+        "embedMemoHits": 0,
+        "spacesSearched": [
+          "code",
+          "docs"
+        ],
+        "normalizedSeen": [
+          "what are the rules about unwrap and error handling in library code",
+          "what are the rules about unwrap and error handling in library code?"
+        ]
+      }
+    ],
+    "threshold": "<=1 query-embedding inference per query; >=1 query searching both spaces; punctuated probe exercised (scored sets contain no sentence punctuation)"
+  },
+  "crossEncoderCost": {
+    "gating": false,
+    "accepted": true,
+    "offMedianMs": 340,
+    "onMedianMs": 810,
+    "ratio": 2.382,
+    "cause": "second full cross-encoder pass per query (docs lane), plan §12",
+    "followUp": "selective/hybrid reranking — only invoke the cross-encoder when raw cosine is ambiguous (§12)"
+  },
+  "docsRows": [
+    {
+      "id": "T1",
+      "query": "why did we choose personalized pagerank over breadth first search for retrieval",
+      "rank": 1,
+      "ms": 790,
+      "nDocs": 2,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T2",
+      "query": "what is our policy when LSIF and tree-sitter disagree about an edge",
+      "rank": 1,
+      "ms": 980,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T3",
+      "query": "what are the rules about unwrap and error handling in library code",
+      "rank": 1,
+      "ms": 849,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T4",
+      "query": "why is the VName signature format version bumped and what breaks when it changes",
+      "rank": 1,
+      "ms": 991,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T5",
+      "query": "how does the knapsack enforce the token budget",
+      "rank": 1,
+      "ms": 986,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T6",
+      "query": "what is the cross encoder relevance arbiter supposed to fix",
+      "rank": 1,
+      "ms": 627,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T7",
+      "query": "why do we run embeddings in a downloadable sidecar instead of in process",
+      "rank": 1,
+      "ms": 1686,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T8",
+      "query": "how is the graph RBAC session and scope model defined",
+      "rank": 1,
+      "ms": 949,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T9",
+      "query": "what is the corpus naming convention derived from a git remote",
+      "rank": 1,
+      "ms": 745,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T10",
+      "query": "why did the model relative semantic floors need auto calibration per model",
+      "rank": 1,
+      "ms": 1009,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T11",
+      "query": "what were the measured root causes of conceptual retrieval failures",
+      "rank": 1,
+      "ms": 763,
+      "nDocs": 2,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T12",
+      "query": "how do we resolve cross language edges between rust and typescript",
+      "rank": 1,
+      "ms": 1166,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T13",
+      "query": "what is the plan for parallel reindex workers",
+      "rank": 1,
+      "ms": 1070,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T14",
+      "query": "how does the two transport plugin architecture work",
+      "rank": 1,
+      "ms": 649,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T15",
+      "query": "why does the retrieval cascade short circuit and starve top K results",
+      "rank": 1,
+      "ms": 944,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T16",
+      "query": "what is the MCP SSE transport design for the cloud tier",
+      "rank": 1,
+      "ms": 908,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T17",
+      "query": "how should overview mode behave in the API",
+      "rank": 1,
+      "ms": 753,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T18",
+      "query": "how are phase B symbols unified with phase A tree-sitter nodes",
+      "rank": 1,
+      "ms": 758,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T19",
+      "query": "what does the fuzzy seed selection design propose",
+      "rank": 1,
+      "ms": 593,
+      "nDocs": 3,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    },
+    {
+      "id": "T20",
+      "query": "why was a per repo linear projection head for embeddings rejected",
+      "rank": 1,
+      "ms": 762,
+      "nDocs": 1,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ]
+    }
+  ]
+}
