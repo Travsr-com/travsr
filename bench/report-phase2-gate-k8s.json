@@ -1,12 +1,12 @@
 {
-  "generatedAt": "2026-08-01T17:29:51.612Z",
+  "generatedAt": "2026-08-01T17:52:02.427Z",
   "repo": "k8s",
   "gate1_docHit": {
     "pass": true,
     "n": 20,
     "hit@1": 0.7,
     "hit@3": 0.9,
-    "medianMs": 5013,
+    "medianMs": 2857,
     "threshold": "hit@1>=0.60, hit@3>=0.90"
   },
   "gate2_codeRegression": {
@@ -19,7 +19,7 @@
       "abstainN": 11,
       "abstainCorrect": 11,
       "abstainRate": 1,
-      "medianMs": 2497,
+      "medianMs": 2001,
       "docsLeaked": 0
     },
     "on": {
@@ -30,7 +30,7 @@
       "abstainN": 11,
       "abstainCorrect": 11,
       "abstainRate": 1,
-      "medianMs": 3282,
+      "medianMs": 2687,
       "docsLeaked": 0
     },
     "perQueryRegressions": []
@@ -41,55 +41,14 @@
     "onAbstainRate": 1
   },
   "gate4_singleInference": {
-    "pass": false,
+    "pass": true,
     "vacuous": false,
     "probeCovered": true,
     "queriesTraced": 23,
     "queriesSearchingBothSpaces": 23,
-    "totalInferences": 28,
-    "totalMemoHits": 18,
-    "violations": [
-      {
-        "id": "D4",
-        "inferences": 2,
-        "spaces": [
-          "code",
-          "docs"
-        ]
-      },
-      {
-        "id": "D7",
-        "inferences": 2,
-        "spaces": [
-          "code",
-          "docs"
-        ]
-      },
-      {
-        "id": "D8",
-        "inferences": 2,
-        "spaces": [
-          "code",
-          "docs"
-        ]
-      },
-      {
-        "id": "D9",
-        "inferences": 2,
-        "spaces": [
-          "code",
-          "docs"
-        ]
-      },
-      {
-        "id": "D20",
-        "inferences": 2,
-        "spaces": [
-          "code",
-          "docs"
-        ]
-      }
-    ],
+    "totalInferences": 23,
+    "totalMemoHits": 23,
+    "violations": [],
     "punctuatedProbe": [
       {
         "id": "D1-punct",
@@ -141,7 +100,7 @@
       "n": 20,
       "hit@1": 0.7,
       "hit@3": 0.9,
-      "medianMs": 2448,
+      "medianMs": 2264,
       "queriesWithDocs": 19,
       "errors": 0
     },
@@ -153,7 +112,7 @@
       "abstainN": 11,
       "abstainCorrect": 11,
       "abstainRate": 1,
-      "medianMs": 1434,
+      "medianMs": 1514,
       "docsLeaked": 0
     },
     "codeOn": {
@@ -164,7 +123,7 @@
       "abstainN": 11,
       "abstainCorrect": 11,
       "abstainRate": 1,
-      "medianMs": 1869,
+      "medianMs": 2068,
       "docsLeaked": 0
     },
     "codeStable": true,
@@ -173,7 +132,7 @@
       "comparable": 20,
       "disagreements": []
     },
-    "daemonReadyMs": 6568,
+    "daemonReadyMs": 9433,
     "daemonWasRunningBefore": false,
     "threshold": "ask hit@1>=0.60, hit@3>=0.90; >=1 query rendering docs; zero presence/top-1 disagreement with get_context; zero code hit/abstain movement docs off vs on",
     "rows": [
@@ -182,7 +141,7 @@
         "query": "why does the apiserver use a watch cache instead of reading from etcd every time",
         "rank": 1,
         "nDocs": 1,
-        "ms": 3228,
+        "ms": 4310,
         "matched": true,
         "entries": [
           {
@@ -196,7 +155,7 @@
         "query": "at what point in the request flow is the body deserialized relative to authentication",
         "rank": 1,
         "nDocs": 1,
-        "ms": 2067,
+        "ms": 2049,
         "matched": false,
         "entries": [
           {
@@ -210,7 +169,7 @@
         "query": "how does the apiserver resolve conflicting concurrent writes",
         "rank": 1,
         "nDocs": 1,
-        "ms": 2767,
+        "ms": 2167,
         "matched": true,
         "entries": [
           {
@@ -224,7 +183,7 @@
         "query": "what is responsible for registering API groups and their storage strategy",
         "rank": 1,
         "nDocs": 3,
-        "ms": 2733,
+        "ms": 2772,
         "matched": true,
         "entries": [
           {
@@ -246,7 +205,7 @@
         "query": "how are long running streaming protocols like exec and attach handled",
         "rank": 1,
         "nDocs": 2,
-        "ms": 2229,
+        "ms": 2349,
         "matched": true,
         "entries": [
           {
@@ -264,7 +223,7 @@
         "query": "how is the apiserver assembled from delegated servers",
         "rank": 3,
         "nDocs": 3,
-        "ms": 1622,
+        "ms": 1635,
         "matched": false,
         "entries": [
           {
@@ -286,7 +245,7 @@
         "query": "how does the apiserver expose discovery and OpenAPI schemas",
         "rank": 1,
         "nDocs": 2,
-        "ms": 2551,
+        "ms": 2348,
         "matched": true,
         "entries": [
           {
@@ -304,7 +263,7 @@
         "query": "how does client-go surface warnings and apply client side rate limiting",
         "rank": 1,
         "nDocs": 3,
-        "ms": 2895,
+        "ms": 2980,
         "matched": false,
         "entries": [
           {
@@ -326,7 +285,7 @@
         "query": "when should I use a dynamic client instead of a typed client",
         "rank": 2,
         "nDocs": 2,
-        "ms": 2176,
+        "ms": 2264,
         "matched": true,
         "entries": [
           {
@@ -344,7 +303,7 @@
         "query": "how does server side apply work from the client library",
         "rank": 1,
         "nDocs": 1,
-        "ms": 2448,
+        "ms": 2174,
         "matched": true,
         "entries": [
           {
@@ -358,7 +317,7 @@
         "query": "what generates the typed clientsets informers and listers",
         "rank": 3,
         "nDocs": 3,
-        "ms": 1616,
+        "ms": 1639,
         "matched": true,
         "entries": [
           {
@@ -380,7 +339,7 @@
         "query": "what are the standard controller patterns for a workqueue based reconciler",
         "rank": 1,
         "nDocs": 1,
-        "ms": 2173,
+        "ms": 1770,
         "matched": true,
         "entries": [
           {
@@ -394,7 +353,7 @@
         "query": "how does client-go build its REST configuration",
         "rank": 0,
         "nDocs": 3,
-        "ms": 2233,
+        "ms": 1891,
         "matched": true,
         "entries": [
           {
@@ -438,7 +397,7 @@
         "query": "explain netfilter chains tables and traversal order",
         "rank": 0,
         "nDocs": 0,
-        "ms": 1872,
+        "ms": 1886,
         "matched": true,
         "entries": []
       },
@@ -447,7 +406,7 @@
         "query": "how do I add my own rules alongside kube-proxy nftables mode",
         "rank": 2,
         "nDocs": 3,
-        "ms": 2495,
+        "ms": 2468,
         "matched": true,
         "entries": [
           {
@@ -469,7 +428,7 @@
         "query": "how does the kubelet discover device plugins over a unix socket",
         "rank": 1,
         "nDocs": 3,
-        "ms": 2545,
+        "ms": 2460,
         "matched": true,
         "entries": [
           {
@@ -491,7 +450,7 @@
         "query": "what is the design of the ipvs based proxy mode",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1660,
+        "ms": 1655,
         "matched": true,
         "entries": [
           {
@@ -513,7 +472,7 @@
         "query": "how is the container runtime interface API versioned across releases",
         "rank": 1,
         "nDocs": 3,
-        "ms": 3154,
+        "ms": 3304,
         "matched": true,
         "entries": [
           {
@@ -535,7 +494,7 @@
         "query": "how does the scheduler performance integration test harness work",
         "rank": 1,
         "nDocs": 3,
-        "ms": 2957,
+        "ms": 2752,
         "matched": true,
         "entries": [
           {
@@ -557,9 +516,9 @@
   "crossEncoderCost": {
     "gating": false,
     "accepted": true,
-    "offMedianMs": 2497,
-    "onMedianMs": 3282,
-    "ratio": 1.314,
+    "offMedianMs": 2001,
+    "onMedianMs": 2687,
+    "ratio": 1.343,
     "cause": "second full cross-encoder pass per query (docs lane), plan §12",
     "followUp": "selective/hybrid reranking — only invoke the cross-encoder when raw cosine is ambiguous (§12)"
   },
@@ -568,7 +527,7 @@
       "id": "D1",
       "query": "why does the apiserver use a watch cache instead of reading from etcd every time",
       "rank": 1,
-      "ms": 5013,
+      "ms": 3294,
       "nDocs": 1,
       "topEntry": {
         "path": "staging/src/k8s.io/apiserver/ARCHITECTURE.md",
@@ -585,7 +544,7 @@
       "id": "D2",
       "query": "at what point in the request flow is the body deserialized relative to authentication",
       "rank": 1,
-      "ms": 3742,
+      "ms": 3057,
       "nDocs": 1,
       "topEntry": {
         "path": "staging/src/k8s.io/apiserver/ARCHITECTURE.md",
@@ -602,7 +561,7 @@
       "id": "D3",
       "query": "how does the apiserver resolve conflicting concurrent writes",
       "rank": 1,
-      "ms": 4921,
+      "ms": 3208,
       "nDocs": 1,
       "topEntry": {
         "path": "staging/src/k8s.io/apiserver/ARCHITECTURE.md",
@@ -619,14 +578,14 @@
       "id": "D4",
       "query": "what is responsible for registering API groups and their storage strategy",
       "rank": 1,
-      "ms": 6151,
+      "ms": 3169,
       "nDocs": 3,
       "topEntry": {
         "path": "staging/src/k8s.io/apiserver/ARCHITECTURE.md",
         "heading": "Apiserver Architecture &gt; 3 Api Group Registration &gt; The Apigroupinfo Struct And Strategy Object:155-196"
       },
-      "embedInferences": 2,
-      "embedMemoHits": 0,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
       "spacesSearched": [
         "code",
         "docs"
@@ -636,7 +595,7 @@
       "id": "D5",
       "query": "how are long running streaming protocols like exec and attach handled",
       "rank": 1,
-      "ms": 4324,
+      "ms": 2857,
       "nDocs": 2,
       "topEntry": {
         "path": "staging/src/k8s.io/apiserver/ARCHITECTURE.md",
@@ -653,7 +612,7 @@
       "id": "D6",
       "query": "how is the apiserver assembled from delegated servers",
       "rank": 3,
-      "ms": 4344,
+      "ms": 2397,
       "nDocs": 3,
       "topEntry": {
         "path": "staging/src/k8s.io/apiserver/README.md",
@@ -670,14 +629,14 @@
       "id": "D7",
       "query": "how does the apiserver expose discovery and OpenAPI schemas",
       "rank": 1,
-      "ms": 7079,
+      "ms": 2521,
       "nDocs": 2,
       "topEntry": {
         "path": "staging/src/k8s.io/apiserver/ARCHITECTURE.md",
         "heading": "Apiserver Architecture &gt; 6 Discovery And Openapi:234-245"
       },
-      "embedInferences": 2,
-      "embedMemoHits": 0,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
       "spacesSearched": [
         "code",
         "docs"
@@ -687,14 +646,14 @@
       "id": "D8",
       "query": "how does client-go surface warnings and apply client side rate limiting",
       "rank": 1,
-      "ms": 6117,
+      "ms": 2678,
       "nDocs": 3,
       "topEntry": {
         "path": "staging/src/k8s.io/client-go/ARCHITECTURE.md",
         "heading": "Client Go Architecture &gt; Rest Client &gt; Errors Warnings And Rate Limiting:47-57"
       },
-      "embedInferences": 2,
-      "embedMemoHits": 0,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
       "spacesSearched": [
         "code",
         "docs"
@@ -704,14 +663,14 @@
       "id": "D9",
       "query": "when should I use a dynamic client instead of a typed client",
       "rank": 2,
-      "ms": 6125,
+      "ms": 2857,
       "nDocs": 2,
       "topEntry": {
         "path": "staging/src/k8s.io/client-go/examples/dynamic-create-update-delete-deployment/README.md",
         "heading": "Create Update Delete Deployment With The Dynamic &gt; Typed Vs Dynamic:6-16"
       },
-      "embedInferences": 2,
-      "embedMemoHits": 0,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
       "spacesSearched": [
         "code",
         "docs"
@@ -721,7 +680,7 @@
       "id": "D10",
       "query": "how does server side apply work from the client library",
       "rank": 1,
-      "ms": 5849,
+      "ms": 2578,
       "nDocs": 1,
       "topEntry": {
         "path": "staging/src/k8s.io/client-go/ARCHITECTURE.md",
@@ -738,7 +697,7 @@
       "id": "D11",
       "query": "what generates the typed clientsets informers and listers",
       "rank": 3,
-      "ms": 3372,
+      "ms": 1673,
       "nDocs": 3,
       "topEntry": {
         "path": "staging/src/k8s.io/code-generator/README.md",
@@ -755,7 +714,7 @@
       "id": "D12",
       "query": "what are the standard controller patterns for a workqueue based reconciler",
       "rank": 1,
-      "ms": 3788,
+      "ms": 1998,
       "nDocs": 1,
       "topEntry": {
         "path": "staging/src/k8s.io/client-go/ARCHITECTURE.md",
@@ -772,7 +731,7 @@
       "id": "D13",
       "query": "how does client-go build its REST configuration",
       "rank": 0,
-      "ms": 4814,
+      "ms": 2808,
       "nDocs": 3,
       "topEntry": {
         "path": "staging/src/k8s.io/client-go/ARCHITECTURE.md",
@@ -789,7 +748,7 @@
       "id": "D14",
       "query": "which netfilter hooks does kube-proxy attach to and at what priority",
       "rank": 1,
-      "ms": 5072,
+      "ms": 1928,
       "nDocs": 3,
       "topEntry": {
         "path": "pkg/proxy/nftables/README.md",
@@ -806,7 +765,7 @@
       "id": "D15",
       "query": "explain netfilter chains tables and traversal order",
       "rank": 0,
-      "ms": 3461,
+      "ms": 2086,
       "nDocs": 0,
       "topEntry": null,
       "embedInferences": 1,
@@ -820,7 +779,7 @@
       "id": "D16",
       "query": "how do I add my own rules alongside kube-proxy nftables mode",
       "rank": 2,
-      "ms": 5251,
+      "ms": 3165,
       "nDocs": 3,
       "topEntry": {
         "path": "pkg/proxy/ipvs/README.md",
@@ -837,7 +796,7 @@
       "id": "D17",
       "query": "how does the kubelet discover device plugins over a unix socket",
       "rank": 1,
-      "ms": 4868,
+      "ms": 3358,
       "nDocs": 3,
       "topEntry": {
         "path": "pkg/kubelet/pluginmanager/pluginwatcher/README.md",
@@ -854,7 +813,7 @@
       "id": "D18",
       "query": "what is the design of the ipvs based proxy mode",
       "rank": 1,
-      "ms": 3594,
+      "ms": 2198,
       "nDocs": 3,
       "topEntry": {
         "path": "pkg/proxy/ipvs/README.md",
@@ -871,7 +830,7 @@
       "id": "D19",
       "query": "how is the container runtime interface API versioned across releases",
       "rank": 1,
-      "ms": 6589,
+      "ms": 3859,
       "nDocs": 3,
       "topEntry": {
         "path": "staging/src/k8s.io/cri-api/README.md",
@@ -888,14 +847,14 @@
       "id": "D20",
       "query": "how does the scheduler performance integration test harness work",
       "rank": 1,
-      "ms": 6287,
+      "ms": 4018,
       "nDocs": 3,
       "topEntry": {
         "path": "test/integration/scheduler_perf/README.md",
         "heading": "Scheduler Performance Test &gt; How To Run &gt; Integration Tests:131-150"
       },
-      "embedInferences": 2,
-      "embedMemoHits": 0,
+      "embedInferences": 1,
+      "embedMemoHits": 1,
       "spacesSearched": [
         "code",
         "docs"
