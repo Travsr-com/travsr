@@ -64,10 +64,74 @@ fn print_docs(docs: &[String]) {
     }
 }
 
+/// #376 G1 / §18.7: `TRAVSR_DOCS_ENABLED` is read by whichever process performs
+/// retrieval, and for `ask` that is never this one. When the daemon serves the
+/// query it reads the flag from its own environment; when it does not, the cold
+/// read-only path deliberately never arms the doc KNN hook. So setting the flag
+/// on this command looks like it applies and silently does nothing — the exact
+/// shape of the #516 bug, where a lane that was wired correctly rendered nothing
+/// and reported no error.
+///
+/// Deliberately phrased as where-to-set-it rather than "docs are off": a query
+/// that legitimately matched no doc above the floor renders nothing either
+/// (§4.2, "absent, not empty-ish"), and this function cannot tell the two apart
+/// from inside the CLI process. Only fires when the user actually set the
+/// variable, and goes to stderr so `--format json` stays machine-readable.
+///
+/// #376 O1 update: there is now a *working* switch to point at.
+/// `travsr config set docs.enabled true` writes the repo's
+/// `.travsr/config.toml`, which the daemon reads regardless of the environment
+/// it was started in, so the note recommends that over restarting the daemon
+/// with an exported variable.
+fn note_docs_flag_is_read_by_the_daemon() {
+    if std::env::var_os("TRAVSR_DOCS_ENABLED").is_none() {
+        return;
+    }
+    eprintln!(
+        "note: TRAVSR_DOCS_ENABLED is read by the process that performs retrieval, \
+         which for `ask` is the travsr daemon — not this command. Prefer the \
+         config key, which the daemon reads whatever environment it was started \
+         in: `travsr config set docs.enabled true`."
+    );
+}
+
+/// #376 O7 / G7: with no daemon running, `ask` is served by the cold read-only
+/// path, which can never render a docs section — and said nothing about it.
+///
+/// The silence was the whole problem: an empty docs section is also what a
+/// correctly-working lane produces when nothing cleared the floor (§4.2,
+/// "absent, not empty-ish"), so a user who enabled the lane and got nothing had
+/// no way to tell "no doc matched" from "this code path structurally cannot
+/// answer you". Two of #376's shipped bugs (#516, and the CLI env-var no-op)
+/// were the same shape.
+///
+/// The fix is to say so rather than to arm the hook. Arming it was measured and
+/// rejected: [`travsr_daemon::try_inject_embed_hook_readonly`] documents that a
+/// per-invocation sidecar costs ~0.6 s of model load, which overruns
+/// `ask_query`'s own 600 ms circuit breaker, so the seeds would be discarded
+/// anyway while every `ask` churned a throwaway 127 MB-model process.
+///
+/// Only fires when the lane is actually enabled for this repo — a user who
+/// never turned docs on is not owed a message about them — and writes to stderr
+/// so `--format json` stays machine-readable.
+fn note_cold_path_cannot_render_docs(repo_root: &std::path::Path) {
+    let enabled = travsr_config::effective_bool("docs.enabled", Some(repo_root)).unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    eprintln!(
+        "note: docs.enabled is on, but no travsr daemon is running — this query \
+         is served by the read-only cold path, which does not load the doc \
+         index, so no docs section can appear. Start the daemon with \
+         `travsr daemon start`."
+    );
+}
+
 pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if query_str.trim().is_empty() {
         anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
     }
+    note_docs_flag_is_read_by_the_daemon();
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
     let db_path = repo_root.join(".travsr/graph.db");
@@ -83,6 +147,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     ) {
         Some(p) => p,
         None => {
+            note_cold_path_cannot_render_docs(&repo_root);
             let mut store = daemon_client::open_read_store(&db_path)?;
             // Best-effort: load HNSW embed hook for cold-path KNN. Falls back to
             // FTS-only if the sidecar binary is absent or the index is not built.
@@ -182,4 +247,78 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         payload.total_tokens
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod docs_note_tests {
+    /// Serializes the tests below: both mutate `HOME`, which is process-global.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A hermetic repo + config environment. Redirects **both** file layers into
+    /// a tempdir — `HOME` for the global one, the returned path for the repo one
+    /// — because a developer with `docs.enabled = true` in their real
+    /// `~/.travsr/config.toml` would otherwise flip these assertions.
+    struct Env {
+        dir: tempfile::TempDir,
+        prev_home: Option<std::ffi::OsString>,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let prev_home = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir.path().join("home"));
+            std::fs::create_dir_all(dir.path().join("repo").join(".travsr")).expect("mk repo");
+            Self { dir, prev_home }
+        }
+        fn repo(&self) -> std::path::PathBuf {
+            self.dir.path().join("repo")
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// #376 O7: the note must be gated on the lane actually being enabled.
+    /// Printing it unconditionally would put a docs warning in front of every
+    /// user who never turned docs on, which is how a note becomes noise and then
+    /// becomes ignored — the failure mode §20.4 O3 flags for flaky CI gates too.
+    #[test]
+    fn cold_path_note_is_silent_when_docs_are_off() {
+        let _g = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = Env::new();
+        assert!(
+            !travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(false),
+            "default must be off, so note_cold_path_cannot_render_docs returns early"
+        );
+    }
+
+    /// And it must fire once the key is on — the condition the live check in
+    /// this session exercised, pinned so a config-plumbing regression is caught
+    /// here rather than by a user seeing an unexplained empty docs section.
+    #[test]
+    fn cold_path_note_fires_when_docs_are_on() {
+        let _g = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = Env::new();
+        travsr_config::set(
+            "docs.enabled",
+            "true",
+            travsr_config::Scope::Repo(env.repo()),
+        )
+        .expect("set");
+        assert!(
+            travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(false),
+            "repo config must drive the note"
+        );
+    }
 }
