@@ -4589,6 +4589,20 @@ pub fn try_inject_embed_hook(
         // once at startup before the daemon serves any request.
         supervisor.prewarm();
         query_store.set_embed_knn_hook(hook);
+        // #376 §4.4: arm the doc-space KNN hook beside the code one. The doc
+        // index is a separate HNSW space (`hnsw-docs.usearch`), so it needs its
+        // own hook — the code hook cannot answer a doc query and `VecIndex::knn`
+        // has no metadata filter to partition one space into two.
+        //
+        // Without this, `travsr ask` could never render a docs section no matter
+        // how the lane was configured: the MCP server arms this hook in
+        // `travsr_mcp::inject_embed_hook`, but the daemon (which is what answers
+        // every CLI `ask`) did not, so `store.embed_doc_knn_fn()` was always
+        // `None` on that route. `None` is indistinguishable from "sidecar too
+        // old" or "repo has no doc-chunk nodes", which is why it failed silently.
+        if let Some(doc_hook) = supervisor.doc_knn_hook(model_id.clone()) {
+            query_store.set_embed_doc_knn_hook(doc_hook);
+        }
         // RFC-019: inject the direct-cosine oracle beside the KNN hook. Reuses the
         // same warm sidecar for the query embedding; candidate vectors are read from
         // embed.db by travsr-store. `None` query-hook → no score hook → the FTS-only

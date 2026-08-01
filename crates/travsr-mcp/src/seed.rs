@@ -655,6 +655,19 @@ pub(crate) fn docs_enabled() -> bool {
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
 }
 
+/// The single lock serializing every test that mutates the process-global
+/// `docs.*` env knobs (they are all env-var-driven — see the #376 Phase 1
+/// completion notes on why travsr-config is not wired into travsr-mcp).
+///
+/// Crate-visible and defined here, next to the knobs it guards, because
+/// `seed.rs`, `tools.rs` and `query.rs` all exercise the docs lane and all run
+/// in the *same* test binary. Two of them previously held two independent
+/// module-local locks, which serialized each module against itself while still
+/// racing the other — a latent flake that only showed up once a third module's
+/// tests widened the window.
+#[cfg(test)]
+pub(crate) static DOCS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Plan §4.3: percentage of `token_budget` the docs section may claim — a
 /// clamp applied to the *measured* doc-block token cost, never a reservation
 /// (a docs-free repo/query must stay byte-identical to pre-Phase-2 output).
@@ -4982,10 +4995,7 @@ mod tests {
 
     // ── #376 Phase 2: docs lane ──────────────────────────────────────────────
 
-    /// Serializes tests that mutate process-global env vars (docs.* knobs are
-    /// all env-var-driven — see the Phase 1 completion notes on why
-    /// travsr-config isn't wired for travsr-mcp).
-    static DOCS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::seed::DOCS_ENV_LOCK;
 
     #[test]
     fn doc_floor_default_is_0_42() {

@@ -3086,7 +3086,7 @@ fn debug_dump_doc_rerank_scores(
     }
 }
 
-fn build_docs_section(
+pub(crate) fn build_docs_section(
     store: &SqliteStore,
     query: &str,
     token_budget: usize,
@@ -9107,9 +9107,6 @@ mod snippet_tests {
 
     // ── #376 Phase 2: docs section ───────────────────────────────────────────
 
-    /// Serializes tests that mutate process-global env vars (docs.* knobs).
-    static DOCS_SECTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn humanize_doc_anchor_formats_trail() {
         assert_eq!(
@@ -9131,7 +9128,7 @@ mod snippet_tests {
 
     #[test]
     fn build_docs_section_disabled_by_default_is_empty() {
-        let _guard = DOCS_SECTION_ENV_LOCK
+        let _guard = crate::seed::DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
@@ -9143,7 +9140,7 @@ mod snippet_tests {
 
     #[test]
     fn build_docs_section_renders_floored_hits_with_no_score_in_text() {
-        let _guard = DOCS_SECTION_ENV_LOCK
+        let _guard = crate::seed::DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
@@ -9196,7 +9193,7 @@ mod snippet_tests {
     /// scored entry must yield no entries — dropped, not truncated mid-line.
     #[test]
     fn build_docs_section_budget_cap_can_drop_all_entries() {
-        let _guard = DOCS_SECTION_ENV_LOCK
+        let _guard = crate::seed::DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("TRAVSR_DOCS_ENABLED", "1");

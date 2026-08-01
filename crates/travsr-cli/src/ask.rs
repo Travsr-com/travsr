@@ -43,6 +43,27 @@ fn to_row(r: &query::AskRow) -> Row {
     }
 }
 
+/// #376 §4.1: print the docs section, or nothing at all when it is empty
+/// ("absent, not empty-ish" — a section that appears on every query trains the
+/// reader to ignore it).
+///
+/// Plain lines, no table, and no score column: doc scores and code scores are
+/// not commensurable (§8.3 measured doc cosines above each repo's code band),
+/// so the header carries the epistemic weight instead of a number. The lines
+/// arrive already sanitized from `travsr_mcp::query` — this function must not
+/// reformat them in a way that could re-introduce what the sanitizer removed.
+fn print_docs(docs: &[String]) {
+    if docs.is_empty() {
+        return;
+    }
+    println!(
+        "── docs — documentation prose: claims about the code, verify behaviour against the code itself ──"
+    );
+    for line in docs {
+        println!("{line}");
+    }
+}
+
 pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if query_str.trim().is_empty() {
         anyhow::bail!("search query must not be empty — try: travsr ask \"PaymentService\"");
@@ -85,10 +106,23 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         // lookup — so an abstention means "no confidently relevant code found",
         // not "that symbol does not exist". Word it that way to avoid the misread.
         println!("no grounded match for '{display_query}' in this repo (try rephrasing, or search a symbol name directly)");
+        // #376 §4.3: doc hits may appear below the abstain message, but never
+        // convert it into a match — `payload.matched` stays false and no
+        // confidence, coverage or tier label is derived from them. This is the
+        // highest-value case for the lane: §8.5 measured 15/20 k8s rationale
+        // queries as hard abstentions with a citable doc section available.
+        if !payload.docs.is_empty() {
+            println!();
+            print_docs(&payload.docs);
+        }
         return Ok(());
     }
     if payload.no_results {
         println!("no graph results for '{display_query}'");
+        if !payload.docs.is_empty() {
+            println!();
+            print_docs(&payload.docs);
+        }
         return Ok(());
     }
 
@@ -100,7 +134,15 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     // path returned above); it only regroups the human table.
     let grouped = n > 4 && payload.rows.iter().any(|r| r.match_source.is_some());
     if grouped {
-        for tag in ["exact", "semantic", "relevant"] {
+        for tag in ["exact", "semantic", "docs", "relevant"] {
+            // #376 §4.1 section order: exact → semantic → docs → relevant. Docs
+            // sit above `relevant` because design intent beats graph-adjacent
+            // filler, and below the code sections so code leads whenever it has
+            // an answer. Docs are not `rows`, so this arm is not a filter.
+            if tag == "docs" {
+                print_docs(&payload.docs);
+                continue;
+            }
             let mut section: Vec<&query::AskRow> = payload
                 .rows
                 .iter()
@@ -122,6 +164,7 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     } else {
         let rows: Vec<Row> = payload.rows.iter().map(to_row).collect();
         println!("{}", Table::new(rows));
+        print_docs(&payload.docs);
     }
     let embed_note = if payload.embed_used {
         " · [embed-enhanced]"
