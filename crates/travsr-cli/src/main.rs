@@ -358,22 +358,20 @@ fn init_tracing() {
     {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_otlp::WithExportConfig as _;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
         use tracing_subscriber::prelude::*;
 
         let endpoint = std::env::var("TRAVSR_OTLP_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
-        let exporter = opentelemetry_otlp::new_exporter()
-            .tonic()
-            .with_endpoint(&endpoint);
-
         // Gracefully degrade to stderr-only if the OTLP pipeline setup fails
         // (e.g. bad endpoint, missing collector). A tracer init failure must
         // never panic the binary — the user still needs the CLI to work.
-        match opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(exporter)
-            .install_batch(opentelemetry_sdk::runtime::Tokio)
+        match opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&endpoint)
+            .build()
+            .map(|exporter| SdkTracerProvider::builder().with_batch_exporter(exporter).build())
         {
             Ok(tracer_provider) => {
                 let otel_layer =
