@@ -434,7 +434,14 @@ async function daemonStop() {
 // initial watcher scan (10-30 s on a large repo), and an `ask` issued in that
 // window falls back to the cold path, which renders no docs — indistinguishable
 // from a broken lane. So readiness is proven by a real `ask` round trip.
-async function daemonStart(env, { readyTimeoutMs = 180000 } = {}) {
+// Readiness budget. Generous by default because the bound is set by the repo's
+// initial watcher scan, not by the daemon: on kubernetes (264k nodes) that scan
+// is minutes, and a timeout here would report Gate 5 FAIL for a harness reason
+// rather than a product one — the worst kind of gate failure, because it trains
+// the reader to discount the gate.
+const DAEMON_READY_MS = Number(process.env.BENCH_DAEMON_READY_MS || 600000);
+
+async function daemonStart(env, { readyTimeoutMs = DAEMON_READY_MS } = {}) {
   const child = spawn(BIN, ["daemon", "start", "--foreground"], {
     cwd: REPO,
     stdio: ["ignore", "ignore", "ignore"],
