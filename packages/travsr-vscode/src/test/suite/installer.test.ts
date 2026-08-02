@@ -1,5 +1,6 @@
 import * as assert from "assert";
 import * as crypto from "crypto";
+import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import {
@@ -11,6 +12,8 @@ import {
   verifyChecksum,
   checkOnPath,
   hasCmdShimOnPath,
+  findCmdShimPath,
+  resolveNpmShimExe,
   assertExecutableBinary,
 } from "../../installer";
 
@@ -193,6 +196,56 @@ suite("WS1: checkOnPath — Windows .cmd discrimination", () => {
   test("hasCmdShimOnPath returns false for nonexistent binary on Windows", () => {
     if (process.platform !== "win32") return;
     assert.strictEqual(hasCmdShimOnPath("__travsr_definitely_not_on_path_xyz__"), false);
+  });
+
+  test("findCmdShimPath returns null on non-Windows platforms", () => {
+    if (process.platform === "win32") return;
+    assert.strictEqual(findCmdShimPath("__anything__"), null);
+  });
+
+  test("findCmdShimPath returns null for nonexistent binary on Windows", () => {
+    if (process.platform !== "win32") return;
+    assert.strictEqual(findCmdShimPath("__travsr_definitely_not_on_path_xyz__"), null);
+  });
+});
+
+// ── #486: resolveNpmShimExe — npm shim → packaged native binary ───────────
+
+suite("#486: installer — resolveNpmShimExe", () => {
+  /** Build <tmp>/travsr.cmd + <tmp>/node_modules/@travsr.com/travsr/bin/<binName>. */
+  function makeNpmPrefix(binName: string | null): { prefix: string; shim: string; exe: string } {
+    const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-shim-"));
+    const shim = path.join(prefix, "travsr.cmd");
+    fs.writeFileSync(shim, "@echo off\r\n");
+    const binDir = path.join(prefix, "node_modules", "@travsr.com", "travsr", "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const exe = path.join(binDir, binName ?? "travsr.exe");
+    if (binName !== null) fs.writeFileSync(exe, "MZ");
+    return { prefix, shim, exe };
+  }
+
+  test("resolves the packaged exe next to an npm .cmd shim (win32 layout)", () => {
+    const { shim, exe } = makeNpmPrefix("travsr.exe");
+    assert.strictEqual(resolveNpmShimExe(shim, "win32"), exe);
+  });
+
+  test("resolves the packaged binary without .exe on unix layout", () => {
+    const { shim, exe } = makeNpmPrefix("travsr");
+    assert.strictEqual(resolveNpmShimExe(shim, "linux"), exe);
+  });
+
+  test("returns null when the packaged binary is missing", () => {
+    const { shim } = makeNpmPrefix(null); // bin dir exists but no exe inside
+    assert.strictEqual(resolveNpmShimExe(shim, "win32"), null);
+  });
+
+  test("returns null when the resolved path fails assertExecutableBinary (metacharacters)", () => {
+    const shimInBadDir =
+      process.platform === "win32"
+        ? "C:\\npm&prefix\\travsr.cmd"
+        : "/npm&prefix/travsr.cmd";
+    // existsFn stubbed true so the metacharacter validation is what rejects it.
+    assert.strictEqual(resolveNpmShimExe(shimInBadDir, process.platform, () => true), null);
   });
 });
 

@@ -94,6 +94,21 @@ jobs:
           [ "$BASE" = "$NPM" ]   || { echo "tag base $BASE != packages/travsr-npm/package.json $NPM" >&2; exit 1; }
           echo "OK: tag base $BASE matches travsr-cli and npm versions"
 
+      # #486: a stale DOWNLOAD_VERSION makes the vscode extension's
+      # "reinstall" advice silently downgrade users. Stable releases must bump
+      # it in lockstep. Pre-releases are exempt — bumping there would point the
+      # extension at a stable tag that doesn't exist yet.
+      - name: vscode DOWNLOAD_VERSION must match tag on stable releases
+        if: needs.channel.outputs.channel == 'stable'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ needs.channel.outputs.ref }}"
+          BASE="${BASE#v}"
+          DL=$(grep -m1 'export const DOWNLOAD_VERSION' packages/travsr-vscode/src/installer.ts | cut -d'"' -f2)
+          [ "$BASE" = "$DL" ] || { echo "tag base $BASE != DOWNLOAD_VERSION $DL in packages/travsr-vscode/src/installer.ts — bump it as part of the release" >&2; exit 1; }
+          echo "OK: DOWNLOAD_VERSION $DL matches tag base $BASE"
+
   preflight:
     name: preflight (CI green on tagged commit)
     if: github.event_name == 'push'

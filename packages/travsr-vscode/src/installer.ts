@@ -14,7 +14,7 @@ import * as https from "https";
 import * as os from "os";
 import * as path from "path";
 
-export const DOWNLOAD_VERSION = "0.10.0";
+export const DOWNLOAD_VERSION = "0.11.0";
 
 const TARGET_MAP: Partial<Record<string, Partial<Record<string, string>>>> = {
   linux:  { x64: "x86_64-unknown-linux-gnu",  arm64: "aarch64-unknown-linux-gnu" },
@@ -155,25 +155,70 @@ export function checkOnPath(binaryName: string): boolean {
   }
 }
 
-export function hasCmdShimOnPath(binaryName: string): boolean {
-  if (process.platform !== "win32") return false;
+export function findCmdShimPath(binaryName: string): string | null {
+  if (process.platform !== "win32") return null;
   try {
     const out = cp.execFileSync("where", [binaryName], { encoding: "utf8" });
-    return out.split(/\r?\n/).some((l) => l.trim().toLowerCase().endsWith(".cmd"));
+    const shim = out
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => /\.(cmd|bat)$/i.test(l));
+    return shim ?? null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-export function assertExecutableBinary(binary: string): void {
+export function hasCmdShimOnPath(binaryName: string): boolean {
+  return findCmdShimPath(binaryName) !== null;
+}
+
+/**
+ * #486: an npm install is a complete install — the real native binary ships
+ * inside the package, right next to the shim npm puts on PATH:
+ *
+ *   <npm prefix>\travsr.cmd                                       ← shim
+ *   <npm prefix>\node_modules\@travsr.com\travsr\bin\travsr.exe   ← real binary
+ *
+ * Given a shim path, return the packaged binary when it exists and is
+ * spawnable, else null.
+ */
+export function resolveNpmShimExe(
+  shimPath: string,
+  platform: string = process.platform,
+  existsFn: (p: string) => boolean = fs.existsSync
+): string | null {
+  const exe = path.join(
+    path.dirname(shimPath),
+    "node_modules",
+    "@travsr.com",
+    "travsr",
+    "bin",
+    platform === "win32" ? "travsr.exe" : "travsr"
+  );
+  if (!existsFn(exe)) return null;
+  try {
+    assertExecutableBinary(exe, platform);
+  } catch {
+    return null;
+  }
+  return exe;
+}
+
+export function assertExecutableBinary(
+  binary: string,
+  platform: string = process.platform
+): void {
   if (!path.isAbsolute(binary)) {
     throw new Error(`travsr binary must be an absolute path, got: ${binary}`);
   }
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     if (!binary.toLowerCase().endsWith(".exe")) {
       throw new Error(
         `travsr binary on Windows must end in .exe, got: ${binary}. ` +
-        `.cmd/.bat shims are not supported — reinstall via the extension.`
+        `.cmd/.bat shims are not supported — point travsr.binaryPath at the ` +
+        `packaged travsr.exe under node_modules\\@travsr.com\\travsr\\bin, ` +
+        `or reinstall via the extension.`
       );
     }
   }
