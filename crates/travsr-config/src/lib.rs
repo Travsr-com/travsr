@@ -155,7 +155,11 @@ pub static KEYS: &[KeySpec] = &[
         description:
             "Retrieve documentation prose as a separate `docs` result section (true | false).",
         env: Some("TRAVSR_DOCS_ENABLED"),
-        default_display: "false",
+        // #519: both bench repos cleared #376 §7's bar, so this is on by
+        // default (travsr-mcp::seed::docs_enabled's own unwrap_or(true)).
+        // Keep this string in sync with that fallback — it is display-only,
+        // read by `config get`/`list`, and does not itself drive behavior.
+        default_display: "true",
         validate: validate_bool,
     },
     KeySpec {

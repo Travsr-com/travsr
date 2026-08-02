@@ -115,7 +115,11 @@ fn note_docs_flag_is_read_by_the_daemon() {
 /// never turned docs on is not owed a message about them — and writes to stderr
 /// so `--format json` stays machine-readable.
 fn note_cold_path_cannot_render_docs(repo_root: &std::path::Path) {
-    let enabled = travsr_config::effective_bool("docs.enabled", Some(repo_root)).unwrap_or(false);
+    // #519: must match travsr-mcp::seed::docs_enabled's own default (now
+    // true) - otherwise this warning silently stops firing for a cold-path
+    // user on the new default, the exact silent-failure shape this function
+    // exists to prevent.
+    let enabled = travsr_config::effective_bool("docs.enabled", Some(repo_root)).unwrap_or(true);
     if !enabled {
         return;
     }
@@ -289,15 +293,30 @@ mod docs_note_tests {
     /// Printing it unconditionally would put a docs warning in front of every
     /// user who never turned docs on, which is how a note becomes noise and then
     /// becomes ignored — the failure mode §20.4 O3 flags for flaky CI gates too.
+    ///
+    /// #519 flipped the default to on, so the "silent" case this test pins is
+    /// now an explicit opt-out rather than the default — was
+    /// `cold_path_note_is_silent_when_docs_are_off`, renamed rather than
+    /// edited in place.
     #[test]
-    fn cold_path_note_is_silent_when_docs_are_off() {
+    fn cold_path_note_is_silent_when_docs_are_explicitly_off() {
         let _g = HOME_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = Env::new();
         assert!(
-            !travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(false),
-            "default must be off, so note_cold_path_cannot_render_docs returns early"
+            travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(true),
+            "default must be on"
+        );
+        travsr_config::set(
+            "docs.enabled",
+            "false",
+            travsr_config::Scope::Repo(env.repo()),
+        )
+        .expect("set");
+        assert!(
+            !travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(true),
+            "explicit opt-out must make note_cold_path_cannot_render_docs return early"
         );
     }
 
