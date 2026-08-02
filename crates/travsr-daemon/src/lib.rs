@@ -393,6 +393,14 @@ const KNOWN_SOURCE_DIRS: &[&str] = &[
     "docs",
     "examples",
     "samples",
+    // Standard source root for static-site generators (Hugo, Jekyll, Gatsby,
+    // Next.js content collections) — the entire doc corpus of a docs-only
+    // repo commonly lives here. Without this, `travsr init` on such a repo
+    // auto-excludes essentially all of it as a false-positive "large dep
+    // dir", silently (non-TTY runs only log the decision via tracing::info!,
+    // never in the command's own visible output) — found indexing
+    // kubernetes/website while measuring #376 lifecycle plan L4.
+    "content",
 ];
 
 /// Heuristic: a single directory holding ≥ 1 000 source-language files AND
@@ -3101,6 +3109,43 @@ mod tests {
         assert!(
             ghosts.is_empty(),
             "ghost node must be purged by init_repo, found: {ghosts:?}"
+        );
+    }
+
+    /// L4 (#376 lifecycle plan): found indexing kubernetes/website, whose
+    /// entire doc corpus lives under `content/` — the standard source root
+    /// for Hugo/Jekyll/Gatsby-style static sites. Before `content` was added
+    /// to `KNOWN_SOURCE_DIRS`, a single top-level `content/` directory large
+    /// enough to dominate the repo (>=1000 files, >=15% of the total) was
+    /// flagged as a false-positive "large dep dir" and auto-excluded in
+    /// non-TTY runs with no visible warning in the command's own output —
+    /// silently discarding the repo's actual content.
+    #[test]
+    fn detect_large_dep_dir_does_not_flag_content() {
+        let repo_root = std::path::Path::new("/repo");
+        let mut files: Vec<PathBuf> = (0..1200)
+            .map(|i| repo_root.join(format!("content/en/docs/page-{i}.md")))
+            .collect();
+        files.push(repo_root.join("go.mod"));
+        assert_eq!(
+            detect_large_dep_dir(&files, repo_root),
+            None,
+            "content/ is a known source dir and must never be auto-excluded"
+        );
+    }
+
+    #[test]
+    fn detect_large_dep_dir_still_flags_an_unknown_large_dir() {
+        let repo_root = std::path::Path::new("/repo");
+        let mut files: Vec<PathBuf> = (0..1200)
+            .map(|i| repo_root.join(format!("node_modules/pkg-{i}/index.js")))
+            .collect();
+        files.push(repo_root.join("go.mod"));
+        let detected = detect_large_dep_dir(&files, repo_root);
+        assert_eq!(
+            detected.map(|(dir, ..)| dir),
+            Some("node_modules".to_string()),
+            "an unknown, dominant top-level dir must still be flagged"
         );
     }
 
