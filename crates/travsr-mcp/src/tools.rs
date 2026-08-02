@@ -9204,8 +9204,15 @@ mod snippet_tests {
         .with_end_line(end_line)
     }
 
+    /// #519: docs.enabled defaults to true now, so this must stay empty for
+    /// the actual reason its name claims — no embed doc hook wired on the
+    /// store at all — not as an accidental side effect of the old default.
+    /// Was `build_docs_section_disabled_by_default_is_empty`: that name is
+    /// what first exposed the coincidence (the assertion still passed after
+    /// #519's flip, but for the wrong reason, since no hook was ever set here
+    /// regardless of the flag).
     #[test]
-    fn build_docs_section_disabled_by_default_is_empty() {
+    fn build_docs_section_with_no_hook_wired_is_empty() {
         let _guard = crate::seed::DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9213,6 +9220,41 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let (entries, tokens) = build_docs_section(&store, "how are floors calibrated", 4000);
         assert!(entries.is_empty());
+        assert_eq!(tokens, 0);
+    }
+
+    /// The flag itself gates the lane even with a real hook wired and the
+    /// default otherwise on — explicit now that "disabled" is a user opt-out
+    /// (`travsr config set docs.enabled false`) rather than the ship default.
+    #[test]
+    fn build_docs_section_explicitly_disabled_is_empty_even_with_a_hook() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "0");
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n1 = doc_chunk_node(
+            "docs/plans/model-relative-semantic-floors.md",
+            "doc:auto-calibrated-floors",
+            10,
+            40,
+        );
+        store.put_node(&n1).unwrap();
+        let id1 = n1.id;
+        let hook: travsr_store::EmbedKnnHook =
+            std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.71)]));
+        store.set_embed_doc_knn_hook(hook);
+
+        let (entries, tokens) =
+            build_docs_section(&store, "how are semantic floors calibrated", 4000);
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+
+        assert!(
+            entries.is_empty(),
+            "the flag must gate the lane even with a hook that would otherwise answer"
+        );
         assert_eq!(tokens, 0);
     }
 

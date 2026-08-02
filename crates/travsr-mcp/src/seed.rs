@@ -679,7 +679,7 @@ pub(crate) fn docs_max_results(store: &SqliteStore) -> usize {
 /// environment keeps its current behaviour byte-for-byte.
 pub(crate) fn docs_enabled(store: &SqliteStore) -> bool {
     travsr_config::effective_bool("docs.enabled", config_repo_root(store).as_deref())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// The single lock serializing every test that mutates the process-global
@@ -5135,15 +5135,20 @@ mod tests {
         assert_eq!(docs_max_results(&env.store), 3);
     }
 
+    /// #519: both bench repos cleared #376 §7's bar (all five docs-lane gates
+    /// green, travsr and kubernetes, against merged code), earning the
+    /// default flip. Was `docs_enabled_defaults_to_false` — renamed rather
+    /// than edited in place, so a reader never trusts a name the assertions
+    /// no longer match.
     #[test]
-    fn docs_enabled_defaults_to_false() {
+    fn docs_enabled_defaults_to_true() {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
-        assert!(!docs_enabled(&env.store));
-        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
         assert!(docs_enabled(&env.store));
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "0");
+        assert!(!docs_enabled(&env.store));
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
     }
 
@@ -5167,11 +5172,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
 
-        assert!(!docs_enabled(&env.store), "default off");
-        env.set_repo("docs.enabled", "true");
+        // #519: default flipped on once both bench repos cleared #376 §7's
+        // bar. The property this test actually pins - repo config controls
+        // the switch with no env var involved - is unchanged; only which
+        // direction the flip demonstrates is.
+        assert!(docs_enabled(&env.store), "default on");
+        env.set_repo("docs.enabled", "false");
         assert!(
-            docs_enabled(&env.store),
-            "repo config must turn the lane on"
+            !docs_enabled(&env.store),
+            "repo config must turn the lane off"
         );
 
         env.set_repo("docs.max_results", "7");
@@ -5215,19 +5224,36 @@ mod tests {
             "[docs]\nenabled = \"ture\"\nmax_results = \"lots\"\n",
         )
         .expect("write config");
-        assert!(!docs_enabled(&env.store));
+        // #519: the built-in default is now `true`.
+        assert!(docs_enabled(&env.store));
         assert_eq!(docs_max_results(&env.store), 3);
     }
 
-    /// docs.enabled=false (the Phase 2 ship default) must return no doc
-    /// results regardless of what the hook would otherwise say — the feature
-    /// flag, not hook availability, gates the lane.
+    /// #519: docs.enabled=true is now the ship default, so a real hook must
+    /// produce real candidates with no config at all. Was
+    /// `doc_lane_candidates_disabled_by_default_returns_empty` - renamed
+    /// rather than edited in place; see `doc_lane_candidates_explicitly_disabled_returns_empty`
+    /// for the flag-gates-the-lane property that test used to cover.
     #[test]
-    fn doc_lane_candidates_disabled_by_default_returns_empty() {
+    fn doc_lane_candidates_enabled_by_default_returns_candidates() {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
+        let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
+        assert!(!doc_lane_candidates(&env.store, "query", Some(hook)).is_empty());
+    }
+
+    /// docs.enabled=false must return no doc results regardless of what the
+    /// hook would otherwise say — the feature flag, not hook availability,
+    /// gates the lane. Explicit now that disabled is no longer the default.
+    #[test]
+    fn doc_lane_candidates_explicitly_disabled_returns_empty() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
+        env.set_repo("docs.enabled", "false");
         let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
         assert!(doc_lane_candidates(&env.store, "query", Some(hook)).is_empty());
     }
