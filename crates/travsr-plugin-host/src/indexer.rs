@@ -897,11 +897,23 @@ impl PluginIndexer {
 /// and the per-repo config, so it is exactly the marker that answers "which
 /// repo's config applies to this file". A file outside any indexed repo yields
 /// `None`, which degrades to the env and global layers.
+///
+/// The home directory is excluded, because `~/.travsr` is the **global** config
+/// dir (it holds `bin/`, `models/` and the global `config.toml`), not a repo.
+/// Without this a file anywhere under `$HOME` but outside a repo resolves its
+/// "repo" layer to the global config file, so the repo and global layers alias
+/// each other and precedence between them stops meaning anything.
+///
+/// Found on Windows CI rather than by review: the runner's temp dir lives under
+/// `C:\Users\RUNNER~1`, which has a real `~/.travsr`, so a path with no repo
+/// above it resolved to the home directory. On macOS and Linux the temp dir
+/// sits outside `$HOME`, which is why it never showed up locally.
 fn find_repo_root(abs_path: &Path) -> Option<PathBuf> {
+    let home = dirs::home_dir();
     abs_path
         .ancestors()
         .skip(1)
-        .find(|dir| dir.join(".travsr").is_dir())
+        .find(|dir| home.as_deref() != Some(*dir) && dir.join(".travsr").is_dir())
         .map(Path::to_path_buf)
 }
 
@@ -1005,11 +1017,37 @@ mod tests {
         );
 
         // A `.travsr` *file* (not a directory) must not be mistaken for a root.
+        //
+        // Asserted as "this directory was not chosen" rather than "the result is
+        // None": the temp dir's own ancestors are not ours to control, and on
+        // Windows they include the user's home, which has a real `~/.travsr`.
+        // Asserting None there tested the runner's filesystem, not this function.
         let other = tempfile::tempdir().expect("tempdir2");
         std::fs::write(other.path().join(".travsr"), "not a dir").expect("write");
         let stray = other.path().join("README.md");
         std::fs::write(&stray, "# hi").expect("write");
-        assert_eq!(find_repo_root(&stray), None);
+        assert_ne!(
+            find_repo_root(&stray).as_deref(),
+            Some(other.path()),
+            "a .travsr file is not a repo root"
+        );
+    }
+
+    /// `~/.travsr` is the global config dir, not a repo, so it must never be
+    /// returned as a repo root. Otherwise a file under `$HOME` but outside any
+    /// repo makes the repo layer alias the global layer.
+    #[test]
+    fn find_repo_root_never_returns_the_home_directory() {
+        let Some(home) = dirs::home_dir() else {
+            return; // no home to test against
+        };
+        // Only meaningful when ~/.travsr actually exists; on a machine without
+        // it the walk would skip the home dir anyway.
+        if !home.join(".travsr").is_dir() {
+            return;
+        }
+        let probe = home.join("__travsr_nonexistent_probe__").join("a.md");
+        assert_ne!(find_repo_root(&probe).as_deref(), Some(home.as_path()));
     }
 
     /// Explicit `with_doc_excludes` patterns and layered-config ones are
