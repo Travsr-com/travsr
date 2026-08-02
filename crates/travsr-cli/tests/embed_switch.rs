@@ -243,9 +243,15 @@ fn list_reports_installed_from_model_files_not_the_shared_binary() {
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::write(bin_dir.join(&binary_only.binary_name), b"").unwrap();
 
+    // `cmd_list` resolves the repo's active model from the *cwd*'s git root.
+    // Without this the child walks up into the real travsr checkout and reads
+    // its `.travsr/embed.toml`, so what the test asserts on depends on the
+    // developer's own machine state.
+    let cwd = tempfile::tempdir().unwrap();
     let out = Command::cargo_bin("travsr")
         .unwrap()
         .env("HOME", home.path())
+        .current_dir(cwd.path())
         .args(["embed", "list", "--json"])
         .output()
         .unwrap();
@@ -263,5 +269,45 @@ fn list_reports_installed_from_model_files_not_the_shared_binary() {
         find(&binary_only.id)["installed"],
         false,
         "a backend with only the shared sidecar binary (no model files) must NOT report installed"
+    );
+}
+
+/// #482, the other half: `cmd_list` was migrated off the shared-binary check
+/// but `cmd_switch` was not. Since every backend declares the same
+/// `binary_name`, installing *any* model made `switch` accept *every* model —
+/// and the command then contradicted itself immediately, with `embed list`
+/// reporting `installed=false` and `embed status` `✗ missing` for the model
+/// `switch` had just made active.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see module doc comment"
+)]
+fn switch_refuses_a_backend_whose_model_files_are_missing() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let backends = travsr_plugin_host::embed_backends();
+    let (fully_installed, binary_only) = (&backends[0], &backends[1]);
+
+    install_backend_files(home.path(), fully_installed);
+    indexed_repo(repo.path());
+
+    let assert = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("HOME", home.path())
+        .current_dir(repo.path())
+        .args(["embed", "switch", &binary_only.id])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+
+    assert!(
+        stderr.contains("is not installed"),
+        "switching to a model with no weights must be refused, got: {stderr}"
+    );
+    assert_eq!(
+        repo_config_active(repo.path()),
+        None,
+        "a refused switch must not write the repo config"
     );
 }

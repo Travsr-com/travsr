@@ -2217,7 +2217,14 @@ fn run_background_phase_b_inner(
     // Phase 2 is intentionally NOT spawned here — the embed_tick in the daemon
     // event loop detects when Phase 1 is done and then spawns Phase 2, so the
     // two phases never write to embed.db concurrently.
-    if succeeded {
+    //
+    // The `repo_backend_id` gate is the auto-embed opt-in, and it has to be
+    // *here*: `spawn_background_reindex_phase1` only checks `resolve_backend`,
+    // which falls back to the machine-global model when a repo has none. So
+    // without this, a repo that never ran `travsr embed init` would get a full
+    // embed pass merely because some *other* repo installed a backend. That is
+    // the same gate `maybe_spawn_embed` applies to the tick-driven catch-up.
+    if succeeded && travsr_plugin_host::repo_backend_id(repo_root).is_some() {
         let db_path = repo_root.join(".travsr/graph.db");
         if travsr_plugin_host::spawn_background_reindex_phase1(&db_path) {
             tracing::info!("triggered post-phase-B embed Phase 1");

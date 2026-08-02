@@ -226,3 +226,84 @@ fn gc_removes_orphaned_hnsw_files_for_reclaimed_models() {
         .join("bge-large-en-v1.5-docs.hnsw.usearch")
         .exists());
 }
+
+/// The keep-set is resolved from *config*; what gets deleted is decided by
+/// what is in *embed.db*. They diverge the moment a user runs `embed switch`
+/// (which prints `Re-embed` and `Reclaim` two lines apart) and then reaches
+/// for the second hint before the first. At that point the active model has
+/// zero vectors, so "keep only the active model" means "keep nothing" — this
+/// must never be a silent success.
+#[test]
+fn gc_refuses_when_the_active_model_has_no_embeddings_of_its_own() {
+    let repo = tempfile::tempdir().unwrap();
+    // Switched to arctic, not yet re-embedded: every row still belongs to bge.
+    indexed_repo(repo.path(), "arctic-embed-m-v1.5");
+    let embed_db = repo.path().join(".travsr/embed.db");
+    write_embed_db(&embed_db, &[("bge-large-en-v1.5", 3)]);
+    let before = model_row_counts(&embed_db);
+
+    let assert = Command::cargo_bin("travsr")
+        .unwrap()
+        .current_dir(repo.path())
+        .args(["embed", "gc", "--apply"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+
+    assert!(
+        stderr.contains("every vector in the repo"),
+        "the refusal must say what was at stake, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("travsr embed reindex"),
+        "the refusal must name the way out, got: {stderr}"
+    );
+    assert_eq!(
+        model_row_counts(&embed_db),
+        before,
+        "nothing may be deleted when the sweep would empty the repo"
+    );
+}
+
+/// Same shape, dry-run: a `Would reclaim: <everything>` preview is a promise
+/// the command must not be willing to keep.
+#[test]
+fn gc_dry_run_also_refuses_a_whole_repo_sweep() {
+    let repo = tempfile::tempdir().unwrap();
+    indexed_repo(repo.path(), "arctic-embed-m-v1.5");
+    write_embed_db(
+        &repo.path().join(".travsr/embed.db"),
+        &[("bge-large-en-v1.5", 3)],
+    );
+
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .current_dir(repo.path())
+        .args(["embed", "gc"])
+        .assert()
+        .failure();
+}
+
+/// `--keep` is the escape hatch: naming a model that actually has rows is an
+/// explicit statement about what to preserve, so the guard steps aside.
+#[test]
+fn gc_keep_clears_the_whole_repo_sweep_guard() {
+    let repo = tempfile::tempdir().unwrap();
+    indexed_repo(repo.path(), "arctic-embed-m-v1.5");
+    let embed_db = repo.path().join(".travsr/embed.db");
+    write_embed_db(
+        &embed_db,
+        &[("bge-large-en-v1.5", 3), ("bge-small-en-v1.5", 2)],
+    );
+
+    Command::cargo_bin("travsr")
+        .unwrap()
+        .current_dir(repo.path())
+        .args(["embed", "gc", "--apply", "--keep", "bge-large-en-v1.5"])
+        .assert()
+        .success();
+
+    let after = model_row_counts(&embed_db);
+    assert_eq!(after.get("bge-large-en-v1.5"), Some(&3));
+    assert_eq!(after.get("bge-small-en-v1.5"), None);
+}

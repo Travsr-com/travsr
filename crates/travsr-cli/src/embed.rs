@@ -1642,8 +1642,13 @@ fn cmd_switch(backend_id: &str, global: bool) -> Result<()> {
         anyhow::anyhow!("Unknown backend '{backend_id}'. Run `travsr embed list`.")
     })?;
 
+    // #482: the sidecar binary is shared by every backend, so its presence only
+    // proves *some* model was installed once. Switching to a model whose weights
+    // are absent used to succeed here and then contradict itself — `embed list`
+    // reporting `installed=false` and `embed status` `✗ missing` for the model
+    // it had just made active. Check the model's own files, as list/status do.
     let bin_dir = embed_bin_dir()?;
-    if !bin_dir.join(&backend.binary_name).exists() {
+    if !bin_dir.join(&backend.binary_name).exists() || !model_files_installed(backend) {
         bail!(
             "Backend '{backend_id}' is not installed. Run `travsr embed init --backend {backend_id}` first."
         );
@@ -1734,6 +1739,7 @@ fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
 
     let embed_db_path = db_path.with_file_name("embed.db");
     let all = travsr_plugin_host::embeddings_by_model(&embed_db_path)?;
+    let embedded_models = all.len();
     let reclaimable: Vec<(String, u64, u64)> = all
         .into_iter()
         .filter(|(m, _, _)| !keep_set.contains(m))
@@ -1743,6 +1749,28 @@ fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
         println!("Nothing to reclaim \u{2014} every embedded model is in the keep-set.");
         return Ok(());
     }
+
+    // The keep-set is resolved from *config*, but what gets deleted is decided
+    // by what is in *embed.db* — and those diverge exactly when it is most
+    // expensive. `embed switch` writes the new model to config and prints
+    // `Re-embed` and `Reclaim` two lines apart, so a user who runs the second
+    // without the first has an active model with zero vectors and a keep-set
+    // that protects nothing. The same holds for a repo with no repo config
+    // whose global active model was switched from some other directory.
+    //
+    // Refuse whenever the sweep would take every vector the repo has. `--keep`
+    // is the escape hatch: naming a model that actually has rows is an explicit
+    // statement about what to preserve, and it clears this guard.
+    anyhow::ensure!(
+        reclaimable.len() < embedded_models,
+        "Refusing to reclaim: '{active}' is this repo's active model but has no embeddings \
+         yet, so this would delete every vector in the repo ({} across {embedded_models} \
+         model{}) and leave it with none.\n\
+         Re-embed first:  travsr embed reindex\n\
+         Or name what to keep:  travsr embed gc --keep <model>",
+        fmt_count(reclaimable.iter().map(|(_, r, _)| r).sum::<u64>()),
+        if embedded_models == 1 { "" } else { "s" },
+    );
 
     let hnsw_paths = reclaimable_hnsw_paths(&db_path, &reclaimable);
     let vec_bytes: u64 = reclaimable.iter().map(|(_, _, b)| b).sum();
@@ -1770,8 +1798,12 @@ fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let (deleted, vacuumed) = travsr_plugin_host::gc_embeddings(&embed_db_path, &keep_set)?;
-    let deleted_models: Vec<&str> = deleted.iter().map(|(m, _, _)| m.as_str()).collect();
+    // Files first, rows second. The HNSW files belong to inactive models, so
+    // nothing reads them and deleting them early is safe — whereas the reverse
+    // order strands them permanently if the process dies in between: the next
+    // `gc` derives its file list from `embeddings_by_model`, which by then
+    // returns nothing for the reclaimed model, so it reports "nothing to
+    // reclaim" while hundreds of MB of orphaned indexes stay on disk.
     let mut removed_files = 0usize;
     for path in &hnsw_paths {
         match std::fs::remove_file(path) {
@@ -1779,6 +1811,9 @@ fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
             Err(e) => tracing::warn!("could not remove {}: {e}", path.display()),
         }
     }
+
+    let (deleted, vacuum_skipped) = travsr_plugin_host::gc_embeddings(&embed_db_path, &keep_set)?;
+    let deleted_models: Vec<&str> = deleted.iter().map(|(m, _, _)| m.as_str()).collect();
 
     println!(
         "\u{2713} Reclaimed {} vectors ({:.1} MB) from {}: {}",
@@ -1796,12 +1831,12 @@ fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
         hnsw_paths.len(),
         if hnsw_paths.len() == 1 { "" } else { "s" }
     );
-    if !vacuumed {
+    if let Some(reason) = vacuum_skipped {
         println!(
-            "  warning: VACUUM skipped (not enough free disk space) \u{2014} rows were deleted \
-             but embed.db's size on disk is unchanged. Re-run `travsr embed gc --apply` later \
-             to shrink it once space frees up (it is idempotent \u{2014} nothing left to delete \
-             will report zero)."
+            "  warning: VACUUM skipped ({reason}) \u{2014} rows were deleted but embed.db's size \
+             on disk is unchanged. Re-run `travsr embed gc --apply` later to shrink it (it is \
+             idempotent \u{2014} nothing left to delete will report zero). A running daemon or \
+             MCP server holding embed.db open is the usual cause: travsr daemon stop"
         );
     }
     Ok(())

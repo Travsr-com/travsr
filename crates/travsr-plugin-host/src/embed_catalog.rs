@@ -122,9 +122,13 @@ impl EmbedOpLock {
     /// holder. On failure, returns a ready-to-print message naming who holds
     /// it — every caller (CLI error, daemon log) can use it as-is.
     ///
-    /// `Ok(None)` (rather than an error) when `.travsr` itself is missing or
-    /// unopenable: that is "not an indexed repo yet", not "locked", and
-    /// callers already handle a missing repo separately.
+    /// `Ok(None)` (rather than an error) **only** when `.travsr` itself is
+    /// missing: that is "not an indexed repo yet", not "locked", and callers
+    /// already handle a missing repo separately. Any *other* open failure
+    /// (EACCES, read-only mount, `embed.lock` replaced by a directory, EMFILE)
+    /// is an error: on an indexed repo `Ok(None)` reaches `run_parallel_reindex`
+    /// as "no lock needed" and the pass runs completely unserialized, which is
+    /// the exact race L5 exists to prevent.
     ///
     /// The pid/op the holder records lives in a separate, never-locked
     /// `embed.lock.info` file rather than inside `embed.lock` itself. Unlike
@@ -139,13 +143,24 @@ impl EmbedOpLock {
         let dir = repo_root.join(".travsr");
         let lock_path = dir.join("embed.lock");
         let info_path = dir.join("embed.lock.info");
-        let Ok(file) = std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&lock_path)
-        else {
-            return Ok(None);
+        {
+            Ok(f) => f,
+            // No `.travsr` at all → not an indexed repo. Fail *open* only here.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !dir.exists() => {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "opening the embed lock at {} \u{2014} refusing to run an embed operation \
+                     without it",
+                    lock_path.display()
+                )));
+            }
         };
         if file.try_lock_exclusive().is_err() {
             let held = std::fs::read_to_string(&info_path).unwrap_or_default();
@@ -154,11 +169,11 @@ impl EmbedOpLock {
                 .split_once('\t')
                 .map(|(p, o)| (p.to_string(), o.to_string()))
                 .unwrap_or_else(|| ("unknown".to_string(), "an embed operation".to_string()));
-            anyhow::bail!(
+            return Err(anyhow::Error::new(Contended(format!(
                 "Another embed operation is already running for this repo \
                  ({held_op}, pid {pid}).\n\
                  Wait for it to finish, or stop it with: travsr daemon stop"
-            );
+            ))));
         }
         std::fs::write(&info_path, format!("{}\t{op}", std::process::id()))
             .context("writing embed.lock.info")?;
@@ -184,6 +199,10 @@ impl EmbedOpLock {
     /// seconds, not minutes) against a pass that is genuinely still running,
     /// so a real conflict still surfaces the "another operation is running"
     /// message rather than hanging.
+    ///
+    /// Only *contention* is retried. An unopenable lock file or an unwritable
+    /// `embed.lock.info` will not resolve itself by waiting, so those surface
+    /// immediately instead of after the full budget.
     pub fn try_acquire_with_retry(repo_root: &Path, op: &str) -> anyhow::Result<Option<Self>> {
         const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -191,7 +210,10 @@ impl EmbedOpLock {
         loop {
             match Self::try_acquire(repo_root, op) {
                 Ok(lock) => return Ok(lock),
-                Err(e) if std::time::Instant::now() < deadline => {
+                Err(e)
+                    if e.downcast_ref::<Contended>().is_some()
+                        && std::time::Instant::now() < deadline =>
+                {
                     tracing::debug!("embed lock busy, retrying: {e}");
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -200,6 +222,20 @@ impl EmbedOpLock {
         }
     }
 }
+
+/// "Someone else holds the lock" — the one `try_acquire` failure that is worth
+/// waiting on. Carries the full user-facing message, so `{e}` is unchanged for
+/// every caller that just prints it.
+#[derive(Debug)]
+struct Contended(String);
+
+impl std::fmt::Display for Contended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Contended {}
 
 impl Drop for EmbedOpLock {
     fn drop(&mut self) {
@@ -1555,9 +1591,13 @@ pub fn embeddings_by_model(embed_db_path: &Path) -> anyhow::Result<Vec<ModelUsag
 /// `VACUUM` needs free disk space roughly equal to the database's size. If
 /// there isn't enough, the delete still lands — rows are gone, which is the
 /// correctness-critical part — but the file stays its prior size on disk.
-/// That is reported via the `bool`, not treated as a failure: the delete
-/// already succeeded by the time `VACUUM` would run, and erroring out after
-/// a successful delete would be the worst outcome (L2's own design note).
+/// That is reported via the returned `Option<String>` — `None` for "shrank",
+/// `Some(reason)` for "rows gone, file not shrunk" — not treated as a failure:
+/// the delete already succeeded by the time `VACUUM` would run, and erroring
+/// out after a successful delete would be the worst outcome (L2's own design
+/// note). The reason is carried rather than inferred because disk space is not
+/// the only cause: a concurrent reader (daemon, MCP server) denies `VACUUM` its
+/// exclusive lock just as easily.
 ///
 /// Policy — which models to keep — is the caller's job (`embed gc` resolves
 /// it from the repo's active model plus any `--keep`). This function only
@@ -1567,7 +1607,7 @@ pub fn embeddings_by_model(embed_db_path: &Path) -> anyhow::Result<Vec<ModelUsag
 pub fn gc_embeddings(
     embed_db_path: &Path,
     keep_ids: &[String],
-) -> anyhow::Result<(Vec<ModelUsage>, bool)> {
+) -> anyhow::Result<(Vec<ModelUsage>, Option<String>)> {
     use anyhow::Context as _;
     anyhow::ensure!(
         !keep_ids.is_empty(),
@@ -1579,7 +1619,7 @@ pub fn gc_embeddings(
         .filter(|(m, _, _)| !keep_ids.iter().any(|k| k == m))
         .collect();
     if reclaimed.is_empty() {
-        return Ok((reclaimed, true));
+        return Ok((reclaimed, None));
     }
 
     let conn = rusqlite::Connection::open(embed_db_path)
@@ -1591,14 +1631,22 @@ pub fn gc_embeddings(
     conn.execute(&sql, params.as_slice())
         .context("deleting inactive-model embeddings")?;
 
+    // VACUUM rewrites the whole file, so it needs room for a second copy. It
+    // also needs an exclusive lock, which a daemon or MCP server holding a read
+    // on embed.db will deny — this lock excludes reindex/gc, not readers. Both
+    // are routine, so report *which* one happened rather than collapsing every
+    // cause into "not enough disk space".
     let db_size = std::fs::metadata(embed_db_path).map(|m| m.len()).ok();
     let free_space = fs2::available_space(embed_db_path).ok();
-    let vacuumed = match (free_space, db_size) {
-        (Some(free), Some(size)) if free > size => conn.execute_batch("VACUUM").is_ok(),
-        _ => false,
+    let vacuum_skipped: Option<String> = match (free_space, db_size) {
+        (Some(free), Some(size)) if free <= size.saturating_mul(2) => Some(format!(
+            "not enough free disk space (VACUUM needs room for a second copy: \
+             embed.db is {size} bytes, {free} bytes free)"
+        )),
+        _ => conn.execute_batch("VACUUM").err().map(|e| e.to_string()),
     };
 
-    Ok((reclaimed, vacuumed))
+    Ok((reclaimed, vacuum_skipped))
 }
 
 /// Read the active backend id from `~/.travsr/embed.toml`.
@@ -2060,6 +2108,58 @@ mod tests {
         assert!(
             free.is_some(),
             "must acquire once the other holder releases"
+        );
+    }
+
+    /// `Ok(None)` means "not an indexed repo", and `run_parallel_reindex` reads
+    /// it as "no lock needed, carry on". So it must be reachable *only* when
+    /// `.travsr` is genuinely absent — an unopenable lock file on a real repo
+    /// has to be an error, or the reindex runs completely unserialized and L5's
+    /// whole guarantee evaporates silently.
+    #[test]
+    fn an_unopenable_lock_on_an_indexed_repo_is_an_error_not_a_skip() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        // A directory where the lock file belongs: open(write) fails with a
+        // kind that is not NotFound, on every platform.
+        std::fs::create_dir(travsr_dir.join("embed.lock")).unwrap();
+
+        let err = EmbedOpLock::try_acquire(repo.path(), "reindex")
+            .expect_err("an unopenable lock on an indexed repo must not be reported as 'no repo'");
+        assert!(
+            err.to_string()
+                .contains("refusing to run an embed operation"),
+            "the error must say the operation was refused, got: {err}"
+        );
+
+        // The contrast case: no `.travsr` at all really is "not indexed yet".
+        let bare = tempfile::tempdir().unwrap();
+        assert!(
+            EmbedOpLock::try_acquire(bare.path(), "reindex")
+                .unwrap()
+                .is_none(),
+            "a repo with no .travsr directory must still yield Ok(None)"
+        );
+    }
+
+    /// Only contention is worth waiting on. A lock file that cannot be opened
+    /// will not become openable, so `try_acquire_with_retry` must surface it
+    /// immediately rather than burning its full 10s budget first.
+    #[test]
+    fn retry_does_not_wait_out_its_budget_on_a_non_contention_error() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        std::fs::create_dir(travsr_dir.join("embed.lock")).unwrap();
+
+        let started = std::time::Instant::now();
+        EmbedOpLock::try_acquire_with_retry(repo.path(), "reindex")
+            .expect_err("an unopenable lock must not be retried into success");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must fail fast, took {:?}",
+            started.elapsed()
         );
     }
 
