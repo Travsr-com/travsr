@@ -804,6 +804,29 @@ pub(crate) fn doc_rerank_floor() -> f32 {
     floor_env("TRAVSR_DOC_RERANK_FLOOR").unwrap_or(DOC_RERANK_FLOOR)
 }
 
+/// #520: ambiguity threshold for *selective* doc-lane reranking (bench
+/// experiment, not a shipped default). `None` (the default — no env set)
+/// means "always rerank", identical to shipped behavior today.
+///
+/// When `Some(t)`, `tools::rerank_doc_candidates` skips the cross-encoder
+/// pass entirely whenever the top raw-cosine candidate already clears `t` —
+/// the reasoning being that a confidently-separated top candidate doesn't
+/// need the reranker's judgment, so the (measured 1.3-2.6x, #520) latency
+/// cost of the second cross-encoder pass can be skipped for the "easy" case.
+///
+/// This is env-only on purpose: #520's own gate is that a threshold must
+/// clear a strict non-regression bar on hit@1/hit@3 with zero per-query
+/// hit-to-miss flips on *both* bench repos before it ships as a default —
+/// see `bench/sweep-selective-rerank.mjs`. An earlier naive attempt at this
+/// exact lever measurably lost accuracy (travsr 1.0/1.0 -> 0.9/0.9), so this
+/// stays opt-in until a threshold is proven, not assumed, safe.
+pub(crate) fn doc_rerank_ambiguity_threshold() -> Option<f32> {
+    std::env::var("TRAVSR_DOC_RERANK_AMBIGUITY_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|&x| (0.0..=1.0).contains(&x))
+}
+
 /// Compiled default for [`doc_rerank_floor`]. See that function for the
 /// measurement behind the value.
 pub(crate) const DOC_RERANK_FLOOR: f32 = 0.05;

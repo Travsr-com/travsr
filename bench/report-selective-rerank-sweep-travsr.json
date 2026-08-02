@@ -1,0 +1,75 @@
+{
+  "generatedAt": "2026-08-02T11:19:51.177Z",
+  "repo": "travsr",
+  "baseline": {
+    "n": 20,
+    "hit@1": 0.9,
+    "hit@3": 0.9,
+    "medianMs": 1967
+  },
+  "sweep": [
+    {
+      "threshold": 0.337,
+      "n": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 1902,
+      "flips": [],
+      "latencyRatio": 0.967
+    },
+    {
+      "threshold": 0.377,
+      "n": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 1729,
+      "flips": [],
+      "latencyRatio": 0.879
+    },
+    {
+      "threshold": 0.417,
+      "n": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 2166,
+      "flips": [],
+      "latencyRatio": 1.101
+    },
+    {
+      "threshold": 0.457,
+      "n": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 1851,
+      "flips": [],
+      "latencyRatio": 0.941
+    },
+    {
+      "threshold": 0.497,
+      "n": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 1786,
+      "flips": [],
+      "latencyRatio": 0.908
+    },
+    {
+      "threshold": 0.538,
+      "n": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 1953,
+      "flips": [],
+      "latencyRatio": 0.993
+    },
+    {
+      "threshold": 0.578,
+      "n": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 2037,
+      "flips": [],
+      "latencyRatio": 1.036
+    }
+  ]
+}
