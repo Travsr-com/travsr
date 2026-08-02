@@ -3,6 +3,17 @@
 // retrieval (that reads <repo>/.travsr/embed.toml). These tests pin the fix:
 // switch writes the layer the user meant, and `status`/`list` stop disagreeing
 // about which model is active.
+//
+// Every test here isolates the machine-global layer by pointing `$HOME` at a
+// fresh tempdir, so a test run never reads or writes this machine's real
+// `~/.travsr/`. That works on Unix (`dirs::home_dir()` reads `$HOME`), but not
+// on Windows: `dirs-sys`'s Windows `home_dir()` calls `SHGetKnownFolderPath`
+// directly and does not consult any environment variable, `HOME` or
+// `USERPROFILE` included (verified by reading dirs-sys 0.4.1's source) - so
+// there the CLI always resolves the real profile directory regardless of
+// what a test sets, and the fake-install setup below never lands where the
+// binary under test actually looks. `#[cfg_attr(windows, ignore)]` on each
+// test records that as a testing-environment limitation, not a product bug.
 
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -67,6 +78,10 @@ fn machine_config_active(home: &Path) -> Option<String> {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see module doc comment"
+)]
 fn switch_in_a_repo_writes_the_repo_config_not_the_machine_config() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -95,6 +110,10 @@ fn switch_in_a_repo_writes_the_repo_config_not_the_machine_config() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see module doc comment"
+)]
 fn switch_with_global_writes_the_machine_config() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -123,6 +142,10 @@ fn switch_with_global_writes_the_machine_config() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see module doc comment"
+)]
 fn status_names_both_layers_when_they_diverge() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -165,6 +188,10 @@ fn status_names_both_layers_when_they_diverge() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see module doc comment"
+)]
 fn status_stays_single_line_when_layers_agree() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -199,6 +226,10 @@ fn status_stays_single_line_when_layers_agree() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see module doc comment"
+)]
 fn list_reports_installed_from_model_files_not_the_shared_binary() {
     let home = tempfile::tempdir().unwrap();
     let backends = travsr_plugin_host::embed_backends();
