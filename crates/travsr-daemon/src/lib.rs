@@ -1363,7 +1363,8 @@ pub fn init_repo_with_progress(
             };
             let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
-            let (resolved, resolved_sites) = resolve_unresolved_calls(&store, &pb_unresolved);
+            let (resolved, resolved_sites) =
+                resolve_unresolved_calls(&store, &pb_unresolved, &pb_nodes, &pb_edges);
             tracing::debug!(
                 resolved_cross_crate_edges = resolved.len(),
                 "Phase B UnresolvedCall resolution complete"
@@ -1479,6 +1480,144 @@ pub fn init_repo_with_progress(
     })
 }
 
+/// #521 F1: crate directory → transitively-reachable crate directories,
+/// derived from the `crate:*` nodes + `Depends` edges that `extract_cargo_deps`
+/// (travsr-analysis) produces as part of the *same* Phase B pass that
+/// produced `unresolved`.
+///
+/// Built from `pb_nodes`/`pb_edges` directly rather than queried back out of
+/// the store: `resolve_unresolved_calls` runs *before*
+/// `write_phase_b_results` persists this Phase B pass's own output (see both
+/// call sites in this file), so a store query at this point would see
+/// whatever crate graph an *earlier* pass left behind — nothing, on a first
+/// `init`. Empty when the corpus has no `crate:` nodes (non-Rust repos), in
+/// which case every lookup returns `None` and [`call_target_reachable`]
+/// degrades to a no-op.
+struct CrateGraph {
+    /// Crate directories, longest first, for longest-prefix path matching.
+    dirs_by_len_desc: Vec<String>,
+    /// Each crate directory's transitive `Depends` closure, including itself.
+    reachable: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl CrateGraph {
+    fn build(pb_nodes: &[travsr_core::Node], pb_edges: &[travsr_core::Edge]) -> Self {
+        // Manifest path → crate directory, e.g.
+        // "crates/travsr-daemon/Cargo.toml" → "crates/travsr-daemon", bare
+        // "Cargo.toml" (single-crate repo) → "". External dependencies have
+        // no resolvable manifest path and are skipped — they can never be the
+        // crate of a real caller or a Phase-A-indexed candidate.
+        fn crate_dir(path: &str) -> Option<String> {
+            if path == "Cargo.toml" {
+                Some(String::new())
+            } else {
+                path.strip_suffix("/Cargo.toml").map(str::to_string)
+            }
+        }
+
+        let mut dir_by_id: std::collections::HashMap<travsr_core::NodeId, String> =
+            std::collections::HashMap::new();
+        for n in pb_nodes {
+            if n.kind == "crate" {
+                if let Some(dir) = crate_dir(&n.vname.path) {
+                    dir_by_id.insert(n.id, dir);
+                }
+            }
+        }
+
+        let mut direct: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for e in pb_edges {
+            if e.kind != travsr_core::EdgeKind::Depends {
+                continue;
+            }
+            let (Some(src_dir), Some(dst_dir)) = (dir_by_id.get(&e.src), dir_by_id.get(&e.dst))
+            else {
+                continue;
+            };
+            direct
+                .entry(src_dir.clone())
+                .or_default()
+                .push(dst_dir.clone());
+        }
+
+        let mut reachable: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for dir in dir_by_id.values() {
+            if reachable.contains_key(dir) {
+                continue;
+            }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            seen.insert(dir.clone());
+            queue.push_back(dir.clone());
+            while let Some(cur) = queue.pop_front() {
+                for dep in direct.get(&cur).into_iter().flatten() {
+                    if seen.insert(dep.clone()) {
+                        queue.push_back(dep.clone());
+                    }
+                }
+            }
+            reachable.insert(dir.clone(), seen);
+        }
+
+        let mut dirs_by_len_desc: Vec<String> = dir_by_id.into_values().collect();
+        dirs_by_len_desc.sort_unstable_by_key(|d| std::cmp::Reverse(d.len()));
+        dirs_by_len_desc.dedup();
+
+        Self {
+            dirs_by_len_desc,
+            reachable,
+        }
+    }
+
+    /// Longest-prefix match of `path` against known crate directories.
+    fn crate_dir_for_path(&self, path: &str) -> Option<&str> {
+        for dir in &self.dirs_by_len_desc {
+            if dir.is_empty() || path == dir.as_str() || path.starts_with(&format!("{dir}/")) {
+                return Some(dir.as_str());
+            }
+        }
+        None
+    }
+}
+
+/// #521 F1/F2: reject a resolved call target the caller could not possibly
+/// reach, applied uniformly regardless of how the candidate was matched
+/// (exact signature, leaf-name fallback, or `hint_crate` substring match).
+///
+/// F2 (`tests/`) is checked first — cheap, and catches same-package
+/// integration-test targets that F1's crate check alone would wave through
+/// (same package name, but `tests/` is a separate compilation unit with no
+/// `[dependencies]` entry either way).
+///
+/// F1 permissively returns `true` when the caller's or candidate's crate
+/// can't be resolved (no `crate:` nodes at all — non-Rust repos), so this
+/// gate is a no-op outside Rust rather than a silent edge-dropper for other
+/// languages that also flow through this function.
+fn call_target_reachable(caller_path: &str, candidate_path: &str, crates: &CrateGraph) -> bool {
+    let candidate_under_tests = candidate_path.split('/').any(|seg| seg == "tests");
+    let caller_under_tests = caller_path.split('/').any(|seg| seg == "tests");
+    if candidate_under_tests && !caller_under_tests {
+        return false;
+    }
+
+    let Some(caller_crate) = crates.crate_dir_for_path(caller_path) else {
+        return true;
+    };
+    let Some(candidate_crate) = crates.crate_dir_for_path(candidate_path) else {
+        return true;
+    };
+    if caller_crate == candidate_crate {
+        return true;
+    }
+    crates
+        .reachable
+        .get(caller_crate)
+        .map(|set| set.contains(candidate_crate))
+        .unwrap_or(false)
+}
+
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
@@ -1504,6 +1643,8 @@ pub fn init_repo_with_progress(
 fn resolve_unresolved_calls(
     store: &SqliteStore,
     unresolved: &[travsr_core::UnresolvedCall],
+    pb_nodes: &[travsr_core::Node],
+    pb_edges: &[travsr_core::Edge],
 ) -> (
     Vec<travsr_core::Edge>,
     Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
@@ -1567,27 +1708,73 @@ fn resolve_unresolved_calls(
                 Vec::new()
             })
     };
-    // leaf → Vec<(NodeId, path)>
-    let mut by_leaf: std::collections::HashMap<String, Vec<(travsr_core::NodeId, &str)>> =
+    // leaf → Vec<(NodeId, path, signature)>. Signature is retained (unlike the
+    // exact `by_sig` pass, where it always equals the lookup key) so #521 F3
+    // can tell a qualified `fn:Type.method` candidate apart from a bare
+    // `fn:name` one — a method call can only ever target the former.
+    let mut by_leaf: std::collections::HashMap<String, Vec<(travsr_core::NodeId, &str, &str)>> =
         std::collections::HashMap::new();
     for (id, sig, path) in &leaf_candidates {
         by_leaf
             .entry(leaf_of(sig))
             .or_default()
-            .push((*id, path.as_str()));
+            .push((*id, path.as_str(), sig.as_str()));
     }
+
+    // #521 F1: crate dependency graph, built from this Phase B pass's own
+    // in-memory output (see [`CrateGraph`] for why not the store).
+    let crates = CrateGraph::build(pb_nodes, pb_edges);
+
+    // #521 F1: batch-fetch every caller's own path so `call_target_reachable`
+    // can determine its crate. `u.src` is always a same-file node (the caller
+    // function), so its path is the call site's own file.
+    let caller_ids: Vec<travsr_core::NodeId> = {
+        let mut ids: Vec<travsr_core::NodeId> = unresolved.iter().map(|u| u.src).collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        ids
+    };
+    let caller_paths: std::collections::HashMap<travsr_core::NodeId, String> = store
+        .get_nodes(&caller_ids)
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_unresolved_calls: caller path lookup failed: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|n| (n.id, n.vname.path))
+        .collect();
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
-        // Exact signature first; fall back to a unique leaf-name match (R1).
-        let matches: &Vec<(travsr_core::NodeId, &str)> = match by_sig.get(u.callee_sig.as_str()) {
-            Some(m) => m,
-            None => match by_leaf.get(&leaf_of(&u.callee_sig)) {
-                Some(m) => m,
-                None => continue,
-            },
+        // Exact signature first; fall back to a leaf-name match (R1). #521 F3:
+        // a method call's `callee_sig` is always the bare `fn:{name}` form
+        // (extraction never sets `is_method_call` with a qualified sig), so an
+        // exact `by_sig` hit there is by construction a free function — never
+        // a valid method-call target. Skip straight to the leaf pool and keep
+        // only qualified (`Type.method`) candidates from it.
+        let matches: Vec<(travsr_core::NodeId, &str)> = if u.is_method_call {
+            by_leaf
+                .get(&leaf_of(&u.callee_sig))
+                .map(|v| {
+                    v.iter()
+                        .filter(|(_, _, sig)| sig.contains('.'))
+                        .map(|(id, path, _)| (*id, *path))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            match by_sig.get(u.callee_sig.as_str()) {
+                Some(m) => m.clone(),
+                None => by_leaf
+                    .get(&leaf_of(&u.callee_sig))
+                    .map(|v| v.iter().map(|(id, path, _)| (*id, *path)).collect())
+                    .unwrap_or_default(),
+            }
         };
+        if matches.is_empty() {
+            continue;
+        }
         let filtered: Vec<_> = if let Some(hint) = &u.hint_crate {
             let hint_dash = hint.replace('_', "-");
             matches
@@ -1596,7 +1783,7 @@ fn resolve_unresolved_calls(
                 .copied()
                 .collect()
         } else {
-            matches.to_vec()
+            matches
         };
         // CO-A1: bare calls with no crate hint resolve to ALL same-named functions
         // across all crates → false edges that flood get_callers / blast_radius.
@@ -1604,8 +1791,11 @@ fn resolve_unresolved_calls(
         if u.hint_crate.is_none() && filtered.len() != 1 {
             continue;
         }
-        for (dst, _) in filtered {
-            if u.src != dst {
+        let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+        for (dst, path) in filtered {
+            // #521 F1/F2: never emit an edge the caller's own crate could not
+            // possibly reach.
+            if u.src != dst && call_target_reachable(caller_path, path, &crates) {
                 edges.push(travsr_core::Edge::new(
                     u.src,
                     dst,
@@ -2124,7 +2314,8 @@ fn run_background_phase_b_inner(
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
 
-    let (resolved, resolved_sites) = resolve_unresolved_calls(&s, &pb_unresolved);
+    let (resolved, resolved_sites) =
+        resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges);
     tracing::debug!(
         resolved_cross_crate_edges = resolved.len(),
         "Phase B UnresolvedCall resolution complete"
@@ -2573,6 +2764,222 @@ mod tests {
         let sites = vec![(NodeId(1), NodeId(2), 5)];
         let out = remap_resolved_sites(sites.clone(), &std::collections::HashMap::new());
         assert_eq!(out, sites);
+    }
+
+    // ── #521: bare-name call resolution must never cross a crate boundary
+    // the caller cannot compile against, or match a method call against an
+    // unrelated free function. ──────────────────────────────────────────
+
+    #[test]
+    fn test_no_phantom_edges_on_dynamic_dispatch() {
+        // Literal repro from issue #521: a method call (`r.get(0)` on some
+        // receiver of unknown type) must never resolve to a same-named free
+        // function defined in an unrelated crate — even when that free
+        // function is the *only* node with that bare signature in the whole
+        // store. The old CO-A1 "unique match" guard treated global
+        // uniqueness as sufficient evidence; it isn't. #521 F3 fixes this at
+        // the source: a method call's `callee_sig` is always bare, so an
+        // exact `by_sig` hit for it is by construction the wrong symbol shape
+        // and must never be consulted.
+        use travsr_core::{Node, VName};
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // #521: `resolve_unresolved_calls` runs before this Phase B pass's
+        // own output is written to the store (see both real call sites in
+        // this file), so the crate graph must come in via `pb_nodes`, not a
+        // store query — the store never sees it in time otherwise.
+        let crate_a = Node::new(
+            VName::new("", "", "crates/crate-a/Cargo.toml", "rust", "crate:crate-a"),
+            "crate",
+        );
+        let crate_b = Node::new(
+            VName::new("", "", "crates/crate-b/Cargo.toml", "rust", "crate:crate-b"),
+            "crate",
+        );
+        let pb_nodes = vec![crate_a, crate_b];
+        // No Depends edge crate-a -> crate-b.
+        let pb_edges: Vec<travsr_core::Edge> = Vec::new();
+
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "fn:Store.prune",
+            ),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+
+        // The only `fn:get` node anywhere — an unrelated free function in a
+        // crate `crate-a` does not depend on.
+        let bare_get = Node::new(
+            VName::new("", "", "crates/crate-b/src/lib.rs", "rust", "fn:get"),
+            "function",
+        );
+        store.put_node(&bare_get).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:get".to_string(),
+            hint_crate: None,
+            caller_line: 42,
+            is_method_call: true,
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        assert!(
+            edges.is_empty(),
+            "method call must not resolve to an unrelated free function: {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn test_no_call_edges_across_non_dependent_crates() {
+        // #521 F1: a bare (non-method) call with a globally-unique name match
+        // must still be rejected when the caller's crate does not depend on
+        // the candidate's crate — the crate dependency graph is already in
+        // the store (`extract_cargo_deps` writes it before call extraction
+        // runs); this is a lookup, not new data.
+        use travsr_core::{Node, VName};
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let crate_a = Node::new(
+            VName::new("", "", "crates/crate-a/Cargo.toml", "rust", "crate:crate-a"),
+            "crate",
+        );
+        let crate_c = Node::new(
+            VName::new("", "", "crates/crate-c/Cargo.toml", "rust", "crate:crate-c"),
+            "crate",
+        );
+        let pb_nodes = vec![crate_a, crate_c];
+        // No Depends edge crate-a -> crate-c.
+        let pb_edges: Vec<travsr_core::Edge> = Vec::new();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "crates/crate-c/src/lib.rs", "rust", "fn:helper"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 7,
+            is_method_call: false,
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        assert!(
+            edges.is_empty(),
+            "bare call must not cross into a non-dependency crate: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_call_edges_allowed_within_dependent_crates() {
+        // Sanity check alongside the two rejection tests above: a bare call
+        // whose target crate IS a dependency of the caller's crate must
+        // still resolve — #521's fixes must not turn into a blanket
+        // cross-crate ban.
+        use travsr_core::{Node, VName};
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let crate_a = Node::new(
+            VName::new("", "", "crates/crate-a/Cargo.toml", "rust", "crate:crate-a"),
+            "crate",
+        );
+        let crate_b = Node::new(
+            VName::new("", "", "crates/crate-b/Cargo.toml", "rust", "crate:crate-b"),
+            "crate",
+        );
+        let pb_edges = vec![travsr_core::Edge::new(
+            crate_a.id,
+            crate_b.id,
+            travsr_core::EdgeKind::Depends,
+        )];
+        let pb_nodes = vec![crate_a, crate_b];
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "crates/crate-b/src/lib.rs", "rust", "fn:helper"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 3,
+            is_method_call: false,
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        assert_eq!(
+            edges.len(),
+            1,
+            "dependency-crate call should still resolve: {edges:?}"
+        );
+        assert_eq!(edges[0].src, caller.id);
+        assert_eq!(edges[0].dst, callee.id);
+        assert_eq!(sites, vec![(caller.id, callee.id, 3)]);
+    }
+
+    #[test]
+    fn test_no_call_edges_into_tests_from_src() {
+        // #521 F2: a `src/` caller resolving onto a `tests/` target must be
+        // rejected. Integration tests are a separate compilation unit —
+        // Cargo never lists them as a `[dependencies]` entry, so F1's
+        // crate-reachability check alone would not catch this (same package,
+        // no Depends edge needed either way).
+        use travsr_core::{Node, VName};
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // Only candidate for the leaf lookup lives under tests/.
+        let callee = Node::new(
+            VName::new("", "", "crates/crate-a/tests/fixture.rs", "rust", "fn:run"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:run".to_string(),
+            hint_crate: None,
+            caller_line: 9,
+            is_method_call: false,
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        assert!(
+            edges.is_empty(),
+            "src/ caller must not resolve into tests/: {edges:?}"
+        );
     }
 
     // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────

@@ -681,6 +681,14 @@ pub struct UnresolvedCall {
     /// skips `edge_sites` emission for zero lines.
     #[serde(default)]
     pub caller_line: u32,
+    /// True when this call came from a method-call receiver (`recv.method()`)
+    /// whose type is not known syntactically. A method call can never resolve
+    /// to a bare free function — the daemon resolver requires a qualified
+    /// `fn:Type.method` / `method:Type.method` match when this is set (#521 F3).
+    /// `false` for `call.fn` / `call.scoped` and for non-Rust emitters that
+    /// predate this field (serde default keeps old sidecar payloads valid).
+    #[serde(default)]
+    pub is_method_call: bool,
 }
 
 // ── Import Resolution ────────────────────────────────────────────────────────

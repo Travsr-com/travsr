@@ -359,6 +359,7 @@ fn extract_file_call_edges(
                         callee_sig: format!("fn:{callee_name}"),
                         hint_crate: None,
                         caller_line: occ_line,
+                        is_method_call: true,
                     });
                 }
                 "call.scoped" => {
@@ -384,6 +385,7 @@ fn extract_file_call_edges(
                                     callee_sig: format!("fn:{qual}.{callee_name}"),
                                     hint_crate: None,
                                     caller_line: occ_line,
+                                    is_method_call: false,
                                 });
                             }
                         }
@@ -395,6 +397,7 @@ fn extract_file_call_edges(
                                     callee_sig: format!("fn:{callee_name}"),
                                     hint_crate: Some(qual.clone()),
                                     caller_line: occ_line,
+                                    is_method_call: false,
                                 });
                             }
                         }
@@ -406,6 +409,7 @@ fn extract_file_call_edges(
                                     callee_sig: format!("fn:{callee_name}"),
                                     hint_crate: None,
                                     caller_line: occ_line,
+                                    is_method_call: false,
                                 });
                             }
                         }
@@ -420,6 +424,7 @@ fn extract_file_call_edges(
                         callee_sig: format!("fn:{callee_name}"),
                         hint_crate: None,
                         caller_line: occ_line,
+                        is_method_call: false,
                     });
                 }
                 _ => {}
@@ -491,6 +496,9 @@ fn extract_macro_calls(
             };
             // Classify by the token before the name.
             let prev = (i >= 2).then(|| children[i - 2].kind());
+            // #521 F3: `.` marks a method-call receiver of unknown type — the
+            // resolver must not match it against a bare free function.
+            let is_method_call = matches!(prev, Some("."));
             let callee_sig = match prev {
                 Some("::") => {
                     // Associated call `Type::method` — recover the qualifier.
@@ -511,6 +519,7 @@ fn extract_macro_calls(
                 callee_sig,
                 hint_crate: None,
                 caller_line: occ_line,
+                is_method_call,
             });
         }
     }
