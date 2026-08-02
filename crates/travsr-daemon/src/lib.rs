@@ -969,8 +969,21 @@ pub fn init_repo_with_progress(
     // has been offline long-term.
     const TOMBSTONE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
     const TOMBSTONE_MAX_ROWS: u64 = 50_000;
-    if let Err(e) = store.prune_tombstones(TOMBSTONE_MAX_AGE_SECS, TOMBSTONE_MAX_ROWS) {
-        tracing::warn!("tombstone GC failed (non-fatal): {e}");
+    match store.prune_tombstones(TOMBSTONE_MAX_AGE_SECS, TOMBSTONE_MAX_ROWS) {
+        Ok((_total, at_risk)) if at_risk > 0 => {
+            // L3: the only signal that freshness coverage degraded — a
+            // tombstone was pruned before the embed sidecar ever consumed it,
+            // for a node that still exists and still has an embedding row.
+            tracing::warn!(
+                at_risk,
+                "pruned {at_risk} tombstone(s) for nodes that still have an \
+                 embedding — their vector may now be stale with nothing left \
+                 to invalidate it (CDC log pruning window: {}s)",
+                TOMBSTONE_MAX_AGE_SECS
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("tombstone GC failed (non-fatal): {e}"),
     }
 
     // Register in global registry so `travsr mcp --global` can find this repo.
