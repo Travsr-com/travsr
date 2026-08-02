@@ -125,23 +125,30 @@ impl EmbedOpLock {
     /// `Ok(None)` (rather than an error) when `.travsr` itself is missing or
     /// unopenable: that is "not an indexed repo yet", not "locked", and
     /// callers already handle a missing repo separately.
+    ///
+    /// The pid/op the holder records lives in a separate, never-locked
+    /// `embed.lock.info` file rather than inside `embed.lock` itself. Unlike
+    /// POSIX `flock`, Windows' `LockFileEx` is mandatory: once one handle
+    /// holds the exclusive lock, a *second* handle's read of that same file
+    /// also fails, not just its own lock attempt — so a losing caller could
+    /// never read the holder's pid/op back out of the locked file to report
+    /// it. Reading an adjacent, always-unlocked file sidesteps that.
     pub fn try_acquire(repo_root: &Path, op: &str) -> anyhow::Result<Option<Self>> {
         use anyhow::Context as _;
         use fs2::FileExt as _;
-        let lock_path = repo_root.join(".travsr").join("embed.lock");
-        let Ok(mut file) = std::fs::OpenOptions::new()
+        let dir = repo_root.join(".travsr");
+        let lock_path = dir.join("embed.lock");
+        let info_path = dir.join("embed.lock.info");
+        let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
-            .truncate(false) // must read the prior holder's PID/op on a failed lock
-            .read(true)
+            .truncate(false)
             .write(true)
             .open(&lock_path)
         else {
             return Ok(None);
         };
         if file.try_lock_exclusive().is_err() {
-            use std::io::Read as _;
-            let mut held = String::new();
-            let _ = file.read_to_string(&mut held);
+            let held = std::fs::read_to_string(&info_path).unwrap_or_default();
             let (pid, held_op) = held
                 .trim()
                 .split_once('\t')
@@ -153,12 +160,8 @@ impl EmbedOpLock {
                  Wait for it to finish, or stop it with: travsr daemon stop"
             );
         }
-        use std::io::{Seek as _, SeekFrom, Write as _};
-        file.set_len(0).context("truncating embed.lock")?;
-        file.seek(SeekFrom::Start(0))
-            .context("seeking embed.lock")?;
-        write!(file, "{}\t{op}", std::process::id()).context("writing embed.lock")?;
-        file.sync_all().context("syncing embed.lock")?;
+        std::fs::write(&info_path, format!("{}\t{op}", std::process::id()))
+            .context("writing embed.lock.info")?;
         Ok(Some(EmbedOpLock { file }))
     }
 
@@ -1924,6 +1927,10 @@ mod tests {
     /// then indexed, and `embed reindex` must still resolve the backend from
     /// the global config rather than failing "No embedding backend active."
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see crates/travsr-cli/tests/embed_switch.rs's module doc comment"
+    )]
     fn resolve_backend_falls_back_to_global_when_repo_unconfigured() {
         let _guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
@@ -1966,6 +1973,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see crates/travsr-cli/tests/embed_switch.rs's module doc comment"
+    )]
     fn resolve_backend_prefers_repo_config_over_global() {
         let _guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
@@ -2029,7 +2040,11 @@ mod tests {
             .open(repo.path().join(".travsr").join("embed.lock"))
             .unwrap();
         fs2::FileExt::lock_exclusive(&held).unwrap();
-        std::io::Write::write_all(&mut { &held }, b"41822\treindex").unwrap();
+        std::fs::write(
+            repo.path().join(".travsr").join("embed.lock.info"),
+            b"41822\treindex",
+        )
+        .unwrap();
 
         let err = EmbedOpLock::try_acquire(repo.path(), "gc")
             .expect_err("must not acquire while another holder has the lock");
