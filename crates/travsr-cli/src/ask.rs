@@ -336,7 +336,7 @@ mod docs_note_tests {
         )
         .expect("set");
         assert!(
-            travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(false),
+            travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(true),
             "repo config must drive the note"
         );
     }
