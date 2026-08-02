@@ -11,11 +11,51 @@
 // is what `.github/workflows/embed-lifecycle-e2e.yml` (manual dispatch +
 // weekly cron) does. Do not wire this into the default `cargo test` sweep:
 // a full double-embed on every PR is the exact cost W7 measures against.
+//
+// Deliberately reuses the real `~/.travsr/bin`/`~/.travsr/models` cache
+// (no fake $HOME) so a local run doesn't re-download ~1 GB every time and a
+// CI run benefits from the same cache across runs. The one thing that must
+// not leak from that choice: `cmd_init` unconditionally writes the
+// machine-global `~/.travsr/embed.toml` active backend alongside the repo
+// config (embed.rs's `cmd_init`), so `embed init --backend B` here would
+// otherwise silently flip the *host machine's* default model — which then
+// shows up nowhere near this test, as a confusing "embed model_id mismatch"
+// warning and degraded (FTS-only) retrieval on a completely unrelated repo
+// with its own already-running daemon. `GlobalConfigGuard` saves and
+// restores that one file around the test run.
 
 use std::path::Path;
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+
+/// Saves `~/.travsr/embed.toml` (the machine-global active-backend config)
+/// on construction and restores its exact prior content (or removes it, if
+/// it didn't exist) on drop — including on a mid-test panic. See the module
+/// doc comment for why this file needs protecting at all.
+struct GlobalConfigGuard {
+    path: std::path::PathBuf,
+    prior: Option<String>,
+}
+impl GlobalConfigGuard {
+    fn capture() -> Self {
+        let path = dirs::home_dir().unwrap().join(".travsr").join("embed.toml");
+        let prior = std::fs::read_to_string(&path).ok();
+        Self { path, prior }
+    }
+}
+impl Drop for GlobalConfigGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(content) => {
+                let _ = std::fs::write(&self.path, content);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
 
 const MODEL_A: &str = "bge-small-en-v1.5"; // 384-dim, cheapest installed backend
 const MODEL_B: &str = "bge-base-en-v1.5"; // next-cheapest — the point is the
@@ -147,6 +187,7 @@ fn model_row_counts(embed_db: &Path) -> std::collections::BTreeMap<String, i64> 
 #[test]
 #[ignore = "downloads real models and runs real reindex passes; see module docs"]
 fn model_switch_lifecycle_end_to_end() {
+    let _global_config_guard = GlobalConfigGuard::capture();
     let repo = tempfile::tempdir().unwrap();
     git_init(repo.path());
     write_fixture(repo.path());
