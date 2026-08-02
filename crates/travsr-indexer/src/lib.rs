@@ -604,6 +604,13 @@ fn normalize_vname_path(path: &std::path::Path) -> std::path::PathBuf {
 pub struct Indexer {
     corpus: String,
     ffi_config: ffi_resolver::FfiConfig,
+    /// Extra `docs.exclude` path-substring patterns (#376 §3.3), additive to
+    /// `markdown`'s built-in default exclusion list. Empty unless a caller
+    /// opts in via [`Indexer::with_doc_excludes`] — travsr-indexer has no
+    /// dependency on travsr-config (see CLAUDE.md's crate dependency rules),
+    /// so resolving the config layer is the caller's job; this is just where
+    /// the resolved value is threaded through to the markdown parser.
+    doc_excludes: Vec<String>,
 }
 
 impl Indexer {
@@ -612,6 +619,7 @@ impl Indexer {
         Self {
             corpus: String::new(),
             ffi_config: ffi_resolver::FfiConfig::default(),
+            doc_excludes: Vec::new(),
         }
     }
 
@@ -621,6 +629,7 @@ impl Indexer {
         Self {
             corpus: corpus.into(),
             ffi_config: ffi_resolver::FfiConfig::default(),
+            doc_excludes: Vec::new(),
         }
     }
 
@@ -631,6 +640,15 @@ impl Indexer {
     /// the pyright timeout.
     pub fn with_ffi_config(mut self, cfg: ffi_resolver::FfiConfig) -> Self {
         self.ffi_config = cfg;
+        self
+    }
+
+    /// Add extra path-substring patterns (`docs.exclude`, #376 §3.3) to the
+    /// markdown chunker's built-in exclusion list. Case-insensitive substring
+    /// match against the repo-relative path, same semantics as the built-in
+    /// patterns in `travsr_analysis::markdown`.
+    pub fn with_doc_excludes(mut self, patterns: Vec<String>) -> Self {
+        self.doc_excludes = patterns;
         self
     }
 
@@ -688,6 +706,13 @@ impl Indexer {
                 travsr_analysis::data_format::parse(&self.corpus, abs_path, vname_path)
                     .map_err(map_err)?
             }
+            Some(Language::Markdown) => travsr_analysis::markdown::parse(
+                &self.corpus,
+                abs_path,
+                vname_path,
+                &self.doc_excludes,
+            )
+            .map_err(map_err)?,
             // Other future languages (#[non_exhaustive]) are silently skipped
             // until their parsers ship.
             _ => ParseOutput::default(),

@@ -16,7 +16,7 @@ use crate::stderr_ring::StderrRing;
 use travsr_plugin_protocol::{
     codec::{decode_message, write_message},
     EmbedHandshakeRequest, EmbedPluginRequest, EmbedPluginResponse, EmbedRequest, KnnRequest,
-    EMBED_PROTOCOL_VERSION,
+    Space, EMBED_PROTOCOL_VERSION,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -63,6 +63,34 @@ pub struct EmbedCapabilities {
     /// Human-readable backend label for `travsr embed status`.
     pub backend: String,
     pub plugin_version: String,
+}
+
+/// #376 Phase 2: first `travsr-embed` release (`plugin_version`, its own
+/// `CARGO_PKG_VERSION` — see `travsr-plugin-sdk/src/embed_runner.rs`) that
+/// maintains a second `hnsw-docs.usearch` index and understands
+/// `KnnRequest.space == Space::Docs`. Mirrors the `sidecar_supports_cancel`
+/// (major, minor) probe pattern in `travsr-plugin-host/src/embed_catalog.rs`,
+/// but reads the value already negotiated at handshake instead of spawning a
+/// second `--version` probe process.
+const MIN_DOC_SPACE_MAJOR: u64 = 1;
+const MIN_DOC_SPACE_MINOR: u64 = 2;
+
+impl EmbedCapabilities {
+    /// Version-gated, not serde-defaulted (plan §4.4): an old sidecar silently
+    /// ignores an unknown `space` field and answers with its (empty) code-only
+    /// behavior, which reads as "no doc chunk cleared the floor" rather than as
+    /// an error. The host must check this before ever setting
+    /// `KnnRequest.space = Space::Docs`.
+    pub fn supports_doc_space(&self) -> bool {
+        let mut parts = self
+            .plugin_version
+            .split('.')
+            .filter_map(|p| p.parse::<u64>().ok());
+        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        (major, minor) >= (MIN_DOC_SPACE_MAJOR, MIN_DOC_SPACE_MINOR)
+    }
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -348,17 +376,24 @@ impl EmbedSidecar {
     /// remove it. The per-call `with_io_watchdog` bounds how long any single caller
     /// can hold it (`EMBED_IO_TIMEOUT_SECS`), so one stalled inference cannot wedge
     /// the mutex indefinitely.
+    /// #376 Phase 2: `space` selects which per-repo HNSW index the sidecar
+    /// searches (`Space::Code`, the historical default, or `Space::Docs`).
+    /// Callers must confirm `Space::Docs` support via
+    /// `capabilities().supports_doc_space()` first — see that method's doc
+    /// comment for why silently sending it to an old sidecar is unsafe.
     pub fn knn(
         &self,
         query_text: &str,
         k: u32,
         model_id: &str,
+        space: Space,
     ) -> Result<Vec<(i64, f32)>, EmbedError> {
         let req = EmbedPluginRequest::Knn(KnnRequest {
             db_path: self.embed_db_path.clone(),
             query_text: query_text.to_string(),
             model_id: model_id.to_string(),
             k,
+            space,
         });
 
         let pid = self.pid;
@@ -390,5 +425,35 @@ impl EmbedSidecar {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps_with_version(v: &str) -> EmbedCapabilities {
+        EmbedCapabilities {
+            model_id: "m".into(),
+            embedding_dim: 384,
+            max_batch: 100,
+            backend: "test".into(),
+            plugin_version: v.to_string(),
+        }
+    }
+
+    #[test]
+    fn supports_doc_space_gates_on_min_version() {
+        assert!(!caps_with_version("1.1.0").supports_doc_space());
+        assert!(!caps_with_version("0.9.9").supports_doc_space());
+        assert!(caps_with_version("1.2.0").supports_doc_space());
+        assert!(caps_with_version("1.3.0").supports_doc_space());
+        assert!(caps_with_version("2.0.0").supports_doc_space());
+    }
+
+    #[test]
+    fn supports_doc_space_unparseable_version_is_false() {
+        assert!(!caps_with_version("garbage").supports_doc_space());
+        assert!(!caps_with_version("").supports_doc_space());
     }
 }

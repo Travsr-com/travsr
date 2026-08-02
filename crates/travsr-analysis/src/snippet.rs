@@ -18,6 +18,12 @@ pub fn snippet_line_cap(kind: &str) -> usize {
     match kind {
         "class" | "struct" | "impl" => 15,
         "interface" | "trait" | "enum" | "type" | "type_alias" => 60,
+        // A doc-chunk is already bounded at chunk-build time (§3.3's 2600/3900
+        // char split thresholds) — 40 lines (the code default) would truncate
+        // a normal-length prose section well before that boundary. 200 lines
+        // comfortably covers a full chunk at typical prose line lengths while
+        // still bounding the pathological case (one line per word, say).
+        "doc-chunk" => 200,
         _ => 40,
     }
 }
@@ -111,7 +117,18 @@ pub fn snippet_for_node_capped(node: &Node, repo_root: &Path, cap: usize) -> Opt
         return None;
     }
     let window: Vec<&str> = all_lines[from..to].to_vec();
-    let trimmed = skip_leading_comments(&window);
+    // `skip_leading_comments` exists to strip a leading docblock above a code
+    // declaration; its `is_comment_line` heuristic treats any bare `#` line as
+    // a comment. In prose that heuristic is simply wrong — a markdown heading
+    // (or a run of nested headings with no intervening paragraph) starts with
+    // `#` and is the content itself, not noise to skip past (#376). A
+    // doc-chunk's window is never a declaration-plus-docblock in the first
+    // place, so it always gets the full raw window unstripped.
+    let trimmed = if node.kind == "doc-chunk" {
+        window
+    } else {
+        skip_leading_comments(&window)
+    };
     if trimmed.is_empty() {
         return None;
     }
@@ -247,6 +264,12 @@ mod tests {
 
     fn make_class_node(path: &str, sig: &str, line: u32, end_line: u32) -> Node {
         Node::new(VName::new("corpus", "", path, "typescript", sig), "class")
+            .with_line(line)
+            .with_end_line(end_line)
+    }
+
+    fn make_doc_chunk_node(path: &str, sig: &str, line: u32, end_line: u32) -> Node {
+        Node::new(VName::new("corpus", "", path, "markdown", sig), "doc-chunk")
             .with_line(line)
             .with_end_line(end_line)
     }
@@ -451,6 +474,41 @@ mod tests {
             snippet_for_node(&node, dir.path()).is_none(),
             "Unix absolute path must be rejected"
         );
+    }
+
+    // ── #376: doc-chunk snippets ─────────────────────────────────────────────
+
+    #[test]
+    fn doc_chunk_snippet_preserves_heading_not_stripped_as_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("guide.md");
+        std::fs::write(&src, "## Real Heading\n### Nested\nprose body\n").unwrap();
+
+        // Span covers all three lines — a code-declaration reader would treat
+        // line 0 as "the signature" (kept) and strip the immediately-following
+        // "### Nested" as a leading comment/docblock (§376 latent bug). A
+        // doc-chunk must return the window untouched.
+        let node = make_doc_chunk_node("guide.md", "doc:real-heading", 1, 3);
+        let snippet = snippet_for_node(&node, dir.path()).unwrap();
+        assert!(snippet.contains("### Nested"), "got: {snippet:?}");
+        assert!(snippet.contains("prose body"));
+    }
+
+    #[test]
+    fn doc_chunk_snippet_rejects_path_traversal_and_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut traversal = make_doc_chunk_node("../secret.md", "doc:x", 1, 1);
+        traversal.vname.path = "../secret.md".to_string();
+        assert!(snippet_for_node(&traversal, dir.path()).is_none());
+
+        let mut absolute = make_doc_chunk_node("/etc/passwd", "doc:x", 1, 1);
+        absolute.vname.path = "/etc/passwd".to_string();
+        assert!(snippet_for_node(&absolute, dir.path()).is_none());
+    }
+
+    #[test]
+    fn doc_chunk_uses_the_200_line_cap_not_the_code_default() {
+        assert_eq!(snippet_line_cap("doc-chunk"), 200);
     }
 
     #[test]

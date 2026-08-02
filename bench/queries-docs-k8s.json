@@ -1,0 +1,140 @@
+{
+  "_comment": [
+    "Doc-retrieval query set for #376, kubernetes repo.",
+    "",
+    "Every gold anchor was read out of the actual file before being written here.",
+    "kubernetes has NO in-repo ADR/RFC corpus (KEPs live in kubernetes/enhancements), so",
+    "these target what it DOES document: the apiserver and client-go ARCHITECTURE.md files,",
+    "the kube-proxy nftables/ipvs READMEs, the kubelet plugin watcher, and cri-api.",
+    "",
+    "expectPath: substring of the gold chunk's file path.",
+    "expectHeading: substring of the gold chunk's heading trail (case-insensitive).",
+    "A hit requires BOTH, so a lucky match on another section of the same file is not a hit.",
+    "",
+    "The code and abstain arms are loaded from queries-seeded-k8s.json by category so they",
+    "stay identical to the existing baselines: literal/conceptual/cross are the code arm",
+    "(docs must not intrude), nonsense/salad are the abstain arm (docs must not answer)."
+  ],
+  "queries": [
+    {
+      "id": "D1",
+      "query": "why does the apiserver use a watch cache instead of reading from etcd every time",
+      "expectPath": "apiserver/ARCHITECTURE.md",
+      "expectHeading": "watch cache"
+    },
+    {
+      "id": "D2",
+      "query": "at what point in the request flow is the body deserialized relative to authentication",
+      "expectPath": "apiserver/ARCHITECTURE.md",
+      "expectHeading": "handler chain"
+    },
+    {
+      "id": "D3",
+      "query": "how does the apiserver resolve conflicting concurrent writes",
+      "expectPath": "apiserver/ARCHITECTURE.md",
+      "expectHeading": "conflict resolution"
+    },
+    {
+      "id": "D4",
+      "query": "what is responsible for registering API groups and their storage strategy",
+      "expectPath": "apiserver/ARCHITECTURE.md",
+      "expectHeading": "api group registration"
+    },
+    {
+      "id": "D5",
+      "query": "how are long running streaming protocols like exec and attach handled",
+      "expectPath": "apiserver/ARCHITECTURE.md",
+      "expectHeading": "streaming"
+    },
+    {
+      "id": "D6",
+      "query": "how is the apiserver assembled from delegated servers",
+      "expectPath": "apiserver/ARCHITECTURE.md",
+      "expectHeading": "server composition"
+    },
+    {
+      "id": "D7",
+      "query": "how does the apiserver expose discovery and OpenAPI schemas",
+      "expectPath": "apiserver/ARCHITECTURE.md",
+      "expectHeading": "discovery"
+    },
+    {
+      "id": "D8",
+      "query": "how does client-go surface warnings and apply client side rate limiting",
+      "expectPath": "client-go/ARCHITECTURE.md",
+      "expectHeading": "rate limiting"
+    },
+    {
+      "id": "D9",
+      "query": "when should I use a dynamic client instead of a typed client",
+      "expectPath": "client-go/ARCHITECTURE.md",
+      "expectHeading": "dynamic client"
+    },
+    {
+      "id": "D10",
+      "query": "how does server side apply work from the client library",
+      "expectPath": "client-go/ARCHITECTURE.md",
+      "expectHeading": "server-side apply"
+    },
+    {
+      "id": "D11",
+      "query": "what generates the typed clientsets informers and listers",
+      "expectPath": "client-go/ARCHITECTURE.md",
+      "expectHeading": "code generation"
+    },
+    {
+      "id": "D12",
+      "query": "what are the standard controller patterns for a workqueue based reconciler",
+      "expectPath": "client-go/ARCHITECTURE.md",
+      "expectHeading": "controller"
+    },
+    {
+      "id": "D13",
+      "query": "how does client-go build its REST configuration",
+      "expectPath": "client-go/ARCHITECTURE.md",
+      "expectHeading": "client configuration"
+    },
+    {
+      "id": "D14",
+      "query": "which netfilter hooks does kube-proxy attach to and at what priority",
+      "expectPath": "nftables/README.md",
+      "expectHeading": "nftables hooks"
+    },
+    {
+      "id": "D15",
+      "query": "explain netfilter chains tables and traversal order",
+      "expectPath": "nftables/README.md",
+      "expectHeading": "general theory"
+    },
+    {
+      "id": "D16",
+      "query": "how do I add my own rules alongside kube-proxy nftables mode",
+      "expectPath": "nftables/README.md",
+      "expectHeading": "integrating"
+    },
+    {
+      "id": "D17",
+      "query": "how does the kubelet discover device plugins over a unix socket",
+      "expectPath": "pluginwatcher/README.md",
+      "expectHeading": ""
+    },
+    {
+      "id": "D18",
+      "query": "what is the design of the ipvs based proxy mode",
+      "expectPath": "proxy/ipvs/README.md",
+      "expectHeading": ""
+    },
+    {
+      "id": "D19",
+      "query": "how is the container runtime interface API versioned across releases",
+      "expectPath": "cri-api/README.md",
+      "expectHeading": ""
+    },
+    {
+      "id": "D20",
+      "query": "how does the scheduler performance integration test harness work",
+      "expectPath": "scheduler_perf/README.md",
+      "expectHeading": ""
+    }
+  ]
+}

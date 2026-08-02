@@ -30,6 +30,11 @@ jobs:
           - fuzz_go_parser
           - fuzz_pyright_lsif_parser
           - fuzz_pcst_session
+          # #376: the markdown chunker is hand-written string processing over
+          # untrusted repo content (no grammar, no subprocess) and sits on the
+          # indexing path for every repo, so a panic here is reachable by
+          # committing a `.md` file.
+          - fuzz_markdown_chunker
 
     steps:
       - name: Checkout

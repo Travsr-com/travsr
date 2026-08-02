@@ -39,7 +39,7 @@ pub fn run_embed_plugin<P: EmbedPlugin>(plugin: P) {
                 );
                 EmbedPluginResponse::Handshake(EmbedHandshakeResponse {
                     protocol_version: EMBED_PROTOCOL_VERSION,
-                    plugin_version: env!("CARGO_PKG_VERSION").to_string(),
+                    plugin_version: plugin.plugin_version().to_string(),
                     model_id: plugin.model_id().to_string(),
                     embedding_dim: plugin.embedding_dim(),
                     backend: plugin.backend().to_string(),

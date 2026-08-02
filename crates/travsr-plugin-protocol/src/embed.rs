@@ -39,6 +39,22 @@ pub trait EmbedPlugin: Send + Sync {
     /// Human-readable backend label for `travsr embed status`.
     fn backend(&self) -> &str;
 
+    /// The concrete plugin binary's own version (its crate's
+    /// `CARGO_PKG_VERSION`), reported in the handshake so the host can gate
+    /// version-sensitive features (e.g. `EmbedCapabilities::supports_doc_space`).
+    ///
+    /// Must be implemented by evaluating `env!("CARGO_PKG_VERSION")` inside the
+    /// concrete plugin crate itself (e.g. `travsr-embed`'s `main.rs`), never
+    /// here or in `travsr-plugin-sdk`'s runner: `env!` expands using the
+    /// *lexically containing* crate's `Cargo.toml`, not the caller's, so a
+    /// shared default would report `travsr-plugin-protocol`'s own workspace
+    /// version for every backend regardless of which binary is actually
+    /// running — the exact bug this method exists to prevent (#376 Phase 2:
+    /// `supports_doc_space` silently gated `false` for every sidecar because
+    /// `run_embed_plugin` previously hardcoded `env!("CARGO_PKG_VERSION")`
+    /// itself).
+    fn plugin_version(&self) -> &str;
+
     /// Maximum texts per `EmbedRequest`. Reported in the handshake so the
     /// daemon can chunk large batches. Defaults to 100.
     fn max_batch(&self) -> u32 {
@@ -100,6 +116,27 @@ pub struct EmbedResponse {
 
 // ── KNN search ───────────────────────────────────────────────────────────────
 
+/// #376 Phase 2: which embedding index a `KnnRequest` searches. A sidecar keeps
+/// one HNSW index per space (`hnsw.usearch` for `Code`, `hnsw-docs.usearch` for
+/// `Docs`) since the two corpora differ by 2-4 orders of magnitude in size and
+/// must never rank against each other (plan §4.1: no cross-modal normalisation).
+///
+/// Deliberately a single `space` field, not the plan's `Vec<Space>` — the host
+/// issues one round trip per space rather than fusing both into one request.
+/// A doc query and a code query for the same text embed independently on the
+/// host side; latency parity with the historical single-space call is restored
+/// by a short-TTL query-embedding memo cache inside the sidecar
+/// (`travsr-embed/src/main.rs`) instead of by request-level fusion, which would
+/// have required changing the `EmbedKnnHook` closure signature shared by every
+/// code-path caller and test double.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Space {
+    #[default]
+    Code,
+    Docs,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnnRequest {
     /// Absolute path to the SQLite DB file.
@@ -111,6 +148,15 @@ pub struct KnnRequest {
     pub model_id: String,
     /// Number of nearest neighbours to return.
     pub k: u32,
+    /// #376 Phase 2: which index to search. Missing on the wire (every
+    /// pre-#376-Phase-2 host) deserializes to `Space::Code` — the historical,
+    /// only-ever-existed behavior. A host must not send `Space::Docs` before
+    /// confirming sidecar support (see `MIN_DOC_SPACE_PLUGIN_VERSION` in
+    /// travsr-plugin-host) — an old sidecar has no `Docs` index and returns an
+    /// empty result rather than an error, which would otherwise look
+    /// indistinguishable from "no doc chunk cleared the floor".
+    #[serde(default)]
+    pub space: Space,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,11 +264,43 @@ mod tests {
             query_text: "payment service".into(),
             model_id: "bge-small-en-v1.5".into(),
             k: 10,
+            space: Space::Code,
         });
         let encoded = encode_message(&req).unwrap();
         let mut cursor = Cursor::new(encoded);
         let decoded: EmbedPluginRequest = decode_message(&mut cursor).unwrap();
         assert!(matches!(decoded, EmbedPluginRequest::Knn(_)));
+    }
+
+    /// #376 Phase 2: a request with no `space` field on the wire (every
+    /// pre-#376-Phase-2 host) must deserialize to `Space::Code` — the
+    /// historical, only-ever-existed behavior.
+    #[test]
+    fn knn_request_missing_space_field_defaults_to_code() {
+        let json = r#"{"type":"knn","db_path":"/tmp/graph.db","query_text":"payment service","model_id":"bge-small-en-v1.5","k":10}"#;
+        let decoded: EmbedPluginRequest = serde_json::from_str(json).unwrap();
+        match decoded {
+            EmbedPluginRequest::Knn(req) => assert_eq!(req.space, Space::Code),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn knn_request_docs_space_round_trip() {
+        let req = EmbedPluginRequest::Knn(KnnRequest {
+            db_path: std::path::PathBuf::from("/tmp/graph.db"),
+            query_text: "how are floors calibrated".into(),
+            model_id: "arctic-embed-m-v1.5".into(),
+            k: 3,
+            space: Space::Docs,
+        });
+        let encoded = encode_message(&req).unwrap();
+        let mut cursor = Cursor::new(encoded);
+        let decoded: EmbedPluginRequest = decode_message(&mut cursor).unwrap();
+        match decoded {
+            EmbedPluginRequest::Knn(req) => assert_eq!(req.space, Space::Docs),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

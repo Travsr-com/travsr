@@ -61,7 +61,11 @@ async fn watcher_ignores_non_source_files() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Write an ignored file first, then a source file.
-    std::fs::write(tmp.path().join("README.md"), "# readme").unwrap();
+    // NB: the ignored fixture is deliberately not `README.md` — #376 Phase 1
+    // made markdown an indexed language, so a `.md` write is now a legitimate
+    // Upsert. `notes.txt` has no `Language::from_extension` arm, which is the
+    // property this test is actually about.
+    std::fs::write(tmp.path().join("notes.txt"), "scratch").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     std::fs::write(tmp.path().join("app.ts"), "export {}").unwrap();
 
@@ -69,9 +73,9 @@ async fn watcher_ignores_non_source_files() {
         loop {
             match rx.recv().await {
                 Some(WatchEvent::Upsert(p)) if p.ends_with("app.ts") => return p,
-                Some(WatchEvent::Upsert(p)) if p.ends_with("README.md") => {
+                Some(WatchEvent::Upsert(p)) if p.ends_with("notes.txt") => {
                     panic!(
-                        "watcher must not emit events for README.md, got: {}",
+                        "watcher must not emit events for notes.txt, got: {}",
                         p.display()
                     );
                 }

@@ -584,6 +584,82 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     }
 }
 
+/// Populate `embed_text` for doc-chunk nodes that have none (#376 W1).
+///
+/// The auto-embed path spawns the sidecar directly, bypassing
+/// [`regenerate_embed_texts_if_stale`] (CLI-only, because a full regeneration
+/// parses every source file in the repo). A doc chunk that reaches the sidecar
+/// without prose used to be embedded from a synthesized heading-and-path
+/// fallback, permanently — the vector exists, so presence-only candidacy never
+/// revisits it. The sidecar now rejects those nodes instead, which turns the
+/// silent corruption into a silent *absence* unless someone fills the text in.
+/// This is that someone.
+///
+/// Affordable on the tick where the full regeneration is not: markdown chunks
+/// are re-derived by a pure function of the file's bytes (no tree-sitter, no
+/// grammar load), and the doc corpus is ~10³ chunks where the code corpus is
+/// ~10⁵ nodes. The store lock is taken twice, briefly, never across the parse.
+///
+/// Returns the number of chunks filled in.
+fn ensure_doc_embed_texts(store: &std::sync::Mutex<SqliteStore>, repo_root: &Path) -> usize {
+    let nodes = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        match s.doc_nodes_missing_embed_text() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!("ensure_doc_embed_texts: query failed: {e}");
+                return 0;
+            }
+        }
+    };
+    if nodes.is_empty() {
+        return 0;
+    }
+
+    let canon_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut by_file: std::collections::HashMap<&str, Vec<&travsr_core::Node>> =
+        std::collections::HashMap::new();
+    for node in &nodes {
+        if !node.vname.path.is_empty() {
+            by_file
+                .entry(node.vname.path.as_str())
+                .or_default()
+                .push(node);
+        }
+    }
+    let richness = richness_from_meta(repo_root);
+    let pairs: Vec<(travsr_core::NodeId, String)> = by_file
+        .into_iter()
+        .flat_map(|(path, fnodes)| {
+            embed_texts_for_file(repo_root, canon_root.as_path(), path, &fnodes, richness)
+        })
+        .collect();
+    if pairs.is_empty() {
+        return 0;
+    }
+
+    let written = {
+        let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0usize;
+        for chunk in pairs.chunks(500) {
+            match s.write_embed_texts_batch(chunk) {
+                Ok(()) => n += chunk.len(),
+                Err(e) => tracing::warn!("ensure_doc_embed_texts: batch write failed: {e}"),
+            }
+        }
+        n
+    };
+    if written > 0 {
+        tracing::info!(
+            written,
+            "regenerated embed_text for doc chunks before embedding"
+        );
+    }
+    written
+}
+
 /// Derive the richness tier for the model currently configured in this repo.
 /// Returns `Compact` when no model is configured (safe default).
 fn richness_from_meta(repo_root: &Path) -> EmbedRichness {
@@ -1716,9 +1792,10 @@ fn collect_present_languages_and_paths(
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         if let Some(lang) = Language::from_extension(ext) {
-            // Data formats index in Phase A only — exclude from the Phase B
-            // present_languages set so P1 never attempts a nonexistent tool.
-            if !lang.is_data_format() {
+            // Data formats and prose (#376) index in Phase A only — exclude
+            // from the Phase B present_languages set so P1 never attempts a
+            // nonexistent tool.
+            if !lang.is_phase_a_only() {
                 langs.insert(lang.as_str().to_string());
             }
             paths.push(p);
@@ -1790,6 +1867,11 @@ fn maybe_spawn_embed(
         None => return,
     };
 
+    // #376 W1: doc chunks are ineligible until they carry prose. Fill them in
+    // before anything below reads coverage, so a freshly-indexed doc is counted
+    // as pending work rather than skipped.
+    ensure_doc_embed_texts(store, repo_root);
+
     // Fix for Bug A: use the derived threshold — same derivation as
     // spawn_background_reindex_phase1/2 — so the progress check here and the
     // actual sidecar partitioning always agree on the Phase 1/2 boundary.
@@ -1857,6 +1939,13 @@ fn maybe_spawn_embed(
 
     if phase2_remaining == 0 {
         phase2_spawned.store(true, Ordering::Relaxed);
+        // #376 W2: coverage is presence-only, so "100 % embedded" says nothing
+        // about whether those vectors still match their nodes. Pending
+        // tombstones are the only signal that content changed or files were
+        // deleted, and nothing else in this function can see them: before this
+        // branch existed, an edit-only workload never triggered a pass, so
+        // stale vectors stayed live in the HNSW indefinitely.
+        maybe_spawn_invalidation_pass(&db_path, store);
         return;
     }
 
@@ -1866,6 +1955,65 @@ fn maybe_spawn_embed(
     );
     if travsr_plugin_host::spawn_background_reindex_phase2(&db_path) {
         phase2_spawned.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Pending-tombstone count observed at the last invalidation-driven spawn.
+///
+/// Re-arm guard for [`maybe_spawn_invalidation_pass`]. A pass does not
+/// necessarily drain the log to zero: a tombstone whose node has no `embed_text`
+/// yet is deliberately *deferred* by the sidecar (its current text is not
+/// knowable, so deleting the vector would re-embed from a degraded fallback).
+/// Without this guard the tick would see the same undrainable backlog every
+/// 60 s and spawn forever. Storing the count rather than a bool means genuinely
+/// new invalidation — the count moves — still spawns immediately.
+///
+/// Process-global because a daemon serves one repo.
+static LAST_INVALIDATION_PENDING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Decide whether an invalidation-only pass should be launched this tick.
+///
+/// Split out from [`maybe_spawn_invalidation_pass`] so the re-arm rule is
+/// testable without a sidecar binary. `last` is `u64::MAX` when no
+/// invalidation-driven pass has run since the log was last empty.
+fn should_spawn_invalidation(pending: u64, last: u64, in_flight: bool) -> bool {
+    pending > 0 && !in_flight && last != pending
+}
+
+/// Spawn a full embed pass purely to apply pending invalidation (#376 W2).
+///
+/// Called only when embedding coverage is complete — there is nothing new to
+/// embed, but changed or deleted content still has to be verified out of
+/// `embed.db` and out of the live HNSW index.
+fn maybe_spawn_invalidation_pass(db_path: &Path, store: &std::sync::Mutex<SqliteStore>) {
+    use std::sync::atomic::Ordering;
+
+    let pending = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        s.pending_tombstones().unwrap_or(0)
+    };
+    if pending == 0 {
+        LAST_INVALIDATION_PENDING.store(u64::MAX, Ordering::Relaxed);
+        return;
+    }
+    if !should_spawn_invalidation(
+        pending,
+        LAST_INVALIDATION_PENDING.load(Ordering::Relaxed),
+        travsr_plugin_host::embed_reindex_in_flight(),
+    ) {
+        tracing::debug!(
+            pending,
+            "embed_tick: invalidation pass not re-armed (in flight, or backlog unchanged)"
+        );
+        return;
+    }
+    tracing::info!(
+        pending,
+        "embed_tick: fully embedded but invalidation pending — spawning verification pass"
+    );
+    if travsr_plugin_host::spawn_background_reindex_all(db_path) {
+        LAST_INVALIDATION_PENDING.store(pending, Ordering::Relaxed);
     }
 }
 
@@ -3133,6 +3281,256 @@ mod tests {
             "incremental delete + reindex must yield same edge count as full rebuild \
              (incremental={inc_edges}, full={full_edges})"
         );
+    }
+
+    /// #376 Phase 1: `travsr init` on a docs fixture produces exactly one
+    /// `file` node and one `doc-chunk` node per heading section, with the
+    /// signature format matching the plan's anchor scheme.
+    #[test]
+    fn init_repo_indexes_markdown_docs_with_exact_counts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(
+            tmp.path().join("guide.md"),
+            "## Overview\nSome explanatory content here.\n## Setup\nMore content, also here.\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        let stats = init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+        assert!(stats.files_indexed >= 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let file_nodes = store.nodes_by_kind("file").unwrap();
+        let doc_nodes = store.nodes_by_kind("doc-chunk").unwrap();
+
+        assert_eq!(
+            file_nodes
+                .iter()
+                .filter(|n| n.vname.path == "guide.md")
+                .count(),
+            1
+        );
+        assert_eq!(doc_nodes.len(), 2, "one doc-chunk per top-level heading");
+        let sigs: std::collections::HashSet<_> = doc_nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains("doc:overview"));
+        assert!(sigs.contains("doc:setup"));
+    }
+
+    /// #376 Phase 1: editing a `.md` file incrementally (reindex_files) must
+    /// leave the graph in the same state as a full rebuild from scratch —
+    /// same highest-risk invariant `incremental_delete_matches_full_rebuild`
+    /// checks for code, applied to prose.
+    #[test]
+    fn markdown_full_vs_incremental_equality() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let doc_path = tmp.path().join("guide.md");
+        std::fs::write(&doc_path, "## Overview\nOriginal content.\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        // Incremental path: edit the file on disk, then reindex just it.
+        std::fs::write(
+            &doc_path,
+            "## Overview\nEdited content.\n## New Section\nA whole new section.\n",
+        )
+        .unwrap();
+        {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            reindex_files(std::slice::from_ref(&doc_path), tmp.path(), &mut store).unwrap();
+        }
+        let (inc_nodes, inc_edges) = {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            (store.node_count().unwrap(), store.edge_count().unwrap())
+        };
+
+        // Full-rebuild path: wipe .travsr and re-init on the same (edited) tree.
+        std::fs::remove_dir_all(tmp.path().join(".travsr")).unwrap();
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+        let (full_nodes, full_edges) = {
+            let db_path = tmp.path().join(".travsr/graph.db");
+            let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            (store.node_count().unwrap(), store.edge_count().unwrap())
+        };
+
+        assert_eq!(
+            inc_nodes, full_nodes,
+            "incremental doc edit + reindex must yield same node count as full rebuild \
+             (incremental={inc_nodes}, full={full_nodes})"
+        );
+        assert_eq!(
+            inc_edges, full_edges,
+            "incremental doc edit + reindex must yield same edge count as full rebuild \
+             (incremental={inc_edges}, full={full_edges})"
+        );
+    }
+
+    /// #376 Phase 1: deleting a `.md` file must tombstone its doc-chunk nodes
+    /// exactly like any other file kind — no ghost doc-chunk nodes survive.
+    #[test]
+    fn markdown_delete_tombstones_doc_chunk_nodes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let doc_path = tmp.path().join("guide.md");
+        std::fs::write(&doc_path, "## Overview\nSome content.\n").unwrap();
+        std::fs::write(tmp.path().join("other.md"), "## Kept\nStays around.\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        std::fs::remove_file(&doc_path).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        reindex_files(std::slice::from_ref(&doc_path), tmp.path(), &mut store).unwrap();
+
+        let doc_nodes = store.nodes_by_kind("doc-chunk").unwrap();
+        assert!(
+            doc_nodes.iter().all(|n| n.vname.path != "guide.md"),
+            "deleted file's doc-chunk nodes must be tombstoned, not left as ghosts"
+        );
+        assert!(
+            doc_nodes.iter().any(|n| n.vname.path == "other.md"),
+            "unrelated file's doc-chunk nodes must survive the delete"
+        );
+    }
+
+    /// #376 Phase 1: `.travsrignore` applies to `.md` files exactly like any
+    /// other extension (no markdown-specific ignore code exists — the walker
+    /// is extension-agnostic), and a negation pattern re-includes a file an
+    /// earlier broader rule excluded.
+    #[test]
+    fn travsrignore_excludes_and_negation_reincludes_markdown() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("drafts")).unwrap();
+        std::fs::write(
+            tmp.path().join("drafts/wip.md"),
+            "## Draft\nNot ready yet.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("drafts/important.md"),
+            "## Important\nMust still be indexed.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".travsrignore"),
+            "drafts/*.md\n!drafts/important.md\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let file_nodes = store.nodes_by_kind("file").unwrap();
+        let paths: std::collections::HashSet<_> =
+            file_nodes.iter().map(|n| n.vname.path.as_str()).collect();
+
+        assert!(
+            !paths.contains("drafts/wip.md"),
+            "wip.md must be excluded by the broad .travsrignore rule"
+        );
+        assert!(
+            paths.contains("drafts/important.md"),
+            "important.md must be re-included by the negation rule"
+        );
+    }
+
+    /// #376 W1: `travsr init` deliberately skips `embed_text` generation (it
+    /// parses every source file and blocks for minutes on a large repo), so
+    /// every doc chunk it writes starts with NULL prose. The sidecar now refuses
+    /// to embed those — otherwise it builds a heading-and-path-only vector and,
+    /// candidacy being presence-only, never revisits it. This is the daemon-side
+    /// half: fill the prose in before the auto-embed path spawns anything.
+    #[test]
+    fn ensure_doc_embed_texts_fills_prose_left_null_by_init() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(
+            tmp.path().join("docs/adr.md"),
+            "# Decision Record\n\nWe picked the second option because the first \
+             requires a global lock during reindex, which stalls every query.\n\n\
+             ## Consequences\n\nReaders never block, writers serialise on one path.\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let chunks = store.nodes_by_kind("doc-chunk").unwrap();
+        assert!(
+            !chunks.is_empty(),
+            "the markdown file must produce doc-chunk nodes"
+        );
+        let missing_before = store.doc_nodes_missing_embed_text().unwrap().len();
+        assert_eq!(
+            missing_before,
+            chunks.len(),
+            "init leaves every doc chunk without prose"
+        );
+
+        let store = std::sync::Mutex::new(store);
+        let filled = ensure_doc_embed_texts(&store, tmp.path());
+        assert_eq!(filled, chunks.len());
+
+        let s = store.lock().unwrap();
+        assert!(
+            s.doc_nodes_missing_embed_text().unwrap().is_empty(),
+            "every doc chunk must carry prose after the backfill"
+        );
+        let texts = s.get_embed_texts(&chunks.iter().map(|n| n.id).collect::<Vec<_>>());
+        let joined: String = texts.unwrap_or_default().values().cloned().collect();
+        assert!(
+            joined.contains("global lock"),
+            "the backfilled text must be the chunk's prose, not just its heading: {joined}"
+        );
+    }
+
+    /// #376 W2: the tick must launch a pass when invalidation is pending even
+    /// though coverage is complete, but must not relaunch one for a backlog a
+    /// previous pass already looked at. Some tombstones are deliberately not
+    /// drainable yet (the sidecar defers a node whose `embed_text` is NULL), and
+    /// without the re-arm rule those would spawn a sidecar every 60 s forever.
+    #[test]
+    fn invalidation_pass_arms_on_new_work_and_not_on_a_stale_backlog() {
+        const NEVER: u64 = u64::MAX;
+        // Nothing pending → nothing to do.
+        assert!(!should_spawn_invalidation(0, NEVER, false));
+        // First invalidation seen → spawn.
+        assert!(should_spawn_invalidation(154, NEVER, false));
+        // Same backlog a pass already processed → do not respawn.
+        assert!(!should_spawn_invalidation(154, 154, false));
+        // New edits arrived on top of the deferred backlog → spawn again.
+        assert!(should_spawn_invalidation(160, 154, false));
+        // A drain that shrank the backlog is still new information.
+        assert!(should_spawn_invalidation(12, 154, false));
+        // Never compete with a running sidecar.
+        assert!(!should_spawn_invalidation(154, NEVER, true));
     }
 
     /// Tier-0 propagation depth-1 bound: re-indexing a file that removes no
@@ -4415,6 +4813,20 @@ pub fn try_inject_embed_hook(
         // once at startup before the daemon serves any request.
         supervisor.prewarm();
         query_store.set_embed_knn_hook(hook);
+        // #376 §4.4: arm the doc-space KNN hook beside the code one. The doc
+        // index is a separate HNSW space (`hnsw-docs.usearch`), so it needs its
+        // own hook — the code hook cannot answer a doc query and `VecIndex::knn`
+        // has no metadata filter to partition one space into two.
+        //
+        // Without this, `travsr ask` could never render a docs section no matter
+        // how the lane was configured: the MCP server arms this hook in
+        // `travsr_mcp::inject_embed_hook`, but the daemon (which is what answers
+        // every CLI `ask`) did not, so `store.embed_doc_knn_fn()` was always
+        // `None` on that route. `None` is indistinguishable from "sidecar too
+        // old" or "repo has no doc-chunk nodes", which is why it failed silently.
+        if let Some(doc_hook) = supervisor.doc_knn_hook(model_id.clone()) {
+            query_store.set_embed_doc_knn_hook(doc_hook);
+        }
         // RFC-019: inject the direct-cosine oracle beside the KNN hook. Reuses the
         // same warm sidecar for the query embedding; candidate vectors are read from
         // embed.db by travsr-store. `None` query-hook → no score hook → the FTS-only

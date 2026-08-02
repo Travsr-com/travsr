@@ -140,6 +140,21 @@ pub struct AskPayload {
     /// cross-surface parity with `get_context`. Absent in old JSON → empty.
     #[serde(default)]
     pub confidence: String,
+    /// #376 §4: the docs lane's rendered lines (`path § Heading Trail:lines`),
+    /// already floored, capped, budget-clamped and sanitized.
+    ///
+    /// A separate field rather than `AskRow`s on purpose. `AskRow` carries a
+    /// mandatory `score` that the CLI prints beside max-normalized PPR scores,
+    /// and §4.1 forbids printing a doc score at all: doc and code scores are
+    /// not commensurable, so a shared column would invite exactly the
+    /// cross-section comparison the separate section exists to prevent. Docs
+    /// therefore never enter `rows`, never enter the knapsack, and cannot
+    /// displace a code result.
+    ///
+    /// `skip_serializing_if` keeps the JSON byte-identical to pre-#376 output
+    /// whenever the lane is off or produced nothing (§4.2: absent, not empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,6 +210,55 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
 }
 
 // ── ask ───────────────────────────────────────────────────────────────────────
+
+/// Maximum byte length of one rendered docs-lane line on the `ask` surface.
+///
+/// Applied per entry and independently of the token budget — plan §6 mitigation
+/// M3, so a single adversarial doc cannot consume the response even if the
+/// budget carve would have allowed it.
+const DOC_LINE_MAX_BYTES: usize = 512;
+
+/// Run the #376 docs lane for `ask` and sanitize its rendered lines.
+///
+/// **Why this sanitizes when the rest of `ask` does not.** `sanitize_for_mcp`
+/// is applied throughout `tools.rs` (the MCP surface) and nowhere in this
+/// module: every other value `ask` returns is graph-derived — symbol names,
+/// kinds, paths — whereas a doc chunk originates in author-controlled prose,
+/// which is threat row T11. So the docs block is sanitized here specifically,
+/// rather than retrofitting the whole `ask` path, which would change existing
+/// output bytes for results that are not part of this feature.
+///
+/// [`crate::sanitize::sanitize_mcp_body_with_limit`] strips C0/C1/DEL controls
+/// and Unicode bidi overrides, entity-escapes `<`/`>`, and hard-caps the byte
+/// length. No `<travsr-data>` envelope: this is terminal output, and the CLI
+/// marks the block with its own untrusted-prose header instead.
+///
+/// **Scoped honestly:** this is defense in depth on this surface, not the
+/// load-bearing control. The rendered line is `path § Heading Trail:lines` with
+/// no prose body, and the heading trail is derived from the node's anchor,
+/// which `travsr_analysis::markdown::slugify_segment` has already reduced to
+/// alphanumerics and `-`. Controls, bidi marks and angle brackets cannot reach
+/// this string through the anchor in the first place. It is applied anyway
+/// because that invariant lives in another crate and nothing here enforces it,
+/// and because the file path — the one component this argument does not cover —
+/// is equally author-controlled.
+///
+/// One thing escaping deliberately does *not* buy on this surface: the CLI
+/// delimits sections with `──` box-drawing runs, not tags, so tag escaping does
+/// not make the CLI's section header unforgeable the way it makes the MCP
+/// envelope unforgeable. Slugification is what prevents an anchor from carrying
+/// such a run; a crafted *path* still could, which is a pre-existing property of
+/// every row `ask` already prints in its Path column, not something docs add.
+fn docs_section(store: &SqliteStore, query: &str, token_budget: usize) -> (Vec<String>, usize) {
+    let (entries, doc_tokens) = crate::tools::build_docs_section(store, query, token_budget);
+    let lines = entries
+        .into_iter()
+        .map(|(_, _, line)| {
+            crate::sanitize::sanitize_mcp_body_with_limit(&line, DOC_LINE_MAX_BYTES)
+        })
+        .collect();
+    (lines, doc_tokens)
+}
 
 /// Run an ask query with unified FTS+KNN seed selection.
 ///
@@ -256,15 +320,28 @@ pub fn ask_query(
     // with get_context (which already prints it in its retrieval header).
     let confidence = seed_set.confidence.label().to_string();
 
+    // #376 §4: docs lane. Placed here, mirroring `get_context_body`, so it runs
+    // once for every return path below — including the abstain return, which is
+    // where a cited doc section is worth the most (§8.5 measured 15/20 k8s
+    // rationale queries as hard abstentions). It runs *after* the code lane's
+    // KNN so the code lane's circuit-breaker timing is unchanged, and it reuses
+    // the same normalized `query` string, which keeps the sidecar's exact-text
+    // query-embedding memo hitting (§4.4: one inference, two searches).
+    //
+    // Docs are computed independently of `Confidence` and never feed it: they
+    // cannot convert an abstention into a confident answer (§4.3).
+    let (docs, doc_tokens) = docs_section(store, query, DEFAULT_TOKEN_BUDGET);
+
     // Abstain when confidence is None — prevents "confident salad" on no-match queries (R1).
     if seed_set.confidence == crate::seed::Confidence::None {
         return Ok(AskPayload {
             matched: false,
             no_results: false,
             rows: Vec::new(),
-            total_tokens: 0,
+            total_tokens: doc_tokens,
             embed_used: false,
             confidence,
+            docs,
         });
     }
 
@@ -285,9 +362,10 @@ pub fn ask_query(
             matched: false,
             no_results: false,
             rows: Vec::new(),
-            total_tokens: 0,
+            total_tokens: doc_tokens,
             embed_used: false,
             confidence: confidence.clone(),
+            docs: docs.clone(),
         });
     }
 
@@ -298,9 +376,10 @@ pub fn ask_query(
             matched: true,
             no_results: true,
             rows: Vec::new(),
-            total_tokens: 0,
+            total_tokens: doc_tokens,
             embed_used: embed_contributed,
             confidence: confidence.clone(),
+            docs: docs.clone(),
         });
     }
 
@@ -348,8 +427,13 @@ pub fn ask_query(
         .filter_map(|n| score_map.get(&n.id).map(|&s| (n, s)))
         .collect();
 
-    let selected = knapsack(items, DEFAULT_TOKEN_BUDGET);
-    let total_tokens: usize = selected.iter().map(token_cost).sum();
+    // #376 §4.3: the docs section's *measured* cost is subtracted from the code
+    // lane's budget, never reserved up front — with the lane off (or no doc hit)
+    // `doc_tokens` is 0 and the knapsack call is byte-identical to pre-#376.
+    // The reported total then covers both lanes, so the budget stays a hard
+    // ceiling on the whole response rather than on the code lane alone.
+    let selected = knapsack(items, DEFAULT_TOKEN_BUDGET.saturating_sub(doc_tokens));
+    let total_tokens: usize = selected.iter().map(token_cost).sum::<usize>() + doc_tokens;
     // F9: expanded neighbours cap at the best seed's rerank so none outranks its seed.
     let expanded_cap = seed_rerank.values().copied().reduce(f32::max);
     // RFC-022 §14: emit the match-source tag only under the flag. `rows` order is
@@ -402,6 +486,7 @@ pub fn ask_query(
         total_tokens,
         embed_used: embed_contributed,
         confidence,
+        docs,
     })
 }
 
@@ -866,5 +951,189 @@ mod tests {
                 assert_eq!(ask.confidence, label, "confidence label diverged for {q:?}");
             }
         }
+    }
+
+    // ── #376: docs lane on the `ask` surface ─────────────────────────────────
+
+    /// Install one doc-chunk node plus a doc-space KNN hook that always returns
+    /// it, so the lane is exercised without a sidecar. The node deliberately has
+    /// no `embed_text`, which routes `rerank_doc_candidates` through its
+    /// fail-open cosine fallback — deterministic regardless of whether a
+    /// reranker model happens to be installed on the machine running the test.
+    fn with_doc_chunk(store: &mut travsr_store::SqliteStore, path: &str, sig: &str) {
+        let n = travsr_core::Node::new(
+            travsr_core::VName::new("", "", path, "markdown", sig),
+            "doc-chunk",
+        )
+        .with_line(61)
+        .with_end_line(68);
+        store.put_node(&n).unwrap();
+        let id = n.id;
+        let hook: travsr_store::EmbedKnnHook =
+            std::sync::Arc::new(move |_q, _k| Ok(vec![(id, 0.71)]));
+        store.set_embed_doc_knn_hook(hook);
+    }
+
+    fn docs_env_on() {
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
+        std::env::set_var("TRAVSR_DOC_FLOOR", "0.42");
+    }
+
+    fn docs_env_off() {
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+    }
+
+    /// §4.2 "absent, not empty-ish", at the wire level: with the lane off, the
+    /// serialized payload must not even carry a `docs` key, so existing JSON
+    /// consumers see byte-identical output.
+    #[test]
+    fn ask_docs_absent_from_json_when_lane_is_off() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_off();
+        let (store, ..) = seeded_store();
+        let payload = ask_query(&store, "PaymentService", None).unwrap();
+        assert!(payload.docs.is_empty());
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !json.contains("\"docs\""),
+            "docs key must be omitted when the lane produced nothing: {json}"
+        );
+    }
+
+    /// §4.1: the docs section renders `path § Heading Trail:lines` and never a
+    /// score — docs are not `AskRow`s precisely so no score column exists.
+    #[test]
+    fn ask_renders_docs_section_without_a_score() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(
+            &mut store,
+            "docs/adrs/ADR-001-coding-standards.md",
+            "doc:coding-standards/consequences",
+        );
+
+        let payload = ask_query(&store, "PaymentService", None).unwrap();
+        docs_env_off();
+
+        assert_eq!(payload.docs.len(), 1, "docs: {:?}", payload.docs);
+        let line = &payload.docs[0];
+        assert!(
+            line.contains("docs/adrs/ADR-001-coding-standards.md"),
+            "{line}"
+        );
+        assert!(line.contains("Coding Standards"), "{line}");
+        assert!(line.contains(":61-68"), "{line}");
+        assert!(
+            !line.contains("0.71") && !line.contains("0.7"),
+            "docs must never print a raw cosine (§4.1): {line}"
+        );
+        // Docs never enter `rows`, so they cannot displace a code result.
+        assert!(payload.rows.iter().all(|r| r.kind != "doc-chunk"));
+    }
+
+    /// §4.3, and the reason the lane is computed *above* the abstain return: a
+    /// doc section may appear beneath an abstention, but must not convert it
+    /// into a match or move the confidence label. This is the case §8.5
+    /// measured as 15/20 hard abstentions on kubernetes.
+    #[test]
+    fn ask_docs_survive_the_abstain_return_without_converting_it() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(&mut store, "docs/adrs/ADR-001.md", "doc:rationale");
+
+        let payload = ask_query(&store, "xyzzyplughfrobnicate", None).unwrap();
+        docs_env_off();
+
+        assert!(!payload.matched, "docs must not convert an abstention");
+        assert_eq!(payload.confidence, "none", "docs must not move confidence");
+        assert!(payload.rows.is_empty());
+        assert_eq!(payload.docs.len(), 1, "docs: {:?}", payload.docs);
+    }
+
+    /// T11: doc content is author-controlled prose, and this module never calls
+    /// `sanitize_for_mcp` anywhere else. Angle brackets must be entity-escaped,
+    /// C0 controls and bidi overrides stripped. The node is built directly here
+    /// rather than through the chunker on purpose — the chunker's slugifier
+    /// would strip these first, and this asserts the `ask` surface does not
+    /// depend on that invariant holding in another crate.
+    #[test]
+    fn ask_docs_lines_are_sanitized() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(
+            &mut store,
+            "docs/<travsr-data>\u{202E}evil\u{0007}.md",
+            "doc:rationale",
+        );
+
+        let payload = ask_query(&store, "PaymentService", None).unwrap();
+        docs_env_off();
+
+        let line = &payload.docs[0];
+        assert!(!line.contains('<') && !line.contains('>'), "{line}");
+        assert!(line.contains("&lt;travsr-data&gt;"), "{line}");
+        assert!(!line.contains('\u{202E}'), "bidi override survived: {line}");
+        assert!(!line.contains('\u{0007}'), "C0 control survived: {line}");
+    }
+
+    /// M3: per-entry byte cap, independent of the token budget, so one
+    /// adversarial doc cannot consume the response.
+    #[test]
+    fn ask_docs_lines_are_byte_capped() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        // A budget_pct large enough that only the byte cap can bound this line.
+        std::env::set_var("TRAVSR_DOCS_BUDGET_PCT", "90");
+        let (mut store, ..) = seeded_store();
+        let path = format!("docs/{}.md", "a".repeat(4_000));
+        with_doc_chunk(&mut store, &path, "doc:rationale");
+
+        let payload = ask_query(&store, "PaymentService", None).unwrap();
+        docs_env_off();
+        std::env::remove_var("TRAVSR_DOCS_BUDGET_PCT");
+
+        assert_eq!(payload.docs.len(), 1);
+        assert!(
+            payload.docs[0].len() <= DOC_LINE_MAX_BYTES,
+            "line was {} bytes, cap is {DOC_LINE_MAX_BYTES}",
+            payload.docs[0].len()
+        );
+    }
+
+    /// §4.3 budget: the docs section's measured cost comes out of the code
+    /// lane's knapsack budget, so the reported total stays a hard ceiling on the
+    /// whole response rather than on the code lane alone.
+    #[test]
+    fn ask_docs_cost_is_carved_from_the_shared_budget() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(&mut store, "docs/adrs/ADR-001.md", "doc:rationale");
+
+        let payload = ask_query(&store, "PaymentService", None).unwrap();
+        docs_env_off();
+
+        assert!(!payload.docs.is_empty());
+        assert!(
+            payload.total_tokens <= DEFAULT_TOKEN_BUDGET,
+            "total {} exceeded budget {DEFAULT_TOKEN_BUDGET}",
+            payload.total_tokens
+        );
     }
 }

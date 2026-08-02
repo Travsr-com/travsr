@@ -139,6 +139,47 @@ pub static KEYS: &[KeySpec] = &[
         default_display: "normal",
         validate: validate_priority,
     },
+    // #376 O1: the docs lane's user-facing knobs. Every key here is read by the
+    // process that actually performs retrieval (the daemon for `ask`, the MCP
+    // server for `get_context`), which is why they are config keys and not only
+    // env vars: `TRAVSR_DOCS_ENABLED` set on the CLI is a silent no-op because
+    // the CLI is not the process that retrieves (plan §18.7, §20.3 F-D).
+    //
+    // Deliberately NOT registered: `TRAVSR_DOC_FLOOR` and
+    // `TRAVSR_DOC_RERANK_FLOOR`. Both are raw model-space score thresholds whose
+    // calibration is measured, not chosen (plan §8.3, §14) — surfacing them as
+    // user config would invite exactly the cross-section score comparison §4.1
+    // exists to prevent. They remain expert env-only overrides.
+    KeySpec {
+        key: "docs.enabled",
+        description:
+            "Retrieve documentation prose as a separate `docs` result section (true | false).",
+        env: Some("TRAVSR_DOCS_ENABLED"),
+        default_display: "false",
+        validate: validate_bool,
+    },
+    KeySpec {
+        key: "docs.max_results",
+        description: "Maximum entries rendered in the `docs` section (>= 1).",
+        env: Some("TRAVSR_DOCS_MAX_RESULTS"),
+        default_display: "3",
+        validate: validate_positive_int,
+    },
+    KeySpec {
+        key: "docs.budget_pct",
+        description: "Share of the token budget the `docs` section may claim, 1-100.",
+        env: Some("TRAVSR_DOCS_BUDGET_PCT"),
+        default_display: "20",
+        validate: validate_percent,
+    },
+    KeySpec {
+        key: "docs.exclude",
+        description:
+            "Extra comma-separated path substrings excluded from doc indexing, beyond the built-ins.",
+        env: Some("TRAVSR_DOCS_EXCLUDE"),
+        default_display: "(none)",
+        validate: validate_string_list,
+    },
 ];
 
 /// Look up a key spec by its dotted name.
@@ -179,6 +220,45 @@ fn validate_priority(s: &str) -> Result<toml::Value> {
         "normal" | "low" | "idle" => Ok(toml::Value::String(s.trim().to_string())),
         other => bail!("priority must be one of: normal, low, idle (got '{other}')"),
     }
+}
+
+/// Accepts the spellings a shell env var realistically carries as well as TOML's
+/// own `true`/`false`, and normalises to a real TOML boolean so a file written by
+/// `set` reads naturally. `1`/`0` are accepted because `TRAVSR_DOCS_ENABLED=1` is
+/// the form every existing script and the bench harness already use.
+fn validate_bool(s: &str) -> Result<toml::Value> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(toml::Value::Boolean(true)),
+        "0" | "false" | "no" | "off" => Ok(toml::Value::Boolean(false)),
+        other => bail!("expected true or false (got '{other}')"),
+    }
+}
+
+fn validate_percent(s: &str) -> Result<toml::Value> {
+    let n: i64 = s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("expected an integer percent 1-100, got '{s}'"))?;
+    if !(1..=100).contains(&n) {
+        bail!("value must be between 1 and 100 (percent), got {n}");
+    }
+    Ok(toml::Value::Integer(n))
+}
+
+/// The list-typed key shape (#376 O1). Accepts the comma-separated form the
+/// matching env var uses, stores a real TOML array so a hand-edited
+/// `config.toml` can use native list syntax, and round-trips back through
+/// [`value_display`] as the same comma-separated string the consumer parses.
+/// Empty entries are dropped rather than rejected, so a trailing comma is not an
+/// error.
+fn validate_string_list(s: &str) -> Result<toml::Value> {
+    let items: Vec<toml::Value> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| toml::Value::String(p.to_string()))
+        .collect();
+    Ok(toml::Value::Array(items))
 }
 
 // ── File layers ───────────────────────────────────────────────────────────────
@@ -236,10 +316,21 @@ fn table_set(table: &mut toml::Table, key: &str, value: toml::Value) -> Result<(
     Ok(())
 }
 
-/// Render a stored TOML scalar as the bare string a user typed (no quotes).
+/// Render a stored TOML value as the bare string a user typed (no quotes).
+///
+/// Arrays render comma-separated rather than in TOML literal syntax, so a
+/// list-typed key round-trips: what `set` stored as `["a", "b"]` reads back as
+/// `a,b`, which is byte-identical to what the matching env var would carry and
+/// therefore parseable by one consumer-side splitter regardless of which layer
+/// supplied it.
 fn value_display(v: &toml::Value) -> String {
     match v {
         toml::Value::String(s) => s.clone(),
+        toml::Value::Array(items) => items
+            .iter()
+            .map(value_display)
+            .collect::<Vec<_>>()
+            .join(","),
         other => other.to_string(),
     }
 }
@@ -336,6 +427,49 @@ fn resolve_status(
 /// one layer explicitly, and for hermetic tests). `None` if absent or unreadable.
 pub fn read_key_file(path: &Path, key: &str) -> Option<String> {
     table_get(&load_table(path), key)
+}
+
+/// The active value of a registered key across `env > repo > global`, or `None`
+/// when unset at every layer (the caller then applies its own built-in default).
+///
+/// This is the reader every *runtime* consumer should use, as opposed to [`get`]
+/// which additionally carries the provenance and description `travsr config`
+/// needs for display. An unknown key yields `None` rather than an error: a
+/// runtime lookup for a key that was removed from the registry must degrade to
+/// the built-in default, never fail a query.
+pub fn effective(key: &str, repo_root: Option<&Path>) -> Option<String> {
+    get(key, repo_root).ok().and_then(|s| s.value)
+}
+
+/// [`effective`], parsed as a boolean with the same spellings [`validate_bool`]
+/// accepts. An unparseable value falls back to `None` (the caller's default)
+/// rather than guessing, so a typo in `config.toml` cannot silently flip a
+/// feature on.
+pub fn effective_bool(key: &str, repo_root: Option<&Path>) -> Option<bool> {
+    match effective(key, repo_root)?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// [`effective`], split on commas into the list form list-typed keys round-trip
+/// through (see [`value_display`]). Absent and empty both yield an empty `Vec`,
+/// which is the "no extra patterns" case.
+pub fn effective_list(key: &str, repo_root: Option<&Path>) -> Vec<String> {
+    effective(key, repo_root)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── Public write API ────────────────────────────────────────────────────────
@@ -465,6 +599,94 @@ mod tests {
             read_key_file(&cfg, "embed.priority").as_deref(),
             Some("low")
         );
+    }
+
+    #[test]
+    fn validate_bool_accepts_env_and_toml_spellings() {
+        for t in ["1", "true", "TRUE", "True", "yes", "on"] {
+            assert_eq!(validate_bool(t).unwrap(), toml::Value::Boolean(true), "{t}");
+        }
+        for f in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(
+                validate_bool(f).unwrap(),
+                toml::Value::Boolean(false),
+                "{f}"
+            );
+        }
+        assert!(validate_bool("maybe").is_err());
+        assert!(validate_bool("").is_err());
+    }
+
+    #[test]
+    fn validate_percent_bounds() {
+        assert!(validate_percent("1").is_ok());
+        assert!(validate_percent("100").is_ok());
+        assert!(validate_percent("0").is_err());
+        assert!(validate_percent("101").is_err());
+        assert!(validate_percent("abc").is_err());
+    }
+
+    /// The list-typed key must survive `set` -> file -> read as the same
+    /// comma-separated string the matching env var carries, so one consumer-side
+    /// splitter handles every layer. A trailing comma is tolerated, not an error.
+    #[test]
+    fn list_typed_key_round_trips_as_comma_separated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".travsr")).expect("mk .travsr");
+        let cfg = repo_path(root);
+
+        set(
+            "docs.exclude",
+            " vendor/ , third_party/ ,",
+            Scope::Repo(root.to_path_buf()),
+        )
+        .expect("set");
+        assert_eq!(
+            read_key_file(&cfg, "docs.exclude").as_deref(),
+            Some("vendor/,third_party/")
+        );
+
+        // Stored as a real TOML array, so a hand-edited file may use list syntax.
+        let text = std::fs::read_to_string(&cfg).expect("read");
+        assert!(
+            text.contains('['),
+            "expected TOML array syntax, got: {text}"
+        );
+    }
+
+    /// Every docs key the runtime honours must be registered, or
+    /// `travsr config set docs.enabled true` succeeds and changes nothing —
+    /// the exact silent-failure class #376 G1 exists to close.
+    #[test]
+    fn docs_keys_are_registered_with_their_env_vars() {
+        for (key, env) in [
+            ("docs.enabled", "TRAVSR_DOCS_ENABLED"),
+            ("docs.max_results", "TRAVSR_DOCS_MAX_RESULTS"),
+            ("docs.budget_pct", "TRAVSR_DOCS_BUDGET_PCT"),
+            ("docs.exclude", "TRAVSR_DOCS_EXCLUDE"),
+        ] {
+            let s = spec(key).unwrap_or_else(|| panic!("{key} not registered"));
+            assert_eq!(s.env, Some(env), "{key}");
+        }
+    }
+
+    #[test]
+    fn effective_bool_rejects_garbage_instead_of_guessing() {
+        // A typo must fall through to the caller's default, never flip a feature on.
+        assert_eq!(parse_bool_str("true"), Some(true));
+        assert_eq!(parse_bool_str("0"), Some(false));
+        assert_eq!(parse_bool_str("ture"), None);
+    }
+
+    /// Mirror of `effective_bool`'s parse, testable without touching the real
+    /// environment or `~/.travsr`.
+    fn parse_bool_str(s: &str) -> Option<bool> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
     }
 
     #[test]

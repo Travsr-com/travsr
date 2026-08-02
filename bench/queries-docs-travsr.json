@@ -1,0 +1,135 @@
+{
+  "_comment": [
+    "Doc-retrieval query set for #376, travsr repo (the gain repo: 54 decision-class files",
+    "across docs/adrs, docs/rfcs, docs/plans).",
+    "",
+    "Unlike kubernetes, these are genuine ADR/RFC rationale questions, which is the corpus",
+    "the issue actually targets. Gold anchors were taken from the real files.",
+    "",
+    "expectPath: substring of the gold chunk's file path.",
+    "expectHeading: substring of the gold chunk's heading trail (case-insensitive);",
+    "empty means any section of that file counts."
+  ],
+  "queries": [
+    {
+      "id": "T1",
+      "query": "why did we choose personalized pagerank over breadth first search for retrieval",
+      "expectPath": "docs/adrs/ADR-003",
+      "expectHeading": ""
+    },
+    {
+      "id": "T2",
+      "query": "what is our policy when LSIF and tree-sitter disagree about an edge",
+      "expectPath": "ADR-002-edge-provenance-policy",
+      "expectHeading": ""
+    },
+    {
+      "id": "T3",
+      "query": "what are the rules about unwrap and error handling in library code",
+      "expectPath": "ADR-001-coding-standards",
+      "expectHeading": ""
+    },
+    {
+      "id": "T4",
+      "query": "why is the VName signature format version bumped and what breaks when it changes",
+      "expectPath": "RFC-002-vname-signature-versioning",
+      "expectHeading": ""
+    },
+    {
+      "id": "T5",
+      "query": "how does the knapsack enforce the token budget",
+      "expectPath": "RFC-010-knapsack-budget-enforcer",
+      "expectHeading": ""
+    },
+    {
+      "id": "T6",
+      "query": "what is the cross encoder relevance arbiter supposed to fix",
+      "expectPath": "RFC-021",
+      "expectHeading": ""
+    },
+    {
+      "id": "T7",
+      "query": "why do we run embeddings in a downloadable sidecar instead of in process",
+      "expectPath": "RFC-018-embedding-plugin-architecture",
+      "expectHeading": ""
+    },
+    {
+      "id": "T8",
+      "query": "how is the graph RBAC session and scope model defined",
+      "expectPath": "RFC-006-graph-rbac-session-model",
+      "expectHeading": ""
+    },
+    {
+      "id": "T9",
+      "query": "what is the corpus naming convention derived from a git remote",
+      "expectPath": "ARCH-102-corpus-naming-convention",
+      "expectHeading": ""
+    },
+    {
+      "id": "T10",
+      "query": "why did the model relative semantic floors need auto calibration per model",
+      "expectPath": "model-relative-semantic-floors",
+      "expectHeading": ""
+    },
+    {
+      "id": "T11",
+      "query": "what were the measured root causes of conceptual retrieval failures",
+      "expectPath": "rfc-022-production-conceptual-retrieval",
+      "expectHeading": ""
+    },
+    {
+      "id": "T12",
+      "query": "how do we resolve cross language edges between rust and typescript",
+      "expectPath": "RFC-005-cross-language-edge-resolution",
+      "expectHeading": ""
+    },
+    {
+      "id": "T13",
+      "query": "what is the plan for parallel reindex workers",
+      "expectPath": "RFC-020-parallel-reindex-workers",
+      "expectHeading": ""
+    },
+    {
+      "id": "T14",
+      "query": "how does the two transport plugin architecture work",
+      "expectPath": "RFC-011-two-transport-plugin-architecture",
+      "expectHeading": ""
+    },
+    {
+      "id": "T15",
+      "query": "why does the retrieval cascade short circuit and starve top K results",
+      "expectPath": "issue-393-rrf-fusion-cascade-redesign",
+      "expectHeading": ""
+    },
+    {
+      "id": "T16",
+      "query": "what is the MCP SSE transport design for the cloud tier",
+      "expectPath": "RFC-007-mcp-sse-transport",
+      "expectHeading": ""
+    },
+    {
+      "id": "T17",
+      "query": "how should overview mode behave in the API",
+      "expectPath": "RFC-015-overview-mode-api",
+      "expectHeading": ""
+    },
+    {
+      "id": "T18",
+      "query": "how are phase B symbols unified with phase A tree-sitter nodes",
+      "expectPath": "RFC-014-phase-b-symbol-unification",
+      "expectHeading": ""
+    },
+    {
+      "id": "T19",
+      "query": "what does the fuzzy seed selection design propose",
+      "expectPath": "RFC-012-fuzzy-seed-selection",
+      "expectHeading": ""
+    },
+    {
+      "id": "T20",
+      "query": "why was a per repo linear projection head for embeddings rejected",
+      "expectPath": "docs/plans",
+      "expectHeading": ""
+    }
+  ]
+}

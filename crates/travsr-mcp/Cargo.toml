@@ -16,6 +16,7 @@ travsr-retrieval = { path = "../travsr-retrieval" }
 travsr-rerank = { path = "../travsr-rerank" }
 travsr-store = { path = "../travsr-store" }
 travsr-plugin-host = { path = "../travsr-plugin-host" }
+travsr-config = { workspace = true }
 dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

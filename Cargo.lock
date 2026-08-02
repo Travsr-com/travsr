@@ -3824,6 +3824,7 @@ name = "travsr-analysis"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "proptest",
  "quick-xml",
  "serde_json",
  "streaming-iterator",
@@ -4011,6 +4012,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "travsr-analysis",
+ "travsr-config",
  "travsr-core",
  "travsr-error",
  "travsr-plugin-host",

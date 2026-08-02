@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use travsr_core::NodeId;
 use travsr_error::StoreError;
+use travsr_plugin_protocol::Space;
 
 use crate::embed_sidecar::{EmbedCapabilities, EmbedSidecar};
 
@@ -153,7 +154,7 @@ impl EmbedSupervisor {
                     if !sidecar.is_alive() {
                         return;
                     }
-                    match sidecar.knn(&query_owned, k, &model_id2) {
+                    match sidecar.knn(&query_owned, k, &model_id2, Space::Code) {
                         Ok(pairs) => {
                             // Kythe VName hashes are signed i64 and can be negative;
                             // usearch stores them as u64 via bit-reinterpretation and
@@ -171,6 +172,51 @@ impl EmbedSupervisor {
 
             // Return whatever arrived within the budget. `unwrap_or_default`
             // covers both timeout (Disconnected or Timeout) and spawn failure.
+            Ok(rx
+                .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
+                .unwrap_or_default())
+        }))
+    }
+
+    /// #376 Phase 2: doc-space counterpart to [`Self::knn_hook`]. `None` both
+    /// when the supervisor is inactive and when the connected sidecar predates
+    /// doc-space support (`EmbedCapabilities::supports_doc_space`) — an old
+    /// sidecar must never be asked for `Space::Docs` (see that method's doc
+    /// comment). Same cold-start / circuit-breaker shape as `knn_hook`, on an
+    /// independent round trip: the sidecar-side query-embedding memo cache
+    /// (`travsr-embed`) absorbs the latency this would otherwise double,
+    /// without changing `KnnHook`'s signature or any of its existing callers.
+    pub fn doc_knn_hook(&self, model_id: String) -> Option<KnnHook> {
+        let arc = self.inner.as_ref()?.clone();
+        if !self.capabilities()?.supports_doc_space() {
+            return None;
+        }
+        Some(Arc::new(move |query: &str, k: u32| {
+            let arc2 = Arc::clone(&arc);
+            let query_owned = query.to_string();
+            let model_id2 = model_id.clone();
+
+            let (tx, rx) = mpsc::channel::<Vec<(NodeId, f32)>>();
+            std::thread::Builder::new()
+                .name("embed-doc-knn-worker".into())
+                .spawn(move || {
+                    let Ok(sidecar) = arc2.lock() else { return };
+                    if !sidecar.is_alive() {
+                        return;
+                    }
+                    match sidecar.knn(&query_owned, k, &model_id2, Space::Docs) {
+                        Ok(pairs) => {
+                            let nodes: Vec<(NodeId, f32)> = pairs
+                                .into_iter()
+                                .map(|(id, score)| (NodeId(id as u64), score))
+                                .collect();
+                            let _ = tx.send(nodes);
+                        }
+                        Err(e) => tracing::warn!("embed doc knn failed (non-fatal): {e}"),
+                    }
+                })
+                .ok();
+
             Ok(rx
                 .recv_timeout(Duration::from_millis(KNN_CALL_TIMEOUT_MS))
                 .unwrap_or_default())
@@ -241,7 +287,7 @@ impl EmbedSupervisor {
             return;
         };
         if let Ok(sidecar) = arc.lock() {
-            let _ = sidecar.knn("_prewarm_", 1, model_id);
+            let _ = sidecar.knn("_prewarm_", 1, model_id, Space::Code);
             tracing::info!("embed sidecar prewarm complete — KNN ready for queries");
         }
     }
