@@ -3868,6 +3868,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -4028,6 +4029,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",

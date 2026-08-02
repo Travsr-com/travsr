@@ -1,36 +1,36 @@
 {
-  "generatedAt": "2026-08-01T21:21:32.249Z",
+  "generatedAt": "2026-08-02T14:30:02.603Z",
   "repo": "travsr",
   "gate1_docHit": {
     "pass": true,
     "n": 20,
-    "hit@1": 1,
-    "hit@3": 1,
-    "medianMs": 820,
+    "hit@1": 0.9,
+    "hit@3": 0.9,
+    "medianMs": 1036,
     "threshold": "hit@1>=0.60, hit@3>=0.90"
   },
   "gate2_codeRegression": {
     "pass": true,
     "off": {
       "n": 33,
-      "hit@1": 0.545,
-      "hit@3": 0.636,
-      "hit@10": 0.727,
+      "hit@1": 0.636,
+      "hit@3": 0.727,
+      "hit@10": 0.788,
       "abstainN": 11,
       "abstainCorrect": 10,
       "abstainRate": 0.909,
-      "medianMs": 316,
+      "medianMs": 348,
       "docsLeaked": 0
     },
     "on": {
       "n": 33,
-      "hit@1": 0.545,
-      "hit@3": 0.636,
-      "hit@10": 0.727,
+      "hit@1": 0.636,
+      "hit@3": 0.727,
+      "hit@10": 0.788,
       "abstainN": 11,
       "abstainCorrect": 10,
       "abstainRate": 0.909,
-      "medianMs": 822,
+      "medianMs": 878,
       "docsLeaked": 0
     },
     "perQueryRegressions": []
@@ -54,7 +54,7 @@
       {
         "id": "T1-punct",
         "query": "why did we choose personalized pagerank over breadth first search for retrieval?",
-        "ms": 831,
+        "ms": 775,
         "embedInferences": 1,
         "embedMemoHits": 1,
         "spacesSearched": [
@@ -71,7 +71,7 @@
       {
         "id": "T2-punct",
         "query": "what is our policy when LSIF and tree-sitter disagree about an edge?",
-        "ms": 895,
+        "ms": 988,
         "embedInferences": 1,
         "embedMemoHits": 1,
         "spacesSearched": [
@@ -88,7 +88,7 @@
       {
         "id": "T3-punct",
         "query": "what are the rules about unwrap and error handling in library code?",
-        "ms": 810,
+        "ms": 1030,
         "embedInferences": 1,
         "embedMemoHits": 1,
         "spacesSearched": [
@@ -111,32 +111,32 @@
     "vacuous": false,
     "docs": {
       "n": 20,
-      "hit@1": 1,
-      "hit@3": 1,
-      "medianMs": 1022,
-      "queriesWithDocs": 20,
+      "hit@1": 0.9,
+      "hit@3": 0.9,
+      "medianMs": 1332,
+      "queriesWithDocs": 18,
       "errors": 0
     },
     "codeOff": {
       "n": 33,
-      "hit@1": 0.545,
+      "hit@1": 0.576,
       "hit@3": 0.667,
-      "hit@10": 0.697,
+      "hit@10": 0.727,
       "abstainN": 11,
       "abstainCorrect": 10,
       "abstainRate": 0.909,
-      "medianMs": 327,
+      "medianMs": 400,
       "docsLeaked": 0
     },
     "codeOn": {
       "n": 33,
-      "hit@1": 0.545,
+      "hit@1": 0.576,
       "hit@3": 0.667,
-      "hit@10": 0.697,
+      "hit@10": 0.727,
       "abstainN": 11,
       "abstainCorrect": 10,
       "abstainRate": 0.909,
-      "medianMs": 898,
+      "medianMs": 1001,
       "docsLeaked": 0
     },
     "codeStable": true,
@@ -145,7 +145,7 @@
       "comparable": 20,
       "disagreements": []
     },
-    "daemonReadyMs": 2954,
+    "daemonReadyMs": 3581,
     "daemonWasRunningBefore": true,
     "threshold": "ask hit@1>=0.60, hit@3>=0.90; >=1 query rendering docs; zero presence/top-1 disagreement with get_context; zero code hit/abstain movement docs off vs on",
     "rows": [
@@ -154,7 +154,7 @@
         "query": "why did we choose personalized pagerank over breadth first search for retrieval",
         "rank": 1,
         "nDocs": 2,
-        "ms": 1141,
+        "ms": 1060,
         "matched": false,
         "entries": [
           {
@@ -163,7 +163,7 @@
           },
           {
             "path": "README.md",
-            "heading": "Travsr › How It Works › Retrieval Algorithms:363-375"
+            "heading": "Travsr › How It Works › Retrieval Algorithms:382-394"
           }
         ]
       },
@@ -172,7 +172,7 @@
         "query": "what is our policy when LSIF and tree-sitter disagree about an edge",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1380,
+        "ms": 1452,
         "matched": true,
         "entries": [
           {
@@ -194,7 +194,7 @@
         "query": "what are the rules about unwrap and error handling in library code",
         "rank": 1,
         "nDocs": 3,
-        "ms": 889,
+        "ms": 1187,
         "matched": false,
         "entries": [
           {
@@ -216,7 +216,7 @@
         "query": "why is the VName signature format version bumped and what breaks when it changes",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1238,
+        "ms": 1178,
         "matched": true,
         "entries": [
           {
@@ -238,7 +238,7 @@
         "query": "how does the knapsack enforce the token budget",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1318,
+        "ms": 1607,
         "matched": true,
         "entries": [
           {
@@ -260,7 +260,7 @@
         "query": "what is the cross encoder relevance arbiter supposed to fix",
         "rank": 1,
         "nDocs": 3,
-        "ms": 731,
+        "ms": 1094,
         "matched": false,
         "entries": [
           {
@@ -272,8 +272,8 @@
             "heading": "Rfc 021 Cross Encoder Relevance Arbiter For Seed › 16 Cross Repo E2e Validation Kubernetes Kubernet#2:322-327"
           },
           {
-            "path": "docs/plans/rfc-021-implementation-plan.md",
-            "heading": "Rfc 021 Implementation Plan Cross Encoder Releva › 10 Session Log 2026 07 24 C4 Release E2e Qa Ci G › 10 5 Remaining After This Session:560-566"
+            "path": "docs/rfcs/RFC-021-cross-encoder-relevance-arbiter.md",
+            "heading": "Rfc 021 Cross Encoder Relevance Arbiter For Seed › 15 Principal Architect End To End Review Rulings › Gap Register Resolved:289-301"
           }
         ]
       },
@@ -282,7 +282,7 @@
         "query": "why do we run embeddings in a downloadable sidecar instead of in process",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1473,
+        "ms": 2100,
         "matched": true,
         "entries": [
           {
@@ -304,7 +304,7 @@
         "query": "how is the graph RBAC session and scope model defined",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1022,
+        "ms": 1385,
         "matched": false,
         "entries": [
           {
@@ -326,7 +326,7 @@
         "query": "what is the corpus naming convention derived from a git remote",
         "rank": 1,
         "nDocs": 3,
-        "ms": 852,
+        "ms": 1129,
         "matched": true,
         "entries": [
           {
@@ -348,7 +348,7 @@
         "query": "why did the model relative semantic floors need auto calibration per model",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1265,
+        "ms": 1615,
         "matched": true,
         "entries": [
           {
@@ -368,27 +368,18 @@
       {
         "id": "T11",
         "query": "what were the measured root causes of conceptual retrieval failures",
-        "rank": 1,
-        "nDocs": 2,
-        "ms": 793,
+        "rank": 0,
+        "nDocs": 0,
+        "ms": 1018,
         "matched": false,
-        "entries": [
-          {
-            "path": "docs/plans/rfc-022-production-conceptual-retrieval.md",
-            "heading": "Rfc 022 Production Grade Conceptual Retrieval Fo › 2 The Problem Measured Root Causes:17-32"
-          },
-          {
-            "path": "docs/plans/rfc-022-production-conceptual-retrieval.md",
-            "heading": "Rfc 022 Production Grade Conceptual Retrieval Fo › 1 Summary:11-16"
-          }
-        ]
+        "entries": []
       },
       {
         "id": "T12",
         "query": "how do we resolve cross language edges between rust and typescript",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1338,
+        "ms": 1938,
         "matched": true,
         "entries": [
           {
@@ -410,7 +401,7 @@
         "query": "what is the plan for parallel reindex workers",
         "rank": 1,
         "nDocs": 3,
-        "ms": 974,
+        "ms": 1517,
         "matched": true,
         "entries": [
           {
@@ -432,7 +423,7 @@
         "query": "how does the two transport plugin architecture work",
         "rank": 1,
         "nDocs": 3,
-        "ms": 703,
+        "ms": 1082,
         "matched": false,
         "entries": [
           {
@@ -454,7 +445,7 @@
         "query": "why does the retrieval cascade short circuit and starve top K results",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1086,
+        "ms": 1654,
         "matched": false,
         "entries": [
           {
@@ -476,7 +467,7 @@
         "query": "what is the MCP SSE transport design for the cloud tier",
         "rank": 1,
         "nDocs": 3,
-        "ms": 802,
+        "ms": 1217,
         "matched": false,
         "entries": [
           {
@@ -498,7 +489,7 @@
         "query": "how should overview mode behave in the API",
         "rank": 1,
         "nDocs": 3,
-        "ms": 729,
+        "ms": 1127,
         "matched": false,
         "entries": [
           {
@@ -520,7 +511,7 @@
         "query": "how are phase B symbols unified with phase A tree-sitter nodes",
         "rank": 1,
         "nDocs": 3,
-        "ms": 673,
+        "ms": 1332,
         "matched": false,
         "entries": [
           {
@@ -542,7 +533,7 @@
         "query": "what does the fuzzy seed selection design propose",
         "rank": 1,
         "nDocs": 3,
-        "ms": 919,
+        "ms": 945,
         "matched": false,
         "entries": [
           {
@@ -562,25 +553,20 @@
       {
         "id": "T20",
         "query": "why was a per repo linear projection head for embeddings rejected",
-        "rank": 1,
-        "nDocs": 1,
-        "ms": 1101,
-        "matched": false,
-        "entries": [
-          {
-            "path": "docs/plans/rfc-022-production-conceptual-retrieval.md",
-            "heading": "Rfc 022 Production Grade Conceptual Retrieval Fo › 10 Alternatives Considered Rejected:152-160"
-          }
-        ]
+        "rank": 0,
+        "nDocs": 0,
+        "ms": 1777,
+        "matched": true,
+        "entries": []
       }
     ]
   },
   "crossEncoderCost": {
     "gating": false,
     "accepted": true,
-    "offMedianMs": 316,
-    "onMedianMs": 822,
-    "ratio": 2.601,
+    "offMedianMs": 348,
+    "onMedianMs": 878,
+    "ratio": 2.523,
     "cause": "second full cross-encoder pass per query (docs lane), plan §12",
     "followUp": "selective/hybrid reranking — only invoke the cross-encoder when raw cosine is ambiguous (§12)"
   },
@@ -589,7 +575,7 @@
       "id": "T1",
       "query": "why did we choose personalized pagerank over breadth first search for retrieval",
       "rank": 1,
-      "ms": 653,
+      "ms": 897,
       "nDocs": 2,
       "topEntry": {
         "path": "docs/adrs/ADR-003-ppr-policy.md",
@@ -609,7 +595,7 @@
       "id": "T2",
       "query": "what is our policy when LSIF and tree-sitter disagree about an edge",
       "rank": 1,
-      "ms": 665,
+      "ms": 873,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/adrs/ADR-002-edge-provenance-policy.md",
@@ -629,7 +615,7 @@
       "id": "T3",
       "query": "what are the rules about unwrap and error handling in library code",
       "rank": 1,
-      "ms": 979,
+      "ms": 1300,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/adrs/ADR-001-coding-standards.md",
@@ -649,7 +635,7 @@
       "id": "T4",
       "query": "why is the VName signature format version bumped and what breaks when it changes",
       "rank": 1,
-      "ms": 856,
+      "ms": 1013,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-002-vname-signature-versioning.md",
@@ -669,7 +655,7 @@
       "id": "T5",
       "query": "how does the knapsack enforce the token budget",
       "rank": 1,
-      "ms": 1204,
+      "ms": 1256,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-010-knapsack-budget-enforcer.md",
@@ -689,7 +675,7 @@
       "id": "T6",
       "query": "what is the cross encoder relevance arbiter supposed to fix",
       "rank": 1,
-      "ms": 608,
+      "ms": 1036,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-021-cross-encoder-relevance-arbiter.md",
@@ -709,7 +695,7 @@
       "id": "T7",
       "query": "why do we run embeddings in a downloadable sidecar instead of in process",
       "rank": 1,
-      "ms": 1587,
+      "ms": 1286,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-018-embedding-plugin-architecture.md",
@@ -729,7 +715,7 @@
       "id": "T8",
       "query": "how is the graph RBAC session and scope model defined",
       "rank": 1,
-      "ms": 988,
+      "ms": 932,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-006-graph-rbac-session-model.md",
@@ -749,7 +735,7 @@
       "id": "T9",
       "query": "what is the corpus naming convention derived from a git remote",
       "rank": 1,
-      "ms": 774,
+      "ms": 786,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/ARCH-102-corpus-naming-convention.md",
@@ -769,7 +755,7 @@
       "id": "T10",
       "query": "why did the model relative semantic floors need auto calibration per model",
       "rank": 1,
-      "ms": 1209,
+      "ms": 1291,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/plans/model-relative-semantic-floors.md",
@@ -788,13 +774,10 @@
     {
       "id": "T11",
       "query": "what were the measured root causes of conceptual retrieval failures",
-      "rank": 1,
-      "ms": 729,
-      "nDocs": 2,
-      "topEntry": {
-        "path": "docs/plans/rfc-022-production-conceptual-retrieval.md",
-        "heading": "Rfc 022 Production Grade Conceptual Retrieval Fo › 2 The Problem Measured Root Causes:17-32"
-      },
+      "rank": 0,
+      "ms": 946,
+      "nDocs": 0,
+      "topEntry": null,
       "embedInferences": 1,
       "embedMemoHits": 1,
       "spacesSearched": [
@@ -809,7 +792,7 @@
       "id": "T12",
       "query": "how do we resolve cross language edges between rust and typescript",
       "rank": 1,
-      "ms": 1298,
+      "ms": 1736,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-005-cross-language-edge-resolution.md",
@@ -829,7 +812,7 @@
       "id": "T13",
       "query": "what is the plan for parallel reindex workers",
       "rank": 1,
-      "ms": 1208,
+      "ms": 1215,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-020-parallel-reindex-workers.md",
@@ -849,7 +832,7 @@
       "id": "T14",
       "query": "how does the two transport plugin architecture work",
       "rank": 1,
-      "ms": 652,
+      "ms": 990,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-011-two-transport-plugin-architecture.md",
@@ -869,7 +852,7 @@
       "id": "T15",
       "query": "why does the retrieval cascade short circuit and starve top K results",
       "rank": 1,
-      "ms": 984,
+      "ms": 1259,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/plans/issue-393-rrf-fusion-cascade-redesign.md",
@@ -889,7 +872,7 @@
       "id": "T16",
       "query": "what is the MCP SSE transport design for the cloud tier",
       "rank": 1,
-      "ms": 782,
+      "ms": 1089,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-007-mcp-sse-transport.md",
@@ -909,7 +892,7 @@
       "id": "T17",
       "query": "how should overview mode behave in the API",
       "rank": 1,
-      "ms": 774,
+      "ms": 902,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-015-overview-mode-api.md",
@@ -929,7 +912,7 @@
       "id": "T18",
       "query": "how are phase B symbols unified with phase A tree-sitter nodes",
       "rank": 1,
-      "ms": 737,
+      "ms": 818,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-014-phase-b-symbol-unification.md",
@@ -949,7 +932,7 @@
       "id": "T19",
       "query": "what does the fuzzy seed selection design propose",
       "rank": 1,
-      "ms": 761,
+      "ms": 703,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-012-fuzzy-seed-selection.md",
@@ -968,13 +951,10 @@
     {
       "id": "T20",
       "query": "why was a per repo linear projection head for embeddings rejected",
-      "rank": 1,
-      "ms": 820,
-      "nDocs": 1,
-      "topEntry": {
-        "path": "docs/plans/rfc-022-production-conceptual-retrieval.md",
-        "heading": "Rfc 022 Production Grade Conceptual Retrieval Fo › 10 Alternatives Considered Rejected:152-160"
-      },
+      "rank": 0,
+      "ms": 1512,
+      "nDocs": 0,
+      "topEntry": null,
       "embedInferences": 1,
       "embedMemoHits": 1,
       "spacesSearched": [

@@ -5061,13 +5061,92 @@ LIMIT 100",
     /// Consistency window: tombstones between the GC cut-off and sidecar ack
     /// may be missed. Acceptable because a full init_repo rebuild covers any
     /// gap. Document this as "eventual" rather than "guaranteed once".
-    pub fn prune_tombstones(&mut self, max_age_secs: u64, max_rows: u64) -> anyhow::Result<u64> {
+    ///
+    /// L3: since ack *is* deletion, every tombstone this prunes before the
+    /// embed sidecar ever consumed it is a potentially-missed invalidation —
+    /// but most pruned tombstones are harmless: the node they name may already
+    /// be gone (covered by the orphan sweep already) or may never have had a
+    /// vector at all. The second return value is the honest subset that
+    /// actually represents risk: pruned tombstones whose node **still exists**
+    /// and **has an embedding row** — i.e. a vector that may now be stale with
+    /// nothing left to invalidate it.
+    pub fn prune_tombstones(
+        &mut self,
+        max_age_secs: u64,
+        max_rows: u64,
+    ) -> anyhow::Result<(u64, u64)> {
+        // ATTACH/DETACH must bracket the transaction from *outside* it: SQLite
+        // refuses `DETACH` while a transaction is open ("database edb is
+        // locked"), and a swallowed DETACH leaves the alias bound, so the next
+        // `ATTACH edb` on this connection fails "already in use" — which would
+        // also break `embed_progress`, since it uses the same alias, and so
+        // silently stop the daemon from ever spawning an embed pass again.
+        // `embed_progress` gets this right; mirror it here.
+        let embed_db_path = self.embed_db_path.clone();
+        let edb_attached = embed_db_path
+            .as_deref()
+            .filter(|p| p.exists())
+            .and_then(|p| p.to_str())
+            // A repo path may legally contain `'`; doubling it keeps the
+            // literal well-formed (and `execute_batch` runs *every* statement
+            // in the string, so an unescaped quote is a live injection sink).
+            .map(|p| {
+                let escaped = p.replace('\'', "''");
+                self.conn
+                    .execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
+            })
+            .transpose()
+            .map_err(|e| {
+                tracing::warn!("attaching embed.db for the tombstone at-risk count failed: {e}");
+            })
+            .unwrap_or(None)
+            .is_some();
+
+        let out = self.prune_tombstones_locked(max_age_secs, max_rows, edb_attached);
+
+        if edb_attached {
+            if let Err(e) = self.conn.execute_batch("DETACH DATABASE edb") {
+                tracing::warn!("detaching embed.db after tombstone prune failed: {e}");
+            }
+        }
+        out
+    }
+
+    /// Body of [`Self::prune_tombstones`], run with `edb` already attached (or
+    /// known absent). Split out so the caller can DETACH on every exit path
+    /// without holding a borrow across the transaction.
+    fn prune_tombstones_locked(
+        &mut self,
+        max_age_secs: u64,
+        max_rows: u64,
+        edb_attached: bool,
+    ) -> anyhow::Result<(u64, u64)> {
         let tx = self.conn.transaction()?;
         let cutoff = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64)
             - max_age_secs as i64;
+
+        // COUNT(DISTINCT t.rowid): a node embedded under more than one model
+        // has one `node_embeddings` row per model, and multi-model rows are
+        // exactly what this release makes normal (`travsr embed gc`). Counting
+        // raw join rows would let `at_risk` exceed the tombstones pruned.
+        const AT_RISK_JOIN: &str = "JOIN nodes n ON n.id = t.node_id \
+             JOIN edb.node_embeddings e ON e.node_id = t.node_id";
+
+        let aged_at_risk: u64 = if edb_attached {
+            tx.query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT t.rowid) FROM node_tombstones t {AT_RISK_JOIN} \
+                     WHERE t.deleted_at < ?1"
+                ),
+                rusqlite::params![cutoff],
+                |r| r.get::<_, i64>(0),
+            )? as u64
+        } else {
+            0
+        };
         let aged = tx.execute(
             "DELETE FROM node_tombstones WHERE deleted_at < ?1",
             rusqlite::params![cutoff],
@@ -5076,21 +5155,36 @@ LIMIT 100",
         // Count remaining rows.
         let remaining: i64 =
             tx.query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))?;
-        let size_pruned = if remaining as u64 > max_rows {
-            tx.execute(
+        let (size_pruned, size_at_risk) = if remaining as u64 > max_rows {
+            let size_at_risk: u64 = if edb_attached {
+                tx.query_row(
+                    &format!(
+                        "SELECT COUNT(DISTINCT t.rowid) FROM node_tombstones t {AT_RISK_JOIN} \
+                         WHERE t.rowid NOT IN \
+                         (SELECT rowid FROM node_tombstones ORDER BY deleted_at DESC LIMIT ?1)"
+                    ),
+                    rusqlite::params![max_rows as i64],
+                    |r| r.get::<_, i64>(0),
+                )? as u64
+            } else {
+                0
+            };
+            let deleted = tx.execute(
                 "DELETE FROM node_tombstones WHERE rowid NOT IN \
                  (SELECT rowid FROM node_tombstones ORDER BY deleted_at DESC LIMIT ?1)",
                 rusqlite::params![max_rows as i64],
-            )? as u64
+            )? as u64;
+            (deleted, size_at_risk)
         } else {
-            0
+            (0, 0)
         };
         tx.commit()?;
         let total = aged + size_pruned;
+        let at_risk = aged_at_risk + size_at_risk;
         if total > 0 {
-            tracing::debug!(aged, size_pruned, "pruned node_tombstones");
+            tracing::debug!(aged, size_pruned, at_risk, "pruned node_tombstones");
         }
-        Ok(total)
+        Ok((total, at_risk))
     }
 }
 
@@ -7865,6 +7959,178 @@ mod tests {
                 .iter()
                 .any(|(src, dst, _, _)| *src == file_id && *dst == callee.id),
             "line 25 ref must fall back to file node attribution"
+        );
+    }
+
+    // ── L3: tombstone at-risk count ────────────────────────────────────────────
+
+    /// A file-backed store (not `open_in_memory`) so `embed_db_path` is set and
+    /// `prune_tombstones` can ATTACH a real `embed.db` sibling for the at-risk
+    /// JOIN. Returns the store and the tempdir (kept alive for the store's life).
+    fn file_backed_store() -> (SqliteStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("graph.db")).unwrap();
+        (store, dir)
+    }
+
+    fn write_embedding_row(embed_db_path: &std::path::Path, node_id: i64) {
+        let conn = rusqlite::Connection::open(embed_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, ?3)",
+            rusqlite::params![node_id, "arctic-embed-m-v1.5", vec![0u8; 8]],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prune_reports_zero_at_risk_when_every_pruned_node_is_gone() {
+        let (mut store, dir) = file_backed_store();
+        let n = sample_node("fn:a");
+        let id = node_id_to_i64(n.id);
+        store.put_node(&n).unwrap();
+        // The v17 trigger inserts a node_tombstones row on this delete.
+        store
+            .conn
+            .execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])
+            .unwrap();
+        // The node still has an embedding row on disk (a stale one, since the
+        // node itself is gone) — this must NOT count as at-risk: nothing
+        // reads that vector once the node is gone, it is the orphan sweep's
+        // job (freshness.rs), not this one's.
+        write_embedding_row(&dir.path().join("embed.db"), id);
+        // Age the tombstone past the cutoff so it is eligible for pruning.
+        store
+            .conn
+            .execute("UPDATE node_tombstones SET deleted_at = 0", [])
+            .unwrap();
+
+        let (total, at_risk) = store.prune_tombstones(3600, 100).unwrap();
+        assert_eq!(total, 1, "the aged tombstone must be pruned");
+        assert_eq!(
+            at_risk, 0,
+            "the node is gone, so this must not count as at-risk"
+        );
+    }
+
+    #[test]
+    fn prune_reports_at_risk_when_a_pruned_node_still_has_a_vector() {
+        let (mut store, dir) = file_backed_store();
+        let n = sample_node("fn:a");
+        let id = node_id_to_i64(n.id);
+        store.put_node(&n).unwrap();
+        store
+            .conn
+            .execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])
+            .unwrap();
+        // Node identity is a deterministic VName hash (Kythe-style), not an
+        // autoincrement — re-inserting the same VName (e.g. a revert, or the
+        // daemon's hash-delta loop reconciling back to prior content) yields
+        // the exact same id. The old tombstone from the delete above is now
+        // stale: the node it named is back, and has a vector.
+        store.put_node(&n).unwrap();
+        write_embedding_row(&dir.path().join("embed.db"), id);
+        store
+            .conn
+            .execute("UPDATE node_tombstones SET deleted_at = 0", [])
+            .unwrap();
+
+        let (total, at_risk) = store.prune_tombstones(3600, 100).unwrap();
+        assert_eq!(total, 1, "the aged tombstone must be pruned");
+        assert_eq!(
+            at_risk, 1,
+            "the node still exists and still has an embedding \u{2014} this is the real risk case"
+        );
+    }
+
+    /// Regression: `prune_tombstones` used to `ATTACH`/`DETACH` inside its own
+    /// transaction. SQLite refuses `DETACH` while a transaction is open, the
+    /// error was swallowed, and the alias stayed bound — so the *second* call
+    /// on the same connection failed `ATTACH ... already in use`, silently
+    /// reporting `at_risk = 0` forever. `embed_progress` shares the `edb`
+    /// alias, so the same connection would also stop reporting embed progress,
+    /// which is what the daemon's auto-spawn decision reads.
+    #[test]
+    fn prune_measures_at_risk_on_every_call_not_just_the_first() {
+        let (mut store, dir) = file_backed_store();
+        let embed_db = dir.path().join("embed.db");
+
+        for name in ["fn:a", "fn:b"] {
+            let n = sample_node(name);
+            let id = node_id_to_i64(n.id);
+            store.put_node(&n).unwrap();
+            store
+                .conn
+                .execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])
+                .unwrap();
+            store.put_node(&n).unwrap();
+            write_embedding_row(&embed_db, id);
+            store
+                .conn
+                .execute("UPDATE node_tombstones SET deleted_at = 0", [])
+                .unwrap();
+
+            let (total, at_risk) = store.prune_tombstones(3600, 100).unwrap();
+            assert_eq!(total, 1, "{name}: the aged tombstone must be pruned");
+            assert_eq!(
+                at_risk, 1,
+                "{name}: at-risk must be measured on this call too \u{2014} a leaked `edb` \
+                 attachment silently degrades it to 0"
+            );
+        }
+
+        // The alias must be free for the next consumer on this connection.
+        store
+            .embed_progress("arctic-embed-m-v1.5", 0)
+            .expect("embed_progress must still be able to ATTACH edb after a prune");
+    }
+
+    /// A node embedded under several models has one `node_embeddings` row per
+    /// model, and multi-model rows are exactly what `travsr embed gc` makes
+    /// normal. Counting raw join rows let `at_risk` exceed the tombstones
+    /// actually pruned.
+    #[test]
+    fn prune_at_risk_counts_nodes_not_embedding_rows() {
+        let (mut store, dir) = file_backed_store();
+        let n = sample_node("fn:a");
+        let id = node_id_to_i64(n.id);
+        store.put_node(&n).unwrap();
+        store
+            .conn
+            .execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])
+            .unwrap();
+        store.put_node(&n).unwrap();
+
+        let embed_db = dir.path().join("embed.db");
+        write_embedding_row(&embed_db, id);
+        let conn = rusqlite::Connection::open(&embed_db).unwrap();
+        conn.execute(
+            "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, "bge-large-en-v1.5", vec![0u8; 8]],
+        )
+        .unwrap();
+        drop(conn);
+
+        store
+            .conn
+            .execute("UPDATE node_tombstones SET deleted_at = 0", [])
+            .unwrap();
+
+        let (total, at_risk) = store.prune_tombstones(3600, 100).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(
+            at_risk, 1,
+            "one tombstone, one node, two models \u{2014} at_risk counts nodes, and must never \
+             exceed the {total} tombstone(s) pruned"
         );
     }
 }

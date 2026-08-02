@@ -94,6 +94,155 @@ impl Drop for ReindexInFlightGuard {
     }
 }
 
+/// L5: cross-process advisory lock on `<repo>/.travsr/embed.lock`, held for
+/// the duration of a reindex sidecar run or an `embed gc` sweep.
+///
+/// `REINDEX_IN_FLIGHT` above is the cheap in-process fast path that keeps the
+/// daemon's own Phase1/Phase2/post-commit spawn sites from racing each other
+/// without touching the filesystem — it answers "is *this process* already
+/// reindexing". This answers a different question: a CLI `travsr embed
+/// reindex` runs in a separate OS process and never sees that flag at all
+/// (#376 §18.7 observed both running at once during verification). Both
+/// layers stay; removing either leaves a real gap.
+///
+/// Non-blocking `try_lock`: a second caller must not hang behind a pass that
+/// can legitimately run for hours (a large repo's cold embed). `flock` is
+/// released by the OS when the holding process dies — even a hard kill — so
+/// a crashed holder can never wedge a future acquire. That is the reason this
+/// uses `flock` rather than a hand-rolled PID file, which would need its own
+/// liveness check and stale-file recovery.
+#[derive(Debug)]
+pub struct EmbedOpLock {
+    file: std::fs::File,
+}
+
+impl EmbedOpLock {
+    /// Try to claim the lock for `repo_root`, recording `op` (`"reindex"` /
+    /// `"gc"`) and this process's PID so a blocked caller can name the
+    /// holder. On failure, returns a ready-to-print message naming who holds
+    /// it — every caller (CLI error, daemon log) can use it as-is.
+    ///
+    /// `Ok(None)` (rather than an error) **only** when `.travsr` itself is
+    /// missing: that is "not an indexed repo yet", not "locked", and callers
+    /// already handle a missing repo separately. Any *other* open failure
+    /// (EACCES, read-only mount, `embed.lock` replaced by a directory, EMFILE)
+    /// is an error: on an indexed repo `Ok(None)` reaches `run_parallel_reindex`
+    /// as "no lock needed" and the pass runs completely unserialized, which is
+    /// the exact race L5 exists to prevent.
+    ///
+    /// The pid/op the holder records lives in a separate, never-locked
+    /// `embed.lock.info` file rather than inside `embed.lock` itself. Unlike
+    /// POSIX `flock`, Windows' `LockFileEx` is mandatory: once one handle
+    /// holds the exclusive lock, a *second* handle's read of that same file
+    /// also fails, not just its own lock attempt — so a losing caller could
+    /// never read the holder's pid/op back out of the locked file to report
+    /// it. Reading an adjacent, always-unlocked file sidesteps that.
+    pub fn try_acquire(repo_root: &Path, op: &str) -> anyhow::Result<Option<Self>> {
+        use anyhow::Context as _;
+        use fs2::FileExt as _;
+        let dir = repo_root.join(".travsr");
+        let lock_path = dir.join("embed.lock");
+        let info_path = dir.join("embed.lock.info");
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            // No `.travsr` at all → not an indexed repo. Fail *open* only here.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !dir.exists() => {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "opening the embed lock at {} \u{2014} refusing to run an embed operation \
+                     without it",
+                    lock_path.display()
+                )));
+            }
+        };
+        if file.try_lock_exclusive().is_err() {
+            let held = std::fs::read_to_string(&info_path).unwrap_or_default();
+            let (pid, held_op) = held
+                .trim()
+                .split_once('\t')
+                .map(|(p, o)| (p.to_string(), o.to_string()))
+                .unwrap_or_else(|| ("unknown".to_string(), "an embed operation".to_string()));
+            return Err(anyhow::Error::new(Contended(format!(
+                "Another embed operation is already running for this repo \
+                 ({held_op}, pid {pid}).\n\
+                 Wait for it to finish, or stop it with: travsr daemon stop"
+            ))));
+        }
+        std::fs::write(&info_path, format!("{}\t{op}", std::process::id()))
+            .context("writing embed.lock.info")?;
+        Ok(Some(EmbedOpLock { file }))
+    }
+
+    /// Like [`Self::try_acquire`], but absorbs a *brief* overlap before
+    /// giving up, instead of failing on the first collision.
+    ///
+    /// Every reindex spawn (this repo's daemon auto-triggers included) funnels
+    /// through this lock, so a repo with a running daemon has a real case a
+    /// bare `try_acquire` gets wrong: `embed switch`/`embed init` writes the
+    /// repo's embed config, and the daemon's own next tick notices it and
+    /// fires its own Phase 1 catch-up — racing the explicit command's own
+    /// foreground reindex (#376 §18.7 observed exactly this). Before L5 that
+    /// race was silent (both sides eventually finished, wastefully). L5 makes
+    /// the loser fail loudly, which is worse for this case specifically: the
+    /// user's own explicit, foreground command now errors out on what is
+    /// normally a brief overlap.
+    ///
+    /// Retrying for a short, bounded window fixes that without reintroducing
+    /// the thing L5 exists to prevent: this still gives up promptly (a few
+    /// seconds, not minutes) against a pass that is genuinely still running,
+    /// so a real conflict still surfaces the "another operation is running"
+    /// message rather than hanging.
+    ///
+    /// Only *contention* is retried. An unopenable lock file or an unwritable
+    /// `embed.lock.info` will not resolve itself by waiting, so those surface
+    /// immediately instead of after the full budget.
+    pub fn try_acquire_with_retry(repo_root: &Path, op: &str) -> anyhow::Result<Option<Self>> {
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + RETRY_BUDGET;
+        loop {
+            match Self::try_acquire(repo_root, op) {
+                Ok(lock) => return Ok(lock),
+                Err(e)
+                    if e.downcast_ref::<Contended>().is_some()
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tracing::debug!("embed lock busy, retrying: {e}");
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// "Someone else holds the lock" — the one `try_acquire` failure that is worth
+/// waiting on. Carries the full user-facing message, so `{e}` is unchanged for
+/// every caller that just prints it.
+#[derive(Debug)]
+struct Contended(String);
+
+impl std::fmt::Display for Contended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Contended {}
+
+impl Drop for EmbedOpLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 /// OS PID of the in-flight reindex sidecar, or 0 when none is running (L8).
 /// Set immediately after spawn; cleared (RAII) on any exit path of
 /// `run_parallel_reindex`. Read by `terminate_inflight_reindex()` at daemon
@@ -914,6 +1063,19 @@ fn run_parallel_reindex(
     // WS2: resolve capacity / max_workers / priority from CLI overrides + the
     // layered config (per-repo + global + env). Governance changes speed only.
     let repo_root = db_path.parent().and_then(|p| p.parent());
+
+    // L5: cross-process lock, held for this function's whole lifetime (spawn
+    // through wait). This is the single point every caller funnels through —
+    // the three daemon auto-spawn sites and the CLI's blocking path alike —
+    // so one acquisition here covers all of them. `REINDEX_IN_FLIGHT` above
+    // already serializes the daemon's own three spawn sites within this
+    // process; this additionally covers a concurrent CLI `embed reindex` in a
+    // different process, and (via `EmbedOpLock::try_acquire`) `embed gc`.
+    let _op_lock = match repo_root {
+        Some(root) => EmbedOpLock::try_acquire_with_retry(root, "reindex")?,
+        None => None,
+    };
+
     let gov = governance::resolve_embed(repo_root, overrides);
     let n = derive_num_workers(model_ram_mb, gov.max_workers.value, gov.capacity_fraction());
     let priority = gov.priority.value;
@@ -1273,12 +1435,23 @@ pub fn run_parallel_reindex_blocking_quiet(db_path: &Path) -> anyhow::Result<()>
 
 /// Resolve the active backend's binary path, embed.db path, and model_id.
 ///
-/// Reads the PER-REPO config from `<repo>/.travsr/embed.toml` (derived from
-/// `db_path`). Returns `None` when the repo has not been configured with
-/// `travsr embed init` — callers must not auto-embed unconfigured repos.
+/// Reads the PER-REPO config from `<repo>/.travsr/embed.toml` first (derived
+/// from `db_path`), falling back to the machine-global config when the repo
+/// has none. The repo layer is what an explicit `embed switch`/`embed init`
+/// inside a repo writes (#481); the global fallback matters when a backend
+/// was installed before the repo was ever indexed — `embed init` cannot write
+/// a repo config for a `graph.db` that doesn't exist yet (`cmd_init`), so
+/// without this fallback the very next `embed reindex` had nothing to resolve
+/// and failed outright even though a perfectly good active backend exists.
+///
+/// This is safe for the daemon's *automatic* background reindex: that path
+/// has its own, separate opt-in gate on `repo_backend_id` alone
+/// (`maybe_spawn_embed`, travsr-daemon) specifically so a repo the user never
+/// ran `embed init` inside is never auto-embedded. This fallback only widens
+/// what an *explicit* `travsr embed reindex`/`embed init` can resolve.
 fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
     let repo_root = db_path.parent().and_then(|p| p.parent())?;
-    let backend_id = repo_backend_id(repo_root)?;
+    let backend_id = repo_backend_id(repo_root).or_else(active_backend_id)?;
     let backend = lookup(&backend_id)?;
     let home = dirs::home_dir()?;
     let bin_path = home.join(".travsr").join("bin").join(&backend.binary_name);
@@ -1372,6 +1545,108 @@ pub fn write_repo_backend_id(repo_root: &Path, backend_id: &str) -> anyhow::Resu
     let content = format!("active = \"{backend_id}\"\n");
     std::fs::write(&path, content)
         .with_context(|| format!("writing repo embed config to {}", path.display()))
+}
+
+/// `(model_id, row_count, vector_bytes)`.
+pub type ModelUsage = (String, u64, u64);
+
+/// Row and vector-byte counts per model in a repo's `embed.db`, descending by
+/// row count. Returns an empty vec when the file does not exist yet (no
+/// reindex has run).
+///
+/// Shared by `embed switch` (the inactive-vector hint), `embed status` (the
+/// reclaimable-space line) and `embed gc` (the sweep itself), so all three
+/// report the same numbers for the same database.
+pub fn embeddings_by_model(embed_db_path: &Path) -> anyhow::Result<Vec<ModelUsage>> {
+    use anyhow::Context as _;
+    if !embed_db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        embed_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", embed_db_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT model_id, COUNT(*), COALESCE(SUM(LENGTH(embedding)), 0) \
+         FROM node_embeddings GROUP BY model_id ORDER BY COUNT(*) DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete every embedding row whose `model_id` is not in `keep_ids`, then
+/// `VACUUM` to actually shrink the file on disk. Returns the per-model
+/// row/byte counts that were reclaimed (measured before the delete) and
+/// whether `VACUUM` ran.
+///
+/// `VACUUM` needs free disk space roughly equal to the database's size. If
+/// there isn't enough, the delete still lands — rows are gone, which is the
+/// correctness-critical part — but the file stays its prior size on disk.
+/// That is reported via the returned `Option<String>` — `None` for "shrank",
+/// `Some(reason)` for "rows gone, file not shrunk" — not treated as a failure:
+/// the delete already succeeded by the time `VACUUM` would run, and erroring
+/// out after a successful delete would be the worst outcome (L2's own design
+/// note). The reason is carried rather than inferred because disk space is not
+/// the only cause: a concurrent reader (daemon, MCP server) denies `VACUUM` its
+/// exclusive lock just as easily.
+///
+/// Policy — which models to keep — is the caller's job (`embed gc` resolves
+/// it from the repo's active model plus any `--keep`). This function only
+/// executes a keep-set it is handed, and refuses an empty one: an empty
+/// keep-set would delete every vector in the repo, and that is a caller bug,
+/// not a valid request.
+pub fn gc_embeddings(
+    embed_db_path: &Path,
+    keep_ids: &[String],
+) -> anyhow::Result<(Vec<ModelUsage>, Option<String>)> {
+    use anyhow::Context as _;
+    anyhow::ensure!(
+        !keep_ids.is_empty(),
+        "refusing to gc with an empty keep-set (would delete every vector in the repo)"
+    );
+
+    let reclaimed: Vec<ModelUsage> = embeddings_by_model(embed_db_path)?
+        .into_iter()
+        .filter(|(m, _, _)| !keep_ids.iter().any(|k| k == m))
+        .collect();
+    if reclaimed.is_empty() {
+        return Ok((reclaimed, None));
+    }
+
+    let conn = rusqlite::Connection::open(embed_db_path)
+        .with_context(|| format!("opening {}", embed_db_path.display()))?;
+    let placeholders = keep_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("DELETE FROM node_embeddings WHERE model_id NOT IN ({placeholders})");
+    let params: Vec<&dyn rusqlite::ToSql> =
+        keep_ids.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+    conn.execute(&sql, params.as_slice())
+        .context("deleting inactive-model embeddings")?;
+
+    // VACUUM rewrites the whole file, so it needs room for a second copy. It
+    // also needs an exclusive lock, which a daemon or MCP server holding a read
+    // on embed.db will deny — this lock excludes reindex/gc, not readers. Both
+    // are routine, so report *which* one happened rather than collapsing every
+    // cause into "not enough disk space".
+    let db_size = std::fs::metadata(embed_db_path).map(|m| m.len()).ok();
+    let free_space = fs2::available_space(embed_db_path).ok();
+    let vacuum_skipped: Option<String> = match (free_space, db_size) {
+        (Some(free), Some(size)) if free <= size.saturating_mul(2) => Some(format!(
+            "not enough free disk space (VACUUM needs room for a second copy: \
+             embed.db is {size} bytes, {free} bytes free)"
+        )),
+        _ => conn.execute_batch("VACUUM").err().map(|e| e.to_string()),
+    };
+
+    Ok((reclaimed, vacuum_skipped))
 }
 
 /// Read the active backend id from `~/.travsr/embed.toml`.
@@ -1686,5 +1961,381 @@ mod tests {
         assert_eq!(derive_num_workers_inner(4, 64_000, 200, None, 1.0), 4);
         // Capacity applies after the RAM guard: derived = min(8, ram=6) = 6 → ×0.5 = 3.
         assert_eq!(derive_num_workers_inner(8, 2_000, 1_400, None, 0.5), 3);
+    }
+
+    /// Serializes tests that override the process-global `HOME` env var
+    /// (`dirs::home_dir()` reads it fresh on every call, so parallel tests
+    /// mutating it race on the same override).
+    static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reproduces the exact sequence that broke `docs-lane-nightly.yml`:
+    /// `embed init` runs before the repo has ever been indexed, so `cmd_init`
+    /// (embed.rs) cannot write a repo config for a `graph.db` that doesn't
+    /// exist yet — only the machine-global config gets written. The repo is
+    /// then indexed, and `embed reindex` must still resolve the backend from
+    /// the global config rather than failing "No embedding backend active."
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see crates/travsr-cli/tests/embed_switch.rs's module doc comment"
+    )]
+    fn resolve_backend_falls_back_to_global_when_repo_unconfigured() {
+        let _guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let backend = &backends()[0];
+        let bin_dir = home.path().join(".travsr").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join(&backend.binary_name), b"").unwrap();
+        let model_dir = home.path().join(".travsr").join("models").join(&backend.id);
+        std::fs::create_dir_all(&model_dir).unwrap();
+        for f in &backend.model_files {
+            std::fs::write(model_dir.join(&f.name), b"").unwrap();
+        }
+        // Global config only — no repo config anywhere.
+        std::fs::write(
+            home.path().join(".travsr").join("embed.toml"),
+            format!("active = \"{}\"\n", backend.id),
+        )
+        .unwrap();
+
+        let graph_db = repo.path().join(".travsr").join("graph.db");
+        std::fs::create_dir_all(graph_db.parent().unwrap()).unwrap();
+        std::fs::write(&graph_db, b"").unwrap();
+
+        let resolved = resolve_backend(&graph_db);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let (_, _, model_id) = resolved.expect(
+            "resolve_backend must fall back to the machine-global config \
+             when the repo has no config of its own",
+        );
+        assert_eq!(model_id, backend.id);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see crates/travsr-cli/tests/embed_switch.rs's module doc comment"
+    )]
+    fn resolve_backend_prefers_repo_config_over_global() {
+        let _guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let all = backends();
+        let (repo_backend, global_backend) = (&all[0], &all[1]);
+        for b in [repo_backend, global_backend] {
+            let bin_dir = home.path().join(".travsr").join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            std::fs::write(bin_dir.join(&b.binary_name), b"").unwrap();
+            let model_dir = home.path().join(".travsr").join("models").join(&b.id);
+            std::fs::create_dir_all(&model_dir).unwrap();
+            for f in &b.model_files {
+                std::fs::write(model_dir.join(&f.name), b"").unwrap();
+            }
+        }
+        std::fs::write(
+            home.path().join(".travsr").join("embed.toml"),
+            format!("active = \"{}\"\n", global_backend.id),
+        )
+        .unwrap();
+
+        let graph_db = repo.path().join(".travsr").join("graph.db");
+        std::fs::create_dir_all(graph_db.parent().unwrap()).unwrap();
+        std::fs::write(&graph_db, b"").unwrap();
+        write_repo_backend_id(repo.path(), &repo_backend.id).unwrap();
+
+        let resolved = resolve_backend(&graph_db);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let (_, _, model_id) = resolved.expect("resolve_backend must resolve");
+        assert_eq!(
+            model_id, repo_backend.id,
+            "the repo's own config must win over the machine-global default"
+        );
+    }
+
+    // ── L5: cross-process reindex/gc lock ─────────────────────────────────────
+
+    #[test]
+    fn two_processes_cannot_both_hold_the_embed_lock() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".travsr")).unwrap();
+
+        // Simulate another process holding the lock: a second, independent
+        // open() + flock on the same path. `flock` does not treat two opens
+        // by the same process as compatible, so this is a faithful stand-in
+        // for a real second process (the existing `daemon_lock_held` test
+        // uses the same technique).
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(repo.path().join(".travsr").join("embed.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        std::fs::write(
+            repo.path().join(".travsr").join("embed.lock.info"),
+            b"41822\treindex",
+        )
+        .unwrap();
+
+        let err = EmbedOpLock::try_acquire(repo.path(), "gc")
+            .expect_err("must not acquire while another holder has the lock");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("41822") && msg.contains("reindex"),
+            "error must name the holder's recorded pid and operation, got: {msg}"
+        );
+
+        fs2::FileExt::unlock(&held).unwrap();
+        drop(held);
+        let free = EmbedOpLock::try_acquire(repo.path(), "gc").unwrap();
+        assert!(
+            free.is_some(),
+            "must acquire once the other holder releases"
+        );
+    }
+
+    /// `Ok(None)` means "not an indexed repo", and `run_parallel_reindex` reads
+    /// it as "no lock needed, carry on". So it must be reachable *only* when
+    /// `.travsr` is genuinely absent — an unopenable lock file on a real repo
+    /// has to be an error, or the reindex runs completely unserialized and L5's
+    /// whole guarantee evaporates silently.
+    #[test]
+    fn an_unopenable_lock_on_an_indexed_repo_is_an_error_not_a_skip() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        // A directory where the lock file belongs: open(write) fails with a
+        // kind that is not NotFound, on every platform.
+        std::fs::create_dir(travsr_dir.join("embed.lock")).unwrap();
+
+        let err = EmbedOpLock::try_acquire(repo.path(), "reindex")
+            .expect_err("an unopenable lock on an indexed repo must not be reported as 'no repo'");
+        assert!(
+            err.to_string()
+                .contains("refusing to run an embed operation"),
+            "the error must say the operation was refused, got: {err}"
+        );
+
+        // The contrast case: no `.travsr` at all really is "not indexed yet".
+        let bare = tempfile::tempdir().unwrap();
+        assert!(
+            EmbedOpLock::try_acquire(bare.path(), "reindex")
+                .unwrap()
+                .is_none(),
+            "a repo with no .travsr directory must still yield Ok(None)"
+        );
+    }
+
+    /// Only contention is worth waiting on. A lock file that cannot be opened
+    /// will not become openable, so `try_acquire_with_retry` must surface it
+    /// immediately rather than burning its full 10s budget first.
+    #[test]
+    fn retry_does_not_wait_out_its_budget_on_a_non_contention_error() {
+        let repo = tempfile::tempdir().unwrap();
+        let travsr_dir = repo.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        std::fs::create_dir(travsr_dir.join("embed.lock")).unwrap();
+
+        let started = std::time::Instant::now();
+        EmbedOpLock::try_acquire_with_retry(repo.path(), "reindex")
+            .expect_err("an unopenable lock must not be retried into success");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must fail fast, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Child-process helper for `lock_is_released_when_the_holder_is_killed`.
+    /// A no-op in every normal test run; when re-exec'd as a subprocess with
+    /// `EMBED_LOCK_HOLD_REPO` set, it holds the lock and blocks so the parent
+    /// can SIGKILL it — the only way to exercise "the OS releases `flock` when
+    /// its holder dies", which a same-process guard `Drop` can never prove.
+    #[test]
+    fn embed_lock_hold_child_helper() {
+        let Ok(repo) = std::env::var("EMBED_LOCK_HOLD_REPO") else {
+            return;
+        };
+        let repo = std::path::Path::new(&repo);
+        // The parent polls readiness by attempting (and instantly releasing)
+        // its own transient acquire, so a single collision with that probe is
+        // expected, not fatal — retry briefly rather than failing on the
+        // first miss.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let _lock = loop {
+            if let Ok(Some(lock)) = EmbedOpLock::try_acquire(repo, "reindex") {
+                break lock;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child must acquire the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn lock_is_released_when_the_holder_is_killed() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".travsr")).unwrap();
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "embed_catalog::tests::embed_lock_hold_child_helper",
+                "--nocapture",
+            ])
+            .env("EMBED_LOCK_HOLD_REPO", repo.path())
+            .spawn()
+            .expect("spawn child holder");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if EmbedOpLock::try_acquire(repo.path(), "probe").is_err() {
+                break; // child now holds it
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("child never acquired the lock");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // Hard-kill, not a graceful exit — this is the case a hand-rolled PID
+        // file would get wrong (L5's stated reason for using `flock`).
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reacquired = loop {
+            if matches!(
+                EmbedOpLock::try_acquire(repo.path(), "reindex"),
+                Ok(Some(_))
+            ) {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            reacquired,
+            "lock must be re-acquirable once its holder is killed"
+        );
+    }
+
+    // ── L2: embed gc ────────────────────────────────────────────────────────
+
+    /// Builds a temp `embed.db` with `node_embeddings` rows for each
+    /// `(model_id, row_count)` pair, using a fixed byte-length embedding blob
+    /// per row so byte-count assertions are exact and readable.
+    fn fake_embed_db(rows: &[(&str, u64)]) -> tempfile::TempPath {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        let blob = vec![0u8; 8];
+        let mut node_id = 0i64;
+        for (model_id, count) in rows {
+            for _ in 0..*count {
+                node_id += 1;
+                conn.execute(
+                    "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![node_id, model_id, blob],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+        file.into_temp_path()
+    }
+
+    fn model_counts(path: &Path) -> std::collections::BTreeMap<String, u64> {
+        embeddings_by_model(path)
+            .unwrap()
+            .into_iter()
+            .map(|(m, rows, _)| (m, rows))
+            .collect()
+    }
+
+    #[test]
+    fn gc_embeddings_refuses_empty_keep_set() {
+        let db = fake_embed_db(&[("arctic-embed-m-v1.5", 5)]);
+        let err = gc_embeddings(&db, &[]).expect_err("empty keep-set must be refused");
+        assert!(err.to_string().contains("empty keep-set"));
+        // Nothing was touched.
+        assert_eq!(model_counts(&db).get("arctic-embed-m-v1.5"), Some(&5));
+    }
+
+    #[test]
+    fn gc_embeddings_never_deletes_the_active_model() {
+        let db = fake_embed_db(&[("arctic-embed-m-v1.5", 5), ("bge-large-en-v1.5", 3)]);
+        let (reclaimed, _) = gc_embeddings(&db, &["arctic-embed-m-v1.5".to_string()]).unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].0, "bge-large-en-v1.5");
+        let after = model_counts(&db);
+        assert_eq!(after.get("arctic-embed-m-v1.5"), Some(&5));
+        assert_eq!(after.get("bge-large-en-v1.5"), None);
+    }
+
+    #[test]
+    fn gc_embeddings_with_keep_retains_the_named_model() {
+        let db = fake_embed_db(&[
+            ("arctic-embed-m-v1.5", 5),
+            ("bge-large-en-v1.5", 3),
+            ("bge-small-en-v1.5", 2),
+        ]);
+        let keep = vec![
+            "arctic-embed-m-v1.5".to_string(),
+            "bge-large-en-v1.5".to_string(),
+        ];
+        let (reclaimed, _) = gc_embeddings(&db, &keep).unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].0, "bge-small-en-v1.5");
+        let after = model_counts(&db);
+        assert_eq!(after.get("arctic-embed-m-v1.5"), Some(&5));
+        assert_eq!(after.get("bge-large-en-v1.5"), Some(&3));
+        assert_eq!(after.get("bge-small-en-v1.5"), None);
+    }
+
+    #[test]
+    fn gc_embeddings_is_idempotent() {
+        let db = fake_embed_db(&[("arctic-embed-m-v1.5", 5), ("bge-large-en-v1.5", 3)]);
+        let keep = vec!["arctic-embed-m-v1.5".to_string()];
+        let (first, _) = gc_embeddings(&db, &keep).unwrap();
+        assert_eq!(first.len(), 1);
+        let (second, _) = gc_embeddings(&db, &keep).unwrap();
+        assert!(
+            second.is_empty(),
+            "second run must find nothing left to reclaim, got {second:?}"
+        );
+        assert_eq!(model_counts(&db).get("arctic-embed-m-v1.5"), Some(&5));
     }
 }

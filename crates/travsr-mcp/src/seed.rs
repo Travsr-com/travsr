@@ -679,7 +679,7 @@ pub(crate) fn docs_max_results(store: &SqliteStore) -> usize {
 /// environment keeps its current behaviour byte-for-byte.
 pub(crate) fn docs_enabled(store: &SqliteStore) -> bool {
     travsr_config::effective_bool("docs.enabled", config_repo_root(store).as_deref())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// The single lock serializing every test that mutates the process-global
@@ -802,6 +802,29 @@ pub(crate) fn doc_rerank_overfetch() -> usize {
 /// non-default reranker must re-measure the negative arm before relying on it.
 pub(crate) fn doc_rerank_floor() -> f32 {
     floor_env("TRAVSR_DOC_RERANK_FLOOR").unwrap_or(DOC_RERANK_FLOOR)
+}
+
+/// #520: ambiguity threshold for *selective* doc-lane reranking (bench
+/// experiment, not a shipped default). `None` (the default — no env set)
+/// means "always rerank", identical to shipped behavior today.
+///
+/// When `Some(t)`, `tools::rerank_doc_candidates` skips the cross-encoder
+/// pass entirely whenever the top raw-cosine candidate already clears `t` —
+/// the reasoning being that a confidently-separated top candidate doesn't
+/// need the reranker's judgment, so the (measured 1.3-2.6x, #520) latency
+/// cost of the second cross-encoder pass can be skipped for the "easy" case.
+///
+/// This is env-only on purpose: #520's own gate is that a threshold must
+/// clear a strict non-regression bar on hit@1/hit@3 with zero per-query
+/// hit-to-miss flips on *both* bench repos before it ships as a default —
+/// see `bench/sweep-selective-rerank.mjs`. An earlier naive attempt at this
+/// exact lever measurably lost accuracy (travsr 1.0/1.0 -> 0.9/0.9), so this
+/// stays opt-in until a threshold is proven, not assumed, safe.
+pub(crate) fn doc_rerank_ambiguity_threshold() -> Option<f32> {
+    std::env::var("TRAVSR_DOC_RERANK_AMBIGUITY_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|&x| (0.0..=1.0).contains(&x))
 }
 
 /// Compiled default for [`doc_rerank_floor`]. See that function for the
@@ -5112,15 +5135,20 @@ mod tests {
         assert_eq!(docs_max_results(&env.store), 3);
     }
 
+    /// #519: both bench repos cleared #376 §7's bar (all five docs-lane gates
+    /// green, travsr and kubernetes, against merged code), earning the
+    /// default flip. Was `docs_enabled_defaults_to_false` — renamed rather
+    /// than edited in place, so a reader never trusts a name the assertions
+    /// no longer match.
     #[test]
-    fn docs_enabled_defaults_to_false() {
+    fn docs_enabled_defaults_to_true() {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
-        assert!(!docs_enabled(&env.store));
-        std::env::set_var("TRAVSR_DOCS_ENABLED", "1");
         assert!(docs_enabled(&env.store));
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "0");
+        assert!(!docs_enabled(&env.store));
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
     }
 
@@ -5144,11 +5172,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
 
-        assert!(!docs_enabled(&env.store), "default off");
-        env.set_repo("docs.enabled", "true");
+        // #519: default flipped on once both bench repos cleared #376 §7's
+        // bar. The property this test actually pins - repo config controls
+        // the switch with no env var involved - is unchanged; only which
+        // direction the flip demonstrates is.
+        assert!(docs_enabled(&env.store), "default on");
+        env.set_repo("docs.enabled", "false");
         assert!(
-            docs_enabled(&env.store),
-            "repo config must turn the lane on"
+            !docs_enabled(&env.store),
+            "repo config must turn the lane off"
         );
 
         env.set_repo("docs.max_results", "7");
@@ -5192,19 +5224,36 @@ mod tests {
             "[docs]\nenabled = \"ture\"\nmax_results = \"lots\"\n",
         )
         .expect("write config");
-        assert!(!docs_enabled(&env.store));
+        // #519: the built-in default is now `true`.
+        assert!(docs_enabled(&env.store));
         assert_eq!(docs_max_results(&env.store), 3);
     }
 
-    /// docs.enabled=false (the Phase 2 ship default) must return no doc
-    /// results regardless of what the hook would otherwise say — the feature
-    /// flag, not hook availability, gates the lane.
+    /// #519: docs.enabled=true is now the ship default, so a real hook must
+    /// produce real candidates with no config at all. Was
+    /// `doc_lane_candidates_disabled_by_default_returns_empty` - renamed
+    /// rather than edited in place; see `doc_lane_candidates_explicitly_disabled_returns_empty`
+    /// for the flag-gates-the-lane property that test used to cover.
     #[test]
-    fn doc_lane_candidates_disabled_by_default_returns_empty() {
+    fn doc_lane_candidates_enabled_by_default_returns_candidates() {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = DocsConfigEnv::new();
+        let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
+        assert!(!doc_lane_candidates(&env.store, "query", Some(hook)).is_empty());
+    }
+
+    /// docs.enabled=false must return no doc results regardless of what the
+    /// hook would otherwise say — the feature flag, not hook availability,
+    /// gates the lane. Explicit now that disabled is no longer the default.
+    #[test]
+    fn doc_lane_candidates_explicitly_disabled_returns_empty() {
+        let _guard = DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = DocsConfigEnv::new();
+        env.set_repo("docs.enabled", "false");
         let hook: DocKnnFn<'_> = &|_q, _k| vec![(NodeId(1), 0.9)];
         assert!(doc_lane_candidates(&env.store, "query", Some(hook)).is_empty());
     }

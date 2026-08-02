@@ -156,9 +156,32 @@ pub enum EmbedCommand {
     /// Show the currently active embedding model and binary status.
     Status,
     /// Switch the active embedding backend (binary must already be installed).
+    ///
+    /// Inside a repo, writes this repo's config (<repo>/.travsr/embed.toml) —
+    /// the only layer that affects an indexed repo's retrieval. Use --global
+    /// to set the machine-wide default instead.
     Switch {
         /// Backend ID to make active (run `travsr embed list` to see options).
         backend: String,
+        /// Write the machine-global default instead of this repo's config.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Reclaim disk space held by inactive embedding models: their vectors in
+    /// embed.db and their HNSW index files. Dry-run by default.
+    ///
+    /// A model switch (`embed switch`) leaves the previous model's vectors in
+    /// place rather than deleting them automatically — re-embedding costs
+    /// hours, and an eager sweep would silently destroy that work the moment
+    /// a user tries a different model. Run this explicitly once you no longer
+    /// need the old model's coverage.
+    Gc {
+        /// Actually delete. Without this, only reports what would be reclaimed.
+        #[arg(long)]
+        apply: bool,
+        /// Retain this model's vectors even though it is inactive. Repeatable.
+        #[arg(long = "keep", value_name = "MODEL_ID")]
+        keep: Vec<String>,
     },
     /// Re-measure the model-relative semantic floors on the existing index.
     ///
@@ -220,7 +243,8 @@ pub fn run(cmd: EmbedCommand) -> Result<()> {
             cmd_reconfigure(db, overrides, global)
         }
         EmbedCommand::Status => cmd_status(),
-        EmbedCommand::Switch { backend } => cmd_switch(&backend),
+        EmbedCommand::Switch { backend, global } => cmd_switch(&backend, global),
+        EmbedCommand::Gc { apply, keep } => cmd_gc(apply, keep),
         EmbedCommand::Calibrate { db } => cmd_calibrate(db),
     }
 }
@@ -260,14 +284,22 @@ fn cmd_calibrate(db_override: Option<PathBuf>) -> Result<()> {
 // ── list ──────────────────────────────────────────────────────────────────────
 
 fn cmd_list(json: bool) -> Result<()> {
-    let active = load_config().and_then(|c| c.active);
-    let bin_dir = embed_bin_dir()?;
+    // Same resolution `status` uses (repo config wins over the machine
+    // default) so the two surfaces can never name different active models
+    // (#482/#483).
+    let cwd = std::env::current_dir().ok();
+    let repo_root = cwd
+        .as_ref()
+        .and_then(|c| crate::repo::find_git_root(c).ok());
+    let repo_active_id = repo_root.and_then(|r| travsr_plugin_host::repo_backend_id(&r));
+    let global_id = load_config().and_then(|c| c.active);
+    let active = repo_active_id.or(global_id);
 
     if json {
         let entries: Vec<String> = embed_backends()
             .iter()
             .map(|b| {
-                let installed = bin_dir.join(&b.binary_name).exists();
+                let installed = model_files_installed(b);
                 let is_active = active.as_deref() == Some(b.id.as_str());
                 format!(
                     r#"{{"id":"{}","description":"{}","dim":{},"params_m":{},"mteb":{:.1},"ram_mb":{},"download_mb":{},"installed":{},"active":{}}}"#,
@@ -293,7 +325,7 @@ fn cmd_list(json: bool) -> Result<()> {
     );
     println!("{}", "-".repeat(92));
     for b in embed_backends() {
-        let installed = bin_dir.join(&b.binary_name).exists();
+        let installed = model_files_installed(b);
         let is_active = active.as_deref() == Some(b.id.as_str());
         let status = if installed && is_active {
             format!("\u{2713} active  {}", b.description)
@@ -676,19 +708,11 @@ fn reindex_after_init(
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     println!();
 
-    // Same cross-process guard cmd_reindex uses: serialize writers to embed.db.
-    let embed_lock_path = db_path
-        .parent()
-        .map(|p| p.join("embed.lock"))
-        .unwrap_or_else(|| PathBuf::from("embed.lock"));
-    let embed_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&embed_lock_path)
-        .context("opening embed.lock")?;
-    fs2::FileExt::lock_exclusive(&embed_lock)
-        .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
+    // L5: cross-process protection now lives one layer down, inside
+    // `run_parallel_reindex` (embed_catalog.rs) — see the comment on the
+    // equivalent removal in `run_reindex_locked`. Locking `embed.lock` here
+    // too would self-block: `run_reindex_with_progress` below calls into that
+    // same lock further down this same call stack.
 
     if let Err(e) = regenerate_embed_texts_if_stale(db_path) {
         tracing::warn!("embed_text regen check failed (non-fatal): {e}");
@@ -859,21 +883,14 @@ fn run_reindex_locked(
         }
     }
 
-    // M6: prevent concurrent `travsr embed reindex` runs from writing to the same
-    // embed.db simultaneously (two terminals, CI + local). Flock on embed.lock in
-    // the same directory as graph.db. Blocks until the other run finishes.
-    let embed_lock_path = db_path
-        .parent()
-        .map(|p| p.join("embed.lock"))
-        .unwrap_or_else(|| std::path::PathBuf::from("embed.lock"));
-    let embed_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&embed_lock_path)
-        .context("opening embed.lock")?;
-    fs2::FileExt::lock_exclusive(&embed_lock)
-        .context("acquiring embed.lock — another `travsr embed reindex` may be running")?;
+    // M6/L5: cross-process protection against a concurrent `travsr embed
+    // reindex` (or `embed gc`) now lives one layer down, inside
+    // `run_parallel_reindex` (embed_catalog.rs) — the single function every
+    // caller (this CLI path, `embed init`'s post-install reindex, and the
+    // daemon's three automatic spawn sites) funnels through. Locking
+    // `embed.lock` here too would self-block: this function calls into that
+    // same lock further down the same call stack, and `flock` does not treat
+    // a second `open()` by the same process as compatible with the first.
 
     let workers = travsr_plugin_host::derive_num_workers_for_cli(db_path, overrides);
     let gov = travsr_plugin_host::resolve_governance_for_db(db_path, overrides);
@@ -1056,10 +1073,15 @@ fn run_reindex_with_progress(
     phase1: Option<u32>,
     overrides: &travsr_plugin_host::EmbedOverrides,
 ) -> Result<()> {
+    // Same fallback as `resolve_backend` (embed_catalog.rs): a repo indexed
+    // after a global-only `embed init` has no repo config yet. Falling back
+    // here only affects the progress bar's label/total, not what actually
+    // gets embedded.
     let model_id = db_path
         .parent()
         .and_then(|p| p.parent())
-        .and_then(travsr_plugin_host::repo_backend_id);
+        .and_then(travsr_plugin_host::repo_backend_id)
+        .or_else(travsr_plugin_host::active_backend_id);
     let total = model_id
         .as_deref()
         .and_then(|m| query_embed_stats(db_path, m).ok())
@@ -1325,6 +1347,35 @@ fn file_size_mb(path: &std::path::Path) -> Option<f64> {
         .map(|m| m.len() as f64 / 1_048_576.0)
 }
 
+/// Whether a backend's model weights + descriptor are on disk, independent of
+/// the sidecar binary (which is shared across every backend and so cannot
+/// answer "is *this* model installed" — #482).
+fn model_files_installed(b: &EmbedBackend) -> bool {
+    embed_model_dir(&b.id)
+        .ok()
+        .map(|d| {
+            b.model_files.iter().all(|f| d.join(&f.name).exists()) && d.join("model.toml").exists()
+        })
+        .unwrap_or(false)
+}
+
+/// The HNSW index files (code + docs space) that exist on disk for a set of
+/// models, keyed off `db_path`'s directory the same way `cmd_status` locates
+/// the active model's own index (`{model}.hnsw.usearch`, `embed.rs:~1533`).
+fn reclaimable_hnsw_paths(db_path: &Path, models: &[(String, u64, u64)]) -> Vec<PathBuf> {
+    let dir = db_path.parent().unwrap_or(db_path);
+    models
+        .iter()
+        .flat_map(|(id, _, _)| {
+            [
+                dir.join(format!("{id}.hnsw.usearch")),
+                dir.join(format!("{id}-docs.hnsw.usearch")),
+            ]
+        })
+        .filter(|p| p.exists())
+        .collect()
+}
+
 fn cmd_status() -> Result<()> {
     let bin_dir = embed_bin_dir()?;
 
@@ -1355,17 +1406,10 @@ fn cmd_status() -> Result<()> {
             }
             Some(b) => {
                 let installed = bin_dir.join(&b.binary_name).exists();
-                let model_dir = embed_model_dir(&b.id).ok();
                 // #391: the sidecar requires a `model.toml` descriptor and exits code 1
                 // without it, so a present-but-descriptor-less install is NOT ready.
                 // Check it alongside the model weights to avoid the old false positive.
-                let models_ok = model_dir
-                    .as_ref()
-                    .map(|d| {
-                        b.model_files.iter().all(|f| d.join(&f.name).exists())
-                            && d.join("model.toml").exists()
-                    })
-                    .unwrap_or(false);
+                let models_ok = model_files_installed(b);
 
                 let ok = installed && models_ok;
                 println!("Backend        : {} (installed)", b.id);
@@ -1398,7 +1442,19 @@ fn cmd_status() -> Result<()> {
 
     // ── per-repo activation state ─────────────────────────────────────────────
     match &repo_active_id {
-        Some(id) => println!("Repo model     : {id} (configured for this repo)"),
+        Some(id) => {
+            println!("Repo model     : {id} (configured for this repo)");
+            // #482/#483: `status` and `list` used to name different models with
+            // no explanation. Surface the divergence rather than silently
+            // picking one — the repo layer always wins for retrieval (#481).
+            if let Some(g) = global_id.as_deref() {
+                if g != id.as_str() {
+                    println!(
+                        "                 (machine default is '{g}' — this repo's setting wins)"
+                    );
+                }
+            }
+        }
         None => {
             println!("Repo model     : not configured — run `travsr embed init` to activate for this repo");
         }
@@ -1425,6 +1481,31 @@ fn cmd_status() -> Result<()> {
         "Repo           : {}",
         db_path.parent().unwrap_or(&db_path).display()
     );
+
+    // L2: what `embed gc` would reclaim, shown only when non-zero so the
+    // common case (nothing to reclaim) is unchanged. Uses the exact same
+    // helper `embed gc` reads, so the two surfaces can never disagree.
+    if let Some(id) = repo_active_id.as_deref() {
+        let embed_db_path = db_path.with_file_name("embed.db");
+        if let Ok(rows) = travsr_plugin_host::embeddings_by_model(&embed_db_path) {
+            let reclaimable: Vec<_> = rows.into_iter().filter(|(m, _, _)| m != id).collect();
+            if !reclaimable.is_empty() {
+                let vec_count: u64 = reclaimable.iter().map(|(_, r, _)| r).sum();
+                let vec_bytes: u64 = reclaimable.iter().map(|(_, _, b)| b).sum();
+                let hnsw_paths = reclaimable_hnsw_paths(&db_path, &reclaimable);
+                let hnsw_bytes_mb: f64 = hnsw_paths.iter().filter_map(|p| file_size_mb(p)).sum();
+                let total_mb = vec_bytes as f64 / 1_048_576.0 + hnsw_bytes_mb;
+                println!(
+                    "Reclaimable    : {} vectors + {} index file{} from {} inactive model{} ({total_mb:.1} MB) \u{2014} travsr embed gc",
+                    fmt_count(vec_count),
+                    hnsw_paths.len(),
+                    if hnsw_paths.len() == 1 { "" } else { "s" },
+                    reclaimable.len(),
+                    if reclaimable.len() == 1 { "" } else { "s" },
+                );
+            }
+        }
+    }
 
     // Phase B state: compare phase_b_commit vs last_commit.
     {
@@ -1556,24 +1637,208 @@ fn cmd_status() -> Result<()> {
 
 // ── switch ────────────────────────────────────────────────────────────────────
 
-fn cmd_switch(backend_id: &str) -> Result<()> {
+fn cmd_switch(backend_id: &str, global: bool) -> Result<()> {
     let backend = lookup_embed_backend(backend_id).ok_or_else(|| {
         anyhow::anyhow!("Unknown backend '{backend_id}'. Run `travsr embed list`.")
     })?;
 
+    // #482: the sidecar binary is shared by every backend, so its presence only
+    // proves *some* model was installed once. Switching to a model whose weights
+    // are absent used to succeed here and then contradict itself — `embed list`
+    // reporting `installed=false` and `embed status` `✗ missing` for the model
+    // it had just made active. Check the model's own files, as list/status do.
     let bin_dir = embed_bin_dir()?;
-    if !bin_dir.join(&backend.binary_name).exists() {
+    if !bin_dir.join(&backend.binary_name).exists() || !model_files_installed(backend) {
         bail!(
             "Backend '{backend_id}' is not installed. Run `travsr embed init --backend {backend_id}` first."
         );
     }
 
-    let mut config = load_config().unwrap_or_default();
-    config.active = Some(backend_id.to_string());
-    save_config(&config)?;
+    // Inside an indexed repo, "switch this repo's model" is the only intent
+    // that has any effect: per-repo embedding reads <repo>/.travsr/embed.toml,
+    // not the machine config (#481). --global or "not in a repo" keeps the
+    // pre-#481 behavior of writing the machine config.
+    let repo_root = if global {
+        None
+    } else {
+        std::env::current_dir()
+            .ok()
+            .and_then(|c| crate::repo::find_git_root(&c).ok())
+            .filter(|r| r.join(".travsr/graph.db").exists())
+    };
 
-    println!("\u{2713} Switched active backend to '{}'.", backend_id);
-    println!("  Restart the daemon to apply: travsr daemon restart");
+    let Some(root) = repo_root else {
+        let mut config = load_config().unwrap_or_default();
+        config.active = Some(backend_id.to_string());
+        save_config(&config)?;
+        println!("\u{2713} Switched active backend to '{}'.", backend_id);
+        println!("  Restart the daemon to apply: travsr daemon restart");
+        return Ok(());
+    };
+
+    let previous = travsr_plugin_host::repo_backend_id(&root);
+    travsr_plugin_host::write_repo_backend_id(&root, backend_id)?;
+
+    println!("\u{2713} Switched this repo to '{}'.", backend_id);
+
+    // A model change makes every existing vector for the previous model
+    // unusable (different space, often a different dimension). Tell the user
+    // what just became inactive so `embed gc` (W3) has a real trigger.
+    if let Some(prev_id) = previous.filter(|p| p != backend_id) {
+        let embed_db = root.join(".travsr/embed.db");
+        if let Ok(rows) = travsr_plugin_host::embeddings_by_model(&embed_db) {
+            if let Some((_, count, bytes)) = rows.into_iter().find(|(m, _, _)| m == &prev_id) {
+                if count > 0 {
+                    let mb = bytes as f64 / 1_048_576.0;
+                    println!(
+                        "  {} vectors for '{prev_id}' are now inactive ({mb:.1} MB).",
+                        fmt_count(count)
+                    );
+                }
+            }
+        }
+    }
+    println!("  Re-embed:  travsr embed reindex");
+    println!("  Reclaim:   travsr embed gc          (after the re-embed succeeds)");
+    Ok(())
+}
+
+// ── gc ────────────────────────────────────────────────────────────────────────
+
+fn cmd_gc(apply: bool, keep: Vec<String>) -> Result<()> {
+    let db_path = resolve_graph_db(None)?;
+    let repo_root = db_path
+        .parent()
+        .and_then(|p| p.parent())
+        .context("resolving repo root from graph.db path")?;
+
+    // L5: refuse to run against an in-flight reindex — reclamation deletes
+    // rows a concurrent reindex may be actively writing to.
+    let _lock = travsr_plugin_host::EmbedOpLock::try_acquire(repo_root, "gc")?
+        .context("could not open .travsr/embed.lock")?;
+
+    let active = travsr_plugin_host::repo_backend_id(repo_root)
+        .or_else(travsr_plugin_host::active_backend_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No embedding backend configured for this repo. Run `travsr embed init` first."
+            )
+        })?;
+
+    // Default keeps the repo's active model; --keep adds exceptions (the A/B
+    // use case). Assert non-empty and containing the active model — a bug
+    // that emptied this set would delete every vector in the repo.
+    let mut keep_set = keep;
+    if !keep_set.iter().any(|k| k == &active) {
+        keep_set.push(active.clone());
+    }
+    anyhow::ensure!(
+        !keep_set.is_empty() && keep_set.contains(&active),
+        "internal error: keep-set must always contain the active model"
+    );
+
+    let embed_db_path = db_path.with_file_name("embed.db");
+    let all = travsr_plugin_host::embeddings_by_model(&embed_db_path)?;
+    let embedded_models = all.len();
+    let reclaimable: Vec<(String, u64, u64)> = all
+        .into_iter()
+        .filter(|(m, _, _)| !keep_set.contains(m))
+        .collect();
+
+    if reclaimable.is_empty() {
+        println!("Nothing to reclaim \u{2014} every embedded model is in the keep-set.");
+        return Ok(());
+    }
+
+    // The keep-set is resolved from *config*, but what gets deleted is decided
+    // by what is in *embed.db* — and those diverge exactly when it is most
+    // expensive. `embed switch` writes the new model to config and prints
+    // `Re-embed` and `Reclaim` two lines apart, so a user who runs the second
+    // without the first has an active model with zero vectors and a keep-set
+    // that protects nothing. The same holds for a repo with no repo config
+    // whose global active model was switched from some other directory.
+    //
+    // Refuse whenever the sweep would take every vector the repo has. `--keep`
+    // is the escape hatch: naming a model that actually has rows is an explicit
+    // statement about what to preserve, and it clears this guard.
+    anyhow::ensure!(
+        reclaimable.len() < embedded_models,
+        "Refusing to reclaim: '{active}' is this repo's active model but has no embeddings \
+         yet, so this would delete every vector in the repo ({} across {embedded_models} \
+         model{}) and leave it with none.\n\
+         Re-embed first:  travsr embed reindex\n\
+         Or name what to keep:  travsr embed gc --keep <model>",
+        fmt_count(reclaimable.iter().map(|(_, r, _)| r).sum::<u64>()),
+        if embedded_models == 1 { "" } else { "s" },
+    );
+
+    let hnsw_paths = reclaimable_hnsw_paths(&db_path, &reclaimable);
+    let vec_bytes: u64 = reclaimable.iter().map(|(_, _, b)| b).sum();
+    let vec_count: u64 = reclaimable.iter().map(|(_, r, _)| r).sum();
+    let hnsw_mb: f64 = hnsw_paths.iter().filter_map(|p| file_size_mb(p)).sum();
+
+    if !apply {
+        println!("Would reclaim:");
+        for (model, rows, bytes) in &reclaimable {
+            println!(
+                "  {model}: {} vectors ({:.1} MB)",
+                fmt_count(*rows),
+                *bytes as f64 / 1_048_576.0
+            );
+        }
+        println!(
+            "  {} HNSW index file{} ({hnsw_mb:.1} MB)",
+            hnsw_paths.len(),
+            if hnsw_paths.len() == 1 { "" } else { "s" }
+        );
+        println!(
+            "Total: {:.1} MB. Run with --apply to reclaim.",
+            vec_bytes as f64 / 1_048_576.0 + hnsw_mb
+        );
+        return Ok(());
+    }
+
+    // Files first, rows second. The HNSW files belong to inactive models, so
+    // nothing reads them and deleting them early is safe — whereas the reverse
+    // order strands them permanently if the process dies in between: the next
+    // `gc` derives its file list from `embeddings_by_model`, which by then
+    // returns nothing for the reclaimed model, so it reports "nothing to
+    // reclaim" while hundreds of MB of orphaned indexes stay on disk.
+    let mut removed_files = 0usize;
+    for path in &hnsw_paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => removed_files += 1,
+            Err(e) => tracing::warn!("could not remove {}: {e}", path.display()),
+        }
+    }
+
+    let (deleted, vacuum_skipped) = travsr_plugin_host::gc_embeddings(&embed_db_path, &keep_set)?;
+    let deleted_models: Vec<&str> = deleted.iter().map(|(m, _, _)| m.as_str()).collect();
+
+    println!(
+        "\u{2713} Reclaimed {} vectors ({:.1} MB) from {}: {}",
+        fmt_count(vec_count),
+        vec_bytes as f64 / 1_048_576.0,
+        if deleted_models.len() == 1 {
+            "model"
+        } else {
+            "models"
+        },
+        deleted_models.join(", ")
+    );
+    println!(
+        "  Removed {removed_files} of {} HNSW index file{}.",
+        hnsw_paths.len(),
+        if hnsw_paths.len() == 1 { "" } else { "s" }
+    );
+    if let Some(reason) = vacuum_skipped {
+        println!(
+            "  warning: VACUUM skipped ({reason}) \u{2014} rows were deleted but embed.db's size \
+             on disk is unchanged. Re-run `travsr embed gc --apply` later to shrink it (it is \
+             idempotent \u{2014} nothing left to delete will report zero). A running daemon or \
+             MCP server holding embed.db open is the usual cause: travsr daemon stop"
+        );
+    }
     Ok(())
 }
 

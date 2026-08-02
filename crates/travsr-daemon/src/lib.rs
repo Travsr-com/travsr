@@ -393,6 +393,14 @@ const KNOWN_SOURCE_DIRS: &[&str] = &[
     "docs",
     "examples",
     "samples",
+    // Standard source root for static-site generators (Hugo, Jekyll, Gatsby,
+    // Next.js content collections) — the entire doc corpus of a docs-only
+    // repo commonly lives here. Without this, `travsr init` on such a repo
+    // auto-excludes essentially all of it as a false-positive "large dep
+    // dir", silently (non-TTY runs only log the decision via tracing::info!,
+    // never in the command's own visible output) — found indexing
+    // kubernetes/website while measuring #376 lifecycle plan L4.
+    "content",
 ];
 
 /// Heuristic: a single directory holding ≥ 1 000 source-language files AND
@@ -969,8 +977,21 @@ pub fn init_repo_with_progress(
     // has been offline long-term.
     const TOMBSTONE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
     const TOMBSTONE_MAX_ROWS: u64 = 50_000;
-    if let Err(e) = store.prune_tombstones(TOMBSTONE_MAX_AGE_SECS, TOMBSTONE_MAX_ROWS) {
-        tracing::warn!("tombstone GC failed (non-fatal): {e}");
+    match store.prune_tombstones(TOMBSTONE_MAX_AGE_SECS, TOMBSTONE_MAX_ROWS) {
+        Ok((_total, at_risk)) if at_risk > 0 => {
+            // L3: the only signal that freshness coverage degraded — a
+            // tombstone was pruned before the embed sidecar ever consumed it,
+            // for a node that still exists and still has an embedding row.
+            tracing::warn!(
+                at_risk,
+                "pruned {at_risk} tombstone(s) for nodes that still have an \
+                 embedding — their vector may now be stale with nothing left \
+                 to invalidate it (CDC log pruning window: {}s)",
+                TOMBSTONE_MAX_AGE_SECS
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("tombstone GC failed (non-fatal): {e}"),
     }
 
     // Register in global registry so `travsr mcp --global` can find this repo.
@@ -2196,7 +2217,14 @@ fn run_background_phase_b_inner(
     // Phase 2 is intentionally NOT spawned here — the embed_tick in the daemon
     // event loop detects when Phase 1 is done and then spawns Phase 2, so the
     // two phases never write to embed.db concurrently.
-    if succeeded {
+    //
+    // The `repo_backend_id` gate is the auto-embed opt-in, and it has to be
+    // *here*: `spawn_background_reindex_phase1` only checks `resolve_backend`,
+    // which falls back to the machine-global model when a repo has none. So
+    // without this, a repo that never ran `travsr embed init` would get a full
+    // embed pass merely because some *other* repo installed a backend. That is
+    // the same gate `maybe_spawn_embed` applies to the tick-driven catch-up.
+    if succeeded && travsr_plugin_host::repo_backend_id(repo_root).is_some() {
         let db_path = repo_root.join(".travsr/graph.db");
         if travsr_plugin_host::spawn_background_reindex_phase1(&db_path) {
             tracing::info!("triggered post-phase-B embed Phase 1");
@@ -3088,6 +3116,43 @@ mod tests {
         assert!(
             ghosts.is_empty(),
             "ghost node must be purged by init_repo, found: {ghosts:?}"
+        );
+    }
+
+    /// L4 (#376 lifecycle plan): found indexing kubernetes/website, whose
+    /// entire doc corpus lives under `content/` — the standard source root
+    /// for Hugo/Jekyll/Gatsby-style static sites. Before `content` was added
+    /// to `KNOWN_SOURCE_DIRS`, a single top-level `content/` directory large
+    /// enough to dominate the repo (>=1000 files, >=15% of the total) was
+    /// flagged as a false-positive "large dep dir" and auto-excluded in
+    /// non-TTY runs with no visible warning in the command's own output —
+    /// silently discarding the repo's actual content.
+    #[test]
+    fn detect_large_dep_dir_does_not_flag_content() {
+        let repo_root = std::path::Path::new("/repo");
+        let mut files: Vec<PathBuf> = (0..1200)
+            .map(|i| repo_root.join(format!("content/en/docs/page-{i}.md")))
+            .collect();
+        files.push(repo_root.join("go.mod"));
+        assert_eq!(
+            detect_large_dep_dir(&files, repo_root),
+            None,
+            "content/ is a known source dir and must never be auto-excluded"
+        );
+    }
+
+    #[test]
+    fn detect_large_dep_dir_still_flags_an_unknown_large_dir() {
+        let repo_root = std::path::Path::new("/repo");
+        let mut files: Vec<PathBuf> = (0..1200)
+            .map(|i| repo_root.join(format!("node_modules/pkg-{i}/index.js")))
+            .collect();
+        files.push(repo_root.join("go.mod"));
+        let detected = detect_large_dep_dir(&files, repo_root);
+        assert_eq!(
+            detected.map(|(dir, ..)| dir),
+            Some("node_modules".to_string()),
+            "an unknown, dominant top-level dir must still be flagged"
         );
     }
 

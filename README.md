@@ -392,6 +392,11 @@ Language support: **TypeScript / TSX, Rust, Python, Go** (builtin, zero configur
 | BM25 | Full-text ranked retrieval | Available |
 | RBAC | Role-based access filtering on graph queries | Available |
 
+`get_context` and `ask` also search your Markdown documentation (ADRs, RFCs,
+design docs) alongside code by default, so a query can surface the
+*rationale* behind code, not just the code itself. Turn it off with
+`travsr config set docs.enabled false`.
+
 ### Edge kinds
 
 | Kind | Meaning |

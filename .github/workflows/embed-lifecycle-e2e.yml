@@ -1,0 +1,36 @@
+name: Embed lifecycle E2E
+
+# L6 (docs/plans/travsr-embed-lifecycle.md): the model-switch lifecycle,
+# end to end — install model A, switch/embed model B, confirm retrieval works
+# under B, then `embed gc --apply` and confirm A's rows and HNSW files are
+# reclaimed while B's survive. Lives in
+# crates/travsr-cli/tests/embed_lifecycle_e2e.rs, `#[ignore]`d by default.
+#
+# Downloads two real embedding backends and runs two real reindex passes, so
+# this does not run on every PR — manual dispatch or weekly cron only.
+
+on:
+  schedule:
+    - cron: '30 3 * * 0'   # 03:30 UTC Sundays, after the docs-lane nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  embed-lifecycle-e2e:
+    name: model-switch lifecycle (ignored E2E)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the model-switch lifecycle E2E test
+        run: cargo test -p travsr-cli --test embed_lifecycle_e2e -- --ignored --nocapture

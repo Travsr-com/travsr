@@ -1,0 +1,36 @@
+{
+  "_comment": "Agent-decomposed variant of queries-k8s.json for the 3-arm seeded-context experiment (RFC-021 / #462 Direction E). Each query carries `seeds`: the candidate symbol NAMES a k8s-savvy agent would produce from the QUERY TEXT ALONE (not reverse-engineered from `expect`). The harness bench/run-seeded-k8s.mjs runs three arms per query — A: get_context(query); B: get_context(seeds joined as a query string); C: get_seeded_context(seeds array) — and compares hitRank. `expect`/`category` are unchanged from queries-k8s.json so hits are scored identically.",
+  "queries": [
+    { "id": "L1", "category": "literal", "query": "syncReplicaSet", "expect": ["syncReplicaSet", "replica_set.go"], "seeds": ["syncReplicaSet"] },
+    { "id": "L2", "category": "literal", "query": "HorizontalController processNextWorkItem", "expect": ["HorizontalController", "podautoscaler/horizontal.go"], "seeds": ["HorizontalController", "processNextWorkItem"] },
+    { "id": "L3", "category": "literal", "query": "SharedInformer interface", "expect": ["SharedInformer", "shared_informer.go"], "seeds": ["SharedInformer"] },
+    { "id": "L4", "category": "literal", "query": "Scheduler ScheduleOne", "expect": ["ScheduleOne", "schedule_one.go"], "seeds": ["ScheduleOne", "Scheduler"] },
+    { "id": "L5", "category": "literal", "query": "leaderElection", "expect": ["leaderElection", "leaderelection.go"], "seeds": ["leaderElection"] },
+    { "id": "L6", "category": "literal", "query": "iptables Proxier", "expect": ["Proxier", "proxy/iptables/proxier.go"], "seeds": ["Proxier", "iptables"] },
+
+    { "id": "C1", "category": "conceptual", "query": "how does the horizontal pod autoscaler scale replicas based on metrics", "expect": ["HorizontalController", "podautoscaler/horizontal.go"], "seeds": ["HorizontalController", "reconcileAutoscaler", "computeReplicasForMetrics", "GetMetrics"] },
+    { "id": "C2", "category": "conceptual", "query": "how are pending pods assigned to nodes", "expect": ["ScheduleOne", "schedule_one.go", "scheduler"], "seeds": ["Scheduler", "ScheduleOne", "schedulePod", "selectHost"] },
+    { "id": "C3", "category": "conceptual", "query": "controller reconciles desired number of pod replicas", "expect": ["syncReplicaSet", "ReplicaSetController", "replica_set.go"], "seeds": ["ReplicaSetController", "syncReplicaSet", "manageReplicas"] },
+    { "id": "C4", "category": "conceptual", "query": "elect a single active leader among controller manager replicas", "expect": ["leaderElection", "leaderelection.go"], "seeds": ["leaderElection", "LeaderElector", "tryAcquireOrRenew", "RunOrDie"] },
+    { "id": "C5", "category": "conceptual", "query": "program network rules for services on each node", "expect": ["proxy/iptables", "Proxier"], "seeds": ["Proxier", "syncProxyRules", "iptables"] },
+    { "id": "C6", "category": "conceptual", "query": "cache and watch kubernetes resources with event handlers", "expect": ["SharedInformer", "shared_informer.go"], "seeds": ["SharedInformer", "sharedIndexInformer", "AddEventHandler", "Reflector"] },
+    { "id": "C7", "category": "conceptual", "query": "kubelet brings a pod to its desired running state", "expect": ["SyncPod", "pod_workers.go", "kubelet"], "seeds": ["SyncPod", "podWorkers", "managePodLoop"] },
+    { "id": "C8", "category": "conceptual", "query": "update service endpoints when backing pods change", "expect": ["endpoints_controller.go", "endpoint"], "seeds": ["EndpointController", "syncEndpoints", "syncService"] },
+
+    { "id": "X1", "category": "cross", "query": "how a replicaset change flows from informer watch to pod creation", "expect": ["shared_informer", "syncReplicaSet", "replica_set.go"], "seeds": ["SharedInformer", "ReplicaSetController", "syncReplicaSet", "manageReplicas"] },
+    { "id": "X2", "category": "cross", "query": "scheduling a pod from the queue through the binding cycle", "expect": ["ScheduleOne", "bindingCycle", "schedule_one.go"], "seeds": ["ScheduleOne", "schedulingQueue", "bindingCycle", "bind"] },
+
+    { "id": "N1", "category": "nonsense", "query": "quantum blockchain payment gateway subscription billing invoice", "expect": [], "seeds": ["paymentGateway", "blockchainLedger", "billingInvoice", "subscription"] },
+    { "id": "N2", "category": "nonsense", "query": "react redux frontend css animation component styling theme", "expect": [], "seeds": ["reactComponent", "reduxStore", "cssAnimation", "themeStyling"] },
+    { "id": "N3", "category": "nonsense", "query": "audio waveform synthesizer midi signal processing reverb filter", "expect": [], "seeds": ["audioSynthesizer", "midiSignal", "reverbFilter", "waveform"] },
+
+    { "id": "G1", "category": "salad", "query": "delete all user accounts and drop the login database", "expect": [], "seeds": ["deleteUserAccount", "dropLoginDatabase", "userAccount"] },
+    { "id": "G2", "category": "salad", "query": "get the customer's shopping cart total and apply a discount", "expect": [], "seeds": ["shoppingCartTotal", "applyDiscount", "customerCart"] },
+    { "id": "G3", "category": "salad", "query": "sync my music playlist across all my devices", "expect": [], "seeds": ["musicPlaylist", "syncPlaylist", "userDevices"] },
+    { "id": "G4", "category": "salad", "query": "watch a movie trailer and leave a star rating", "expect": [], "seeds": ["movieTrailer", "starRating", "watchTrailer"] },
+    { "id": "G5", "category": "salad", "query": "insert a new row into the customer spreadsheet", "expect": [], "seeds": ["insertSpreadsheetRow", "customerSpreadsheet", "newRow"] },
+    { "id": "G6", "category": "salad", "query": "create a new email newsletter subscription", "expect": [], "seeds": ["emailNewsletter", "newsletterSubscription", "createSubscription"] },
+    { "id": "G7", "category": "salad", "query": "update my profile picture and bio on the dating app", "expect": [], "seeds": ["profilePicture", "updateBio", "datingProfile"] },
+    { "id": "G8", "category": "salad", "query": "list all my saved recipes in the cookbook app", "expect": [], "seeds": ["savedRecipes", "cookbookRecipes", "listRecipes"] }
+  ]
+}

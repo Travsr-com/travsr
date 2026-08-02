@@ -67,3 +67,4 @@ otlp = [
 [dev-dependencies]
 assert_cmd = { workspace = true }
 tempfile = { workspace = true }
+rusqlite = { workspace = true }

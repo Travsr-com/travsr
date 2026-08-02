@@ -3037,6 +3037,16 @@ fn rerank_doc_candidates(
 ) -> Vec<(NodeId, f32)> {
     let cap = crate::seed::docs_max_results(store);
 
+    // #520 (bench experiment, env-gated, off by default): skip the
+    // cross-encoder when the top raw-cosine candidate is already confidently
+    // separated. `candidates` arrives sorted descending (doc_lane_candidates),
+    // so the first entry is the top-1 raw cosine.
+    if let Some(threshold) = crate::seed::doc_rerank_ambiguity_threshold() {
+        if candidates.first().is_some_and(|&(_, s)| s >= threshold) {
+            return crate::seed::cosine_floor_select(store, candidates);
+        }
+    }
+
     let ids: Vec<NodeId> = candidates.iter().map(|&(id, _)| id).collect();
     let text_map = store.get_nodes_embed_text(&ids).unwrap_or_default();
     // O11 (§20.4), recorded as a decision rather than left as an accident: this
@@ -9194,8 +9204,15 @@ mod snippet_tests {
         .with_end_line(end_line)
     }
 
+    /// #519: docs.enabled defaults to true now, so this must stay empty for
+    /// the actual reason its name claims — no embed doc hook wired on the
+    /// store at all — not as an accidental side effect of the old default.
+    /// Was `build_docs_section_disabled_by_default_is_empty`: that name is
+    /// what first exposed the coincidence (the assertion still passed after
+    /// #519's flip, but for the wrong reason, since no hook was ever set here
+    /// regardless of the flag).
     #[test]
-    fn build_docs_section_disabled_by_default_is_empty() {
+    fn build_docs_section_with_no_hook_wired_is_empty() {
         let _guard = crate::seed::DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9203,6 +9220,41 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let (entries, tokens) = build_docs_section(&store, "how are floors calibrated", 4000);
         assert!(entries.is_empty());
+        assert_eq!(tokens, 0);
+    }
+
+    /// The flag itself gates the lane even with a real hook wired and the
+    /// default otherwise on — explicit now that "disabled" is a user opt-out
+    /// (`travsr config set docs.enabled false`) rather than the ship default.
+    #[test]
+    fn build_docs_section_explicitly_disabled_is_empty_even_with_a_hook() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOCS_ENABLED", "0");
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let n1 = doc_chunk_node(
+            "docs/plans/model-relative-semantic-floors.md",
+            "doc:auto-calibrated-floors",
+            10,
+            40,
+        );
+        store.put_node(&n1).unwrap();
+        let id1 = n1.id;
+        let hook: travsr_store::EmbedKnnHook =
+            std::sync::Arc::new(move |_q, _k| Ok(vec![(id1, 0.71)]));
+        store.set_embed_doc_knn_hook(hook);
+
+        let (entries, tokens) =
+            build_docs_section(&store, "how are semantic floors calibrated", 4000);
+
+        std::env::remove_var("TRAVSR_DOCS_ENABLED");
+
+        assert!(
+            entries.is_empty(),
+            "the flag must gate the lane even with a hook that would otherwise answer"
+        );
         assert_eq!(tokens, 0);
     }
 
@@ -9255,6 +9307,53 @@ mod snippet_tests {
         std::env::remove_var("TRAVSR_DOCS_ENABLED");
         std::env::remove_var("TRAVSR_DOC_FLOOR");
         std::env::remove_var("TRAVSR_DOCS_MAX_RESULTS");
+    }
+
+    /// #520: with no threshold set (the shipped default), reranking must
+    /// always run. This pins the "off by default" contract at the type
+    /// level, not just by convention — a threshold defaulting to `Some(_)`
+    /// would silently change production behavior.
+    #[test]
+    fn doc_rerank_ambiguity_threshold_defaults_to_none() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("TRAVSR_DOC_RERANK_AMBIGUITY_THRESHOLD");
+        assert_eq!(crate::seed::doc_rerank_ambiguity_threshold(), None);
+    }
+
+    /// #520: a confidently-separated top candidate must skip the
+    /// cross-encoder entirely and fall through to `cosine_floor_select`. No
+    /// reranker model needs to be installed for this test — that is the
+    /// point of the early return.
+    #[test]
+    fn rerank_doc_candidates_skips_cross_encoder_above_threshold() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_DOC_RERANK_AMBIGUITY_THRESHOLD", "0.9");
+        std::env::set_var("TRAVSR_DOC_FLOOR", "0.01");
+
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let confident = travsr_core::NodeId(1);
+        let ambiguous = travsr_core::NodeId(2);
+        let result = rerank_doc_candidates(
+            &store,
+            "irrelevant",
+            vec![(confident, 0.95), (ambiguous, 0.4)],
+        );
+
+        std::env::remove_var("TRAVSR_DOC_RERANK_AMBIGUITY_THRESHOLD");
+        std::env::remove_var("TRAVSR_DOC_FLOOR");
+
+        // cosine_floor_select's behavior (floor + sort + cap), not the
+        // reranker's: both candidates survive since both clear the 0.01
+        // floor set above, in cosine-descending order.
+        assert_eq!(
+            result,
+            vec![(confident, 0.95), (ambiguous, 0.4)],
+            "must take the cosine-only path, unchanged by any reranker score"
+        );
     }
 
     /// §4.3 budget carve: a docs.budget_pct that cannot fit even the highest

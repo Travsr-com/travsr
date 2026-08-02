@@ -26,6 +26,7 @@ toml       = { workspace = true }
 rusqlite   = { workspace = true }
 streaming-iterator    = { workspace = true }
 tree-sitter           = { workspace = true }
+fs2        = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
