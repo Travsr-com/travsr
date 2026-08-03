@@ -594,19 +594,19 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
 
 /// Populate `embed_text` for doc-chunk nodes that have none (#376 W1).
 ///
-/// The auto-embed path spawns the sidecar directly, bypassing
-/// [`regenerate_embed_texts_if_stale`] (CLI-only, because a full regeneration
-/// parses every source file in the repo). A doc chunk that reaches the sidecar
-/// without prose used to be embedded from a synthesized heading-and-path
-/// fallback, permanently — the vector exists, so presence-only candidacy never
-/// revisits it. The sidecar now rejects those nodes instead, which turns the
-/// silent corruption into a silent *absence* unless someone fills the text in.
-/// This is that someone.
+/// [`regenerate_embed_texts_if_stale`] (#512) reconciles code `embed_text`
+/// against the active model on every tick, but its full-regeneration branch
+/// is tree-sitter based and does not produce doc-chunk prose the same way. A
+/// doc chunk that reaches the sidecar without prose used to be embedded from
+/// a synthesized heading-and-path fallback, permanently — the vector exists,
+/// so presence-only candidacy never revisits it. The sidecar now rejects
+/// those nodes instead, which turns the silent corruption into a silent
+/// *absence* unless someone fills the text in. This is that someone.
 ///
-/// Affordable on the tick where the full regeneration is not: markdown chunks
-/// are re-derived by a pure function of the file's bytes (no tree-sitter, no
-/// grammar load), and the doc corpus is ~10³ chunks where the code corpus is
-/// ~10⁵ nodes. The store lock is taken twice, briefly, never across the parse.
+/// Affordable on every tick: markdown chunks are re-derived by a pure
+/// function of the file's bytes (no tree-sitter, no grammar load), and the
+/// doc corpus is ~10³ chunks where the code corpus is ~10⁵ nodes. The store
+/// lock is taken twice, briefly, never across the parse.
 ///
 /// Returns the number of chunks filled in.
 fn ensure_doc_embed_texts(store: &std::sync::Mutex<SqliteStore>, repo_root: &Path) -> usize {
@@ -2089,6 +2089,21 @@ fn maybe_spawn_embed(
         Some(id) => id,
         None => return,
     };
+
+    // #512: this auto-embed path used to spawn the sidecar without ever
+    // reconciling `embed_text` against the active model. A model switch
+    // applied by daemon restart alone (no explicit `travsr embed reindex`)
+    // then embedded every symbol from `embed_text` still written at the
+    // *previous* model's richness tier — vectors valid enough to reach 100%
+    // coverage but too degraded to clear the new model's recall floor, so
+    // `embed status` read healthy while `ask`'s KNN silently contributed
+    // nothing. Two meta reads in the common case (model unchanged); the
+    // expensive full-repo re-parse only runs on the tick right after a
+    // genuine switch, the same self-healing precedent as
+    // `maybe_spawn_invalidation_pass` for tombstones below.
+    if let Err(e) = regenerate_embed_texts_if_stale(&db_path) {
+        tracing::warn!("embed_tick: embed_text regen check failed (non-fatal): {e}");
+    }
 
     // #376 W1: doc chunks are ineligible until they carry prose. Fill them in
     // before anything below reads coverage, so a freshly-indexed doc is counted
@@ -4172,6 +4187,28 @@ mod tests {
         maybe_spawn_embed(tmp.path(), &store, &flag);
         // flag stays false — Phase 1 still not done, Phase 2 not triggered
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn maybe_spawn_embed_reconciles_stale_embed_text_model_id() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // #512: reproduce a model switch applied via daemon restart alone (no
+        // explicit `travsr embed reindex`) — `embed_text_model_id` still names
+        // a stale model while the repo's configured backend has moved on. The
+        // auto-embed tick must reconcile this itself rather than silently
+        // embedding under the wrong richness tier forever.
+        let (tmp, mut store) = setup_repo_with_phase_b(5, Some("deadbeef"));
+        store
+            .set_meta("embed_text_model_id", "stale-old-model")
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let flag = std::sync::atomic::AtomicBool::new(false);
+
+        maybe_spawn_embed(tmp.path(), &store, &flag);
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        let reconciled = s.get_meta("embed_text_model_id").unwrap().unwrap();
+        assert_eq!(reconciled, "bge-small-en-v1.5");
     }
 
     #[test]
