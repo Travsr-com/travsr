@@ -13,9 +13,12 @@
 ///
 /// Delimiters: every non-ASCII-alphanumeric character. Also splits on
 /// lower→upper transitions (`getCallers` → `get`, `callers`) and on
-/// letter↔digit transitions (`utf8Decode` → `utf`, `8`, `decode`). Adjacent
-/// duplicate segments are suppressed as they are produced (matches the
-/// pre-extraction `tokenize_identifier` behaviour exactly).
+/// letter↔digit transitions (`utf8Decode` → `utf`, `8`, `decode`). Repeated
+/// segments are suppressed, keeping only the first occurrence (matches the
+/// pre-extraction `tokenize_identifier` behaviour exactly — that function
+/// builds a bag-of-words FTS field, where position doesn't matter and a
+/// repeated word is redundant). Do not reuse this for anything that needs
+/// the segments' true position in `s` — see [`raw_segments`].
 ///
 /// KNOWN LIMITATION (deliberate, see RFC-023 §13): consecutive-uppercase
 /// acronym runs are not split — `HTTPServer` → `["httpserver"]`. Changing
@@ -23,6 +26,25 @@
 ///
 /// O(n) in the length of `s`, single pass.
 pub fn segments(s: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    for tok in raw_segments(s) {
+        if !tokens.contains(&tok) {
+            tokens.push(tok);
+        }
+    }
+    tokens
+}
+
+/// Same splitting as [`segments`], but keeps every occurrence in its original
+/// position — no "first occurrence only" dedup. [`contains_token`]'s
+/// contiguous-run check needs the text's *true* segment sequence: `segments`'
+/// dedup drops a segment that recurs elsewhere in `s`, which can sever the
+/// contiguity between that segment and its real neighbour (e.g.
+/// `"path_to_path_map"` deduped is `["path","to","map"]` — the second `path`,
+/// contiguous with `map` in the source, is gone, so `"pathmap"` would wrongly
+/// fail to match). Never use this for FTS indexing — that output must match
+/// `tokenize_identifier`'s bag-of-words contract exactly, which is `segments`.
+fn raw_segments(s: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
 
@@ -62,10 +84,7 @@ pub fn segments(s: &str) -> Vec<String> {
 #[inline]
 fn flush(current: &mut String, tokens: &mut Vec<String>) {
     if !current.is_empty() {
-        let tok = std::mem::take(current);
-        if !tokens.contains(&tok) {
-            tokens.push(tok);
-        }
+        tokens.push(std::mem::take(current));
     }
 }
 
@@ -81,6 +100,10 @@ fn flush(current: &mut String, tokens: &mut Vec<String>) {
 /// This is the replacement for `travsr_mcp::seed::token_is_sig_component`,
 /// which required non-alphanumeric boundaries and so rejected camelCase/
 /// PascalCase anchors.
+///
+/// Uses [`raw_segments`], not [`segments`]: this check is positional (a
+/// contiguous run in `text`), and `segments`' first-occurrence dedup would
+/// silently break contiguity for a segment that recurs elsewhere in `text`.
 pub fn contains_token(token: &str, text: &str) -> bool {
     if token.is_empty() {
         return false;
@@ -93,7 +116,7 @@ pub fn contains_token(token: &str, text: &str) -> bool {
     if token_norm.is_empty() {
         return false;
     }
-    let segs = segments(text);
+    let segs = raw_segments(text);
 
     for start in 0..segs.len() {
         let mut acc = String::new();
@@ -235,6 +258,19 @@ mod tests {
         // does — the token's own delimiters are stripped before comparing.
         assert!(contains_token("seed_target", "fn:seed_target"));
         assert!(contains_token("Seed_Target", "fn:seed_target"));
+    }
+
+    #[test]
+    fn contiguous_run_matches_across_a_segment_that_recurs_elsewhere() {
+        // `segments()` dedups to ["get", "config", "name"] (the second "get"
+        // is a repeat of the first, so it's dropped) — using that deduped
+        // list for positional matching would sever the contiguity between
+        // the *second* "get" and "name", even though "get_name" is a real
+        // contiguous run at the end of the source string. `contains_token`
+        // must use the non-deduped segmentation for this to match.
+        assert!(contains_token("getname", "get_config_get_name"));
+        // Same shape, repeated segment in the middle rather than at the front.
+        assert!(contains_token("pathmap", "fn:path_to_path_map"));
     }
 
     #[test]
