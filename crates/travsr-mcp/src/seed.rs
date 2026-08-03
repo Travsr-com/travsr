@@ -869,27 +869,47 @@ pub(crate) fn doc_lane_candidates(
     hits
 }
 
-/// The exact text the docs lane sends to `knn` — identical to what the code
-/// lane sends (`tools::embed_path_seeds` normalizes with the same function
-/// before its own KNN call).
+/// The text the docs lane sends to `knn` for **recall**.
 ///
-/// This is a latency contract, not a formatting nicety. Plan §4.4 promised
-/// "one inference, two searches"; the shipped protocol dropped the planned
-/// `KnnRequest.spaces: Vec<Space>` fusion in favour of one round trip per
-/// space, and restored the guarantee with a **single-slot, exact-text** memo
-/// of the last query embedding inside the sidecar
-/// (`travsr-embed`'s `embed_query_cached`). That memo only hits when both
-/// lanes present byte-identical text. While this lane sent the raw query and
-/// the code lane sent the normalized one, every query carrying sentence
-/// punctuation (a trailing `?` is the common case) missed the memo and paid a
-/// second full query-embedding inference — 200-270ms against a 600ms circuit
-/// breaker — silently, since nothing measured inference count.
+/// Historically this was byte-identical to what `tools::embed_path_seeds`
+/// sends for the code lane's own KNN call (both called `normalize_nl_query`),
+/// to hit the sidecar's single-slot exact-text memo (`embed_query_cached`)
+/// and save a second ~200-270ms inference — see #376 §4.4, "one inference,
+/// two searches".
 ///
-/// Keep these two call sites using the same normalizer. `TRAVSR_EMBED_QUERY_CACHE_DEBUG`
-/// on the sidecar reports hit/miss per KNN, and `bench/run-phase2-gate.mjs`'s
-/// single-inference gate asserts it.
+/// #539: that shared full-sentence text is also the root cause of doc-lane
+/// recall failures on natural-language queries. A pooled/mean query
+/// embedding drifts toward whatever generic prose region the corpus's
+/// longer documents occupy as the ratio of filler words ("why", "was",
+/// "did", "the") to content words rises, and the correct short technical doc
+/// chunk can fall entirely outside the `doc_rerank_overfetch` candidate
+/// window before the reranker ever sees it — a recall failure, not merely a
+/// rerank-precision one. Embedding content tokens only fixes this because it
+/// is exactly what `tokenize_query` already does for the code lane's
+/// per-token anchor resolution (`build_seed_set`) — reused here rather than
+/// duplicated.
+///
+/// This intentionally **breaks** the exact-text memo contract with the code
+/// lane's `embed_path_seeds` call: the two lanes now send different text
+/// (content tokens vs full normalized sentence) whenever the query has any
+/// filler words, so a docs-enabled query pays the second inference on
+/// purpose. Correctness (citing the right doc) outranks that latency cost —
+/// the docs lane exists specifically for the low-confidence/abstention case
+/// where a wrong or missing citation is the worse failure. Gate 4 in
+/// `bench/run-phase2-gate.mjs` expects this specific divergence rather than
+/// requiring single-text identity; `TRAVSR_EMBED_QUERY_CACHE_DEBUG` on the
+/// sidecar still reports hit/miss per KNN if the memo rate needs rechecking.
+///
+/// Falls back to `normalize_nl_query` verbatim when `tokenize_query` strips
+/// every token (an all-stopword or all-punctuation query), so the KNN call
+/// is never sent an empty string.
 pub(crate) fn doc_lane_query(query: &str) -> String {
-    travsr_store::fts_tokenize::normalize_nl_query(query)
+    let tokens = tokenize_query(query);
+    if tokens.is_empty() {
+        travsr_store::fts_tokenize::normalize_nl_query(query)
+    } else {
+        tokens.join(" ")
+    }
 }
 
 // ── Stop-word list (code-aware: omit "get", "set", "run", "use") ─────────────
@@ -5941,33 +5961,54 @@ mod tests {
         );
     }
 
-    /// §4.4 latency contract: the docs lane must present the sidecar with
-    /// byte-identical query text to the code lane, or the sidecar's
-    /// single-slot exact-text memo (`embed_query_cached`) misses and the query
-    /// pays a second full embedding inference. `tools::embed_path_seeds`
-    /// normalizes with `normalize_nl_query` before its KNN call; this asserts
-    /// the docs lane derives the same string, including for the punctuated
-    /// queries that made the two diverge in the first place.
+    /// #539: the docs lane's recall stage embeds content tokens only (the
+    /// same extraction `tokenize_query` already does for the code lane's
+    /// per-token anchor resolution), not the full normalized sentence — this
+    /// is what fixes the NL-query dilution bug. This deliberately breaks the
+    /// old §4.4 byte-identical-text memo contract with the code lane's
+    /// `embed_path_seeds` call whenever the query has filler words; see the
+    /// docstring on `doc_lane_query` for why that tradeoff is intentional.
     #[test]
-    fn doc_lane_query_matches_the_code_lane_normalization() {
+    fn doc_lane_query_strips_filler_words_for_recall() {
         for raw in [
             "how does the knapsack enforce the token budget?",
             "why did we choose PPR over BFS ?",
             "what are the rules about unwrap and error handling in library code",
-            "  leading and trailing  ",
         ] {
             assert_eq!(
                 doc_lane_query(raw),
+                tokenize_query(raw).join(" "),
+                "doc_lane_query must send tokenize_query's content tokens for {raw:?}"
+            );
+            assert_ne!(
+                doc_lane_query(raw),
                 travsr_store::fts_tokenize::normalize_nl_query(raw),
-                "docs lane must send exactly what embed_path_seeds sends for {raw:?}"
+                "test query must actually carry filler words the fix strips, for {raw:?}"
             );
         }
     }
 
-    /// The normalization is actually applied at the KNN boundary, not merely
-    /// available as a helper — captures the text the hook receives.
+    /// Falls back to the full normalized sentence, never an empty string,
+    /// when every token is a stopword.
     #[test]
-    fn doc_lane_candidates_sends_the_normalized_query_to_knn() {
+    fn doc_lane_query_falls_back_to_normalized_sentence_when_all_stopwords() {
+        let raw = "  what is the  ";
+        assert!(
+            tokenize_query(raw).is_empty(),
+            "test query must be all-stopword"
+        );
+        assert_eq!(
+            doc_lane_query(raw),
+            travsr_store::fts_tokenize::normalize_nl_query(raw),
+        );
+        assert!(!doc_lane_query(raw).is_empty());
+    }
+
+    /// The content-token normalization is actually applied at the KNN
+    /// boundary, not merely available as a helper — captures the text the
+    /// hook receives.
+    #[test]
+    fn doc_lane_candidates_sends_the_content_token_query_to_knn() {
         let _guard = DOCS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5985,8 +6026,13 @@ mod tests {
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
             sent,
+            doc_lane_query(raw),
+            "the hook must receive doc_lane_query's content-token text"
+        );
+        assert_ne!(
+            sent,
             travsr_store::fts_tokenize::normalize_nl_query(raw),
-            "raw query reached the sidecar — the memo cache would miss and re-embed"
+            "test query must exercise the filler-word-stripping change"
         );
         assert_ne!(sent, raw, "test query must exercise a normalization change");
 

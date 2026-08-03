@@ -130,6 +130,30 @@
       "query": "why was a per repo linear projection head for embeddings rejected",
       "expectPath": "docs/plans",
       "expectHeading": ""
+    },
+    {
+      "id": "T21",
+      "query": "kuzu",
+      "expectPath": "ADR-018-drop-kuzu-backend",
+      "expectHeading": ""
+    },
+    {
+      "id": "T22",
+      "query": "why did we drop kuzu",
+      "expectPath": "ADR-018-drop-kuzu-backend",
+      "expectHeading": ""
+    },
+    {
+      "id": "T23",
+      "query": "why was kuzu dropped",
+      "expectPath": "ADR-018-drop-kuzu-backend",
+      "expectHeading": ""
+    },
+    {
+      "id": "T24",
+      "query": "what is the rationale for kuzu",
+      "expectPath": "ADR-018-drop-kuzu-backend",
+      "expectHeading": ""
     }
   ]
 }

@@ -2890,6 +2890,15 @@ fn rerank_doc_candidates(
     query: &str,
     candidates: Vec<(NodeId, f32)>,
 ) -> Vec<(NodeId, f32)> {
+    // #539: normalize before scoring so this stage is consistent with the
+    // rest of the docs lane. Unlike the recall stage (`doc_lane_query`),
+    // this deliberately does NOT strip filler words: the cross-encoder does
+    // token-level cross-attention over a natural sentence, not mean-pooling,
+    // so it does not share the recall stage's dilution failure mode, and
+    // stripping stopwords here would only fight the reranker's own training
+    // distribution (MS MARCO-style rerankers are trained on full questions).
+    let query = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let query = query.as_str();
     let cap = crate::seed::docs_max_results(store);
 
     // #520 (bench experiment, env-gated, off by default): skip the
