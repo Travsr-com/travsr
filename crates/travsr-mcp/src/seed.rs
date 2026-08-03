@@ -900,16 +900,21 @@ pub(crate) fn doc_lane_candidates(
 /// requiring single-text identity; `TRAVSR_EMBED_QUERY_CACHE_DEBUG` on the
 /// sidecar still reports hit/miss per KNN if the memo rate needs rechecking.
 ///
-/// Falls back to `normalize_nl_query` verbatim when `tokenize_query` strips
-/// every token (an all-stopword or all-punctuation query), so the KNN call
-/// is never sent an empty string.
+/// Falls back to `normalize_nl_query` when `tokenize_query` strips every
+/// token (an all-stopword query), then to the trimmed raw query itself when
+/// even that is empty (an all-punctuation query — `normalize_nl_query` also
+/// strips bare punctuation tokens, e.g. `"???"` normalizes to `""`), so the
+/// KNN call is never sent an empty string for a non-blank input.
 pub(crate) fn doc_lane_query(query: &str) -> String {
     let tokens = tokenize_query(query);
-    if tokens.is_empty() {
-        travsr_store::fts_tokenize::normalize_nl_query(query)
-    } else {
-        tokens.join(" ")
+    if !tokens.is_empty() {
+        return tokens.join(" ");
     }
+    let normalized = travsr_store::fts_tokenize::normalize_nl_query(query);
+    if !normalized.is_empty() {
+        return normalized;
+    }
+    query.trim().to_string()
 }
 
 // ── Stop-word list (code-aware: omit "get", "set", "run", "use") ─────────────
@@ -924,6 +929,9 @@ const STOP_WORDS: &[&str] = &[
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
 
 /// Extract content tokens from a query for per-token anchor resolution.
+/// Also reused by [`doc_lane_query`] (#539) to build the doc-lane's KNN
+/// embedding text — `STOP_WORDS` is now a shared dependency of both callers,
+/// so retuning it for one lane's ranking affects the other's embeddings too.
 ///
 /// - Strips leading/trailing ASCII punctuation (preserving `_` and `.`)
 /// - Removes stop-words and tokens shorter than 2 characters (stop-word/length
@@ -6002,6 +6010,25 @@ mod tests {
             travsr_store::fts_tokenize::normalize_nl_query(raw),
         );
         assert!(!doc_lane_query(raw).is_empty());
+    }
+
+    /// An all-punctuation query strips to zero tokens *and* normalizes to an
+    /// empty string (`normalize_nl_query` also drops bare-punctuation
+    /// tokens), so the first fallback isn't enough on its own — this asserts
+    /// the second fallback (trimmed raw query) keeps the "never empty"
+    /// contract for that case too.
+    #[test]
+    fn doc_lane_query_falls_back_to_raw_text_when_all_punctuation() {
+        let raw = "???";
+        assert!(
+            tokenize_query(raw).is_empty(),
+            "test query must strip to zero tokens"
+        );
+        assert!(
+            travsr_store::fts_tokenize::normalize_nl_query(raw).is_empty(),
+            "test query must also normalize to empty, exercising the second fallback"
+        );
+        assert_eq!(doc_lane_query(raw), "???");
     }
 
     /// The content-token normalization is actually applied at the KNN
