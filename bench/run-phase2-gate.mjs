@@ -109,6 +109,34 @@ if (process.argv.includes("--self-test")) {
       row: { id: "c", embedInferences: 2, queryTexts: ["q", "q?"], ms: 40 },
       expect: "normalization",
     },
+    {
+      name: "#539: one code miss + one docs miss, different text => expected split, not a failure",
+      row: {
+        id: "d",
+        embedInferences: 2,
+        queryTexts: ["how does the daemon work", "daemon work"],
+        missEntries: [
+          { space: "code", query: "how does the daemon work" },
+          { space: "docs", query: "daemon work" },
+        ],
+        ms: 40,
+      },
+      expect: "docs-lane-recall-split",
+    },
+    {
+      name: "two misses in the same space, different text => still normalization, still fails",
+      row: {
+        id: "e",
+        embedInferences: 2,
+        queryTexts: ["q", "q2"],
+        missEntries: [
+          { space: "code", query: "q" },
+          { space: "code", query: "q2" },
+        ],
+        ms: 40,
+      },
+      expect: "normalization",
+    },
   ];
   let bad = 0;
   for (const c of cases) {
@@ -127,6 +155,21 @@ if (process.argv.includes("--self-test")) {
     [{ ...base, id: "d", embedInferences: 2, queryTexts: ["q", "q?"] }],
     probe
   );
+  const docsSplit = summarizeInference(
+    [
+      {
+        ...base,
+        id: "s",
+        embedInferences: 2,
+        queryTexts: ["how does the daemon work", "daemon work"],
+        missEntries: [
+          { space: "code", query: "how does the daemon work" },
+          { space: "docs", query: "daemon work" },
+        ],
+      },
+    ],
+    probe
+  );
   if (!ttl.pass) {
     bad++;
     console.error("FAIL  a TTL expiry alone must not fail Gate 4");
@@ -138,6 +181,12 @@ if (process.argv.includes("--self-test")) {
     console.error("FAIL  a normalization divergence must fail Gate 4");
   } else {
     console.error("ok    a normalization divergence fails Gate 4");
+  }
+  if (!docsSplit.pass) {
+    bad++;
+    console.error("FAIL  #539's expected code/docs recall split alone must not fail Gate 4");
+  } else {
+    console.error("ok    #539's expected code/docs recall split does not fail Gate 4");
   }
   console.error(bad === 0 ? "\nself-test: PASS" : `\nself-test: FAIL (${bad})`);
   process.exit(bad === 0 ? 0 : 1);
@@ -398,6 +447,12 @@ async function runDocs() {
       // query. This is what makes Gate 4 timing-independent — see
       // `summarizeInference`.
       queryTexts: [...new Set(trace.map((t) => t.query))],
+      // #539: which space each miss belongs to, so the classifier can tell
+      // an expected code/docs split from a real divergence — see
+      // `classifyExtraInference`.
+      missEntries: trace
+        .filter((t) => t.outcome === "miss")
+        .map((t) => ({ space: t.space, query: t.query })),
     });
   }
 
@@ -429,6 +484,9 @@ async function runDocs() {
       // normalization ran at all. Same field Gate 4 classifies on.
       normalizedSeen,
       queryTexts: normalizedSeen,
+      missEntries: trace
+        .filter((t) => t.outcome === "miss")
+        .map((t) => ({ space: t.space, query: t.query })),
     });
   }
 
@@ -466,18 +524,52 @@ async function runDocs() {
 //
 // TTL expiries are still reported, and still count against `slowQueries` for
 // the perf record (O8), but they do not fail the gate.
+//
+// #539: the docs lane now embeds `tokenize_query`'s content tokens instead of
+// the full normalized sentence, to fix NL-query dilution dropping the right
+// doc as filler words accumulate. That makes the docs-space text legitimately
+// differ from the code-space text for any query carrying a filler word — a
+// designed divergence, not a regression. A third kind, "docs-lane-recall-
+// split", separates it from a real "normalization" violation: it fires only
+// when there are exactly two misses, exactly one in the "code" space and one
+// in the "docs" space, each with a single distinct text. Anything else — a
+// repeated miss within the same space, more than two distinct texts, or a
+// divergence that does not line up with the space boundary — is still
+// unexplained and still fails the gate as "normalization". This never
+// reimplements the Rust normalizer/tokenizer in JS (see the note above
+// `runDocs`): it classifies by *which space* diverged, not by predicting
+// *what* the docs-lane text should be.
 function classifyExtraInference(row) {
   if (row.embedInferences <= 1) return null;
   const distinctTexts = (row.queryTexts ?? []).length;
+
+  const misses = row.missEntries ?? [];
+  const bySpace = new Map();
+  for (const m of misses) {
+    if (!bySpace.has(m.space)) bySpace.set(m.space, new Set());
+    bySpace.get(m.space).add(m.query);
+  }
+  const isExpectedDocsLaneSplit =
+    misses.length === 2 &&
+    bySpace.size === 2 &&
+    bySpace.has("code") &&
+    bySpace.has("docs") &&
+    [...bySpace.values()].every((texts) => texts.size === 1);
+
   return {
     id: row.id,
     inferences: row.embedInferences,
     spaces: row.spacesSearched,
     ms: row.ms ?? null,
     queryTexts: row.queryTexts ?? [],
-    // >1 distinct text is a divergence no TTL can explain. Exactly 1 means the
-    // lanes agreed and the entry simply aged out.
-    kind: distinctTexts > 1 ? "normalization" : "ttl-expiry",
+    kind: isExpectedDocsLaneSplit
+      ? "docs-lane-recall-split"
+      // >1 distinct text with no clean code/docs split is a divergence no
+      // TTL can explain. Exactly 1 means the lanes agreed and the entry
+      // simply aged out.
+      : distinctTexts > 1
+      ? "normalization"
+      : "ttl-expiry",
   };
 }
 
@@ -488,6 +580,7 @@ function summarizeInference(rows, probeRows) {
   const extras = observed.map(classifyExtraInference).filter(Boolean);
   const violations = extras.filter((e) => e.kind === "normalization");
   const ttlExpiries = extras.filter((e) => e.kind === "ttl-expiry");
+  const docsRecallSplits = extras.filter((e) => e.kind === "docs-lane-recall-split");
   const vacuous = bothSpaces.length === 0;
   // The probe must have actually run and searched both spaces, or the
   // normalization-divergence case went unexercised and the gate is only
@@ -504,12 +597,15 @@ function summarizeInference(rows, probeRows) {
     totalMemoHits: all.reduce((a, r) => a + r.embedMemoHits, 0),
     violations,
     ttlExpiries,
+    docsRecallSplits,
     punctuatedProbe: probeRows,
     threshold:
       "zero normalization divergences (a query whose trace holds >1 distinct " +
-      "text); >=1 query searching both spaces; punctuated probe exercised " +
-      "(scored sets contain no sentence punctuation). Memo TTL expiries are " +
-      "reported, not failed: they track machine load, not the §4.4 contract.",
+      "text with no clean code/docs space split); >=1 query searching both " +
+      "spaces; punctuated probe exercised (scored sets contain no sentence " +
+      "punctuation). Memo TTL expiries and #539's expected docs-lane recall " +
+      "split (content-token text in the docs space vs full-sentence text in " +
+      "the code space) are reported, not failed.",
   };
 }
 // ── Gate 5: the `ask` surface ───────────────────────────────────────────────
@@ -920,6 +1016,15 @@ if (inference.ttlExpiries.length > 0) {
     `  note: ${inference.ttlExpiries.length} query/queries re-embedded after the sidecar's ` +
       `memo TTL expired (identical text both lanes, so not a normalization divergence): ${slowest}. ` +
       `Not a gate failure; it tracks cross-encoder cost under load (plan §20.4 O8).`
+  );
+}
+// #539: reported, never failed — this is the docs lane's fix working as
+// designed (content-token text in the docs space vs full-sentence text in
+// the code space), not a contract breach.
+if (inference.docsRecallSplits.length > 0) {
+  console.error(
+    `  note: ${inference.docsRecallSplits.length} query/queries split code/docs query text ` +
+      `for doc-lane recall (#539, expected, not a gate failure)`
   );
 }
 if (!inference.vacuous && !inference.probeCovered) {
