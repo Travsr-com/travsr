@@ -1,7 +1,36 @@
 # ADR-007: PCST λ Parameter Selection (λ = 0.5)
 
 **Date:** 2026-05-24  
-**Status:** Accepted
+**Status:** Accepted, with corrections (see below)
+
+---
+
+> ## ⚠️ Correction — 2026-08-03 (issue #527)
+>
+> Two statements in this ADR do not describe what shipped. The λ = 0.5 decision
+> itself is accurate and stands; the surrounding description is not. Recorded
+> here as an amendment rather than an in-place edit, so the original decision
+> record survives for the eventual supersede.
+>
+> **1. "Context" below calls PCST the production algorithm.** It is not
+> implemented. `crates/travsr-retrieval/src/pcst.rs` runs Dijkstra (plus A* with
+> a zero heuristic, which degenerates to Dijkstra) over a bounded local
+> subgraph, then pads the result with nodes whose cheapest-path cost is within
+> `λ × total_cost`. That padding step is the only PCST-flavoured part; there is
+> no Goemans-Williamson primal-dual approximation anywhere in the crate.
+>
+> **2. The "Timeout" section below is inverted.** No wall-clock timeout exists.
+> `pcst.rs` deliberately does *not* gate on elapsed time — the comment above
+> `expand_local_subgraph` explains why: such a check can only fire after the
+> work it nominally guards has already completed, so its only effect would be to
+> discard a complete bounded subgraph and make results nondeterministic under
+> load. The BFS fallback fires when source or sink is absent from the local
+> subgraph, or when no path exists — never on a timer.
+>
+> Real PCST is scoped as S16 and gated on a benchmark demonstrating it beats the
+> current heuristic. If that gate is not cleared, this ADR should be superseded
+> by one that records the heuristic as the intended design rather than a
+> deferral.
 
 ---
 
@@ -50,4 +79,14 @@ PPR weights (ADR-003) measure edge _transition probability_. PCST λ measures no
 
 ## Timeout
 
-PCST computation on large graphs (>10k nodes) can exceed p95 50ms budget. A hard 80ms wall-clock timeout is enforced; on timeout the algorithm falls back to BFS depth-3. This is logged at WARN level so operators can track fallback frequency.
+> **Superseded by the correction at the top of this file (issue #527).** The
+> paragraph below describes a wall-clock timeout that was never shipped, or was
+> removed without updating this ADR. Retained verbatim as the original record.
+
+~~PCST computation on large graphs (>10k nodes) can exceed p95 50ms budget. A hard 80ms wall-clock timeout is enforced; on timeout the algorithm falls back to BFS depth-3. This is logged at WARN level so operators can track fallback frequency.~~
+
+**Actual behaviour.** Cost is bounded structurally, not temporally:
+`expand_local_subgraph` stops after `MAX_LOCAL_NODES` (2000) node pops, so the
+Dijkstra/A* pass below it is microsecond-scale regardless of graph fan-out. The
+BFS depth-3 fallback triggers only when source or sink is missing from the local
+subgraph, or when `astar` finds no path.

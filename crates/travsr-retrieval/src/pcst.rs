@@ -1,18 +1,21 @@
-//! Prize-Collecting Steiner Tree (PCST) retrieval — S14 approximation.
+//! Execution-path retrieval — shortest path plus a λ-corridor of context.
 //!
 //! Finds a low-cost subgraph connecting `source` to `sink` through the indexed
 //! graph, applying the `EdgeFilter` at every traversal step (RBAC enforcement).
 //!
-//! # Algorithm (ADR-007)
-//! S14 ships a practical PCST approximation:
+//! **This is not Prize-Collecting Steiner Tree.** Despite the module path and
+//! ADR-007, no Goemans-Williamson primal-dual approximation is implemented
+//! here — the algorithm below is Dijkstra with a threshold-based padding step.
+//! Real PCST is scoped as S16 and gated on a benchmark showing it beats this
+//! heuristic; see issue #527.
+//!
+//! # Algorithm (ADR-007 for λ only)
 //! 1. Build a bounded local subgraph via bidirectional BFS from source + sink (depth 5).
 //! 2. Map to a petgraph `DiGraph` with edge costs = `1.0 - ppr_weight`.
 //! 3. Run Dijkstra from source; extract the minimum-cost path to sink.
 //! 4. Include nodes within λ of the optimal path cost (λ = 0.5, ADR-007).
-//! 5. On timeout (> 80ms) or no path found: fall back to BFS depth-3.
-//!
-//! Full Goemans-Williamson (1995) is deferred to S16 when benchmark data
-//! from real repos is available to tune λ.
+//! 5. On missing source/sink, or when no path exists: fall back to BFS depth-3.
+//!    There is no wall-clock timeout — see the rationale in `pcst_path`.
 //!
 //! # Complexity
 //! O((V + E) log V) for the Dijkstra pass over the local subgraph,
@@ -52,6 +55,10 @@ pub fn pcst_path(
     filter: &dyn EdgeFilter,
     token_budget: usize,
 ) -> Result<Vec<Node>, travsr_error::TravsrError> {
+    // Observability only — this is NOT a budget. Nothing below reads `start`
+    // except the `elapsed_ms` field on the closing debug! span. There is no
+    // wall-clock gate in this function; see the rationale above
+    // `expand_local_subgraph` for why one was deliberately not added.
     let start = Instant::now();
 
     // Validate both endpoints are accessible via the filter.

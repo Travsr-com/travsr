@@ -209,7 +209,7 @@ an optional `repo` parameter to target a specific registered repo. Omitting
 | `get_blast_radius(file)` | Files transitively affected if the given file changes |
 | `search_symbol(name)` | Symbol definitions matching a name across the graph |
 | `get_repo_map` | Structural overview of the indexed repository |
-| `get_execution_path(source, sink)` | PCST-optimal execution path between two symbols |
+| `get_execution_path(source, sink)` | Lowest-cost execution path between two symbols, plus nearby context |
 | `get_context(query, token_budget)` | PPR traversal ranked by relevance, budget-capped by knapsack |
 | `get_graph_stats` | Node/edge counts, schema version, last-indexed SHA |
 | `get_graph_json(query, direction, depth)` | Subgraph as structured JSON for graph renderers |
@@ -387,7 +387,7 @@ Language support: **TypeScript / TSX, Rust, Python, Go** (builtin, zero configur
 | Personalized PageRank (PPR) | `get_context` and deep traversal | Available |
 | PPR weighted | Score-aware PPR variant | Available |
 | 0-1 Knapsack | Token budget cap on `get_context` results | Available |
-| Prize-Collecting Steiner Tree (PCST) | `get_execution_path`: optimal path between two symbols | Available |
+| Shortest path + λ-corridor | `get_execution_path`: lowest-cost path between two symbols, padded with nodes within λ=0.5 of that cost | Available |
 | k-core decomposition | Buried-middle recovery | Available |
 | BM25 | Full-text ranked retrieval | Available |
 | RBAC | Role-based access filtering on graph queries | Available |
