@@ -22,6 +22,15 @@ type KnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
 use travsr_retrieval::{context_candidates, knapsack, ppr_weighted, token_cost, OpenFilter};
 use travsr_store::{SqliteStore, Store, StoreMigratable};
 
+// #478 RFC-023 §6.1/WS-8: `explain_query`'s report type lives in `seed` (an
+// internal, crate-private module) alongside the other seed-building internals
+// it's built from; re-exported here since `query` is this crate's one public
+// surface for CLI-facing payload types.
+pub use crate::seed::{
+    ExplainDisposition, ExplainLeg, ExplainLegMatches, ExplainReport, ExplainThresholds,
+    ExplainToken,
+};
+
 /// Token budget for `travsr ask` and the default for `travsr graph --budget`.
 /// Matches the MCP `get_context` default.
 pub const DEFAULT_TOKEN_BUDGET: usize = 4096;
@@ -155,6 +164,11 @@ pub struct AskPayload {
     /// whenever the lane is off or produced nothing (§4.2: absent, not empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docs: Vec<String>,
+    /// #478: honest FTS-only / degraded-embed note, reusing
+    /// `build_context_signals` so `ask` and `get_context` stay at parity.
+    /// Empty when embeddings are fully warm and contributing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub degraded_note: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -282,6 +296,8 @@ pub fn ask_query(
     let query = normalized.as_str();
 
     // ── Tier-0 seed selection (per-token anchor + BM25 FTS + optional KNN) ──
+    let has_embed = knn_fn.is_some();
+    let embed_warming = has_embed && !store.embed_ready();
     let knn_pairs;
     let knn_oracle;
     let embed_contributed;
@@ -308,6 +324,19 @@ pub fn ask_query(
         knn_oracle = std::collections::HashMap::new();
         embed_contributed = false;
     }
+
+    // #478: honest degraded note — mirrors get_context's build_context_signals
+    // rather than a second formatter. knn_degraded is true only when embeddings
+    // were configured but did not end up contributing (empty KNN or circuit-broken).
+    let knn_degraded = has_embed && !embed_contributed;
+    let degraded_note = crate::tools::build_context_signals(
+        store,
+        has_embed,
+        embed_warming,
+        knn_degraded,
+        None,
+        None,
+    );
 
     // RFC-019: direct-cosine oracle hook (None when embeddings off → FTS-only path).
     let score_fn = store.embed_score_fn();
@@ -339,9 +368,10 @@ pub fn ask_query(
             no_results: false,
             rows: Vec::new(),
             total_tokens: doc_tokens,
-            embed_used: false,
+            embed_used: embed_contributed,
             confidence,
             docs,
+            degraded_note: degraded_note.clone(),
         });
     }
 
@@ -363,9 +393,10 @@ pub fn ask_query(
             no_results: false,
             rows: Vec::new(),
             total_tokens: doc_tokens,
-            embed_used: false,
+            embed_used: embed_contributed,
             confidence: confidence.clone(),
             docs: docs.clone(),
+            degraded_note: degraded_note.clone(),
         });
     }
 
@@ -380,6 +411,7 @@ pub fn ask_query(
             embed_used: embed_contributed,
             confidence: confidence.clone(),
             docs: docs.clone(),
+            degraded_note: degraded_note.clone(),
         });
     }
 
@@ -461,6 +493,7 @@ pub fn ask_query(
                     &seed_rerank,
                     is_primary,
                     expanded_cap,
+                    seed_set.confidence,
                 ),
                 match_source: emit_match_source.then(|| {
                     let is_exact = matches!(
@@ -487,7 +520,54 @@ pub fn ask_query(
         embed_used: embed_contributed,
         confidence,
         docs,
+        degraded_note,
     })
+}
+
+// ── explain (#478 RFC-023 §6.1, WS-8) ────────────────────────────────────────
+
+/// Diagnostic seed-building trace for one query/symbol pair: per-token IDF,
+/// per-leg match status, every threshold, and final disposition (live vs an
+/// FTS-only counterfactual). Local CLI diagnostic only (RFC-023 §4) — never
+/// routed through the daemon control socket like `ask`/`graph`/`status`, so
+/// it always uses the direct (cold) store-open path.
+pub fn explain_query(
+    store: &SqliteStore,
+    query: &str,
+    symbol: &str,
+    knn_fn: Option<KnnFn<'_>>,
+) -> crate::seed::ExplainReport {
+    let query = query.strip_prefix(':').unwrap_or(query).trim();
+    let normalized = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let query = normalized.as_str();
+
+    let (knn_pairs, knn_oracle) = match knn_fn {
+        Some(knn) => {
+            let (knn_scored, _n_eligible, knn_elapsed_ms, oracle) =
+                crate::tools::embed_path_seeds(store, query, knn, &OpenFilter);
+            let budget_ms = crate::tools::knn_budget_ms();
+            if knn_elapsed_ms > budget_ms {
+                (vec![], std::collections::HashMap::new())
+            } else {
+                (knn_scored, oracle)
+            }
+        }
+        None => (vec![], std::collections::HashMap::new()),
+    };
+
+    let score_fn = store.embed_score_fn();
+    let score_ref = score_fn
+        .as_ref()
+        .map(|f| f as &dyn Fn(&str, &[travsr_core::NodeId]) -> Vec<(travsr_core::NodeId, f32)>);
+    crate::seed::explain_seed_set(
+        store,
+        query,
+        symbol,
+        &OpenFilter,
+        knn_pairs,
+        &knn_oracle,
+        score_ref,
+    )
 }
 
 // ── graph ─────────────────────────────────────────────────────────────────────

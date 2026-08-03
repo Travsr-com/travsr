@@ -34,6 +34,10 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
         println!("swept {} orphan edge(s)", report.orphan_edges_swept);
     }
 
+    if let Some(issue) = &report.lexical_index_parity_issue {
+        println!("warning: {issue}");
+    }
+
     if report.aborted {
         if let Some(reason) = &report.abort_reason {
             anyhow::bail!("fsck aborted: {reason}");

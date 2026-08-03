@@ -88,6 +88,17 @@ fn idf_coverage_min() -> f32 {
         .unwrap_or(0.55)
 }
 
+/// Anchor-emit IDF cut (#478 RFC-023 §9): a token below this is too generic to
+/// emit as an anchor at all — stricter than [`idf_coverage_min`], which only
+/// controls whether an already-emitted anchor counts toward coverage.
+fn anchor_emit_cut() -> f32 {
+    std::env::var("TRAVSR_ANCHOR_EMIT_CUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x: &f32| x > 0.0 && x <= 1.0)
+        .unwrap_or(0.15)
+}
+
 /// RRF k constant — controls how sharply the top ranks dominate.
 fn rrf_k() -> f32 {
     std::env::var("TRAVSR_RRF_K")
@@ -480,11 +491,12 @@ pub(crate) fn display_score(
     seed_rerank: &HashMap<NodeId, f32>,
     is_primary_seed: bool,
     expanded_cap: Option<f32>,
+    confidence: Confidence,
 ) -> f32 {
     if let Some(&r) = seed_rerank.get(&node) {
         r
     } else if is_primary_seed {
-        normalized_ppr
+        normalized_ppr.min(confidence_display_ceiling(confidence))
     } else {
         match expanded_cap {
             Some(cap) => normalized_ppr.min(cap),
@@ -961,46 +973,6 @@ pub(crate) fn idf_weight(freq: usize, n_total: usize) -> f32 {
     let num = (n_total + 1) as f32;
     let den = (freq + 1) as f32;
     ((num / den).ln() / num.ln()).clamp(0.05, 1.0)
-}
-
-// ── Signature component check ─────────────────────────────────────────────────
-
-/// Returns `true` if `token` (lowercase) appears as a **standalone word-boundary
-/// component** in `signature`, not merely as a substring of a longer word.
-///
-/// Needed to prevent NL verbs like "works" from matching identifier substrings like
-/// "workspace" (which would add VS Code nodes as anchors for a Rust algorithm query).
-///
-/// Boundary characters: anything that is NOT ASCII alphanumeric.
-///
-/// Examples:
-///   "ppr" in "fn:ppr_inner"           → true  (bounded by ':' and '_')
-///   "works" in "provideWorkspaceChatContext" → false ("works" is inside "workspace")
-///   "auth" in "fn:auth_middleware"    → true  (bounded by ':' and '_')
-///   "auth" in "fn:authentication"     → false ("auth" is a prefix of a longer word)
-fn token_is_sig_component(token: &str, signature: &str) -> bool {
-    let sig = signature.as_bytes();
-    let tok = token.as_bytes();
-    let tlen = tok.len();
-    if tlen == 0 || tlen > sig.len() {
-        return false;
-    }
-    let sig_lower: Vec<u8> = sig.iter().map(|b| b.to_ascii_lowercase()).collect();
-    let tok_lower: Vec<u8> = tok.iter().map(|b| b.to_ascii_lowercase()).collect();
-    let slen = sig_lower.len();
-
-    let mut i = 0;
-    while i + tlen <= slen {
-        if sig_lower[i..i + tlen] == tok_lower[..] {
-            let left_ok = i == 0 || !sig_lower[i - 1].is_ascii_alphanumeric();
-            let right_ok = i + tlen >= slen || !sig_lower[i + tlen].is_ascii_alphanumeric();
-            if left_ok && right_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
 }
 
 // ── RRF fusion ────────────────────────────────────────────────────────────────
@@ -1713,6 +1685,28 @@ fn scope_strong_floor() -> f32 {
         .unwrap_or(SCOPE_STRONG_FLOOR_DEFAULT)
 }
 
+/// #478: ceiling on the displayed score of an unscored primary seed (the
+/// reranker never scored it — G1 bypass, or reranker off/degraded), so a
+/// PPR-normalised 1.0 (true by construction for the top item in any batch,
+/// see the PPR normalisation in `tools.rs`) never reads as an absolute
+/// judgement next to a `weak`/`none` confidence label. The reranked branch in
+/// `display_score` is untouched — an absolute cross-encoder score is already
+/// honest.
+///
+/// Values are display-only proposals (RFC-023 §14.4, not bench-measured).
+/// Gate behind `TRAVSR_DISPLAY_TIER_CAP`; set to `0` to restore pre-#478
+/// output byte-for-byte.
+fn confidence_display_ceiling(confidence: Confidence) -> f32 {
+    if std::env::var("TRAVSR_DISPLAY_TIER_CAP").as_deref() == Ok("0") {
+        return 1.0;
+    }
+    match confidence {
+        Confidence::Exact | Confidence::Strong => 1.0,
+        Confidence::Weak => 0.60,
+        Confidence::None => 0.40,
+    }
+}
+
 /// #393 score-aware scope gate decision (pure, so the admit/gate policy is
 /// unit-testable without a store fixture). Returns `true` = DROP the seed.
 ///
@@ -2023,9 +2017,32 @@ pub(crate) fn build_seed_set(
 
     for token in &content_tokens {
         let exact_nodes = store.search_nodes_by_name(token).unwrap_or_default();
-        let freq = store.symbol_frequency(token).unwrap_or(n_total);
-        let resolved = !exact_nodes.is_empty();
-        let top_node = exact_nodes.first().map(|n| n.id);
+        // #478: absent from the vocabulary (unknown token, or < 3 bytes so
+        // never indexed) is treated as maximally generic, matching the
+        // previous `unwrap_or(n_total)` failure behaviour. A token we cannot
+        // measure must never be *promoted* to a rare anchor.
+        let freq = store
+            .symbol_frequency(token)
+            .ok()
+            .flatten()
+            .unwrap_or(n_total);
+        // #478 RFC-023 §6.2: `resolved` used to be true from an unguarded
+        // substring hit (`search_nodes_by_name` matches on path too, so "wal"
+        // read as resolved via a hit on "walker.ts"). Require the token to
+        // appear as a whole word segment (or contiguous run of segments) in
+        // the candidate's signature or path before counting it as resolved —
+        // otherwise correcting symbol_frequency's df (22 -> 1) alone would
+        // make an unresolved token look *more* specific (IDF 0.660 -> 0.925)
+        // with nothing anchoring it.
+        let boundary_matched: Vec<&CoreNode> = exact_nodes
+            .iter()
+            .filter(|n| {
+                travsr_core::ident::contains_token(token, &n.vname.signature)
+                    || travsr_core::ident::contains_token(token, &n.vname.path)
+            })
+            .collect();
+        let resolved = !boundary_matched.is_empty();
+        let top_node = boundary_matched.first().map(|n| n.id);
 
         let idf_w = idf_weight(freq, n_total);
 
@@ -2038,7 +2055,7 @@ pub(crate) fn build_seed_set(
         });
 
         // Only emit high-IDF tokens as anchors (suppresses generic "queue", "run" etc.)
-        if idf_w < 0.15 {
+        if idf_w < anchor_emit_cut() {
             continue;
         }
         // Emit top-3 matches per token to represent the anchor fully.
@@ -2071,11 +2088,13 @@ pub(crate) fn build_seed_set(
             if !filter.allow(node.id, node.id, Some(node.vname.corpus.as_str())) {
                 continue;
             }
-            // Require the token to appear as a standalone identifier component in the
-            // signature, not just as a substring of a longer word.  This prevents NL
-            // verbs like "works" from anchoring to "provideWorkspaceChatContext" via
-            // the "works" substring of "workspace".
-            if !token_is_sig_component(token, &node.vname.signature) {
+            // Require the token to appear as a whole word segment (or a contiguous
+            // run of segments) in the signature, not just as a substring of a
+            // longer word. #478 WS-1: `ident::contains_token` is camelCase/
+            // PascalCase-aware (unlike the old punctuation-only boundary check),
+            // so "sqlite" now correctly anchors to `fn:SqliteStore.exec_ddl` while
+            // "works" still does not anchor to "provideWorkspaceChatContext".
+            if !travsr_core::ident::contains_token(token, &node.vname.signature) {
                 continue;
             }
             let path_count = anchor_path_counts
@@ -2162,13 +2181,34 @@ pub(crate) fn build_seed_set(
     // explicit max over the batch — using `.first()` here would understate the
     // normalisation denominator and make the score-aware scope gate below (and the
     // `top_bm25` abstention signal) silently more permissive than intended.
-    let top_bm25 = lexical_scored.iter().map(|p| p.1).fold(0.0_f32, f32::max);
+    //
+    // #478 RFC-023 §5.4/Evidence E: fold over `bm25_natural`, not the old
+    // conflated `natural` field. `natural` mixes a real BM25 score (Leg B/C)
+    // with a position-derived synthetic score (Leg A) and even an L2-A/embed
+    // score on a miss — reading it as "the BM25 batch max" is exactly how
+    // `fn:walk` reached norm 1.0 with no lexical evidence at all. `bm25_natural`
+    // is `None` unless Leg B or Leg C actually matched, so this fold is now a
+    // true BM25-scale max, not a mixed-scale one.
+    let top_bm25 = lexical_scored
+        .iter()
+        .filter_map(|hit| hit.bm25_natural)
+        .fold(0.0_f32, f32::max);
     // Normalise BM25 scores per-batch for PPR weight (max = 1.0); floor at 0.05.
     let max_bm25 = top_bm25.max(0.001);
 
     let mut lex_path_counts: HashMap<String, usize> = HashMap::new();
     let mut lexical_raw: Vec<(NodeId, f32)> = Vec::new();
-    for (node, bm25) in &lexical_scored {
+    for hit in &lexical_scored {
+        let node = &hit.node;
+        // #478: no real BM25-scale evidence (Leg B/C) for this node — it only
+        // reached the fused result via Leg A (exact/name) or, on a miss,
+        // L2-A/embed. Those are not lexical evidence; the anchor loop above
+        // and the KNN loop below are the correct paths for them. Admitting a
+        // node here with no lexical backing at all is exactly how a
+        // substring-only match used to escape crate scope at norm 1.0.
+        let Some(bm25) = hit.bm25_natural else {
+            continue;
+        };
         if is_noise_seed(node) {
             continue;
         }
@@ -2709,6 +2749,212 @@ pub(crate) fn build_seed_set(
         coverage,
         confidence,
         top_bm25,
+    }
+}
+
+// ── `travsr explain` diagnostic (#478 RFC-023 §6.1, WS-8) ────────────────────
+
+impl SeedSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Lexical => "lexical",
+            Self::Knn => "knn",
+        }
+    }
+}
+
+/// Per-query-token report: `travsr explain`'s view of the anchor loop.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExplainToken {
+    pub token: String,
+    pub symbol_freq: usize,
+    pub idf_w: f32,
+    pub resolved: bool,
+    pub is_anchor_emit: bool,
+    pub top_node_signature: Option<String>,
+}
+
+/// One leg's raw (pre-fusion) rank + score for the explained node, from
+/// [`travsr_store::ExplainLegs`]. Absent when that leg did not match at all.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct ExplainLeg {
+    pub rank: usize,
+    pub raw_score: f32,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ExplainLegMatches {
+    pub exact: Option<ExplainLeg>,
+    pub word: Option<ExplainLeg>,
+    pub trigram: Option<ExplainLeg>,
+    pub l2a: Option<ExplainLeg>,
+    pub embed: Option<ExplainLeg>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExplainThresholds {
+    pub idf_coverage_min: f32,
+    pub anchor_emit_cut: f32,
+    pub bm25_strong_floor: f32,
+    pub scope_strong_floor: f32,
+}
+
+/// The explained node's outcome for one `build_seed_set` run (live, or the
+/// FTS-only counterfactual).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExplainDisposition {
+    pub in_seed_set: bool,
+    pub seed_rank: Option<usize>,
+    pub weight: Option<f32>,
+    pub source: Option<&'static str>,
+    pub rerank_score: Option<f32>,
+    pub confidence: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExplainReport {
+    pub query: String,
+    pub symbol: String,
+    /// Whether `symbol` resolved to a node in the graph at all — distinct
+    /// from whether that node made it into either seed set.
+    pub node_found: bool,
+    pub target_signature: Option<String>,
+    pub target_path: Option<String>,
+    pub tokens: Vec<ExplainToken>,
+    pub thresholds: ExplainThresholds,
+    /// `None` when `symbol` did not resolve to a node.
+    pub legs: Option<ExplainLegMatches>,
+    pub is_noise: bool,
+    pub oracle_cosine: Option<f32>,
+    pub live: ExplainDisposition,
+    pub fts_only: ExplainDisposition,
+}
+
+/// Per-query-token IDF, per-leg match, every gate + threshold, and final
+/// disposition — including the FTS-only counterfactual — for one
+/// query/symbol pair. Built on top of [`build_seed_set`] and
+/// [`SqliteStore::explain_leg_scores`] rather than threading a collector
+/// through either: both already compute (or make available) everything this
+/// needs, so a diagnostic-only caller does not add any cost or risk to the
+/// hot query path (RFC-023 §6.1/§10 — zero cost when not invoked, since this
+/// function is only ever called by `travsr explain` itself).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn explain_seed_set(
+    store: &SqliteStore,
+    query: &str,
+    symbol: &str,
+    filter: &dyn EdgeFilter,
+    knn_pairs: Vec<(CoreNode, f32)>,
+    knn_oracle: &HashMap<NodeId, f32>,
+    score_fn: Option<&dyn Fn(&str, &[NodeId]) -> Vec<(NodeId, f32)>>,
+) -> ExplainReport {
+    let normalized_query = travsr_store::fts_tokenize::normalize_nl_query(query);
+    let query = normalized_query.as_str();
+
+    // Resolve the target symbol to a node: prefer an exact signature match
+    // (mirrors the G1 fast-path's own equality check) over the first
+    // substring hit, since `search_nodes_by_name` is substring-based.
+    let candidates = store.search_nodes_by_name(symbol).unwrap_or_default();
+    let target = candidates
+        .iter()
+        .find(|n| n.vname.signature == symbol)
+        .or_else(|| candidates.first())
+        .cloned();
+    let target_id = target.as_ref().map(|n| n.id);
+
+    let live_set = build_seed_set(store, query, filter, knn_pairs, knn_oracle, score_fn);
+    // FTS-only counterfactual (RFC-023 §11 AC #1, §6.1): the same query with
+    // embeddings entirely absent, so `explain` can show whether the live
+    // result depends on the embed backstop the RFC exists to stop relying on.
+    let empty_oracle: HashMap<NodeId, f32> = HashMap::new();
+    let fts_only_set = build_seed_set(store, query, filter, Vec::new(), &empty_oracle, None);
+
+    let tokens: Vec<ExplainToken> = live_set
+        .terms
+        .iter()
+        .map(|t| ExplainToken {
+            token: t.token.clone(),
+            symbol_freq: t.symbol_freq,
+            idf_w: t.idf_w,
+            resolved: t.resolved,
+            is_anchor_emit: t.idf_w >= anchor_emit_cut(),
+            top_node_signature: t
+                .top_node
+                .and_then(|id| store.get_node(id).ok().flatten())
+                .map(|n| n.vname.signature),
+        })
+        .collect();
+
+    let thresholds = ExplainThresholds {
+        idf_coverage_min: idf_coverage_min(),
+        anchor_emit_cut: anchor_emit_cut(),
+        bm25_strong_floor: bm25_strong_floor(),
+        scope_strong_floor: scope_strong_floor(),
+    };
+
+    let (legs, is_noise, oracle_cosine) = match &target {
+        Some(node) => {
+            let empty_legs = || travsr_store::ExplainLegs {
+                exact: Vec::new(),
+                word: Vec::new(),
+                trigram: Vec::new(),
+                l2a: Vec::new(),
+                embed: Vec::new(),
+            };
+            let leg_scores = store
+                .explain_leg_scores(query, None)
+                .unwrap_or_else(|_| empty_legs());
+            let find = |leg: &[(CoreNode, f32)]| -> Option<ExplainLeg> {
+                leg.iter()
+                    .position(|(n, _)| n.id == node.id)
+                    .map(|rank| ExplainLeg {
+                        rank,
+                        raw_score: leg[rank].1,
+                    })
+            };
+            let matches = ExplainLegMatches {
+                exact: find(&leg_scores.exact),
+                word: find(&leg_scores.word),
+                trigram: find(&leg_scores.trigram),
+                l2a: find(&leg_scores.l2a),
+                embed: find(&leg_scores.embed),
+            };
+            (
+                Some(matches),
+                is_noise_seed(node),
+                knn_oracle.get(&node.id).copied(),
+            )
+        }
+        None => (None, false, None),
+    };
+
+    let disposition_for = |set: &SeedSet| -> ExplainDisposition {
+        let seed =
+            target_id.and_then(|id| set.seeds.iter().enumerate().find(|(_, s)| s.node == id));
+        ExplainDisposition {
+            in_seed_set: seed.is_some(),
+            seed_rank: seed.as_ref().map(|(rank, _)| *rank),
+            weight: seed.as_ref().map(|(_, s)| s.weight),
+            source: seed.as_ref().map(|(_, s)| s.source.label()),
+            rerank_score: seed.as_ref().and_then(|(_, s)| s.rerank_score),
+            confidence: set.confidence.label(),
+        }
+    };
+
+    ExplainReport {
+        query: query.to_string(),
+        symbol: symbol.to_string(),
+        node_found: target.is_some(),
+        target_signature: target.as_ref().map(|n| n.vname.signature.clone()),
+        target_path: target.as_ref().map(|n| n.vname.path.clone()),
+        tokens,
+        thresholds,
+        legs,
+        is_noise,
+        oracle_cosine,
+        live: disposition_for(&live_set),
+        fts_only: disposition_for(&fts_only_set),
     }
 }
 
@@ -3355,16 +3601,72 @@ mod tests {
 
         // Reranked seed shows its absolute cross-encoder score, NOT the
         // normalized-PPR 1.0 (this is the "always 1.00" artefact F9 kills).
-        assert_eq!(display_score(NodeId(1), 1.0, &rr, true, cap), 0.85);
-        // Primary seed the reranker never scored → its own normalized PPR, uncapped.
-        assert_eq!(display_score(NodeId(2), 0.9, &rr, true, cap), 0.9);
+        assert_eq!(
+            display_score(NodeId(1), 1.0, &rr, true, cap, Confidence::Strong),
+            0.85
+        );
+        // Primary seed the reranker never scored → its own normalized PPR, uncapped
+        // at Strong/Exact confidence.
+        assert_eq!(
+            display_score(NodeId(2), 0.9, &rr, true, cap, Confidence::Strong),
+            0.9
+        );
         // Expanded neighbour above the cap is pulled down so it can't outrank its seed.
-        assert_eq!(display_score(NodeId(3), 1.0, &rr, false, cap), 0.85);
+        assert_eq!(
+            display_score(NodeId(3), 1.0, &rr, false, cap, Confidence::Strong),
+            0.85
+        );
         // Expanded neighbour already below the cap keeps its own score.
-        assert_eq!(display_score(NodeId(4), 0.3, &rr, false, cap), 0.3);
+        assert_eq!(
+            display_score(NodeId(4), 0.3, &rr, false, cap, Confidence::Strong),
+            0.3
+        );
         // No reranked seeds at all (ships-dark / reranker off) → cap is a no-op.
         let empty: HashMap<NodeId, f32> = HashMap::new();
-        assert_eq!(display_score(NodeId(5), 0.7, &empty, false, None), 0.7);
+        assert_eq!(
+            display_score(NodeId(5), 0.7, &empty, false, None, Confidence::Exact),
+            0.7
+        );
+    }
+
+    #[test]
+    fn display_score_tier_ceiling_caps_unscored_primary_seed_only() {
+        let empty: HashMap<NodeId, f32> = HashMap::new();
+        // #478: an unscored primary seed (reranker never scored it) at
+        // normalized-PPR 1.0 must not display as 1.0 next to weak/none
+        // confidence — that is the "1.000 next to confidence: weak" defect.
+        assert_eq!(
+            display_score(NodeId(1), 1.0, &empty, true, None, Confidence::Weak),
+            0.60
+        );
+        assert_eq!(
+            display_score(NodeId(1), 1.0, &empty, true, None, Confidence::None),
+            0.40
+        );
+        // Exact/Strong stay uncapped.
+        assert_eq!(
+            display_score(NodeId(1), 1.0, &empty, true, None, Confidence::Exact),
+            1.0
+        );
+        // A score already below the tier ceiling is untouched (min() is a no-op).
+        assert_eq!(
+            display_score(NodeId(1), 0.5, &empty, true, None, Confidence::Weak),
+            0.5
+        );
+        // The reranked branch is never touched by the ceiling, regardless of confidence.
+        let mut rr: HashMap<NodeId, f32> = HashMap::new();
+        rr.insert(NodeId(2), 0.95);
+        assert_eq!(
+            display_score(NodeId(2), 1.0, &rr, true, None, Confidence::None),
+            0.95
+        );
+        // TRAVSR_DISPLAY_TIER_CAP=0 restores pre-#478 output byte-for-byte.
+        std::env::set_var("TRAVSR_DISPLAY_TIER_CAP", "0");
+        assert_eq!(
+            display_score(NodeId(1), 1.0, &empty, true, None, Confidence::None),
+            1.0
+        );
+        std::env::remove_var("TRAVSR_DISPLAY_TIER_CAP");
     }
 
     #[test]
@@ -4913,6 +5215,204 @@ mod tests {
             seed_set.seeds.iter().any(|s| s.node == daemon.id),
             "G1's rare exact match must survive semantic_validate, not be cut \
              by a low cosine to the noisy whole-query embedding; seeds: {:?}",
+            seed_set
+                .seeds
+                .iter()
+                .map(|s| (s.node, s.source))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── #478 RFC-023: FTS-only lexical precision regression tests ────────────
+    //
+    // Every test below passes `None` as `score_fn` (the RFC-019 direct-cosine
+    // oracle). The original bug was invisible on a warm embed oracle — the
+    // oracle vetoed the bad candidate and the query correctly abstained —
+    // which is exactly why the pre-#478 suite never caught it. These tests
+    // run the FTS-only path deliberately, per RFC-023 AC #10.
+
+    /// The #478 repro itself. `fn:walk` in `walker.ts` is a pure trigram
+    /// substring match on the query token "wal" with no word-boundary
+    /// evidence, and must not anchor — before this fix it reached norm 1.000
+    /// and outranked everything, including escaping crate scope.
+    #[test]
+    fn wal_does_not_anchor_to_walk_on_the_fts_only_path() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let walk = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "packages/travsr-lsif-ts/src/walker.ts",
+                "typescript",
+                "fn:walk",
+            ),
+            "function",
+        );
+        store.put_node(&walk).unwrap();
+
+        // A genuine SQLite/WAL-adjacent node so the query resolves to
+        // *something* real rather than testing pure abstention.
+        let journal_mode = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "crates/travsr-store/src/lib.rs",
+                "rust",
+                "fn:SqliteStore.journal_mode",
+            ),
+            "method",
+        );
+        store.put_node(&journal_mode).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "what is the rationale for SQLite WAL",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None, // FTS-only: embed oracle disabled.
+        );
+
+        assert!(
+            !seed_set.seeds.iter().any(|s| s.node == walk.id),
+            "fn:walk must not anchor to the 'wal' token on the FTS-only path; \
+             seeds: {:?}",
+            seed_set
+                .seeds
+                .iter()
+                .map(|s| (s.node, s.source))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// #478 RFC-023 §6.1 (WS-8): `travsr explain`'s own report on the exact
+    /// #478 repro fixture must show the leg separation that explains *why*
+    /// `fn:walk` doesn't anchor — a real trigram (substring) match and no
+    /// word/exact match — not just the fact that it doesn't. This is the
+    /// diagnostic's core value proposition, pinned as a regression.
+    #[test]
+    fn explain_seed_set_shows_trigram_only_match_for_walk_on_wal_query() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let walk = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "packages/travsr-lsif-ts/src/walker.ts",
+                "typescript",
+                "fn:walk",
+            ),
+            "function",
+        );
+        store.put_node(&walk).unwrap();
+
+        let report = explain_seed_set(
+            &store,
+            "what is the rationale for SQLite WAL",
+            "fn:walk",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None, // FTS-only: embed oracle disabled.
+        );
+
+        assert!(report.node_found, "fn:walk must resolve to a node");
+        let legs = report.legs.expect("legs must be Some when node_found");
+        assert!(
+            legs.trigram.is_some(),
+            "fn:walk must show a trigram (substring) match on 'wal' — that's \
+             the actual mechanism, and explain exists to surface it"
+        );
+        assert!(
+            legs.word.is_none(),
+            "fn:walk must NOT show a word-leg match — 'wal' is not a word \
+             segment of 'walk', only a substring of it"
+        );
+        assert!(
+            legs.exact.is_none(),
+            "fn:walk has no genuine exact/name match for this query"
+        );
+    }
+
+    /// RFC-023 AC #2 (the W1 fix): `sqlite` must now anchor to
+    /// `SqliteStore.*` methods — rejected pre-#478 because the old
+    /// punctuation-only boundary check saw `s` immediately after `sqlite` in
+    /// `SqliteStore` and refused the match.
+    #[test]
+    fn sqlite_anchors_to_sqlitestore_method_on_the_fts_only_path() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let exec_ddl = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "crates/travsr-store/src/lib.rs",
+                "rust",
+                "fn:SqliteStore.exec_ddl",
+            ),
+            "method",
+        );
+        store.put_node(&exec_ddl).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "sqlite exec_ddl",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert!(
+            seed_set.seeds.iter().any(|s| s.node == exec_ddl.id),
+            "SqliteStore.exec_ddl must anchor for the token 'sqlite' \
+             (camelCase/PascalCase-aware boundary check); seeds: {:?}",
+            seed_set
+                .seeds
+                .iter()
+                .map(|s| (s.node, s.source))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// RFC-023 AC #6: word-level `symbol_frequency` — "works" must not anchor
+    /// via a substring hit inside "workspace" (the regression guard for the
+    /// anchor loop's `resolved`/boundary check, not just `contains_token`
+    /// in isolation).
+    #[test]
+    fn works_does_not_anchor_to_workspace_on_the_fts_only_path() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let workspace_fn = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "packages/travsr-vscode/src/extension.ts",
+                "typescript",
+                "fn:provideWorkspaceChatContext",
+            ),
+            "function",
+        );
+        store.put_node(&workspace_fn).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "does this works correctly",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert!(
+            !seed_set.seeds.iter().any(|s| s.node == workspace_fn.id),
+            "provideWorkspaceChatContext must not anchor for the NL verb \
+             'works'; seeds: {:?}",
             seed_set
                 .seeds
                 .iter()

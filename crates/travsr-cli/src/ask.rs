@@ -250,6 +250,9 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
         "\n{n} nodes · ~{} tokens{confidence_note}{embed_note}",
         payload.total_tokens
     );
+    if !payload.degraded_note.is_empty() {
+        println!("{}", payload.degraded_note);
+    }
     Ok(())
 }
 
