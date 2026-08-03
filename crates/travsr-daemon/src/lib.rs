@@ -4215,6 +4215,61 @@ mod tests {
     }
 
     #[test]
+    fn control_reindex_commit_stamps_last_commit_when_nothing_changed() {
+        // Regression: reindex_files only stamps last_commit when any_changed
+        // is true (avoids stamping FS noise). The daemon's git-hook path
+        // never got the PR #207 fix that made init_repo stamp last_commit
+        // unconditionally — so a commit whose files were already reindexed
+        // by the live watcher before the hook ran (the common editor-save-
+        // then-commit flow) left last_commit permanently stale.
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let ts_path = tmp.path().join("svc.ts");
+        std::fs::write(&ts_path, "export class Svc { go() {} }").unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        // Pre-reindex so the file's hash is already current — the next
+        // ReindexCommit must find any_changed == false, same as the real
+        // "editor already saved, watcher already indexed it" sequence.
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert!(store.get_meta("last_commit").unwrap().is_none());
+
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        let msg = serde_json::to_string(&travsr_ipc::ControlMessage::ReindexCommit {
+            sha: "deadbeef".to_string(),
+        })
+        .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            tmp.path(),
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+        );
+        assert!(resp.ok, "control message must succeed: {resp:?}");
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get_meta("last_commit").unwrap().as_deref(),
+            Some("deadbeef"),
+            "last_commit must be stamped even when reindex_files found nothing to change"
+        );
+    }
+
+    #[test]
     fn maybe_spawn_embed_does_not_trigger_phase2_when_phase2_flag_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, store) = setup_repo_with_phase_b(5, Some("deadbeef"));
@@ -5044,6 +5099,19 @@ fn handle_control_message(
                     return (ControlResponse::err(e.to_string()), false);
                 }
             };
+            // Stamp last_commit unconditionally, independent of whether any
+            // file actually changed — mirrors the init_repo fix (PR #207) for
+            // the same any_changed-suppression regression: a commit whose
+            // files were already reindexed by the live watcher before the
+            // hook ran (the common editor-save-then-commit flow) must still
+            // advance last_commit, or `travsr status` reports stale forever.
+            // Skip only when reindex_files itself skipped everything due to a
+            // signature-format mismatch (graph.db needs `travsr init`), so
+            // this never claims freshness for a commit that was never
+            // actually reindexed.
+            if s.get_signature_format_version().ok() == Some(SIGNATURE_FORMAT_VERSION) {
+                let _ = s.set_meta("last_commit", &sha);
+            }
             drop(s);
             enqueue_dirty_callers(dirty, repo_root, index_tx);
             // #318 O3: Phase A is now fresh for this commit; arm a debounced
