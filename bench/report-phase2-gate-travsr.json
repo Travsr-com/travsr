@@ -1,151 +1,525 @@
 {
-  "generatedAt": "2026-08-02T14:30:02.603Z",
+  "generatedAt": "2026-08-03T20:37:21.593Z",
   "repo": "travsr",
   "gate1_docHit": {
     "pass": true,
-    "n": 20,
-    "hit@1": 0.9,
-    "hit@3": 0.9,
-    "medianMs": 1036,
+    "n": 22,
+    "hit@1": 0.864,
+    "hit@3": 0.909,
+    "medianMs": 1008,
     "threshold": "hit@1>=0.60, hit@3>=0.90"
   },
   "gate2_codeRegression": {
     "pass": true,
     "off": {
       "n": 33,
-      "hit@1": 0.636,
-      "hit@3": 0.727,
-      "hit@10": 0.788,
+      "hit@1": 0.545,
+      "hit@3": 0.667,
+      "hit@10": 0.727,
       "abstainN": 11,
-      "abstainCorrect": 10,
-      "abstainRate": 0.909,
-      "medianMs": 348,
+      "abstainCorrect": 9,
+      "abstainRate": 0.818,
+      "medianMs": 335,
       "docsLeaked": 0
     },
     "on": {
       "n": 33,
-      "hit@1": 0.636,
-      "hit@3": 0.727,
-      "hit@10": 0.788,
+      "hit@1": 0.545,
+      "hit@3": 0.667,
+      "hit@10": 0.727,
       "abstainN": 11,
-      "abstainCorrect": 10,
-      "abstainRate": 0.909,
-      "medianMs": 878,
+      "abstainCorrect": 9,
+      "abstainRate": 0.818,
+      "medianMs": 857,
       "docsLeaked": 0
     },
     "perQueryRegressions": []
   },
   "gate3_abstainRegression": {
     "pass": true,
-    "offAbstainRate": 0.909,
-    "onAbstainRate": 0.909
+    "offAbstainRate": 0.818,
+    "onAbstainRate": 0.818
   },
   "gate4_singleInference": {
     "pass": true,
     "vacuous": false,
     "probeCovered": true,
-    "queriesTraced": 23,
-    "queriesSearchingBothSpaces": 23,
-    "totalInferences": 23,
-    "totalMemoHits": 23,
+    "queriesTraced": 25,
+    "queriesSearchingBothSpaces": 25,
+    "totalInferences": 49,
+    "totalMemoHits": 1,
     "violations": [],
     "ttlExpiries": [],
+    "docsRecallSplits": [
+      {
+        "id": "T1",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 863,
+        "queryTexts": [
+          "why did we choose personalized pagerank over breadth first search for retrieval",
+          "why choose personalized pagerank over breadth first search retrieval"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T2",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 917,
+        "queryTexts": [
+          "what is our policy when LSIF and tree-sitter disagree about an edge",
+          "our policy LSIF tree-sitter disagree about edge"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T3",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 865,
+        "queryTexts": [
+          "what are the rules about unwrap and error handling in library code",
+          "rules about unwrap error handling library code"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T4",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1219,
+        "queryTexts": [
+          "why is the VName signature format version bumped and what breaks when it changes",
+          "why VName signature format version bumped breaks changes"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T5",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1328,
+        "queryTexts": [
+          "how does the knapsack enforce the token budget",
+          "knapsack enforce token budget"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T6",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 774,
+        "queryTexts": [
+          "what is the cross encoder relevance arbiter supposed to fix",
+          "cross encoder relevance arbiter supposed fix"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T7",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1846,
+        "queryTexts": [
+          "why do we run embeddings in a downloadable sidecar instead of in process",
+          "why run embeddings downloadable sidecar instead process"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T8",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1092,
+        "queryTexts": [
+          "how is the graph RBAC session and scope model defined",
+          "graph RBAC session scope model defined"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T9",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 722,
+        "queryTexts": [
+          "what is the corpus naming convention derived from a git remote",
+          "corpus naming convention derived git remote"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T10",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1292,
+        "queryTexts": [
+          "why did the model relative semantic floors need auto calibration per model",
+          "why model relative semantic floors need auto calibration per model"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T11",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1137,
+        "queryTexts": [
+          "what were the measured root causes of conceptual retrieval failures",
+          "measured root causes conceptual retrieval failures"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T12",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1736,
+        "queryTexts": [
+          "how do we resolve cross language edges between rust and typescript",
+          "resolve cross language edges between rust typescript"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T13",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1221,
+        "queryTexts": [
+          "what is the plan for parallel reindex workers",
+          "plan parallel reindex workers"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T14",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 766,
+        "queryTexts": [
+          "how does the two transport plugin architecture work",
+          "two transport plugin architecture work"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T15",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1276,
+        "queryTexts": [
+          "why does the retrieval cascade short circuit and starve top K results",
+          "why retrieval cascade short circuit starve top results"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T16",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1129,
+        "queryTexts": [
+          "what is the MCP SSE transport design for the cloud tier",
+          "MCP SSE transport design cloud tier"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T17",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 758,
+        "queryTexts": [
+          "how should overview mode behave in the API",
+          "overview mode behave API"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T18",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 583,
+        "queryTexts": [
+          "how are phase B symbols unified with phase A tree-sitter nodes",
+          "phase symbols unified phase tree-sitter nodes"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T19",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 852,
+        "queryTexts": [
+          "what does the fuzzy seed selection design propose",
+          "fuzzy seed selection design propose"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T20",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1008,
+        "queryTexts": [
+          "why was a per repo linear projection head for embeddings rejected",
+          "why per repo linear projection head embeddings rejected"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T22",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 670,
+        "queryTexts": [
+          "why did we drop kuzu",
+          "why drop kuzu"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T1-punct",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 971,
+        "queryTexts": [
+          "why did we choose personalized pagerank over breadth first search for retrieval",
+          "why choose personalized pagerank over breadth first search retrieval"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T2-punct",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 882,
+        "queryTexts": [
+          "what is our policy when LSIF and tree-sitter disagree about an edge",
+          "our policy LSIF tree-sitter disagree about edge"
+        ],
+        "kind": "docs-lane-recall-split"
+      },
+      {
+        "id": "T3-punct",
+        "inferences": 2,
+        "spaces": [
+          "code",
+          "docs"
+        ],
+        "ms": 1001,
+        "queryTexts": [
+          "what are the rules about unwrap and error handling in library code",
+          "rules about unwrap error handling library code"
+        ],
+        "kind": "docs-lane-recall-split"
+      }
+    ],
     "punctuatedProbe": [
       {
         "id": "T1-punct",
         "query": "why did we choose personalized pagerank over breadth first search for retrieval?",
-        "ms": 775,
-        "embedInferences": 1,
-        "embedMemoHits": 1,
+        "ms": 971,
+        "embedInferences": 2,
+        "embedMemoHits": 0,
         "spacesSearched": [
           "code",
           "docs"
         ],
         "normalizedSeen": [
-          "why did we choose personalized pagerank over breadth first search for retrieval"
+          "why did we choose personalized pagerank over breadth first search for retrieval",
+          "why choose personalized pagerank over breadth first search retrieval"
         ],
         "queryTexts": [
-          "why did we choose personalized pagerank over breadth first search for retrieval"
+          "why did we choose personalized pagerank over breadth first search for retrieval",
+          "why choose personalized pagerank over breadth first search retrieval"
+        ],
+        "missEntries": [
+          {
+            "space": "code",
+            "query": "why did we choose personalized pagerank over breadth first search for retrieval"
+          },
+          {
+            "space": "docs",
+            "query": "why choose personalized pagerank over breadth first search retrieval"
+          }
         ]
       },
       {
         "id": "T2-punct",
         "query": "what is our policy when LSIF and tree-sitter disagree about an edge?",
-        "ms": 988,
-        "embedInferences": 1,
-        "embedMemoHits": 1,
+        "ms": 882,
+        "embedInferences": 2,
+        "embedMemoHits": 0,
         "spacesSearched": [
           "code",
           "docs"
         ],
         "normalizedSeen": [
-          "what is our policy when LSIF and tree-sitter disagree about an edge"
+          "what is our policy when LSIF and tree-sitter disagree about an edge",
+          "our policy LSIF tree-sitter disagree about edge"
         ],
         "queryTexts": [
-          "what is our policy when LSIF and tree-sitter disagree about an edge"
+          "what is our policy when LSIF and tree-sitter disagree about an edge",
+          "our policy LSIF tree-sitter disagree about edge"
+        ],
+        "missEntries": [
+          {
+            "space": "code",
+            "query": "what is our policy when LSIF and tree-sitter disagree about an edge"
+          },
+          {
+            "space": "docs",
+            "query": "our policy LSIF tree-sitter disagree about edge"
+          }
         ]
       },
       {
         "id": "T3-punct",
         "query": "what are the rules about unwrap and error handling in library code?",
-        "ms": 1030,
-        "embedInferences": 1,
-        "embedMemoHits": 1,
+        "ms": 1001,
+        "embedInferences": 2,
+        "embedMemoHits": 0,
         "spacesSearched": [
           "code",
           "docs"
         ],
         "normalizedSeen": [
-          "what are the rules about unwrap and error handling in library code"
+          "what are the rules about unwrap and error handling in library code",
+          "rules about unwrap error handling library code"
         ],
         "queryTexts": [
-          "what are the rules about unwrap and error handling in library code"
+          "what are the rules about unwrap and error handling in library code",
+          "rules about unwrap error handling library code"
+        ],
+        "missEntries": [
+          {
+            "space": "code",
+            "query": "what are the rules about unwrap and error handling in library code"
+          },
+          {
+            "space": "docs",
+            "query": "rules about unwrap error handling library code"
+          }
         ]
       }
     ],
-    "threshold": "zero normalization divergences (a query whose trace holds >1 distinct text); >=1 query searching both spaces; punctuated probe exercised (scored sets contain no sentence punctuation). Memo TTL expiries are reported, not failed: they track machine load, not the §4.4 contract."
+    "threshold": "zero normalization divergences (a query whose trace holds >1 distinct text with no clean code/docs space split); >=1 query searching both spaces; punctuated probe exercised (scored sets contain no sentence punctuation). Memo TTL expiries and #539's expected docs-lane recall split (content-token text in the docs space vs full-sentence text in the code space) are reported, not failed."
   },
   "gate5_askSurface": {
     "pass": true,
     "error": null,
     "vacuous": false,
     "docs": {
-      "n": 20,
-      "hit@1": 0.9,
-      "hit@3": 0.9,
-      "medianMs": 1332,
-      "queriesWithDocs": 18,
+      "n": 22,
+      "hit@1": 0.864,
+      "hit@3": 0.909,
+      "medianMs": 1125,
+      "queriesWithDocs": 20,
       "errors": 0
     },
     "codeOff": {
       "n": 33,
-      "hit@1": 0.576,
-      "hit@3": 0.667,
-      "hit@10": 0.727,
+      "hit@1": 0.485,
+      "hit@3": 0.606,
+      "hit@10": 0.758,
       "abstainN": 11,
-      "abstainCorrect": 10,
-      "abstainRate": 0.909,
-      "medianMs": 400,
+      "abstainCorrect": 9,
+      "abstainRate": 0.818,
+      "medianMs": 385,
       "docsLeaked": 0
     },
     "codeOn": {
       "n": 33,
-      "hit@1": 0.576,
-      "hit@3": 0.667,
-      "hit@10": 0.727,
+      "hit@1": 0.485,
+      "hit@3": 0.606,
+      "hit@10": 0.758,
       "abstainN": 11,
-      "abstainCorrect": 10,
-      "abstainRate": 0.909,
-      "medianMs": 1001,
+      "abstainCorrect": 9,
+      "abstainRate": 0.818,
+      "medianMs": 916,
       "docsLeaked": 0
     },
     "codeStable": true,
     "docsLeakedWhileOff": 0,
     "surfaceParity": {
-      "comparable": 20,
+      "comparable": 22,
       "disagreements": []
     },
-    "daemonReadyMs": 3581,
+    "daemonReadyMs": 3985,
     "daemonWasRunningBefore": true,
     "threshold": "ask hit@1>=0.60, hit@3>=0.90; >=1 query rendering docs; zero presence/top-1 disagreement with get_context; zero code hit/abstain movement docs off vs on",
     "rows": [
@@ -154,7 +528,7 @@
         "query": "why did we choose personalized pagerank over breadth first search for retrieval",
         "rank": 1,
         "nDocs": 2,
-        "ms": 1060,
+        "ms": 1162,
         "matched": false,
         "entries": [
           {
@@ -163,7 +537,7 @@
           },
           {
             "path": "README.md",
-            "heading": "Travsr › How It Works › Retrieval Algorithms:382-394"
+            "heading": "Travsr › How It Works › Retrieval Algorithms:382-399"
           }
         ]
       },
@@ -172,7 +546,7 @@
         "query": "what is our policy when LSIF and tree-sitter disagree about an edge",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1452,
+        "ms": 1034,
         "matched": true,
         "entries": [
           {
@@ -194,7 +568,7 @@
         "query": "what are the rules about unwrap and error handling in library code",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1187,
+        "ms": 897,
         "matched": false,
         "entries": [
           {
@@ -216,7 +590,7 @@
         "query": "why is the VName signature format version bumped and what breaks when it changes",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1178,
+        "ms": 1256,
         "matched": true,
         "entries": [
           {
@@ -238,7 +612,7 @@
         "query": "how does the knapsack enforce the token budget",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1607,
+        "ms": 958,
         "matched": true,
         "entries": [
           {
@@ -260,7 +634,7 @@
         "query": "what is the cross encoder relevance arbiter supposed to fix",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1094,
+        "ms": 808,
         "matched": false,
         "entries": [
           {
@@ -282,7 +656,7 @@
         "query": "why do we run embeddings in a downloadable sidecar instead of in process",
         "rank": 1,
         "nDocs": 3,
-        "ms": 2100,
+        "ms": 1578,
         "matched": true,
         "entries": [
           {
@@ -304,7 +678,7 @@
         "query": "how is the graph RBAC session and scope model defined",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1385,
+        "ms": 1178,
         "matched": false,
         "entries": [
           {
@@ -326,7 +700,7 @@
         "query": "what is the corpus naming convention derived from a git remote",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1129,
+        "ms": 752,
         "matched": true,
         "entries": [
           {
@@ -348,7 +722,7 @@
         "query": "why did the model relative semantic floors need auto calibration per model",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1615,
+        "ms": 1358,
         "matched": true,
         "entries": [
           {
@@ -370,7 +744,7 @@
         "query": "what were the measured root causes of conceptual retrieval failures",
         "rank": 0,
         "nDocs": 0,
-        "ms": 1018,
+        "ms": 1261,
         "matched": false,
         "entries": []
       },
@@ -379,7 +753,7 @@
         "query": "how do we resolve cross language edges between rust and typescript",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1938,
+        "ms": 1585,
         "matched": true,
         "entries": [
           {
@@ -401,7 +775,7 @@
         "query": "what is the plan for parallel reindex workers",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1517,
+        "ms": 1125,
         "matched": true,
         "entries": [
           {
@@ -423,7 +797,7 @@
         "query": "how does the two transport plugin architecture work",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1082,
+        "ms": 779,
         "matched": false,
         "entries": [
           {
@@ -445,7 +819,7 @@
         "query": "why does the retrieval cascade short circuit and starve top K results",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1654,
+        "ms": 1224,
         "matched": false,
         "entries": [
           {
@@ -467,7 +841,7 @@
         "query": "what is the MCP SSE transport design for the cloud tier",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1217,
+        "ms": 1168,
         "matched": false,
         "entries": [
           {
@@ -489,7 +863,7 @@
         "query": "how should overview mode behave in the API",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1127,
+        "ms": 860,
         "matched": false,
         "entries": [
           {
@@ -511,7 +885,7 @@
         "query": "how are phase B symbols unified with phase A tree-sitter nodes",
         "rank": 1,
         "nDocs": 3,
-        "ms": 1332,
+        "ms": 953,
         "matched": false,
         "entries": [
           {
@@ -533,7 +907,7 @@
         "query": "what does the fuzzy seed selection design propose",
         "rank": 1,
         "nDocs": 3,
-        "ms": 945,
+        "ms": 993,
         "matched": false,
         "entries": [
           {
@@ -555,18 +929,62 @@
         "query": "why was a per repo linear projection head for embeddings rejected",
         "rank": 0,
         "nDocs": 0,
-        "ms": 1777,
+        "ms": 1177,
         "matched": true,
         "entries": []
+      },
+      {
+        "id": "T21",
+        "query": "kuzu",
+        "rank": 1,
+        "nDocs": 3,
+        "ms": 678,
+        "matched": false,
+        "entries": [
+          {
+            "path": "docs/adrs/ADR-018-drop-kuzu-backend.md",
+            "heading": "Adr 018 Drop The Kùzu Storage Backend Sqlite Onl › Context:13-25"
+          },
+          {
+            "path": "docs/rfcs/RFC-008-multilang-extension-architecture.md",
+            "heading": "Rfc 008 Multi Language Extension Architecture:1-14"
+          },
+          {
+            "path": "docs/rfcs/RFC-011-two-transport-plugin-architecture.md",
+            "heading": "Rfc 011 Two Transport Language Plugin Architectu:1-14"
+          }
+        ]
+      },
+      {
+        "id": "T22",
+        "query": "why did we drop kuzu",
+        "rank": 2,
+        "nDocs": 3,
+        "ms": 589,
+        "matched": false,
+        "entries": [
+          {
+            "path": "docs/rfcs/RFC-012-fuzzy-seed-selection.md",
+            "heading": "Rfc 012 Fuzzy Seed Selection:1-17"
+          },
+          {
+            "path": "docs/adrs/ADR-018-drop-kuzu-backend.md",
+            "heading": "Adr 018 Drop The Kùzu Storage Backend Sqlite Onl › Context:13-25"
+          },
+          {
+            "path": "docs/rfcs/RFC-001-mvp-scope.md",
+            "heading": "Rfc 001 Mvp Scope Phase 1:1-15"
+          }
+        ]
       }
     ]
   },
   "crossEncoderCost": {
     "gating": false,
     "accepted": true,
-    "offMedianMs": 348,
-    "onMedianMs": 878,
-    "ratio": 2.523,
+    "offMedianMs": 335,
+    "onMedianMs": 857,
+    "ratio": 2.558,
     "cause": "second full cross-encoder pass per query (docs lane), plan §12",
     "followUp": "selective/hybrid reranking — only invoke the cross-encoder when raw cosine is ambiguous (§12)"
   },
@@ -575,217 +993,338 @@
       "id": "T1",
       "query": "why did we choose personalized pagerank over breadth first search for retrieval",
       "rank": 1,
-      "ms": 897,
+      "ms": 863,
       "nDocs": 2,
       "topEntry": {
         "path": "docs/adrs/ADR-003-ppr-policy.md",
         "heading": "Adr 003 Personalized Pagerank Damping Factor Con › Context:11-22"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "why did we choose personalized pagerank over breadth first search for retrieval"
+        "why did we choose personalized pagerank over breadth first search for retrieval",
+        "why choose personalized pagerank over breadth first search retrieval"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "why did we choose personalized pagerank over breadth first search for retrieval"
+        },
+        {
+          "space": "docs",
+          "query": "why choose personalized pagerank over breadth first search retrieval"
+        }
       ]
     },
     {
       "id": "T2",
       "query": "what is our policy when LSIF and tree-sitter disagree about an edge",
       "rank": 1,
-      "ms": 873,
+      "ms": 917,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/adrs/ADR-002-edge-provenance-policy.md",
         "heading": "Adr 002 Edge Provenance And Lsif Tree Sitter Pre › Consequences:25-42"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "what is our policy when LSIF and tree-sitter disagree about an edge"
+        "what is our policy when LSIF and tree-sitter disagree about an edge",
+        "our policy LSIF tree-sitter disagree about edge"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what is our policy when LSIF and tree-sitter disagree about an edge"
+        },
+        {
+          "space": "docs",
+          "query": "our policy LSIF tree-sitter disagree about edge"
+        }
       ]
     },
     {
       "id": "T3",
       "query": "what are the rules about unwrap and error handling in library code",
       "rank": 1,
-      "ms": 1300,
+      "ms": 865,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/adrs/ADR-001-coding-standards.md",
         "heading": "Adr 001 Rust Coding Standards › Consequences:61-68"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "what are the rules about unwrap and error handling in library code"
+        "what are the rules about unwrap and error handling in library code",
+        "rules about unwrap error handling library code"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what are the rules about unwrap and error handling in library code"
+        },
+        {
+          "space": "docs",
+          "query": "rules about unwrap error handling library code"
+        }
       ]
     },
     {
       "id": "T4",
       "query": "why is the VName signature format version bumped and what breaks when it changes",
       "rank": 1,
-      "ms": 1013,
+      "ms": 1219,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-002-vname-signature-versioning.md",
         "heading": "Rfc 002 Vname Signature Format Versioning › Drawbacks:160-170"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "why is the VName signature format version bumped and what breaks when it changes"
+        "why is the VName signature format version bumped and what breaks when it changes",
+        "why VName signature format version bumped breaks changes"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "why is the VName signature format version bumped and what breaks when it changes"
+        },
+        {
+          "space": "docs",
+          "query": "why VName signature format version bumped breaks changes"
+        }
       ]
     },
     {
       "id": "T5",
       "query": "how does the knapsack enforce the token budget",
       "rank": 1,
-      "ms": 1256,
+      "ms": 1328,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-010-knapsack-budget-enforcer.md",
         "heading": "Rfc 010 0 1 Knapsack Token Budget Enforcer › Detailed Design › 3 Get Context Mcp Tool#3:300-326"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "how does the knapsack enforce the token budget"
+        "how does the knapsack enforce the token budget",
+        "knapsack enforce token budget"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "how does the knapsack enforce the token budget"
+        },
+        {
+          "space": "docs",
+          "query": "knapsack enforce token budget"
+        }
       ]
     },
     {
       "id": "T6",
       "query": "what is the cross encoder relevance arbiter supposed to fix",
       "rank": 1,
-      "ms": 1036,
+      "ms": 774,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-021-cross-encoder-relevance-arbiter.md",
         "heading": "Rfc 021 Cross Encoder Relevance Arbiter For Seed › 13 Decisions Locked:262-273"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "what is the cross encoder relevance arbiter supposed to fix"
+        "what is the cross encoder relevance arbiter supposed to fix",
+        "cross encoder relevance arbiter supposed fix"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what is the cross encoder relevance arbiter supposed to fix"
+        },
+        {
+          "space": "docs",
+          "query": "cross encoder relevance arbiter supposed fix"
+        }
       ]
     },
     {
       "id": "T7",
       "query": "why do we run embeddings in a downloadable sidecar instead of in process",
       "rank": 1,
-      "ms": 1286,
+      "ms": 1846,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-018-embedding-plugin-architecture.md",
         "heading": "Rfc 018 Embedding Plugin Architecture › Summary:12-25"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "why do we run embeddings in a downloadable sidecar instead of in process"
+        "why do we run embeddings in a downloadable sidecar instead of in process",
+        "why run embeddings downloadable sidecar instead process"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "why do we run embeddings in a downloadable sidecar instead of in process"
+        },
+        {
+          "space": "docs",
+          "query": "why run embeddings downloadable sidecar instead process"
+        }
       ]
     },
     {
       "id": "T8",
       "query": "how is the graph RBAC session and scope model defined",
       "rank": 1,
-      "ms": 932,
+      "ms": 1092,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-006-graph-rbac-session-model.md",
         "heading": "Rfc 006 Graph Rbac Session Model:1-21"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "how is the graph RBAC session and scope model defined"
+        "how is the graph RBAC session and scope model defined",
+        "graph RBAC session scope model defined"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "how is the graph RBAC session and scope model defined"
+        },
+        {
+          "space": "docs",
+          "query": "graph RBAC session scope model defined"
+        }
       ]
     },
     {
       "id": "T9",
       "query": "what is the corpus naming convention derived from a git remote",
       "rank": 1,
-      "ms": 786,
+      "ms": 722,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/ARCH-102-corpus-naming-convention.md",
         "heading": "Arch 102 Kythe Corpus Naming Convention › Detailed Design › Canonical Derivation Algorithm Travsr Core Canon:63-103"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "what is the corpus naming convention derived from a git remote"
+        "what is the corpus naming convention derived from a git remote",
+        "corpus naming convention derived git remote"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what is the corpus naming convention derived from a git remote"
+        },
+        {
+          "space": "docs",
+          "query": "corpus naming convention derived git remote"
+        }
       ]
     },
     {
       "id": "T10",
       "query": "why did the model relative semantic floors need auto calibration per model",
       "rank": 1,
-      "ms": 1291,
+      "ms": 1292,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/plans/model-relative-semantic-floors.md",
         "heading": "Plan Model Relative Semantic Floors › Approaches Considered › C Auto Calibrated Model Relative Floors Recommen#2:122-124"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "why did the model relative semantic floors need auto calibration per model"
+        "why did the model relative semantic floors need auto calibration per model",
+        "why model relative semantic floors need auto calibration per model"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "why did the model relative semantic floors need auto calibration per model"
+        },
+        {
+          "space": "docs",
+          "query": "why model relative semantic floors need auto calibration per model"
+        }
       ]
     },
     {
       "id": "T11",
       "query": "what were the measured root causes of conceptual retrieval failures",
       "rank": 0,
-      "ms": 946,
+      "ms": 1137,
       "nDocs": 0,
       "topEntry": null,
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "what were the measured root causes of conceptual retrieval failures"
+        "what were the measured root causes of conceptual retrieval failures",
+        "measured root causes conceptual retrieval failures"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what were the measured root causes of conceptual retrieval failures"
+        },
+        {
+          "space": "docs",
+          "query": "measured root causes conceptual retrieval failures"
+        }
       ]
     },
     {
@@ -798,145 +1337,281 @@
         "path": "docs/rfcs/RFC-005-cross-language-edge-resolution.md",
         "heading": "Rfc 005 Cross Language Edge Resolution Protocol › Detailed Design › Ffi Pairs:57-64"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "how do we resolve cross language edges between rust and typescript"
+        "how do we resolve cross language edges between rust and typescript",
+        "resolve cross language edges between rust typescript"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "how do we resolve cross language edges between rust and typescript"
+        },
+        {
+          "space": "docs",
+          "query": "resolve cross language edges between rust typescript"
+        }
       ]
     },
     {
       "id": "T13",
       "query": "what is the plan for parallel reindex workers",
       "rank": 1,
-      "ms": 1215,
+      "ms": 1221,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-020-parallel-reindex-workers.md",
         "heading": "Rfc 020 Parallel Reindex Workers › Summary:11-20"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "what is the plan for parallel reindex workers"
+        "what is the plan for parallel reindex workers",
+        "plan parallel reindex workers"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what is the plan for parallel reindex workers"
+        },
+        {
+          "space": "docs",
+          "query": "plan parallel reindex workers"
+        }
       ]
     },
     {
       "id": "T14",
       "query": "how does the two transport plugin architecture work",
       "rank": 1,
-      "ms": 990,
+      "ms": 766,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-011-two-transport-plugin-architecture.md",
         "heading": "Rfc 011 Two Transport Language Plugin Architectu › Detailed Design › 1 The Plugin Contract:44-87"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "how does the two transport plugin architecture work"
+        "how does the two transport plugin architecture work",
+        "two transport plugin architecture work"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "how does the two transport plugin architecture work"
+        },
+        {
+          "space": "docs",
+          "query": "two transport plugin architecture work"
+        }
       ]
     },
     {
       "id": "T15",
       "query": "why does the retrieval cascade short circuit and starve top K results",
       "rank": 1,
-      "ms": 1259,
+      "ms": 1276,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/plans/issue-393-rrf-fusion-cascade-redesign.md",
         "heading": "Issue 393 Retrieval Cascade Short Circuit Top K › 4 Design Reciprocal Rank Fusion Rrf Replaces Sho › 4 1 Why Rrf Not Score Normalization:76-89"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "why does the retrieval cascade short circuit and starve top K results"
+        "why does the retrieval cascade short circuit and starve top K results",
+        "why retrieval cascade short circuit starve top results"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "why does the retrieval cascade short circuit and starve top K results"
+        },
+        {
+          "space": "docs",
+          "query": "why retrieval cascade short circuit starve top results"
+        }
       ]
     },
     {
       "id": "T16",
       "query": "what is the MCP SSE transport design for the cloud tier",
       "rank": 1,
-      "ms": 1089,
+      "ms": 1129,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-007-mcp-sse-transport.md",
         "heading": "Rfc 007 Mcp Sse Transport › Summary:12-21"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "what is the MCP SSE transport design for the cloud tier"
+        "what is the MCP SSE transport design for the cloud tier",
+        "MCP SSE transport design cloud tier"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what is the MCP SSE transport design for the cloud tier"
+        },
+        {
+          "space": "docs",
+          "query": "MCP SSE transport design cloud tier"
+        }
       ]
     },
     {
       "id": "T17",
       "query": "how should overview mode behave in the API",
       "rank": 1,
-      "ms": 902,
+      "ms": 758,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-015-overview-mode-api.md",
         "heading": "Rfc 015 Mode Overview Mcp Api Contract › Api Contract › Parameters:25-37"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "how should overview mode behave in the API"
+        "how should overview mode behave in the API",
+        "overview mode behave API"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "how should overview mode behave in the API"
+        },
+        {
+          "space": "docs",
+          "query": "overview mode behave API"
+        }
       ]
     },
     {
       "id": "T18",
       "query": "how are phase B symbols unified with phase A tree-sitter nodes",
       "rank": 1,
-      "ms": 818,
+      "ms": 583,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-014-phase-b-symbol-unification.md",
         "heading": "Rfc 014 Phase B Symbol Unification › Detailed Design › G1 Symbol Unification Merge Scip Nodes Onto Tree:95-135"
       },
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "how are phase B symbols unified with phase A tree-sitter nodes"
+        "how are phase B symbols unified with phase A tree-sitter nodes",
+        "phase symbols unified phase tree-sitter nodes"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "how are phase B symbols unified with phase A tree-sitter nodes"
+        },
+        {
+          "space": "docs",
+          "query": "phase symbols unified phase tree-sitter nodes"
+        }
       ]
     },
     {
       "id": "T19",
       "query": "what does the fuzzy seed selection design propose",
       "rank": 1,
-      "ms": 703,
+      "ms": 852,
       "nDocs": 3,
       "topEntry": {
         "path": "docs/rfcs/RFC-012-fuzzy-seed-selection.md",
         "heading": "Rfc 012 Fuzzy Seed Selection › Detailed Design L1 Lexical Fts5 › 1 1 Schema Migration V8 Nodes Fts Sql:103-136"
+      },
+      "embedInferences": 2,
+      "embedMemoHits": 0,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ],
+      "queryTexts": [
+        "what does the fuzzy seed selection design propose",
+        "fuzzy seed selection design propose"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "what does the fuzzy seed selection design propose"
+        },
+        {
+          "space": "docs",
+          "query": "fuzzy seed selection design propose"
+        }
+      ]
+    },
+    {
+      "id": "T20",
+      "query": "why was a per repo linear projection head for embeddings rejected",
+      "rank": 0,
+      "ms": 1008,
+      "nDocs": 0,
+      "topEntry": null,
+      "embedInferences": 2,
+      "embedMemoHits": 0,
+      "spacesSearched": [
+        "code",
+        "docs"
+      ],
+      "queryTexts": [
+        "why was a per repo linear projection head for embeddings rejected",
+        "why per repo linear projection head embeddings rejected"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "why was a per repo linear projection head for embeddings rejected"
+        },
+        {
+          "space": "docs",
+          "query": "why per repo linear projection head embeddings rejected"
+        }
+      ]
+    },
+    {
+      "id": "T21",
+      "query": "kuzu",
+      "rank": 1,
+      "ms": 663,
+      "nDocs": 3,
+      "topEntry": {
+        "path": "docs/adrs/ADR-018-drop-kuzu-backend.md",
+        "heading": "Adr 018 Drop The Kùzu Storage Backend Sqlite Onl › Context:13-25"
       },
       "embedInferences": 1,
       "embedMemoHits": 1,
@@ -945,24 +1620,44 @@
         "docs"
       ],
       "queryTexts": [
-        "what does the fuzzy seed selection design propose"
+        "kuzu"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "kuzu"
+        }
       ]
     },
     {
-      "id": "T20",
-      "query": "why was a per repo linear projection head for embeddings rejected",
-      "rank": 0,
-      "ms": 1512,
-      "nDocs": 0,
-      "topEntry": null,
-      "embedInferences": 1,
-      "embedMemoHits": 1,
+      "id": "T22",
+      "query": "why did we drop kuzu",
+      "rank": 2,
+      "ms": 670,
+      "nDocs": 3,
+      "topEntry": {
+        "path": "docs/rfcs/RFC-012-fuzzy-seed-selection.md",
+        "heading": "Rfc 012 Fuzzy Seed Selection:1-17"
+      },
+      "embedInferences": 2,
+      "embedMemoHits": 0,
       "spacesSearched": [
         "code",
         "docs"
       ],
       "queryTexts": [
-        "why was a per repo linear projection head for embeddings rejected"
+        "why did we drop kuzu",
+        "why drop kuzu"
+      ],
+      "missEntries": [
+        {
+          "space": "code",
+          "query": "why did we drop kuzu"
+        },
+        {
+          "space": "docs",
+          "query": "why drop kuzu"
+        }
       ]
     }
   ]
