@@ -594,14 +594,17 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
 
 /// Populate `embed_text` for doc-chunk nodes that have none (#376 W1).
 ///
-/// [`regenerate_embed_texts_if_stale`] (#512) reconciles code `embed_text`
-/// against the active model on every tick, but its full-regeneration branch
-/// is tree-sitter based and does not produce doc-chunk prose the same way. A
-/// doc chunk that reaches the sidecar without prose used to be embedded from
-/// a synthesized heading-and-path fallback, permanently — the vector exists,
-/// so presence-only candidacy never revisits it. The sidecar now rejects
-/// those nodes instead, which turns the silent corruption into a silent
-/// *absence* unless someone fills the text in. This is that someone.
+/// [`regenerate_embed_texts_if_stale`] (#512) now runs [`update_embed_texts`]
+/// on every tick, which already re-derives doc-chunk prose through the same
+/// `chunk_markdown` path this function uses — so on the daemon tick this call
+/// is normally a fast no-op. It stays as the backstop for callers that reach
+/// the sidecar without going through #512 first (e.g. paths that spawn the
+/// sidecar directly). A doc chunk that reaches the sidecar without prose used
+/// to be embedded from a synthesized heading-and-path fallback, permanently —
+/// the vector exists, so presence-only candidacy never revisits it. The
+/// sidecar now rejects those nodes instead, which turns the silent corruption
+/// into a silent *absence* unless someone fills the text in. This is that
+/// someone.
 ///
 /// Affordable on every tick: markdown chunks are re-derived by a pure
 /// function of the file's bytes (no tree-sitter, no grammar load), and the
