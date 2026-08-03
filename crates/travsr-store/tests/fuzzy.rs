@@ -352,12 +352,15 @@ fn issue393_workflow_singular_surfaces_files_not_only_functions() {
         n_files > 0,
         "#393: singular 'workflow' must surface the workflows/*.yml files, not 0"
     );
-    // Diversity: a file must reach the visible top-K, not be starved to the tail.
-    let top = &r[..r.len().min(6)];
-    assert!(
-        top.iter().any(|n| n.kind == "file"),
-        "#393: a file node must appear in the top-6, not be starved by functions"
-    );
+    // #478 RFC-023 §6 item 7 (WS-7): kind diversity is now a tie-break within
+    // a score band, not an unconditional top-K promotion. The singular query
+    // "workflow" only substring-matches the plural "workflows/*.yml" paths via
+    // the down-weighted trigram leg (Leg C) — it never word-matches them via
+    // Leg B — so these files legitimately score well below the genuine
+    // "workflow"-named functions and are no longer forced into the top-6.
+    // That forced promotion was the exact bug this workstream fixes (a weak
+    // substring-only match must not outrank a clean same-kind run). The
+    // no-longer-zero assertion above is what #393 actually required.
 }
 
 #[test]
@@ -393,6 +396,33 @@ fn issue393_exact_signature_still_fast_paths() {
         r.first().map(|n| n.vname.signature.as_str()),
         Some("fn:github_actions_workflow_parse_3"),
         "#393 G1: exact signature hit must remain the first result"
+    );
+}
+
+/// #478 RFC-023 §11 AC #4 / Evidence E: the G1 exact fast-path never sets
+/// `bm25_natural` — no real BM25-scale leg (Leg B/C) backs a pure
+/// exact-signature match, so the abstention gate that reads `bm25_natural`
+/// must see `None` here, not a position-derived score masquerading as one.
+#[test]
+fn issue478_g1_fast_path_has_no_bm25_natural() {
+    let mut store = open();
+    put(
+        &mut store,
+        &node("src/a.rs", "fn:exact_unique_name_xyz", "function"),
+    );
+
+    let hits = store
+        .search_nodes_fuzzy_scored("fn:exact_unique_name_xyz")
+        .unwrap();
+    assert!(!hits.is_empty(), "the exact signature match must be found");
+    assert_eq!(
+        hits[0].exact_rank,
+        Some(0),
+        "G1 fast path must set exact_rank"
+    );
+    assert!(
+        hits[0].bm25_natural.is_none(),
+        "AC #4: a G1 exact-fast-path hit must have bm25_natural=None"
     );
 }
 
@@ -447,12 +477,12 @@ fn issue393_scored_carries_bm25_scale_not_rrf() {
     // get_context's BM25-scale relevance floor depends on (#393 §5.1).
     let scored = store.search_nodes_fuzzy_scored("knapsack_select").unwrap();
     assert!(!scored.is_empty());
-    let top = scored.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
+    let top = scored.iter().map(|hit| hit.natural).fold(0.0f32, f32::max);
     assert!(top > 0.1, "score must be BM25/synthetic scale, got {top}");
 }
 
 #[test]
-fn issue393_embed_gated_and_get_context_path_never_embeds() {
+fn issue478_embed_always_contributes_but_get_context_path_never_embeds() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -470,25 +500,31 @@ fn issue393_embed_gated_and_get_context_path_never_embeds() {
     });
     store.set_embed_knn_hook(hook);
 
-    // Cheap SQLite stages resolve => embed must NOT fire (G2 gate).
+    // #478 RFC-023 §6 item 6: embed (like L2-A) now always contributes on the
+    // `include_embed = true` path, even when the cheap SQLite stages already
+    // resolve — the old "fire only on a combined miss" gate is exactly the
+    // #393 cascade short-circuit this closes (a correct embed candidate could
+    // never surface once any cheap stage returned even one weak hit).
     let _ = store.search_nodes_fuzzy("dispatch_tool_call").unwrap();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "embed must not fire when the cheap stages already return results"
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "embed must contribute even when the cheap stages already resolve (no longer miss-gated)"
     );
 
-    // Combined Stage1+Stage2 miss on the ask path (include_embed=true) => embed fires.
+    // Still fires on a combined miss.
+    let before = calls.load(Ordering::SeqCst);
     let _ = store
         .search_nodes_fuzzy("zzqqvv nonexistent token")
         .unwrap();
     assert!(
-        calls.load(Ordering::SeqCst) >= 1,
+        calls.load(Ordering::SeqCst) > before,
         "embed must fire on a combined miss (ask path)"
     );
 
     // get_context path (_scored, include_embed=false) must NEVER call embed — it has
     // its own KNN channel, so double-embedding would be redundant (#393 §5.1).
+    // Un-gating L2-A/embed relative to the cheap-stage miss (above) is orthogonal
+    // to this contract: `include_embed` still gates embed independently.
     let before = calls.load(Ordering::SeqCst);
     let _ = store
         .search_nodes_fuzzy_scored("zzqqvv nonexistent token")

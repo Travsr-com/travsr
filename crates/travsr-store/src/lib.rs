@@ -516,6 +516,30 @@ impl Migration for V20PurgeOrphanEdgeSites {
     }
 }
 
+/// #478 RFC-023: word-segmented lexical precision leg (`nodes_fts_words`) +
+/// `nodes.is_noise` structural-noise column. See
+/// docs/rfcs/RFC-023-lexical-retrieval-architecture.md §5.1.
+///
+/// Schema only — no data backfill here. `nodes_fts_words`/`is_noise` values
+/// for existing rows are populated by `backfill_fts_words_if_needed`, called
+/// after the migration runner at `open()`/`open_in_memory()` (same pattern as
+/// `backfill_fts_if_needed`/`backfill_vocab_if_needed`), since `Migration::up`
+/// only has DDL access (`exec_ddl`), not the per-row Rust logic
+/// (`travsr_core::ident::segments`/`travsr_core::noise::is_structural_noise`)
+/// needed to compute them.
+struct V21LexicalSplit;
+impl Migration for V21LexicalSplit {
+    fn version(&self) -> u32 {
+        21
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        if !store.column_exists("nodes", "is_noise")? {
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN is_noise INTEGER NOT NULL DEFAULT 0")?;
+        }
+        store.exec_ddl(include_str!("migrations/v21_lexical_split.sql"))
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -539,6 +563,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V18EmbedText);
     r.register(V19NodesSignatureIdx);
     r.register(V20PurgeOrphanEdgeSites);
+    r.register(V21LexicalSplit);
     r
 }
 
@@ -611,6 +636,50 @@ pub struct BatchWriteCounts {
     pub nodes_upserted: u64,
     pub edges_upserted: u64,
     pub files_written: u64,
+}
+
+/// #478 RFC-023 §5.4: a fused-search result carrying the channel-separated
+/// scores that let the abstention gate distinguish "a real BM25-scale leg
+/// matched" from "only the position-derived exact leg (or L2-A/embed)
+/// contributed" — the distinction Evidence E's collapsed single float
+/// couldn't make.
+#[derive(Debug, Clone)]
+pub struct FusedHit {
+    pub node: Node,
+    /// Existing pre-#478 semantics, unchanged: the max natural (BM25-scale or
+    /// synthetic-position) score across every stage the node appeared in.
+    /// `search_nodes_fuzzy`/`search_nodes_fuzzy_filtered` read only this field
+    /// (via `.node`), so their output is byte-for-byte unchanged by #478.
+    pub natural: f32,
+    /// `Some` only when Leg B (word) or Leg C (trigram) — a real BM25-scale
+    /// leg — matched this node. `None` for a Leg-A(exact)-only, L2-A-only, or
+    /// embed-only hit. This is what makes the abstention gate read a live
+    /// signal instead of the position-derived Stage-1 float (Evidence E).
+    pub bm25_natural: Option<f32>,
+    /// `Some(rank)` (0-based, best-first) only when Leg A (exact/name) matched.
+    pub exact_rank: Option<usize>,
+}
+
+/// Stages 2/B/3/4 of [`SqliteStore::fused_search_scored`], shared with
+/// [`SqliteStore::explain_leg_scores`]. See [`SqliteStore::compute_lexical_stages`].
+struct LexicalStages {
+    stage2: Vec<(Node, f32)>,
+    stage_b: Vec<(Node, f32)>,
+    stage3: Vec<(Node, f32)>,
+    stage4: Vec<(Node, f32)>,
+}
+
+/// #478 RFC-023 §6.1: per-leg raw scores (best-first) for `travsr explain`,
+/// from [`SqliteStore::explain_leg_scores`]. Each `Vec` is exactly one leg's
+/// own ranked output, before RRF fusion or kind diversification — a node's
+/// position in a leg's `Vec` is that leg's rank, and the paired `f32` is that
+/// leg's raw (not RRF) score.
+pub struct ExplainLegs {
+    pub exact: Vec<(Node, f32)>,
+    pub word: Vec<(Node, f32)>,
+    pub trigram: Vec<(Node, f32)>,
+    pub l2a: Vec<(Node, f32)>,
+    pub embed: Vec<(Node, f32)>,
 }
 
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
@@ -686,6 +755,9 @@ impl SqliteStore {
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index")?;
+            store
+                .backfill_fts_words_if_needed()
+                .context("backfilling FTS word index (#478)")?;
             store
                 .backfill_vocab_if_needed()
                 .context("backfilling fts_vocab index (L2-A)")?;
@@ -780,6 +852,9 @@ impl SqliteStore {
             store
                 .backfill_fts_if_needed()
                 .context("backfilling FTS index (in-memory)")?;
+            store
+                .backfill_fts_words_if_needed()
+                .context("backfilling FTS word index in-memory (#478)")?;
             store
                 .backfill_vocab_if_needed()
                 .context("backfilling fts_vocab index in-memory (L2-A)")?;
@@ -1172,6 +1247,56 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// #478: row count in `nodes_fts_words_map` (Leg B retraction memory).
+    /// Should match `node_count()`. A mismatch indicates a partial write from
+    /// before the v21 migration's backfill completed, or a bug in one of the
+    /// write paths — `fsck` reports this, report-only (see RFC-023 §8).
+    pub fn fts_words_node_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM nodes_fts_words_map", [], |row| {
+                    row.get(0)
+                })
+                .context("counting nodes_fts_words_map")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// #478: the `nodes.is_noise` flag computed by `travsr_core::noise::is_structural_noise`
+    /// at write time. `None` when `id` is absent. Test/diagnostic accessor —
+    /// production filtering reads the column directly in SQL (WS-5).
+    pub fn is_noise_flag(&self, id: NodeId) -> Result<Option<bool>, StoreError> {
+        (|| -> AnyResult<Option<bool>> {
+            let v: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT is_noise FROM nodes WHERE id = ?1",
+                    params![node_id_to_i64(id)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("reading is_noise flag")?;
+            Ok(v.map(|n| n != 0))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// #478: word-segmented `(sig_words, path_words)` currently indexed for `id`
+    /// (`nodes_fts_words_map`). `None` when absent. Test/diagnostic accessor.
+    pub fn fts_words_entry(&self, id: NodeId) -> Result<Option<(String, String)>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT sig_words, path_words FROM nodes_fts_words_map WHERE node_id = ?1",
+                params![node_id_to_i64(id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("reading fts_words_entry")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Embedding coverage counts for a given model, split by k-core shell threshold.
     ///
     /// Returns `(total_symbols, embedded, phase1_total, phase1_done)` where
@@ -1449,8 +1574,8 @@ impl SqliteStore {
                     for node in &file.nodes {
                         tx.execute(
                             "INSERT INTO nodes_stage(id,corpus,root,path,language,\
-                             signature,kind,package,line,end_line) \
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                             signature,kind,package,line,end_line,is_noise) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                             params![
                                 node_id_to_i64(node.id),
                                 node.vname.corpus,
@@ -1462,11 +1587,14 @@ impl SqliteStore {
                                 node.package,
                                 node.line.map(|l| l as i64),
                                 node.end_line.map(|l| l as i64),
+                                travsr_core::noise::is_structural_noise(node),
                             ],
                         )
                         .context("staging: inserting node")?;
                         Self::put_node_fts_map_only(&tx, node)
                             .context("staging: put_node_fts_map_only")?;
+                        Self::put_node_fts_words_map_only(&tx, node)
+                            .context("staging: put_node_fts_words_map_only")?;
                         counts.nodes_upserted += 1;
                     }
                     for edge in &file.edges {
@@ -1517,6 +1645,22 @@ impl SqliteStore {
                     for ts in &old_token_strings {
                         Self::vocab_decrement(&tx, ts)?;
                     }
+                    // #478: retract nodes_fts_words the same way (own retraction
+                    // memory, no vocab decrement needed — fts5vocab has zero drift).
+                    tx.execute(
+                        "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
+                         SELECT 'delete', m.node_id, m.sig_words, m.path_words \
+                         FROM nodes_fts_words_map m JOIN nodes n ON n.id = m.node_id \
+                         WHERE n.path = ?1",
+                        params![file.vname_path],
+                    )
+                    .context("retracting FTS word rows")?;
+                    tx.execute(
+                        "DELETE FROM nodes_fts_words_map \
+                         WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                        params![file.vname_path],
+                    )
+                    .context("removing FTS word map rows")?;
                     tx.execute(
                         "DELETE FROM edges \
                          WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
@@ -1530,12 +1674,13 @@ impl SqliteStore {
                     for node in &file.nodes {
                         let id_i64 = node_id_to_i64(node.id);
                         tx.execute(
-                            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line) \
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
                              ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                                package = excluded.package, \
                                line = COALESCE(excluded.line, nodes.line), \
-                               end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                               end_line = COALESCE(excluded.end_line, nodes.end_line), \
+                               is_noise = excluded.is_noise",
                             params![
                                 id_i64,
                                 node.vname.corpus,
@@ -1547,14 +1692,19 @@ impl SqliteStore {
                                 node.package,
                                 node.line.map(|l| l as i64),
                                 node.end_line.map(|l| l as i64),
+                                travsr_core::noise::is_structural_noise(node),
                             ],
                         )
                         .context("inserting node in batch")?;
                         if bulk {
                             Self::put_node_fts_map_only(&tx, node)
                                 .context("batch put_node_fts_map_only")?;
+                            Self::put_node_fts_words_map_only(&tx, node)
+                                .context("batch put_node_fts_words_map_only")?;
                         } else {
                             Self::put_node_fts(&tx, node).context("batch put_node_fts")?;
+                            Self::put_node_fts_words(&tx, node)
+                                .context("batch put_node_fts_words")?;
                         }
                         counts.nodes_upserted += 1;
                     }
@@ -1659,6 +1809,22 @@ impl SqliteStore {
                 Self::vocab_decrement(&tx, ts)?;
             }
 
+            // #478: retract nodes_fts_words the same way (no vocab decrement needed).
+            tx.execute(
+                "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
+                 SELECT 'delete', m.node_id, m.sig_words, m.path_words \
+                 FROM nodes_fts_words_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.path = ?1",
+                params![path],
+            )
+            .context("retracting FTS word rows for path")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_words_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                params![path],
+            )
+            .context("removing nodes_fts_words_map rows for path")?;
+
             tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
                 .context("deleting nodes for path")?;
 
@@ -1757,6 +1923,22 @@ impl SqliteStore {
             for ts in &token_strings {
                 Self::vocab_decrement(&tx, ts)?;
             }
+
+            // #478: retract nodes_fts_words the same way (no vocab decrement needed).
+            tx.execute(
+                "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
+                 SELECT 'delete', m.node_id, m.sig_words, m.path_words \
+                 FROM nodes_fts_words_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.corpus=?1 AND n.path=?2",
+                params![corpus, path],
+            )
+            .context("retracting FTS word rows for delete_file")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_words_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("removing nodes_fts_words_map rows for delete_file")?;
 
             // Delete nodes — v17 capture_node_delete trigger auto-writes tombstones.
             tx.execute(
@@ -1871,6 +2053,22 @@ impl SqliteStore {
                 Self::vocab_decrement(&tx, ts)?;
             }
 
+            // #478: retract nodes_fts_words the same way (no vocab decrement needed).
+            tx.execute(
+                "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
+                 SELECT 'delete', m.node_id, m.sig_words, m.path_words \
+                 FROM nodes_fts_words_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.corpus=?1 AND n.path=?2",
+                params![corpus, path],
+            )
+            .context("retracting FTS word rows for reindex_replace")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_words_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("removing nodes_fts_words_map rows for reindex_replace")?;
+
             // Delete old nodes — v17 trigger auto-writes tombstones for changed IDs.
             tx.execute(
                 "DELETE FROM nodes WHERE corpus=?1 AND path=?2",
@@ -1885,12 +2083,13 @@ impl SqliteStore {
                 let id_i64 = node_id_to_i64(node.id);
                 new_ids.insert(id_i64);
                 tx.execute(
-                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                      ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                      package = excluded.package, \
                      line = COALESCE(excluded.line, nodes.line), \
-                     end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                     end_line = COALESCE(excluded.end_line, nodes.end_line), \
+                     is_noise = excluded.is_noise",
                     params![
                         id_i64,
                         node.vname.corpus,
@@ -1902,10 +2101,13 @@ impl SqliteStore {
                         node.package,
                         node.line.map(|l| l as i64),
                         node.end_line.map(|l| l as i64),
+                        travsr_core::noise::is_structural_noise(node),
                     ],
                 )
                 .context("inserting node in reindex_replace")?;
                 Self::put_node_fts(&tx, node).context("put_node_fts in reindex_replace")?;
+                Self::put_node_fts_words(&tx, node)
+                    .context("put_node_fts_words in reindex_replace")?;
             }
 
             // Write new edges.
@@ -2147,6 +2349,22 @@ impl SqliteStore {
                 Self::vocab_decrement(&tx, ts)?;
             }
 
+            // #478: retract nodes_fts_words the same way (no vocab decrement needed).
+            tx.execute(
+                "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
+                 SELECT 'delete', m.node_id, m.sig_words, m.path_words \
+                 FROM nodes_fts_words_map m JOIN nodes n ON n.id = m.node_id \
+                 WHERE n.path LIKE ?1",
+                params![pattern],
+            )
+            .context("retracting FTS word rows for path prefix")?;
+            tx.execute(
+                "DELETE FROM nodes_fts_words_map \
+                 WHERE node_id IN (SELECT id FROM nodes WHERE path LIKE ?1)",
+                params![pattern],
+            )
+            .context("removing nodes_fts_words_map rows for path prefix")?;
+
             tx.execute("DELETE FROM nodes WHERE path LIKE ?1", params![pattern])
                 .context("deleting nodes for path prefix")?;
 
@@ -2161,7 +2379,12 @@ impl SqliteStore {
     ///
     /// Results are ordered by match quality (exact > prefix > substring), then
     /// production-file bias (test and vendor paths rank lower), then path length.
-    /// At most 100 results are returned.
+    /// At most 100 results are returned. Excludes `doc-chunk` nodes: a doc's
+    /// markdown path (e.g. `docs/adrs/ADR-018-drop-kuzu-backend.md`) trivially
+    /// substring-matches on stray query words, which was leaking a doc-only
+    /// anchor into the code lane's exact-anchor confidence classification
+    /// (`Confidence::Exact` on unrelated code results) — docs have their own
+    /// dedicated, separately-floored KNN lane (`doc_lane_candidates`).
     pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>, StoreError> {
         // Log the query name (symbol/path, not file contents — SEC log-redaction rule).
         let _span = tracing::debug_span!("store.search_nodes_by_name", query = name).entered();
@@ -2203,8 +2426,9 @@ impl SqliteStore {
       END
   ) AS rank
 FROM nodes
-WHERE signature LIKE '%' || ?1 || '%'
-   OR path LIKE '%' || ?1 || '%'
+WHERE (signature LIKE '%' || ?1 || '%'
+   OR path LIKE '%' || ?1 || '%')
+  AND kind != 'doc-chunk'
 ORDER BY rank ASC, id ASC
 LIMIT 100",
                 )
@@ -3010,12 +3234,13 @@ LIMIT 20",
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
             tx.execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
-                 end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                 end_line = COALESCE(excluded.end_line, nodes.end_line), \
+                 is_noise = excluded.is_noise",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -3027,10 +3252,13 @@ LIMIT 20",
                     node.package,
                     node.line.map(|l| l as i64),
                     node.end_line.map(|l| l as i64),
+                    travsr_core::noise::is_structural_noise(node),
                 ],
             )
             .context("write_phase_b_batch: insert node")?;
             Self::put_node_fts(&tx, node).context("write_phase_b_batch: put_node_fts")?;
+            Self::put_node_fts_words(&tx, node)
+                .context("write_phase_b_batch: put_node_fts_words")?;
         }
         for edge in edges {
             tx.execute(
@@ -3077,12 +3305,13 @@ LIMIT 20",
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
             tx.execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
-                 end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                 end_line = COALESCE(excluded.end_line, nodes.end_line), \
+                 is_noise = excluded.is_noise",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -3094,10 +3323,13 @@ LIMIT 20",
                     node.package,
                     node.line.map(|l| l as i64),
                     node.end_line.map(|l| l as i64),
+                    travsr_core::noise::is_structural_noise(node),
                 ],
             )
             .context("write_scip_attributed_batch: insert node")?;
             Self::put_node_fts(&tx, node).context("write_scip_attributed_batch: put_node_fts")?;
+            Self::put_node_fts_words(&tx, node)
+                .context("write_scip_attributed_batch: put_node_fts_words")?;
         }
 
         // P4: build span cache — one SELECT per unique caller_path instead of one per ref.
@@ -3712,6 +3944,98 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// #478 WS-1/WS-3: word-segmented `(sig, path)` pair for `nodes_fts_words`
+    /// (Leg B, RFC-023 §5.1). Segmentation goes through
+    /// `travsr_core::ident::segments` — the same segmenter the boundary
+    /// predicate (`ident::contains_token`) uses — so Leg B matches exactly the
+    /// vocabulary the anchor guard reasons about.
+    ///
+    /// Drops segments `< 3` bytes, matching `tokenize_identifier`'s existing
+    /// filter for `nodes_fts`/`fts_vocab`. Without this, near-universal short
+    /// segments (`"fn"` from every `fn:`-prefixed signature, `"id"`, `"ok"`)
+    /// leak into Leg B in a way the trigram index's `len>=3` filter always
+    /// prevented, turning them into accidental near-universal anchors.
+    fn node_fts_words(node: &Node) -> (String, String) {
+        let sig = travsr_core::ident::segments(&node.vname.signature)
+            .into_iter()
+            .filter(|t| t.len() >= 3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let path = travsr_core::ident::segments(&node.vname.path)
+            .into_iter()
+            .filter(|t| t.len() >= 3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        (sig, path)
+    }
+
+    /// Upsert a node's word-index entry (Leg B). Mirrors [`put_node_fts_tokens`]'s
+    /// contentless-FTS5 retract/insert dance for the two-column `nodes_fts_words`
+    /// table, using `nodes_fts_words_map` as the retraction memory (parallel to
+    /// `nodes_fts_map`). No vocab-refcount step: `nodes_words_vocab` is an
+    /// `fts5vocab` view, FTS5-maintained with zero drift (RFC-023 §5.5).
+    fn put_node_fts_words(conn: &Connection, node: &Node) -> AnyResult<()> {
+        let id_i64 = node_id_to_i64(node.id);
+        let (sig_words, path_words) = Self::node_fts_words(node);
+
+        let old: Option<(String, String)> = conn
+            .query_row(
+                "SELECT sig_words, path_words FROM nodes_fts_words_map WHERE node_id = ?1",
+                params![id_i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("reading old FTS word entry")?;
+
+        if let Some((old_sig, old_path)) = old {
+            conn.execute(
+                "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
+                 VALUES('delete', ?1, ?2, ?3)",
+                params![id_i64, old_sig, old_path],
+            )
+            .context("retracting stale FTS word row")?;
+        }
+
+        conn.execute(
+            "INSERT INTO nodes_fts_words(rowid, sig, path) VALUES(?1, ?2, ?3)",
+            params![id_i64, sig_words, path_words],
+        )
+        .context("inserting FTS word row")?;
+
+        conn.execute(
+            "INSERT INTO nodes_fts_words_map(node_id, sig_words, path_words) VALUES(?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET \
+               sig_words = excluded.sig_words, path_words = excluded.path_words",
+            params![id_i64, sig_words, path_words],
+        )
+        .context("upserting nodes_fts_words_map")?;
+
+        Ok(())
+    }
+
+    /// Bulk-init variant of [`put_node_fts_words`]: writes only the
+    /// `nodes_fts_words_map` row and records the node_id in the same
+    /// `_bulk_fts_pending` table [`put_node_fts_map_only`] uses (`INSERT OR
+    /// IGNORE`, so recording from both is idempotent). [`rebuild_fts_from_map`]
+    /// finalizes both the trigram and word indexes for pending nodes in one pass.
+    fn put_node_fts_words_map_only(conn: &Connection, node: &Node) -> AnyResult<()> {
+        let id_i64 = node_id_to_i64(node.id);
+        let (sig_words, path_words) = Self::node_fts_words(node);
+        conn.execute(
+            "INSERT INTO nodes_fts_words_map(node_id, sig_words, path_words) VALUES(?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET \
+               sig_words = excluded.sig_words, path_words = excluded.path_words",
+            params![id_i64, sig_words, path_words],
+        )
+        .context("bulk: writing nodes_fts_words_map")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO _bulk_fts_pending(node_id) VALUES(?1)",
+            params![id_i64],
+        )
+        .context("bulk: recording node_id in _bulk_fts_pending (words)")?;
+        Ok(())
+    }
+
     /// Create the per-connection temp table used to track which node IDs had
     /// their `nodes_fts_map` row written during a bulk init run.
     ///
@@ -3748,7 +4072,8 @@ impl SqliteStore {
                 "CREATE TEMP TABLE IF NOT EXISTS nodes_stage( \
                    id INTEGER, corpus TEXT, root TEXT, path TEXT, \
                    language TEXT, signature TEXT, kind TEXT, \
-                   package TEXT, line INTEGER, end_line INTEGER \
+                   package TEXT, line INTEGER, end_line INTEGER, \
+                   is_noise INTEGER \
                  ); \
                  CREATE INDEX IF NOT EXISTS nodes_stage_id ON nodes_stage(id); \
                  CREATE TEMP TABLE IF NOT EXISTS edges_stage( \
@@ -3794,15 +4119,16 @@ impl SqliteStore {
 
             let nodes_written = tx
                 .execute(
-                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line) \
+                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise) \
                        SELECT id,corpus,root,path,language,signature,kind,package, \
-                              MAX(line),MAX(end_line) \
+                              MAX(line),MAX(end_line),MAX(is_noise) \
                        FROM nodes_stage GROUP BY id \
                        ON CONFLICT(id) DO UPDATE SET \
                          kind     = excluded.kind, \
                          package  = excluded.package, \
                          line     = COALESCE(excluded.line,     nodes.line), \
-                         end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                         end_line = COALESCE(excluded.end_line, nodes.end_line), \
+                         is_noise = excluded.is_noise",
                     [],
                 )
                 .context("inserting nodes from staging")?;
@@ -3941,6 +4267,99 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// #478 WS-3: idempotent backfill for `nodes_fts_words` (Leg B) + `is_noise`,
+    /// called once after migrations at `open()` / `open_in_memory()`, mirroring
+    /// [`backfill_fts_if_needed`]. Same cheap gate: if
+    /// `COUNT(nodes) == COUNT(nodes_fts_words_map)` both are already up to date.
+    ///
+    /// Cannot share `backfill_fts_if_needed`'s gate or node set: right after the
+    /// v21 migration ships, `nodes_fts_map` is already fully populated (no rows
+    /// missing) while `nodes_fts_words_map` is completely empty, so a shared
+    /// gate would wrongly skip this backfill forever. `is_noise` is recomputed
+    /// here too — the ALTER TABLE default (`0`) is correct only for brand-new
+    /// rows written after this PR; every pre-existing row needs the real value.
+    fn backfill_fts_words_if_needed(&mut self) -> AnyResult<()> {
+        let node_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .context("counting nodes for FTS word backfill gate")?;
+        let words_map_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes_fts_words_map", [], |r| r.get(0))
+            .context("counting nodes_fts_words_map for FTS word backfill gate")?;
+
+        if node_count == words_map_count {
+            return Ok(());
+        }
+
+        tracing::info!(
+            missing = node_count.saturating_sub(words_map_count),
+            stale = words_map_count.saturating_sub(node_count),
+            "#478: backfilling nodes_fts_words + is_noise for unindexed nodes"
+        );
+
+        let nodes: Vec<Node> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line \
+                     FROM nodes WHERE id NOT IN (SELECT node_id FROM nodes_fts_words_map)",
+                )
+                .context("preparing FTS word backfill query")?;
+            let collected = stmt
+                .query_map([], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    })
+                })
+                .context("executing FTS word backfill query")?
+                .collect::<Result<_, _>>()
+                .context("collecting FTS word backfill rows")?;
+            collected
+        };
+
+        let tx = self
+            .conn
+            .transaction()
+            .context("starting FTS word backfill transaction")?;
+        for node in &nodes {
+            Self::put_node_fts_words(&tx, node).context("put_node_fts_words during backfill")?;
+            tx.execute(
+                "UPDATE nodes SET is_noise = ?2 WHERE id = ?1",
+                params![
+                    node_id_to_i64(node.id),
+                    travsr_core::noise::is_structural_noise(node),
+                ],
+            )
+            .context("backfilling is_noise")?;
+        }
+        tx.commit()
+            .context("committing FTS word backfill transaction")?;
+
+        tracing::info!(
+            indexed = nodes.len(),
+            "#478: nodes_fts_words + is_noise backfill complete"
+        );
+        Ok(())
+    }
+
     // ── #393: RRF fusion cascade (replaces the first-nonempty short-circuit) ──
     //
     // The legacy cascade returned the first non-empty stage and stopped, which
@@ -3955,56 +4374,38 @@ impl SqliteStore {
     const RRF_K: f32 = 60.0;
     /// Per-stage RRF weights. Exact-substring is the most trusted signal.
     const RRF_W_EXACT: f32 = 2.0;
-    const RRF_W_FTS: f32 = 1.0;
+    /// #478 RFC-023 §3: Leg B (word BM25, `nodes_fts_words`) — the new precision
+    /// leg. Weighted above the trigram leg since a word-boundary match is
+    /// stronger evidence than a substring match. Starting value from the RFC's
+    /// own probe; not yet bench-swept (WS-9).
+    const RRF_W_WORD: f32 = 1.2;
+    /// #478 RFC-023 §3: Leg C (trigram BM25, `nodes_fts`) — down-weighted from
+    /// the pre-#478 `1.0` so a pure-substring match (no word-boundary evidence)
+    /// can no longer take rank 1 corpus-wide on BM25 length normalisation alone
+    /// (Evidence A). Trigram recall/typo-tolerance is unchanged; only its
+    /// fusion weight drops. Starting value, not yet bench-swept (WS-9).
+    const RRF_W_TRIGRAM: f32 = 0.4;
     const RRF_W_L2A: f32 = 0.7;
     const RRF_W_EMBED: f32 = 1.0;
+    /// #478 RFC-023 §5.1: `bm25(nodes_fts_words, W_SIG, W_PATH)` per-column
+    /// weights — a signature match outranks a path match for the same term
+    /// (Evidence B). From the RFC's §1 probe; not yet bench-swept (WS-9).
+    const FTS_WORDS_W_SIG: f64 = 3.0;
+    const FTS_WORDS_W_PATH: f64 = 1.0;
 
-    /// Unified fuzzy-search core (#393). `lang_filter = Some(l)` scopes every
-    /// stage to language `l`; `include_embed = false` skips the semantic-ANN
-    /// stage (used by the get_context seed path, which has its own KNN channel
-    /// and must not double-count the embed signal — see plan §5.1).
-    ///
-    /// Returns `(Node, score)` where `score` is a BM25-scale relevance float
-    /// (FTS rows carry `-bm25()`, exact/substring rows a synthetic descending
-    /// score, L2-A rows a 0.25 floor, embed rows the cosine). The *ordering* is
-    /// RRF-fused + kind-diversified; the *score* stays BM25-scale so downstream
-    /// relevance floors remain calibrated.
-    fn fused_search_scored(
+    /// Stages 2/B/3/4 of the fused core (everything except Stage 1's G1 exact
+    /// fast-path, which only [`Self::fused_search_scored`] special-cases).
+    /// Factored out so [`Self::explain_leg_scores`] (#478 RFC-023 §6.1) can
+    /// get the same raw per-leg data `travsr explain` needs, without
+    /// duplicating the stage-construction logic or threading a collector
+    /// through the hot query path.
+    fn compute_lexical_stages(
         &self,
         query: &str,
         lang_filter: Option<&str>,
         include_embed: bool,
-    ) -> Result<Vec<(Node, f32)>, StoreError> {
-        let _span = tracing::debug_span!(
-            "store.fused_search_scored",
-            query,
-            lang = lang_filter.unwrap_or(""),
-            include_embed
-        )
-        .entered();
-
-        // Stage 1 — exact substring, ranked best-first.
-        let stage1_nodes = match lang_filter {
-            Some(l) => self.search_nodes_by_name_with_lang(query, l)?,
-            None => self.search_nodes_by_name(query)?,
-        };
-
-        // G1 — confident-exact fast path: the top row is an exact signature match
-        // (SQL rank 0). Return Stage 1 only, so crisp symbol lookups stay precise
-        // and can't be diluted by fuzzy neighbours (preserves TL3).
-        if let Some(first) = stage1_nodes.first() {
-            if first.vname.signature == query {
-                tracing::debug!(
-                    layer = "exact_fastpath",
-                    nodes_returned = stage1_nodes.len()
-                );
-                return Ok(Self::synthetic_desc_scores(stage1_nodes));
-            }
-        }
-
-        let stage1 = Self::synthetic_desc_scores(stage1_nodes);
-
-        // Stage 2 — FTS5 BM25 (scored), best-first.
+    ) -> Result<LexicalStages, StoreError> {
+        // Stage 2 (Leg C, trigram, down-weighted) — FTS5 BM25 (scored), best-first.
         let stage2 = match build_fuzzy_match_expr_db(query, &self.conn)
             .map_err(|e| StoreError::Database(e.to_string()))?
         {
@@ -4020,29 +4421,189 @@ impl SqliteStore {
             None => Vec::new(),
         };
 
-        // G2 (part 1) — always fuse the two cheap SQLite stages.
-        let mut fused = Self::rrf_fuse(&[(Self::RRF_W_EXACT, &stage1), (Self::RRF_W_FTS, &stage2)]);
+        // Stage B (Leg B, word, RFC-023 §5.1) — word-segmented BM25, best-first.
+        // `nodes_fts_words` is `unicode61`, so the query must be pre-segmented
+        // the same way the index was populated (one segmenter, by construction),
+        // including the `< 3` byte filter `node_fts_words` applies at write time —
+        // a MATCH clause for a term the index never contains is dead weight.
+        let stage_b_segs: Vec<String> = travsr_core::ident::segments(query)
+            .into_iter()
+            .filter(|t| t.len() >= 3)
+            .collect();
+        let stage_b = if stage_b_segs.is_empty() {
+            Vec::new()
+        } else {
+            let expr = stage_b_segs
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            match lang_filter {
+                Some(l) => self
+                    .fts_query_words_scored_with_lang(&expr, l)
+                    .map_err(|e| StoreError::Database(e.to_string()))?,
+                None => self
+                    .fts_query_words_scored(&expr)
+                    .map_err(|e| StoreError::Database(e.to_string()))?,
+            }
+        };
 
-        // G2 (part 2) — gate the costly stages. Phase 1: fire only on a combined
-        // Stage 1 + Stage 2 miss (same trigger as the legacy empty-cascade), so no
-        // added latency on the hot path. Phase 2 will loosen this to weak-union.
-        if fused.is_empty() {
-            let stage3 = self.l2a_scored(query, lang_filter)?;
-            let stage4 = if include_embed {
-                self.embed_scored(query, lang_filter)?
-            } else {
-                Vec::new()
-            };
-            fused = Self::rrf_fuse(&[
-                (Self::RRF_W_EXACT, &stage1),
-                (Self::RRF_W_FTS, &stage2),
-                (Self::RRF_W_L2A, &stage3),
-                (Self::RRF_W_EMBED, &stage4),
-            ]);
+        // G2 (#478 RFC-023 §6 item 6): L2-A and embed now always contribute
+        // rather than firing only on a combined Stage 1 + Stage 2 + Stage B
+        // miss — this closes the #393 cascade short-circuit (a correct L2-A/
+        // embed candidate could never surface at all once any cheap stage
+        // returned even one weak hit). Weighted RRF fusion means a confident
+        // cheap-stage hit is not displaced by weak L2-A/embed noise; it just
+        // gets the chance to reinforce or be reinforced.
+        let stage3 = self.l2a_scored(query, lang_filter)?;
+        let stage4 = if include_embed {
+            self.embed_scored(query, lang_filter)?
+        } else {
+            Vec::new()
+        };
+        Ok(LexicalStages {
+            stage2,
+            stage_b,
+            stage3,
+            stage4,
+        })
+    }
+
+    /// #478 RFC-023 §6.1: per-leg raw scores for `travsr explain`, uncollapsed
+    /// by the G1 exact fast-path (unlike [`Self::fused_search_scored`], whose
+    /// whole point is to short-circuit on a crisp signature match) — the
+    /// diagnostic's job is showing what every leg found, including when G1
+    /// would otherwise have hidden them from the fused result.
+    pub fn explain_leg_scores(
+        &self,
+        query: &str,
+        lang_filter: Option<&str>,
+    ) -> Result<ExplainLegs, StoreError> {
+        let stage1_nodes = match lang_filter {
+            Some(l) => self.search_nodes_by_name_with_lang(query, l)?,
+            None => self.search_nodes_by_name(query)?,
+        };
+        let exact = Self::synthetic_desc_scores(stage1_nodes);
+        let LexicalStages {
+            stage2,
+            stage_b,
+            stage3,
+            stage4,
+        } = self.compute_lexical_stages(query, lang_filter, true)?;
+        Ok(ExplainLegs {
+            exact,
+            word: stage_b,
+            trigram: stage2,
+            l2a: stage3,
+            embed: stage4,
+        })
+    }
+
+    /// Unified fuzzy-search core (#393, #478). `lang_filter = Some(l)` scopes
+    /// every stage to language `l`; `include_embed = false` skips the
+    /// semantic-ANN stage (used by the get_context seed path, which has its
+    /// own KNN channel and must not double-count the embed signal — see plan
+    /// §5.1).
+    ///
+    /// Returns [`FusedHit`]s: `natural` is a BM25-scale relevance float exactly
+    /// as before #478 (FTS rows carry `-bm25()`, exact/substring rows a
+    /// synthetic descending score, L2-A rows a 0.25 floor, embed rows the
+    /// cosine) — every existing consumer of the *ordering* and *natural* score
+    /// is unaffected. `bm25_natural`/`exact_rank` are the RFC-023 §5.4 channel
+    /// split: `bm25_natural` is `Some` only when Leg B (word) or Leg C
+    /// (trigram) matched the node — never for a Leg A (exact)-only or L2-A/
+    /// embed-only hit — so the abstention gate that reads it is live rather
+    /// than inert (Evidence E). `exact_rank` is `Some` only for a Leg A match.
+    fn fused_search_scored(
+        &self,
+        query: &str,
+        lang_filter: Option<&str>,
+        include_embed: bool,
+    ) -> Result<Vec<FusedHit>, StoreError> {
+        let _span = tracing::debug_span!(
+            "store.fused_search_scored",
+            query,
+            lang = lang_filter.unwrap_or(""),
+            include_embed
+        )
+        .entered();
+
+        // Stage 1 (Leg A) — exact substring, ranked best-first.
+        let stage1_nodes = match lang_filter {
+            Some(l) => self.search_nodes_by_name_with_lang(query, l)?,
+            None => self.search_nodes_by_name(query)?,
+        };
+
+        // G1 — confident-exact fast path: the top row is an exact signature match
+        // (SQL rank 0). Return Stage 1 only, so crisp symbol lookups stay precise
+        // and can't be diluted by fuzzy neighbours (preserves TL3).
+        if let Some(first) = stage1_nodes.first() {
+            if first.vname.signature == query {
+                tracing::debug!(
+                    layer = "exact_fastpath",
+                    nodes_returned = stage1_nodes.len()
+                );
+                return Ok(Self::synthetic_desc_scores(stage1_nodes)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, (node, natural))| FusedHit {
+                        node,
+                        natural,
+                        bm25_natural: None,
+                        exact_rank: Some(rank),
+                    })
+                    .collect());
+            }
         }
 
+        let stage1 = Self::synthetic_desc_scores(stage1_nodes);
+
+        let LexicalStages {
+            stage2,
+            stage_b,
+            stage3,
+            stage4,
+        } = self.compute_lexical_stages(query, lang_filter, include_embed)?;
+        let fused = Self::rrf_fuse(&[
+            (Self::RRF_W_EXACT, &stage1),
+            (Self::RRF_W_WORD, &stage_b),
+            (Self::RRF_W_TRIGRAM, &stage2),
+            (Self::RRF_W_L2A, &stage3),
+            (Self::RRF_W_EMBED, &stage4),
+        ]);
+
         // G3 — kind diversity so one kind can't saturate the visible top-K.
-        Ok(Self::diversify_topk(fused))
+        let diversified = Self::diversify_topk(fused);
+
+        // #478 RFC-023 §5.4: channel split, computed post-fusion by cross-
+        // referencing which pre-fusion stage(s) a node appeared in — no change
+        // to `rrf_fuse`'s fusion algorithm itself.
+        let exact_rank_map: HashMap<NodeId, usize> = stage1
+            .iter()
+            .enumerate()
+            .map(|(rank, (n, _))| (n.id, rank))
+            .collect();
+        let mut bm25_scale_map: HashMap<NodeId, f32> = HashMap::new();
+        for (n, natural) in stage_b.iter().chain(stage2.iter()) {
+            bm25_scale_map
+                .entry(n.id)
+                .and_modify(|s| *s = s.max(*natural))
+                .or_insert(*natural);
+        }
+
+        Ok(diversified
+            .into_iter()
+            .map(|(node, natural)| {
+                let exact_rank = exact_rank_map.get(&node.id).copied();
+                let bm25_natural = bm25_scale_map.get(&node.id).copied();
+                FusedHit {
+                    node,
+                    natural,
+                    bm25_natural,
+                    exact_rank,
+                }
+            })
+            .collect())
     }
 
     /// Assign descending synthetic relevance scores [1.0 … 0.1] to a ranked node
@@ -4064,9 +4625,11 @@ impl SqliteStore {
     ///
     /// `RRF(d) = Σ_i w_i / (k + rank_i(d))` with 1-based ranks. Nodes are ordered
     /// by descending fused score, tie-broken on node id for determinism. Each
-    /// returned node carries the **max natural (BM25-scale) score** across the
-    /// stages it appeared in, so downstream BM25 floors stay calibrated (#393 §5.1).
-    fn rrf_fuse(stages: &[(f32, &[(Node, f32)])]) -> Vec<(Node, f32)> {
+    /// returned node carries its accumulated RRF score (used by
+    /// [`Self::diversify_topk`] for score-band tie-breaking) and the **max
+    /// natural (BM25-scale) score** across the stages it appeared in, so
+    /// downstream BM25 floors stay calibrated (#393 §5.1).
+    fn rrf_fuse(stages: &[(f32, &[(Node, f32)])]) -> Vec<(Node, f32, f32)> {
         use std::collections::HashMap;
         // id → (node, accumulated rrf, best natural score)
         let mut acc: HashMap<NodeId, (Node, f32, f32)> = HashMap::new();
@@ -4089,22 +4652,69 @@ impl SqliteStore {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
-        fused.into_iter().map(|(n, _rrf, nat)| (n, nat)).collect()
+        fused
     }
 
-    /// G3 — round-robin interleave by node `kind`, preserving RRF order within
-    /// each kind and leading with the globally best node. A single-kind result
-    /// passes through unchanged. Guarantees minority kinds (e.g. data-format
-    /// `file` nodes) reach the visible top-K instead of being starved by a
-    /// dominant kind (#393).
-    fn diversify_topk(fused: Vec<(Node, f32)>) -> Vec<(Node, f32)> {
+    /// Relative score-band width for [`Self::diversify_topk`] (#478 RFC-023 §6
+    /// item 7), read from `TRAVSR_DIVERSIFY_BAND_EPSILON` (default 0.05 = 5%).
+    /// A node only shares a band with the node(s) ranked above it when its RRF
+    /// score is within this fraction of the band leader's score, so the
+    /// kind-diversity round-robin can only reorder near-ties, never displace a
+    /// clearly-ahead node. 0 disables banding (every node is its own band, so
+    /// global RRF order always wins and diversification never fires).
+    fn diversify_band_epsilon() -> f32 {
+        std::env::var("TRAVSR_DIVERSIFY_BAND_EPSILON")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|&x| (0.0..=1.0).contains(&x))
+            .unwrap_or(0.05)
+    }
+
+    /// G3 — round-robin interleave by node `kind`, but only as a tie-break
+    /// *within* a score band, not across the whole ranked list (#478 RFC-023
+    /// §6 item 7). `fused` is already RRF-sorted best-first; we walk it in
+    /// contiguous runs ("bands") of nodes whose RRF score is within
+    /// [`Self::diversify_band_epsilon`] of the band's leading score, and only
+    /// diversify by kind inside each band. Global rank order is preserved
+    /// *across* bands, so a clear top-5 same-kind run (Evidence A) is never
+    /// perturbed by a minority kind several bands below it — diversity only
+    /// kicks in once the fused scores are already close enough that kind is a
+    /// legitimate tie-breaker. Still guarantees minority kinds (e.g.
+    /// data-format `file` nodes) reach the visible top-K when they are
+    /// genuinely competitive with the dominant kind (#393).
+    fn diversify_topk(mut fused: Vec<(Node, f32, f32)>) -> Vec<(Node, f32)> {
         if fused.len() <= 2 {
-            return fused;
+            return fused.into_iter().map(|(n, _rrf, nat)| (n, nat)).collect();
         }
-        // Insertion-ordered kind buckets; `fused` is already RRF-sorted, so the
-        // first bucket created holds the globally best node.
+        let epsilon = Self::diversify_band_epsilon();
+        let mut out = Vec::with_capacity(fused.len());
+        while !fused.is_empty() {
+            let band_floor = fused[0].1 * (1.0 - epsilon);
+            let band_len = fused
+                .iter()
+                .take_while(|(_, rrf, _)| *rrf >= band_floor)
+                .count()
+                .max(1);
+            let band: Vec<(Node, f32)> = fused
+                .drain(0..band_len)
+                .map(|(n, _rrf, nat)| (n, nat))
+                .collect();
+            out.extend(Self::diversify_band(band));
+        }
+        out
+    }
+
+    /// Round-robin interleave by node `kind` within a single score band,
+    /// preserving RRF order within each kind and leading with the band's best
+    /// node. A single-kind band passes through unchanged.
+    fn diversify_band(band: Vec<(Node, f32)>) -> Vec<(Node, f32)> {
+        if band.len() <= 1 {
+            return band;
+        }
+        // Insertion-ordered kind buckets; `band` is already RRF-sorted, so the
+        // first bucket created holds the band's best node.
         let mut buckets: Vec<(String, std::collections::VecDeque<(Node, f32)>)> = Vec::new();
-        for (node, score) in fused {
+        for (node, score) in band {
             match buckets.iter_mut().find(|(k, _)| *k == node.kind) {
                 Some((_, q)) => q.push_back((node, score)),
                 None => {
@@ -4151,17 +4761,36 @@ impl SqliteStore {
             if l2a_extra.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut arms: Vec<String> = t0_tokens;
-            for c in l2a_extra {
+            // #478 RFC-023 §6 item 8: raw T0 query tokens are kept
+            // unconditionally — a long query must never lose one of its own
+            // words to the arm cap. Only the L2-A expansion candidates are
+            // capped, and by IDF (rarest first via `symbol_frequency`), not
+            // alphabetically — the old `arms.sort(); arms.truncate(16)` could
+            // silently drop a raw token that happened to sort late whenever
+            // `t0_tokens` alone already reached 16.
+            let mut arms: Vec<String> = t0_tokens.clone();
+            let mut extra_ranked: Vec<(String, i64)> = l2a_extra
+                .into_iter()
+                .filter(|c| !arms.iter().any(|t| t == c))
+                .map(|c| {
+                    // Absent from vocabulary treated as maximally generic
+                    // (pushed to the back), matching the seed.rs fallback contract.
+                    let freq = self
+                        .symbol_frequency(&c)
+                        .ok()
+                        .flatten()
+                        .map(|f| f as i64)
+                        .unwrap_or(i64::MAX);
+                    (c, freq)
+                })
+                .collect();
+            extra_ranked.sort_by_key(|(_, freq)| *freq);
+            for (c, _) in extra_ranked {
                 if arms.len() >= 16 {
                     break;
                 }
-                if !arms.iter().any(|t| t == &c) {
-                    arms.push(c);
-                }
+                arms.push(c);
             }
-            arms.sort();
-            arms.truncate(16);
             let match_expr = arms
                 .iter()
                 .map(|t| format!("\"{t}\""))
@@ -4220,6 +4849,11 @@ impl SqliteStore {
         match_expr: &str,
         lang: &str,
     ) -> AnyResult<Vec<(Node, f32)>> {
+        // #478: is_noise = 0 filters test/vendor/build-artifact noise before the
+        // LIMIT (RFC-023 §6 item 5) — the top-K starvation half of #393. Scoped
+        // to this FTS-scored leg only, not `search_nodes_by_name` (Leg A), which
+        // legitimately needs to find noise-classified nodes by exact name for
+        // get_dependencies/get_blast_radius/find_references.
         let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
                           n.kind, n.package, n.line, n.end_line, -bm25(nodes_fts) \
                    FROM nodes_fts \
@@ -4227,6 +4861,7 @@ impl SqliteStore {
                    JOIN nodes n ON n.id = m.node_id \
                    WHERE nodes_fts MATCH ?1 \
                      AND n.language = ?2 \
+                     AND n.is_noise = 0 \
                    ORDER BY bm25(nodes_fts) \
                    LIMIT 50";
         let mut stmt = self
@@ -4291,7 +4926,7 @@ impl SqliteStore {
         Ok(self
             .fused_search_scored(query, None, true)?
             .into_iter()
-            .map(|(n, _score)| n)
+            .map(|hit| hit.node)
             .collect())
     }
 
@@ -4389,6 +5024,7 @@ impl SqliteStore {
 FROM nodes
 WHERE (signature LIKE '%' || ?1 || '%'
    OR path LIKE '%' || ?1 || '%')
+  AND kind != 'doc-chunk'
   AND language = ?2
 ORDER BY rank ASC, id ASC
 LIMIT 100",
@@ -4427,17 +5063,144 @@ LIMIT 100",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Leg B (RFC-023 §5.1): word-segmented BM25 query over `nodes_fts_words`.
+    ///
+    /// `match_expr` must already be built from `travsr_core::ident::segments()`
+    /// output — `nodes_fts_words` is `unicode61`, which splits on punctuation
+    /// but does not split camelCase/PascalCase on its own, so the caller
+    /// (`fused_search_scored`) must pre-segment the query the same way the
+    /// index was populated (one segmenter, by construction).
+    ///
+    /// `bm25(nodes_fts_words, W_SIG, W_PATH)`: a signature match outranks a
+    /// path match for the same term (Evidence B). Negated like the trigram
+    /// leg so higher scores mean better matches.
+    fn fts_query_words_scored(&self, match_expr: &str) -> AnyResult<Vec<(Node, f32)>> {
+        let sql = format!(
+            "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                    n.kind, n.package, n.line, n.end_line, \
+                    -bm25(nodes_fts_words, {sig_w}, {path_w}) \
+             FROM nodes_fts_words \
+             JOIN nodes_fts_words_map m ON nodes_fts_words.rowid = m.node_id \
+             JOIN nodes n ON n.id = m.node_id \
+             WHERE nodes_fts_words MATCH ?1 \
+               AND n.is_noise = 0 \
+             ORDER BY bm25(nodes_fts_words, {sig_w}, {path_w}) \
+             LIMIT 50",
+            sig_w = Self::FTS_WORDS_W_SIG,
+            path_w = Self::FTS_WORDS_W_PATH,
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("preparing Leg B word FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                let bm25: f64 = row.get(10).unwrap_or(0.0);
+                Ok((
+                    Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    },
+                    bm25 as f32,
+                ))
+            })
+            .context("executing Leg B word FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding Leg B word FTS5 row")?);
+        }
+        Ok(out)
+    }
+
+    /// Language-filtered variant of [`fts_query_words_scored`].
+    fn fts_query_words_scored_with_lang(
+        &self,
+        match_expr: &str,
+        lang: &str,
+    ) -> AnyResult<Vec<(Node, f32)>> {
+        let sql = format!(
+            "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
+                    n.kind, n.package, n.line, n.end_line, \
+                    -bm25(nodes_fts_words, {sig_w}, {path_w}) \
+             FROM nodes_fts_words \
+             JOIN nodes_fts_words_map m ON nodes_fts_words.rowid = m.node_id \
+             JOIN nodes n ON n.id = m.node_id \
+             WHERE nodes_fts_words MATCH ?1 \
+               AND n.language = ?2 \
+               AND n.is_noise = 0 \
+             ORDER BY bm25(nodes_fts_words, {sig_w}, {path_w}) \
+             LIMIT 50",
+            sig_w = Self::FTS_WORDS_W_SIG,
+            path_w = Self::FTS_WORDS_W_PATH,
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("preparing lang-filtered Leg B word FTS5 query")?;
+        let rows = stmt
+            .query_map(params![match_expr, lang], |row| {
+                let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                let vname = VName::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                );
+                let kind: String = row.get(6)?;
+                let package: String = row.get(7)?;
+                let line: Option<i64> = row.get(8)?;
+                let end_line: Option<i64> = row.get(9)?;
+                let bm25: f64 = row.get(10).unwrap_or(0.0);
+                Ok((
+                    Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    },
+                    bm25 as f32,
+                ))
+            })
+            .context("executing lang-filtered Leg B word FTS5 query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding lang-filtered Leg B word FTS5 row")?);
+        }
+        Ok(out)
+    }
+
     /// FTS5 query that returns `(Node, bm25_score)` pairs.
     ///
     /// SQLite `bm25()` is negated so higher scores mean better matches (positive = good).
     /// Typical range: 0.05 (weak) to 5.0+ (strong match on a small corpus).
     fn fts_query_nodes_scored(&self, match_expr: &str) -> AnyResult<Vec<(Node, f32)>> {
+        // #478: is_noise = 0, see the lang-filtered sibling's comment.
         let sql = "SELECT n.id, n.corpus, n.root, n.path, n.language, n.signature, \
                           n.kind, n.package, n.line, n.end_line, -bm25(nodes_fts) \
                    FROM nodes_fts \
                    JOIN nodes_fts_map m ON nodes_fts.rowid = m.node_id \
                    JOIN nodes n ON n.id = m.node_id \
                    WHERE nodes_fts MATCH ?1 \
+                     AND n.is_noise = 0 \
                    ORDER BY bm25(nodes_fts) \
                    LIMIT 50";
         let mut stmt = self
@@ -4482,28 +5245,83 @@ LIMIT 100",
     /// Scored variant of [`search_nodes_fuzzy`]: returns `(Node, score)` pairs where
     /// score is a positive, BM25-scale relevance float (higher = better).
     ///
-    /// #393: this is the `get_context` seed path. It runs through
+    /// #393: this is the `get_context`/`ask` seed path. It runs through
     /// [`fused_search_scored`] with `include_embed = false` — get_context has its
     /// own KNN seed channel, so folding the embed stage in here would double-count
     /// the semantic signal (plan §5.1). Scores stay BM25-scale (RRF only reorders,
     /// it does not rescore) so the downstream relevance/abstention floor that reads
     /// the top score remains calibrated.
-    pub fn search_nodes_fuzzy_scored(&self, query: &str) -> Result<Vec<(Node, f32)>, StoreError> {
+    ///
+    /// #478: returns [`FusedHit`] (not a bare tuple) — this is the one caller
+    /// (`travsr-mcp`'s lexical loop) that reads `bm25_natural`/`exact_rank` to
+    /// fix the boundary-evidence bug by topology rather than by a discount.
+    pub fn search_nodes_fuzzy_scored(&self, query: &str) -> Result<Vec<FusedHit>, StoreError> {
         self.fused_search_scored(query, None, false)
     }
 
-    /// Returns the count of nodes whose `signature` contains `token` as a substring.
+    /// Returns the number of nodes whose indexed word set contains `token`
+    /// (#478 RFC-023 §5.5).
     ///
-    /// Used as IDF denominator for per-token anchor specificity: high `freq` means
-    /// the token is generic ("get", "run") and should contribute low weight even when
-    /// it matches a real symbol.
-    pub fn symbol_frequency(&self, token: &str) -> Result<usize, StoreError> {
-        (|| -> AnyResult<usize> {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT COUNT(*) FROM nodes WHERE signature LIKE '%' || ?1 || '%'")?;
-            let count: i64 = stmt.query_row(params![token], |r| r.get(0))?;
-            Ok(count.max(0) as usize)
+    /// Reads `nodes_words_vocab` (`fts5vocab` 'row' mode over `nodes_fts_words`)
+    /// — FTS5-maintained document frequency over the same word segmentation
+    /// (`travsr_core::ident::segments`) that built the index and that the
+    /// boundary predicate (`ident::contains_token`) reasons about. Three
+    /// reasons this replaced a `signature LIKE '%tok%'` scan:
+    ///   1. Correct: the old scan counted substrings (`wal` matched 22 nodes
+    ///      containing "walk"/"walker"/etc. for a token appearing in 1).
+    ///   2. Consistent: same segmentation that built the index, not a fourth
+    ///      independent notion of "this token matches this node".
+    ///   3. Fast: O(1) indexed lookup, replacing a full `nodes` table scan.
+    ///
+    /// Used as IDF denominator for per-token anchor specificity: high `freq`
+    /// means the token is generic ("get", "run") and should contribute low
+    /// weight even when it matches a real symbol.
+    ///
+    /// Returns `None` when `token` is absent from the vocabulary — including
+    /// every token shorter than 3 bytes (never indexed) and any token that
+    /// simply never occurs. "Absent from vocabulary" and "occurs in zero
+    /// nodes" are different facts; callers must supply their own fallback
+    /// (never conflate the two — see the seed.rs call site).
+    ///
+    /// `token` may itself be a compound identifier the caller has not
+    /// pre-segmented (`tokenize_query`'s content tokens preserve `_`, e.g.
+    /// `"dispatch_tool_call"` stays one token, unlike `ident::segments`'
+    /// index-time output). Segmenting here and taking the *minimum*
+    /// document frequency across the token's own segments (dropping any
+    /// sub-segment `< 3` bytes, same as `node_fts_words` at write time — those
+    /// are never indexed and carry no signal either way) approximates the
+    /// compound's specificity from its rarest indexed part — the same
+    /// reasoning `ident::contains_token`'s contiguous-run match uses — and
+    /// keeps this function's contract single-word-token-compatible (a token
+    /// with no internal delimiters segments to itself, so plain-word
+    /// behaviour is unchanged). Absent if *every* indexable segment is absent
+    /// from the vocabulary.
+    pub fn symbol_frequency(&self, token: &str) -> Result<Option<usize>, StoreError> {
+        (|| -> AnyResult<Option<usize>> {
+            let segs: Vec<String> = travsr_core::ident::segments(token)
+                .into_iter()
+                .filter(|s| s.len() >= 3)
+                .collect();
+            if segs.is_empty() {
+                return Ok(None);
+            }
+            let mut min_doc: Option<i64> = None;
+            for seg in &segs {
+                let doc: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT doc FROM nodes_words_vocab WHERE term = ?1",
+                        params![seg],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .context("reading nodes_words_vocab for symbol_frequency")?;
+                let Some(d) = doc else {
+                    return Ok(None);
+                };
+                min_doc = Some(min_doc.map_or(d, |m: i64| m.min(d)));
+            }
+            Ok(min_doc.map(|d| d.max(0) as usize))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }
@@ -4584,7 +5402,7 @@ LIMIT 100",
         Ok(self
             .fused_search_scored(query, lang_filter, true)?
             .into_iter()
-            .map(|(n, _score)| n)
+            .map(|hit| hit.node)
             .collect())
     }
 
@@ -4775,9 +5593,14 @@ LIMIT 100",
                    WHERE EXISTS ( \
                      SELECT 1 FROM _bulk_fts_pending p WHERE p.node_id = m.node_id \
                    ); \
+                 INSERT INTO nodes_fts_words(rowid, sig, path) \
+                   SELECT m.node_id, m.sig_words, m.path_words FROM nodes_fts_words_map m \
+                   WHERE EXISTS ( \
+                     SELECT 1 FROM _bulk_fts_pending p WHERE p.node_id = m.node_id \
+                   ); \
                  DROP TABLE IF EXISTS _bulk_fts_pending;",
             )
-            .context("bulk-inserting nodes_fts from pending nodes")?;
+            .context("bulk-inserting nodes_fts + nodes_fts_words from pending nodes")?;
             tx.commit().context("committing FTS rebuild")?;
         }
         tracing::info!(
@@ -5203,12 +6026,13 @@ impl Store for SqliteStore {
                 .transaction()
                 .context("starting put_node transaction")?;
             tx.execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
-                 end_line = COALESCE(excluded.end_line, nodes.end_line)",
+                 end_line = COALESCE(excluded.end_line, nodes.end_line), \
+                 is_noise = excluded.is_noise",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -5220,10 +6044,12 @@ impl Store for SqliteStore {
                     node.package,
                     node.line.map(|l| l as i64),
                     node.end_line.map(|l| l as i64),
+                    travsr_core::noise::is_structural_noise(node),
                 ],
             )
             .context("inserting node")?;
             Self::put_node_fts(&tx, node).context("put_node_fts")?;
+            Self::put_node_fts_words(&tx, node).context("put_node_fts_words")?;
             tx.commit().context("committing put_node transaction")?;
             Ok(())
         })()
@@ -6689,6 +7515,148 @@ mod tests {
         let r2 = store.search_nodes_by_name("foo").unwrap();
         // Order must be deterministic across two calls
         assert_eq!(r1[0].vname.path, r2[0].vname.path);
+    }
+
+    /// #478 RFC-023 §6 item 7, Evidence A: a `file` node scoring far below a
+    /// clean top-5 run of `function` nodes must stay at the tail, not get
+    /// promoted to rank 2 by an unconditional kind round-robin. This is the
+    /// exact fixture shape RFC-023 §1's dump showed (`var:m`/`var:fn` in the
+    /// top 8 despite scoring far below the genuine top-5 methods).
+    #[test]
+    fn diversify_topk_does_not_perturb_clear_top5_same_kind_run() {
+        let f1 = sample_node("fn:top_1");
+        let f2 = sample_node("fn:top_2");
+        let f3 = sample_node("fn:top_3");
+        let f4 = sample_node("fn:top_4");
+        let f5 = sample_node("fn:top_5");
+        let file = Node::new(
+            VName::new(
+                "test-corpus",
+                "main",
+                "docs/readme.md",
+                "markdown",
+                "docs/readme.md",
+            ),
+            "file",
+        );
+        // RRF scores mirror a real fused list: a decisive same-kind top-5 run
+        // (each within TRAVSR_DIVERSIFY_BAND_EPSILON's default 5% of the one
+        // above), then a minority-kind node scoring far below any of them.
+        let fused = vec![
+            (f1.clone(), 0.069, 1.0),
+            (f2.clone(), 0.0678, 0.9),
+            (f3.clone(), 0.0667, 0.8),
+            (f4.clone(), 0.0657, 0.7),
+            (f5.clone(), 0.0648, 0.6),
+            (file.clone(), 0.010, 0.3),
+        ];
+        let out = SqliteStore::diversify_topk(fused);
+        let sigs: Vec<&str> = out
+            .iter()
+            .map(|(n, _)| n.vname.signature.as_str())
+            .collect();
+        assert_eq!(
+            sigs,
+            vec![
+                "fn:top_1",
+                "fn:top_2",
+                "fn:top_3",
+                "fn:top_4",
+                "fn:top_5",
+                "docs/readme.md",
+            ],
+            "a low-scoring minority kind must not be promoted ahead of a clear same-kind top-5 run"
+        );
+    }
+
+    /// #478 RFC-023 §6 item 7 / #393: when scores genuinely are close (within
+    /// `TRAVSR_DIVERSIFY_BAND_EPSILON`), kind diversity still applies as a
+    /// tie-break — a competitive minority kind must not be starved out of the
+    /// visible top-K just because it shares a band with a dominant kind.
+    #[test]
+    fn diversify_topk_interleaves_within_a_close_score_band() {
+        let f1 = sample_node("fn:a");
+        let f2 = sample_node("fn:b");
+        let file = Node::new(
+            VName::new(
+                "test-corpus",
+                "main",
+                "docs/readme.md",
+                "markdown",
+                "docs/readme.md",
+            ),
+            "file",
+        );
+        // All three within 5% of the band leader (0.069 * 0.95 = 0.06555).
+        let fused = vec![
+            (f1.clone(), 0.069, 1.0),
+            (f2.clone(), 0.067, 0.9),
+            (file.clone(), 0.066, 0.8),
+        ];
+        let out = SqliteStore::diversify_topk(fused);
+        let sigs: Vec<&str> = out
+            .iter()
+            .map(|(n, _)| n.vname.signature.as_str())
+            .collect();
+        assert_eq!(
+            sigs,
+            vec!["fn:a", "docs/readme.md", "fn:b"],
+            "within a close score band, kind round-robin must still promote a competitive minority kind"
+        );
+    }
+
+    /// #478 RFC-023 §6.1: `explain_leg_scores` must show the leg separation
+    /// `travsr explain` exists to surface — the same distinction Evidence A
+    /// documents. "wal" is a substring of both `walk` and `walker`, so the
+    /// trigram leg matches both; neither node has "wal" as its own word
+    /// segment, so the word leg matches neither.
+    #[test]
+    fn explain_leg_scores_separates_word_from_trigram() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&node_with_path("src/walker.rs", "fn:walk"))
+            .unwrap();
+        store
+            .put_node(&node_with_path("src/walker.rs", "fn:walker_helper"))
+            .unwrap();
+        let legs = store.explain_leg_scores("wal", None).unwrap();
+        assert!(
+            legs.trigram.len() >= 2,
+            "trigram (substring) leg must match both walk and walker_helper"
+        );
+        assert!(
+            legs.word.is_empty(),
+            "word leg must not match — \"wal\" is not a word segment of either node"
+        );
+    }
+
+    /// #478 RFC-023 §11 AC #3 / Evidence B: `bm25(nodes_fts_words, W_SIG,
+    /// W_PATH)` weights the signature column higher than the path column
+    /// (3.0 vs 1.0), so a node matching the term in its signature must
+    /// outrank one matching only in its path.
+    #[test]
+    fn fts_query_words_scored_signature_match_outranks_path_match() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&node_with_path("src/a.rs", "fn:widget_factory"))
+            .unwrap();
+        store
+            .put_node(&node_with_path("src/widget/other.rs", "fn:make_thing"))
+            .unwrap();
+
+        let results = store.fts_query_words_scored("\"widget\"").unwrap();
+        let rank_of = |sig: &str| results.iter().position(|(n, _)| n.vname.signature == sig);
+        let sig_rank = rank_of("fn:widget_factory").expect("signature match must appear");
+        let path_rank = rank_of("fn:make_thing").expect("path match must appear");
+        assert!(
+            sig_rank < path_rank,
+            "a signature match must outrank a path match for the same term \
+             (W_SIG=3.0 > W_PATH=1.0); results: {:?}",
+            results
+                .iter()
+                .map(|(n, s)| (n.vname.signature.clone(), *s))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

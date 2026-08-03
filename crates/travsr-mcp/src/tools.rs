@@ -2385,162 +2385,17 @@ pub(crate) const KNN_BUDGET_MS: u128 = 600;
 /// Returns `true` for nodes that should never be used as PPR seeds regardless
 /// of their KNN cosine score.
 ///
-/// Excluded categories (R5):
-///
-/// - `kind == "crate"` — Cargo dependency manifest nodes (no code body).
-/// - `scip:` signatures — synthetic SCIP reference nodes with no real body.
-/// - Test directories: `tests/`, `benches/`, `spec/` (Ruby), `testdata/` (Go),
-///   `src/test/java|kotlin|scala/` (JVM), `_test.go` (Go), `fixtures/`, `fuzz/`.
-/// - Build artefacts: `target/debug|release|classes|scala-*/` (Rust/Maven/sbt),
-///   `build/classes|generated/` (Gradle), `node_modules/`, `dist/*.js` (JS),
-///   `*.class`, `*.o/.obj`, `CMakeFiles/`, `_deps/` (CMake).
-/// - Dependency/package caches: `go/pkg/mod/`, `.pub-cache/` (Dart),
-///   `vendor/bundle/` (Ruby), `vendor/*.php` (PHP), `Library/Caches/`, `.cache/`.
-/// - Paths escaping the repo root (`../`), Python bytecode (`__pycache__/`, `.pyc`).
+/// See [`travsr_core::noise::is_structural_noise`] for the full exclusion list
+/// (R5 test/build/vendor directory patterns, doc-chunk/crate kind, `scip:`
+/// signatures, and the ingest-level checks in [`travsr_core::is_noise_node`]).
 pub(crate) fn is_noise_seed(node: &CoreNode) -> bool {
-    // Core structural noise (vendored, OS caches, repo-escaping paths, SCIP locals).
-    // Enforced identically at ingest and query time via is_noise_node.
-    if travsr_core::is_noise_node(node) {
-        return true;
-    }
-    // #376: doc-chunk nodes are legitimate content — this is not a "noise"
-    // exclusion in the path-based sense every other check below is — but this
-    // is the one gate every candidate source in `build_seed_set` (fuzzy/name
-    // FTS, embed-path seeds, anchors) is proven to pass through, so it is the
-    // correct permanent place to keep doc-chunk nodes out of the generic,
-    // unfloored lexical/PPR path. Confirmed empirically in Phase 1: without
-    // this, `## Payment Architecture` outranked nothing but still leaked into
-    // a `PaymentService` query's "relevant" section at score 0.000.
-    //
-    // Phase 2 shipped `MatchSource::Docs` (§4) as a fully separate lane —
-    // `build_docs_section`/`crate::seed::doc_lane_seeds`, its own floored
-    // doc-space KNN, never `build_seed_set` — so this arm does NOT make Docs
-    // unreachable; it is what keeps the two paths from ever colliding.
-    // **Do not remove this arm.** Removing it reopens the exact unfloored
-    // leak Phase 1 fixed, now that doc-chunk nodes exist in the graph.
-    if node.kind == "doc-chunk" {
-        return true;
-    }
-    if node.kind == "crate" {
-        return true;
-    }
-    // Signatures prefixed "scip:" are synthetic SCIP reference nodes with no real body.
-    if node.vname.signature.starts_with("scip:") {
-        return true;
-    }
-    let p = &node.vname.path;
-    // Rust/Go integration test and benchmark directories.
-    if p.contains("/tests/") || p.contains("/benches/") {
-        return true;
-    }
-    // Common fixture and fuzz directories (arbitrary repo layouts).
-    // Match both "/fuzz/" (nested) and "fuzz/" (repo-root prefix).
-    if p.contains("/fixtures/") || p.starts_with("fixtures/") {
-        return true;
-    }
-    if p.contains("/fuzz/") || p.starts_with("fuzz/") {
-        return true;
-    }
-    // Go test files (_test.go suffix) and generic test subdirectories.
-    if p.ends_with("_test.go") || p.contains("/_test/") {
-        return true;
-    }
-    // Rust/Go integration tests at repo root (tests/) and benches at root.
-    if p.starts_with("tests/") || p.starts_with("benches/") {
-        return true;
-    }
-    // Rust/Cargo build output — seeding into build artefacts walks into macro-expanded code.
-    if p.contains("/target/debug/") || p.contains("/target/release/") {
-        return true;
-    }
-    // JavaScript / TypeScript build artefacts.
-    if p.contains("/node_modules/") || (p.contains("/dist/") && p.ends_with(".js")) {
-        return true;
-    }
-    // R5: paths that escape the repo root (e.g. Go build cache:
-    // `../../../Library/Caches/go-build/...`). Any path starting with `../`
-    // is outside the indexed repo and is never useful as a seed.
-    if p.starts_with("../") {
-        return true;
-    }
-    // R5: Go module cache and OS build caches (absolute or relative to cache dirs).
-    if p.contains("/go/pkg/mod/") || p.contains("/Library/Caches/") || p.contains("/.cache/") {
-        return true;
-    }
-    // R5: testdata/ directories (Go convention) and __pycache__ artefacts.
-    if p.contains("/testdata/") || p.starts_with("testdata/") {
-        return true;
-    }
-    if p.contains("/__pycache__/") || p.ends_with(".pyc") {
-        return true;
-    }
-    // Java / Kotlin / Scala — Maven src/test, Gradle build/, sbt target/
-    if p.contains("/src/test/java/")
-        || p.starts_with("src/test/java/")
-        || p.contains("/src/test/kotlin/")
-        || p.starts_with("src/test/kotlin/")
-        || p.contains("/src/test/scala/")
-        || p.starts_with("src/test/scala/")
-    {
-        return true;
-    }
-    if p.contains("/build/classes/")
-        || p.starts_with("build/classes/")
-        || p.contains("/build/generated/")
-        || p.starts_with("build/generated/")
-    {
-        return true;
-    }
-    // Maven/sbt general build output under target/ (not just Rust debug/release).
-    // Avoid blocking "target/" anywhere — only when it looks like a build output
-    // directory (contains compiled files, not source).
-    if p.contains("/target/classes/")
-        || p.contains("/target/generated-sources/")
-        || p.contains("/target/scala-")
-        || p.ends_with(".class")
-    {
-        return true;
-    }
-    // Ruby — RSpec spec/, Bundler vendor/bundle/
-    if p.contains("/spec/") || p.starts_with("spec/") {
-        return true;
-    }
-    if p.contains("/vendor/bundle/") {
-        return true;
-    }
-    // PHP — Composer vendor/ (parallel to JS node_modules).
-    // Guard with php extension to avoid false-positives in repos that use
-    // "vendor" as a deliberate source dir in non-PHP projects.
-    if p.contains("/vendor/") && p.ends_with(".php") {
-        return true;
-    }
-    // C/C++ — object files, CMake out-of-source build directories.
-    if p.ends_with(".o") || p.ends_with(".obj") {
-        return true;
-    }
-    if p.contains("/CMakeFiles/") || p.contains("/_deps/") {
-        return true;
-    }
-    // Dart/Flutter — package cache and build output.
-    if p.contains("/.dart_tool/") || p.contains("/.pub-cache/") {
-        return true;
-    }
-    // C# / .NET — compiler-generated build output in obj/ and bin/ subdirectories.
-    // Real source lives under src/; obj/Debug/, obj/Release/, bin/Debug/ are noise.
-    if p.contains("/obj/Debug/")
-        || p.contains("/obj/Release/")
-        || p.starts_with("obj/Debug/")
-        || p.starts_with("obj/Release/")
-        || p.contains("/bin/Debug/")
-        || p.contains("/bin/Release/")
-        || p.starts_with("bin/Debug/")
-        || p.starts_with("bin/Release/")
-        || p.ends_with(".AssemblyInfo.cs")
-        || p.ends_with(".GlobalUsings.g.cs")
-    {
-        return true;
-    }
-    false
+    // #478 WS-2: the full structural-noise predicate (core ingest-time checks
+    // plus the per-language test/build-artifact/doc-chunk/crate/scip rules
+    // this function used to carry inline) now lives in `travsr_core::noise`,
+    // the single source of truth — needed there so the schema v21 migration
+    // in `travsr-store` can compute the same `is_noise` classification without
+    // depending on `travsr-mcp` (crate dependency rule).
+    travsr_core::noise::is_structural_noise(node)
 }
 
 /// #462: nodes that are never useful as `get_context` *relevance results*, even
@@ -2739,7 +2594,7 @@ pub(crate) fn embed_path_seeds(
 /// R3: `knn_degraded` is true when the embed sidecar was configured (`has_embed`)
 /// but KNN returned empty or was circuit-broken; the note distinguishes this from
 /// the "embed not configured" case so the AI doesn't assume full semantic coverage.
-fn build_context_signals(
+pub(crate) fn build_context_signals(
     store: &SqliteStore,
     has_embed: bool,
     embed_warming: bool,
@@ -3825,6 +3680,7 @@ fn get_context_body(
                     &seed_rerank,
                     primary_seed_ids.contains(&id),
                     expanded_cap,
+                    seed_set.confidence,
                 ),
             )
         })
@@ -7640,9 +7496,15 @@ mod snippet_tests {
         store.put_node(&node).unwrap();
 
         let result = get_context_body(&store, "x", 4096, &OpenFilter, true, None, None);
-        // Either "not found" (no FTS match on empty index) or the init hint — never a panic.
-        let has_meta_hint =
-            result.contains("travsr init") || result.is_empty() || result.contains("No symbols");
+        // Either "not found" (no FTS match on empty index), the init hint, or a
+        // clean abstention note (#478: a lone 1-char query has no real lexical
+        // evidence — Leg A matching "fn:x" as a bare substring is not grounds
+        // for a confident answer, so this now abstains honestly instead of
+        // fabricating a match from zero evidence) — never a panic.
+        let has_meta_hint = result.contains("travsr init")
+            || result.is_empty()
+            || result.contains("No symbols")
+            || result.contains("no grounded match");
         assert!(
             has_meta_hint,
             "absent repo_root must degrade gracefully: {result}"

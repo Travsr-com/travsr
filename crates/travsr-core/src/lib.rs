@@ -11,6 +11,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub mod ident;
+pub mod noise;
+
 /// Version of the VName signature format baked into every `NodeId` hash.
 ///
 /// This byte is the **first input** to the BLAKE3 hasher in `VName::id()`.
@@ -999,6 +1002,11 @@ pub struct GcReport {
     pub aborted: bool,
     /// Human-readable reason for abort (set when `aborted = true`).
     pub abort_reason: Option<String>,
+    /// #478 RFC-023 §8: set when `nodes` / `nodes_fts_map` / `nodes_fts_words_map`
+    /// row counts disagree — indicates a partial write on one of the lexical
+    /// index write paths. Report-only; `fsck --fix` does not auto-repair this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_index_parity_issue: Option<String>,
 }
 
 /// Safety guards for reconciliation (§6.5 of the GC architecture doc).

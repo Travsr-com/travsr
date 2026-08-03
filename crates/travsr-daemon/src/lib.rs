@@ -769,9 +769,21 @@ pub fn fsck_repo(
 
     let corpus = store.get_meta("corpus")?.unwrap_or_default();
 
+    let node_count = store.node_count()?;
+    let fts_words_count = store.fts_words_node_count()?;
+    let lexical_index_parity_issue = if node_count == fts_words_count {
+        None
+    } else {
+        Some(format!(
+            "nodes ({node_count}) != nodes_fts_words_map ({fts_words_count}) — \
+             run `travsr init` to re-backfill the lexical word index (#478)"
+        ))
+    };
+
     let mut report = travsr_core::GcReport {
-        node_count: store.node_count()?,
+        node_count,
         edge_count: store.edge_count()?,
+        lexical_index_parity_issue,
         ..travsr_core::GcReport::default()
     };
 

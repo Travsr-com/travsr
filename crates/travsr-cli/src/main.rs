@@ -8,6 +8,7 @@ mod autostart;
 mod config;
 mod daemon_client;
 mod embed;
+mod explain;
 mod fsck;
 mod graph;
 mod index;
@@ -107,6 +108,20 @@ enum Command {
         /// Output format: table (default) or json.
         #[arg(long, value_enum, default_value = "table")]
         format: ask::OutputFormat,
+    },
+    /// #478 RFC-023 §6.1: diagnostic seed-building trace for one query/symbol
+    /// pair — per-token IDF, per-leg match, every gate + threshold, and final
+    /// disposition (live vs an FTS-only counterfactual). The instrument for
+    /// tuning retrieval thresholds; not part of the normal retrieval path.
+    Explain {
+        /// Natural-language question, or a symbol name, exactly as you would
+        /// pass it to `travsr ask`.
+        query: String,
+        /// The symbol to explain (bare name or full signature).
+        symbol: String,
+        /// Output format: text (default) or json.
+        #[arg(long, value_enum, default_value = "text")]
+        format: explain::OutputFormat,
     },
     /// Enumerate every use site (path:line) of a symbol across the repo.
     #[command(alias = "refs")]
@@ -629,6 +644,11 @@ async fn run(cli: Cli) -> Result<()> {
         } => repos::run(prune, remove.as_deref(), json)?,
         Command::Status => status::run()?,
         Command::Ask { query, format } => ask::run(&query, format)?,
+        Command::Explain {
+            query,
+            symbol,
+            format,
+        } => explain::run(&query, &symbol, format)?,
         Command::References {
             symbol,
             path,

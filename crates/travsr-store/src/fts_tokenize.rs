@@ -28,42 +28,11 @@
 /// assert!(tokenize_identifier("src/payment.ts").contains("payment"));
 /// ```
 pub fn tokenize_identifier(s: &str) -> String {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-
-    for i in 0..len {
-        let c = chars[i];
-
-        if !c.is_ascii_alphanumeric() {
-            // Non-alphanumeric: flush current token, treat as delimiter.
-            flush(&mut current, &mut tokens);
-            continue;
-        }
-
-        if c.is_ascii_uppercase() {
-            // CamelCase split: flush if previous char was lowercase ASCII or a digit.
-            if i > 0 && (chars[i - 1].is_ascii_lowercase() || chars[i - 1].is_ascii_digit()) {
-                flush(&mut current, &mut tokens);
-            }
-            current.push(c.to_ascii_lowercase());
-        } else if c.is_ascii_digit() {
-            // Digit run: flush if the previous char was a letter.
-            if i > 0 && chars[i - 1].is_ascii_alphabetic() {
-                flush(&mut current, &mut tokens);
-            }
-            current.push(c);
-        } else {
-            // Lowercase letter: flush if previous char was a digit.
-            if i > 0 && chars[i - 1].is_ascii_digit() {
-                flush(&mut current, &mut tokens);
-            }
-            current.push(c);
-        }
-    }
-    flush(&mut current, &mut tokens);
+    // #478 WS-1: segmentation itself now lives in `travsr_core::ident`, the
+    // single source of truth shared with the retrieval boundary predicate
+    // (`ident::contains_token`). This function keeps only the post-processing
+    // that is specific to building the FTS `tokens` column.
+    let mut tokens: Vec<String> = travsr_core::ident::segments(s);
 
     // Emit the original lowercased input as an extra token so exact-name
     // queries can also hit via the FTS path when the LIKE step is skipped.
@@ -214,16 +183,6 @@ pub fn build_match_expr(query: &str) -> Option<String> {
         None
     } else {
         Some(expr)
-    }
-}
-
-#[inline]
-fn flush(current: &mut String, tokens: &mut Vec<String>) {
-    if !current.is_empty() {
-        let tok = std::mem::take(current);
-        if !tokens.contains(&tok) {
-            tokens.push(tok);
-        }
     }
 }
 

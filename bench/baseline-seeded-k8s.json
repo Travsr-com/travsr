@@ -1,0 +1,29 @@
+{
+  "generatedAt": "2026-08-03T13:42:46.255Z",
+  "repo": "/Users/ak/Documents/k8/kubernetes",
+  "total": 22,
+  "n": 27,
+  "abstainLeak": 0,
+  "byCat": {
+    "literal": {
+      "pass": 6,
+      "n": 6
+    },
+    "conceptual": {
+      "pass": 4,
+      "n": 8
+    },
+    "cross": {
+      "pass": 1,
+      "n": 2
+    },
+    "nonsense": {
+      "pass": 3,
+      "n": 3
+    },
+    "salad": {
+      "pass": 8,
+      "n": 8
+    }
+  }
+}
