@@ -2379,7 +2379,12 @@ impl SqliteStore {
     ///
     /// Results are ordered by match quality (exact > prefix > substring), then
     /// production-file bias (test and vendor paths rank lower), then path length.
-    /// At most 100 results are returned.
+    /// At most 100 results are returned. Excludes `doc-chunk` nodes: a doc's
+    /// markdown path (e.g. `docs/adrs/ADR-018-drop-kuzu-backend.md`) trivially
+    /// substring-matches on stray query words, which was leaking a doc-only
+    /// anchor into the code lane's exact-anchor confidence classification
+    /// (`Confidence::Exact` on unrelated code results) — docs have their own
+    /// dedicated, separately-floored KNN lane (`doc_lane_candidates`).
     pub fn search_nodes_by_name(&self, name: &str) -> Result<Vec<Node>, StoreError> {
         // Log the query name (symbol/path, not file contents — SEC log-redaction rule).
         let _span = tracing::debug_span!("store.search_nodes_by_name", query = name).entered();
@@ -2421,8 +2426,9 @@ impl SqliteStore {
       END
   ) AS rank
 FROM nodes
-WHERE signature LIKE '%' || ?1 || '%'
-   OR path LIKE '%' || ?1 || '%'
+WHERE (signature LIKE '%' || ?1 || '%'
+   OR path LIKE '%' || ?1 || '%')
+  AND kind != 'doc-chunk'
 ORDER BY rank ASC, id ASC
 LIMIT 100",
                 )
@@ -5018,6 +5024,7 @@ impl SqliteStore {
 FROM nodes
 WHERE (signature LIKE '%' || ?1 || '%'
    OR path LIKE '%' || ?1 || '%')
+  AND kind != 'doc-chunk'
   AND language = ?2
 ORDER BY rank ASC, id ASC
 LIMIT 100",
