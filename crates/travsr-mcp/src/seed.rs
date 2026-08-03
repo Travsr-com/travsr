@@ -906,8 +906,22 @@ const STOP_WORDS: &[&str] = &[
 /// Extract content tokens from a query for per-token anchor resolution.
 ///
 /// - Strips leading/trailing ASCII punctuation (preserving `_` and `.`)
-/// - Lowercases each word
-/// - Removes stop-words and tokens shorter than 2 characters
+/// - Removes stop-words and tokens shorter than 2 characters (stop-word/length
+///   checks are case-insensitive; the returned token keeps its original case)
+///
+/// Case is preserved deliberately (#478 fix): `symbol_frequency` and
+/// `ident::contains_token` both call `ident::segments` on this token to find
+/// its own internal word boundaries (e.g. `"isPrime"` → `["is","prime"]`).
+/// That split relies on lower→upper transitions in the token itself — if this
+/// function lowercased `"isPrime"` to `"isprime"` first, the boundary is gone
+/// permanently and `segments("isprime")` returns one fused, unsplittable
+/// segment that can never match the index's real `"prime"` vocabulary entry.
+/// `symbol_frequency` then falls back to "absent from vocabulary" and the
+/// token is wrongly treated as maximally generic, which can suppress a
+/// perfectly unambiguous exact-name query down to total abstention on the
+/// FTS-only path. `search_nodes_by_name`'s `LIKE` scan and
+/// `ident::contains_token`'s own token-normalisation are already
+/// case-insensitive, so returning the original case here is free for them.
 pub(crate) fn tokenize_query(query: &str) -> Vec<String> {
     query
         .split_whitespace()
@@ -921,7 +935,7 @@ pub(crate) fn tokenize_query(query: &str) -> Vec<String> {
             if lower.len() < 2 || STOP_WORDS.contains(&lower.as_str()) {
                 return None;
             }
-            Some(lower)
+            Some(stripped.to_string())
         })
         .collect()
 }
@@ -3447,6 +3461,30 @@ mod tests {
         assert!(toks.contains(&"handler".to_string()));
     }
 
+    /// #478 fix: `tokenize_query` must preserve the token's original case.
+    /// Stop-word/length filtering is still case-insensitive ("What" is still
+    /// dropped), but a content token like "isPrime" must come back exactly as
+    /// written — lowercasing it here would permanently destroy the
+    /// lower→upper boundary `ident::segments` needs to split it into
+    /// `["is", "prime"]`. See `symbol_frequency_finds_camel_case_query_token`
+    /// in `travsr-store` for the downstream consequence this was causing
+    /// (a real, unambiguous exact-name query collapsing to total abstention
+    /// on the FTS-only path).
+    #[test]
+    fn tokenize_preserves_original_case() {
+        let toks = tokenize_query("What calls isPrime");
+        assert!(!toks.contains(&"what".to_string()));
+        assert!(
+            !toks.contains(&"What".to_string()),
+            "stop-word check is case-insensitive"
+        );
+        assert!(toks.contains(&"isPrime".to_string()), "got: {toks:?}");
+        assert!(
+            !toks.contains(&"isprime".to_string()),
+            "must not be lowercased"
+        );
+    }
+
     #[test]
     fn tokenize_strips_punctuation_preserves_underscores() {
         let toks = tokenize_query("search_nodes_fuzzy?");
@@ -5413,6 +5451,70 @@ mod tests {
             !seed_set.seeds.iter().any(|s| s.node == workspace_fn.id),
             "provideWorkspaceChatContext must not anchor for the NL verb \
              'works'; seeds: {:?}",
+            seed_set
+                .seeds
+                .iter()
+                .map(|s| (s.node, s.source))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Found via CI (not local dev, where an installed embed backend masked
+    /// it): an exact camelCase symbol name typed verbatim as a query — e.g.
+    /// `travsr ask "isPrime"` against a fresh repo with no embed model
+    /// installed, exactly `travsr-daemon`'s
+    /// `query_cache_invalidated_by_out_of_band_delete` test's own setup —
+    /// must reach at least `Confidence::Strong`, not collapse to `None`.
+    ///
+    /// Root cause: `tokenize_query` used to lowercase every content token
+    /// before `symbol_frequency`/`contains_token` ever saw it. Lowercasing
+    /// `"isPrime"` to `"isprime"` destroys the lower→upper transition
+    /// `ident::segments` needs to split it into `["is", "prime"]`, so
+    /// `segments("isprime")` returns one fused, unsplittable segment that
+    /// can never match the index's real `"prime"` vocabulary entry.
+    /// `symbol_frequency` then falls back to "absent from vocabulary" (the
+    /// corpus-size floor, effectively "maximally generic"), the anchor-emit
+    /// IDF gate rejects it, and the query's only real anchor is silently
+    /// dropped even though Leg A (exact/name) found it at rank 0. Fixed by
+    /// having `tokenize_query` preserve the token's original case.
+    #[test]
+    fn camel_case_exact_name_query_reaches_strong_confidence_on_the_fts_only_path() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        store
+            .put_node(&Node::new(
+                VName::new("corpus", "", "prime.ts", "typescript", "fn:isPrime"),
+                "function",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("corpus", "", "a.ts", "typescript", "class:Alpha"),
+                "class",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("corpus", "", "b.ts", "typescript", "class:Beta"),
+                "class",
+            ))
+            .unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "isPrime",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None, // FTS-only: embed oracle disabled, matching the CI regression.
+        );
+
+        assert!(
+            matches!(seed_set.confidence, Confidence::Strong | Confidence::Exact),
+            "an exact camelCase symbol-name query must not collapse to a weak \
+             confidence, let alone abstain — got {:?}, seeds: {:?}",
+            seed_set.confidence,
             seed_set
                 .seeds
                 .iter()

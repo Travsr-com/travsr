@@ -203,6 +203,34 @@ fn bulk_init_path_populates_fts_words_and_is_noise() {
 
 // ── symbol_frequency (WS-4) ─────────────────────────────────────────────────
 
+/// Found via CI, not local dev (an installed embed backend was masking it):
+/// `symbol_frequency` must be given the token's *original case* to segment it
+/// correctly. `ident::segments` finds "isPrime"'s word boundary via the
+/// lower→upper transition; if the caller lowercases to "isprime" first (as
+/// `travsr-mcp::seed::tokenize_query` used to, before the #478 fix), that
+/// transition is gone permanently and `segments("isprime")` returns one
+/// fused, unsplittable segment that can never match the index's real
+/// "prime" vocabulary entry — `symbol_frequency` then reports the token as
+/// absent, and callers wrongly treat it as maximally generic. This test
+/// pins `symbol_frequency`'s own contract (correct given proper case); the
+/// end-to-end regression this was causing (a real query collapsing to total
+/// abstention) is pinned separately in `travsr-mcp`'s
+/// `camel_case_exact_name_query_reaches_strong_confidence_on_the_fts_only_path`.
+#[test]
+fn symbol_frequency_finds_camel_case_token_when_case_is_preserved() {
+    let mut store = open();
+    store
+        .put_node(&node("prime.ts", "fn:isPrime", "function"))
+        .unwrap();
+    // "is" is dropped (< 3 bytes); "prime" is the real indexed segment.
+    // doc=1: one row (this node) has "prime" in its word index, regardless
+    // of it appearing in both the sig and path columns of that one row.
+    assert_eq!(store.symbol_frequency("isPrime").unwrap(), Some(1));
+    // The all-lowercase fused form is a different, unindexed word — proves
+    // this isn't accidentally passing via a substring/prefix match.
+    assert_eq!(store.symbol_frequency("isprime").unwrap(), None);
+}
+
 #[test]
 fn symbol_frequency_wal_does_not_count_walk() {
     let mut store = open();
