@@ -1,4 +1,4 @@
-# RFC-023: Semantic Occurrence Roles — Stop Discarding What Phase B Already Computes
+# RFC-024: Semantic Occurrence Roles — Stop Discarding What Phase B Already Computes
 
 **Status:** Draft — for discussion, not yet proposed for sign-off
 **Author:** Ritik
@@ -93,6 +93,7 @@ Instead, define travsr's own closed vocabulary in `travsr-core`:
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(rename_all = "snake_case")]
 pub enum OccurrenceRole {
     Definition,
     Reference,
@@ -102,6 +103,12 @@ pub enum OccurrenceRole {
     Test,
     Generated,
     ForwardDeclaration,
+    /// Wire-compatibility escape hatch, not a role. A newer plugin sending a
+    /// variant this build does not know deserializes here instead of failing.
+    /// See "Adding a variant later" below — this is what keeps D3's
+    /// no-version-bump claim true for the *enum* as well as the field.
+    #[serde(other)]
+    Unknown,
 }
 ```
 
@@ -121,6 +128,32 @@ edge. `OccurrenceRole` extends that principle one level down.
 
 **Consequence:** a language added tomorrow participates without a protocol
 change. That is the requirement this design exists to satisfy.
+
+#### Adding a variant later
+
+Review on #552 caught a real gap in the first draft, which claimed
+`#[non_exhaustive]` was sufficient. It is not, and the two attributes solve
+different problems:
+
+- `#[non_exhaustive]` is a **compile-time** guarantee. It stops downstream crates
+  writing exhaustive `match` arms and constructing the enum, so adding a variant
+  is not a semver break for Rust consumers.
+- It says nothing about **deserialization**. An older daemon receiving a variant
+  its enum does not contain would fail to deserialize — and because roles arrive
+  inside `InvokeResponse`, that failure is not confined to one occurrence. It
+  fails the payload, which means a newer plugin silently breaks an older daemon.
+
+That would quietly undo D3. `#[serde(other)]` closes it: the unknown variant
+deserializes to `Unknown`, the payload survives, and the occurrence degrades to
+"a role we do not understand" rather than taking the response down with it.
+
+**Consumers must treat `Unknown` as they treat `None` from D2** — as absence of
+information, never as a negative finding. A role this build cannot interpret is
+not evidence that the occurrence is not a test.
+
+This does constrain how variants get added: a new role is only safe if every
+consumer already handles `Unknown` conservatively. That constraint is stated here
+rather than left to be discovered when the first new role ships.
 
 ### D2 — Absent is not false
 
