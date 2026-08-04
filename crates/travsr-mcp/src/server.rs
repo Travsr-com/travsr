@@ -141,7 +141,8 @@ fn handle_tool_call(
         "find_pattern" => {
             let pattern = args["pattern"].as_str().unwrap_or("");
             let scope = args["scope"].as_str().filter(|s| !s.is_empty());
-            tools::find_pattern(store, pattern, scope)
+            let fixed = args["fixed"].as_bool().unwrap_or(false);
+            tools::find_pattern(store, pattern, scope, fixed)
         }
         "get_blast_radius" => {
             let file = args["file"].as_str().unwrap_or("");
@@ -364,12 +365,13 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Optionally scope to a path prefix or to files-importing(<symbol>) so results are confined to the graph-relevant file set.",
+                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or to files-importing(<symbol>) so results are confined to the graph-relevant file set.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Text or regex to search for" },
-                        "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" }
+                        "pattern": { "type": "string", "description": "POSIX ERE pattern to search for (use fixed:true for a literal string)" },
+                        "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" },
+                        "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" }
                     },
                     "required": ["pattern"],
                     "additionalProperties": false
@@ -745,6 +747,7 @@ fn handle_tool_call_global(
             args["pattern"].as_str().unwrap_or(""),
             args["scope"].as_str().filter(|s| !s.is_empty()),
             repo_arg,
+            args["fixed"].as_bool().unwrap_or(false),
         ),
         "get_blast_radius" => {
             let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
@@ -934,12 +937,13 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Optionally scope to a path prefix or files-importing(<symbol>). Supply `repo` to scope; omit only to search across all repos.",
+                "description": "Graph-scoped textual search (git grep) returning path:line:col: text. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or files-importing(<symbol>). Supply `repo` to scope; omit only to search across all repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Text or regex to search for" },
+                        "pattern": { "type": "string", "description": "POSIX ERE pattern to search for (use fixed:true for a literal string)" },
                         "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" },
+                        "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["pattern"],

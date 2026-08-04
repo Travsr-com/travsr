@@ -137,11 +137,14 @@ enum Command {
     },
     /// Graph-scoped textual search (git grep) over a bounded file set.
     Pattern {
-        /// Text or regex to search for.
+        /// POSIX ERE pattern to search for (use --fixed for a literal string).
         pattern: String,
         /// Optional scope: a path prefix, or files-importing(<symbol>).
         #[arg(long)]
         scope: Option<String>,
+        /// Treat pattern as a literal string instead of a regular expression.
+        #[arg(long)]
+        fixed: bool,
         /// Output format: text (default) or json.
         #[arg(long, value_enum, default_value = "text")]
         format: pattern::OutputFormat,
@@ -657,8 +660,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Pattern {
             pattern,
             scope,
+            fixed,
             format,
-        } => pattern::run(&pattern, scope, format)?,
+        } => pattern::run(&pattern, scope, fixed, format)?,
         Command::Graph {
             query,
             all,

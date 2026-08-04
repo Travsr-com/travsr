@@ -592,21 +592,35 @@ fn is_semantic_edge(kind: &str) -> bool {
     )
 }
 
+/// Containment edges answer "where does this live", not "who calls this".
+/// In caller traversal they are shown as orientation but never expanded —
+/// expanding one pulls in every sibling definition of the containing file
+/// (#517).
+fn is_containment_edge(kind: &str) -> bool {
+    kind == "defines/binding"
+}
+
 /// Outgoing/incoming expansion for one node, mirroring `travsr graph`'s edge
 /// semantics (RFC-014 file-node caller splice, semantic-preferred mode with
 /// per-node structural fallback for display). Whether to surface the
 /// language-level "semantic unavailable" note is decided once in `graph_query`
 /// from coverage — NOT here — so a single caller-less leaf cannot trip it.
+///
+/// Returns `(edge_kind, next_id, expand)`. `expand` is `false` for a
+/// containment edge reached in `Callers`/`Both` direction (#517 DD-1): the
+/// node is still recorded and displayed, but the traversal does not walk
+/// further from it, so a file's other definitions never enter the BFS queue.
 fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
-) -> anyhow::Result<Vec<(String, NodeId)>> {
+    is_seed: bool,
+) -> anyhow::Result<Vec<(String, NodeId, bool)>> {
     let mut out = Vec::new();
     if matches!(direction, QueryDirection::Deps | QueryDirection::Both) {
         for e in store.iter_edges_from(node_id)? {
-            out.push((e.kind.as_str().to_string(), e.dst));
+            out.push((e.kind.as_str().to_string(), e.dst, true));
         }
     }
     if matches!(direction, QueryDirection::Callers | QueryDirection::Both) {
@@ -615,23 +629,30 @@ fn next_edges(
         // contains — splice them in so function-level callers surface when a
         // query resolves to a file node. Edges sourced from the file itself
         // (defines/binding) are skipped to avoid self-loops.
-        if let Some(node) = store.get_node(node_id)? {
-            if node.kind == "file" {
-                // Cap the splice at 200 definitions: pathological generated
-                // files can hold thousands, each costing an iter_edges_to
-                // round-trip. Full fidelity remains available via per-symbol
-                // queries.
-                for def_id in store
-                    .definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
-                    .into_iter()
-                    .take(200)
-                {
-                    incoming.extend(
-                        store
-                            .iter_edges_to(def_id)?
-                            .into_iter()
-                            .filter(|e| e.src != node_id),
-                    );
+        //
+        // #517 DD-2: gated on `is_seed` — this splice is only correct when the
+        // *user's query* resolved to a file. A file node reached incidentally
+        // by walking a containment edge up from a symbol must not re-trigger
+        // it, or every sibling definition in that file floods the traversal.
+        if is_seed {
+            if let Some(node) = store.get_node(node_id)? {
+                if node.kind == "file" {
+                    // Cap the splice at 200 definitions: pathological generated
+                    // files can hold thousands, each costing an iter_edges_to
+                    // round-trip. Full fidelity remains available via per-symbol
+                    // queries.
+                    for def_id in store
+                        .definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
+                        .into_iter()
+                        .take(200)
+                    {
+                        incoming.extend(
+                            store
+                                .iter_edges_to(def_id)?
+                                .into_iter()
+                                .filter(|e| e.src != node_id),
+                        );
+                    }
                 }
             }
         }
@@ -641,7 +662,7 @@ fn next_edges(
                 for e in &incoming {
                     let s = e.kind.as_str();
                     if is_semantic_edge(s) || s == "defines/binding" {
-                        out.push((s.to_string(), e.src));
+                        out.push((s.to_string(), e.src, !is_containment_edge(s)));
                     }
                 }
             } else {
@@ -650,19 +671,25 @@ fn next_edges(
                 // *language* lacks semantic data (and thus warrants the note) is
                 // judged from coverage in graph_query, not from this one node.
                 for e in &incoming {
-                    out.push((e.kind.as_str().to_string(), e.src));
+                    let s = e.kind.as_str();
+                    out.push((s.to_string(), e.src, !is_containment_edge(s)));
                 }
             }
         } else {
             for e in &incoming {
-                out.push((e.kind.as_str().to_string(), e.src));
+                let s = e.kind.as_str();
+                out.push((s.to_string(), e.src, !is_containment_edge(s)));
             }
         }
     }
     // Multiple call sites (and the file-node definition splice) can yield the
     // same (kind, src) pair — collapse them for display.
     let mut seen = HashSet::new();
-    out.retain(|(kind, id)| seen.insert((kind.clone(), *id)));
+    out.retain(|(kind, id, _)| seen.insert((kind.clone(), *id)));
+    // #517 DD-1: non-containment edges (the answer) precede containment edges
+    // (orientation) from the same parent. Stable sort preserves DB order
+    // within each group, so output stays deterministic.
+    out.sort_by_key(|(kind, _, _)| is_containment_edge(kind));
     Ok(out)
 }
 
@@ -700,23 +727,33 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let mut edges_raw: Vec<(NodeId, NodeId, String, String)> = Vec::new();
     let mut tree: Vec<TreeStep> = Vec::new();
     let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
+    let mut queue: VecDeque<(NodeId, u8, bool)> = VecDeque::new();
 
     visited.insert(seed.id);
-    queue.push_back((seed.id, 0));
+    queue.push_back((seed.id, 0, true));
 
-    while let Some((current_id, depth)) = queue.pop_front() {
+    while let Some((current_id, depth, expand)) = queue.pop_front() {
         if let Some(node) = store.get_node(current_id)? {
             if node_index.insert(current_id) {
                 nodes.push(node_entry(&node, depth));
             }
         }
 
-        if depth >= args.depth {
+        // #517 DD-1: the depth guard and the terminal-node guard (`!expand`)
+        // sit after the node has already been pushed above, so a containment
+        // leaf is still emitted and rendered at its true depth — it is simply
+        // not walked any further.
+        if depth >= args.depth || !expand {
             continue;
         }
 
-        for (edge_kind, next_id) in next_edges(store, current_id, args.direction, args.edge_mode)? {
+        for (edge_kind, next_id, child_expand) in next_edges(
+            store,
+            current_id,
+            args.direction,
+            args.edge_mode,
+            depth == 0,
+        )? {
             let (src, dst) = match args.direction {
                 QueryDirection::Callers => (next_id, current_id),
                 _ => (current_id, next_id),
@@ -739,7 +776,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     edge_kind,
                     child: next_id.0,
                 });
-                queue.push_back((next_id, depth + 1));
+                queue.push_back((next_id, depth + 1, child_expand));
             }
         }
     }
@@ -989,6 +1026,187 @@ mod tests {
         let before = payload.nodes.len();
         assert_eq!(apply_token_budget(&mut payload, 0), 0);
         assert_eq!(payload.nodes.len(), before);
+    }
+
+    // ── #517: containment edges terminal in caller traversal ──────────────────
+
+    /// `seeded_store` plus a sibling definition in the same file and a second
+    /// caller, so containment-vs-answer ordering and expansion are observable.
+    fn seeded_store_with_sibling() -> (SqliteStore, Node, Node, Node, Node, Node) {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let file = node("file", "file", "src/service.ts");
+        let class = node("class:PaymentService", "class", "src/service.ts");
+        let sibling = node("class:UnrelatedHelper", "class", "src/service.ts");
+        let caller = node("fn:processPayment", "function", "src/controller.ts");
+        let caller2 = node("fn:refundPayment", "function", "src/controller.ts");
+        for n in [&file, &class, &sibling, &caller, &caller2] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(file.id, class.id, EdgeKind::DefinesBinding))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(file.id, sibling.id, EdgeKind::DefinesBinding))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, class.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(caller2.id, class.id, EdgeKind::RefCall))
+            .unwrap();
+        (store, file, class, sibling, caller, caller2)
+    }
+
+    #[test]
+    fn callers_do_not_expand_the_defining_file() {
+        let (store, .., sibling, _caller, _caller2) = seeded_store_with_sibling();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "PaymentService".to_string(),
+                depth: 3,
+                direction: QueryDirection::Callers,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            !payload.nodes.iter().any(|n| n.id == sibling.id.0),
+            "sibling definition in the same file must not be pulled in through \
+             the incidentally-reached file's containment edge"
+        );
+    }
+
+    #[test]
+    fn callers_rank_call_edges_before_containment() {
+        let (store, file, class, _sibling, caller, caller2) = seeded_store_with_sibling();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "PaymentService".to_string(),
+                depth: 3,
+                direction: QueryDirection::Callers,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let steps_from_seed: Vec<&TreeStep> = payload
+            .tree
+            .iter()
+            .filter(|t| t.parent == class.id.0)
+            .collect();
+        let containment_pos = steps_from_seed
+            .iter()
+            .position(|t| t.child == file.id.0)
+            .expect("containment step to the defining file is present");
+        let call_positions: Vec<usize> = steps_from_seed
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.child == caller.id.0 || t.child == caller2.id.0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(call_positions.len(), 2, "both callers must be present");
+        assert!(
+            call_positions.iter().all(|&p| p < containment_pos),
+            "ref/call steps must precede the defines/binding step"
+        );
+    }
+
+    #[test]
+    fn callers_still_show_the_defining_file() {
+        let (store, file, ..) = seeded_store_with_sibling();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "PaymentService".to_string(),
+                depth: 3,
+                direction: QueryDirection::Callers,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let file_node = payload
+            .nodes
+            .iter()
+            .find(|n| n.id == file.id.0)
+            .expect("the defining file is still shown for orientation");
+        assert_eq!(file_node.depth, 1);
+    }
+
+    /// #317 regression guard: querying a *file* directly still splices in the
+    /// callers of the definitions it holds. This is the test that fails if
+    /// DD-2 were implemented as an unconditional removal of the splice.
+    #[test]
+    fn file_seed_still_splices_definition_callers() {
+        let (store, file, _class, _sibling, caller, caller2) = seeded_store_with_sibling();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "service.ts".to_string(),
+                depth: 2,
+                direction: QueryDirection::Callers,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let seed = payload.seed.as_ref().expect("seed must match");
+        assert_eq!(
+            seed.id, file.id.0,
+            "the file itself must be the traversal seed"
+        );
+        assert!(payload.nodes.iter().any(|n| n.id == caller.id.0));
+        assert!(payload.nodes.iter().any(|n| n.id == caller2.id.0));
+    }
+
+    #[test]
+    fn deps_direction_still_expands_the_file() {
+        let (store, _file, class, sibling, ..) = seeded_store_with_sibling();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "service.ts".to_string(),
+                depth: 2,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(payload.nodes.iter().any(|n| n.id == class.id.0));
+        assert!(payload.nodes.iter().any(|n| n.id == sibling.id.0));
+    }
+
+    #[test]
+    fn budget_keeps_callers_over_containment() {
+        let (store, ..) = seeded_store_with_sibling();
+        let mut payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "PaymentService".to_string(),
+                depth: 3,
+                direction: QueryDirection::Callers,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            payload.nodes.len() >= 4,
+            "need seed + 2 callers + the containing file for this test to be meaningful"
+        );
+        // Budget that admits exactly the seed plus the two callers (which sort
+        // before the containment file in BFS discovery order).
+        let budget: usize = payload.nodes[..3].iter().map(|n| n.tokens).sum();
+        apply_token_budget(&mut payload, budget);
+        assert_eq!(payload.nodes.len(), 3);
+        assert!(
+            payload.nodes[1..].iter().all(|n| n.kind != "file"),
+            "the two survivors beyond the seed must be ref/call parents, not the containment file"
+        );
     }
 
     #[test]

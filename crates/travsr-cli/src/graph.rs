@@ -19,7 +19,8 @@ use crate::repo::find_git_root;
 pub enum Direction {
     /// Follow outgoing edges (what does this symbol import / define?)
     Deps,
-    /// Follow incoming edges (who calls / depends on this symbol?)
+    /// Follow incoming edges (who calls / depends on this symbol?). Containment
+    /// edges to the defining file are shown but not expanded.
     Callers,
     /// Follow both directions
     Both,
