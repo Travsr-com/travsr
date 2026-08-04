@@ -845,9 +845,16 @@ fn find_pattern_body(
 
 /// #517 DD-5: constructs that are syntactically valid POSIX ERE atoms (so
 /// `git grep -E` accepts them without error) but mean something else than
-/// their PCRE reading — so a pattern relying on the PCRE meaning silently
-/// finds nothing instead of erroring. Advisory only; never changes what is
-/// searched and never fires when there are matches.
+/// their PCRE reading under a strict POSIX regex engine — so a pattern
+/// relying on the PCRE meaning silently finds nothing instead of erroring.
+/// Advisory only; never changes what is searched and never fires when there
+/// are matches.
+///
+/// Caveat: `\b \B \w \W \s \S` are also GNU regex extensions, so on
+/// glibc-based git (Linux, and Windows via Git for Windows/MSYS2) they work
+/// as their PCRE-adjacent meaning even under `-E` and this advisory never
+/// fires for them — only macOS's BSD-based git grep treats them as inert.
+/// `\d \D` and `(?` are not GNU extensions and behave the same everywhere.
 fn pcre_only_advisory(pattern: &str) -> Option<String> {
     const CONSTRUCTS: &[&str] = &["\\b", "\\B", "\\d", "\\D", "\\w", "\\W", "\\s", "\\S", "(?"];
     let found = *CONSTRUCTS.iter().find(|c| pattern.contains(*c))?;
@@ -9345,16 +9352,19 @@ mod snippet_tests {
         );
     }
 
-    /// #517 DD-5: `\b` is a GNU/PCRE word-boundary escape with no POSIX ERE
-    /// equivalent — `git grep -E` treats it as a literal `b` preceded by a
-    /// backspace, so it silently matches nothing rather than erroring. The
-    /// advisory names the construct instead of returning bare empty.
+    /// #517 DD-5: `\d` is a PCRE digit-class escape with no POSIX ERE
+    /// equivalent. Unlike `\b \B \w \W \s \S`, it is not a GNU regex
+    /// extension either, so `git grep -E` treats it as inert on both the
+    /// glibc-based (Linux, Windows/MSYS2) and BSD-based (macOS) regex
+    /// engines git ships with — it silently matches nothing rather than
+    /// erroring, on every platform this test runs on in CI. The advisory
+    /// names the construct instead of returning bare empty.
     #[test]
     fn pattern_advises_on_pcre_only_construct() {
         let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\n");
-        let out = find_pattern(&store, "\\balpha\\b", None, false);
+        let out = find_pattern(&store, "\\dalpha", None, false);
         assert!(
-            out.contains("\\b"),
+            out.contains("\\d"),
             "advisory must name the unsupported construct: {out}"
         );
         assert!(
