@@ -932,52 +932,44 @@ enum GrepOutcome {
 /// POSIX ERE (no backreferences/lookaround) a pathological pattern against a
 /// large repo can pin a core; this bounds the daemon's exposure to a
 /// user-supplied pattern.
-const GREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Execute `git grep` under `repo_root` with an argument vector (no shell) and
-/// format the capped results as `path:line:col: text`.
 ///
-/// `fixed` selects `-F` (literal string) instead of the default `-E` (POSIX
-/// extended regular expression) — #517 DD-3/DD-6.
-fn run_git_grep(
-    repo_root: &std::path::Path,
-    pattern: &str,
-    pathspecs: &[String],
-    fixed: bool,
-) -> GrepOutcome {
+/// #517 §9.2 follow-up: the original 10s figure was calibrated against this
+/// repo (~10k nodes). Measured against the k8s corpus (263k nodes) with
+/// `--threads` pinned per [`git_grep_thread_count`], a legitimate broad
+/// alternation pattern (`(Pod|Service|Deployment|Node|Volume)`) already took
+/// 8s at 2 threads and 15s at 1 thread — realistic for a small CI runner or a
+/// daemon busy with concurrent tool calls. 30s keeps that same class of query
+/// from being misreported as a timeout while still bounding a runaway one.
+const GREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `--threads=N` for `git grep`, pinned to the number of cores actually
+/// available rather than left to git's own default heuristic, so the
+/// [`GREP_TIMEOUT`] budget above is measured against the same parallelism the
+/// daemon will see in production (#517 §9.2).
+fn git_grep_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Spawn `cmd` with piped stdout/stderr, drain both on background threads, and
+/// poll for exit against `deadline` (#517 DD-8). Returns `(status, stdout,
+/// stderr)`; `status` is `None` if `cmd` exceeded `deadline` and was killed.
+///
+/// Draining on background threads means a large result set can't fill a pipe
+/// buffer and deadlock the child while the loop below polls for exit —
+/// `Command::wait_with_output` has no deadline, so this reimplements it with
+/// one instead of using it directly.
+fn spawn_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> std::io::Result<(Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>)> {
     use std::io::Read as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_root)
-        .arg("grep")
-        .arg("--no-color")
-        .arg("-n") // line numbers
-        .arg("--column") // column numbers
-        .arg("-I") // skip binary files
-        .arg(if fixed { "-F" } else { "-E" })
-        .arg("-e")
-        .arg(pattern);
-    // `--` terminates options so the pattern/pathspecs can never be read as flags.
-    cmd.arg("--");
-    for spec in pathspecs {
-        cmd.arg(spec);
-    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("find_pattern git grep spawn failed: {e}");
-            return GrepOutcome::Error(format!("failed to run git grep: {e}"));
-        }
-    };
-
-    // Drain stdout/stderr on reader threads so a large result set can't fill a
-    // pipe buffer and deadlock the child while the loop below polls for exit —
-    // `Command::wait_with_output` has no deadline, so DD-8 reimplements it with
-    // one instead of using it directly.
     let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
     let stdout_reader = std::thread::spawn(move || {
@@ -991,7 +983,7 @@ fn run_git_grep(
         buf
     });
 
-    let deadline = std::time::Instant::now() + GREP_TIMEOUT;
+    let cutoff = std::time::Instant::now() + deadline;
     // Both pipes are already draining on background threads above — no
     // pipe-buffer deadlock risk (same exception as
     // `travsr-indexer::runner::run_with_drain`, which `travsr-mcp` cannot
@@ -1001,7 +993,7 @@ fn run_git_grep(
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                if std::time::Instant::now() >= cutoff {
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -1009,14 +1001,56 @@ fn run_git_grep(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Err(e) => {
-                tracing::warn!("find_pattern git grep wait failed: {e}");
+                tracing::warn!("spawn_with_deadline wait failed: {e}");
                 let _ = child.kill();
+                let _ = child.wait();
                 break None;
             }
         }
     };
     let stdout_bytes = stdout_reader.join().unwrap_or_default();
     let stderr_bytes = stderr_reader.join().unwrap_or_default();
+    Ok((status, stdout_bytes, stderr_bytes))
+}
+
+/// Execute `git grep` under `repo_root` with an argument vector (no shell) and
+/// format the capped results as `path:line:col: text`.
+///
+/// `fixed` selects `-F` (literal string) instead of the default `-E` (POSIX
+/// extended regular expression) — #517 DD-3/DD-6.
+fn run_git_grep(
+    repo_root: &std::path::Path,
+    pattern: &str,
+    pathspecs: &[String],
+    fixed: bool,
+) -> GrepOutcome {
+    use std::process::Command;
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_root)
+        .arg("grep")
+        .arg("--no-color")
+        .arg("-n") // line numbers
+        .arg("--column") // column numbers
+        .arg("-I") // skip binary files
+        .arg(format!("--threads={}", git_grep_thread_count()))
+        .arg(if fixed { "-F" } else { "-E" })
+        .arg("-e")
+        .arg(pattern);
+    // `--` terminates options so the pattern/pathspecs can never be read as flags.
+    cmd.arg("--");
+    for spec in pathspecs {
+        cmd.arg(spec);
+    }
+
+    let (status, stdout_bytes, stderr_bytes) = match spawn_with_deadline(cmd, GREP_TIMEOUT) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("find_pattern git grep spawn failed: {e}");
+            return GrepOutcome::Error(format!("failed to run git grep: {e}"));
+        }
+    };
 
     let Some(status) = status else {
         return GrepOutcome::Error(format!(
@@ -9390,6 +9424,57 @@ mod snippet_tests {
             out.contains("alpha"),
             "the healthy repo's match must still appear alongside the error: {out}"
         );
+    }
+
+    // ── #517 DD-8: subprocess deadline ───────────────────────────────────────
+    //
+    // `git hash-object --stdin` reads from stdin until EOF. `spawn_with_deadline`
+    // never touches `child.stdin`, so the pipe's write end stays open (held by
+    // the `Child`) for as long as the child runs — giving a reliably slow, fully
+    // cross-platform child process without a `sleep`/`printf` dependency that
+    // would not exist on the `windows-latest` CI runner.
+    fn blocked_on_stdin() -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("hash-object").arg("--stdin");
+        cmd.stdin(std::process::Stdio::piped());
+        cmd
+    }
+
+    #[test]
+    fn spawn_with_deadline_kills_and_reports_none_for_a_slow_child() {
+        let start = std::time::Instant::now();
+        let (status, _out, _err) =
+            spawn_with_deadline(blocked_on_stdin(), std::time::Duration::from_millis(200)).unwrap();
+        assert!(
+            status.is_none(),
+            "a child still running past the deadline must report None, not a real exit status"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the call must return once the deadline fires, not wait for the child \
+             to finish on its own — took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn spawn_with_deadline_returns_status_and_output_for_a_fast_child() {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("--version");
+        let (status, stdout, _err) =
+            spawn_with_deadline(cmd, std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(status.map(|s| s.code()), Some(Some(0)));
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("git version"),
+            "stdout must be captured for a normally-exiting child: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+    }
+
+    #[test]
+    fn spawn_with_deadline_returns_err_for_a_missing_binary() {
+        let cmd = std::process::Command::new("travsr-517-no-such-binary-xyz");
+        assert!(spawn_with_deadline(cmd, std::time::Duration::from_secs(1)).is_err());
     }
 
     // ── #376 Phase 2: docs section ───────────────────────────────────────────
