@@ -3443,6 +3443,65 @@ LIMIT 20",
     /// `dst`) also fixes the empty-`language` false-negative: an occurrence's
     /// enclosing `src` node reliably carries the calling file's language even
     /// when the `dst` definition node was stored with an empty `language`.
+    /// Fraction of this language's definition-bearing files that carry at least
+    /// one `ref/call` occurrence, as `(files_with_occurrences, files_total)`.
+    ///
+    /// #450: [`Self::language_has_edge_sites`] answers a binary question — does
+    /// *any* occurrence exist for this language — which is the right gate for
+    /// "the index was never built". It cannot distinguish that from *partial*
+    /// coverage, and partial coverage is common: a Phase B pass can analyse a
+    /// handful of files and stop (analyzer crash, per-file timeout, a provider
+    /// that only indexes its own package). Every symbol in the unanalysed
+    /// remainder then reaches the confident-zero branch and is reported as
+    /// having "no recorded uses" — a statement of fact the index cannot support.
+    ///
+    /// Measured on travsr's own graph, where the gap is not hypothetical:
+    ///
+    /// ```text
+    /// rust        161/169   95%   confident zero is reasonable
+    /// typescript    4/65     6%   94% of files never analysed
+    /// go            1/17     5%   ditto
+    /// ```
+    ///
+    /// Both TypeScript and Go pass `language_has_edge_sites`, so today every
+    /// symbol in those 60-odd unanalysed files is described as definitively
+    /// unreferenced.
+    ///
+    /// Returns `(0, 0)` for the empty language, matching
+    /// `language_has_edge_sites`'s treatment of the file-attribution fallback.
+    ///
+    /// Counts *files* rather than symbols deliberately: Phase B coverage is
+    /// decided per file, and a file-level ratio is not skewed by one densely
+    /// referenced module. This remains a proxy — a genuinely reference-free file
+    /// is indistinguishable from an unanalysed one. RFC-023 / #549 would replace
+    /// it with a recorded per-file coverage map; until then this is derivable
+    /// from data already stored.
+    pub fn language_occurrence_coverage(&self, language: &str) -> anyhow::Result<(u64, u64)> {
+        if language.is_empty() {
+            return Ok((0, 0));
+        }
+        // Two scalar sub-selects rather than a `JOIN … ON es.src = n.id OR
+        // es.dst = n.id`: an OR-join defeats both `edge_sites` PK prefixes and
+        // forces a scan. The UNION of src/dst probes each index separately.
+        // Measured 2-23 ms per language on this repo's graph.
+        let (with_occ, total): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(DISTINCT path) FROM nodes \
+                      WHERE id IN ( \
+                        SELECT src FROM edge_sites WHERE kind = 'ref/call' \
+                        UNION SELECT dst FROM edge_sites WHERE kind = 'ref/call') \
+                      AND language = ?1 AND kind IN ('function','method')), \
+                   (SELECT COUNT(DISTINCT path) FROM nodes \
+                      WHERE language = ?1 AND kind IN ('function','method'))",
+                params![language],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("querying language_occurrence_coverage")?;
+        Ok((with_occ.max(0) as u64, total.max(0) as u64))
+    }
+
     pub fn language_has_edge_sites(&self, language: &str) -> anyhow::Result<bool> {
         if language.is_empty() {
             // No occurrence index is ever "built for" the empty language; the

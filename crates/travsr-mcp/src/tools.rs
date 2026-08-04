@@ -408,6 +408,20 @@ pub fn get_callers_global(
 /// the spirit of `MAX_SITES_PER_CALLER` but is per-symbol, not per-caller.
 const MAX_REFERENCE_SITES: usize = 500;
 
+/// #450: minimum per-language file coverage before `find_references` will state
+/// a definitive "0 reference(s)".
+///
+/// Below this, a zero result is reported as non-definitive and names the actual
+/// coverage, because the symbol may well be used from a file Phase B never
+/// analysed. Set high because the underlying signal is a proxy — a file with
+/// genuinely no outbound references is indistinguishable from an unanalysed one,
+/// so the ratio understates true coverage and the threshold must tolerate that.
+///
+/// 95 rather than 100: travsr's own Rust index sits at 161/169 files (95%), and
+/// that is a healthy, fully-run Phase B pass. Requiring 100% would make the
+/// definitive branch unreachable in practice.
+const DEFINITIVE_ZERO_COVERAGE_PCT: u32 = 95;
+
 /// Byte cap for `find_references` / `find_pattern` output. The default scalar
 /// cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped 500-site list
 /// mid-line and drop the truncation notice — the same trap `get_snippets`
@@ -669,10 +683,35 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  for a textual search."
             );
         }
-        // The index is populated for this language and this symbol has neither
-        // occurrence rows nor ref/call edges: a genuine zero. (If the same name
-        // is also defined elsewhere, bare calls to it are left unindexed to
-        // avoid mis-targeting — precision over recall.)
+        // #450: the language has *some* occurrence data, but "some" is not
+        // "complete". Phase B routinely covers a language partially — an
+        // analyzer crash, a per-file timeout, or a provider that only indexes
+        // its own package all leave most files unanalysed while still producing
+        // enough rows to pass the gate above. Reporting a definitive zero for a
+        // symbol that lives in an unanalysed file states something the index
+        // cannot support.
+        //
+        // Coverage is a file-level proxy, not a recorded fact (RFC-023 / #549
+        // would make it one), so the threshold is deliberately forgiving: only
+        // claim a definitive zero when nearly every file of this language
+        // carries occurrence data.
+        let (files_with_occ, files_total) =
+            store.language_occurrence_coverage(lang).unwrap_or((0, 0));
+        let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
+        if coverage_pct < DEFINITIVE_ZERO_COVERAGE_PCT {
+            return format!(
+                "{header}\n0 recorded reference(s) — not a definitive zero. \
+                 Semantic analysis covers {files_with_occ} of {files_total} \
+                 '{lang}' files in this repo ({coverage_pct}%), so this symbol \
+                 may be used from a file that was never analyzed. Run \
+                 `travsr status` to check Phase B, or use `find_pattern` for a \
+                 textual search."
+            );
+        }
+        // Coverage is effectively complete for this language and this symbol has
+        // neither occurrence rows nor ref/call edges: a genuine zero. (If the
+        // same name is also defined elsewhere, bare calls to it are left
+        // unindexed to avoid mis-targeting — precision over recall.)
         return format!(
             "{header}\n0 reference(s). This symbol has no recorded uses. If this \
              name is also defined elsewhere, bare calls to it are left unindexed \
