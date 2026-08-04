@@ -10,7 +10,7 @@ use travsr_store::{SqliteStore, Store};
 
 use crate::sanitize::{
     sanitize_for_mcp, sanitize_mcp_body_with_limit, validate_mcp_arg, validate_mcp_list_arg,
-    wrap_envelope,
+    validate_mcp_pattern_arg, wrap_envelope,
 };
 
 /// Short alias for the embed KNN closure used throughout `get_context` variants.
@@ -749,23 +749,36 @@ const MAX_PATTERN_MATCHES: usize = 500;
 /// inject. Control characters are rejected, absolute / parent-escaping
 /// pathspecs are dropped, execution is pinned to the repo root, and the match
 /// count is capped.
-pub fn find_pattern(store: &SqliteStore, pattern: &str, scope: Option<&str>) -> String {
+pub fn find_pattern(
+    store: &SqliteStore,
+    pattern: &str,
+    scope: Option<&str>,
+    fixed: bool,
+) -> String {
     // Wrap with the larger find-output limit (not the 4 KiB scalar cap) so a
     // capped 500-match list and its truncation notice survive intact.
     wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_pattern_body(store, pattern, scope),
+        &find_pattern_body(store, pattern, scope, fixed),
         FIND_OUTPUT_LIMIT,
     ))
 }
 
 /// Raw (unsanitized) body for `find_pattern`, shared by the global aggregator.
-fn find_pattern_body(store: &SqliteStore, pattern: &str, scope: Option<&str>) -> String {
-    // SEC-002: validate the pattern; reject control chars (newlines, NUL, …) that
-    // could smuggle additional grep semantics or corrupt the output framing.
-    if let Err(reason) = validate_mcp_arg(pattern) {
+fn find_pattern_body(
+    store: &SqliteStore,
+    pattern: &str,
+    scope: Option<&str>,
+    fixed: bool,
+) -> String {
+    // #517 DD-7: the pattern argument gets its own validator — it is never
+    // path-resolved, so the `../` / `%` guards in `validate_mcp_arg` only cost
+    // correctness here (see `validate_mcp_pattern_arg`'s doc comment).
+    if let Err(reason) = validate_mcp_pattern_arg(pattern) {
         tracing::warn!("find_pattern rejected invalid pattern: {reason}");
         return String::new();
     }
+    // SEC-002: reject control chars (newlines, NUL, …) that could smuggle
+    // additional grep semantics or corrupt the `path:line:col:` output framing.
     if pattern.is_empty() || pattern.chars().any(|c| c.is_control()) {
         tracing::warn!("find_pattern rejected empty or control-char pattern");
         return String::new();
@@ -812,7 +825,47 @@ fn find_pattern_body(store: &SqliteStore, pattern: &str, scope: Option<&str>) ->
         }
     };
 
-    run_git_grep(&repo_root, pattern, &pathspecs)
+    match run_git_grep(&repo_root, pattern, &pathspecs, fixed) {
+        GrepOutcome::Matches(body) => body,
+        // #517 DD-4: deliberately empty, not an error string. `find_pattern_global`
+        // (`collect_global`) uses `result.is_empty()` to skip a repo with no
+        // matches during multi-repo aggregation — preserve that contract.
+        // #517 DD-5: unless the pattern uses a PCRE-only construct that is
+        // syntactically valid-but-different under POSIX ERE, in which case a
+        // silent zero is worse than a one-line advisory.
+        GrepOutcome::NoMatches => pcre_only_advisory(pattern)
+            .map(|note| format!("no matches. {note}"))
+            .unwrap_or_default(),
+        GrepOutcome::Error(detail) => format!(
+            "pattern error: {detail} — the pattern is POSIX ERE; use --fixed for a literal \
+             search, or escape metacharacters."
+        ),
+    }
+}
+
+/// #517 DD-5: constructs that are syntactically valid POSIX ERE atoms (so
+/// `git grep -E` accepts them without error) but mean something else than
+/// their PCRE reading under a strict POSIX regex engine — so a pattern
+/// relying on the PCRE meaning silently finds nothing instead of erroring.
+/// Advisory only; never changes what is searched and never fires when there
+/// are matches.
+///
+/// Caveat: `\b \B \w \W \s \S` are also GNU regex extensions, so on
+/// glibc-based git (Linux, and Windows via Git for Windows/MSYS2) they work
+/// as their PCRE-adjacent meaning even under `-E` and this advisory never
+/// fires for them — only macOS's BSD-based git grep treats them as inert.
+/// `\d \D` and `(?` are not GNU extensions and behave the same everywhere.
+fn pcre_only_advisory(pattern: &str) -> Option<String> {
+    const CONSTRUCTS: &[&str] = &["\\b", "\\B", "\\d", "\\D", "\\w", "\\W", "\\s", "\\S", "(?"];
+    let found = *CONSTRUCTS.iter().find(|c| pattern.contains(*c))?;
+    let hint = match found {
+        "\\b" | "\\B" => " Try [[:<:]] or a character class.",
+        _ => "",
+    };
+    Some(format!(
+        "note: `{found}` is a PCRE construct; travsr pattern uses POSIX ERE, \
+         where it is not supported.{hint}"
+    ))
 }
 
 /// Resolve `files-importing(<symbol>)` to the set of repo-relative file paths
@@ -871,10 +924,115 @@ fn build_travsrignore_matcher(repo_root: &std::path::Path) -> Option<ignore::git
     builder.build().ok()
 }
 
+/// Outcome of a `git grep` invocation, distinguishing a clean zero-match run
+/// from a search the regex engine could not even compile (#517 DD-4). Exit
+/// codes, measured against `git grep`: `0` = matched, `1` = no match, anything
+/// else (or a spawn failure, or the DD-8 deadline) = an error the caller must
+/// not launder into an empty result.
+enum GrepOutcome {
+    Matches(String),
+    NoMatches,
+    Error(String),
+}
+
+/// Wall-clock ceiling on the `git grep` child process (#517 DD-8). Even under
+/// POSIX ERE (no backreferences/lookaround) a pathological pattern against a
+/// large repo can pin a core; this bounds the daemon's exposure to a
+/// user-supplied pattern.
+///
+/// #517 §9.2 follow-up: the original 10s figure was calibrated against this
+/// repo (~10k nodes). Measured against the k8s corpus (263k nodes) with
+/// `--threads` pinned per [`git_grep_thread_count`], a legitimate broad
+/// alternation pattern (`(Pod|Service|Deployment|Node|Volume)`) already took
+/// 8s at 2 threads and 15s at 1 thread — realistic for a small CI runner or a
+/// daemon busy with concurrent tool calls. 30s keeps that same class of query
+/// from being misreported as a timeout while still bounding a runaway one.
+const GREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `--threads=N` for `git grep`, pinned to the number of cores actually
+/// available rather than left to git's own default heuristic, so the
+/// [`GREP_TIMEOUT`] budget above is measured against the same parallelism the
+/// daemon will see in production (#517 §9.2).
+fn git_grep_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Spawn `cmd` with piped stdout/stderr, drain both on background threads, and
+/// poll for exit against `deadline` (#517 DD-8). Returns `(status, stdout,
+/// stderr)`; `status` is `None` if `cmd` exceeded `deadline` and was killed.
+///
+/// Draining on background threads means a large result set can't fill a pipe
+/// buffer and deadlock the child while the loop below polls for exit —
+/// `Command::wait_with_output` has no deadline, so this reimplements it with
+/// one instead of using it directly.
+fn spawn_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> std::io::Result<(Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>)> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let cutoff = std::time::Instant::now() + deadline;
+    // Both pipes are already draining on background threads above — no
+    // pipe-buffer deadlock risk (same exception as
+    // `travsr-indexer::runner::run_with_drain`, which `travsr-mcp` cannot
+    // depend on per the crate dependency rules).
+    #[allow(clippy::disallowed_methods)]
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= cutoff {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                tracing::warn!("spawn_with_deadline wait failed: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let stdout_bytes = stdout_reader.join().unwrap_or_default();
+    let stderr_bytes = stderr_reader.join().unwrap_or_default();
+    Ok((status, stdout_bytes, stderr_bytes))
+}
+
 /// Execute `git grep` under `repo_root` with an argument vector (no shell) and
 /// format the capped results as `path:line:col: text`.
-fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]) -> String {
+///
+/// `fixed` selects `-F` (literal string) instead of the default `-E` (POSIX
+/// extended regular expression) — #517 DD-3/DD-6.
+fn run_git_grep(
+    repo_root: &std::path::Path,
+    pattern: &str,
+    pathspecs: &[String],
+    fixed: bool,
+) -> GrepOutcome {
     use std::process::Command;
+
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo_root)
@@ -883,6 +1041,8 @@ fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]
         .arg("-n") // line numbers
         .arg("--column") // column numbers
         .arg("-I") // skip binary files
+        .arg(format!("--threads={}", git_grep_thread_count()))
+        .arg(if fixed { "-F" } else { "-E" })
         .arg("-e")
         .arg(pattern);
     // `--` terminates options so the pattern/pathspecs can never be read as flags.
@@ -890,16 +1050,35 @@ fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]
     for spec in pathspecs {
         cmd.arg(spec);
     }
-    let output = match cmd.output() {
-        Ok(o) => o,
+
+    let (status, stdout_bytes, stderr_bytes) = match spawn_with_deadline(cmd, GREP_TIMEOUT) {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!("find_pattern git grep spawn failed: {e}");
-            return String::new();
+            return GrepOutcome::Error(format!("failed to run git grep: {e}"));
         }
     };
-    // git grep exits 1 with no matches — a normal empty result, not an error.
-    // Any non-zero status with stdout is unusual but we still surface what we got.
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let Some(status) = status else {
+        return GrepOutcome::Error(format!(
+            "pattern search timed out after {}s",
+            GREP_TIMEOUT.as_secs()
+        ));
+    };
+    match status.code() {
+        Some(0) => {} // matched — fall through to formatting below
+        Some(1) => return GrepOutcome::NoMatches,
+        _ => {
+            let detail = String::from_utf8_lossy(&stderr_bytes)
+                .lines()
+                .next()
+                .unwrap_or("git grep failed")
+                .to_string();
+            return GrepOutcome::Error(detail);
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     // `git grep` honors `.gitignore` but knows nothing about `.travsrignore`, so a
     // git-tracked file the user excluded from the graph would still appear here —
     // making find_pattern and find_references disagree on the same repo. Filter
@@ -918,7 +1097,9 @@ fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]
         })
         .collect();
     if all.is_empty() {
-        return String::new();
+        // The .travsrignore filter emptied a non-empty git-grep match set — the
+        // honest outcome is still "no matches", not an error (§4 W2 edge case).
+        return GrepOutcome::NoMatches;
     }
     // Per-match line-length cap: a single minified/generated line can be
     // hundreds of KB and would otherwise blow the output budget on its own.
@@ -941,7 +1122,7 @@ fn run_git_grep(repo_root: &std::path::Path, pattern: &str, pathspecs: &[String]
     if total > shown {
         lines.push(format!("[truncated: showing {shown} of {total} matches]"));
     }
-    lines.join("\n")
+    GrepOutcome::Matches(lines.join("\n"))
 }
 
 /// Global variant of `find_pattern` — runs the graph-scoped grep per repo.
@@ -950,8 +1131,11 @@ pub fn find_pattern_global(
     pattern: &str,
     scope: Option<&str>,
     repo: Option<&str>,
+    fixed: bool,
 ) -> String {
-    if let Err(reason) = validate_mcp_arg(pattern) {
+    // #517 DD-7: same exemption as `find_pattern_body` — see
+    // `validate_mcp_pattern_arg`'s doc comment.
+    if let Err(reason) = validate_mcp_pattern_arg(pattern) {
         tracing::warn!("find_pattern_global rejected invalid pattern: {reason}");
         return String::new();
     }
@@ -964,7 +1148,7 @@ pub fn find_pattern_global(
     // Aggregate raw per-repo bodies (not the wrapped form) so there is a single
     // envelope + one large-limit sanitize over the whole result.
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = find_pattern_body(store, pattern, scope);
+        let result = find_pattern_body(store, pattern, scope, fixed);
         if result.is_empty() || single {
             result
         } else {
@@ -8959,14 +9143,14 @@ mod snippet_tests {
         // Newline / NUL in the pattern must be rejected before any exec: the body
         // is empty, so only the empty envelope comes back (never a match list).
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "foo\nbar", None), empty);
-        assert_eq!(find_pattern(&store, "", None), empty);
+        assert_eq!(find_pattern(&store, "foo\nbar", None, false), empty);
+        assert_eq!(find_pattern(&store, "", None, false), empty);
     }
 
     #[test]
     fn find_pattern_without_repo_root_is_graceful() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let out = find_pattern(&store, "charge", None);
+        let out = find_pattern(&store, "charge", None, false);
         assert!(
             out.contains("run `travsr init`"),
             "expected init hint: {out}"
@@ -8980,8 +9164,11 @@ mod snippet_tests {
         // Absolute and parent-escaping scopes must be dropped before exec →
         // empty envelope, never a match list.
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "charge", Some("/etc")), empty);
-        assert_eq!(find_pattern(&store, "charge", Some("../secrets")), empty);
+        assert_eq!(find_pattern(&store, "charge", Some("/etc"), false), empty);
+        assert_eq!(
+            find_pattern(&store, "charge", Some("../secrets"), false),
+            empty
+        );
     }
 
     #[test]
@@ -9012,13 +9199,292 @@ mod snippet_tests {
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
 
         // Skip if git is unavailable in the sandbox (grep returns nothing).
-        let out = find_pattern(&store, "charge", None);
+        let out = find_pattern(&store, "charge", None, false);
         if out.contains("keep.rs") {
             assert!(
                 !out.contains("gen/skip.rs"),
                 ".travsrignore-excluded file must not appear: {out}"
             );
         }
+    }
+
+    // ── #517: honest find_pattern failures (D2/D3/D5) ────────────────────────
+
+    /// A one-file git repo with `content` written to `path`, and a store whose
+    /// `repo_root` points at it. The `TempDir` must be kept alive by the caller
+    /// for the store's `repo_root` to remain valid.
+    fn pattern_fixture(
+        path: &str,
+        content: &str,
+    ) -> (tempfile::TempDir, travsr_store::SqliteStore) {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        let full = root.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full, content).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+        (dir, store)
+    }
+
+    /// Parses the `N match(es):` header `find_pattern` prints as its first line.
+    fn extract_match_count(out: &str) -> usize {
+        out.lines()
+            .find_map(|l| l.strip_suffix(" match(es):").and_then(|n| n.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    /// The issue's own invariant: a strict superset of a pattern (alternation
+    /// with a term that cannot match) must never return fewer results.
+    #[test]
+    fn pattern_alternation_never_reduces_match_count() {
+        let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\nlet beta = 2;\n");
+        let base = find_pattern(&store, "alpha", None, false);
+        let widened = find_pattern(&store, "alpha|zzznonexistent", None, false);
+        assert!(
+            extract_match_count(&widened) >= extract_match_count(&base),
+            "alternation must never reduce match count: base={base:?} widened={widened:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_capture_group_matches_like_the_bare_literal() {
+        let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\n");
+        let bare = find_pattern(&store, "alpha", None, false);
+        let grouped = find_pattern(&store, "(alpha)", None, false);
+        assert_eq!(
+            extract_match_count(&bare),
+            extract_match_count(&grouped),
+            "a capture group around a literal must match identically: bare={bare:?} grouped={grouped:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_escaped_paren_finds_call_sites() {
+        let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
+        let out = find_pattern(&store, "alpha\\(", None, false);
+        assert!(
+            out.contains("alpha();"),
+            "escaped paren must find the call site: {out}"
+        );
+    }
+
+    #[test]
+    fn pattern_reports_error_for_uncompilable_pattern() {
+        let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
+        let out = find_pattern(&store, "alpha(", None, false);
+        assert!(
+            out.contains("pattern error"),
+            "an unbalanced group must error, not return empty: {out}"
+        );
+        assert!(
+            out.contains("--fixed"),
+            "the error must name --fixed as the escape hatch: {out}"
+        );
+        assert_ne!(
+            out, "<travsr-data></travsr-data>",
+            "the error must not be laundered into an empty envelope"
+        );
+    }
+
+    #[test]
+    fn pattern_fixed_mode_treats_metachars_literally() {
+        let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
+        let out = find_pattern(&store, "alpha(", None, true);
+        assert!(
+            !out.contains("pattern error"),
+            "--fixed must not attempt regex compilation: {out}"
+        );
+        assert!(
+            out.contains("alpha();"),
+            "--fixed must find the literal match: {out}"
+        );
+    }
+
+    /// #517 D3: `%` is a legitimate search character (never path-resolved).
+    #[test]
+    fn pattern_allows_percent_in_pattern() {
+        let (_dir, store) = pattern_fixture("fix.rs", "let load = 100%;\n");
+        let out = find_pattern(&store, "100%", None, false);
+        assert_eq!(
+            extract_match_count(&out),
+            1,
+            "percent must not be rejected as path-traversal signal: {out}"
+        );
+    }
+
+    /// #517 DD-7 M2: the pattern validator dropped the path guards but must
+    /// still reject NUL and other control characters (output-framing safety).
+    #[test]
+    fn pattern_still_rejects_nul_and_control_chars() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let empty = "<travsr-data></travsr-data>";
+        assert_eq!(find_pattern(&store, "foo\0bar", None, false), empty);
+        assert_eq!(find_pattern(&store, "foo\nbar", None, false), empty);
+    }
+
+    /// #517 DD-7 M1: the relaxed validator applies only to `pattern` — `scope`
+    /// keeps the full `validate_mcp_arg` path-traversal guard.
+    #[test]
+    fn pattern_scope_still_rejects_traversal() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", "/tmp/whatever").unwrap();
+        let empty = "<travsr-data></travsr-data>";
+        assert_eq!(
+            find_pattern(&store, "100%", Some("../etc"), false),
+            empty,
+            "a percent-containing pattern must not smuggle a traversal scope past validation"
+        );
+    }
+
+    /// #517 DD-5: `\d` is a PCRE digit-class escape with no POSIX ERE
+    /// equivalent. Unlike `\b \B \w \W \s \S`, it is not a GNU regex
+    /// extension either, so `git grep -E` treats it as inert on both the
+    /// glibc-based (Linux, Windows/MSYS2) and BSD-based (macOS) regex
+    /// engines git ships with — it silently matches nothing rather than
+    /// erroring, on every platform this test runs on in CI. The advisory
+    /// names the construct instead of returning bare empty.
+    #[test]
+    fn pattern_advises_on_pcre_only_construct() {
+        let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\n");
+        let out = find_pattern(&store, "\\dalpha", None, false);
+        assert!(
+            out.contains("\\d"),
+            "advisory must name the unsupported construct: {out}"
+        );
+        assert!(
+            out.contains("PCRE"),
+            "advisory must explain why it is unsupported: {out}"
+        );
+    }
+
+    #[test]
+    fn pattern_global_attributes_error_to_the_failing_repo() {
+        use std::process::Command;
+        let workdir = tempfile::tempdir().unwrap();
+
+        // A real git repo with one match for "alpha".
+        let ok_root = workdir.path().join("ok_root");
+        std::fs::create_dir_all(&ok_root).unwrap();
+        let git = |root: &std::path::Path, args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&ok_root, &["init", "-q"]);
+        git(&ok_root, &["config", "user.email", "t@t.com"]);
+        git(&ok_root, &["config", "user.name", "t"]);
+        std::fs::write(ok_root.join("fix.rs"), "let alpha = 1;\n").unwrap();
+        git(&ok_root, &["add", "-A"]);
+        git(&ok_root, &["commit", "-qm", "init"]);
+        let ok_db = workdir.path().join("ok.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&ok_db).unwrap();
+            store
+                .set_meta("repo_root", ok_root.to_str().unwrap())
+                .unwrap();
+        }
+
+        // `repo_root` points at a directory that is not a git repository at
+        // all, so `git -C <root> grep` fails with a real (non-pattern) error —
+        // independent of the pattern, unlike a regex-compile failure.
+        let bad_root = workdir.path().join("bad_root");
+        std::fs::create_dir_all(&bad_root).unwrap();
+        let bad_db = workdir.path().join("bad.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&bad_db).unwrap();
+            store
+                .set_meta("repo_root", bad_root.to_str().unwrap())
+                .unwrap();
+        }
+
+        let repos: HashMap<String, PathBuf> = [
+            ("repo_ok".to_string(), ok_db),
+            ("repo_bad".to_string(), bad_db),
+        ]
+        .into();
+
+        let out = find_pattern_global(&repos, "alpha", None, None, false);
+        assert!(
+            out.contains("[repo_bad] pattern error"),
+            "the failing repo's error must be attributed to it, not silently dropped: {out}"
+        );
+        assert!(
+            !out.contains("[repo_ok] pattern error"),
+            "the healthy repo must not show an error: {out}"
+        );
+        assert!(
+            out.contains("alpha"),
+            "the healthy repo's match must still appear alongside the error: {out}"
+        );
+    }
+
+    // ── #517 DD-8: subprocess deadline ───────────────────────────────────────
+    //
+    // `git hash-object --stdin` reads from stdin until EOF. `spawn_with_deadline`
+    // never touches `child.stdin`, so the pipe's write end stays open (held by
+    // the `Child`) for as long as the child runs — giving a reliably slow, fully
+    // cross-platform child process without a `sleep`/`printf` dependency that
+    // would not exist on the `windows-latest` CI runner.
+    fn blocked_on_stdin() -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("hash-object").arg("--stdin");
+        cmd.stdin(std::process::Stdio::piped());
+        cmd
+    }
+
+    #[test]
+    fn spawn_with_deadline_kills_and_reports_none_for_a_slow_child() {
+        let start = std::time::Instant::now();
+        let (status, _out, _err) =
+            spawn_with_deadline(blocked_on_stdin(), std::time::Duration::from_millis(200)).unwrap();
+        assert!(
+            status.is_none(),
+            "a child still running past the deadline must report None, not a real exit status"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the call must return once the deadline fires, not wait for the child \
+             to finish on its own — took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn spawn_with_deadline_returns_status_and_output_for_a_fast_child() {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("--version");
+        let (status, stdout, _err) =
+            spawn_with_deadline(cmd, std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(status.map(|s| s.code()), Some(Some(0)));
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("git version"),
+            "stdout must be captured for a normally-exiting child: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+    }
+
+    #[test]
+    fn spawn_with_deadline_returns_err_for_a_missing_binary() {
+        let cmd = std::process::Command::new("travsr-517-no-such-binary-xyz");
+        assert!(spawn_with_deadline(cmd, std::time::Duration::from_secs(1)).is_err());
     }
 
     // ── #376 Phase 2: docs section ───────────────────────────────────────────

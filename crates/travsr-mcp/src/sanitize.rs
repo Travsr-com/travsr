@@ -170,6 +170,31 @@ pub fn validate_mcp_list_arg(arg: &str) -> Result<(), &'static str> {
     validate_mcp_arg_with_limit(arg, MAX_LIST_ARG_BYTES)
 }
 
+/// Pattern-specific variant of [`validate_mcp_arg`] for `find_pattern`'s
+/// `pattern` argument (#517 DD-7).
+///
+/// The path-traversal guards in [`validate_mcp_arg`] exist because arguments
+/// like `symbol` and `repo` can reach path resolution, where a decoded
+/// `%2e%2e%2f` becomes `../`. A grep pattern never does: it is passed as a
+/// single argument-vector element after the `--` terminator, is never
+/// concatenated with a path, and is never shell-interpreted (see
+/// `run_git_grep`). Applying the path guards here only drops legitimate
+/// searches — `%` in particular is common in real code (`"100%"`). Do not
+/// re-add them without re-deriving a reachable attack; see the #517 security
+/// review for the analysis this exemption is based on.
+///
+/// Keeps: byte-length cap, null-byte rejection.
+/// Drops: percent-encoding rejection, `../` / absolute-path rejection.
+pub fn validate_mcp_pattern_arg(arg: &str) -> Result<(), &'static str> {
+    if arg.len() > MAX_ARG_BYTES {
+        return Err("argument exceeds maximum length");
+    }
+    if arg.contains('\0') {
+        return Err("null bytes not permitted in arguments");
+    }
+    Ok(())
+}
+
 fn validate_mcp_arg_with_limit(arg: &str, max_bytes: usize) -> Result<(), &'static str> {
     if arg.len() > max_bytes {
         return Err("argument exceeds maximum length");
@@ -328,6 +353,26 @@ mod tests {
     fn validate_rejects_null_byte() {
         assert!(validate_mcp_arg("foo\0bar").is_err());
         assert!(validate_mcp_arg("\0").is_err());
+    }
+
+    // ── #517 DD-7: pattern-specific validator ────────────────────────────────
+
+    #[test]
+    fn pattern_arg_allows_percent_and_traversal_lookalikes() {
+        // #517 D3: `%` and `..` are path-traversal signals for `validate_mcp_arg`
+        // but a grep pattern never becomes a path — these must be accepted.
+        assert!(validate_mcp_pattern_arg("100%").is_ok());
+        assert!(validate_mcp_pattern_arg("../etc/passwd").is_ok());
+        assert!(validate_mcp_pattern_arg("foo%20bar").is_ok());
+    }
+
+    #[test]
+    fn pattern_arg_still_rejects_null_byte_and_oversize() {
+        assert!(validate_mcp_pattern_arg("foo\0bar").is_err());
+        let long = "a".repeat(MAX_ARG_BYTES + 1);
+        assert!(validate_mcp_pattern_arg(&long).is_err());
+        let exact = "a".repeat(MAX_ARG_BYTES);
+        assert!(validate_mcp_pattern_arg(&exact).is_ok());
     }
 
     #[test]
