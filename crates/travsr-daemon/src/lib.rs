@@ -4120,6 +4120,76 @@ mod tests {
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
+    /// #526: hook injection must prefer a repo's own `.travsr/embed.toml`
+    /// override over the machine-wide `~/.travsr/embed.toml` default, the
+    /// same resolution order `resolve_backend` (travsr-plugin-host) uses.
+    #[test]
+    fn hook_backend_id_prefers_repo_config_over_global() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
+        std::fs::write(
+            home.path().join(".travsr").join("embed.toml"),
+            "active = \"global-backend\"\n",
+        )
+        .unwrap();
+
+        let repo_travsr = repo.path().join(".travsr");
+        std::fs::create_dir_all(&repo_travsr).unwrap();
+        std::fs::write(
+            repo_travsr.join("embed.toml"),
+            "active = \"repo-backend\"\n",
+        )
+        .unwrap();
+
+        let resolved = hook_backend_id(&repo_travsr.join("graph.db"));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("repo-backend"),
+            "repo's .travsr/embed.toml must win over the machine-wide default"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "dirs::home_dir() on Windows ignores HOME/USERPROFILE entirely (SHGetKnownFolderPath) - this test's isolation cannot work there, see crates/travsr-cli/tests/embed_switch.rs's module doc comment"
+    )]
+    fn hook_backend_id_falls_back_to_global_when_repo_unconfigured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
+        std::fs::write(
+            home.path().join(".travsr").join("embed.toml"),
+            "active = \"global-backend\"\n",
+        )
+        .unwrap();
+
+        // No repo .travsr/embed.toml written at all.
+        let resolved = hook_backend_id(&repo.path().join(".travsr").join("graph.db"));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(resolved.as_deref(), Some("global-backend"));
+    }
+
     /// Set shell_number = `shell` on every embeddable node (kind not in the
     /// exclusion list). This simulates Phase B having run and computed k-core
     /// without requiring the Phase B toolchain to be installed.
@@ -5338,6 +5408,22 @@ fn run_query(
     }
 }
 
+/// Resolve the embed backend id to use for hook injection at `db_path`,
+/// preferring the repo's own `.travsr/embed.toml` override over the
+/// machine-wide `~/.travsr/embed.toml` default. Mirrors `resolve_backend`'s
+/// resolution order in travsr-plugin-host — hook injection is a per-repo
+/// embedding decision, so it must not resolve on `active_backend_id()` alone
+/// (#526: a repo-level `travsr embed switch` was silently ignored, causing
+/// the daemon to spawn the wrong sidecar model and disable Step 4).
+fn hook_backend_id(db_path: &Path) -> Option<String> {
+    use travsr_plugin_host::{active_backend_id, repo_backend_id};
+
+    let repo_root = db_path.parent().and_then(|p| p.parent());
+    repo_root
+        .and_then(repo_backend_id)
+        .or_else(active_backend_id)
+}
+
 /// Try to start an embed plugin supervisor and inject its KNN hook into `store`.
 ///
 /// Wire the embed KNN hook into the daemon stores.
@@ -5353,18 +5439,20 @@ pub fn try_inject_embed_hook(
     write_store: &mut SqliteStore,
     db_path: &Path,
 ) {
-    use travsr_plugin_host::{
-        active_backend_id, embed_backends, lookup_embed_backend, EmbedSupervisor,
-    };
+    use travsr_plugin_host::{embed_backends, lookup_embed_backend, EmbedSupervisor};
 
     let Some(home) = dirs::home_dir() else {
         tracing::debug!("embed hook: HOME not set — skipping");
         return;
     };
 
-    // Prefer the user's active backend from ~/.travsr/embed.toml; fall back to
-    // the catalog default so a fresh install without `travsr embed switch` still works.
-    let backend = active_backend_id()
+    // Prefer the repo's own `.travsr/embed.toml` override, then the user's
+    // machine-wide active backend from ~/.travsr/embed.toml, then the catalog
+    // default so a fresh install without `travsr embed switch` still works.
+    // Mirrors `resolve_backend`'s resolution order (travsr-plugin-host) — this
+    // is a per-repo embedding decision, not an install/list/hint path, so it
+    // must not resolve on `active_backend_id()` alone (#526).
+    let backend = hook_backend_id(db_path)
         .as_deref()
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
