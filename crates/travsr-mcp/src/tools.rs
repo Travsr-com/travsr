@@ -408,20 +408,6 @@ pub fn get_callers_global(
 /// the spirit of `MAX_SITES_PER_CALLER` but is per-symbol, not per-caller.
 const MAX_REFERENCE_SITES: usize = 500;
 
-/// #450: minimum per-language file coverage before `find_references` will state
-/// a definitive "0 reference(s)".
-///
-/// Below this, a zero result is reported as non-definitive and names the actual
-/// coverage, because the symbol may well be used from a file Phase B never
-/// analysed. Set high because the underlying signal is a proxy — a file with
-/// genuinely no outbound references is indistinguishable from an unanalysed one,
-/// so the ratio understates true coverage and the threshold must tolerate that.
-///
-/// 95 rather than 100: travsr's own Rust index sits at 161/169 files (95%), and
-/// that is a healthy, fully-run Phase B pass. Requiring 100% would make the
-/// definitive branch unreachable in practice.
-const DEFINITIVE_ZERO_COVERAGE_PCT: u32 = 95;
-
 /// Byte cap for `find_references` / `find_pattern` output. The default scalar
 /// cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped 500-site list
 /// mid-line and drop the truncation notice — the same trap `get_snippets`
@@ -691,21 +677,32 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // symbol that lives in an unanalysed file states something the index
         // cannot support.
         //
-        // Coverage is a file-level proxy, not a recorded fact (RFC-023 / #549
-        // would make it one), so the threshold is deliberately forgiving: only
-        // claim a definitive zero when nearly every file of this language
-        // carries occurrence data.
-        let (files_with_occ, files_total) =
-            store.language_occurrence_coverage(lang).unwrap_or((0, 0));
-        let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
-        if coverage_pct < DEFINITIVE_ZERO_COVERAGE_PCT {
+        // The gate is the target's OWN file, not a language-wide ratio (#551
+        // review): `find_references` resolves targets of any kind, so a ratio
+        // over one population of files can describe a set the target is not in —
+        // 52 of 221 Rust files here hold no function or method node at all.
+        //
+        // Still a proxy. A file that genuinely references nothing looks the same
+        // as an unanalysed one, so this can only ever soften a claim, never
+        // assert absence. RFC-024 / #549 would make it a recorded fact.
+        let file_analyzed = store
+            .file_has_occurrences(&target.vname.path)
+            .unwrap_or(false);
+        if !file_analyzed {
+            // Language-wide coverage is reported as context, not as the gate: it
+            // is what makes the softened answer interpretable — "4 of 78 files"
+            // reads very differently from "161 of 221".
+            let (files_with_occ, files_total) =
+                store.language_occurrence_coverage(lang).unwrap_or((0, 0));
+            let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
             return format!(
-                "{header}\n0 recorded reference(s) — not a definitive zero. \
-                 Semantic analysis covers {files_with_occ} of {files_total} \
-                 '{lang}' files in this repo ({coverage_pct}%), so this symbol \
-                 may be used from a file that was never analyzed. Run \
-                 `travsr status` to check Phase B, or use `find_pattern` for a \
-                 textual search."
+                "{header}\n0 recorded reference(s) — not a definitive zero. No \
+                 reference occurrences are recorded for '{}' itself, so semantic \
+                 analysis may never have covered this file ({files_with_occ} of \
+                 {files_total} '{lang}' files in this repo carry occurrence data, \
+                 {coverage_pct}%). Run `travsr status` to check Phase B, or use \
+                 `find_pattern` for a textual search.",
+                target.vname.path
             );
         }
         // Coverage is effectively complete for this language and this symbol has
@@ -8923,6 +8920,91 @@ mod snippet_tests {
         assert!(out.contains("src/svc.rs:9"), "site 9 missing: {out}");
         assert!(out.contains("src/svc.rs:10"), "site 10 missing: {out}");
         assert!(out.contains("2 reference(s)"), "count missing: {out}");
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_target_file_has_no_occurrences() {
+        // #450: the language gate passes (another file of the same language has
+        // occurrence rows), but the target's OWN file has none — so a definitive
+        // "no recorded uses" would be a claim the index cannot support.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // covered.rs is analysed: it carries a real occurrence.
+        let caller = Node::new(
+            VName::new("", "", "src/covered.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/covered.rs", "rust", "fn:callee"),
+            "function",
+        );
+        // untouched.rs is not: same language, no occurrence rows at all.
+        let orphan = Node::new(
+            VName::new("", "", "src/untouched.rs", "rust", "fn:orphan"),
+            "function",
+        )
+        .with_line(3);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&orphan).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .unwrap();
+
+        let out = find_references(&store, "orphan", None);
+        assert!(
+            out.contains("not a definitive zero"),
+            "should soften the claim: {out}"
+        );
+        assert!(
+            out.contains("src/untouched.rs"),
+            "should name the unanalysed file: {out}"
+        );
+        assert!(
+            !out.contains("has no recorded uses"),
+            "must not assert absence: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_keeps_definitive_zero_when_target_file_is_analyzed() {
+        // Converse of the above: the target's own file carries occurrence rows,
+        // so a zero for this symbol is a real zero and the existing confident
+        // wording must be preserved unchanged.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
+            "function",
+        );
+        // Same file, analysed, but nothing references it.
+        let unused = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
+            "function",
+        )
+        .with_line(20);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&unused).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("has no recorded uses"),
+            "analysed file should still give a definitive zero: {out}"
+        );
+        assert!(
+            !out.contains("not a definitive zero"),
+            "should not soften when the file was analysed: {out}"
+        );
     }
 
     #[test]

@@ -3443,39 +3443,65 @@ LIMIT 20",
     /// `dst`) also fixes the empty-`language` false-negative: an occurrence's
     /// enclosing `src` node reliably carries the calling file's language even
     /// when the `dst` definition node was stored with an empty `language`.
-    /// Fraction of this language's definition-bearing files that carry at least
-    /// one `ref/call` occurrence, as `(files_with_occurrences, files_total)`.
+    /// Whether `path` carries any recorded `ref/call` occurrence — i.e. whether
+    /// Phase B appears to have analysed this file at all.
     ///
-    /// #450: [`Self::language_has_edge_sites`] answers a binary question — does
-    /// *any* occurrence exist for this language — which is the right gate for
-    /// "the index was never built". It cannot distinguish that from *partial*
-    /// coverage, and partial coverage is common: a Phase B pass can analyse a
-    /// handful of files and stop (analyzer crash, per-file timeout, a provider
-    /// that only indexes its own package). Every symbol in the unanalysed
-    /// remainder then reaches the confident-zero branch and is reported as
-    /// having "no recorded uses" — a statement of fact the index cannot support.
+    /// #450. The first cut of this check used a per-*language* coverage ratio,
+    /// which review (#551) correctly rejected: `find_references` resolves
+    /// targets of any kind, so a ratio computed over one population of files can
+    /// describe a set the target's own file is not in. On this repo's graph that
+    /// is 52 of 221 Rust files and 13 of 78 TypeScript files — files holding only
+    /// type definitions, with no function or method node in them.
     ///
-    /// Measured on travsr's own graph, where the gap is not hypothetical:
+    /// Asking about the target's own file avoids the mismatch entirely and is a
+    /// stronger signal besides: a language-wide ratio says how much of the
+    /// language was covered, this says whether *this* file was.
     ///
-    /// ```text
-    /// rust        161/169   95%   confident zero is reasonable
-    /// typescript    4/65     6%   94% of files never analysed
-    /// go            1/17     5%   ditto
-    /// ```
+    /// **Still a proxy.** A file that genuinely references nothing and is
+    /// referenced by nothing looks identical to an unanalysed one, so a `false`
+    /// means "cannot claim coverage", not "definitely unanalysed". Callers must
+    /// treat it as a reason to soften a claim, never as evidence of absence.
+    /// RFC-024 / #549 would replace this with a recorded per-file coverage map.
     ///
-    /// Both TypeScript and Go pass `language_has_edge_sites`, so today every
-    /// symbol in those 60-odd unanalysed files is described as definitively
-    /// unreferenced.
+    /// Empty path returns `false` — the file-attribution fallback's default is
+    /// not a real file.
+    pub fn file_has_occurrences(&self, path: &str) -> anyhow::Result<bool> {
+        if path.is_empty() {
+            return Ok(false);
+        }
+        let present: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM nodes n \
+                    WHERE n.path = ?1 \
+                      AND n.id IN ( \
+                        SELECT src FROM edge_sites WHERE kind = 'ref/call' \
+                        UNION SELECT dst FROM edge_sites WHERE kind = 'ref/call'))",
+                params![path],
+                |row| row.get(0),
+            )
+            .context("querying file_has_occurrences")?;
+        Ok(present != 0)
+    }
+
+    /// Files of `language` carrying at least one `ref/call` occurrence, as
+    /// `(files_with_occurrences, files_total)`.
+    ///
+    /// #450. Reported alongside [`Self::file_has_occurrences`] purely as
+    /// *context* — it tells a reader how much of the language was analysed, which
+    /// makes a softened result interpretable ("4 of 78 files" reads very
+    /// differently from "161 of 221"). It is deliberately **not** the gate: per
+    /// review on #551, a language-wide ratio can describe a population the target
+    /// is not part of.
+    ///
+    /// Counts every node kind, not just functions and methods. Restricting to
+    /// callables made the ratio look healthier than the index is — 161/169 (95%)
+    /// against 161/221 (72%) for Rust here — by excluding files the target may
+    /// well live in.
     ///
     /// Returns `(0, 0)` for the empty language, matching
-    /// `language_has_edge_sites`'s treatment of the file-attribution fallback.
-    ///
-    /// Counts *files* rather than symbols deliberately: Phase B coverage is
-    /// decided per file, and a file-level ratio is not skewed by one densely
-    /// referenced module. This remains a proxy — a genuinely reference-free file
-    /// is indistinguishable from an unanalysed one. RFC-023 / #549 would replace
-    /// it with a recorded per-file coverage map; until then this is derivable
-    /// from data already stored.
+    /// [`Self::language_has_edge_sites`]'s treatment of the attribution fallback.
     pub fn language_occurrence_coverage(&self, language: &str) -> anyhow::Result<(u64, u64)> {
         if language.is_empty() {
             return Ok((0, 0));
@@ -3483,7 +3509,6 @@ LIMIT 20",
         // Two scalar sub-selects rather than a `JOIN … ON es.src = n.id OR
         // es.dst = n.id`: an OR-join defeats both `edge_sites` PK prefixes and
         // forces a scan. The UNION of src/dst probes each index separately.
-        // Measured 2-23 ms per language on this repo's graph.
         let (with_occ, total): (i64, i64) = self
             .conn
             .query_row(
@@ -3492,9 +3517,8 @@ LIMIT 20",
                       WHERE id IN ( \
                         SELECT src FROM edge_sites WHERE kind = 'ref/call' \
                         UNION SELECT dst FROM edge_sites WHERE kind = 'ref/call') \
-                      AND language = ?1 AND kind IN ('function','method')), \
-                   (SELECT COUNT(DISTINCT path) FROM nodes \
-                      WHERE language = ?1 AND kind IN ('function','method'))",
+                      AND language = ?1), \
+                   (SELECT COUNT(DISTINCT path) FROM nodes WHERE language = ?1)",
                 params![language],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -7031,6 +7055,97 @@ mod tests {
         assert!(!store.language_has_edge_sites("java").unwrap());
         // A language with no nodes at all is also "unavailable", not zero.
         assert!(!store.language_has_edge_sites("go").unwrap());
+    }
+
+    #[test]
+    fn file_has_occurrences_is_scoped_to_the_file_not_the_language() {
+        // #450 / #551 review: the gate must answer "was THIS file analysed",
+        // not "was this language analysed". A language can be partially covered
+        // — one analysed file and twenty untouched ones — and a symbol in an
+        // untouched file must not inherit the analysed file's confidence.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "covered.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "covered.rs", "rust", "fn:callee"),
+            "function",
+        );
+        // Same language, different file, never receives an occurrence row.
+        let untouched = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "untouched.rs", "rust", "fn:orphan"),
+            "function",
+        );
+        // A non-callable kind: the first cut of this check filtered on
+        // kind IN ('function','method') and would have made this file invisible.
+        let type_only = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "types.rs", "rust", "struct:Config"),
+            "struct",
+        );
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&untouched).unwrap();
+        store.put_node(&type_only).unwrap();
+
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 7)])
+            .unwrap();
+
+        assert!(store.file_has_occurrences("covered.rs").unwrap());
+        // Same language, and the language gate would pass — but this file has
+        // no occurrence row, so no definitive claim can be made about it.
+        assert!(!store.file_has_occurrences("untouched.rs").unwrap());
+        assert!(!store.file_has_occurrences("types.rs").unwrap());
+        // The attribution fallback's empty default is not a real file.
+        assert!(!store.file_has_occurrences("").unwrap());
+        // Contrast: the language-wide gate says "covered", which is exactly the
+        // over-confidence #450 is about.
+        assert!(store.language_has_edge_sites("rust").unwrap());
+    }
+
+    #[test]
+    fn language_occurrence_coverage_counts_distinct_files_across_all_kinds() {
+        // Context metric, not the gate. Must count every kind: restricting to
+        // callables inflated the ratio by excluding type-only files, which is
+        // what #551 review caught (161/169 = 95% vs 161/221 = 72% on the real
+        // graph).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        );
+        let b = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:b"),
+            "function",
+        );
+        // Two symbols in one file must not count that file twice.
+        let b2 = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:b2"),
+            "function",
+        );
+        // Type-only file: no callable, still part of the language's surface.
+        let t = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "t.rs", "rust", "struct:T"),
+            "struct",
+        );
+        for n in [&a, &b, &b2, &t] {
+            store.put_node(n).unwrap();
+        }
+        store.record_edge_sites(&[(a.id, b.id, 3)]).unwrap();
+
+        // a.rs and b.rs carry occurrences; t.rs does not. Three distinct files.
+        let (with_occ, total) = store.language_occurrence_coverage("rust").unwrap();
+        assert_eq!(with_occ, 2, "a.rs and b.rs, each counted once");
+        assert_eq!(
+            total, 3,
+            "type-only t.rs must be visible in the denominator"
+        );
+
+        // A language with no nodes yields (0, 0) rather than dividing by zero.
+        assert_eq!(store.language_occurrence_coverage("go").unwrap(), (0, 0));
+        // Empty language matches language_has_edge_sites' treatment.
+        assert_eq!(store.language_occurrence_coverage("").unwrap(), (0, 0));
     }
 
     #[test]
