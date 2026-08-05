@@ -380,10 +380,9 @@ fn which_binary(name: &str) -> Option<String> {
     }
     search_dirs.extend(std::env::split_paths(&host_path));
 
-    search_dirs
-        .into_iter()
-        .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
+    // #502: PATHEXT-aware resolution — on Windows the providers are
+    // scip-go.exe / travsr-lang-java.exe, which a bare-name probe misses.
+    travsr_core::exec::resolve_executable_in(search_dirs, name)
         .map(|p| p.to_string_lossy().into_owned())
 }
 

@@ -408,6 +408,15 @@ pub async fn download_zip_and_extract(
     let tmp = dest.join("_download.zip");
     std::fs::write(&tmp, &bytes).with_context(|| format!("writing zip to {}", tmp.display()))?;
 
+    // #502: Windows ships no `unzip`, but its tar.exe is bsdtar, which
+    // extracts zip archives natively (already used for tarballs above).
+    #[cfg(windows)]
+    let status = std::process::Command::new("tar")
+        .args(["-xf", &tmp.to_string_lossy(), "-C", &dest.to_string_lossy()])
+        .status()
+        .context("running tar to extract zip")?;
+
+    #[cfg(not(windows))]
     let status = std::process::Command::new("unzip")
         .args(["-qo", &tmp.to_string_lossy(), "-d", &dest.to_string_lossy()])
         .status()
@@ -416,7 +425,7 @@ pub async fn download_zip_and_extract(
     let _ = std::fs::remove_file(&tmp);
 
     if !status.success() {
-        bail!("unzip exited with {status}");
+        bail!("zip extraction exited with {status}");
     }
 
     Ok(dest)
