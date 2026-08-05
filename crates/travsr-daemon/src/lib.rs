@@ -1736,6 +1736,77 @@ fn resolve_unresolved_calls(
             .push((*id, path.as_str(), sig.as_str()));
     }
 
+    // #529: batch-resolve qualified `fn:T.method` candidates and graph-type
+    // existence for every method call whose receiver type extraction
+    // recovered (`UnresolvedCall::recv_type`). Two purposes:
+    //   (1) an exact `fn:T.method` match resolves the call precisely,
+    //       bypassing the unique-leaf ambiguity gate below entirely — the
+    //       receiver type already disambiguated it.
+    //   (2) when no such node exists AND `T` itself is not any node in the
+    //       graph, the call is almost certainly into a std/external type
+    //       (`HashSet::insert`, `Iterator::filter`) that collided with an
+    //       unrelated same-named user method under #521's leaf-uniqueness
+    //       rule. Emit nothing instead of guessing (the #529 fix). When `T`
+    //       IS a graph type but just doesn't have this method (trait impls,
+    //       `Deref` targets the extractor can't see), fall through to
+    //       today's leaf-pool resolution unchanged — see the three-way
+    //       branch below.
+    let recv_qualified_sigs: Vec<String> = {
+        let mut v: Vec<String> = unresolved
+            .iter()
+            .filter_map(|u| {
+                u.recv_type
+                    .as_ref()
+                    .map(|t| format!("fn:{t}.{}", leaf_of(&u.callee_sig)))
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let recv_qualified_candidates = store
+        .nodes_by_signatures(&recv_qualified_sigs)
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_unresolved_calls: recv_type qualified lookup failed: {e}");
+            Vec::new()
+        });
+    let mut by_recv_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str)>> =
+        std::collections::HashMap::new();
+    for (id, sig, path) in &recv_qualified_candidates {
+        by_recv_sig
+            .entry(sig.as_str())
+            .or_default()
+            .push((*id, path.as_str()));
+    }
+
+    let recv_type_probe_sigs: Vec<String> = {
+        let mut types: Vec<&str> = unresolved
+            .iter()
+            .filter_map(|u| u.recv_type.as_deref())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        types
+            .iter()
+            .flat_map(|t| {
+                [
+                    format!("struct:{t}"),
+                    format!("enum:{t}"),
+                    format!("trait:{t}"),
+                ]
+            })
+            .collect()
+    };
+    let known_graph_types: std::collections::HashSet<String> = store
+        .nodes_by_signatures(&recv_type_probe_sigs)
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_unresolved_calls: recv_type existence lookup failed: {e}");
+            Vec::new()
+        })
+        .iter()
+        .filter_map(|(_, sig, _)| sig.split_once(':').map(|(_, name)| name.to_string()))
+        .collect();
+
     // #521 F1: crate dependency graph, built from this Phase B pass's own
     // in-memory output (see [`CrateGraph`] for why not the store).
     let crates = CrateGraph::build(pb_nodes, pb_edges);
@@ -1759,6 +1830,20 @@ fn resolve_unresolved_calls(
         .map(|n| (n.id, n.vname.path))
         .collect();
 
+    // Shared by both the #529 recv_type fallback and the pre-#529 is_method_call
+    // path: qualified (`Type.method`) candidates from the unique-leaf pool.
+    let leaf_method_matches = |sig: &str| -> Vec<(travsr_core::NodeId, &str)> {
+        by_leaf
+            .get(&leaf_of(sig))
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, s)| s.contains('.'))
+                    .map(|(id, path, _)| (*id, *path))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
@@ -1769,15 +1854,29 @@ fn resolve_unresolved_calls(
         // a valid method-call target. Skip straight to the leaf pool and keep
         // only qualified (`Type.method`) candidates from it.
         let matches: Vec<(travsr_core::NodeId, &str)> = if u.is_method_call {
-            by_leaf
-                .get(&leaf_of(&u.callee_sig))
-                .map(|v| {
-                    v.iter()
-                        .filter(|(_, _, sig)| sig.contains('.'))
-                        .map(|(id, path, _)| (*id, *path))
-                        .collect()
-                })
-                .unwrap_or_default()
+            match &u.recv_type {
+                // #529: receiver type recovered — resolve against it instead
+                // of guessing by leaf uniqueness. Three-way split (§4.3):
+                Some(t) => {
+                    let qsig = format!("fn:{t}.{}", leaf_of(&u.callee_sig));
+                    match by_recv_sig.get(qsig.as_str()) {
+                        // (1) `fn:T.method` exists — exact resolution.
+                        Some(m) => m.clone(),
+                        // (2) `T` is not any node in the graph at all — the
+                        // receiver is a std/external type; emit nothing
+                        // rather than let it fall into the unique-leaf pool
+                        // and collide with an unrelated method (the #529 bug
+                        // itself, e.g. `Session::filter` vs `Iterator::filter`).
+                        None if !known_graph_types.contains(t.as_str()) => continue,
+                        // (3) `T` is a real graph type but doesn't have this
+                        // method (trait impls / `Deref` targets the
+                        // extractor can't see) — fall through unchanged.
+                        None => leaf_method_matches(&u.callee_sig),
+                    }
+                }
+                // recv_type not recovered — pre-#529 behavior, unchanged.
+                None => leaf_method_matches(&u.callee_sig),
+            }
         } else {
             match by_sig.get(u.callee_sig.as_str()) {
                 Some(m) => m.clone(),
@@ -2857,6 +2956,7 @@ mod tests {
             hint_crate: None,
             caller_line: 42,
             is_method_call: true,
+            recv_type: None,
         }];
 
         let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
@@ -2908,6 +3008,7 @@ mod tests {
             hint_crate: None,
             caller_line: 7,
             is_method_call: false,
+            recv_type: None,
         }];
 
         let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
@@ -2960,6 +3061,7 @@ mod tests {
             hint_crate: None,
             caller_line: 3,
             is_method_call: false,
+            recv_type: None,
         }];
 
         let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
@@ -3003,12 +3105,325 @@ mod tests {
             hint_crate: None,
             caller_line: 9,
             is_method_call: false,
+            recv_type: None,
         }];
 
         let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
         assert!(
             edges.is_empty(),
             "src/ caller must not resolve into tests/: {edges:?}"
+        );
+    }
+
+    // ── #529: receiver-type resolution (docs/plans/issue-529-method-call-
+    // receiver-resolution.md §6.2) ───────────────────────────────────────
+
+    #[test]
+    fn t5_recv_type_exact_match_resolves_precisely() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "fn:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 5,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        assert_eq!(
+            edges.len(),
+            1,
+            "recv_type exact match should resolve: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+        assert_eq!(sites, vec![(caller.id, callee.id, 5)]);
+    }
+
+    #[test]
+    fn t6_recv_type_not_a_graph_type_resolves_to_zero_edges() {
+        // The literal #529 repro: a `.filter()` call on a std-typed receiver
+        // (HashSet) must not fall back into the unique-leaf pool and collide
+        // with an unrelated `Session.filter` — this is the test that fails
+        // on pre-#529 master.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // The only `*.filter` node anywhere — same shape as real Session::filter.
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-b/src/session.rs",
+                "rust",
+                "fn:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 12,
+            is_method_call: true,
+            recv_type: Some("HashSet".to_string()),
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        assert!(
+            edges.is_empty(),
+            "HashSet.filter must not resolve to Session.filter: {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn t7_recv_type_is_a_graph_type_without_this_method_falls_through() {
+        // `T` IS a real type in the graph, just doesn't have `.filter`
+        // (e.g. a trait-provided method the extractor can't see) — branch 3
+        // must fall through to today's unique-leaf resolution unchanged,
+        // not drop the call. Asserts we did not over-tighten.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // "Session" exists as a real type...
+        let session_type = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "struct:Session",
+            ),
+            "struct",
+        );
+        store.put_node(&session_type).unwrap();
+
+        // ...but the only `*.filter` method belongs to a different type.
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/other.rs",
+                "rust",
+                "fn:Other.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 7,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        assert_eq!(
+            edges.len(),
+            1,
+            "should fall through to unique-leaf match: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn t8_recv_type_exact_match_still_respects_crate_reachability() {
+        // Invariant 4: an exactly-resolved `fn:T.method` in a crate the
+        // caller cannot reach must still be rejected — the #529 fast path
+        // does not bypass #521's call_target_reachable gate.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let crate_a = Node::new(
+            VName::new("", "", "crates/crate-a/Cargo.toml", "rust", "crate:crate-a"),
+            "crate",
+        );
+        let crate_c = Node::new(
+            VName::new("", "", "crates/crate-c/Cargo.toml", "rust", "crate:crate-c"),
+            "crate",
+        );
+        let pb_nodes = vec![crate_a, crate_c];
+        let pb_edges: Vec<travsr_core::Edge> = Vec::new(); // no Depends edge
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-c/src/session.rs",
+                "rust",
+                "fn:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 3,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        assert!(
+            edges.is_empty(),
+            "exact recv_type match must still respect crate reachability: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn t9_recv_type_none_is_byte_identical_to_pre_529_behavior() {
+        // No receiver type recovered — must go through the exact same
+        // leaf-unique-match path as before #529.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "fn:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 8,
+            is_method_call: true,
+            recv_type: None,
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        assert_eq!(
+            edges.len(),
+            1,
+            "unique-leaf match must still resolve when recv_type is None: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn t10_ambiguous_leaf_with_recv_type_resolves_where_master_drops() {
+        // §4.4 recall win: two types share the same method leaf, which
+        // makes today's CO-A1 uniqueness gate drop the call entirely. A
+        // known recv_type disambiguates it directly.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee_a = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "fn:SqliteStore.get_nodes",
+            ),
+            "method",
+        );
+        store.put_node(&callee_a).unwrap();
+        let callee_b = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/other.rs",
+                "rust",
+                "fn:OtherStore.get_nodes",
+            ),
+            "method",
+        );
+        store.put_node(&callee_b).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:get_nodes".to_string(),
+            hint_crate: None,
+            caller_line: 4,
+            is_method_call: true,
+            recv_type: Some("SqliteStore".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        assert_eq!(
+            edges.len(),
+            1,
+            "recv_type should disambiguate a leaf that is globally ambiguous: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee_a.id);
+
+        // Sanity: without recv_type, master's ambiguity gate drops this same
+        // call site entirely (0 edges) — the recall win is real, not a no-op.
+        let unresolved_no_recv = vec![travsr_core::UnresolvedCall {
+            recv_type: None,
+            ..unresolved[0].clone()
+        }];
+        let (edges2, _sites2) = resolve_unresolved_calls(&store, &unresolved_no_recv, &[], &[]);
+        assert!(
+            edges2.is_empty(),
+            "ambiguous leaf without recv_type must still be dropped: {edges2:?}"
         );
     }
 

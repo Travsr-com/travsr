@@ -692,6 +692,15 @@ pub struct UnresolvedCall {
     /// predate this field (serde default keeps old sidecar payloads valid).
     #[serde(default)]
     pub is_method_call: bool,
+    /// Receiver type for a method call (`recv.method()`), when the extractor
+    /// could recover it from the enclosing function's own text (#529). `Some(T)`
+    /// lets the daemon resolve `fn:T.method` exactly instead of guessing by
+    /// unique leaf name; `None` keeps the pre-#529 leaf-fallback behavior. Only
+    /// ever set alongside `is_method_call`. `#[serde(default)]` keeps older
+    /// sidecar payloads valid, matching how `caller_line` and `is_method_call`
+    /// were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_type: Option<String>,
 }
 
 // ── Import Resolution ────────────────────────────────────────────────────────
@@ -1486,6 +1495,48 @@ mod tests {
         let json = r#"{"src":1,"dst":2,"kind":"ref/call"}"#;
         let e: Edge = serde_json::from_str(json).unwrap();
         assert_eq!(e.confidence, None);
+    }
+
+    #[test]
+    fn unresolved_call_serde_roundtrip_without_recv_type_field() {
+        // T-11 (#529): a pre-#529 sidecar payload (no recv_type key at all)
+        // must still deserialize, with recv_type defaulting to None.
+        let json = r#"{"src":1,"callee_sig":"fn:filter","caller_line":42,"is_method_call":true}"#;
+        let u: UnresolvedCall = serde_json::from_str(json).unwrap();
+        assert_eq!(u.recv_type, None);
+        assert!(u.is_method_call);
+    }
+
+    #[test]
+    fn unresolved_call_serde_roundtrip_with_recv_type_field() {
+        let u = UnresolvedCall {
+            src: NodeId(1),
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 42,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains("\"recv_type\":\"Session\""));
+        let u2: UnresolvedCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(u2.recv_type, Some("Session".to_string()));
+    }
+
+    #[test]
+    fn unresolved_call_recv_type_omitted_from_json_when_none() {
+        // skip_serializing_if keeps wire payloads small when the extractor
+        // could not recover a receiver type (the overwhelming common case).
+        let u = UnresolvedCall {
+            src: NodeId(1),
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 42,
+            is_method_call: true,
+            recv_type: None,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(!json.contains("recv_type"));
     }
 
     #[test]
