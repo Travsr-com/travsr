@@ -53,8 +53,26 @@ const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 // ── Job Object limits (ADR-017 Rule 1) ────────────────────────────────────────
 
 const JOB_MEMORY_LIMIT: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
-const JOB_TIME_LIMIT: i64 = 3_000_000_000; // 300 s in 100-ns intervals
 const JOB_ACTIVE_PROC_LIMIT: u32 = 64;
+
+/// #504: per-job user CPU time cap, in 100-ns intervals.
+///
+/// `PerJobUserTimeLimit` accumulates CPU time across every thread of every
+/// process in the job. The old flat 300 s was chosen as a wall-clock analogue
+/// of the transport's `INVOKE_TIMEOUT_SECS`, so a multithreaded Phase B pass
+/// on 8 cores burned it in ~40 s of wall time and Windows terminated the
+/// whole job (PluginCrashed, faster machines failing sooner). Scaling by the
+/// logical core count restores the intended meaning — the cap cannot fire
+/// before ~300 s of wall time even at full parallelism, so it only catches a
+/// genuine runaway spin the transport watchdog has not already killed.
+fn job_cpu_time_limit() -> i64 {
+    const BASE_SECS: i64 = 300;
+    const HUNDRED_NS_PER_SEC: i64 = 10_000_000;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as i64)
+        .unwrap_or(1);
+    BASE_SECS * cores * HUNDRED_NS_PER_SEC
+}
 
 // ── SECURITY_MAX_SID_SIZE ─────────────────────────────────────────────────────
 
@@ -397,7 +415,7 @@ pub(super) fn create_job_with_limits() -> io::Result<OwnedJobHandle> {
     let jeli = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
         BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
             PerProcessUserTimeLimit: 0,
-            PerJobUserTimeLimit: JOB_TIME_LIMIT,
+            PerJobUserTimeLimit: job_cpu_time_limit(),
             LimitFlags: limit_flags,
             MinimumWorkingSetSize: 0,
             MaximumWorkingSetSize: 0,
@@ -1115,6 +1133,51 @@ mod tests {
                 "{var} must be forced to the scratch dir"
             );
         }
+    }
+
+    // ── #504: Job Object CPU cap ────────────────────────────────────────────
+
+    /// #504 regression: the per-job CPU cap must scale with core count so a
+    /// multithreaded Phase B pass cannot exhaust it in a fraction of the
+    /// intended 300 s wall-clock window (the old flat cap died in ~40 s of
+    /// wall time on 8 cores).
+    #[test]
+    fn job_cpu_cap_scales_with_core_count() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as i64)
+            .unwrap_or(1);
+        assert_eq!(job_cpu_time_limit(), 300 * cores * 10_000_000);
+        assert!(job_cpu_time_limit() >= 300 * 10_000_000);
+    }
+
+    /// The scaled cap (and the JOB_TIME flag) must actually land on the
+    /// created Job Object, read back via QueryInformationJobObject.
+    #[test]
+    fn job_object_carries_scaled_cpu_cap() {
+        use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
+
+        let job = create_job_with_limits().expect("create job object");
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_handle(),
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *mut _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "QueryInformationJobObject failed");
+        assert_eq!(
+            info.BasicLimitInformation.PerJobUserTimeLimit,
+            job_cpu_time_limit(),
+            "job must carry the core-scaled CPU cap"
+        );
+        assert_ne!(
+            info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_JOB_TIME,
+            0,
+            "JOB_TIME limit flag must stay set (runaway-spin backstop)"
+        );
     }
 
     /// The block must never carry case-insensitive duplicate names —
