@@ -3223,6 +3223,7 @@ LIMIT 20",
         &mut self,
         nodes: &[travsr_core::Node],
         edges: &[travsr_core::Edge],
+        provenance: &str,
     ) -> anyhow::Result<()> {
         if nodes.is_empty() && edges.is_empty() {
             return Ok(());
@@ -3261,21 +3262,52 @@ LIMIT 20",
                 .context("write_phase_b_batch: put_node_fts_words")?;
         }
         for edge in edges {
+            // E1: label edges with their true provenance (SCIP relationships vs
+            // native tree-sitter leaf-name resolution) instead of hardcoding
+            // 'lsif'. Precedence-preserving: a compiler provenance ('lsif'/
+            // 'scip') already on the row is never demoted by a later write
+            // (ADR-002), so a heuristic 'tree-sitter' write cannot overwrite it.
             tx.execute(
                 "INSERT INTO edges(src, dst, kind, provenance, confidence) \
-                 VALUES(?1, ?2, ?3, 'lsif', ?4) \
+                 VALUES(?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT(src, dst, kind) DO UPDATE SET \
-                 provenance = 'lsif', confidence = excluded.confidence",
+                 provenance = CASE \
+                   WHEN excluded.provenance IN ('lsif','scip') THEN excluded.provenance \
+                   WHEN edges.provenance IN ('lsif','scip') THEN edges.provenance \
+                   ELSE excluded.provenance END, \
+                 confidence = excluded.confidence",
                 params![
                     node_id_to_i64(edge.src),
                     node_id_to_i64(edge.dst),
                     edge.kind.as_str(),
+                    provenance,
                     edge.confidence.map(|c| c as i64),
                 ],
             )
             .context("write_phase_b_batch: insert edge")?;
         }
         tx.commit().context("write_phase_b_batch: commit")
+    }
+
+    /// E1: reconcile every edge's `language` label to its endpoints' language.
+    ///
+    /// Edge language is a derived label, not authored data. Edge INSERTs across
+    /// the store omit it and rely on the schema default (`'typescript'`), which
+    /// mislabels every edge in a non-TypeScript graph. This single idempotent
+    /// pass sets each edge's language from its src node (falling back to dst,
+    /// then `'unknown'` for a dangling endpoint). Run at the end of indexing
+    /// (full and incremental); it is O(edges) and label-only (no edge is added
+    /// or removed). Returns the number of rows updated.
+    pub fn reconcile_edge_languages(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "UPDATE edges SET language = COALESCE( \
+                   (SELECT n.language FROM nodes n WHERE n.id = edges.src), \
+                   (SELECT n.language FROM nodes n WHERE n.id = edges.dst), \
+                   'unknown')",
+                [],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// G2 attribution-aware Phase B write.
@@ -7722,6 +7754,61 @@ mod tests {
 
         let edges = store.all_edges().unwrap();
         assert_eq!(edges[0].3, "tree-sitter");
+    }
+
+    #[test]
+    fn e1_reconcile_edge_languages_derives_from_endpoints() {
+        // E1: an edge's language is derived from its src node, not the schema
+        // default 'typescript'. write_phase_b_batch labels provenance truthfully.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        );
+        let b = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "method:T.b"),
+            "method",
+        );
+        let edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store
+            .write_phase_b_batch(&[a.clone(), b.clone()], &[edge], "tree-sitter")
+            .unwrap();
+
+        // Before reconcile: schema default mislabels the edge 'typescript'.
+        let lang_before: String = store
+            .conn
+            .query_row("SELECT language FROM edges LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lang_before, "typescript", "reproduces the mislabel default");
+
+        let n = store.reconcile_edge_languages().unwrap();
+        assert_eq!(n, 1);
+        let (lang, prov): (String, String) = store
+            .conn
+            .query_row("SELECT language, provenance FROM edges LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(lang, "rust", "edge language tracks its src node");
+        assert_eq!(prov, "tree-sitter", "native resolved edges are not 'lsif'");
+    }
+
+    #[test]
+    fn e1_write_phase_b_batch_does_not_demote_compiler_provenance() {
+        // E1 precedence: a 'tree-sitter' batch write must not overwrite an
+        // existing compiler ('lsif'/'scip') provenance (ADR-002).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge_lsif(&edge).unwrap();
+        store
+            .write_phase_b_batch(&[], &[edge], "tree-sitter")
+            .unwrap();
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges[0].3, "lsif", "tree-sitter batch must not demote lsif");
     }
 
     #[test]

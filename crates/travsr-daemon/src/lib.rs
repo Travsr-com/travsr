@@ -1323,6 +1323,13 @@ pub fn init_repo_with_progress(
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
+    // E1: reconcile Phase A edge languages now so the graph is correctly
+    // labelled even when Phase B is deferred or unavailable (no analyzer). The
+    // Phase B paths re-run this after adding their own edges.
+    if let Err(e) = store.reconcile_edge_languages() {
+        tracing::warn!("reconciling edge languages after Phase A: {e:#}");
+    }
+
     // Decide whether to run Phase B inline now, defer it, or skip it entirely.
     //
     // Already-done path: `phase_b_commit == HEAD` means Phase B is current for
@@ -1376,7 +1383,7 @@ pub fn init_repo_with_progress(
                 // skip their own directory walks.
                 indexable_paths: &indexable_paths,
             };
-            let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+            let (pb_nodes, pb_edges, pb_refs, pb_unresolved, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
             let (resolved, resolved_sites) =
                 resolve_unresolved_calls(&store, &pb_unresolved, &pb_nodes, &pb_edges);
@@ -1384,9 +1391,14 @@ pub fn init_repo_with_progress(
                 resolved_cross_crate_edges = resolved.len(),
                 "Phase B UnresolvedCall resolution complete"
             );
-            pb_edges.extend(resolved);
             let (report, alias_map) =
                 write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            // E1: edges resolved by native leaf-name heuristics are tree-sitter,
+            // not compiler-derived — write them separately with truthful
+            // provenance instead of folding them into the SCIP batch as 'lsif'.
+            if let Err(e) = store.write_phase_b_batch(&[], &resolved, "tree-sitter") {
+                tracing::warn!("phase B native resolved edges write error: {e:#}");
+            }
             // #299 WS-4: record cross-crate call occurrence lines after the edges
             // (and their callee nodes) are in the store. #299 F2: remap dst ids
             // through the unification alias map first so a site never points at a
@@ -1394,6 +1406,11 @@ pub fn init_repo_with_progress(
             let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
             if let Err(e) = store.record_edge_sites(&resolved_sites) {
                 tracing::warn!("recording cross-crate edge_sites: {e:#}");
+            }
+            // E1: label-only reconcile of edge languages to their endpoints
+            // (the schema default 'typescript' otherwise mislabels every edge).
+            if let Err(e) = store.reconcile_edge_languages() {
+                tracing::warn!("reconciling edge languages: {e:#}");
             }
             report
         };
@@ -1955,7 +1972,8 @@ fn write_phase_b_results(
         std::collections::HashMap::new();
     if pb_refs.is_empty() {
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
-        if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
+        // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
+        if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges, "scip") {
             tracing::warn!("phase B batch write error: {e:#}");
         }
     } else {
@@ -1999,7 +2017,7 @@ fn write_phase_b_results(
         // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
         // need to be written — they are not represented in ScipRef records.
         if !pb_edges.is_empty() {
-            if let Err(e) = store.write_phase_b_batch(&[], &pb_edges) {
+            if let Err(e) = store.write_phase_b_batch(&[], &pb_edges, "scip") {
                 tracing::warn!("phase B structural edges write error: {e:#}");
             }
         }
@@ -2437,7 +2455,7 @@ fn run_background_phase_b_inner(
         present_languages,
         indexable_paths: &indexable_paths,
     };
-    let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+    let (pb_nodes, pb_edges, pb_refs, pb_unresolved, pb_outcome) =
         indexer.invoke_phase_b_all(&inputs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
@@ -2449,7 +2467,6 @@ fn run_background_phase_b_inner(
         resolved_cross_crate_edges = resolved.len(),
         "Phase B UnresolvedCall resolution complete"
     );
-    pb_edges.extend(resolved);
 
     // Write LSIF edges first (pre-collected lock-free above).
     for edge in &lsif_edges {
@@ -2460,12 +2477,21 @@ fn run_background_phase_b_inner(
 
     let (report, alias_map) =
         write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    // E1: native leaf-name resolved edges are tree-sitter-heuristic — truthful
+    // provenance, not the SCIP batch's 'lsif'.
+    if let Err(e) = s.write_phase_b_batch(&[], &resolved, "tree-sitter") {
+        tracing::warn!("phase B native resolved edges write error: {e:#}");
+    }
     // #299 WS-4: record cross-crate call occurrence lines after their edges land.
     // #299 F2: remap dst ids through the unification alias map so a site never
     // points at a SCIP node that unification dropped.
     let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
     if let Err(e) = s.record_edge_sites(&resolved_sites) {
         tracing::warn!("recording cross-crate edge_sites: {e:#}");
+    }
+    // E1: reconcile edge languages to their endpoints (label-only).
+    if let Err(e) = s.reconcile_edge_languages() {
+        tracing::warn!("reconciling edge languages: {e:#}");
     }
 
     // C4: only advance phase_b_commit when no language crashed. A partial result
