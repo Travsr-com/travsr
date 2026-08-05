@@ -32,6 +32,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("import", "import", "import"),
     ],
     method_containers: &[("class_specifier", "class"), ("struct_specifier", "struct")],
+    decl_kinds: &["function_definition"],
     get_grammar: || tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
 };
 

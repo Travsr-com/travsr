@@ -42,6 +42,15 @@ pub struct LanguageConfig {
     /// of the file (N1 collision fix + N3 containment). Empty ⇒ the language
     /// has no methods (e.g. C), so every `fn` capture stays a free function.
     pub method_containers: &'static [(&'static str, &'static str)],
+    /// AST node kinds that represent a full definition *with its body* (N2).
+    /// When a name capture is nested below its declaration (C
+    /// `function_declarator`, C++ inline methods, Obj-C C-functions), a single
+    /// hop to `name.parent()` ends the span at the signature line and excludes
+    /// the body, so call sites inside fail span-containment and mis-attribute
+    /// to the file node. The span end is instead taken from the nearest
+    /// ancestor whose kind is listed here. Empty ⇒ the 1-hop span is already
+    /// correct for this grammar (name is a direct child of its declaration).
+    pub decl_kinds: &'static [&'static str],
     /// Returns the tree-sitter grammar for this language.
     /// Stored as a function pointer so `LanguageConfig` is `const`-constructible
     /// (tree-sitter `Language` itself is not directly `const`-constructible).
@@ -114,12 +123,10 @@ pub fn parse_with_config(
             }
 
             let line = cap.node.start_position().row as u32 + 1;
-            // G2: one hop from the name capture to the declaration node gives the full span.
-            let end_line = cap
-                .node
-                .parent()
-                .map(|p| p.end_position().row as u32 + 1)
-                .unwrap_or(line);
+            // N2: end the span at the enclosing full-definition node when the
+            // name is nested below it (C/C++/Obj-C function bodies); otherwise
+            // one hop to `name.parent()` gives the full span (G2).
+            let end_line = decl_end_line(cap.node, config.decl_kinds).unwrap_or(line);
 
             // N1/N3: a `fn`-prefixed definition nested inside a type container
             // is a method. Qualify its signature by the enclosing type
@@ -177,6 +184,26 @@ pub fn parse_with_config(
         edges,
         ffi_markers: vec![],
     })
+}
+
+/// Compute the 1-based end line for a definition's span (N2).
+///
+/// Walks up (bounded) from the name capture: if an ancestor's kind is in
+/// `decl_kinds` (a full definition with body), that node's end row is the span
+/// end. Otherwise falls back to the one-hop `name.parent()` end row, which is
+/// correct for grammars where the name is a direct child of its declaration.
+fn decl_end_line(node: tree_sitter::Node<'_>, decl_kinds: &[&str]) -> Option<u32> {
+    if !decl_kinds.is_empty() {
+        let mut cur = node.parent();
+        for _ in 0..6 {
+            let Some(n) = cur else { break };
+            if decl_kinds.contains(&n.kind()) {
+                return Some(n.end_position().row as u32 + 1);
+            }
+            cur = n.parent();
+        }
+    }
+    node.parent().map(|p| p.end_position().row as u32 + 1)
 }
 
 /// Walk up from a definition capture to the nearest enclosing type container.
@@ -325,6 +352,27 @@ mod tests {
                 .iter()
                 .any(|e| e.src == file_id && e.dst == method_id),
             "flat file → method edge must be gone (N3)"
+        );
+    }
+
+    #[test]
+    fn n2_c_function_span_includes_body() {
+        // N2: a C function's end_line must reach the closing brace so call
+        // sites inside its body fall within [line, end_line] and attribute to
+        // the function (not the file). Before N2 the 1-hop span ended at the
+        // signature line (function_declarator), excluding the body.
+        let src = "int compute(int x) {\n    int y = x + 1;\n    return y;\n}\n";
+        let out = parse_str(&crate::c::CONFIG, "compute.c", src);
+        let f = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "fn:compute")
+            .expect("fn:compute node");
+        assert_eq!(f.line, Some(1), "starts on the signature line");
+        assert_eq!(
+            f.end_line,
+            Some(4),
+            "span must reach the closing brace (line 4), not end at the signature line"
         );
     }
 

@@ -31,6 +31,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("object_definition", "class"),
         ("trait_definition", "class"),
     ],
+    decl_kinds: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_scala::LANGUAGE),
 };
 

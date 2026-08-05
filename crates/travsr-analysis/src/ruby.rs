@@ -22,6 +22,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
     ],
     method_containers: &[("class", "class"), ("module", "class")],
+    decl_kinds: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
 };
 

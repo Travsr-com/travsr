@@ -36,6 +36,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("extension_declaration", "class"),
         ("enum_declaration", "enum"),
     ],
+    decl_kinds: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
 };
 

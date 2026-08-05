@@ -28,6 +28,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class_declaration", "class"),
         ("object_declaration", "class"),
     ],
+    decl_kinds: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
 };
 
