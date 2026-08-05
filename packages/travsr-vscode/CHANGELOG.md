@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Windows-on-ARM guaranteed-404 download (#497): removed the `aarch64-pc-windows-msvc` claim from the installer's `TARGET_MAP` (releases never ship that artifact), aligning it with the release matrix and the npm `TARGETS` map. On platforms with no published prebuilt binary the extension no longer offers the doomed "Download?" prompt; it explains that no prebuilt binary exists and links to the `travsr.binaryPath` setting instead.
 - PATH auto-detect dead-end (#495): with `travsr.binaryPath` empty, a travsr install found on PATH is now resolved to its absolute location (preferring `.exe` and skipping `.cmd`/`.bat` shims on Windows), persisted to `travsr.binaryPath`, and connected immediately. Previously the PATH check returned early while the client rejected the bare `travsr` fallback, leaving the status bar permanently dead with no recovery prompt.
 - Windows npm-shim dead-end (#486): a configured `travsr.binaryPath` is now validated on activation (not just checked for existence), so an invalid path — e.g. the `travsr.cmd` shim from `where travsr` — falls through to recovery instead of failing silently. When the path (or PATH lookup) resolves to an npm shim, the extension auto-adopts the packaged native binary at `node_modules/@travsr.com/travsr/bin` and persists it.
 - Stale `DOWNLOAD_VERSION` (0.10.0 → 0.11.0) that made "reinstall via the extension" downgrade npm users; stable releases now CI-check the constant against the tag.

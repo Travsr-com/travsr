@@ -16,10 +16,15 @@ import * as path from "path";
 
 export const DOWNLOAD_VERSION = "0.11.0";
 
+// #497: must stay in lockstep with the release workflow matrix
+// (.github/workflows/release.yml) and the npm TARGETS map
+// (packages/travsr-npm/scripts/install.js). Releases ship no
+// aarch64-pc-windows-msvc artifact, so claiming win32/arm64 here sent
+// Windows-on-ARM users into a guaranteed-404 download.
 const TARGET_MAP: Partial<Record<string, Partial<Record<string, string>>>> = {
   linux:  { x64: "x86_64-unknown-linux-gnu",  arm64: "aarch64-unknown-linux-gnu" },
   darwin: { x64: "x86_64-apple-darwin",        arm64: "aarch64-apple-darwin" },
-  win32:  { x64: "x86_64-pc-windows-msvc", arm64: "aarch64-pc-windows-msvc" },
+  win32:  { x64: "x86_64-pc-windows-msvc" },
 };
 
 export function resolveTargetTriple(
@@ -27,8 +32,25 @@ export function resolveTargetTriple(
   arch: string = process.arch
 ): string {
   const triple = TARGET_MAP[platform]?.[arch];
-  if (!triple) throw new Error(`Unsupported platform/arch: ${platform}/${arch}`);
+  if (!triple) {
+    throw new Error(
+      `Unsupported platform/arch: ${platform}/${arch} — no prebuilt travsr ` +
+      `binary is published for this target`
+    );
+  }
   return triple;
+}
+
+/**
+ * #497: whether a prebuilt binary is published for this platform/arch.
+ * Lets callers skip the download prompt entirely instead of offering a
+ * download that resolveTargetTriple (or GitHub, with a 404) will reject.
+ */
+export function isDownloadSupported(
+  platform: string = process.platform,
+  arch: string = process.arch
+): boolean {
+  return TARGET_MAP[platform]?.[arch] !== undefined;
 }
 
 export function resolveInstallDir(): string {
