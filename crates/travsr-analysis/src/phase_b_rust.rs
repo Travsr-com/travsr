@@ -590,9 +590,11 @@ fn find_enclosing_fn(
     Some((fn_name, impl_type))
 }
 
-/// Walk up from `node` to find the nearest enclosing `impl_item` type name.
-/// Returns the implementing type (e.g. `"Worker"` for `impl Trait for Worker`).
-/// Stops at `mod_item` boundaries.
+/// Walk up from `node` to find the nearest enclosing type-container name.
+/// Returns the implementing type (e.g. `"Worker"` for `impl Trait for Worker`)
+/// or, for a default method inside a trait, the trait name (N4c) — matching the
+/// Phase A node identity `method:Trait.name`, so caller `src` ids and `self`
+/// receiver types stay consistent. Stops at `mod_item` boundaries.
 fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let mut cur = node.parent()?;
     loop {
@@ -607,6 +609,14 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
                         .and_then(|c| c.utf8_text(source).ok().map(str::to_string)),
                     _ => None,
                 };
+            }
+            // N4c: a default method inside a trait belongs to the trait.
+            "trait_item" => {
+                return cur
+                    .child_by_field_name("name")?
+                    .utf8_text(source)
+                    .ok()
+                    .map(str::to_string);
             }
             "mod_item" => return None,
             _ => {}

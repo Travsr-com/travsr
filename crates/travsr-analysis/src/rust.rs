@@ -152,13 +152,20 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     // Functions inside impl blocks become methods; the parent impl
                     // type is the namespace so signatures are `method:TypeName.method` (N1).
                     let end_line = decl_end_line(capture.node);
-                    let parent_impl = find_parent_impl_type(capture.node, source.as_slice());
-                    let (node, src_id) = if let Some(impl_type) = parent_impl {
-                        let impl_id = rust_impl_node(corpus, vname_path, &impl_type).id;
-                        let n = rust_method_node(corpus, vname_path, &impl_type, text)
+                    let parent = find_parent_container(capture.node, source.as_slice());
+                    let (node, src_id) = if let Some((container, is_trait)) = parent {
+                        // N4c: a default method inside a `trait_item` is a method of
+                        // the trait (`method:Trait.name`), parented to the trait node,
+                        // not leaked to a file-level `fn:`.
+                        let parent_id = if is_trait {
+                            rust_trait_node(corpus, vname_path, &container).id
+                        } else {
+                            rust_impl_node(corpus, vname_path, &container).id
+                        };
+                        let n = rust_method_node(corpus, vname_path, &container, text)
                             .with_line(line)
                             .with_end_line(end_line);
-                        (n, impl_id)
+                        (n, parent_id)
                     } else {
                         let n = rust_fn_node(corpus, vname_path, text)
                             .with_line(line)
@@ -308,11 +315,13 @@ fn has_impl_or_trait_ancestor(node: tree_sitter::Node<'_>) -> bool {
 }
 
 /// Walk up the AST from `node` to find the nearest enclosing `impl_item`.
-/// Returns the implementing **type** name (not the trait name), e.g. for
-/// `impl Processor for Worker` returns `"Worker"`.
-/// Stops at `mod_item` — functions inside a module but outside any impl
-/// are free functions, not methods.
-fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+/// Returns the enclosing type container for a function, as `(name, is_trait)`.
+///
+/// For `impl Processor for Worker` returns `("Worker", false)` — the implementing
+/// **type**, not the trait name. For a default method inside `trait Speak`
+/// returns `("Speak", true)` (N4c). Stops at `mod_item` — functions inside a
+/// module but outside any impl/trait are free functions, not methods.
+fn find_parent_container(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<(String, bool)> {
     let mut current = node.parent()?;
     loop {
         match current.kind() {
@@ -320,7 +329,7 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
                 // `type:` field is the implementing type (e.g. `Worker` in
                 // `impl Processor for Worker`); `trait:` is the trait name.
                 let type_node = current.child_by_field_name("type")?;
-                return match type_node.kind() {
+                let name = match type_node.kind() {
                     "type_identifier" => type_node.utf8_text(source).ok().map(str::to_string),
                     "generic_type" => {
                         // e.g. `impl<T> Container<T>` — base name is first type_identifier child
@@ -331,6 +340,13 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
                     }
                     _ => None,
                 };
+                return name.map(|n| (n, false));
+            }
+            // N4c: a default method (`function_item` with a body) inside a trait
+            // belongs to the trait — `method:Trait.name`, not a file-level `fn:`.
+            "trait_item" => {
+                let name = current.child_by_field_name("name")?;
+                return name.utf8_text(source).ok().map(|n| (n.to_string(), true));
             }
             // Don't cross a module boundary — functions inside a mod are free functions.
             "mod_item" => return None,
@@ -725,6 +741,60 @@ mod tests {
         assert!(
             !out.nodes.iter().any(|n| n.kind == "type"),
             "trait associated type default must not emit a type node"
+        );
+    }
+
+    #[test]
+    fn n4c_default_trait_method_belongs_to_trait_not_file() {
+        // N4c: a default method with a body inside a trait must resolve to
+        // `method:Trait.name` parented to the trait node, not leak to a
+        // file-level `fn:`. A same-named impl override stays distinct (Invariant #1).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trait_default.rs");
+        std::fs::write(
+            &path,
+            b"trait Speak { fn speak(&self) { println!(\"...\"); } }\n\
+              struct Dog;\n\
+              impl Speak for Dog { fn speak(&self) { println!(\"woof\"); } }\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "trait_default.rs").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(
+            sigs.contains(&"method:Speak.speak"),
+            "trait default method must be method:Speak.speak, got {sigs:?}"
+        );
+        assert!(
+            sigs.contains(&"method:Dog.speak"),
+            "impl override must be method:Dog.speak, got {sigs:?}"
+        );
+        assert!(
+            !sigs.contains(&"fn:speak"),
+            "default trait method must not leak to file-level fn:speak, got {sigs:?}"
+        );
+
+        // Containment: trait:Speak → method:Speak.speak (parented to the trait).
+        let trait_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "trait:Speak")
+            .unwrap()
+            .id;
+        let method_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Speak.speak")
+            .unwrap()
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == trait_id
+                && e.dst == method_id
+                && e.kind == EdgeKind::DefinesBinding),
+            "expected trait:Speak → method:Speak.speak DefinesBinding edge"
         );
     }
 
