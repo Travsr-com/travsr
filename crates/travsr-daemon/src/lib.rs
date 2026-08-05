@@ -2682,6 +2682,20 @@ fn arm_phase_b_if_pending(
         .unwrap_or_default();
     if !last.is_empty() && last != pb {
         sched.arm_immediate();
+        return;
+    }
+
+    // #583: a watcher reindex changes content without moving HEAD, so the test
+    // above cannot see it. `phase_b_dirty` carries that signal instead.
+    //
+    // Debounced rather than immediate: this runs on the 5 s tick, and an
+    // editor writing a burst of saves should settle into one Phase B run.
+    // Guarded on `is_pending` because `mark_dirty` pushes the deadline forward
+    // on every call — re-arming each tick would keep the deadline 30 s away
+    // forever and starve the run until `max_defer` finally forced it.
+    let dirty = s.get_meta("phase_b_dirty").ok().flatten().unwrap_or_default();
+    if dirty == "1" && !sched.is_pending() {
+        sched.mark_dirty();
     }
 }
 
@@ -2753,7 +2767,17 @@ fn run_background_phase_b_inner(
             .ok()
             .flatten()
             .unwrap_or_default();
-        if last.is_empty() || last == phase_b {
+        // #583: `last == phase_b` is not sufficient evidence of freshness. A
+        // watcher reindex rewrites a file's Phase A nodes without moving HEAD,
+        // which drops that file's `ref/call` edges while both markers stay
+        // equal. `phase_b_dirty` records that case so the run proceeds.
+        let dirty = s
+            .get_meta("phase_b_dirty")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            == "1";
+        if last.is_empty() || (last == phase_b && !dirty) {
             // Already up to date — not a failure, treat as success so the
             // retry counter is not incremented.
             return phase_b_sched::RunOutcome::Success;
@@ -2844,6 +2868,9 @@ fn run_background_phase_b_inner(
     // be retried once the user installs the missing tool or clears disk space.
     if report.crashed.is_empty() {
         let _ = s.set_meta("phase_b_commit", &target_sha);
+        // #583: the semantic layer now matches the working tree again. Left set
+        // on a crash so the next tick retries, same as `phase_b_commit`.
+        let _ = s.set_meta("phase_b_dirty", "0");
     }
 
     let outcome = if report.crashed.is_empty() {
@@ -3124,6 +3151,16 @@ pub fn reindex_files(
         if let Ok(sha) = read_head_commit_sha(repo_root) {
             let _ = store.set_meta("last_commit", &sha);
         }
+
+        // #583: content changed, so the semantic layer is stale. On the commit
+        // path `last_commit` moves and the `last != phase_b` test already
+        // catches it, but the watcher path reindexes without a commit — HEAD is
+        // unchanged, so that test stays false and Phase B is never re-run. The
+        // file keeps its Phase A nodes and permanently loses its `ref/call`
+        // edges. This flag is the content-based freshness signal the commit sha
+        // cannot provide; `run_background_phase_b_inner` clears it after a
+        // successful run.
+        let _ = store.set_meta("phase_b_dirty", "1");
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
         // O(V + E) — fast enough to run inline on the hook path at MVP scale.
@@ -4958,6 +4995,53 @@ mod tests {
         );
     }
 
+    /// #583: a reindex that rewrites a file's Phase A nodes also drops that
+    /// file's Phase B `ref/call` edges, and on the watcher path HEAD never
+    /// moves, so `last_commit` cannot signal it. `reindex_files` must record
+    /// the staleness itself, and only when something actually changed.
+    #[test]
+    fn reindex_files_flags_phase_b_dirty_only_when_content_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let ts_path = tmp.path().join("svc.ts");
+        std::fs::write(&ts_path, "export class OldSvc { foo() {} }").unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("1"),
+            "first index of a file must flag Phase B as stale"
+        );
+
+        // A completed Phase B run clears the flag.
+        store.set_meta("phase_b_dirty", "0").unwrap();
+
+        // Re-running over unchanged content must not re-flag: the hash guard
+        // means nothing was rewritten, so the semantic layer is still valid.
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("0"),
+            "an unchanged file must not flag Phase B as stale"
+        );
+
+        // Editing it must flag again — this is the #583 path.
+        std::fs::write(&ts_path, "export class NewSvc { bar() {} }").unwrap();
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("1"),
+            "a changed file must flag Phase B as stale"
+        );
+    }
+
     /// RFC-002: when the stored signature format version differs from the binary's
     /// version, `reindex_files` must return `Ok(())` without touching the graph.
     /// This is the core correctness guarantee — a version mismatch must never
@@ -6145,6 +6229,76 @@ mod tests {
             store.get_meta("phase_b_commit").unwrap(),
         );
         assert_ne!(last, pb, "mismatch means Phase B stale");
+    }
+
+    /// #583: the watcher reindexes a file without a commit, so `last_commit`
+    /// and `phase_b_commit` stay equal while the file's `ref/call` edges are
+    /// gone. Equal markers must therefore not be read as "Phase B is fresh".
+    #[test]
+    fn arm_phase_b_honours_content_dirt_when_markers_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = {
+            let mut s = travsr_store::SqliteStore::open(&db_path).unwrap();
+            s.set_meta("last_commit", "abc123").unwrap();
+            s.set_meta("phase_b_commit", "abc123").unwrap();
+            std::sync::Mutex::new(s)
+        };
+
+        // Markers agree and nothing flagged the content: stay idle.
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(
+            !sched.is_pending(),
+            "equal markers with no content dirt must not arm a run"
+        );
+
+        // A watcher reindex sets the flag. Markers are still equal.
+        store
+            .lock()
+            .unwrap()
+            .set_meta("phase_b_dirty", "1")
+            .unwrap();
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(
+            sched.is_pending(),
+            "content dirt must arm a run even when last_commit == phase_b_commit"
+        );
+    }
+
+    /// #583: re-arming on every 5 s tick would push the debounce deadline
+    /// forward forever and starve the run until `max_defer`. Once armed, the
+    /// deadline must stop moving.
+    #[test]
+    fn arm_phase_b_does_not_re_arm_while_already_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = {
+            let mut s = travsr_store::SqliteStore::open(&db_path).unwrap();
+            s.set_meta("last_commit", "abc123").unwrap();
+            s.set_meta("phase_b_commit", "abc123").unwrap();
+            s.set_meta("phase_b_dirty", "1").unwrap();
+            std::sync::Mutex::new(s)
+        };
+
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_millis(50));
+        let armed_at = std::time::Instant::now();
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(sched.is_pending());
+
+        // Simulate later ticks arriving before the debounce window closes.
+        for _ in 0..3 {
+            arm_phase_b_if_pending(&store, &sched);
+        }
+
+        // The original 50 ms deadline must still govern, so a claim succeeds
+        // shortly after the first arm rather than being pushed out repeatedly.
+        assert!(
+            sched.try_claim_at(armed_at + std::time::Duration::from_millis(60)),
+            "repeated ticks must not push the debounce deadline forward"
+        );
     }
 
     /// #464: an out-of-band graph.db writer (`fsck --fix` from a separate
