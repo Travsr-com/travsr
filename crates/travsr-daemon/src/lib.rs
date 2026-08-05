@@ -2685,14 +2685,10 @@ fn arm_phase_b_if_pending(
         return;
     }
 
-    // #583: a watcher reindex changes content without moving HEAD, so the test
-    // above cannot see it. `phase_b_dirty` carries that signal instead.
-    //
-    // Debounced rather than immediate: this runs on the 5 s tick, and an
-    // editor writing a burst of saves should settle into one Phase B run.
-    // Guarded on `is_pending` because `mark_dirty` pushes the deadline forward
-    // on every call — re-arming each tick would keep the deadline 30 s away
-    // forever and starve the run until `max_defer` finally forced it.
+    // #583: a watcher reindex moves no commit, so the test above cannot see it.
+    // Debounced so a burst of saves settles into one run, and guarded on
+    // `is_pending` because `mark_dirty` pushes the deadline forward on every
+    // call, which would starve the run until `max_defer`.
     let dirty = s
         .get_meta("phase_b_dirty")
         .ok()
@@ -3156,14 +3152,9 @@ pub fn reindex_files(
             let _ = store.set_meta("last_commit", &sha);
         }
 
-        // #583: content changed, so the semantic layer is stale. On the commit
-        // path `last_commit` moves and the `last != phase_b` test already
-        // catches it, but the watcher path reindexes without a commit — HEAD is
-        // unchanged, so that test stays false and Phase B is never re-run. The
-        // file keeps its Phase A nodes and permanently loses its `ref/call`
-        // edges. This flag is the content-based freshness signal the commit sha
-        // cannot provide; `run_background_phase_b_inner` clears it after a
-        // successful run.
+        // #583: the commit path moves `last_commit`, but the watcher path does
+        // not, so `last != phase_b` cannot see a reindex that dropped this
+        // file's `ref/call` edges. Cleared by `run_background_phase_b_inner`.
         let _ = store.set_meta("phase_b_dirty", "1");
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
@@ -5036,7 +5027,7 @@ mod tests {
             "an unchanged file must not flag Phase B as stale"
         );
 
-        // Editing it must flag again — this is the #583 path.
+        // Editing it must flag again. This is the #583 path.
         std::fs::write(&ts_path, "export class NewSvc { bar() {} }").unwrap();
         reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
         assert_eq!(
