@@ -3,6 +3,9 @@
 
 mod ffi;
 
+/// #500: process-liveness probe for the embed sidecar's shutdown grace poll.
+pub(crate) use ffi::pid_alive;
+
 use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 use crate::sandbox::StdioCfg;
 use std::io;

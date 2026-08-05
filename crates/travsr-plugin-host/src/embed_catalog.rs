@@ -358,10 +358,22 @@ fn pid_alive(pid: u32) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
-#[cfg(not(unix))]
+/// #500: real liveness probe (OpenProcess + GetExitCodeProcess, no signal).
+/// The previous hardcoded `false` made `!pid_alive(pid)` in the grace poll
+/// true on its first iteration, so `terminate_inflight_reindex` logged
+/// "drained gracefully" immediately and returned — skipping both the grace
+/// wait and the `kill_pid` fallback (which the same `false` also made dead
+/// code). The sidecar was never terminated on Windows.
+#[cfg(target_os = "windows")]
+fn pid_alive(pid: u32) -> bool {
+    crate::sandbox::windows::pid_alive(pid)
+}
+
+/// Conservative stub for platforms with neither probe: report alive, so
+/// shutdown waits the full grace window and always runs the kill fallback.
+#[cfg(not(any(unix, target_os = "windows")))]
 fn pid_alive(_pid: u32) -> bool {
-    // Windows falls straight through to `kill_pid` (taskkill /F) — no grace poll.
-    false
+    true
 }
 
 /// Gracefully cancel an in-flight reindex sidecar, else best-effort terminate it.
@@ -1699,6 +1711,34 @@ mod tests {
         assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 12345);
         drop(guard);
         assert_eq!(REINDEX_CHILD_PID.load(Ordering::SeqCst), 0);
+    }
+
+    /// #500 regression: pid_alive must report real liveness on every platform.
+    /// The Windows stub used to hardcode `false`, which made the shutdown
+    /// grace poll claim "drained gracefully" on its first iteration and turned
+    /// the `kill_pid` fallback into dead code — orphaning the sidecar.
+    #[test]
+    fn pid_alive_reports_running_and_exited_processes() {
+        assert!(
+            pid_alive(std::process::id()),
+            "the current process must be reported alive"
+        );
+
+        let mut child = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        }
+        .spawn()
+        .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait for child");
+        assert!(
+            !pid_alive(pid),
+            "an exited, reaped child must be reported dead"
+        );
     }
 
     // ── TC-FT-M4: RAII single-flight guard ───────────────────────────────────
