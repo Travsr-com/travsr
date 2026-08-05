@@ -33,8 +33,10 @@ const QUERIES: &str = r"
 (function_declaration name: (identifier) @fn.name)
 (function_signature name: (identifier) @fn.name)
 (method_definition name: (property_identifier) @method.name)
-(lexical_declaration (variable_declarator name: (identifier) @var.name))
-(variable_declaration (variable_declarator name: (identifier) @var.name))
+(program (lexical_declaration (variable_declarator) @topvar))
+(program (export_statement (lexical_declaration (variable_declarator) @topvar)))
+(program (variable_declaration (variable_declarator) @topvar))
+(program (export_statement (variable_declaration (variable_declarator) @topvar)))
 (import_statement source: (string (string_fragment) @import.source))
 ";
 
@@ -176,8 +178,35 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.nodes.push(node);
                     output.edges.push(edge);
                 }
-                "var.name" => {
-                    let node = emit::var_node(corpus, vname_path, text).with_line(line);
+                "topvar" => {
+                    // N4a: only top-level (program-child) declarators become
+                    // nodes — locals inside function bodies no longer pollute
+                    // the graph. A top-level arrow (`const f = () => {}`) or
+                    // function expression is a function, not a variable.
+                    let Some(name_node) = capture.node.child_by_field_name("name") else {
+                        continue;
+                    };
+                    // Skip destructuring patterns (`const { a, b } = ...`) — not
+                    // a single named symbol.
+                    if name_node.kind() != "identifier" {
+                        continue;
+                    }
+                    let Ok(name) = name_node.utf8_text(source.as_slice()) else {
+                        continue;
+                    };
+                    let name_line = name_node.start_position().row as u32 + 1;
+                    let is_fn = capture
+                        .node
+                        .child_by_field_name("value")
+                        .map(|v| matches!(v.kind(), "arrow_function" | "function_expression"))
+                        .unwrap_or(false);
+                    let node = if is_fn {
+                        emit::fn_node(corpus, vname_path, name)
+                            .with_line(name_line)
+                            .with_end_line(decl_end_line(capture.node))
+                    } else {
+                        emit::var_node(corpus, vname_path, name).with_line(name_line)
+                    };
                     let edge = emit::defines_edge(file_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
@@ -334,6 +363,42 @@ mod tests {
                 "file at exact limit must not be rejected: {e}"
             );
         }
+    }
+
+    #[test]
+    fn n4a_top_level_arrow_is_function_locals_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.ts");
+        std::fs::write(
+            &path,
+            "export const handler = () => { const local = 1; return local; };\n\
+             const MAX = 42;\n\
+             function outer() { const inner = 2; return inner; }\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "m.ts").unwrap();
+        let sigs: Vec<(&str, &str)> = out
+            .nodes
+            .iter()
+            .map(|n| (n.kind.as_str(), n.vname.signature.as_str()))
+            .collect();
+        // Top-level arrow → function, not var.
+        assert!(
+            sigs.contains(&("function", "fn:handler")),
+            "top-level arrow must be a function node; got {sigs:?}"
+        );
+        // Top-level non-arrow const → variable.
+        assert!(
+            sigs.contains(&("variable", "var:MAX")),
+            "top-level const literal stays a var node; got {sigs:?}"
+        );
+        // Locals inside function bodies must NOT pollute the graph.
+        assert!(
+            !sigs
+                .iter()
+                .any(|(_, s)| *s == "var:local" || *s == "var:inner"),
+            "locals must be dropped; got {sigs:?}"
+        );
     }
 
     // Error message must include the file path so operators know which file triggered it.
