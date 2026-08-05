@@ -88,6 +88,17 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
                 std::fs::read_to_string(&cmd_hook_path).context("reading existing cmd hook")?;
             if existing.contains(TRAVSR_MARKER_CMD) {
                 CMD_HOOK_BODY
+            } else if cmd_bak_path.exists() {
+                // L6 (#507): same guard as the POSIX branch above. The user may
+                // have restored their own hook over ours; fs::rename on Windows
+                // REPLACES the destination, so re-backing up here would destroy
+                // the original backup.
+                tracing::info!(
+                    "post-commit.cmd hook modified since last install and {} already exists — \
+                     overwriting hook only (not re-backing up)",
+                    cmd_bak_path.display()
+                );
+                CMD_CHAIN_HOOK_BODY
             } else {
                 std::fs::rename(&cmd_hook_path, &cmd_bak_path)
                     .context("backing up existing cmd hook")?;
