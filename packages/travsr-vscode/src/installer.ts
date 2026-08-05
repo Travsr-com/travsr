@@ -155,6 +155,46 @@ export function checkOnPath(binaryName: string): boolean {
   }
 }
 
+/**
+ * #495: pick the first spawnable hit from `where`/`which` output. On Windows
+ * only `.exe` hits qualify; `.cmd`/`.bat` shims are skipped (the npm-shim
+ * resolution path, #486, handles those). Candidates that fail
+ * assertExecutableBinary (relative, metacharacters) are skipped too.
+ */
+export function pickPathCandidate(
+  lines: string[],
+  platform: string = process.platform
+): string | null {
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (platform === "win32" && !line.toLowerCase().endsWith(".exe")) continue;
+    try {
+      assertExecutableBinary(line, platform);
+      return line;
+    } catch {
+      // unusable candidate; try the next hit
+    }
+  }
+  return null;
+}
+
+/**
+ * #495: resolve a binary on PATH to an absolute path the spawn gate accepts.
+ * checkOnPath only answers "is it there?" and discards the location, but the
+ * client rejects the bare binary name, so callers need the resolved path to
+ * persist into travsr.binaryPath and reconnect with.
+ */
+export function resolveOnPath(binaryName: string): string | null {
+  try {
+    const lookup = process.platform === "win32" ? "where" : "which";
+    const out = cp.execFileSync(lookup, [binaryName], { encoding: "utf8" });
+    return pickPathCandidate(out.split(/\r?\n/));
+  } catch {
+    return null;
+  }
+}
+
 export function findCmdShimPath(binaryName: string): string | null {
   if (process.platform !== "win32") return null;
   try {

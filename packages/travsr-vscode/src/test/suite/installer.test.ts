@@ -11,6 +11,8 @@ import {
   buildSumsUrl,
   verifyChecksum,
   checkOnPath,
+  pickPathCandidate,
+  resolveOnPath,
   hasCmdShimOnPath,
   findCmdShimPath,
   resolveNpmShimExe,
@@ -206,6 +208,81 @@ suite("WS1: checkOnPath — Windows .cmd discrimination", () => {
   test("findCmdShimPath returns null for nonexistent binary on Windows", () => {
     if (process.platform !== "win32") return;
     assert.strictEqual(findCmdShimPath("__travsr_definitely_not_on_path_xyz__"), null);
+  });
+});
+
+// ── #495: pickPathCandidate / resolveOnPath — PATH auto-detect ────────────
+
+suite("#495: installer — pickPathCandidate", () => {
+  test("win32: prefers the .exe hit over a preceding .cmd shim", () => {
+    const lines = [
+      "C:\\Users\\user\\AppData\\Roaming\\npm\\travsr.cmd",
+      "C:\\Users\\user\\.cargo\\bin\\travsr.exe",
+    ];
+    assert.strictEqual(
+      pickPathCandidate(lines, "win32"),
+      "C:\\Users\\user\\.cargo\\bin\\travsr.exe"
+    );
+  });
+
+  test("win32: returns null when only .cmd/.bat shims are on PATH", () => {
+    const lines = [
+      "C:\\Users\\user\\AppData\\Roaming\\npm\\travsr.cmd",
+      "C:\\tools\\travsr.bat",
+    ];
+    assert.strictEqual(pickPathCandidate(lines, "win32"), null);
+  });
+
+  test("posix: returns the first absolute hit", () => {
+    assert.strictEqual(
+      pickPathCandidate(["/usr/local/bin/travsr"], "linux"),
+      "/usr/local/bin/travsr"
+    );
+  });
+
+  test("skips candidates that fail assertExecutableBinary (metacharacters)", () => {
+    const lines = ["/opt/bad&dir/travsr", "/usr/local/bin/travsr"];
+    assert.strictEqual(pickPathCandidate(lines, "linux"), "/usr/local/bin/travsr");
+  });
+
+  test("skips non-absolute candidates", () => {
+    assert.strictEqual(pickPathCandidate(["travsr"], "linux"), null);
+  });
+
+  test("ignores blank and whitespace-only lines", () => {
+    assert.strictEqual(pickPathCandidate(["", "  ", "\r"], "win32"), null);
+    assert.strictEqual(
+      pickPathCandidate(["", "  /usr/local/bin/travsr  "], "darwin"),
+      "/usr/local/bin/travsr"
+    );
+  });
+});
+
+suite("#495: installer — resolveOnPath", () => {
+  test("returns null for a binary not on PATH", () => {
+    assert.strictEqual(resolveOnPath("__travsr_definitely_not_on_path_xyz__"), null);
+  });
+
+  test("resolves a binary from PATH to its absolute location", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-path-"));
+    const name = "__travsr_resolve_test__";
+    const file = path.join(dir, process.platform === "win32" ? `${name}.exe` : name);
+    fs.writeFileSync(file, "MZ");
+    if (process.platform !== "win32") fs.chmodSync(file, 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = dir + path.delimiter + (oldPath ?? "");
+    try {
+      const resolved = resolveOnPath(name);
+      assert.ok(resolved !== null, "expected the binary to resolve from PATH");
+      // where/which may return long-form paths while os.tmpdir() can use
+      // Windows 8.3 short names; canonicalize both before comparing.
+      assert.strictEqual(
+        fs.realpathSync.native(resolved).toLowerCase(),
+        fs.realpathSync.native(file).toLowerCase()
+      );
+    } finally {
+      process.env.PATH = oldPath;
+    }
   });
 });
 
