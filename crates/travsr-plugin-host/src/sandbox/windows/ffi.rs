@@ -6,6 +6,7 @@
 use std::io;
 use std::path::Path;
 
+use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
     HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_FAILED,
@@ -33,10 +34,11 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, GetProcessId,
-    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, IO_COUNTERS, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, IO_COUNTERS,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 // ── Access masks ──────────────────────────────────────────────────────────────
@@ -911,6 +913,26 @@ pub(super) fn terminate_process(handle: HANDLE) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// #500: true if a process with `pid` is currently running.
+///
+/// Opens the process with `PROCESS_QUERY_LIMITED_INFORMATION` (works for
+/// non-child processes and across integrity levels) and checks
+/// `GetExitCodeProcess` for `STILL_ACTIVE`. Returns `false` when the PID
+/// cannot be opened (already exited and reaped) or an exit code is recorded.
+/// Sends no signal. `pub(crate)`: `embed_catalog::pid_alive` delegates here so
+/// the daemon-shutdown grace poll can observe the sidecar, keeping all unsafe
+/// confined to this file.
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let handle = OwnedHandle(handle);
+    let mut code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(handle.as_handle(), &mut code) };
+    ok != 0 && code == STILL_ACTIVE as u32
 }
 
 #[cfg(test)]
