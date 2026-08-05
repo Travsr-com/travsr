@@ -19,6 +19,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (alias_declaration name: (type_identifier) @using.name)
 (function_declarator declarator: (identifier) @fn.name)
 (function_declarator declarator: (field_identifier) @fn.name)
+(preproc_def name: (identifier) @macro.name)
+(preproc_function_def name: (identifier) @macro.name)
 (preproc_include path: (_) @import)
 "#,
     capture_kinds: &[
@@ -29,6 +31,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("namespace.name", "namespace", "namespace"),
         ("using.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // N4e: `#define` object-like and function-like macros as first-class nodes.
+        ("macro.name", "macro", "macro"),
         ("import", "import", "import"),
     ],
     method_containers: &[("class_specifier", "class"), ("struct_specifier", "struct")],
@@ -64,5 +68,22 @@ mod tests {
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"));
         assert!(kinds.contains(&"namespace"));
+    }
+
+    #[test]
+    fn n4e_define_macros_are_nodes() {
+        // N4e: object-like and function-like `#define` macros become `macro:` nodes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("macros.cpp");
+        std::fs::write(&path, "#define PI 3.14\n#define SQ(x) ((x)*(x))\n").unwrap();
+        let out = parse("corp", &path, "macros.cpp").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "macro")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"macro:PI"), "got {sigs:?}");
+        assert!(sigs.contains(&"macro:SQ"), "got {sigs:?}");
     }
 }
