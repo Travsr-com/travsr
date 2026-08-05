@@ -89,14 +89,16 @@ suite("#498: mcpRegister — resolveExportBinaryPath", () => {
     );
   });
 
-  test("configured npm .cmd shim is substituted with the packaged binary", () => {
+  test("configured npm .cmd shim is substituted with the packaged binary (win32)", () => {
+    // npm .cmd shims are a Windows-only artifact; on POSIX platform rules a
+    // .cmd path is spawnable as-is, so pin win32 semantics explicitly.
     const shim = abs("npm-prefix", "travsr.cmd");
     const packaged = path.join(
-      path.dirname(shim), "node_modules", "@travsr.com", "travsr", "bin", exeName
+      path.dirname(shim), "node_modules", "@travsr.com", "travsr", "bin", "travsr.exe"
     );
     const existsFn = (p: string): boolean => p === packaged;
     assert.strictEqual(
-      resolveExportBinaryPath(shim, process.platform, existsFn, never, never),
+      resolveExportBinaryPath(shim, "win32", existsFn, never, never),
       packaged
     );
   });
@@ -155,10 +157,11 @@ suite("#498: mcpRegister — resolveExportBinaryPath", () => {
   });
 
   test("uses injected existsFn, never the real filesystem, for the shim substitute", () => {
+    // win32 semantics so the .cmd shim is rejected and substitution is
+    // attempted; packaged binary "missing" per existsFn → null, no fs access.
     const shim = abs("npm-prefix-2", "travsr.cmd");
-    // Packaged binary "missing" per existsFn — must not fall back to fs.
     assert.strictEqual(
-      resolveExportBinaryPath(shim, process.platform, noneExist, never, never),
+      resolveExportBinaryPath(shim, "win32", noneExist, never, never),
       null
     );
     assert.ok(!fs.existsSync(shim), "test precondition: shim does not really exist");
