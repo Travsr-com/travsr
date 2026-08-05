@@ -20,8 +20,9 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, DACL_SECURITY_INFORMATION, PSID,
-    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    CreateWellKnownSid, EqualSid, FreeSid, GetAce, WinCapabilityInternetClientSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    OBJECT_INHERIT_ACE, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::System::JobObjects::{
@@ -249,7 +250,54 @@ pub(super) fn ensure_appcontainer_profile(profile_name: &str) -> io::Result<()> 
     Ok(())
 }
 
+/// ACE type byte for `ACCESS_ALLOWED_ACE` (Win32 `ACCESS_ALLOWED_ACE_TYPE`).
+const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
+
+/// #505: true when `dacl` already carries an inheritable allow ACE for `sid`
+/// whose mask covers `access_mask`.
+///
+/// # Safety
+/// `dacl` must be null or a valid, readable `ACL` (as returned by
+/// `GetNamedSecurityInfoW`); `sid` must be a valid SID.
+unsafe fn dacl_has_inheritable_allow_ace(dacl: *const ACL, sid: PSID, access_mask: u32) -> bool {
+    if dacl.is_null() {
+        return false;
+    }
+    const INHERIT_BOTH: u8 = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
+    for i in 0..u32::from((*dacl).AceCount) {
+        let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        if GetAce(dacl, i, &mut ace_ptr) == 0 {
+            continue;
+        }
+        let header = ace_ptr as *const ACE_HEADER;
+        if (*header).AceType != ACE_TYPE_ACCESS_ALLOWED {
+            continue;
+        }
+        if (*header).AceFlags & INHERIT_BOTH != INHERIT_BOTH {
+            continue;
+        }
+        let ace = ace_ptr as *const ACCESS_ALLOWED_ACE;
+        if (*ace).Mask & access_mask != access_mask {
+            continue;
+        }
+        let ace_sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
+        if EqualSid(ace_sid, sid) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Adds an allow ACE for `sid` with `access_mask` to the DACL of `path`.
+///
+/// #505: idempotent. `SetNamedSecurityInfoW` with an inheritable ACE
+/// propagates through the whole subtree — a full DACL rewrite of every file
+/// under `path`. The AppContainer profile SID is deterministic per repo, so
+/// once the grant exists this returns after a single security-descriptor
+/// read instead of re-churning the tree on every sidecar spawn (minutes on a
+/// monorepo, permanent MFT/USN write traffic, EDR alarms). Exactly one ACE
+/// per (repo, SID, mask) persists on the tree; it is intentionally left in
+/// place across spawns — see the issue for the uninstall-cleanup discussion.
 pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io::Result<()> {
     let path_wide = path_to_wide(path);
 
@@ -279,6 +327,11 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
         }
     }
     let _sd_guard = SdGuard(sd);
+
+    // #505: grant already present → skip the subtree rewrite entirely.
+    if unsafe { dacl_has_inheritable_allow_ace(old_dacl, sid, access_mask) } {
+        return Ok(());
+    }
 
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access_mask,
@@ -1133,6 +1186,123 @@ mod tests {
                 "{var} must be forced to the scratch dir"
             );
         }
+    }
+
+    // ── #505: grant_path_access idempotence ─────────────────────────────────
+
+    /// DACL of a path plus the guard keeping its backing SD allocation alive.
+    struct DaclHandle {
+        dacl: *mut ACL,
+        sd: HLOCAL,
+    }
+    impl Drop for DaclHandle {
+        fn drop(&mut self) {
+            if !self.sd.is_null() {
+                unsafe { LocalFree(self.sd) };
+            }
+        }
+    }
+
+    fn read_dacl(path: &Path) -> DaclHandle {
+        let path_wide = to_wide(&path.to_string_lossy());
+        let mut dacl = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        let err = unsafe {
+            GetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(err, ERROR_SUCCESS, "GetNamedSecurityInfoW failed");
+        DaclHandle {
+            dacl,
+            sd: sd as HLOCAL,
+        }
+    }
+
+    /// #505 regression: a repeated grant must detect the existing ACE and
+    /// skip the subtree DACL rewrite — previously every sidecar spawn
+    /// re-propagated ACLs across the entire repo tree.
+    #[test]
+    fn grant_path_access_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("travsr-acl-505-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sid = derive_appcontainer_sid("travsr-test-505-acl").expect("derive sid");
+
+        // Before any grant: the ACE must not be reported present.
+        {
+            let h = read_dacl(&dir);
+            assert!(
+                !unsafe {
+                    dacl_has_inheritable_allow_ace(h.dacl, sid.as_psid(), ACCESS_GENERIC_READ)
+                },
+                "fresh dir must not carry the AppContainer ACE"
+            );
+        }
+
+        grant_path_access(&dir, sid.as_psid(), ACCESS_GENERIC_READ).expect("first grant");
+
+        // After the grant: detectable, so the second grant takes the skip
+        // path and the ACE count stays put.
+        let count_after_first = {
+            let h = read_dacl(&dir);
+            assert!(
+                unsafe {
+                    dacl_has_inheritable_allow_ace(h.dacl, sid.as_psid(), ACCESS_GENERIC_READ)
+                },
+                "granted ACE must be detected on re-read"
+            );
+            unsafe { (*h.dacl).AceCount }
+        };
+
+        grant_path_access(&dir, sid.as_psid(), ACCESS_GENERIC_READ).expect("second grant");
+        let count_after_second = {
+            let h = read_dacl(&dir);
+            unsafe { (*h.dacl).AceCount }
+        };
+        assert_eq!(
+            count_after_first, count_after_second,
+            "repeat grant must not touch the DACL"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A different SID or a wider mask must NOT be treated as already
+    /// granted — only an exact-or-superset mask for the same SID skips.
+    #[test]
+    fn grant_skip_requires_matching_sid_and_mask() {
+        let dir = std::env::temp_dir().join(format!("travsr-acl-505b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sid_a = derive_appcontainer_sid("travsr-test-505-sid-a").expect("derive sid a");
+        let sid_b = derive_appcontainer_sid("travsr-test-505-sid-b").expect("derive sid b");
+
+        grant_path_access(&dir, sid_a.as_psid(), ACCESS_GENERIC_READ).expect("grant read");
+
+        let h = read_dacl(&dir);
+        assert!(
+            !unsafe {
+                dacl_has_inheritable_allow_ace(h.dacl, sid_b.as_psid(), ACCESS_GENERIC_READ)
+            },
+            "another profile's SID must not match"
+        );
+        assert!(
+            !unsafe { dacl_has_inheritable_allow_ace(h.dacl, sid_a.as_psid(), ACCESS_GENERIC_ALL) },
+            "a read grant must not satisfy an ALL request"
+        );
+        drop(h);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── #504: Job Object CPU cap ────────────────────────────────────────────
