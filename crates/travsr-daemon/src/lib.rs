@@ -1383,8 +1383,23 @@ pub fn init_repo_with_progress(
                 // skip their own directory walks.
                 indexable_paths: &indexable_paths,
             };
-            let (pb_nodes, pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+            let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
+            // E3 W3b: resolve rust-analyzer LSIF positional refs against the full
+            // store (cross-file + incremental-safe) into attributable ScipRefs.
+            // Fail closed — a callee that resolves to no node is dropped here, so
+            // no dangling ref/call edge is ever written.
+            match store.resolve_lsif_positional_refs(&corpus, &pb_positional) {
+                Ok(resolved) => {
+                    tracing::debug!(
+                        positional_in = pb_positional.len(),
+                        resolved = resolved.len(),
+                        "Phase B: rust-analyzer positional refs resolved"
+                    );
+                    pb_refs.extend(resolved);
+                }
+                Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
+            }
             let (resolved, resolved_sites) =
                 resolve_unresolved_calls(&store, &pb_unresolved, &pb_nodes, &pb_edges);
             tracing::debug!(
@@ -2455,11 +2470,26 @@ fn run_background_phase_b_inner(
         present_languages,
         indexable_paths: &indexable_paths,
     };
-    let (pb_nodes, pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+    let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
         indexer.invoke_phase_b_all(&inputs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+
+    // E3 W3b: resolve rust-analyzer LSIF positional refs against the full store
+    // (cross-file + incremental-safe). Fail closed — unresolved callees dropped,
+    // never dangled.
+    match s.resolve_lsif_positional_refs(&corpus, &pb_positional) {
+        Ok(resolved) => {
+            tracing::debug!(
+                positional_in = pb_positional.len(),
+                resolved = resolved.len(),
+                "Phase B: rust-analyzer positional refs resolved"
+            );
+            pb_refs.extend(resolved);
+        }
+        Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
+    }
 
     let (resolved, resolved_sites) =
         resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges);

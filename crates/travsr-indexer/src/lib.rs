@@ -33,7 +33,8 @@ pub use ffi_resolver::FfiConfig;
 pub use hash::hash_file;
 pub use lsif::ingest as ingest_lsif;
 pub use lsif::{
-    ingest_g2 as ingest_lsif_g2, ingest_rust, ingest_rust_raw, ingest_scip, LsifG2Output,
+    ingest_g2 as ingest_lsif_g2, ingest_rust, ingest_rust_positional, ingest_rust_raw, ingest_scip,
+    LsifG2Output,
 };
 pub use ra_runner::run_ra_lsif;
 pub use runner::{run_lsif_emitter, run_lsif_py_emitter, run_scip_python};

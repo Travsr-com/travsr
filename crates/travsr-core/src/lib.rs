@@ -552,6 +552,27 @@ pub struct ScipRef {
     pub callee_id: NodeId,
 }
 
+/// A positional reference occurrence from a rust-analyzer LSIF dump (E3 W3b).
+///
+/// Unlike [`ScipRef`], the callee is identified by its **definition location**
+/// (`callee_def_path`, `callee_def_line`) rather than a pre-resolved `NodeId`,
+/// because rust-analyzer LSIF carries no `travsr_vname` — only monikers and
+/// definition ranges. The store resolves the callee positionally (narrowest
+/// node span containing the def line) and fails closed when nothing resolves,
+/// turning these into `ScipRef`s. This is what replaces the old moniker-synth
+/// path whose callee VName (at `path = project_root`) matched no Phase A node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LsifPositionalRef {
+    /// Repo-relative path of the file containing the reference occurrence.
+    pub caller_path: String,
+    /// 1-based source line of the reference occurrence.
+    pub caller_line: u32,
+    /// Repo-relative path of the file containing the callee's definition.
+    pub callee_def_path: String,
+    /// 1-based source line of the callee's definition occurrence.
+    pub callee_def_line: u32,
+}
+
 /// A single reference occurrence returned by `find_references` (issue #299):
 /// the file path and 1-based line of one use site of a symbol.
 ///

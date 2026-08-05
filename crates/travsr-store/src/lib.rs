@@ -3387,6 +3387,30 @@ LIMIT 20",
             };
 
             let callee_id = node_id_to_i64(scip_ref.callee_id);
+
+            // E3 (W3a) — fail closed (Invariant #4): never write a `ref/call`
+            // edge whose callee resolves to no node. The full node table is
+            // present here (Phase A nodes already persisted, this batch's
+            // `pb_nodes` inserted above in the same tx), so a missing callee is a
+            // genuine unresolved symbol (external/stdlib, or a positional lookup
+            // that found nothing) — not a not-yet-written node. A dangling
+            // `ref/call` pollutes `get_callers`/blast-radius, so drop it here
+            // rather than persist it. This gate is what lets the positional
+            // rust-analyzer LSIF path (W3b) and any external-symbol reference
+            // fail closed instead of leaving the 34% dangling this plan removes.
+            let callee_exists = tx
+                .query_row(
+                    "SELECT 1 FROM nodes WHERE id = ?1",
+                    params![callee_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .context("write_scip_attributed_batch: callee existence check")?
+                .is_some();
+            if !callee_exists {
+                continue;
+            }
+
             tx.execute(
                 "INSERT INTO edges(src, dst, kind, provenance, confidence) \
                  VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
@@ -3404,6 +3428,80 @@ LIMIT 20",
         }
 
         tx.commit().context("write_scip_attributed_batch: commit")
+    }
+
+    /// Resolve rust-analyzer LSIF positional references (E3 W3b) into `ScipRef`s.
+    ///
+    /// rust-analyzer LSIF identifies a callee only by its definition location,
+    /// not a `travsr_vname`. This maps each `callee_def_(path,line)` to the
+    /// **narrowest Phase A node whose span contains that line** — the same
+    /// positional rule `write_scip_attributed_batch` uses for the caller — and
+    /// emits a `ScipRef` whose `callee_id` is that real node. **Fails closed**:
+    /// a reference whose callee def resolves to no node (external symbol, or a
+    /// def line outside every span) is dropped, so no dangling edge is produced.
+    ///
+    /// Read-only. Caller attribution (`caller_line` → enclosing function) is left
+    /// to `write_scip_attributed_batch`, through which the returned refs flow.
+    ///
+    /// O(unique callee paths) span queries + O(refs) span scans.
+    pub fn resolve_lsif_positional_refs(
+        &self,
+        corpus: &str,
+        positional: &[travsr_core::LsifPositionalRef],
+    ) -> anyhow::Result<Vec<travsr_core::ScipRef>> {
+        if positional.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One span query per unique callee-definition path. Any node kind is a
+        // valid callee (method/fn/struct/enum/const/…); `.rs` files carry no
+        // span-bearing noise nodes (doc-chunks are markdown-only), so no kind
+        // filter is needed — the narrowest containing span is the symbol.
+        let unique_paths: std::collections::HashSet<&str> = positional
+            .iter()
+            .map(|p| p.callee_def_path.as_str())
+            .collect();
+        let mut span_cache: std::collections::HashMap<&str, Vec<FnSpan>> =
+            std::collections::HashMap::with_capacity(unique_paths.len());
+        for path in unique_paths {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT id, line, end_line FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 \
+                       AND line IS NOT NULL AND end_line IS NOT NULL \
+                     ORDER BY (end_line - line) ASC, id ASC",
+                )
+                .context("resolve_lsif_positional_refs: prepare")?;
+            let spans = stmt
+                .query_map(params![corpus, path], |row| {
+                    Ok(FnSpan {
+                        id: row.get(0)?,
+                        line: row.get(1)?,
+                        end_line: row.get(2)?,
+                    })
+                })
+                .context("resolve_lsif_positional_refs: query")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("resolve_lsif_positional_refs: collect")?;
+            span_cache.insert(path, spans);
+        }
+
+        let mut out = Vec::with_capacity(positional.len());
+        for p in positional {
+            let def_line = p.callee_def_line as i64;
+            let Some(callee_i64) = span_cache
+                .get(p.callee_def_path.as_str())
+                .and_then(|spans| find_narrowest_enclosing(spans, def_line))
+            else {
+                continue; // fail closed: callee def resolves to no node
+            };
+            out.push(travsr_core::ScipRef {
+                caller_path: p.caller_path.clone(),
+                caller_line: p.caller_line,
+                callee_id: i64_to_node_id(callee_i64),
+            });
+        }
+        Ok(out)
     }
 
     /// Occurrence sites (`path:line`) of every `ref/call` to `dst`, read from the
