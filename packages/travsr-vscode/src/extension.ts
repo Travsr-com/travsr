@@ -21,7 +21,7 @@ import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
 import { GraphPanel } from "./graph";
 import {
   installBinary,
-  checkOnPath,
+  resolveOnPath,
   findCmdShimPath,
   resolveNpmShimExe,
   assertExecutableBinary,
@@ -593,8 +593,18 @@ async function checkBinaryAndPrompt(
     return;
   }
 
-  // 3. Check PATH — daemon may have been installed via npm or Homebrew.
-  if (checkOnPath("travsr")) return;
+  // 3. Check PATH — daemon may have been installed via npm, Homebrew, or
+  //    cargo. #495: returning early on a bare hit left the client dead — it
+  //    rejects the non-absolute "travsr" fallback — so capture the resolved
+  //    absolute path, persist it, and reconnect (same pattern as step 2).
+  //    resolveOnPath prefers .exe hits and skips .cmd/.bat shims; shim-only
+  //    installs fall through to the npm-shim resolution in step 4 (#486).
+  const onPath = resolveOnPath("travsr");
+  if (onPath) {
+    channel.appendLine(`Resolved travsr on PATH: ${onPath}`);
+    await adoptBinary(onPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+    return;
+  }
 
   // 4. Windows npm install: only a .cmd shim on PATH, but the package ships
   //    the real exe next to it (#486) — adopt it instead of prompting.
