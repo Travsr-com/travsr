@@ -4801,6 +4801,21 @@ impl Daemon {
                                     .as_bytes(),
                                 )
                                 .await;
+                            let _ = writer.flush().await;
+                            // #503: do not drop the pipe server until the
+                            // client has read the response. Closing the handle
+                            // (and DisconnectNamedPipe alike) discards bytes
+                            // still unread in the pipe buffer, so a fast drop
+                            // intermittently surfaced as "daemon closed
+                            // connection without a response". The client
+                            // closes its end right after reading, which we
+                            // observe as EOF here; the timeout bounds a hung
+                            // client and merely degrades to today's behavior.
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                lines.next_line(),
+                            )
+                            .await;
                             if shutdown_requested {
                                 sd.notify_one();
                             }

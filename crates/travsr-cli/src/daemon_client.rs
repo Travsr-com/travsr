@@ -62,12 +62,26 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path) -> SpawnOutc
     }
     // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
     // lock — the last-line-of-defense guard for the tight spawn race).
-    let spawned = std::process::Command::new(exe)
-        .args(["daemon", "start", "--foreground"])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["daemon", "start", "--foreground"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    // #503: fully detach from the launching console. Without these flags the
+    // daemon stays attached to the parent's console, so Ctrl+C in that
+    // terminal reaches its ctrl_c handler and shuts it down, closing the
+    // terminal kills it via CTRL_CLOSE_EVENT, and the Task Scheduler
+    // autostart path pops a visible console window. DETACHED_PROCESS gives
+    // the child no console at all; CREATE_NEW_PROCESS_GROUP takes it out of
+    // the parent's Ctrl+C signal group.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let spawned = cmd.spawn();
     if spawned.is_err() {
         return SpawnOutcome::Failed;
     }
