@@ -1,13 +1,19 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use anyhow::Context as _;
 
+/// #507: the task name must be stable across travsr builds — `register` and
+/// `unregister` typically run from different binaries (upgrade in between).
+/// The previous `DefaultHasher` scheme is explicitly unstable across Rust
+/// releases, so `daemon stop` after an upgrade computed a different `/tn`
+/// and the old ONLOGON task was orphaned with no CLI way to remove it.
+/// Reuse the repo identity scheme the control transport already uses
+/// (`ControlAddr::for_repo`: canonicalized, case-folded, blake3-hashed).
 fn task_name(repo_root: &Path) -> String {
-    let mut h = DefaultHasher::new();
-    repo_root.hash(&mut h);
-    format!(r"Travsr\travsr-{:016x}", h.finish())
+    format!(
+        r"Travsr\travsr-{}",
+        travsr_ipc::ControlAddr::for_repo(repo_root)
+    )
 }
 
 fn xml_escape(s: &str) -> String {
@@ -69,8 +75,15 @@ pub fn register(exe: &Path, repo_root: &Path) -> anyhow::Result<()> {
 "#
     );
 
+    // #507: the XML declares encoding="UTF-8", but schtasks /xml rejects
+    // non-ASCII content in a BOM-less file — a non-ASCII username or repo
+    // path failed registration. Write a UTF-8 BOM so schtasks decodes it as
+    // declared.
+    let mut xml_bytes = vec![0xEF, 0xBB, 0xBF];
+    xml_bytes.extend_from_slice(xml.as_bytes());
+
     let tmp = std::env::temp_dir().join(format!("travsr-schtask-{}.xml", std::process::id()));
-    std::fs::write(&tmp, xml.as_bytes()).context("writing task XML")?;
+    std::fs::write(&tmp, &xml_bytes).context("writing task XML")?;
 
     let status = std::process::Command::new("schtasks")
         .args([
@@ -116,6 +129,16 @@ mod tests {
         assert_eq!(task_name(p), task_name(p));
         assert!(task_name(p).starts_with(r"Travsr\travsr-"));
         assert_eq!(task_name(p).len(), "Travsr\\travsr-".len() + 16);
+    }
+
+    /// #507: the name must come from the build-stable ControlAddr scheme,
+    /// not DefaultHasher (unstable across Rust releases), so unregister
+    /// finds the task registered by an older travsr build.
+    #[test]
+    fn task_name_uses_control_addr_identity() {
+        let p = Path::new(r"C:\Users\user\my-repo");
+        let expected = travsr_ipc::ControlAddr::for_repo(p).to_string();
+        assert_eq!(task_name(p), format!(r"Travsr\travsr-{expected}"));
     }
 
     #[test]
