@@ -26,6 +26,12 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],
+    method_containers: &[
+        ("class_declaration", "class"),
+        ("interface_declaration", "interface"),
+        ("trait_declaration", "class"),
+        ("enum_declaration", "enum"),
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
 };
 

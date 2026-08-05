@@ -34,6 +34,14 @@ pub struct LanguageConfig {
     /// Special prefix `"import"` → uses the full node text, strips the leading
     /// keyword (`import`, `use`, `require`, `using`) and trailing `;`.
     pub capture_kinds: &'static [(&'static str, &'static str, &'static str)],
+    /// AST node kinds that enclose their methods as a type/namespace, each
+    /// paired with the signature prefix that container is itself captured
+    /// under. When a `fn`-prefixed definition capture is nested inside one of
+    /// these, it is emitted as `method:{ContainerName}.{leaf}` (kind `method`)
+    /// and its `DefinesBinding` edge is parented to the container node instead
+    /// of the file (N1 collision fix + N3 containment). Empty ⇒ the language
+    /// has no methods (e.g. C), so every `fn` capture stays a free function.
+    pub method_containers: &'static [(&'static str, &'static str)],
     /// Returns the tree-sitter grammar for this language.
     /// Stored as a function pointer so `LanguageConfig` is `const`-constructible
     /// (tree-sitter `Language` itself is not directly `const`-constructible).
@@ -79,7 +87,10 @@ pub fn parse_with_config(
 
     let lang_str = config.language.as_str();
     let file_vname = VName::new(corpus, "", vname_path, lang_str, "file");
-    let mut nodes = vec![Node::new(file_vname, "file")];
+    let file_node = Node::new(file_vname, "file");
+    let file_id = file_node.id;
+    let mut nodes = vec![file_node];
+    let mut edges: Vec<Edge> = Vec::new();
 
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
@@ -110,19 +121,40 @@ pub fn parse_with_config(
                 .map(|p| p.end_position().row as u32 + 1)
                 .unwrap_or(line);
 
-            let sig = if sig_prefix == "import" {
-                // Use the full node text, strip leading keyword + trailing semicolons.
-                let cleaned = text
-                    .trim_start_matches("import ")
-                    .trim_start_matches("use ")
-                    .trim_start_matches("require ")
-                    .trim_start_matches("using ")
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
-                format!("import:{cleaned}")
+            // N1/N3: a `fn`-prefixed definition nested inside a type container
+            // is a method. Qualify its signature by the enclosing type
+            // (`method:Type.name`, collision-free per Invariant #1) and parent
+            // its containment edge to the container node, not the file.
+            let enclosing = if sig_prefix == "fn" {
+                enclosing_container(cap.node, config.method_containers, &source)
             } else {
-                format!("{sig_prefix}:{text}")
+                None
+            };
+
+            let (sig, node_kind, parent_id) = match (&enclosing, sig_prefix) {
+                (Some((container_prefix, container_name)), _) => {
+                    let container_sig = format!("{container_prefix}:{container_name}");
+                    let container_id =
+                        VName::new(corpus, "", vname_path, lang_str, &container_sig).id();
+                    (
+                        format!("method:{container_name}.{text}"),
+                        "method",
+                        container_id,
+                    )
+                }
+                (None, "import") => {
+                    // Use the full node text, strip leading keyword + trailing semicolons.
+                    let cleaned = text
+                        .trim_start_matches("import ")
+                        .trim_start_matches("use ")
+                        .trim_start_matches("require ")
+                        .trim_start_matches("using ")
+                        .trim_end_matches(';')
+                        .trim()
+                        .to_string();
+                    (format!("import:{cleaned}"), node_kind, file_id)
+                }
+                (None, _) => (format!("{sig_prefix}:{text}"), node_kind, file_id),
             };
 
             let vname = VName::new(corpus, "", vname_path, lang_str, &sig);
@@ -130,26 +162,185 @@ pub fn parse_with_config(
             if sig_prefix != "import" {
                 node = node.with_end_line(end_line);
             }
-            nodes.push(node);
-        }
-    }
-
-    let file_id = nodes[0].id;
-    let edges: Vec<Edge> = nodes[1..]
-        .iter()
-        .map(|n| {
-            let kind = if n.kind == "import" {
+            let edge_kind = if node_kind == "import" {
                 EdgeKind::Depends
             } else {
                 EdgeKind::DefinesBinding
             };
-            Edge::new(file_id, n.id, kind)
-        })
-        .collect();
+            edges.push(Edge::new(parent_id, node.id, edge_kind));
+            nodes.push(node);
+        }
+    }
 
     Ok(ParseOutput {
         nodes,
         edges,
         ffi_markers: vec![],
     })
+}
+
+/// Walk up from a definition capture to the nearest enclosing type container.
+///
+/// Returns `(container_prefix, container_name)` for the first ancestor whose
+/// kind appears in `method_containers`, or `None` if the definition is not
+/// nested in any container (i.e. a free function). `container_prefix` is the
+/// signature prefix that container is captured under, so the caller can
+/// reconstruct the container's own VName (`{prefix}:{name}`) for the
+/// containment edge.
+fn enclosing_container<'a>(
+    node: tree_sitter::Node<'_>,
+    method_containers: &[(&'static str, &'a str)],
+    source: &[u8],
+) -> Option<(&'a str, String)> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if let Some((_, prefix)) = method_containers.iter().find(|(kind, _)| *kind == n.kind()) {
+            if let Some(name) = container_name(n, source) {
+                return Some((prefix, name));
+            }
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Extract a type container's declared name. Prefers the `name` field; falls
+/// back to the first identifier-like child (grammars such as tree-sitter-objc
+/// anchor the class name positionally with no `name` field).
+fn container_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Ok(t) = name_node.utf8_text(source) {
+            let t = t.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    let mut walk = node.walk();
+    for child in node.children(&mut walk) {
+        if matches!(
+            child.kind(),
+            "identifier"
+                | "type_identifier"
+                | "constant"
+                | "simple_identifier"
+                | "name"
+                | "namespace_identifier"
+        ) {
+            if let Ok(t) = child.utf8_text(source) {
+                let t = t.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use travsr_core::EdgeKind;
+
+    fn parse_str(config: &LanguageConfig, name: &str, src: &str) -> ParseOutput {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, src).unwrap();
+        let grammar = (config.get_grammar)();
+        parse_with_config(config, &grammar, None, "corp", &path, name).unwrap()
+    }
+
+    #[test]
+    fn keystone_two_same_named_methods_are_distinct_nodes() {
+        // N1 / Invariant #1: two classes each defining `run()` must NOT collapse
+        // to one VName. Before N1 both were `fn:run` → one NodeId clobbered the
+        // other. After N1 they are `method:A.run` and `method:B.run`.
+        let out = parse_str(
+            &crate::php::CONFIG,
+            "collide.php",
+            "<?php\nclass A { function run() {} }\nclass B { function run() {} }\n",
+        );
+        let method_sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "method")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(method_sigs.contains(&"method:A.run"), "got {method_sigs:?}");
+        assert!(method_sigs.contains(&"method:B.run"), "got {method_sigs:?}");
+
+        let a = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:A.run")
+            .unwrap();
+        let b = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:B.run")
+            .unwrap();
+        assert_ne!(
+            a.id, b.id,
+            "two distinct methods must have distinct NodeIds"
+        );
+
+        // No bare `fn:run` collision node survives.
+        assert!(
+            !out.nodes.iter().any(|n| n.vname.signature == "fn:run"),
+            "bare fn:run must not exist after N1"
+        );
+    }
+
+    #[test]
+    fn keystone_containment_edge_parents_method_to_type() {
+        // N3: the DefinesBinding edge for a method is parented to its enclosing
+        // type node, not the file.
+        let out = parse_str(
+            &crate::php::CONFIG,
+            "contain.php",
+            "<?php\nclass A { function run() {} }\n",
+        );
+        let file_id = out.nodes.iter().find(|n| n.kind == "file").unwrap().id;
+        let class_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "class:A")
+            .unwrap()
+            .id;
+        let method_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:A.run")
+            .unwrap()
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == class_id
+                && e.dst == method_id
+                && e.kind == EdgeKind::DefinesBinding),
+            "expected class:A → method:A.run containment edge"
+        );
+        assert!(
+            !out.edges
+                .iter()
+                .any(|e| e.src == file_id && e.dst == method_id),
+            "flat file → method edge must be gone (N3)"
+        );
+    }
+
+    #[test]
+    fn free_function_stays_unqualified() {
+        // A `fn` capture NOT nested in a container is still a free function.
+        let out = parse_str(
+            &crate::php::CONFIG,
+            "free.php",
+            "<?php\nfunction top() {}\n",
+        );
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.kind == "function" && n.vname.signature == "fn:top"),
+            "top-level function must stay fn:top"
+        );
+    }
 }

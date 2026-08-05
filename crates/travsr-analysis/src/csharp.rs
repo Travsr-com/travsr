@@ -30,6 +30,13 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],
+    method_containers: &[
+        ("class_declaration", "class"),
+        ("struct_declaration", "class"),
+        ("record_declaration", "class"),
+        ("interface_declaration", "interface"),
+        ("enum_declaration", "enum"),
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
 };
 
@@ -65,7 +72,17 @@ mod tests {
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"));
         assert!(kinds.contains(&"interface"));
-        assert!(kinds.contains(&"function"));
         assert!(kinds.contains(&"import"));
+        // N1: `void Bar()` inside `class Foo` is a method, qualified by its type.
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.kind == "method" && n.vname.signature == "method:Foo.Bar"),
+            "expected method:Foo.Bar; got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
+        );
     }
 }

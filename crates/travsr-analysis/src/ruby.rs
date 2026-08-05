@@ -21,6 +21,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("module.name", "class", "class"),
         ("fn.name", "function", "fn"),
     ],
+    method_containers: &[("class", "class"), ("module", "class")],
     get_grammar: || tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
 };
 
@@ -55,6 +56,15 @@ mod tests {
         let out = parse("corp", &path, "sample.rb").unwrap();
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"));
-        assert_eq!(kinds.iter().filter(|&&k| k == "function").count(), 2);
+        // N1: both methods are qualified by `Foo`. `def self.baz` no longer
+        // collides with a same-named instance method (the ruby.rs defect).
+        assert_eq!(kinds.iter().filter(|&&k| k == "method").count(), 2);
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(sigs.contains(&"method:Foo.bar"), "got {sigs:?}");
+        assert!(sigs.contains(&"method:Foo.baz"), "got {sigs:?}");
     }
 }

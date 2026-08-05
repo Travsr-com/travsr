@@ -43,6 +43,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],
+    method_containers: &[
+        ("class_implementation", "impl"),
+        ("class_interface", "class"),
+        ("protocol_declaration", "protocol"),
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_objc::LANGUAGE),
 };
 
@@ -80,7 +85,17 @@ mod tests {
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"), "class from @interface");
         assert!(kinds.contains(&"impl"), "impl from @implementation");
-        assert!(kinds.contains(&"function"), "method node");
         assert!(kinds.contains(&"import"), "import node");
+        // N1: the selector is qualified by its enclosing type.
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.kind == "method" && n.vname.signature == "method:MyClass.doThing"),
+            "expected method:MyClass.doThing; got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
+        );
     }
 }

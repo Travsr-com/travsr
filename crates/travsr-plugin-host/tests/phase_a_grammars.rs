@@ -43,7 +43,9 @@ object Main { def run(): Unit = () }
 trait Logger { def log(): Unit }
 "#;
     let k = kinds(src, "scala");
-    for expected in ["class", "object", "trait", "function", "import"] {
+    // N1: `def hi/run/log` are all nested in a type container, so they are
+    // `method` nodes (qualified by their enclosing type), not free functions.
+    for expected in ["class", "object", "trait", "method", "import"] {
         assert!(
             k.contains(expected),
             "scala: missing {expected:?} node — got {k:?}"
@@ -262,13 +264,16 @@ fn objc_class_impl_and_protocol_sigs_emitted() {
 @end
 "#;
     let s = sigs(src, "m");
+    // N1: selectors are qualified by their enclosing @interface/@implementation
+    // /@protocol type. `draw` lives in both protocol Drawable and impl Shape.
     for expected in [
         "class:Shape",
         "impl:Shape",
         "protocol:Drawable",
-        "fn:render",
-        "fn:unit",
-        "fn:draw",
+        "method:Shape.render",
+        "method:Shape.unit",
+        "method:Shape.draw",
+        "method:Drawable.draw",
     ] {
         assert!(
             s.contains(expected),

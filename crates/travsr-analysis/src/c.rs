@@ -26,6 +26,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],
+    // C has no methods; every `fn` capture is a free function.
+    method_containers: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
 };
 

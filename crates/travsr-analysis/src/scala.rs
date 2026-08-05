@@ -26,6 +26,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("typedef.name", "type", "type"),
         ("import", "import", "import"),
     ],
+    method_containers: &[
+        ("class_definition", "class"),
+        ("object_definition", "class"),
+        ("trait_definition", "class"),
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_scala::LANGUAGE),
 };
 

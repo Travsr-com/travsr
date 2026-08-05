@@ -30,6 +30,12 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],
+    method_containers: &[
+        ("class_declaration", "class"),
+        ("mixin_declaration", "class"),
+        ("extension_declaration", "class"),
+        ("enum_declaration", "enum"),
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
 };
 

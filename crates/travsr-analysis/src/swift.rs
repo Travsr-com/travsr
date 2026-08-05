@@ -31,6 +31,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         // queries resolve.
         ("var.name", "field", "var"),
     ],
+    method_containers: &[
+        ("class_declaration", "class"),
+        ("protocol_declaration", "class"),
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_swift::LANGUAGE),
 };
 

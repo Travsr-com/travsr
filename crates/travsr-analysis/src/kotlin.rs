@@ -24,6 +24,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("typealias.name", "type", "type"),
         ("import", "import", "import"),
     ],
+    method_containers: &[
+        ("class_declaration", "class"),
+        ("object_declaration", "class"),
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
 };
 
