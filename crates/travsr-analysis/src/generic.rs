@@ -150,7 +150,11 @@ pub fn parse_with_config(
                     )
                 }
                 (None, "import") => {
-                    // Use the full node text, strip leading keyword + trailing semicolons.
+                    // Use the full node text, strip leading keyword + trailing
+                    // semicolons. N5: also strip surrounding quotes so Dart
+                    // `import 'dart:core';` yields `import:dart:core` (the
+                    // DartResolver tests `starts_with("dart:")`) and C
+                    // `#include "foo.h"` yields `import:foo.h`.
                     let cleaned = text
                         .trim_start_matches("import ")
                         .trim_start_matches("use ")
@@ -158,6 +162,7 @@ pub fn parse_with_config(
                         .trim_start_matches("using ")
                         .trim_end_matches(';')
                         .trim()
+                        .trim_matches(|c| c == '\'' || c == '"')
                         .to_string();
                     (format!("import:{cleaned}"), node_kind, file_id)
                 }
@@ -373,6 +378,28 @@ mod tests {
             f.end_line,
             Some(4),
             "span must reach the closing brace (line 4), not end at the signature line"
+        );
+    }
+
+    #[test]
+    fn n5_dart_import_strips_quotes() {
+        // N5: `import 'dart:core';` must yield `import:dart:core` (no quotes) so
+        // the DartResolver's `starts_with("dart:")` test resolves stdlib imports.
+        let out = parse_str(
+            &crate::dart::CONFIG,
+            "q.dart",
+            "import 'dart:core';\nimport 'package:foo/bar.dart';\n",
+        );
+        let imports: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "import")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(imports.contains(&"import:dart:core"), "got {imports:?}");
+        assert!(
+            imports.contains(&"import:package:foo/bar.dart"),
+            "got {imports:?}"
         );
     }
 
