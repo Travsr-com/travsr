@@ -6,6 +6,11 @@ All notable changes to Travsr are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- **Windows hardening batch (#495, #497, #498-#507).** Twelve Windows issues fixed across the daemon lifecycle (named-pipe response delivery, console detachment, duplicate-daemon startup guard), the plugin sandbox (AppContainer capability-pointer UB, toolchain env forwarding, core-count-scaled Job Object CPU cap, idempotent ACL grants), tool resolution (PATHEXT-aware executable lookup, npm/zip installs), binary upgrades while the daemon runs, and the VS Code extension (PATH auto-detect, honest Windows ARM messaging, validated MCP config export).
+- **Windows upgrade note — autostart task migration.** The Task Scheduler auto-start task name now derives from a hash that is stable across travsr builds; previously it changed with every toolchain upgrade, so `travsr daemon stop` could not remove tasks registered by older builds. Tasks registered **before** this change keep their old names and cannot be found by the new scheme: after upgrading, remove them once manually — list with `schtasks /query /fo list | findstr Travsr`, then `schtasks /delete /tn "<name>" /f` for any stale entry. Tasks registered by this version onward are removed by `travsr daemon stop` as normal.
+
 ### Changed
 
 - **Documentation-prose retrieval (#376) is on by default (#519).** `get_context`, `ask`, and `find_references`/`find_pattern`'s doc lane now search Markdown documentation (ADRs, RFCs, plans) alongside code by default, surfacing rationale and design docs relevant to a query. All five docs-lane accuracy/regression gates are green on both bench repos (travsr and kubernetes) against merged code. Turn it off with `travsr config set docs.enabled false`.

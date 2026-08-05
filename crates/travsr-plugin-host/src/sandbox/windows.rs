@@ -1,4 +1,4 @@
-//! Windows AppContainer + Job Object sandbox (RFC-014 / ADR-017 Rule 2).
+//! Windows AppContainer + Job Object sandbox (ADR-017 Rules 1-2).
 //! Safe wrapper — no `unsafe` code in this file; all unsafe is in `ffi.rs`.
 
 mod ffi;
@@ -164,6 +164,37 @@ impl AppContainerSpawn {
         }
         for path in &self.toolchain.write_paths {
             let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_ALL);
+        }
+        // PR #577 review: an AppContainer token cannot map an image whose DACL
+        // carries no AppContainer ACE — user-profile trees don't carry ALL
+        // APPLICATION PACKAGES, and the owner-only hardening of ~/.travsr
+        // (#507, travsr-store restrict_to_owner_windows) strips inherited ACEs
+        // for anything created under it afterwards. The resolver hands us
+        // plugin binaries from exactly ~/.travsr/bin, so grant read+execute on
+        // that dir and on the program's own directory; without this the
+        // sandbox spawn fails ERROR_ACCESS_DENIED at image load and the PATH
+        // prepend (#501) points at files the child could not execute anyway.
+        // Best-effort like the toolchain grants: the dir may not exist yet,
+        // and a program under a machine-wide tree (Program Files) already
+        // carries the needed ACEs. Idempotent per #505 — a repeat is one read.
+        if let Some(home) = dirs::home_dir() {
+            let travsr_bin = home.join(".travsr").join("bin");
+            if travsr_bin.is_dir() {
+                let _ = ffi::grant_path_access(
+                    &travsr_bin,
+                    sid.as_psid(),
+                    ffi::ACCESS_GENERIC_READ_EXECUTE,
+                );
+            }
+        }
+        if let Some(program_dir) = std::path::Path::new(&self.program).parent() {
+            if program_dir.is_dir() {
+                let _ = ffi::grant_path_access(
+                    program_dir,
+                    sid.as_psid(),
+                    ffi::ACCESS_GENERIC_READ_EXECUTE,
+                );
+            }
         }
 
         // PSE R5 (#499): capability storage is heap-pinned inside the owner;

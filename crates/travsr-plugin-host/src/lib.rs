@@ -1,4 +1,4 @@
-#![deny(unsafe_code)] // overridden only in sandbox/windows/ffi.rs (RFC-014 approved)
+#![deny(unsafe_code)] // overridden only in sandbox/windows/ffi.rs (ADR-017 Amendment A2)
 //! travsr-plugin-host — owns the trust boundary between the daemon and plugins.
 //!
 //! The ONLY crate in the indexer tier that depends on travsr-plugin-protocol.

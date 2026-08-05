@@ -1,5 +1,7 @@
-//! Unsafe Win32 FFI wrappers for AppContainer + Job Object sandbox (RFC-014).
-//! All `unsafe` blocks in travsr-plugin-host are confined to this file.
+//! Unsafe Win32 FFI wrappers for AppContainer + Job Object sandbox (ADR-017).
+//! All `unsafe` blocks in travsr-plugin-host are confined to this file
+//! (sanctioned by ADR-017 Amendment A2, which records the confinement,
+//! encapsulation, and verification invariants this file must uphold).
 #![allow(unsafe_code)]
 #![allow(clippy::io_other_error)]
 
@@ -46,6 +48,9 @@ use windows_sys::Win32::System::Threading::{
 
 pub(super) const ACCESS_GENERIC_READ: u32 = 0x8000_0000;
 pub(super) const ACCESS_GENERIC_ALL: u32 = 0x1000_0000;
+/// Read + execute (GENERIC_READ | GENERIC_EXECUTE): the minimum an
+/// AppContainer token needs to map and run a program image (PR #577 review).
+pub(super) const ACCESS_GENERIC_READ_EXECUTE: u32 = 0x8000_0000 | 0x2000_0000;
 
 // ── SE_GROUP_ENABLED for capability SID attributes ────────────────────────────
 
@@ -1272,6 +1277,123 @@ mod tests {
             count_after_first, count_after_second,
             "repeat grant must not touch the DACL"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Like `dacl_has_inheritable_allow_ace` but ignoring inherit flags —
+    /// ACEs inherited BY a file carry INHERITED_ACE, not the inherit bits,
+    /// so file-level assertions need a flag-agnostic scan.
+    unsafe fn dacl_has_allow_ace_any_flags(dacl: *const ACL, sid: PSID, mask: u32) -> bool {
+        if dacl.is_null() {
+            return false;
+        }
+        for i in 0..u32::from((*dacl).AceCount) {
+            let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, i, &mut ace_ptr) == 0 {
+                continue;
+            }
+            let header = ace_ptr as *const ACE_HEADER;
+            if (*header).AceType != ACE_TYPE_ACCESS_ALLOWED {
+                continue;
+            }
+            let ace = ace_ptr as *const ACCESS_ALLOWED_ACE;
+            if (*ace).Mask & mask != mask {
+                continue;
+            }
+            let ace_sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
+            if EqualSid(ace_sid, sid) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// PR #577 review: after travsr-store's owner-only hardening of ~/.travsr
+    /// (#507: icacls /inheritance:r + user-only (OI)(CI)F), an AppContainer
+    /// token has no path to binaries under ~/.travsr/bin unless the spawn
+    /// grants one explicitly. This pins the exact sequence the spawn now
+    /// performs: restriction strips the AppContainer's access, the
+    /// read+execute grant restores it on the directory AND propagates to a
+    /// pre-existing file inside (the plugin binary the child must map).
+    #[test]
+    fn grant_read_execute_restores_access_after_owner_only_restriction() {
+        let dir = std::env::temp_dir().join(format!("travsr-acl-577-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("plugin.exe");
+        std::fs::write(&binary, b"MZ").unwrap();
+
+        // Replicate restrict_to_owner_windows (travsr-store/src/registry.rs).
+        let user = std::env::var("USERNAME").expect("USERNAME set on Windows");
+        let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+        let account = if domain.is_empty() {
+            user
+        } else {
+            format!("{domain}\\{user}")
+        };
+        let status = std::process::Command::new("icacls")
+            .args([
+                dir.to_str().unwrap(),
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{account}:(OI)(CI)F"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("icacls runs");
+        assert!(status.success(), "icacls restriction must apply");
+
+        let sid = derive_appcontainer_sid("travsr-test-577-rx").expect("derive sid");
+
+        // Post-restriction: the AppContainer has no ACE on the dir.
+        {
+            let h = read_dacl(&dir);
+            assert!(
+                !unsafe {
+                    dacl_has_inheritable_allow_ace(
+                        h.dacl,
+                        sid.as_psid(),
+                        ACCESS_GENERIC_READ_EXECUTE,
+                    )
+                },
+                "restricted dir must carry no AppContainer ACE"
+            );
+        }
+
+        // The spawn-path grant restores read+execute...
+        grant_path_access(&dir, sid.as_psid(), ACCESS_GENERIC_READ_EXECUTE)
+            .expect("grant read+execute");
+        {
+            let h = read_dacl(&dir);
+            assert!(
+                unsafe {
+                    dacl_has_inheritable_allow_ace(
+                        h.dacl,
+                        sid.as_psid(),
+                        ACCESS_GENERIC_READ_EXECUTE,
+                    )
+                },
+                "grant must be present on the directory"
+            );
+        }
+
+        // ...and inheritance propagation reaches the pre-existing binary,
+        // which is what the AppContainer child must be able to map. Windows
+        // maps GENERIC_* to file-specific rights when an inheritable ACE
+        // lands on a file, so assert the two specific bits image loading
+        // needs: FILE_READ_DATA (0x1) and FILE_EXECUTE (0x20).
+        {
+            const FILE_READ_DATA_AND_EXECUTE: u32 = 0x1 | 0x20;
+            let h = read_dacl(&binary);
+            assert!(
+                unsafe {
+                    dacl_has_allow_ace_any_flags(h.dacl, sid.as_psid(), FILE_READ_DATA_AND_EXECUTE)
+                },
+                "grant must propagate read+execute to the existing plugin binary"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

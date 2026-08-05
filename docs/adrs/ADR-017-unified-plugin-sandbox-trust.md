@@ -72,6 +72,63 @@ SandboxPolicy::Standard
 > **Approved by:** Principal Security Engineer (PSE review 2026-06-11, branch
 > `feature/travsr-daemon-init-at-scale-295`)
 
+> **Amendment A2 — Windows sandbox FFI unsafe-code sanction (2026-08-05)**
+>
+> The Windows sandbox mechanism (AppContainer + Job Object, the Windows row of the
+> table below) is implemented against raw Win32 APIs — `CreateAppContainerProfile`,
+> `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`,
+> `SetNamedSecurityInfoW`/`GetAce`, `CreateJobObjectW`, `OpenProcess` — none of which
+> have safe standard-library equivalents. This amendment sanctions `unsafe` code in
+> the `travsr-plugin-host` workspace under the following invariants:
+>
+> 1. **Confinement:** every `unsafe` block lives in exactly one file,
+>    `crates/travsr-plugin-host/src/sandbox/windows/ffi.rs`. The crate root carries
+>    `#![deny(unsafe_code)]`; only that file carries the `#![allow(unsafe_code)]`
+>    override. Any second override site re-opens this amendment.
+> 2. **Encapsulation:** the file exposes only safe wrappers; OS handles, SIDs, ACLs,
+>    and attribute lists are owned by RAII types (`OwnedHandle`, `AppContainerSid`,
+>    `AttrList`, `OwnedSecurityCapabilities`) so no raw resource outlives its owner.
+> 3. **Verification:** invariants with a history of violation are pinned by unit
+>    tests running against real OS objects (capability-pointer stability after moves,
+>    Job Object limit read-back, DACL ACE round-trips, process liveness).
+>
+> This corrects a stale citation: the override previously cited RFC-014, which covers
+> Phase B symbol unification and says nothing about unsafe or FFI. ADR-017 is the
+> governing document for the sandbox mechanism, so the sanction is recorded here.
+>
+> **Approved by:** _pending Tech Lead sign-off (raised in PR #577 review; drafted
+> 2026-08-05)_
+
+> **Amendment A3 — per-language toolchain env forwarding (2026-08-05)**
+>
+> Rule 1's scrubbed env allowlist (PATH / LANG / LC_ALL / TMPDIR) is extended by the
+> **daemon-computed** per-language toolchain variables in
+> `crates/travsr-plugin-host/src/sandbox/toolchain.rs` (`ToolchainAccess::env`):
+> `HOME`, `GOPATH`, `GOCACHE`, `GOMODCACHE`, `GOROOT`, `JAVA_HOME`,
+> `GRADLE_USER_HOME`, `SBT_OPTS`, `COMPOSER_HOME`, `NUGET_PACKAGES`, `DOTNET_ROOT`,
+> `GEM_HOME`, `GEM_PATH`, `CARGO_HOME`, `RUSTUP_HOME`, `NVM_DIR`, `PYENV_ROOT`,
+> and `TRAVSR_DART_EMITTER`.
+>
+> **Rationale:** Phase B analyzers drive the language's real build tool, which
+> resolves module/build caches through these variables; without them the analyzer
+> resolves zero packages and emits an empty index (the scip-go 0-of-244 case that
+> created `toolchain.rs`). These are location pointers computed by the daemon from
+> the same paths that receive the sandbox's filesystem grants — they are **not** an
+> ambient-environment passthrough, and the filesystem confinement (not the env)
+> remains the enforcement boundary: a forwarded `HOME` value does not grant access
+> to anything the FS rules deny. The Rule 1 exclusion of credential-carrying
+> variables (`GIT_*`, `SSH_*`, `AWS_*`/`GCP_*`/`AZURE_*`, `CI`, `GITHUB_TOKEN`,
+> `NPM_TOKEN`, …) is unchanged and still absolute; `HOME` and `CARGO_HOME` move
+> from the "never" list to this justified set.
+>
+> Linux (`sandbox/linux.rs`) and macOS (`sandbox/macos.rs`) have forwarded this set
+> since `toolchain.rs` was introduced; Windows (`sandbox/windows/ffi.rs`) matches as
+> of #501. This amendment makes that shipped behavior the recorded policy instead of
+> an undocumented divergence (raised in PR #577 review).
+>
+> **Approved by:** _pending Tech Lead sign-off (raised in PR #577 review; drafted
+> 2026-08-05)_
+
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 
 | Platform | Primary mechanism | Fallback |

@@ -435,16 +435,33 @@ fn rename_with_retry(from: &std::path::Path, to: &std::path::Path) -> std::io::R
     }
 }
 
-/// Best-effort removal of `*.old.*` files left by earlier [`replace_file`]
-/// displacements in `dest`'s directory. Files still backing a running process
-/// refuse deletion — they are picked up by the sweep of a later install.
+/// True when `name` has the exact displacement shape [`replace_file`]
+/// creates: `<original>.old.<uuid>`, with the trailing component parsing as
+/// a real UUID.
+///
+/// PR #577 review: a plain `.old.` substring match also hit unrelated files
+/// a user parked in the directory (e.g. `notes.old.txt`), silently deleting
+/// them on every install. Requiring the UUID suffix confines the sweep to
+/// artifacts this module itself created, while still collecting leftovers
+/// of sibling binaries displaced by earlier installs.
+fn is_displaced_leftover(name: &str) -> bool {
+    name.rfind(".old.")
+        .map(|i| &name[i + ".old.".len()..])
+        .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+        .is_some()
+}
+
+/// Best-effort removal of `<name>.old.<uuid>` files left by earlier
+/// [`replace_file`] displacements in `dest`'s directory. Files still backing
+/// a running process refuse deletion — they are picked up by the sweep of a
+/// later install.
 fn sweep_displaced_siblings(dest: &std::path::Path) {
     let Some(dir) = dest.parent() else { return };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().contains(".old.") {
+        if is_displaced_leftover(&entry.file_name().to_string_lossy()) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -556,8 +573,16 @@ mod tests {
         let dest = dir.path().join("tool.exe");
         std::fs::write(&dest, b"old").unwrap();
         // Leftover from a previous displaced upgrade — must be swept.
-        let leftover = dir.path().join("tool.exe.old.deadbeef");
+        let leftover = dir
+            .path()
+            .join(format!("tool.exe.old.{}", uuid::Uuid::new_v4()));
         std::fs::write(&leftover, b"stale").unwrap();
+        // PR #577 review: files that merely CONTAIN ".old." are not ours and
+        // must survive the sweep untouched.
+        let user_note = dir.path().join("notes.old.txt");
+        std::fs::write(&user_note, b"keep me").unwrap();
+        let near_miss = dir.path().join("tool.exe.old.deadbeef");
+        std::fs::write(&near_miss, b"keep me too").unwrap();
 
         let tmp = dir.path().join("tool.exe.tmp.1");
         std::fs::write(&tmp, b"new").unwrap();
@@ -565,7 +590,26 @@ mod tests {
         replace_file(&tmp, &dest).expect("replace over plain file");
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         assert!(!tmp.exists(), "tmp must be consumed");
-        assert!(!leftover.exists(), "stale .old.* leftovers must be swept");
+        assert!(
+            !leftover.exists(),
+            "stale .old.<uuid> leftovers must be swept"
+        );
+        assert!(user_note.exists(), "unrelated .old. files must survive");
+        assert!(near_miss.exists(), "non-UUID .old. suffixes must survive");
+    }
+
+    /// PR #577 review: the sweep predicate itself, exhaustively.
+    #[test]
+    fn displaced_leftover_shape_is_exact() {
+        let uuid = uuid::Uuid::new_v4();
+        assert!(is_displaced_leftover(&format!(
+            "travsr-embed.exe.old.{uuid}"
+        )));
+        assert!(is_displaced_leftover(&format!("scip-java.old.{uuid}")));
+        assert!(!is_displaced_leftover("notes.old.txt"));
+        assert!(!is_displaced_leftover("tool.exe.old.deadbeef"));
+        assert!(!is_displaced_leftover("archive.old."));
+        assert!(!is_displaced_leftover("plain-file.exe"));
     }
 
     #[test]
