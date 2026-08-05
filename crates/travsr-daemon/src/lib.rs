@@ -2693,7 +2693,11 @@ fn arm_phase_b_if_pending(
     // Guarded on `is_pending` because `mark_dirty` pushes the deadline forward
     // on every call — re-arming each tick would keep the deadline 30 s away
     // forever and starve the run until `max_defer` finally forced it.
-    let dirty = s.get_meta("phase_b_dirty").ok().flatten().unwrap_or_default();
+    let dirty = s
+        .get_meta("phase_b_dirty")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if dirty == "1" && !sched.is_pending() {
         sched.mark_dirty();
     }
