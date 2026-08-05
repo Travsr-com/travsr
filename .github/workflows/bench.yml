@@ -129,6 +129,15 @@ jobs:
         run: critcmp pr | tee bench-diff.txt || true
 
       # Post the diff table as a sticky PR comment (updated on each push).
+      #
+      # Best-effort only. PRs from forks get a read-only GITHUB_TOKEN for the
+      # pull_request event no matter what `permissions:` this workflow declares
+      # — a hard GitHub restriction, not a config bug — so `gh pr comment` always
+      # fails there with "Resource not accessible by integration". Switching to
+      # pull_request_target would fix the token but would then run fork-submitted
+      # code (`cargo bench` above) with write credentials, which is worse. So this
+      # step must never fail the job: the regression gate already ran and set its
+      # exit code in "Compare baselines" above, this is just the summary comment.
       - name: Post benchmark diff comment
         if: always() && github.event_name == 'pull_request'
         env:
@@ -159,4 +168,5 @@ jobs:
           gh pr comment ${{ github.event.pull_request.number }} \
             --edit-last --body "${BODY}" \
             || gh pr comment ${{ github.event.pull_request.number }} \
-               --body "${BODY}"
+               --body "${BODY}" \
+            || echo "::warning title=Bench comment skipped::Could not post benchmark results as a PR comment (expected for fork PRs, which get a read-only GITHUB_TOKEN). The regression gate itself already ran in 'Compare baselines' above; see that step's log for the raw diff."
