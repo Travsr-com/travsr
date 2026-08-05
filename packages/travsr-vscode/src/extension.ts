@@ -25,6 +25,7 @@ import {
   findCmdShimPath,
   resolveNpmShimExe,
   assertExecutableBinary,
+  isDownloadSupported,
   resolveInstallDir,
   resolveInstallPath,
   DOWNLOAD_VERSION,
@@ -621,7 +622,26 @@ async function checkBinaryAndPrompt(
     }
   }
 
-  // 5. Binary not found anywhere — prompt once.
+  // 5. Binary not found anywhere. #497: only offer the download when a
+  //    prebuilt binary is actually published for this platform/arch —
+  //    e.g. Windows-on-ARM releases don't exist, so the prompt used to
+  //    lead straight into an HTTP 404.
+  if (!isDownloadSupported()) {
+    const msg =
+      `Travsr binary not found, and no prebuilt binary is published for ` +
+      `${process.platform}/${process.arch}. Build travsr from source and ` +
+      `point travsr.binaryPath at it.`;
+    channel.appendLine(msg);
+    const action = await vscode.window.showWarningMessage(msg, "Open Settings");
+    if (action === "Open Settings") {
+      await vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "travsr.binaryPath"
+      );
+    }
+    return;
+  }
+
   const promptMsg = cmdShim
     ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary — Download v${DOWNLOAD_VERSION}?`
     : `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`;

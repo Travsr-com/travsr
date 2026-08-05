@@ -5,6 +5,7 @@ import * as os from "os";
 import * as path from "path";
 import {
   resolveTargetTriple,
+  isDownloadSupported,
   resolveInstallDir,
   resolveInstallPath,
   buildDownloadUrl,
@@ -42,8 +43,11 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
     assert.strictEqual(resolveTargetTriple("win32", "x64"), "x86_64-pc-windows-msvc");
   });
 
-  test("win32/arm64 → aarch64-pc-windows-msvc", () => {
-    assert.strictEqual(resolveTargetTriple("win32", "arm64"), "aarch64-pc-windows-msvc");
+  test("win32/arm64 throws — releases ship no aarch64-pc-windows-msvc artifact (#497)", () => {
+    assert.throws(
+      () => resolveTargetTriple("win32", "arm64"),
+      (e: Error) => e.message.includes("win32") && e.message.includes("arm64")
+    );
   });
 
   test("unknown platform throws with platform and arch in message", () => {
@@ -58,6 +62,32 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
       () => resolveTargetTriple("linux", "mips"),
       (e: Error) => e.message.includes("linux") && e.message.includes("mips")
     );
+  });
+});
+
+// ── #497: isDownloadSupported — prompt gating ──────────────────────────────
+
+suite("#497: installer — isDownloadSupported", () => {
+  test("true for every published release target", () => {
+    assert.strictEqual(isDownloadSupported("linux", "x64"), true);
+    assert.strictEqual(isDownloadSupported("linux", "arm64"), true);
+    assert.strictEqual(isDownloadSupported("darwin", "x64"), true);
+    assert.strictEqual(isDownloadSupported("darwin", "arm64"), true);
+    assert.strictEqual(isDownloadSupported("win32", "x64"), true);
+  });
+
+  test("false for win32/arm64 — no published artifact", () => {
+    assert.strictEqual(isDownloadSupported("win32", "arm64"), false);
+  });
+
+  test("false for unknown platform or arch", () => {
+    assert.strictEqual(isDownloadSupported("freebsd", "x64"), false);
+    assert.strictEqual(isDownloadSupported("linux", "mips"), false);
+  });
+
+  test("agrees with resolveTargetTriple for supported and unsupported targets", () => {
+    assert.doesNotThrow(() => resolveTargetTriple("win32", "x64"));
+    assert.throws(() => resolveTargetTriple("win32", "arm64"));
   });
 });
 
