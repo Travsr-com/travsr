@@ -1757,7 +1757,7 @@ fn resolve_unresolved_calls(
             .filter_map(|u| {
                 u.recv_type
                     .as_ref()
-                    .map(|t| format!("fn:{t}.{}", leaf_of(&u.callee_sig)))
+                    .map(|t| format!("method:{t}.{}", leaf_of(&u.callee_sig)))
             })
             .collect();
         v.sort_unstable();
@@ -1858,7 +1858,7 @@ fn resolve_unresolved_calls(
                 // #529: receiver type recovered — resolve against it instead
                 // of guessing by leaf uniqueness. Three-way split (§4.3):
                 Some(t) => {
-                    let qsig = format!("fn:{t}.{}", leaf_of(&u.callee_sig));
+                    let qsig = format!("method:{t}.{}", leaf_of(&u.callee_sig));
                     match by_recv_sig.get(qsig.as_str()) {
                         // (1) `fn:T.method` exists — exact resolution.
                         Some(m) => m.clone(),
@@ -2936,7 +2936,7 @@ mod tests {
                 "",
                 "crates/crate-a/src/store.rs",
                 "rust",
-                "fn:Store.prune",
+                "method:Store.prune",
             ),
             "method",
         );
@@ -3135,7 +3135,7 @@ mod tests {
                 "",
                 "crates/crate-a/src/session.rs",
                 "rust",
-                "fn:Session.filter",
+                "method:Session.filter",
             ),
             "method",
         );
@@ -3182,7 +3182,7 @@ mod tests {
                 "",
                 "crates/crate-b/src/session.rs",
                 "rust",
-                "fn:Session.filter",
+                "method:Session.filter",
             ),
             "method",
         );
@@ -3240,7 +3240,7 @@ mod tests {
                 "",
                 "crates/crate-a/src/other.rs",
                 "rust",
-                "fn:Other.filter",
+                "method:Other.filter",
             ),
             "method",
         );
@@ -3295,7 +3295,7 @@ mod tests {
                 "",
                 "crates/crate-c/src/session.rs",
                 "rust",
-                "fn:Session.filter",
+                "method:Session.filter",
             ),
             "method",
         );
@@ -3336,7 +3336,7 @@ mod tests {
                 "",
                 "crates/crate-a/src/session.rs",
                 "rust",
-                "fn:Session.filter",
+                "method:Session.filter",
             ),
             "method",
         );
@@ -3380,7 +3380,7 @@ mod tests {
                 "",
                 "crates/crate-a/src/store.rs",
                 "rust",
-                "fn:SqliteStore.get_nodes",
+                "method:SqliteStore.get_nodes",
             ),
             "method",
         );
@@ -3391,7 +3391,7 @@ mod tests {
                 "",
                 "crates/crate-a/src/other.rs",
                 "rust",
-                "fn:OtherStore.get_nodes",
+                "method:OtherStore.get_nodes",
             ),
             "method",
         );

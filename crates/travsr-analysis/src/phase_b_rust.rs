@@ -340,7 +340,7 @@ fn extract_file_call_edges(
                     "",
                     vname_path,
                     "rust",
-                    format!("fn:{t}.{caller_fn}"),
+                    format!("method:{t}.{caller_fn}"),
                 )
                 .id(),
                 None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
@@ -402,7 +402,7 @@ fn extract_file_call_edges(
                             if !NOISE_NAMES.contains(&callee_name) {
                                 unresolved.push(UnresolvedCall {
                                     src: caller_id,
-                                    callee_sig: format!("fn:{qual}.{callee_name}"),
+                                    callee_sig: format!("method:{qual}.{callee_name}"),
                                     hint_crate: None,
                                     caller_line: occ_line,
                                     is_method_call: false,
@@ -513,7 +513,7 @@ fn extract_macro_calls(
                     "",
                     vname_path,
                     "rust",
-                    format!("fn:{t}.{caller_fn}"),
+                    format!("method:{t}.{caller_fn}"),
                 )
                 .id(),
                 None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
@@ -531,7 +531,7 @@ fn extract_macro_calls(
                         .filter(|n| n.kind() == "identifier")
                         .and_then(|n| n.utf8_text(source).ok());
                     match qual {
-                        Some(q) => format!("fn:{q}.{callee_name}"),
+                        Some(q) => format!("method:{q}.{callee_name}"),
                         None => format!("fn:{callee_name}"),
                     }
                 }
@@ -1197,7 +1197,7 @@ fn run(z: &Zoo) {
         assert_eq!(describe.caller_line, 3);
         // Associated call `Animal::speak()` (prev `::`) keeps the qualifier.
         let speak = by_sig
-            .get("fn:Animal.speak")
+            .get("method:Animal.speak")
             .expect("associated call recovered from macro");
         assert_eq!(speak.caller_line, 4);
         // Bare call `greet()`.

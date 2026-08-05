@@ -150,7 +150,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             match cap_name.as_str() {
                 "fn.name" => {
                     // Functions inside impl blocks become methods; the parent impl
-                    // type is the namespace so signatures are `fn:TypeName.method`.
+                    // type is the namespace so signatures are `method:TypeName.method` (N1).
                     let end_line = decl_end_line(capture.node);
                     let parent_impl = find_parent_impl_type(capture.node, source.as_slice());
                     let (node, src_id) = if let Some(impl_type) = parent_impl {
@@ -445,8 +445,10 @@ fn rust_fn_node(corpus: &str, path: &str, name: &str) -> Node {
 }
 
 fn rust_method_node(corpus: &str, path: &str, impl_type: &str, method: &str) -> Node {
+    // N1: canonical `method:Type.name` (was `fn:Type.method`). Free functions
+    // stay `fn:name`; see rust_fn_node.
     Node::new(
-        rust_vname(corpus, path, &format!("fn:{impl_type}.{method}")),
+        rust_vname(corpus, path, &format!("method:{impl_type}.{method}")),
         "method",
     )
 }
@@ -781,8 +783,8 @@ mod tests {
         assert!(
             out.nodes
                 .iter()
-                .any(|n| n.vname.signature == "fn:Worker.new" && n.kind == "method"),
-            "expected fn:Worker.new method node"
+                .any(|n| n.vname.signature == "method:Worker.new" && n.kind == "method"),
+            "expected method:Worker.new method node"
         );
     }
 
@@ -792,8 +794,8 @@ mod tests {
         assert!(
             out.nodes
                 .iter()
-                .any(|n| n.vname.signature == "fn:Worker.process" && n.kind == "method"),
-            "expected fn:Worker.process — impl Trait for Type must use the implementing type"
+                .any(|n| n.vname.signature == "method:Worker.process" && n.kind == "method"),
+            "expected method:Worker.process — impl Trait for Type must use the implementing type"
         );
     }
 
@@ -816,7 +818,7 @@ mod tests {
             "expected file → struct:Config DefinesBinding edge"
         );
 
-        // impl:Worker → fn:Worker.new
+        // impl:Worker → method:Worker.new
         let impl_id = out
             .nodes
             .iter()
@@ -826,14 +828,14 @@ mod tests {
         let method_id = out
             .nodes
             .iter()
-            .find(|n| n.vname.signature == "fn:Worker.new")
+            .find(|n| n.vname.signature == "method:Worker.new")
             .unwrap()
             .id;
         assert!(
             out.edges.iter().any(|e| e.src == impl_id
                 && e.dst == method_id
                 && e.kind == EdgeKind::DefinesBinding),
-            "expected impl:Worker → fn:Worker.new DefinesBinding edge"
+            "expected impl:Worker → method:Worker.new DefinesBinding edge"
         );
     }
 
