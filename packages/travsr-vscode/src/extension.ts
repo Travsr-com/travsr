@@ -469,8 +469,10 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  // ITEM 2: MCP server registration for external agents.
-  context.subscriptions.push(registerMcpServerCommand(binary));
+  // ITEM 2: MCP server registration for external agents. #498: the command
+  // resolves and validates the binary itself at invocation time — the raw
+  // activation-time fallback must never reach an external agent config.
+  context.subscriptions.push(registerMcpServerCommand());
 
   // ITEM 2 (part 3): pull graph context onto the clipboard for chat agents that
   // can't take the MCP-register route (Copilot). Lightbulb CodeAction + palette.
