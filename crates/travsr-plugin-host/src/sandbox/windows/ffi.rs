@@ -481,15 +481,35 @@ fn build_command_line(program: &str, args: &[String]) -> String {
     line
 }
 
+/// Insert or (case-insensitively, matching Windows env-name semantics)
+/// overwrite an entry, so the final block never carries duplicate names.
+fn upsert_env(entries: &mut Vec<(String, String)>, key: &str, val: String) {
+    if let Some(e) = entries
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+    {
+        e.1 = val;
+    } else {
+        entries.push((key.to_string(), val));
+    }
+}
+
 /// Build a UTF-16 double-null-terminated environment block.
-/// Contains an allowlist of non-sensitive parent variables plus
-/// TEMP/TMP/TMPDIR forced to `scratch_dir` (PSE R2).
+/// Contains an allowlist of non-sensitive parent variables, the language's
+/// toolchain env passthrough (#501), `~/.travsr/bin` prepended to `PATH`
+/// (#501), and TEMP/TMP/TMPDIR forced to `scratch_dir` (PSE R2).
 ///
 /// SYSTEMROOT, SystemDrive, COMPUTERNAME, OS, PROCESSOR_ARCHITECTURE are
 /// included because the Windows AppContainer setup path expands %SYSTEMROOT%
 /// internally using the child env block; omitting them causes CreateProcessW
 /// to fail with ERROR_ENVVAR_NOT_FOUND (203).
-pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
+///
+/// #501: this explicit block replaces the child env entirely — nothing is
+/// inherited. Toolchain env (JAVA_HOME/GOPATH/GRADLE_USER_HOME/…) must
+/// therefore be forwarded here, mirroring what linux.rs and macos.rs do for
+/// their cleared sandbox envs; without it the sandbox ACL-grants the cache
+/// directories but the analyzer has no variables telling it where they are.
+pub(super) fn build_env_block(scratch_dir: &Path, toolchain_env: &[(String, String)]) -> Vec<u16> {
     const ALLOWLIST: &[&str] = &[
         // Shell / locale
         "PATH",
@@ -512,20 +532,48 @@ pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
         "APPDATA",
         "PUBLIC",
     ];
-    let scratch = scratch_dir.to_string_lossy().to_string();
-    let mut block: Vec<u16> = Vec::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
 
     for var in ALLOWLIST {
         if let Ok(val) = std::env::var(var) {
-            let entry = format!("{var}={val}");
-            block.extend(entry.encode_utf16());
-            block.push(0);
+            upsert_env(&mut entries, var, val);
         }
     }
-    // TEMP/TMP/TMPDIR → scratch dir (PSE R2: child may only write to scratch)
+
+    // #501: per-language toolchain env so the analyzer's build tool can locate
+    // the caches the sandbox ACL-grants (windows.rs grants the paths).
+    for (key, val) in toolchain_env {
+        upsert_env(&mut entries, key, val.clone());
+    }
+
+    // #501: prepend ~/.travsr/bin so tools installed by `travsr lang install`
+    // (e.g. scip-java, scip-go) resolve inside the sandbox.
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let travsr_bin = format!("{profile}\\.travsr\\bin");
+        let base = entries
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let joined = if base.is_empty() {
+            travsr_bin
+        } else {
+            format!("{travsr_bin};{base}")
+        };
+        upsert_env(&mut entries, "PATH", joined);
+    }
+
+    // TEMP/TMP/TMPDIR → scratch dir (PSE R2: child may only write to scratch).
+    // Applied last so nothing above — toolchain env included — can redirect
+    // the child's temp dir outside the scratch grant.
+    let scratch = scratch_dir.to_string_lossy().to_string();
     for var in &["TEMP", "TMP", "TMPDIR"] {
-        let entry = format!("{var}={scratch}");
-        block.extend(entry.encode_utf16());
+        upsert_env(&mut entries, var, scratch.clone());
+    }
+
+    let mut block: Vec<u16> = Vec::new();
+    for (key, val) in &entries {
+        block.extend(format!("{key}={val}").encode_utf16());
         block.push(0);
     }
     block.push(0); // final double-null terminator
@@ -611,6 +659,7 @@ pub(super) fn spawn_in_appcontainer(
     program: &str,
     args: &[String],
     scratch_dir: &Path,
+    toolchain_env: &[(String, String)],
     security_caps: &SECURITY_CAPABILITIES,
     job: OwnedJobHandle,
     stdin_mode: StdioMode,
@@ -812,7 +861,7 @@ pub(super) fn spawn_in_appcontainer(
     let cmdline = build_command_line(program, args);
     let mut cmdline_wide = to_wide(&cmdline);
     let scratch_wide = path_to_wide(scratch_dir);
-    let mut env_block = build_env_block(scratch_dir);
+    let mut env_block = build_env_block(scratch_dir, toolchain_env);
 
     // ── 5. CreateProcessW ─────────────────────────────────────────────────────
     // PSE R3: CREATE_NO_WINDOW | PSE R2: CREATE_UNICODE_ENVIRONMENT
@@ -1004,5 +1053,89 @@ mod tests {
         assert_eq!(caps.CapabilityCount, 0);
         assert!(caps.Capabilities.is_null());
         assert_eq!(caps.AppContainerSid, container.as_ptr() as PSID);
+    }
+
+    // ── #501: build_env_block — toolchain env passthrough ──────────────────
+
+    fn decode_env_block(block: &[u16]) -> Vec<String> {
+        String::from_utf16_lossy(block)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn env_value<'a>(entries: &'a [String], key: &str) -> Option<&'a str> {
+        entries.iter().find_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            k.eq_ignore_ascii_case(key).then_some(v)
+        })
+    }
+
+    /// #501 regression: toolchain env must reach the child env block, and
+    /// ~/.travsr/bin must lead PATH — previously the fixed allowlist silently
+    /// dropped both, so Phase B analyzers could not find the caches the
+    /// sandbox had ACL-granted.
+    #[test]
+    fn env_block_forwards_toolchain_env_and_prepends_travsr_bin() {
+        let scratch = std::env::temp_dir();
+        let tc = vec![
+            ("GOPATH".to_string(), "C:\\test-gopath".to_string()),
+            ("JAVA_HOME".to_string(), "C:\\test-jdk".to_string()),
+        ];
+        let entries = decode_env_block(&build_env_block(&scratch, &tc));
+
+        assert_eq!(env_value(&entries, "GOPATH"), Some("C:\\test-gopath"));
+        assert_eq!(env_value(&entries, "JAVA_HOME"), Some("C:\\test-jdk"));
+
+        let profile = std::env::var("USERPROFILE").expect("USERPROFILE set on Windows");
+        let path = env_value(&entries, "PATH").expect("PATH present");
+        assert!(
+            path.starts_with(&format!("{profile}\\.travsr\\bin")),
+            "PATH must start with ~/.travsr/bin, got: {path}"
+        );
+
+        // Allowlisted system vars still present (AppContainer setup needs them).
+        assert!(env_value(&entries, "SYSTEMROOT").is_some());
+    }
+
+    /// PSE R2 must win over toolchain env: TEMP/TMP/TMPDIR always point at the
+    /// scratch dir even if a toolchain entry tries to redirect them.
+    #[test]
+    fn env_block_scratch_temp_overrides_toolchain_env() {
+        let scratch = std::env::temp_dir();
+        let scratch_s = scratch.to_string_lossy().to_string();
+        let tc = vec![("TEMP".to_string(), "C:\\somewhere-else".to_string())];
+        let entries = decode_env_block(&build_env_block(&scratch, &tc));
+
+        for var in ["TEMP", "TMP", "TMPDIR"] {
+            assert_eq!(
+                env_value(&entries, var),
+                Some(scratch_s.as_str()),
+                "{var} must be forced to the scratch dir"
+            );
+        }
+    }
+
+    /// The block must never carry case-insensitive duplicate names —
+    /// CreateProcessW env lookups treat names case-insensitively.
+    #[test]
+    fn env_block_has_no_duplicate_names() {
+        let entries = decode_env_block(&build_env_block(
+            &std::env::temp_dir(),
+            &[("path".to_string(), "C:\\override".to_string())],
+        ));
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.split_once('=').map(|(k, _)| k.to_ascii_lowercase()))
+            .collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            total,
+            names.len(),
+            "duplicate env names in block: {entries:?}"
+        );
     }
 }

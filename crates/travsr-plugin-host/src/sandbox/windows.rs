@@ -126,9 +126,10 @@ pub struct AppContainerSpawn {
     repo_root: PathBuf,
     scratch_dir: PathBuf,
     policy: SandboxPolicy,
-    /// Per-language toolchain cache grants (read/write paths). Env passthrough is
-    /// unnecessary on Windows: AppContainer does not clear the env, so the child
-    /// inherits GOPATH/USERPROFILE/etc. from the daemon.
+    /// Per-language toolchain cache grants (read/write paths) and env.
+    /// #501: the child env is an explicit allowlist block (`build_env_block`),
+    /// NOT inherited — `toolchain.env` (JAVA_HOME/GOPATH/…) is forwarded into
+    /// it and `~/.travsr/bin` is prepended to PATH, mirroring linux.rs/macos.rs.
     toolchain: crate::sandbox::toolchain::ToolchainAccess,
     stdin: StdioCfg,
     stdout: StdioCfg,
@@ -188,6 +189,7 @@ impl AppContainerSpawn {
             &self.program,
             &self.args,
             &self.scratch_dir,
+            &self.toolchain.env,  // #501: forwarded into the child env block
             security_caps.caps(), // PSE R5: owner `security_caps` still live here
             job,
             to_mode(self.stdin),
