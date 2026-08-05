@@ -162,9 +162,9 @@ impl AppContainerSpawn {
             let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_ALL);
         }
 
-        // PSE R5: all three bound on this stack frame; must outlive CreateProcessW.
-        let (_cap_sid_buf, _cap_attr, security_caps) =
-            ffi::build_security_capabilities(sid.as_psid(), elevated)?;
+        // PSE R5 (#499): capability storage is heap-pinned inside the owner;
+        // the binding only needs to stay alive until CreateProcessW returns.
+        let security_caps = ffi::build_security_capabilities(sid.as_psid(), elevated)?;
 
         if let SandboxPolicy::Elevated {
             permitted_hosts, ..
@@ -185,7 +185,7 @@ impl AppContainerSpawn {
             &self.program,
             &self.args,
             &self.scratch_dir,
-            &security_caps, // PSE R5: _cap_sid_buf + _cap_attr still live here
+            security_caps.caps(), // PSE R5: owner `security_caps` still live here
             job,
             to_mode(self.stdin),
             to_mode(self.stdout),

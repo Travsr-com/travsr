@@ -305,17 +305,39 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
     Ok(())
 }
 
+/// #499: owns the storage a `SECURITY_CAPABILITIES` points into, so the
+/// self-referential pointers stay valid however the value is moved.
+///
+/// `caps.Capabilities` points at the boxed `SID_AND_ATTRIBUTES`, whose `Sid`
+/// points at the boxed SID buffer. Box gives both stable heap addresses:
+/// moving `OwnedSecurityCapabilities` moves only the box pointers, never the
+/// pointees. `AppContainerSid` is caller-owned and not covered here.
+pub(super) struct OwnedSecurityCapabilities {
+    _sid_buf: Option<Box<[u8; SECURITY_MAX_SID_SIZE]>>,
+    _cap_attr: Option<Box<SID_AND_ATTRIBUTES>>,
+    caps: SECURITY_CAPABILITIES,
+}
+
+impl OwnedSecurityCapabilities {
+    /// The `SECURITY_CAPABILITIES` to hand to `UpdateProcThreadAttribute`.
+    /// Valid for as long as `self` is alive (PSE R5).
+    pub(super) fn caps(&self) -> &SECURITY_CAPABILITIES {
+        &self.caps
+    }
+}
+
 /// Builds `SECURITY_CAPABILITIES` for Standard or Elevated policy.
+///
+/// #499: previously returned `(sid_buf, cap_attr, caps)` by value, which
+/// moved the buffers while `caps` kept pointers into the callee's dead stack
+/// frame — every Elevated spawn read freed memory. The capability data is now
+/// heap-pinned before the internal pointers are taken.
 pub(super) fn build_security_capabilities(
     container_sid: PSID,
     elevated: bool,
-) -> io::Result<(
-    [u8; SECURITY_MAX_SID_SIZE],
-    Option<SID_AND_ATTRIBUTES>,
-    SECURITY_CAPABILITIES,
-)> {
+) -> io::Result<OwnedSecurityCapabilities> {
     if elevated {
-        let mut sid_buf = [0u8; SECURITY_MAX_SID_SIZE];
+        let mut sid_buf = Box::new([0u8; SECURITY_MAX_SID_SIZE]);
         let mut sid_size = SECURITY_MAX_SID_SIZE as u32;
         let ok = unsafe {
             CreateWellKnownSid(
@@ -328,25 +350,32 @@ pub(super) fn build_security_capabilities(
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        let cap_attr = SID_AND_ATTRIBUTES {
+        let cap_attr = Box::new(SID_AND_ATTRIBUTES {
             Sid: sid_buf.as_ptr() as PSID,
             Attributes: SE_GROUP_ENABLED,
-        };
+        });
         let caps = SECURITY_CAPABILITIES {
             AppContainerSid: container_sid,
-            Capabilities: &cap_attr as *const SID_AND_ATTRIBUTES as *mut SID_AND_ATTRIBUTES,
+            Capabilities: &*cap_attr as *const SID_AND_ATTRIBUTES as *mut SID_AND_ATTRIBUTES,
             CapabilityCount: 1,
             Reserved: 0,
         };
-        Ok((sid_buf, Some(cap_attr), caps))
+        Ok(OwnedSecurityCapabilities {
+            _sid_buf: Some(sid_buf),
+            _cap_attr: Some(cap_attr),
+            caps,
+        })
     } else {
-        let caps = SECURITY_CAPABILITIES {
-            AppContainerSid: container_sid,
-            Capabilities: std::ptr::null_mut(),
-            CapabilityCount: 0,
-            Reserved: 0,
-        };
-        Ok(([0u8; SECURITY_MAX_SID_SIZE], None, caps))
+        Ok(OwnedSecurityCapabilities {
+            _sid_buf: None,
+            _cap_attr: None,
+            caps: SECURITY_CAPABILITIES {
+                AppContainerSid: container_sid,
+                Capabilities: std::ptr::null_mut(),
+                CapabilityCount: 0,
+                Reserved: 0,
+            },
+        })
     }
 }
 
@@ -572,9 +601,9 @@ pub(super) fn handle_into_read_file(h: OwnedHandle) -> std::fs::File {
 /// Spawn `program` with `args` inside an AppContainer + Job Object.
 ///
 /// # Safety contract (PSE R5)
-/// `security_caps` must remain alive on the caller's stack until this function
-/// returns. The `_cap_sid_buf` and `_cap_attr` from `build_security_capabilities`
-/// must be bound as named locals in the calling frame.
+/// `security_caps` must come from a live `OwnedSecurityCapabilities` (#499):
+/// the owner heap-pins the capability SID and `SID_AND_ATTRIBUTES` storage the
+/// struct points into, and must outlive this call.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_in_appcontainer(
     program: &str,
@@ -881,5 +910,77 @@ pub(super) fn terminate_process(handle: HANDLE) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Security::{EqualSid, IsValidSid};
+
+    fn well_known_sid() -> Box<[u8; SECURITY_MAX_SID_SIZE]> {
+        let mut buf = Box::new([0u8; SECURITY_MAX_SID_SIZE]);
+        let mut size = SECURITY_MAX_SID_SIZE as u32;
+        let ok = unsafe {
+            CreateWellKnownSid(
+                WinCapabilityInternetClientSid,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as PSID,
+                &mut size,
+            )
+        };
+        assert_ne!(ok, 0, "CreateWellKnownSid failed");
+        buf
+    }
+
+    /// #499 regression: the SECURITY_CAPABILITIES internal pointers must
+    /// target the owner's heap storage, so they survive the owner being
+    /// moved (returning it from build_security_capabilities was the bug).
+    #[test]
+    fn elevated_capability_pointers_survive_moves() {
+        let container = well_known_sid();
+        let owned = build_security_capabilities(container.as_ptr() as PSID, true).unwrap();
+
+        // Move the owner to a new address; heap pointees must not move.
+        let moved = Box::new(owned);
+        let caps = moved.caps();
+        assert_eq!(caps.CapabilityCount, 1);
+
+        let cap_attr_ptr = caps.Capabilities as *const SID_AND_ATTRIBUTES;
+        let expected_attr: &SID_AND_ATTRIBUTES = moved._cap_attr.as_ref().unwrap();
+        assert_eq!(
+            cap_attr_ptr, expected_attr as *const SID_AND_ATTRIBUTES,
+            "Capabilities must point at the owner's boxed SID_AND_ATTRIBUTES"
+        );
+
+        let sid_ptr = unsafe { (*cap_attr_ptr).Sid };
+        let expected_sid = moved._sid_buf.as_ref().unwrap().as_ptr() as PSID;
+        assert_eq!(
+            sid_ptr, expected_sid,
+            "capability Sid must point at the owner's boxed SID buffer"
+        );
+
+        assert_ne!(
+            unsafe { IsValidSid(sid_ptr) },
+            0,
+            "capability SID must be valid"
+        );
+        let reference = well_known_sid();
+        assert_ne!(
+            unsafe { EqualSid(sid_ptr, reference.as_ptr() as PSID) },
+            0,
+            "capability SID must be WinCapabilityInternetClientSid"
+        );
+    }
+
+    /// Standard (non-elevated) policy must carry no capability list at all.
+    #[test]
+    fn standard_capabilities_have_no_capability_list() {
+        let container = well_known_sid();
+        let owned = build_security_capabilities(container.as_ptr() as PSID, false).unwrap();
+        let caps = owned.caps();
+        assert_eq!(caps.CapabilityCount, 0);
+        assert!(caps.Capabilities.is_null());
+        assert_eq!(caps.AppContainerSid, container.as_ptr() as PSID);
     }
 }
