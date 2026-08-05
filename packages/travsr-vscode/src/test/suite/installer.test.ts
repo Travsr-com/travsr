@@ -214,22 +214,19 @@ suite("WS1: checkOnPath — Windows .cmd discrimination", () => {
 // ── #495: pickPathCandidate / resolveOnPath — PATH auto-detect ────────────
 
 suite("#495: installer — pickPathCandidate", () => {
+  // Candidates are built with host path semantics: assertExecutableBinary
+  // checks absoluteness with the host's path.isAbsolute, so hardcoded
+  // Windows-style paths would be skipped as non-absolute on POSIX runners.
+  const abs = (...segs: string[]): string => path.resolve(os.tmpdir(), ...segs);
+
   test("win32: prefers the .exe hit over a preceding .cmd shim", () => {
-    const lines = [
-      "C:\\Users\\user\\AppData\\Roaming\\npm\\travsr.cmd",
-      "C:\\Users\\user\\.cargo\\bin\\travsr.exe",
-    ];
-    assert.strictEqual(
-      pickPathCandidate(lines, "win32"),
-      "C:\\Users\\user\\.cargo\\bin\\travsr.exe"
-    );
+    const shim = abs("npm", "travsr.cmd");
+    const exe = abs("cargo", "travsr.exe");
+    assert.strictEqual(pickPathCandidate([shim, exe], "win32"), exe);
   });
 
   test("win32: returns null when only .cmd/.bat shims are on PATH", () => {
-    const lines = [
-      "C:\\Users\\user\\AppData\\Roaming\\npm\\travsr.cmd",
-      "C:\\tools\\travsr.bat",
-    ];
+    const lines = [abs("npm", "travsr.cmd"), abs("tools", "travsr.bat")];
     assert.strictEqual(pickPathCandidate(lines, "win32"), null);
   });
 
