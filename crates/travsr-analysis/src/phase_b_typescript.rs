@@ -12,18 +12,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use streaming_iterator::StreamingIterator as _;
-use travsr_core::{Edge, EdgeKind, Node, VName};
+use travsr_core::{Edge, EdgeKind, Node, UnresolvedCall, VName};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 // ── Tree-sitter queries ───────────────────────────────────────────────────────
 
 /// Call-site captures:
 ///   `call.fn`     — `foo()`
-///   `call.method` — `obj.method()` / `this.method()`
+///   `call.method` — `obj.method()` / `this.method()`, with the receiver
+///                   expression bound as `call.recv` (E4) so the extractor can
+///                   attempt to recover its type instead of discarding it.
 ///   `call.new`    — `new Foo()`
 const CALL_QUERY: &str = "
 (call_expression function: (identifier) @call.fn)
-(call_expression function: (member_expression property: (property_identifier) @call.method))
+(call_expression function: (member_expression object: (_) @call.recv property: (property_identifier) @call.method))
 (new_expression constructor: (identifier) @call.new)
 ";
 
@@ -54,9 +56,13 @@ pub fn extract_native_phase_b(
     corpus: &str,
     root: &Path,
     files: Option<&[(PathBuf, String)]>,
-) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<UnresolvedCall>)> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    // E4: call sites are emitted as `UnresolvedCall`s (receiver type recovered
+    // where possible) and resolved fail-closed against the real node table by
+    // the daemon — no more same-file leaf guesses that dangle cross-file.
+    let mut unresolved: Vec<UnresolvedCall> = Vec::new();
 
     let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT);
     let call_q = Query::new(&language, CALL_QUERY).context("ts call query")?;
@@ -84,9 +90,10 @@ pub fn extract_native_phase_b(
             &extends_q,
             &implements_q,
         ) {
-            Ok((file_nodes, file_edges)) => {
+            Ok((file_nodes, file_edges, file_unresolved)) => {
                 nodes.extend(file_nodes);
                 edges.extend(file_edges);
+                unresolved.extend(file_unresolved);
             }
             Err(e) => {
                 tracing::debug!(err = %e, path = %abs_path.display(), "ts phase_b file skipped")
@@ -99,7 +106,7 @@ pub fn extract_native_phase_b(
     edges.sort_unstable_by_key(|e| (e.src, e.dst));
     edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
-    Ok((nodes, edges))
+    Ok((nodes, edges, unresolved))
 }
 
 // ── Per-file analysis ─────────────────────────────────────────────────────────
@@ -112,7 +119,7 @@ fn extract_file_edges(
     call_q: &Query,
     extends_q: &Query,
     implements_q: &Query,
-) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
+) -> anyhow::Result<(Vec<Node>, Vec<Edge>, Vec<UnresolvedCall>)> {
     let source =
         std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
 
@@ -122,11 +129,12 @@ fn extract_file_edges(
         .context("loading TypeScript grammar")?;
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
-        None => return Ok((vec![], vec![])),
+        None => return Ok((vec![], vec![], vec![])),
     };
 
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    let mut unresolved: Vec<UnresolvedCall> = Vec::new();
 
     // ── Call sites ────────────────────────────────────────────────────────────
     {
@@ -143,12 +151,20 @@ fn extract_file_edges(
                 let Some(cap_name) = cap_names.get(cap.index as usize) else {
                     continue;
                 };
+                // The receiver is consumed as a sibling of `call.method`, not on
+                // its own — skip it here so it never becomes a callee.
+                if cap_name == "call.recv" {
+                    continue;
+                }
                 let Ok(callee_name) = cap.node.utf8_text(source.as_slice()) else {
                     continue;
                 };
                 if callee_name.len() < 2 {
                     continue;
                 }
+
+                // 1-based call-site line (#299) for edge_sites → find_references.
+                let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
 
                 let Some((caller_fn, caller_class)) =
                     find_enclosing_fn_ts(cap.node, source.as_slice())
@@ -163,21 +179,60 @@ fn extract_file_edges(
                     None => ts_vname(corpus, vname_path, &format!("fn:{caller_fn}")).id(),
                 };
 
-                let callee_id = match cap_name.as_str() {
-                    "call.method" => match &caller_class {
-                        Some(c) => {
-                            ts_vname(corpus, vname_path, &format!("method:{c}.{callee_name}")).id()
-                        }
-                        None => ts_vname(corpus, vname_path, &format!("fn:{callee_name}")).id(),
-                    },
-                    "call.new" => {
-                        ts_vname(corpus, vname_path, &format!("class:{callee_name}")).id()
+                // E4: emit an UnresolvedCall (fail-closed, resolved against the
+                // real node table by the daemon) instead of a same-file leaf
+                // guess. `this.method()` recovers `recv_type` = enclosing class;
+                // `obj.method()` recovers it from the nearest preceding
+                // `const obj = new Foo()` / `obj: Foo` annotation, else `None`
+                // (the daemon then requires a unique qualified leaf).
+                match cap_name.as_str() {
+                    "call.method" => {
+                        let recv_type = m
+                            .captures
+                            .iter()
+                            .find(|c| {
+                                cap_names.get(c.index as usize).map(String::as_str)
+                                    == Some("call.recv")
+                            })
+                            .and_then(|recv_cap| {
+                                resolve_receiver_type_ts(
+                                    recv_cap.node,
+                                    source.as_slice(),
+                                    &caller_class,
+                                )
+                            });
+                        unresolved.push(UnresolvedCall {
+                            src: caller_id,
+                            callee_sig: format!("fn:{callee_name}"),
+                            hint_crate: None,
+                            caller_line: occ_line,
+                            is_method_call: true,
+                            recv_type,
+                        });
                     }
-                    _ => ts_vname(corpus, vname_path, &format!("fn:{callee_name}")).id(),
-                };
-
-                if caller_id != callee_id {
-                    edges.push(Edge::new(caller_id, callee_id, EdgeKind::RefCall));
+                    // `new Foo()` targets the class definition — resolve it
+                    // fail-closed against the real `class:Foo` node.
+                    "call.new" => {
+                        unresolved.push(UnresolvedCall {
+                            src: caller_id,
+                            callee_sig: format!("class:{callee_name}"),
+                            hint_crate: None,
+                            caller_line: occ_line,
+                            is_method_call: false,
+                            recv_type: None,
+                        });
+                    }
+                    // Bare `foo()` — free function; daemon resolves by unique sig.
+                    _ => {
+                        unresolved.push(UnresolvedCall {
+                            src: caller_id,
+                            callee_sig: format!("fn:{callee_name}"),
+                            hint_crate: None,
+                            caller_line: occ_line,
+                            is_method_call: false,
+                            recv_type: None,
+                        });
+                    }
                 }
             }
         }
@@ -256,7 +311,158 @@ fn extract_file_edges(
         }
     }
 
-    Ok((nodes, edges))
+    Ok((nodes, edges, unresolved))
+}
+
+// ── Receiver-type resolution (E4) ─────────────────────────────────────────────
+
+/// Recover the receiver's type name for `recv.method()`, using only information
+/// visible inside the enclosing function (file-local by construction, so an
+/// incremental single-file reindex reaches the same answer as a full build).
+///
+/// Accepted: `this` resolves via the enclosing class; a plain identifier
+/// resolves via the nearest preceding `const/let name = new Type()` /
+/// `name: Type` annotation (variable or parameter). Anything else — member
+/// chains (`this.x.method()`), calls, index expressions — returns `None`,
+/// keeping the daemon on its fail-closed unique-leaf path.
+fn resolve_receiver_type_ts(
+    recv: tree_sitter::Node<'_>,
+    source: &[u8],
+    enclosing_class: &Option<String>,
+) -> Option<String> {
+    match recv.kind() {
+        "this" => enclosing_class.clone(),
+        "identifier" => {
+            let name = recv.utf8_text(source).ok()?;
+            let scope = enclosing_scope_ts(recv)?;
+            nearest_preceding_binding_type_ts(scope, source, name, recv.start_byte())
+        }
+        _ => None,
+    }
+}
+
+/// Walk up to the nearest enclosing function-like node (the scope whose
+/// parameters and body can bind the receiver identifier).
+fn enclosing_scope_ts(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut cur = node.parent()?;
+    loop {
+        match cur.kind() {
+            "method_definition"
+            | "function_declaration"
+            | "function_expression"
+            | "arrow_function" => return Some(cur),
+            "program" => return None,
+            _ => {}
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Type of the nearest binding of `name` starting before `before_byte`: an
+/// annotated parameter (`name: Type`), an annotated variable (`const name: Type`),
+/// or a `new Type()` initializer (`const name = new Type()`). Only these
+/// syntactically unambiguous shapes are used; generics/unions yield `None`.
+fn nearest_preceding_binding_type_ts(
+    scope: tree_sitter::Node<'_>,
+    source: &[u8],
+    name: &str,
+    before_byte: usize,
+) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+
+    if let Some(params) = scope.child_by_field_name("parameters") {
+        let mut c = params.walk();
+        for p in params.children(&mut c) {
+            if !matches!(p.kind(), "required_parameter" | "optional_parameter") {
+                continue;
+            }
+            if p.child_by_field_name("pattern")
+                .and_then(|n| n.utf8_text(source).ok())
+                != Some(name)
+            {
+                continue;
+            }
+            let Some(ty) = p
+                .child_by_field_name("type")
+                .and_then(|t| type_name_ts(t, source))
+            else {
+                continue;
+            };
+            if p.start_byte() < before_byte
+                && best.as_ref().map_or(true, |(b, _)| p.start_byte() > *b)
+            {
+                best = Some((p.start_byte(), ty));
+            }
+        }
+    }
+
+    if let Some(body) = scope.child_by_field_name("body") {
+        collect_nearest_var_ts(body, source, name, before_byte, &mut best);
+    }
+
+    best.map(|(_, t)| t)
+}
+
+/// Bare type name from a `type_annotation` node. Accepts `type_identifier`
+/// (`Foo`); rejects generics/unions (`Foo<T>`, `A | B`) whose receiver has no
+/// single resolvable name.
+fn type_name_ts(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_annotation" => node.named_child(0).and_then(|c| type_name_ts(c, source)),
+        "type_identifier" => node.utf8_text(source).ok().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Recurse through `node` collecting `variable_declarator`s that bind `name`
+/// before `before_byte`, keeping the nearest preceding one. Prefers an explicit
+/// `: Type` annotation, else a `new Type()` initializer. Does not descend into
+/// nested function bodies (their locals are not visible to an outer receiver).
+fn collect_nearest_var_ts(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    name: &str,
+    before_byte: usize,
+    best: &mut Option<(usize, String)>,
+) {
+    if node.kind() == "variable_declarator"
+        && node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            == Some(name)
+        && node.start_byte() < before_byte
+    {
+        let ty = node
+            .child_by_field_name("type")
+            .and_then(|t| type_name_ts(t, source))
+            .or_else(|| {
+                let v = node.child_by_field_name("value")?;
+                if v.kind() != "new_expression" {
+                    return None;
+                }
+                let ctor = v.child_by_field_name("constructor")?;
+                if ctor.kind() == "identifier" {
+                    ctor.utf8_text(source).ok().map(str::to_string)
+                } else {
+                    None
+                }
+            });
+        if let Some(t) = ty {
+            if best.as_ref().map_or(true, |(b, _)| node.start_byte() > *b) {
+                *best = Some((node.start_byte(), t));
+            }
+        }
+    }
+    if matches!(
+        node.kind(),
+        "function_declaration" | "method_definition" | "arrow_function" | "function_expression"
+    ) {
+        return;
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        collect_nearest_var_ts(child, source, name, before_byte, best);
+    }
 }
 
 // ── AST helpers ───────────────────────────────────────────────────────────────
@@ -376,5 +582,148 @@ fn walk(root: &Path, dir: &Path, exts: &[&str], out: &mut Vec<(PathBuf, String)>
                 out.push((path, vname_path));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run the real `CALL_QUERY` + `resolve_receiver_type_ts` path end-to-end
+    /// against `source`, returning the recovered receiver type for the
+    /// `.method_name()` call site.
+    fn recv_type_for_call(source: &[u8], method_name: &str) -> Option<String> {
+        let language = tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT);
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = Query::new(&language, CALL_QUERY).unwrap();
+        let cap_names: Vec<String> = query
+            .capture_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut cursor = QueryCursor::new();
+        let mut iter = cursor.matches(&query, tree.root_node(), source);
+        while let Some(m) = iter.next() {
+            for &cap in m.captures {
+                let cap_name = cap_names.get(cap.index as usize).map(String::as_str);
+                if cap_name != Some("call.method") {
+                    continue;
+                }
+                if cap.node.utf8_text(source).ok() != Some(method_name) {
+                    continue;
+                }
+                let caller_class = find_enclosing_fn_ts(cap.node, source).and_then(|(_, c)| c);
+                let recv = m.captures.iter().find(|c| {
+                    cap_names.get(c.index as usize).map(String::as_str) == Some("call.recv")
+                });
+                return recv.and_then(|r| resolve_receiver_type_ts(r.node, source, &caller_class));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn recv_this_resolves_to_enclosing_class() {
+        let source = br#"
+class App {
+    run() {
+        this.helper();
+    }
+}
+"#;
+        assert_eq!(
+            recv_type_for_call(source, "helper"),
+            Some("App".to_string())
+        );
+    }
+
+    #[test]
+    fn recv_new_initializer_resolves() {
+        let source = br#"
+function build() {
+    const store = new SqliteStore();
+    store.open();
+}
+"#;
+        assert_eq!(
+            recv_type_for_call(source, "open"),
+            Some("SqliteStore".to_string())
+        );
+    }
+
+    #[test]
+    fn recv_typed_variable_resolves() {
+        let source = br#"
+function build() {
+    const s: Session = get();
+    s.close();
+}
+"#;
+        assert_eq!(
+            recv_type_for_call(source, "close"),
+            Some("Session".to_string())
+        );
+    }
+
+    #[test]
+    fn recv_typed_parameter_resolves() {
+        let source = br#"
+function handle(session: Session) {
+    session.close();
+}
+"#;
+        assert_eq!(
+            recv_type_for_call(source, "close"),
+            Some("Session".to_string())
+        );
+    }
+
+    #[test]
+    fn recv_member_chain_is_none() {
+        // `this.other.run()` — receiver is a member chain, not `this` or a plain
+        // identifier. Must NOT resolve (no false self-class edge).
+        let source = br#"
+class App {
+    run() {
+        this.other.run();
+    }
+}
+"#;
+        assert_eq!(recv_type_for_call(source, "run"), None);
+    }
+
+    #[test]
+    fn new_expression_emits_class_unresolved_call() {
+        let dir = std::env::temp_dir().join(format!("e4_ts_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("m.ts");
+        std::fs::write(
+            &file,
+            b"function build() {\n    const x = new Session();\n    x.run();\n}\n",
+        )
+        .unwrap();
+        let files = vec![(file.clone(), "m.ts".to_string())];
+        let (_nodes, edges, unresolved) = extract_native_phase_b("c", &dir, Some(&files)).unwrap();
+        assert!(
+            edges.iter().all(|e| e.kind != EdgeKind::RefCall),
+            "call sites must not emit raw RefCall edges"
+        );
+        // `new Session()` → class:Session UnresolvedCall.
+        assert!(
+            unresolved
+                .iter()
+                .any(|u| u.callee_sig == "class:Session" && !u.is_method_call),
+            "new Session() emitted as class: UnresolvedCall"
+        );
+        // `x.run()` → recv_type Session (from `new Session()`).
+        let run = unresolved
+            .iter()
+            .find(|u| u.callee_sig == "fn:run")
+            .expect("run() emitted as UnresolvedCall");
+        assert!(run.is_method_call);
+        assert_eq!(run.recv_type.as_deref(), Some("Session"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

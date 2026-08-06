@@ -574,7 +574,7 @@ impl PluginIndexer {
                                             .map(|r| (repo_root.join(r), r.clone()))
                                             .collect()
                                     });
-                                let (mut nodes, mut edges) =
+                                let (mut nodes, mut edges, mut unresolved_calls) =
                                     travsr_indexer::phase_b_native_typescript(
                                         corpus,
                                         repo_root,
@@ -582,11 +582,12 @@ impl PluginIndexer {
                                     )
                                     .unwrap_or_else(|e| {
                                         tracing::warn!("ts native phase_b: {e}");
-                                        (vec![], vec![])
+                                        (vec![], vec![], vec![])
                                     });
                                 tracing::debug!(
                                     nodes = nodes.len(),
                                     edges = edges.len(),
+                                    unresolved_calls = unresolved_calls.len(),
                                     "Phase B: native typescript complete"
                                 );
                                 // LSIF enrichment via travsr-lsif-ts when tsconfig.json exists.
@@ -621,12 +622,26 @@ impl PluginIndexer {
                                 edges.sort_unstable_by_key(|e| (e.src, e.dst));
                                 edges
                                     .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                // E4: keep caller_line in the dedup key so every
+                                // distinct call site survives (#299 find_references).
+                                unresolved_calls.sort_unstable_by(|a, b| {
+                                    a.src
+                                        .0
+                                        .cmp(&b.src.0)
+                                        .then(a.callee_sig.cmp(&b.callee_sig))
+                                        .then(a.caller_line.cmp(&b.caller_line))
+                                });
+                                unresolved_calls.dedup_by(|a, b| {
+                                    a.src == b.src
+                                        && a.callee_sig == b.callee_sig
+                                        && a.caller_line == b.caller_line
+                                });
                                 LangResult {
                                     lang,
                                     nodes,
                                     edges,
                                     refs,
-                                    unresolved_calls: Vec::new(),
+                                    unresolved_calls,
                                     positional_refs: Vec::new(),
                                     ran: true,
                                     skipped_no_analyzer: false,
@@ -641,7 +656,7 @@ impl PluginIndexer {
                                             .map(|r| (repo_root.join(r), r.clone()))
                                             .collect()
                                     });
-                                let (mut nodes, mut edges) =
+                                let (mut nodes, mut edges, mut unresolved_calls) =
                                     travsr_indexer::phase_b_native_python(
                                         corpus,
                                         repo_root,
@@ -649,11 +664,12 @@ impl PluginIndexer {
                                     )
                                     .unwrap_or_else(|e| {
                                         tracing::warn!("python native phase_b: {e}");
-                                        (vec![], vec![])
+                                        (vec![], vec![], vec![])
                                     });
                                 tracing::debug!(
                                     nodes = nodes.len(),
                                     edges = edges.len(),
+                                    unresolved_calls = unresolved_calls.len(),
                                     "Phase B: native python complete"
                                 );
                                 // LSIF enrichment via travsr-lsif-py (bundled, PATH-independent).
@@ -685,12 +701,26 @@ impl PluginIndexer {
                                 edges.sort_unstable_by_key(|e| (e.src, e.dst));
                                 edges
                                     .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                // E4: keep caller_line in the dedup key so every
+                                // distinct call site survives (#299 find_references).
+                                unresolved_calls.sort_unstable_by(|a, b| {
+                                    a.src
+                                        .0
+                                        .cmp(&b.src.0)
+                                        .then(a.callee_sig.cmp(&b.callee_sig))
+                                        .then(a.caller_line.cmp(&b.caller_line))
+                                });
+                                unresolved_calls.dedup_by(|a, b| {
+                                    a.src == b.src
+                                        && a.callee_sig == b.callee_sig
+                                        && a.caller_line == b.caller_line
+                                });
                                 LangResult {
                                     lang,
                                     nodes,
                                     edges,
                                     refs,
-                                    unresolved_calls: Vec::new(),
+                                    unresolved_calls,
                                     positional_refs: Vec::new(),
                                     ran: true,
                                     skipped_no_analyzer: false,

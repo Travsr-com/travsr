@@ -105,18 +105,30 @@ pub fn phase_b_native_rust(
 /// Native Phase B for TypeScript: tree-sitter call + inheritance edges.
 /// Zero external-tool downloads. LSIF enrichment is merged by the caller.
 ///
+/// Returns `(nodes, edges, unresolved_calls)`. E4: call sites are `UnresolvedCall`s
+/// (receiver type recovered where possible) resolved fail-closed by the daemon
+/// against Phase A store nodes — no same-file leaf guesses that dangle cross-file.
+///
 /// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
 /// Pass `None` to fall back to a local directory walk.
 pub fn phase_b_native_typescript(
     corpus: &str,
     root: &std::path::Path,
     files: Option<&[(std::path::PathBuf, String)]>,
-) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+) -> anyhow::Result<(
+    Vec<travsr_core::Node>,
+    Vec<travsr_core::Edge>,
+    Vec<travsr_core::UnresolvedCall>,
+)> {
     phase_b_typescript::extract_native_phase_b(corpus, root, files)
 }
 
 /// Native Phase B for Python: tree-sitter call + inheritance edges.
-/// Zero external-tool downloads. SCIP enrichment is merged by the caller.
+/// Zero external-tool downloads. LSIF enrichment is merged by the caller.
+///
+/// Returns `(nodes, edges, unresolved_calls)`. E4: call sites are `UnresolvedCall`s
+/// (receiver type recovered where possible) resolved fail-closed by the daemon
+/// against Phase A store nodes — no same-file leaf guesses that dangle cross-file.
 ///
 /// `files`: pre-walked `(abs_path, vname_path)` pairs (P6 — #329).
 /// Pass `None` to fall back to a local directory walk.
@@ -124,7 +136,11 @@ pub fn phase_b_native_python(
     corpus: &str,
     root: &std::path::Path,
     files: Option<&[(std::path::PathBuf, String)]>,
-) -> anyhow::Result<(Vec<travsr_core::Node>, Vec<travsr_core::Edge>)> {
+) -> anyhow::Result<(
+    Vec<travsr_core::Node>,
+    Vec<travsr_core::Edge>,
+    Vec<travsr_core::UnresolvedCall>,
+)> {
     phase_b_python::extract_native_phase_b(corpus, root, files)
 }
 

@@ -61,18 +61,19 @@ impl Plugin for TypeScriptPlugin {
             .map(|rel| rel.iter().map(|r| (req.root.join(r), r.clone())).collect());
 
         // Native Phase B: always runs, zero external-tool requirements.
-        let (mut nodes, mut edges) = travsr_indexer::phase_b_native_typescript(
+        let (mut nodes, mut edges, unresolved_calls) = travsr_indexer::phase_b_native_typescript(
             &req.corpus,
             &req.root,
             files_owned.as_deref(),
         )
         .unwrap_or_else(|e| {
             tracing::warn!("ts native phase_b: {e}");
-            (vec![], vec![])
+            (vec![], vec![], vec![])
         });
         tracing::debug!(
             nodes = nodes.len(),
             edges = edges.len(),
+            unresolved_calls = unresolved_calls.len(),
             "ts native phase_b complete"
         );
 
@@ -105,6 +106,7 @@ impl Plugin for TypeScriptPlugin {
         InvokeResponse {
             nodes,
             edges,
+            unresolved_calls,
             ..Default::default()
         }
     }

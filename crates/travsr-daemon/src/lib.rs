@@ -1732,14 +1732,14 @@ fn resolve_unresolved_calls(
         }
     };
 
-    // sig → Vec<(NodeId, path)>
-    let mut by_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str)>> =
+    // sig → Vec<(NodeId, path, language)>
+    let mut by_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str, &str)>> =
         std::collections::HashMap::new();
-    for (id, sig, path) in &candidates {
+    for (id, sig, path, lang) in &candidates {
         by_sig
             .entry(sig.as_str())
             .or_default()
-            .push((*id, path.as_str()));
+            .push((*id, path.as_str(), lang.as_str()));
     }
 
     // #299 R1: leaf-name fallback for method calls. `recv.method()` can't be
@@ -1772,17 +1772,22 @@ fn resolve_unresolved_calls(
                 Vec::new()
             })
     };
-    // leaf → Vec<(NodeId, path, signature)>. Signature is retained (unlike the
-    // exact `by_sig` pass, where it always equals the lookup key) so #521 F3
-    // can tell a qualified `fn:Type.method` candidate apart from a bare
-    // `fn:name` one — a method call can only ever target the former.
-    let mut by_leaf: std::collections::HashMap<String, Vec<(travsr_core::NodeId, &str, &str)>> =
-        std::collections::HashMap::new();
-    for (id, sig, path) in &leaf_candidates {
-        by_leaf
-            .entry(leaf_of(sig))
-            .or_default()
-            .push((*id, path.as_str(), sig.as_str()));
+    // leaf → Vec<(NodeId, path, signature, language)>. Signature is retained
+    // (unlike the exact `by_sig` pass, where it always equals the lookup key) so
+    // #521 F3 can tell a qualified `fn:Type.method` candidate apart from a bare
+    // `fn:name` one — a method call can only ever target the former. Language is
+    // retained so the caller's language can scope the candidate pool (E4).
+    let mut by_leaf: std::collections::HashMap<
+        String,
+        Vec<(travsr_core::NodeId, &str, &str, &str)>,
+    > = std::collections::HashMap::new();
+    for (id, sig, path, lang) in &leaf_candidates {
+        by_leaf.entry(leaf_of(sig)).or_default().push((
+            *id,
+            path.as_str(),
+            sig.as_str(),
+            lang.as_str(),
+        ));
     }
 
     // #529: batch-resolve qualified `fn:T.method` candidates and graph-type
@@ -1819,13 +1824,13 @@ fn resolve_unresolved_calls(
             tracing::warn!("resolve_unresolved_calls: recv_type qualified lookup failed: {e}");
             Vec::new()
         });
-    let mut by_recv_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str)>> =
+    let mut by_recv_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str, &str)>> =
         std::collections::HashMap::new();
-    for (id, sig, path) in &recv_qualified_candidates {
+    for (id, sig, path, lang) in &recv_qualified_candidates {
         by_recv_sig
             .entry(sig.as_str())
             .or_default()
-            .push((*id, path.as_str()));
+            .push((*id, path.as_str(), lang.as_str()));
     }
 
     let recv_type_probe_sigs: Vec<String> = {
@@ -1838,10 +1843,16 @@ fn resolve_unresolved_calls(
         types
             .iter()
             .flat_map(|t| {
+                // E4: `class:` makes the receiver-type existence gate
+                // language-general — Python/TypeScript/Java/Go receivers are
+                // `class:T`, not Rust's `struct:`/`enum:`/`trait:`. Without it a
+                // real graph class was treated as an external type (#529 branch
+                // 2), dropping legitimate cross-file method edges.
                 [
                     format!("struct:{t}"),
                     format!("enum:{t}"),
                     format!("trait:{t}"),
+                    format!("class:{t}"),
                 ]
             })
             .collect()
@@ -1853,7 +1864,7 @@ fn resolve_unresolved_calls(
             Vec::new()
         })
         .iter()
-        .filter_map(|(_, sig, _)| sig.split_once(':').map(|(_, name)| name.to_string()))
+        .filter_map(|(_, sig, _, _)| sig.split_once(':').map(|(_, name)| name.to_string()))
         .collect();
 
     // #521 F1: crate dependency graph, built from this Phase B pass's own
@@ -1869,25 +1880,32 @@ fn resolve_unresolved_calls(
         ids.dedup();
         ids
     };
-    let caller_paths: std::collections::HashMap<travsr_core::NodeId, String> = store
-        .get_nodes(&caller_ids)
-        .unwrap_or_else(|e| {
-            tracing::warn!("resolve_unresolved_calls: caller path lookup failed: {e}");
-            Vec::new()
-        })
+    let caller_nodes = store.get_nodes(&caller_ids).unwrap_or_else(|e| {
+        tracing::warn!("resolve_unresolved_calls: caller path lookup failed: {e}");
+        Vec::new()
+    });
+    let caller_paths: std::collections::HashMap<travsr_core::NodeId, String> = caller_nodes
+        .iter()
+        .map(|n| (n.id, n.vname.path.clone()))
+        .collect();
+    // E4: each caller's own language, so candidate resolution can be scoped to
+    // it — a Python/TS/Rust call must never resolve to a same-signature
+    // definition in another language (mixed-repo cross-language collision).
+    let caller_langs: std::collections::HashMap<travsr_core::NodeId, String> = caller_nodes
         .into_iter()
-        .map(|n| (n.id, n.vname.path))
+        .map(|n| (n.id, n.vname.language))
         .collect();
 
     // Shared by both the #529 recv_type fallback and the pre-#529 is_method_call
     // path: qualified (`Type.method`) candidates from the unique-leaf pool.
-    let leaf_method_matches = |sig: &str| -> Vec<(travsr_core::NodeId, &str)> {
+    // Each match carries `(NodeId, path, language)`.
+    let leaf_method_matches = |sig: &str| -> Vec<(travsr_core::NodeId, &str, &str)> {
         by_leaf
             .get(&leaf_of(sig))
             .map(|v| {
                 v.iter()
-                    .filter(|(_, _, s)| s.contains('.'))
-                    .map(|(id, path, _)| (*id, *path))
+                    .filter(|(_, _, s, _)| s.contains('.'))
+                    .map(|(id, path, _, lang)| (*id, *path, *lang))
                     .collect()
             })
             .unwrap_or_default()
@@ -1915,7 +1933,7 @@ fn resolve_unresolved_calls(
         // exact `by_sig` hit there is by construction a free function — never
         // a valid method-call target. Skip straight to the leaf pool and keep
         // only qualified (`Type.method`) candidates from it.
-        let matches: Vec<(travsr_core::NodeId, &str)> = if u.is_method_call {
+        let matches: Vec<(travsr_core::NodeId, &str, &str)> = if u.is_method_call {
             match &u.recv_type {
                 // #529: receiver type recovered — resolve against it instead
                 // of guessing by leaf uniqueness. Three-way split (§4.3):
@@ -1944,10 +1962,31 @@ fn resolve_unresolved_calls(
                 Some(m) => m.clone(),
                 None => by_leaf
                     .get(&leaf_of(&u.callee_sig))
-                    .map(|v| v.iter().map(|(id, path, _)| (*id, *path)).collect())
+                    .map(|v| {
+                        v.iter()
+                            .map(|(id, path, _, lang)| (*id, *path, *lang))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             }
         };
+        if matches.is_empty() {
+            continue;
+        }
+        // E4: scope candidates to the caller's own language. This is the
+        // fuzzy leaf-name resolver; a cross-language name match here (e.g.
+        // Python `fn:parse` → a Rust `fn:parse`) is a coincidental collision,
+        // never real linkage — it is a false `ref/call` edge and also inflates
+        // the candidate count, breaking the CO-A1 uniqueness gate below.
+        // Genuine cross-language linkage (FFI: cgo / N-API / PyO3 / JNI) is
+        // modelled separately as `ffi/call` by the RFC-005 marker resolver
+        // (`ffi_resolver.rs`), which this filter does not touch — so no real
+        // cross-language edge is ever suppressed here.
+        let caller_lang = caller_langs.get(&u.src).map(String::as_str).unwrap_or("");
+        let matches: Vec<(travsr_core::NodeId, &str, &str)> = matches
+            .into_iter()
+            .filter(|(_, _, lang)| *lang == caller_lang)
+            .collect();
         if matches.is_empty() {
             continue;
         }
@@ -1955,7 +1994,7 @@ fn resolve_unresolved_calls(
             let hint_dash = hint.replace('_', "-");
             matches
                 .iter()
-                .filter(|(_, path)| path.contains(hint.as_str()) || path.contains(&*hint_dash))
+                .filter(|(_, path, _)| path.contains(hint.as_str()) || path.contains(&*hint_dash))
                 .copied()
                 .collect()
         } else {
@@ -1968,7 +2007,7 @@ fn resolve_unresolved_calls(
             continue;
         }
         let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
-        for (dst, path) in filtered {
+        for (dst, path, _lang) in filtered {
             // #521 F1/F2: never emit an edge the caller's own crate could not
             // possibly reach.
             if u.src != dst && call_target_reachable(caller_path, path, &crates) {
@@ -3649,6 +3688,174 @@ mod tests {
             "E7: an uncovered call site must still resolve natively: {edges_residual:?}"
         );
         assert_eq!(edges_residual[0].dst, callee.id);
+    }
+
+    #[test]
+    fn e4_class_receiver_is_a_graph_type_falls_through_to_unique_leaf() {
+        // E4: a Python/TS receiver whose type is a real `class:T` in the graph
+        // but whose `method:T.leaf` node does not exist (inherited method) must
+        // fall through to unique-leaf resolution — NOT be dropped as external.
+        // This is the language-general analog of t7 and directly exercises the
+        // `class:{t}` addition to `recv_type_probe_sigs`; without it, `App`
+        // would be unknown → branch 2 → the call would be wrongly dropped.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/app.ts", "typescript", "fn:run"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // `App` is a real class in the graph...
+        let app = Node::new(
+            VName::new("", "", "src/app.ts", "typescript", "class:App"),
+            "class",
+        );
+        store.put_node(&app).unwrap();
+
+        // ...but the only `*.helper` method belongs to a different class,
+        // cross-file (inherited/mixed-in — the extractor can't see the link).
+        let callee = Node::new(
+            VName::new("", "", "src/base.ts", "typescript", "method:Base.helper"),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 4,
+            is_method_call: true,
+            recv_type: Some("App".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "class receiver that is a graph type must fall through to unique leaf: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn e4_chain_receiver_does_not_fabricate_false_self_class_edge() {
+        // E4 acceptance: `this.other.run()` where the enclosing class ALSO
+        // defines `run`. The receiver is an unrecoverable chain (recv_type =
+        // None); with two `method:*.run` in the graph the leaf is ambiguous, so
+        // NOTHING is emitted — no false self-class edge (the exact defect the
+        // old in-extractor `method:{enclosing_class}.{leaf}` guess produced).
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/app.ts", "typescript", "method:App.render"),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+
+        // Two distinct `run` methods → ambiguous leaf.
+        for (path, sig) in [
+            ("src/app.ts", "method:App.run"),
+            ("src/other.ts", "method:Other.run"),
+        ] {
+            store
+                .put_node(&Node::new(
+                    VName::new("", "", path, "typescript", sig),
+                    "method",
+                ))
+                .unwrap();
+        }
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:run".to_string(),
+            hint_crate: None,
+            caller_line: 5,
+            is_method_call: true,
+            recv_type: None, // chain receiver — unrecoverable
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "ambiguous chain-receiver call must emit no edge (no false self-class): {edges:?}"
+        );
+    }
+
+    #[test]
+    fn e4_call_is_scoped_to_caller_language() {
+        // E4: a call must resolve only within the caller's own language. A
+        // Python `helper()` must NOT resolve to a Rust `fn:helper` even when
+        // that Rust node is the unique bearer of the leaf — cross-language edges
+        // are false. Adding a Python `fn:helper` then makes it resolve.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(VName::new("", "", "app.py", "python", "fn:run"), "function");
+        store.put_node(&caller).unwrap();
+        // `helper` exists ONLY in Rust.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "lib.rs", "rust", "fn:helper"),
+                "function",
+            ))
+            .unwrap();
+
+        let call = travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 2,
+            is_method_call: false,
+            recv_type: None,
+        };
+
+        let (edges, _s) = resolve_unresolved_calls(
+            &store,
+            std::slice::from_ref(&call),
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "python call must not resolve to a rust definition: {edges:?}"
+        );
+
+        // Now add a Python `fn:helper` — the same call resolves, within language.
+        let py_helper = Node::new(
+            VName::new("", "", "util.py", "python", "fn:helper"),
+            "function",
+        );
+        store.put_node(&py_helper).unwrap();
+        let (edges2, _s) = resolve_unresolved_calls(
+            &store,
+            std::slice::from_ref(&call),
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges2.len(),
+            1,
+            "same-language call must resolve: {edges2:?}"
+        );
+        assert_eq!(edges2[0].dst, py_helper.id);
     }
 
     // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────

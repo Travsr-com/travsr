@@ -2652,14 +2652,18 @@ LIMIT 20",
 
     /// Bulk-lookup nodes by signature strings. Returns `(id, signature, path)` triples.
     /// Used by the daemon to resolve `UnresolvedCall`s emitted by Phase B.
+    /// Returns `(id, signature, path, language)`. Language is carried so the
+    /// daemon resolver can scope candidates to the caller's own language — a
+    /// call in one language must never resolve to a same-signature definition
+    /// in another (E4).
     pub fn nodes_by_signatures(
         &self,
         sigs: &[String],
-    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+    ) -> Result<Vec<(NodeId, String, String, String)>, StoreError> {
         if sigs.is_empty() {
             return Ok(Vec::new());
         }
-        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+        (|| -> AnyResult<Vec<(NodeId, String, String, String)>> {
             let placeholders = sigs
                 .iter()
                 .enumerate()
@@ -2667,7 +2671,7 @@ LIMIT 20",
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, signature, path FROM nodes WHERE signature IN ({placeholders})"
+                "SELECT id, signature, path, language FROM nodes WHERE signature IN ({placeholders})"
             );
             let mut stmt = self
                 .conn
@@ -2680,7 +2684,8 @@ LIMIT 20",
                     let id = i64_to_node_id(row.get::<_, i64>(0)?);
                     let sig: String = row.get(1)?;
                     let path: String = row.get(2)?;
-                    Ok((id, sig, path))
+                    let lang: String = row.get(3)?;
+                    Ok((id, sig, path, lang))
                 })
                 .context("executing nodes_by_signatures")?;
             let mut out = Vec::new();
@@ -2707,11 +2712,11 @@ LIMIT 20",
     pub fn fn_nodes_by_leaf_name(
         &self,
         names: &[String],
-    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+    ) -> Result<Vec<(NodeId, String, String, String)>, StoreError> {
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+        (|| -> AnyResult<Vec<(NodeId, String, String, String)>> {
             // Each name contributes 3 params (exact + 2 LIKE). Chunk so a large
             // `names` slice never exceeds SQLite's SQLITE_MAX_VARIABLE_NUMBER
             // (default 999 on older builds) or the expression-tree depth limit:
@@ -2737,7 +2742,7 @@ LIMIT 20",
                 // by some Phase A parsers) so leaf-name resolution and span
                 // attribution consider the same node population.
                 let sql = format!(
-                    "SELECT id, signature, path FROM nodes \
+                    "SELECT id, signature, path, language FROM nodes \
                      WHERE kind IN ('function','method','fn') AND ({})",
                     clauses.join(" OR ")
                 );
@@ -2752,7 +2757,8 @@ LIMIT 20",
                         let id = i64_to_node_id(row.get::<_, i64>(0)?);
                         let sig: String = row.get(1)?;
                         let path: String = row.get(2)?;
-                        Ok((id, sig, path))
+                        let lang: String = row.get(3)?;
+                        Ok((id, sig, path, lang))
                     })
                     .context("executing fn_nodes_by_leaf_name")?;
                 for row in rows {
@@ -7131,7 +7137,7 @@ mod tests {
             .fn_nodes_by_leaf_name(&["describe".to_string(), "add".to_string()])
             .unwrap()
             .into_iter()
-            .map(|(_, sig, _)| sig)
+            .map(|(_, sig, _, _)| sig)
             .collect();
         got.sort();
         assert_eq!(
@@ -7149,7 +7155,7 @@ mod tests {
             .fn_nodes_by_leaf_name(&["announce_all".to_string()])
             .unwrap()
             .into_iter()
-            .map(|(_, sig, _)| sig)
+            .map(|(_, sig, _, _)| sig)
             .collect();
         assert_eq!(hit, vec!["fn:Zoo.announce_all".to_string()]);
 
@@ -7271,7 +7277,7 @@ mod tests {
             .fn_nodes_by_leaf_name(&names)
             .unwrap()
             .into_iter()
-            .map(|(_, sig, _)| sig)
+            .map(|(_, sig, _, _)| sig)
             .collect();
         assert_eq!(got, vec!["fn:Zoo.feed".to_string()]);
     }
