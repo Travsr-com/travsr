@@ -22,6 +22,13 @@ pub struct PhaseBOutcome {
     /// `travsr lang add <lang>`.
     pub skipped_no_analyzer: Vec<String>,
     pub skipped_unregistered: Vec<String>,
+    /// Languages that require a `compile_commands.json` at the repo root
+    /// (scip-clang, for `c`/`cpp`) but don't have one. Without this gate the
+    /// scip-clang invoke hangs with no compilation database until the 300s
+    /// invoke timeout, then reports as `crashed`. User-actionable: generate a
+    /// compile_commands.json (e.g. via `bear` or CMake's
+    /// `CMAKE_EXPORT_COMPILE_COMMANDS`).
+    pub skipped_no_compdb: Vec<String>,
     /// Languages registered as RequiresElevated but lacking a PSE approval
     /// entry in lang.toml. User-actionable: `travsr lang approve <lang>`.
     pub skipped_needs_approval: Vec<String>,
@@ -379,6 +386,23 @@ impl PluginIndexer {
                     work: LangWork::NativePython,
                     files: lang_files("python"),
                 });
+                continue;
+            }
+
+            // L5a: scip-clang (c/cpp) requires a compile_commands.json at the repo
+            // root (`--compdb-path` in its catalog args). Without one it hangs
+            // with no compilation database until the invoke timeout fires and the
+            // whole batch reports `crashed`, blocking phase_b_commit forever.
+            // Detect the dependency from the catalog entry rather than hardcoding
+            // language names, so any future scip-clang-based language is covered.
+            let needs_compdb = crate::phase_b::catalog::lookup(lang.as_str())
+                .is_some_and(|entry| entry.command == "scip-clang");
+            if needs_compdb && !inputs.repo_root.join("compile_commands.json").exists() {
+                tracing::debug!(
+                    lang = %lang,
+                    "Phase B skipped — scip-clang requires compile_commands.json"
+                );
+                outcome.skipped_no_compdb.push(lang.clone());
                 continue;
             }
 

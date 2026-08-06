@@ -88,6 +88,9 @@ pub struct PhaseBReport {
     pub skipped_no_analyzer: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
+    /// Languages that need a `compile_commands.json` at the repo root
+    /// (scip-clang, for `c`/`cpp`) but don't have one (L5a).
+    pub skipped_no_compdb: Vec<String>,
     /// Languages that are RequiresElevated but have no PSE approval in lang.toml.
     /// Shown to the user with a `travsr lang approve` call-to-action.
     pub skipped_needs_approval: Vec<String>,
@@ -178,6 +181,16 @@ fn index_paths_parallel(
     // Divide `paths` into `jobs` slices (last shard may be smaller).
     let shard_size = paths.len().div_ceil(jobs);
 
+    // L5b: `.h` is ambiguous between C and Obj-C. `paths` is already the full
+    // indexable file list for this run, so checking it in memory is free (no
+    // extra walk) and gives an accurate repo-wide signal.
+    let objc_signal = paths.iter().any(|p| {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("m") | Some("mm")
+        )
+    });
+
     let (tx, rx) = mpsc::sync_channel::<anyhow::Result<ParseResult>>(jobs * 4);
 
     // ── spawn worker threads ──────────────────────────────────────────────────
@@ -221,8 +234,18 @@ fn index_paths_parallel(
                         continue;
                     }
 
-                    // Parse Phase A.
-                    let out = match indexer.parse_file_with_vname(abs_path, &vname_path) {
+                    // Parse Phase A. L5b: route `.h` to the Obj-C parser instead of
+                    // the default C dispatch when the repo has `.m`/`.mm` sources —
+                    // the C grammar cannot parse `@interface`/`@protocol` headers.
+                    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let parsed = if ext == "h" && objc_signal {
+                        travsr_analysis::objc::parse(&corpus, abs_path, &vname_path)
+                    } else {
+                        indexer
+                            .parse_file_with_vname(abs_path, &vname_path)
+                            .map_err(anyhow::Error::from)
+                    };
+                    let out = match parsed {
                         Ok(o) => o,
                         Err(e) => {
                             tracing::warn!(path=%abs_path.display(), err=%e, "parse error, skipping");
@@ -231,7 +254,6 @@ fn index_paths_parallel(
                     };
 
                     // Import resolution (read-only FS, no store access).
-                    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let import_edges = match Language::from_extension(ext) {
                         Some(Language::TypeScript) => {
                             link_imports(&out.nodes, &vname_path, &corpus)
@@ -1138,6 +1160,7 @@ pub fn init_repo_with_progress(
             indexable_paths.push(p);
         }
     }
+    reclassify_objc_headers(&mut present_languages, &indexable_paths);
 
     // L13: warn if a rebase is in progress — init during rebase risks indexing
     // conflict-marker noise into graph.db; the user should finish rebasing first.
@@ -1181,6 +1204,7 @@ pub fn init_repo_with_progress(
                     indexable_paths.push(p);
                 }
             }
+            reclassify_objc_headers(&mut present_languages, &indexable_paths);
         }
     }
 
@@ -2142,6 +2166,11 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_no_analyzer {
         warnings.push(format!("skipped_no_analyzer:{lang}"));
     }
+    // L5a: scip-clang (c/cpp) needs a compile_commands.json — surface it the
+    // same way as the other user-actionable skip classes above.
+    for lang in &pb_outcome.skipped_no_compdb {
+        warnings.push(format!("skipped_no_compdb:{lang}"));
+    }
     // E6: surface SCIP def-unification misses (orphaned twins). Positional
     // span-containment makes this near-zero; a non-zero rate means Phase A
     // nodes the compiler defined were not matched, so their ref/call edges
@@ -2172,6 +2201,7 @@ fn write_phase_b_results(
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
         skipped_unregistered: pb_outcome.skipped_unregistered,
+        skipped_no_compdb: pb_outcome.skipped_no_compdb,
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,
         version_mismatch: pb_outcome.version_mismatch,
@@ -2244,7 +2274,64 @@ fn collect_present_languages_and_paths(
             paths.push(p);
         }
     }
+
+    reclassify_objc_headers(&mut langs, &paths);
+
     (langs, paths)
+}
+
+/// L5b: `.h` is ambiguous between C and Obj-C headers. `Language::from_extension`
+/// has no repo context (deliberately — it stays a pure ext→lang map), so every
+/// file-discovery walk in this module always attributes `.h` to C first.
+/// Disambiguate after the fact using a repo-level signal (any `.m`/`.mm`
+/// present) that can only be known once every file in the walk has been seen.
+/// Shared by every `present_languages` builder (`collect_present_languages_and_paths`
+/// and both walk loops in `init_repo_with_progress`) so the reclassification is
+/// never applied to only one of them.
+fn reclassify_objc_headers(langs: &mut std::collections::HashSet<String>, paths: &[PathBuf]) {
+    let has_objc_source = paths.iter().any(|p| {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("m") | Some("mm")
+        )
+    });
+    let has_header = paths
+        .iter()
+        .any(|p| p.extension().and_then(|e| e.to_str()) == Some("h"));
+    if has_objc_source && has_header {
+        langs.insert(Language::ObjectiveC.as_str().to_string());
+        // Only drop "c" when no genuine .c source exists — a mixed C+Obj-C repo
+        // must still enroll the C analyzer for its real .c files.
+        let has_c_source = paths
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("c"));
+        if !has_c_source {
+            langs.remove(Language::C.as_str());
+        }
+    }
+}
+
+/// L5b: early-exit repo-wide scan for any `.m`/`.mm` file — the signal used to
+/// disambiguate a changed `.h` file's language on the commit-hook path, where
+/// `reindex_files`'s own `paths` batch is a diff and may not include a sibling
+/// `.m`/`.mm` that already establishes the repo as Obj-C. Callers gate this
+/// behind "batch touches a `.h` file" so it costs nothing on other commits.
+fn repo_has_objc_sources(repo_root: &Path) -> bool {
+    use ignore::WalkBuilder;
+    WalkBuilder::new(repo_root)
+        .hidden(false)
+        .git_ignore(true)
+        .follow_links(false)
+        .add_custom_ignore_filename(".travsrignore")
+        .build()
+        .flatten()
+        .any(|entry| {
+            entry.file_type().is_some_and(|t| t.is_file())
+                && matches!(
+                    entry.path().extension().and_then(|e| e.to_str()),
+                    Some("m") | Some("mm")
+                )
+        })
 }
 
 /// Background, single-flight Phase B refresh (#318 O3).
@@ -2765,6 +2852,16 @@ pub fn reindex_files(
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
 
+    // L5b: unlike `index_paths_parallel`'s full-repo `paths`, this commit-hook
+    // batch only contains changed files — a `.m`/`.mm` sibling may not be in it
+    // even when the repo has Obj-C sources. Only pay for a repo-wide scan when
+    // this batch actually touches a `.h` file (the ambiguous case); every other
+    // commit costs nothing extra.
+    let objc_signal = paths
+        .iter()
+        .any(|p| p.extension().and_then(|e| e.to_str()) == Some("h"))
+        && repo_has_objc_sources(repo_root);
+
     for abs_path in paths {
         let vname_path = abs_path
             .strip_prefix(repo_root)
@@ -2811,7 +2908,18 @@ pub fn reindex_files(
         }
 
         // §2 GC keystone: parse FIRST — a syntax error never erases the old graph.
-        let out = match indexer.parse_file_with_vname(abs_path, &vname_path) {
+        // L5b: route `.h` to the Obj-C parser instead of the default C dispatch
+        // when the repo has `.m`/`.mm` sources — the C grammar cannot parse
+        // `@interface`/`@protocol` headers.
+        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let parsed = if ext == "h" && objc_signal {
+            travsr_analysis::objc::parse(&corpus, abs_path, &vname_path)
+        } else {
+            indexer
+                .parse_file_with_vname(abs_path, &vname_path)
+                .map_err(anyhow::Error::from)
+        };
+        let out = match parsed {
             Ok(o) => o,
             Err(err) => {
                 tracing::warn!("parse error for {}: {err}", abs_path.display());
@@ -2820,7 +2928,6 @@ pub fn reindex_files(
         };
 
         // Build import-resolver edges before the atomic reindex_replace call.
-        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let import_edges = match Language::from_extension(ext) {
             Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
             Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
@@ -2868,6 +2975,12 @@ pub fn reindex_files(
                 tracing::warn!("ffi edge write error: {err}");
             }
         }
+    }
+
+    // E1: label-only reconcile of edge languages to their endpoints (the schema
+    // default 'typescript' otherwise mislabels edges rewritten by this commit).
+    if let Err(e) = store.reconcile_edge_languages() {
+        tracing::warn!("reconciling edge languages: {e:#}");
     }
 
     // Record the current HEAD commit so `travsr status` can show freshness.
@@ -3043,6 +3156,121 @@ mod tests {
         let sites = vec![(NodeId(1), NodeId(2), 5)];
         let out = remap_resolved_sites(sites.clone(), &std::collections::HashMap::new());
         assert_eq!(out, sites);
+    }
+
+    // L5b: `.h` must be reclassified as Obj-C — not C — when the repo has any
+    // `.m`/`.mm` source, and "c" must be dropped from the enrolled language set
+    // when no genuine `.c` file backs it (pure Obj-C headers-only signal).
+    #[test]
+    fn collect_present_languages_and_paths_routes_h_to_objc_when_m_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cat.h"), "@interface Cat\n@end\n").unwrap();
+        std::fs::write(dir.path().join("Cat.m"), "@implementation Cat\n@end\n").unwrap();
+
+        let (langs, paths) = collect_present_languages_and_paths(dir.path());
+        assert!(
+            langs.contains("objectivec"),
+            "expected objectivec enrolled, got {langs:?}"
+        );
+        assert!(
+            !langs.contains("c"),
+            "c must not be enrolled from .h alone when no genuine .c file exists, got {langs:?}"
+        );
+        assert_eq!(paths.len(), 2, "both .h and .m must remain indexable paths");
+    }
+
+    // L5b: without any `.m`/`.mm` sibling, `.h` must keep its default C
+    // classification — pure C repos must never be reclassified.
+    #[test]
+    fn collect_present_languages_and_paths_keeps_h_as_c_without_objc_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("util.h"), "void f(void);\n").unwrap();
+        std::fs::write(dir.path().join("util.c"), "void f(void) {}\n").unwrap();
+
+        let (langs, _paths) = collect_present_languages_and_paths(dir.path());
+        assert!(langs.contains("c"), "expected c enrolled, got {langs:?}");
+        assert!(
+            !langs.contains("objectivec"),
+            "must not enroll objectivec without any .m/.mm, got {langs:?}"
+        );
+    }
+
+    // L5b: a mixed C + Obj-C repo (genuine .c files alongside .m) must enroll
+    // both analyzers — the "c" removal only applies when nothing backs it.
+    #[test]
+    fn collect_present_languages_and_paths_keeps_c_when_genuine_c_file_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared.h"), "void f(void);\n").unwrap();
+        std::fs::write(dir.path().join("shared.c"), "void f(void) {}\n").unwrap();
+        std::fs::write(dir.path().join("Cat.m"), "@implementation Cat\n@end\n").unwrap();
+
+        let (langs, _paths) = collect_present_languages_and_paths(dir.path());
+        assert!(
+            langs.contains("c") && langs.contains("objectivec"),
+            "mixed repo must enroll both c and objectivec, got {langs:?}"
+        );
+    }
+
+    #[test]
+    fn repo_has_objc_sources_detects_mm_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("view.mm"), "// objc++\n").unwrap();
+        assert!(repo_has_objc_sources(dir.path()));
+    }
+
+    #[test]
+    fn repo_has_objc_sources_false_for_pure_c_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        assert!(!repo_has_objc_sources(dir.path()));
+    }
+
+    // L5b regression: `reclassify_objc_headers` is the single shared
+    // implementation called from all three `present_languages` builders
+    // (`collect_present_languages_and_paths` plus both walk loops in
+    // `init_repo_with_progress` — the second loop, gated behind the
+    // large-dep-dir re-walk, initially lacked this call entirely, so a `.h`
+    // header in a pure Obj-C repo still enrolled the crashing "c" scip-clang
+    // pass on the full `travsr init` path even though the background-refresh
+    // path was already fixed). Test the shared function directly so every
+    // call site inherits the same, single-sourced correctness.
+    #[test]
+    fn reclassify_objc_headers_drops_c_for_header_only_objc_repo() {
+        let mut langs: std::collections::HashSet<String> =
+            ["c".to_string(), "objectivec".to_string()]
+                .into_iter()
+                .collect();
+        let paths = vec![PathBuf::from("/repo/Cat.h"), PathBuf::from("/repo/Cat.m")];
+        reclassify_objc_headers(&mut langs, &paths);
+        assert!(langs.contains("objectivec"));
+        assert!(
+            !langs.contains("c"),
+            "c must be dropped when no genuine .c file backs it"
+        );
+    }
+
+    #[test]
+    fn reclassify_objc_headers_keeps_c_when_genuine_c_file_present() {
+        let mut langs: std::collections::HashSet<String> =
+            ["c".to_string(), "objectivec".to_string()]
+                .into_iter()
+                .collect();
+        let paths = vec![
+            PathBuf::from("/repo/shared.h"),
+            PathBuf::from("/repo/shared.c"),
+            PathBuf::from("/repo/Cat.m"),
+        ];
+        reclassify_objc_headers(&mut langs, &paths);
+        assert!(langs.contains("c") && langs.contains("objectivec"));
+    }
+
+    #[test]
+    fn reclassify_objc_headers_noop_without_objc_signal() {
+        let mut langs: std::collections::HashSet<String> = ["c".to_string()].into_iter().collect();
+        let paths = vec![PathBuf::from("/repo/util.h"), PathBuf::from("/repo/util.c")];
+        reclassify_objc_headers(&mut langs, &paths);
+        assert!(langs.contains("c"));
+        assert!(!langs.contains("objectivec"));
     }
 
     // ── #521: bare-name call resolution must never cross a crate boundary
