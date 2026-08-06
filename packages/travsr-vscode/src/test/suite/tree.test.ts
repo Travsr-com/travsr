@@ -308,3 +308,170 @@ suite("VSCODE-204: TravsrTreeDataProvider — refresh", () => {
     assert.strictEqual(provider.getTreeItem(section), section);
   });
 });
+
+// ── envelope stripping ─────────────────────────────────────────────────────
+
+suite("VSCODE-204: TravsrTreeDataProvider — <travsr-data> envelope stripping", () => {
+  // Helper to wrap a payload in the MCP server envelope.
+  function wrap(payload: string): string {
+    return `<travsr-data>\n${payload}\n</travsr-data>`;
+  }
+
+  // ── deps ──────────────────────────────────────────────────────────────────
+
+  test("envelope tags do not appear as dep tree nodes", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: wrap("import:./mcp\nimport:./status\n") }),
+      makeContext()
+    );
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(depsSection);
+    const labels = children.map((c) => c.label as string);
+    assert.ok(
+      !labels.some((l) => l.includes("<travsr-data>") || l.includes("</travsr-data>")),
+      "no envelope tag must appear as a tree node label"
+    );
+  });
+
+  test("deps parse correctly when response is envelope-wrapped", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: wrap("import:./mcp\ntype-import:./bar\n") }),
+      makeContext()
+    );
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(depsSection);
+    assert.strictEqual(children.length, 2);
+    assert.strictEqual(children[0].label, "./mcp");
+    assert.strictEqual(children[0].description, "import");
+    assert.strictEqual(children[1].label, "./bar");
+    assert.strictEqual(children[1].description, "type-import");
+  });
+
+  test("external dep in envelope has no open-file command", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: wrap("import:vscode\n") }),
+      makeContext()
+    );
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(depsSection);
+    assert.strictEqual(entry.label, "vscode");
+    assert.strictEqual(entry.command, undefined);
+  });
+
+  test("empty envelope payload returns deps placeholder", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: "<travsr-data>\n</travsr-data>" }),
+      makeContext()
+    );
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(depsSection);
+    assert.strictEqual(children.length, 1);
+    assert.ok((children[0].label as string).includes("No dependencies found"));
+  });
+
+  // ── callers ───────────────────────────────────────────────────────────────
+
+  test("envelope tags do not appear as caller tree nodes", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({
+        get_callers: wrap("[call] fn:bar (function) \u2014 src/bar.ts\n"),
+      }),
+      makeContext()
+    );
+    setSymbol(provider, "myFn");
+    const [, callersSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(callersSection);
+    const labels = children.map((c) => c.label as string);
+    assert.ok(
+      !labels.some((l) => l.includes("<travsr-data>") || l.includes("</travsr-data>")),
+      "no envelope tag must appear as a tree node label"
+    );
+  });
+
+  test("callers parse correctly when response is envelope-wrapped", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({
+        get_callers: wrap(
+          "[call] fn:bar (function) \u2014 src/bar.ts\n[structural] class:Foo (class) \u2014 src/foo.ts\n"
+        ),
+      }),
+      makeContext()
+    );
+    setSymbol(provider, "myFn");
+    const [, callersSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(callersSection);
+    assert.strictEqual(children.length, 2);
+    assert.strictEqual(children[0].label, "fn:bar");
+    assert.strictEqual(children[1].label, "class:Foo");
+  });
+
+  test("caller entry in envelope has open-file command", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({
+        get_callers: wrap("[call] fn:bar (function) \u2014 src/bar.ts\n"),
+      }),
+      makeContext()
+    );
+    setSymbol(provider, "myFn");
+    const [, callersSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(callersSection);
+    assert.ok(entry.command !== undefined);
+    assert.strictEqual(entry.command!.command, "vscode.open");
+  });
+
+  test("empty envelope payload returns callers placeholder", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_callers: "<travsr-data>\n</travsr-data>" }),
+      makeContext()
+    );
+    setSymbol(provider, "myFn");
+    const [, callersSection] = await provider.getChildren(undefined);
+    const children = await provider.getChildren(callersSection);
+    assert.strictEqual(children.length, 1);
+    assert.ok((children[0].label as string).includes("No callers found"));
+  });
+
+  // ── fallback: unrecognised lines inside an envelope ───────────────────────
+
+  test("unrecognised caller line inside envelope still falls back to raw label", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_callers: wrap("some unexpected format\n") }),
+      makeContext()
+    );
+    setSymbol(provider, "foo");
+    const [, callersSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(callersSection);
+    assert.strictEqual(entry.label, "some unexpected format");
+  });
+
+  // ── no-envelope responses still work (regression guard) ──────────────────
+
+  test("plain (non-wrapped) dep response still parses correctly", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: "import:./mcp\n" }),
+      makeContext()
+    );
+    setFile(provider, "src/extension.ts");
+    const [depsSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(depsSection);
+    assert.strictEqual(entry.label, "./mcp");
+    assert.strictEqual(entry.description, "import");
+  });
+
+  test("plain (non-wrapped) caller response still parses correctly", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({
+        get_callers: "[call] fn:x (function) \u2014 src/x.ts\n",
+      }),
+      makeContext()
+    );
+    setSymbol(provider, "foo");
+    const [, callersSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(callersSection);
+    assert.strictEqual(entry.label, "fn:x");
+  });
+});
