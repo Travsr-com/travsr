@@ -59,8 +59,26 @@ pub fn unify_all(
     // defs (struct fields, module vars) are excluded: many Phase A parsers
     // don't model them at all (e.g. Go struct fields), so counting them would
     // inflate the rate with benign non-matches on every real repo.
-    let mut attempted: usize = 0;
-    let mut unified: usize = 0;
+    //
+    // Counted per *distinct SCIP symbol*, not per occurrence: a symbol whose
+    // definition appears in several files (Obj-C `@interface` in the `.h` and
+    // `@implementation` in the `.m`, C/C++ `.h` decl + `.cpp` def) is one
+    // definition. It unifies against the file that carries the Phase A node,
+    // and the other files' occurrences find no same-file tree-sitter node — a
+    // benign duplicate, not a real miss. Tracking symbols (rather than adding
+    // to the per-occurrence counters on each file) keeps those from inflating
+    // the rate regardless of the order files are visited (#596).
+    let mut attempted_syms: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut unified_syms: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // SCIP symbol → the tree-sitter node it unified onto (first match wins).
+    // Used after the pass to collapse the *other* files' occurrences of the
+    // same symbol (Obj-C `@implementation` twin, C/C++ header-vs-source) onto
+    // that node so they are dropped as duplicates instead of surviving as
+    // orphan def nodes (#596).
+    let mut sym_to_ts: HashMap<&str, NodeId> = HashMap::new();
+    // Def nodes whose own file carried no matching tree-sitter node — revisited
+    // below to see whether the symbol unified in some other file.
+    let mut unmatched: Vec<(NodeId, &str)> = Vec::new();
 
     for node in nodes {
         let scip_sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
@@ -93,7 +111,7 @@ pub fn unify_all(
         let scip_line = line as i64;
         let counts_toward_miss_rate = matches!(parsed.kind, "function" | "class");
         if counts_toward_miss_rate {
-            attempted += 1;
+            attempted_syms.insert(scip_sym);
         }
 
         match store.find_ts_node_for_unification(
@@ -106,15 +124,36 @@ pub fn unify_all(
             Ok(Some(ts_id)) => {
                 aliases.push((scip_sym.to_string(), ts_id));
                 alias_map.insert(node.id, ts_id);
+                sym_to_ts.entry(scip_sym).or_insert(ts_id);
                 if counts_toward_miss_rate {
-                    unified += 1;
+                    unified_syms.insert(scip_sym);
                 }
                 tracing::trace!(symbol = %scip_sym, ?ts_id, "G1: unified");
             }
-            Ok(None) => {}
+            Ok(None) => unmatched.push((node.id, scip_sym)),
             Err(e) => tracing::warn!(symbol = %scip_sym, "G1: DB lookup: {e:#}"),
         }
     }
+
+    // Cross-file duplicate collapse: an unmatched def whose symbol unified in a
+    // different file is the same definition (Obj-C interface/implementation,
+    // C/C++ header/source). Alias it onto that node so it is dropped as a
+    // duplicate and its edges/refs rewrite onto the real node, and credit its
+    // symbol as unified so the miss-rate does not penalize the benign twin.
+    for (node_id, sym) in unmatched {
+        if let Some(&ts_id) = sym_to_ts.get(sym) {
+            aliases.push((sym.to_string(), ts_id));
+            alias_map.insert(node_id, ts_id);
+            // Only callable/type symbols feed the miss-rate; crediting a
+            // `variable` twin would let `unified` exceed `attempted`.
+            if attempted_syms.contains(sym) {
+                unified_syms.insert(sym);
+            }
+        }
+    }
+
+    let attempted = attempted_syms.len();
+    let unified = unified_syms.len();
 
     if let Err(e) = store.register_symbol_aliases(&aliases) {
         tracing::warn!("G1: register_symbol_aliases batch: {e:#}");

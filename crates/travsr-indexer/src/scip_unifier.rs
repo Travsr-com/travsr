@@ -34,6 +34,23 @@ pub struct ScipName<'a> {
 /// can feed every Phase B node through without pre-filtering by language.
 pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
     let descriptor_chain = symbol.split_whitespace().last()?;
+
+    // Namespace descriptor `Name/`: Obj-C emits protocols this way
+    // (`Speakable/`), and a protocol is a unifiable type (Phase A `protocol:`).
+    // Restrict to a SINGLE-segment name — multi-segment package paths
+    // (`github.com/org/repo/pkg/`, `com/example/`) are Go/Java packages that
+    // Phase A does not model, so they stay unparsed to avoid false unification.
+    if let Some(name) = descriptor_chain.strip_suffix('/') {
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        return Some(ScipName {
+            container: None,
+            name: strip_backticks(name),
+            kind: "class",
+        });
+    }
+
     let leaf = descriptor_chain
         .rsplit('/')
         .next()
@@ -340,6 +357,25 @@ mod tests {
     #[test]
     fn no_suffix_is_none() {
         assert_eq!(scip_name_kind("scip-go go pkg v1.0.0 something"), None);
+    }
+
+    #[test]
+    fn objc_protocol_namespace_descriptor_parses_as_class() {
+        // #596: ObjC protocols are emitted as `Name/`; they must parse as a
+        // type so they unify with the Phase A `protocol:` node.
+        let p = scip_name_kind("objc . local/objc 0.0.0 Speakable/").unwrap();
+        assert_eq!(p, parsed(None, "Speakable", "class"));
+        assert!(candidate_signatures(&p).contains(&"protocol:Speakable".to_string()));
+    }
+
+    #[test]
+    fn multi_segment_package_descriptor_is_none() {
+        // Go/Java package paths end in `/` too but are multi-segment and have
+        // no Phase A node — must stay unparsed to avoid false unification.
+        assert_eq!(
+            scip_name_kind("scip-go go github.com/org/repo v1.0.0 github.com/org/repo/pkg/"),
+            None
+        );
     }
 
     #[test]
