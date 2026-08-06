@@ -593,6 +593,31 @@ fn walk_for_ffi_attrs(
             travsr_core::VName::new(corpus, "", vname_path, "rust", format!("fn:{fn_name}"));
         let node_id = vname.id();
 
+        // L6: JNI native implementation — identified by the `Java_<pkg>_<Class>_
+        // <method>` naming the JNI spec mandates (typically `#[no_mangle] pub
+        // extern "system"/"C" fn Java_...`), not an attribute like napi/pyo3.
+        // The Java method name is the segment after the last `_` — JNI escapes
+        // a literal underscore in an identifier as `_1`, so an unescaped `_` is
+        // always a safe split point. `bound_name` carries it so the resolver's
+        // `effective_name()` matches `JniExport`'s bare Java method local_name.
+        if let Some(java_method) = fn_name
+            .strip_prefix("Java_")
+            .and_then(|rest| rest.rsplit('_').next())
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(m) = FfiMarker::try_new(
+                node_id,
+                FfiMarkerKind::JniCall,
+                fn_name.clone(),
+                Some(java_method.to_string()),
+                None,
+                None::<String>,
+                corpus,
+            ) {
+                out.push(m);
+            }
+        }
+
         for attr in &attrs {
             let attr_clean = attr.trim();
 
@@ -989,5 +1014,48 @@ mod tests {
             "Rust function signature must start with fn:"
         );
         assert_eq!(fn_node.vname.language, "rust");
+    }
+
+    // L6: a JNI native implementation function (`Java_<pkg>_<Class>_<method>`)
+    // must emit a JniCall marker whose effective name is the bare Java method
+    // name, so it string-matches a JniExport's local_name in the resolver.
+    #[test]
+    fn jni_native_impl_emits_jnicall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jni_bridge.rs");
+        std::fs::write(
+            &path,
+            br#"#[no_mangle]
+pub extern "system" fn Java_com_example_Foo_bar() {}
+"#,
+        )
+        .unwrap();
+        let out = parse("", &path, "jni_bridge.rs").unwrap();
+        let marker = out
+            .ffi_markers
+            .iter()
+            .find(|m| m.kind == FfiMarkerKind::JniCall)
+            .expect("expected a JniCall marker");
+        assert_eq!(
+            marker.effective_name(),
+            "bar",
+            "effective_name must be the bare Java method name (after the last _)"
+        );
+    }
+
+    // A plain Rust function whose name merely contains underscores must not be
+    // misdetected as a JNI bridge.
+    #[test]
+    fn non_jni_function_emits_no_jnicall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.rs");
+        std::fs::write(&path, b"pub fn do_the_thing() {}\n").unwrap();
+        let out = parse("", &path, "plain.rs").unwrap();
+        assert!(
+            !out.ffi_markers
+                .iter()
+                .any(|m| m.kind == FfiMarkerKind::JniCall),
+            "a non-Java_-prefixed function must not emit a JniCall marker"
+        );
     }
 }
