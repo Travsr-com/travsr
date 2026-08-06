@@ -539,7 +539,10 @@ impl PluginIndexer {
                                     Vec::new();
                                 match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
                                     Ok(Some(dump)) => {
-                                        let prefs = travsr_indexer::ingest_rust_positional(&dump);
+                                        let prefs = travsr_indexer::ingest_rust_positional(
+                                            &dump,
+                                            &repo_root.to_string_lossy(),
+                                        );
                                         tracing::debug!(
                                             positional_refs = prefs.len(),
                                             "Phase B: rust-analyzer LSIF positional refs parsed"

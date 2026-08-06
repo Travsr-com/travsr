@@ -1413,7 +1413,7 @@ pub fn init_repo_with_progress(
             // store (cross-file + incremental-safe) into attributable ScipRefs.
             // Fail closed — a callee that resolves to no node is dropped here, so
             // no dangling ref/call edge is ever written.
-            let mut lsif_covered: std::collections::HashSet<(String, u32)> =
+            let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
                 std::collections::HashSet::new();
             match store.resolve_lsif_positional_refs(&corpus, &pb_positional) {
                 Ok(resolved) => {
@@ -1422,13 +1422,11 @@ pub fn init_repo_with_progress(
                         resolved = resolved.len(),
                         "Phase B: rust-analyzer positional refs resolved"
                     );
-                    // E7: remember which call sites LSIF positionally resolved so
-                    // the native heuristic below can defer to them per-site.
-                    lsif_covered.extend(
-                        resolved
-                            .iter()
-                            .map(|r| (r.caller_path.clone(), r.caller_line)),
-                    );
+                    // E7: remember which call sites LSIF positionally resolved,
+                    // keyed by the resolved callee's leaf name too — a suppression
+                    // keyed only on (path, line) would drop a second real call
+                    // sharing the line with the one LSIF actually resolved (#I2).
+                    lsif_covered.extend(lsif_covered_keys(&store, &resolved));
                     pb_refs.extend(resolved);
                 }
                 Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
@@ -1703,6 +1701,52 @@ fn call_target_reachable(caller_path: &str, candidate_path: &str, crates: &Crate
         .unwrap_or(false)
 }
 
+/// Leaf identifier from a `kind:Qualified.Name` signature, e.g. `"filter"`
+/// from `"fn:Session.filter"` or `"method:Type.method"`. Shared by the E7
+/// LSIF per-callee suppression key and the native leaf-uniqueness resolver
+/// below, so both sides agree on what "the same callee" means.
+fn leaf_of(sig: &str) -> String {
+    let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
+    body.rsplit('.').next().unwrap_or(body).to_string()
+}
+
+/// E7 (#I2): build the `(caller_path, caller_line, callee_leaf)` suppression
+/// keys for a batch of positionally-resolved `ScipRef`s. Batch-fetches each
+/// resolved callee's own node to recover its signature leaf, so suppression
+/// is scoped to the specific callee LSIF resolved rather than the whole
+/// source line — a second real call sharing that line is not also dropped.
+/// A ref whose callee node lookup fails is skipped (fail open on suppression,
+/// never fail closed on emission — the native heuristic may then duplicate
+/// it, which is the pre-existing worst case, not a new one).
+fn lsif_covered_keys(
+    store: &SqliteStore,
+    resolved: &[travsr_core::ScipRef],
+) -> Vec<(String, u32, String)> {
+    let callee_ids: Vec<travsr_core::NodeId> = {
+        let mut ids: Vec<travsr_core::NodeId> = resolved.iter().map(|r| r.callee_id).collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        ids
+    };
+    let callee_leaves: std::collections::HashMap<travsr_core::NodeId, String> = store
+        .get_nodes(&callee_ids)
+        .unwrap_or_else(|e| {
+            tracing::warn!("lsif_covered: callee node lookup failed: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|n| (n.id, leaf_of(&n.vname.signature)))
+        .collect();
+    resolved
+        .iter()
+        .filter_map(|r| {
+            callee_leaves
+                .get(&r.callee_id)
+                .map(|leaf| (r.caller_path.clone(), r.caller_line, leaf.clone()))
+        })
+        .collect()
+}
+
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
@@ -1730,9 +1774,11 @@ fn resolve_unresolved_calls(
     unresolved: &[travsr_core::UnresolvedCall],
     pb_nodes: &[travsr_core::Node],
     pb_edges: &[travsr_core::Edge],
-    // E7: call sites (caller_path, caller_line) already resolved by E3's
-    // positional rust-analyzer LSIF path. The native heuristic defers to them.
-    lsif_covered: &std::collections::HashSet<(String, u32)>,
+    // E7: call sites (caller_path, caller_line, callee_leaf) already resolved
+    // by E3's positional rust-analyzer LSIF path. The native heuristic defers
+    // to them, per callee — not per line, so a second real call sharing the
+    // line with an LSIF-covered one is not also dropped (#I2).
+    lsif_covered: &std::collections::HashSet<(String, u32, String)>,
 ) -> (
     Vec<travsr_core::Edge>,
     Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
@@ -1771,10 +1817,6 @@ fn resolve_unresolved_calls(
     // a bare `fn:method` sig; when the definition is a qualified `fn:Type.method`
     // node the exact pass above misses it. Look up the still-unmatched sigs by
     // leaf identifier and resolve only when the leaf is unique (precision).
-    let leaf_of = |sig: &str| -> String {
-        let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
-        body.rsplit('.').next().unwrap_or(body).to_string()
-    };
     let unmatched_leaves: Vec<String> = {
         let mut v: Vec<String> = unresolved
             .iter()
@@ -1947,7 +1989,12 @@ fn resolve_unresolved_calls(
         // heuristic as the full fallback — its intended E7 role.
         if !lsif_covered.is_empty() {
             let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
-            if lsif_covered.contains(&(caller_path.to_owned(), u.caller_line)) {
+            let key = (
+                caller_path.to_owned(),
+                u.caller_line,
+                leaf_of(&u.callee_sig),
+            );
+            if lsif_covered.contains(&key) {
                 continue;
             }
         }
@@ -2007,10 +2054,20 @@ fn resolve_unresolved_calls(
         // (`ffi_resolver.rs`), which this filter does not touch — so no real
         // cross-language edge is ever suppressed here.
         let caller_lang = caller_langs.get(&u.src).map(String::as_str).unwrap_or("");
-        let matches: Vec<(travsr_core::NodeId, &str, &str)> = matches
-            .into_iter()
-            .filter(|(_, _, lang)| *lang == caller_lang)
-            .collect();
+        // #I3: an empty caller_lang would filter every candidate to nothing and
+        // silently drop a real call. No Phase A node-construction path leaves
+        // `vname.language` empty for a function/method node (verified across
+        // 16 fixture languages plus this repo's own multi-language index), but
+        // guard anyway — a future gap then degrades to pre-E4 behavior
+        // (candidates unfiltered by language) instead of dropping the call.
+        let matches: Vec<(travsr_core::NodeId, &str, &str)> = if caller_lang.is_empty() {
+            matches
+        } else {
+            matches
+                .into_iter()
+                .filter(|(_, _, lang)| *lang == caller_lang)
+                .collect()
+        };
         if matches.is_empty() {
             continue;
         }
@@ -2651,7 +2708,7 @@ fn run_background_phase_b_inner(
     // E3 W3b: resolve rust-analyzer LSIF positional refs against the full store
     // (cross-file + incremental-safe). Fail closed — unresolved callees dropped,
     // never dangled.
-    let mut lsif_covered: std::collections::HashSet<(String, u32)> =
+    let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
         std::collections::HashSet::new();
     match s.resolve_lsif_positional_refs(&corpus, &pb_positional) {
         Ok(resolved) => {
@@ -2660,13 +2717,9 @@ fn run_background_phase_b_inner(
                 resolved = resolved.len(),
                 "Phase B: rust-analyzer positional refs resolved"
             );
-            // E7: remember which call sites LSIF positionally resolved so the
-            // native heuristic below can defer to them per-site.
-            lsif_covered.extend(
-                resolved
-                    .iter()
-                    .map(|r| (r.caller_path.clone(), r.caller_line)),
-            );
+            // E7: remember which call sites LSIF positionally resolved, keyed
+            // by the resolved callee's leaf name too (#I2) — see lsif_covered_keys.
+            lsif_covered.extend(lsif_covered_keys(&s, &resolved));
             pb_refs.extend(resolved);
         }
         Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
@@ -3908,11 +3961,15 @@ mod tests {
             recv_type: None,
         };
 
-        // The LSIF positional path covered the call on line 8 of the caller's
-        // file, but not the one on line 12.
-        let mut lsif_covered: std::collections::HashSet<(String, u32)> =
+        // The LSIF positional path covered the `filter` call on line 8 of the
+        // caller's file, but not the one on line 12.
+        let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
             std::collections::HashSet::new();
-        lsif_covered.insert(("crates/crate-a/src/lib.rs".to_string(), 8));
+        lsif_covered.insert((
+            "crates/crate-a/src/lib.rs".to_string(),
+            8,
+            "filter".to_string(),
+        ));
 
         // Covered site → native heuristic must defer (0 edges) even though the
         // unique-leaf match would otherwise fire (cf. t9, same setup).
@@ -3932,6 +3989,131 @@ mod tests {
             "E7: an uncovered call site must still resolve natively: {edges_residual:?}"
         );
         assert_eq!(edges_residual[0].dst, callee.id);
+    }
+
+    #[test]
+    fn t12_e7_suppression_is_per_callee_not_per_line() {
+        // I2: two calls on the same physical line, only one of which LSIF
+        // positionally resolved. Suppression keyed on (path, line) alone would
+        // drop both; keyed on (path, line, callee_leaf) it must drop only the
+        // LSIF-covered callee and still resolve the other one natively.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let filter_callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&filter_callee).unwrap();
+
+        let count_callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.count",
+            ),
+            "method",
+        );
+        store.put_node(&count_callee).unwrap();
+
+        // Both calls are on line 8 (e.g. `s.filter(x).count()`), but LSIF only
+        // resolved the `filter` callee on that line.
+        let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
+            std::collections::HashSet::new();
+        lsif_covered.insert((
+            "crates/crate-a/src/lib.rs".to_string(),
+            8,
+            "filter".to_string(),
+        ));
+
+        let calls = vec![
+            travsr_core::UnresolvedCall {
+                src: caller.id,
+                callee_sig: "fn:filter".to_string(),
+                hint_crate: None,
+                caller_line: 8,
+                is_method_call: true,
+                recv_type: None,
+            },
+            travsr_core::UnresolvedCall {
+                src: caller.id,
+                callee_sig: "fn:count".to_string(),
+                hint_crate: None,
+                caller_line: 8,
+                is_method_call: true,
+                recv_type: None,
+            },
+        ];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &calls, &[], &[], &lsif_covered);
+        assert_eq!(
+            edges.len(),
+            1,
+            "only the LSIF-covered callee (filter) must be suppressed: {edges:?}"
+        );
+        assert_eq!(
+            edges[0].dst, count_callee.id,
+            "the uncovered callee (count) sharing the same line must still resolve natively"
+        );
+    }
+
+    #[test]
+    fn e4_empty_caller_language_falls_through_to_unfiltered_matches() {
+        // #I3: a caller node with an empty `vname.language` (should not occur
+        // in practice — see the guard's comment at the E4 filter site) must
+        // not have every candidate filtered to nothing by the language scope.
+        // It must fall through to pre-E4 behavior and still resolve.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/caller.rs", "", "fn:run"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "src/helper.rs", "rust", "fn:helper"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 4,
+            is_method_call: false,
+            recv_type: None,
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "empty caller_lang must not filter out the only candidate: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
     }
 
     #[test]

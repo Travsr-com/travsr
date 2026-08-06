@@ -176,8 +176,12 @@ fn dart_enum_and_typedef_emitted() {
 
 #[test]
 fn swift_typealias_and_struct_emitted() {
-    // tree-sitter-swift parses struct/enum/actor as class_declaration — the
-    // existing class capture must cover them (sig prefix `class:`).
+    // N4d: struct/enum/actor/extension no longer collapse to kind `class` —
+    // each gets its own distinct signature prefix (see
+    // travsr_analysis::swift::tests::n4d_distinct_type_kinds). The SCIP
+    // unifier's `class`-kind candidate set was extended in lockstep to accept
+    // `struct:`/`enum:`/`actor:` as valid unification targets, so this split
+    // does not break G1 unification.
     let s = sigs(
         "typealias Velocity = Double\nstruct Point { var x: Double }\nenum Direction { case north }\n",
         "swift",
@@ -187,12 +191,12 @@ fn swift_typealias_and_struct_emitted() {
         "swift: missing type:Velocity — got {s:?}"
     );
     assert!(
-        s.contains("class:Point"),
-        "swift: struct must emit class:Point — got {s:?}"
+        s.contains("struct:Point"),
+        "swift: missing struct:Point — got {s:?}"
     );
     assert!(
-        s.contains("class:Direction"),
-        "swift: enum must emit class:Direction — got {s:?}"
+        s.contains("enum:Direction"),
+        "swift: missing enum:Direction — got {s:?}"
     );
 }
 

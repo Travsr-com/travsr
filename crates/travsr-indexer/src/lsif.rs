@@ -765,8 +765,17 @@ pub fn ingest_rust_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
 /// node) — fail closed by construction.
 ///
 /// O(N) over dump lines plus O(occurrences × defs-per-symbol) for the emit pass.
-pub fn ingest_rust_positional(dump: &str) -> Vec<travsr_core::LsifPositionalRef> {
-    let mut project_root = String::new();
+///
+/// `repo_root` is the daemon's own repo root (the same base `Node::vname.path`
+/// is made relative to), NOT rust-analyzer's self-reported LSIF `projectRoot`.
+/// For a Cargo workspace member, rust-analyzer's `projectRoot` can diverge from
+/// the repo root (e.g. a member sub-root); using it here would make
+/// `caller_path`/`callee_def_path` relative to the wrong base, so they would
+/// never match a real `Node::vname.path` — silently failing every positional
+/// ref closed (#I4) instead of resolving. Always relativize against the
+/// caller-supplied `repo_root` so both sides of every downstream comparison
+/// (`resolve_lsif_positional_refs`, E7's `lsif_covered`) agree.
+pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::LsifPositionalRef> {
     let mut doc_paths: HashMap<u64, String> = HashMap::new();
     let mut range_lines: HashMap<u64, u32> = HashMap::new();
     // range id → resultSet id (the `next` edge).
@@ -789,11 +798,6 @@ pub fn ingest_rust_positional(dump: &str) -> Vec<travsr_core::LsifPositionalRef>
         };
         match v.get("type").and_then(|t| t.as_str()) {
             Some("vertex") => match v.get("label").and_then(|l| l.as_str()) {
-                Some("metaData") => {
-                    if let Some(root) = v.get("projectRoot").and_then(|r| r.as_str()) {
-                        project_root = root.strip_prefix("file://").unwrap_or(root).to_string();
-                    }
-                }
                 Some("document") => {
                     if let (Some(id), Some(uri)) = (
                         v.get("id").and_then(|i| i.as_u64()),
@@ -889,7 +893,7 @@ pub fn ingest_rust_positional(dump: &str) -> Vec<travsr_core::LsifPositionalRef>
         let Some(targets) = items.get(defres) else {
             continue;
         };
-        let caller_path = make_relative(&project_root, caller_abs);
+        let caller_path = make_relative(repo_root, caller_abs);
         for (tdoc, trid) in targets {
             let (Some(def_abs), Some(&def_line0)) = (doc_paths.get(tdoc), range_lines.get(trid))
             else {
@@ -898,7 +902,7 @@ pub fn ingest_rust_positional(dump: &str) -> Vec<travsr_core::LsifPositionalRef>
             out.push(travsr_core::LsifPositionalRef {
                 caller_path: caller_path.clone(),
                 caller_line: caller_line0 + 1,
-                callee_def_path: make_relative(&project_root, def_abs),
+                callee_def_path: make_relative(repo_root, def_abs),
                 callee_def_line: def_line0 + 1,
             });
         }
@@ -1004,7 +1008,7 @@ mod rust_lsif_tests {
 {"id":231,"type":"edge","label":"item","document":2,"property":"definitions","inVs":[11],"outV":61}
 {"id":232,"type":"edge","label":"item","document":99,"property":"definitions","inVs":[70],"outV":62}
 "#;
-        let mut out = ingest_rust_positional(dump);
+        let mut out = ingest_rust_positional(dump, "/repo");
         out.sort_by(|a, b| {
             a.callee_def_path
                 .cmp(&b.callee_def_path)
@@ -1025,6 +1029,43 @@ mod rust_lsif_tests {
         assert_eq!(out[2].callee_def_path, "src/types.rs");
         assert_eq!(out[2].callee_def_line, 7);
         assert_eq!(out[2].caller_line, 7);
+    }
+
+    #[test]
+    fn ingest_rust_positional_ignores_dump_project_root_divergence() {
+        // #I4: rust-analyzer's self-reported LSIF `projectRoot` can diverge from
+        // the daemon's actual repo root (e.g. a Cargo workspace member
+        // sub-root). Relativizing against the dump's `projectRoot` here would
+        // produce a `caller_path`/`callee_def_path` that never matches a real
+        // `Node::vname.path` downstream, silently dropping every positional
+        // ref. The dump below self-reports `projectRoot":"file:///repo/crates/foo"`
+        // (a workspace member sub-root), but the caller passes the real repo
+        // root `/repo` — paths must come out relative to `/repo`, not the
+        // dump's claim.
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo/crates/foo","positionEncoding":"utf-16","toolInfo":{"name":"rust-analyzer","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///repo/crates/foo/src/lib.rs"}
+{"id":3,"type":"vertex","label":"document","uri":"file:///repo/crates/foo/src/helper.rs"}
+{"id":10,"type":"vertex","label":"range","start":{"line":1,"character":0},"end":{"line":1,"character":4}}
+{"id":20,"type":"vertex","label":"range","start":{"line":5,"character":6},"end":{"line":5,"character":12}}
+{"id":50,"type":"vertex","label":"resultSet"}
+{"id":60,"type":"vertex","label":"definitionResult"}
+{"id":200,"type":"edge","label":"contains","outV":3,"inVs":[10]}
+{"id":201,"type":"edge","label":"contains","outV":2,"inVs":[20]}
+{"id":210,"type":"edge","label":"next","outV":20,"inV":50}
+{"id":220,"type":"edge","label":"textDocument/definition","outV":50,"inV":60}
+{"id":230,"type":"edge","label":"item","document":3,"property":"definitions","inVs":[10],"outV":60}
+"#;
+        let out = ingest_rust_positional(dump, "/repo");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].caller_path, "crates/foo/src/lib.rs",
+            "caller_path must be relative to the real repo root, not the dump's projectRoot"
+        );
+        assert_eq!(
+            out[0].callee_def_path, "crates/foo/src/helper.rs",
+            "callee_def_path must be relative to the real repo root, not the dump's projectRoot"
+        );
     }
 
     #[test]

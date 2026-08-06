@@ -536,6 +536,70 @@ fn rust_vname(corpus: &str, path: &str, signature: &str) -> VName {
 
 // ── FFI marker collection (RFC-005) ──────────────────────────────────────────
 
+/// Best-effort demangle of a JNI native-method name (the part of the mangled
+/// symbol after the `Java_` prefix, before any overload signature). The
+/// package/class/method boundary is genuinely ambiguous without the Java
+/// side (all three are `_`-separated), so this keeps the existing
+/// last-segment heuristic for that boundary but correctly unescapes JNI's
+/// underscore-escaping (`_1` -> `_`, `_2` -> `;`, `_3` -> `[`,
+/// `_0XXXX` -> unicode) so an escaped underscore inside the method name is
+/// not mistaken for a segment delimiter. Fails closed (`None`) on anything
+/// that does not look like an unambiguous bare method name.
+fn jni_demangle_method(rest: &str) -> Option<String> {
+    // Drop the overload-signature suffix (`__<argsig>`) before demangling.
+    let rest = rest.split("__").next().unwrap_or(rest);
+
+    let chars: Vec<char> = rest.chars().collect();
+    let mut segments: Vec<String> = vec![String::new()];
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '_' {
+            match chars.get(i + 1) {
+                Some('1') => {
+                    segments.last_mut().unwrap().push('_');
+                    i += 2;
+                }
+                Some('2') => {
+                    segments.last_mut().unwrap().push(';');
+                    i += 2;
+                }
+                Some('3') => {
+                    segments.last_mut().unwrap().push('[');
+                    i += 2;
+                }
+                Some('0') if chars.len() >= i + 6 => {
+                    let hex: String = chars[i + 2..i + 6].iter().collect();
+                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    segments.last_mut().unwrap().push(char::from_u32(code)?);
+                    i += 6;
+                }
+                _ => {
+                    // A real, unescaped underscore: package/class/method boundary.
+                    segments.push(String::new());
+                    i += 1;
+                }
+            }
+        } else {
+            segments.last_mut().unwrap().push(chars[i]);
+            i += 1;
+        }
+    }
+
+    // Require package + class + method (>= 3 segments) so a bare `Java_foo`
+    // is not misdetected as a JNI bridge.
+    if segments.len() < 3 {
+        return None;
+    }
+    let method = segments.last().unwrap();
+    // `;`/`[` are signature-escape artifacts (`_2`/`_3`) that should never
+    // appear in a bare method name; their presence means the split landed
+    // somewhere unexpected, so bail rather than emit a junk name.
+    if method.is_empty() || method.contains(';') || method.contains('[') {
+        return None;
+    }
+    Some(method.clone())
+}
+
 /// Walk the AST looking for #[napi] and #[pyfunction] attribute items on functions,
 /// emitting FfiMarker records for the ffi_resolver.
 pub fn collect_ffi_markers(
@@ -596,20 +660,19 @@ fn walk_for_ffi_attrs(
         // L6: JNI native implementation — identified by the `Java_<pkg>_<Class>_
         // <method>` naming the JNI spec mandates (typically `#[no_mangle] pub
         // extern "system"/"C" fn Java_...`), not an attribute like napi/pyo3.
-        // The Java method name is the segment after the last `_` — JNI escapes
-        // a literal underscore in an identifier as `_1`, so an unescaped `_` is
-        // always a safe split point. `bound_name` carries it so the resolver's
-        // `effective_name()` matches `JniExport`'s bare Java method local_name.
-        if let Some(java_method) = fn_name
-            .strip_prefix("Java_")
-            .and_then(|rest| rest.rsplit('_').next())
-            .filter(|s| !s.is_empty())
-        {
+        // The last `_`-delimited segment is a heuristic, not a real demangle: the
+        // package/class/method boundary is ambiguous without the Java side, since
+        // all three are `_`-separated. `jni_demangle_method` truncates the overload
+        // signature and unescapes `_1`/`_2`/`_3` in the extracted segment, but a
+        // method name containing an escaped underscore (`_1`) still can't be told
+        // apart from a package/class boundary here, so this remains fail-closed:
+        // ambiguous or unescapable input yields `None` rather than a junk name.
+        if let Some(java_method) = fn_name.strip_prefix("Java_").and_then(jni_demangle_method) {
             if let Some(m) = FfiMarker::try_new(
                 node_id,
                 FfiMarkerKind::JniCall,
                 fn_name.clone(),
-                Some(java_method.to_string()),
+                Some(java_method),
                 None,
                 None::<String>,
                 corpus,
@@ -1056,6 +1119,77 @@ pub extern "system" fn Java_com_example_Foo_bar() {}
                 .iter()
                 .any(|m| m.kind == FfiMarkerKind::JniCall),
             "a non-Java_-prefixed function must not emit a JniCall marker"
+        );
+    }
+
+    // Overloaded native: JNI appends `__<argsig>` for overload resolution.
+    // The demangler must drop the signature suffix, not treat it as part of
+    // the method name.
+    #[test]
+    fn jni_overloaded_native_emits_bare_method_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jni_overload.rs");
+        std::fs::write(
+            &path,
+            br#"#[no_mangle]
+pub extern "system" fn Java_com_example_Foo_bar__ILjava_lang_String_2() {}
+"#,
+        )
+        .unwrap();
+        let out = parse("", &path, "jni_overload.rs").unwrap();
+        let marker = out
+            .ffi_markers
+            .iter()
+            .find(|m| m.kind == FfiMarkerKind::JniCall)
+            .expect("expected a JniCall marker");
+        assert_eq!(
+            marker.effective_name(),
+            "bar",
+            "overload signature suffix must be dropped from the method name"
+        );
+    }
+
+    // Underscored method: JNI escapes a literal `_` in an identifier as `_1`.
+    // The demangler must unescape it back to a real underscore rather than
+    // treating it as a segment boundary.
+    #[test]
+    fn jni_underscored_method_name_is_unescaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jni_underscored.rs");
+        std::fs::write(
+            &path,
+            br#"#[no_mangle]
+pub extern "system" fn Java_com_example_Foo_do_1work() {}
+"#,
+        )
+        .unwrap();
+        let out = parse("", &path, "jni_underscored.rs").unwrap();
+        let marker = out
+            .ffi_markers
+            .iter()
+            .find(|m| m.kind == FfiMarkerKind::JniCall)
+            .expect("expected a JniCall marker");
+        assert_eq!(
+            marker.effective_name(),
+            "do_work",
+            "an escaped underscore (_1) in the method name must be unescaped, not treated as a boundary"
+        );
+    }
+
+    // A bare `Java_foo` (no package/class segments) must not emit a marker:
+    // without at least three `_`-separated segments there is no method
+    // boundary to anchor on, so this stays fail-closed.
+    #[test]
+    fn jni_bare_java_prefix_emits_no_jnicall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("java_foo.rs");
+        std::fs::write(&path, b"pub fn Java_foo() {}\n").unwrap();
+        let out = parse("", &path, "java_foo.rs").unwrap();
+        assert!(
+            !out.ffi_markers
+                .iter()
+                .any(|m| m.kind == FfiMarkerKind::JniCall),
+            "Java_foo has no package/class/method segments and must not emit a JniCall marker"
         );
     }
 }
