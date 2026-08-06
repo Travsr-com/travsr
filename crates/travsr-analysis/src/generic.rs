@@ -51,10 +51,40 @@ pub struct LanguageConfig {
     /// ancestor whose kind is listed here. Empty ⇒ the 1-hop span is already
     /// correct for this grammar (name is a direct child of its declaration).
     pub decl_kinds: &'static [&'static str],
+    /// N4d refiners for grammars that fold several type kinds into one AST node
+    /// with no distinguishing field (unlike Swift's `declaration_kind`).
+    /// tree-sitter-kotlin-ng folds `class`/`interface`/`enum class` into
+    /// `class_declaration`, distinguished by a signal node: the `interface`
+    /// keyword (a direct child) or the `enum` class-modifier token (inside the
+    /// `modifiers` subtree). A query-only split would regress bare/constructor
+    /// classes, so the broad query stays and the kind is refined in Rust
+    /// (`refine_type`). Empty ⇒ no folding to refine (every non-Kotlin config).
+    pub type_refinements: &'static [TypeRefinement],
     /// Returns the tree-sitter grammar for this language.
     /// Stored as a function pointer so `LanguageConfig` is `const`-constructible
     /// (tree-sitter `Language` itself is not directly `const`-constructible).
     pub get_grammar: fn() -> tree_sitter::Language,
+}
+
+/// N4d: refine a folded type declaration's kind by the presence of a signal
+/// node (`has_child_kind`) among the decl's direct children OR inside its
+/// `modifiers` subtree. The modifiers subtree is scanned because grammars put
+/// discriminating class modifiers there (Kotlin `enum` is
+/// `class_declaration > modifiers > class_modifier > enum`), while a keyword
+/// like `interface` is a direct child. The declaration *body* is deliberately
+/// never scanned — a signal there could belong to a nested type. Applied both
+/// to the type node's own emission and to the containment prefix of methods
+/// nested inside it.
+pub struct TypeRefinement {
+    /// The folded declaration node kind, e.g. `"class_declaration"`.
+    pub decl_kind: &'static str,
+    /// A signal node kind (direct child or modifier token) whose presence
+    /// identifies the refined kind, e.g. `"interface"` / `"enum"`.
+    pub has_child_kind: &'static str,
+    /// Refined node kind, e.g. `"enum"` / `"interface"`.
+    pub kind: &'static str,
+    /// Refined signature prefix, e.g. `"enum"` / `"interface"`.
+    pub prefix: &'static str,
 }
 
 /// Parse `abs_path` using the given grammar and `LanguageConfig`.
@@ -117,6 +147,20 @@ pub fn parse_with_config(
                 continue;
             };
 
+            // N4d: if the captured name's declaration is a folded type node
+            // (Kotlin `class_declaration` covering class/interface/enum),
+            // refine its kind+prefix from the decl's direct children. Only
+            // fires when the parent kind matches a declared refinement, so
+            // `fn`/`import`/object captures are untouched.
+            let (node_kind, sig_prefix) = match cap
+                .node
+                .parent()
+                .and_then(|p| refine_type(p, config.type_refinements))
+            {
+                Some(r) => (r.kind, r.prefix),
+                None => (node_kind, sig_prefix),
+            };
+
             let text = cap.node.utf8_text(&source).unwrap_or("").trim();
             if text.is_empty() {
                 continue;
@@ -133,7 +177,12 @@ pub fn parse_with_config(
             // (`method:Type.name`, collision-free per Invariant #1) and parent
             // its containment edge to the container node, not the file.
             let enclosing = if sig_prefix == "fn" {
-                enclosing_container(cap.node, config.method_containers, &source)
+                enclosing_container(
+                    cap.node,
+                    config.method_containers,
+                    config.type_refinements,
+                    &source,
+                )
             } else {
                 None
             };
@@ -222,6 +271,7 @@ fn decl_end_line(node: tree_sitter::Node<'_>, decl_kinds: &[&str]) -> Option<u32
 fn enclosing_container<'a>(
     node: tree_sitter::Node<'_>,
     method_containers: &[(&'static str, &'a str)],
+    type_refinements: &[TypeRefinement],
     source: &[u8],
 ) -> Option<(&'a str, String)> {
     let mut cur = node.parent();
@@ -229,14 +279,15 @@ fn enclosing_container<'a>(
         if let Some((_, prefix)) = method_containers.iter().find(|(kind, _)| *kind == n.kind()) {
             if let Some(name) = container_name(n, source) {
                 // N4d: grammars that fold several type kinds into one AST node
-                // (tree-sitter-swift's `class_declaration` covers
-                // class/struct/enum/actor/extension) disambiguate via a
-                // `declaration_kind` keyword field. When present, the container
-                // is emitted under that keyword's signature prefix, so the
-                // method's containment edge must target `{keyword}:{name}`, not
-                // the static `method_containers` prefix. Absent that field the
-                // static prefix is used (every non-Swift grammar).
-                let prefix = container_kind_prefix(n, source).unwrap_or(prefix);
+                // disambiguate either via a `declaration_kind` keyword field
+                // (tree-sitter-swift: class/struct/enum/actor/extension) or via
+                // a distinguishing direct child (tree-sitter-kotlin-ng:
+                // interface/enum via `type_refinements`). When either resolves,
+                // the container is emitted under that refined prefix, so the
+                // method's containment edge must target `{prefix}:{name}` to
+                // match. Absent both, the static `method_containers` prefix is
+                // used (every non-Swift/Kotlin grammar).
+                let prefix = container_kind_prefix(n, type_refinements, source).unwrap_or(prefix);
                 return Some((prefix, name));
             }
         }
@@ -245,12 +296,19 @@ fn enclosing_container<'a>(
     None
 }
 
-/// N4d: if `node` carries a `declaration_kind` keyword field (tree-sitter-swift),
-/// return the matching `&'static` signature prefix so a folded type node
-/// (`struct`/`enum`/`actor`/`extension`/`class`) and its members' containment
-/// edges agree on the container's VName. Returns `None` for grammars without the
-/// field, leaving the caller's static prefix in force.
-fn container_kind_prefix(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<&'static str> {
+/// N4d: resolve the refined signature prefix of a folded type container so the
+/// node and its members' containment edges agree on its VName. Checks the
+/// child-based `type_refinements` first (Kotlin interface/enum), then the
+/// Swift-style `declaration_kind` keyword field. Returns `None` when neither
+/// applies, leaving the caller's static prefix in force.
+fn container_kind_prefix(
+    node: tree_sitter::Node<'_>,
+    type_refinements: &[TypeRefinement],
+    source: &[u8],
+) -> Option<&'static str> {
+    if let Some(r) = refine_type(node, type_refinements) {
+        return Some(r.prefix);
+    }
     let kw = node
         .child_by_field_name("declaration_kind")?
         .utf8_text(source)
@@ -263,6 +321,46 @@ fn container_kind_prefix(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<&
         "extension" => Some("extension"),
         "class" => Some("class"),
         _ => None,
+    }
+}
+
+/// N4d: refine a folded type declaration by inspecting its direct children and
+/// its `modifiers` subtree. Returns the first refinement (list order = the
+/// tie-break) whose `decl_kind` matches `decl.kind()` and whose `has_child_kind`
+/// appears as a direct child or a `modifiers` descendant. `None` when `decl` is
+/// not a folded type node or no refinement matches (the common case:
+/// `type_refinements` is empty for every non-Kotlin config).
+fn refine_type<'r>(
+    decl: tree_sitter::Node<'_>,
+    type_refinements: &'r [TypeRefinement],
+) -> Option<&'r TypeRefinement> {
+    if type_refinements.is_empty() {
+        return None;
+    }
+    let kind = decl.kind();
+    // Signal kinds: the decl's direct children, plus every node kind inside a
+    // `modifiers` child (where class-level modifiers like `enum`/`sealed` live).
+    // The body is not scanned so a nested type cannot leak its keyword upward.
+    let mut signals: Vec<&str> = Vec::new();
+    let mut walk = decl.walk();
+    for child in decl.children(&mut walk) {
+        signals.push(child.kind());
+        if child.kind() == "modifiers" {
+            collect_descendant_kinds(child, &mut signals);
+        }
+    }
+    type_refinements
+        .iter()
+        .find(|r| r.decl_kind == kind && signals.contains(&r.has_child_kind))
+}
+
+/// Collect the kinds of every descendant of `node` (used to flatten a small
+/// `modifiers` subtree so nested modifier tokens like `enum` are visible).
+fn collect_descendant_kinds<'a>(node: tree_sitter::Node<'a>, out: &mut Vec<&'a str>) {
+    let mut walk = node.walk();
+    for child in node.children(&mut walk) {
+        out.push(child.kind());
+        collect_descendant_kinds(child, out);
     }
 }
 

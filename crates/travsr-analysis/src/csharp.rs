@@ -44,6 +44,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum_declaration", "enum"),
     ],
     decl_kinds: &[],
+    type_refinements: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
 };
 

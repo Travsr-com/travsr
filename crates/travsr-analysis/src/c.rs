@@ -33,6 +33,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     // C has no methods; every `fn` capture is a free function.
     method_containers: &[],
     decl_kinds: &["function_definition"],
+    type_refinements: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
 };
 

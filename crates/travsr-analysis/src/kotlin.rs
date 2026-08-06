@@ -4,7 +4,7 @@ use std::path::Path;
 
 use travsr_core::Language;
 
-use crate::generic::{parse_with_config, LanguageConfig};
+use crate::generic::{parse_with_config, LanguageConfig, TypeRefinement};
 use crate::ParseOutput;
 
 pub const CONFIG: LanguageConfig = LanguageConfig {
@@ -29,6 +29,32 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("object_declaration", "class"),
     ],
     decl_kinds: &[],
+    // N4d: tree-sitter-kotlin-ng folds interface/enum into `class_declaration`.
+    // Signals (verified via parse dumps, all children()-based; note `enum` and
+    // `sealed`/`data`/`abstract` live inside a `modifiers > class_modifier`
+    // subtree, which `refine_type` scans in addition to direct children):
+    //   * interface: the `interface` keyword is a direct child (present even
+    //     with a body).
+    //   * enum: an `enum` class-modifier token. NOT `enum_class_body` — that
+    //     node also appears via error recovery on plain constructor-classes
+    //     (`class C(x) { ... }`) and interfaces, so it is not a sound signal.
+    // Interface is checked first (order in this list is the tie-break). Bare /
+    // constructor / data / annotation / sealed classes carry neither signal and
+    // stay `class`.
+    type_refinements: &[
+        TypeRefinement {
+            decl_kind: "class_declaration",
+            has_child_kind: "interface",
+            kind: "interface",
+            prefix: "interface",
+        },
+        TypeRefinement {
+            decl_kind: "class_declaration",
+            has_child_kind: "enum",
+            kind: "enum",
+            prefix: "enum",
+        },
+    ],
     get_grammar: || tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
 };
 
@@ -41,6 +67,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use travsr_core::EdgeKind;
 
     #[test]
     fn parse_empty_file() {
@@ -66,5 +93,109 @@ mod tests {
         assert!(kinds.contains(&"object"));
         assert!(kinds.contains(&"function"));
         assert!(kinds.contains(&"import"));
+    }
+
+    fn parse_src(name: &str, src: &str) -> ParseOutput {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, src).unwrap();
+        parse("corp", &path, name).unwrap()
+    }
+
+    fn sigs(out: &ParseOutput) -> Vec<&str> {
+        out.nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn n4d_refines_interface_and_enum_without_regressing_class() {
+        // R5 (N4d): the folded `class_declaration` is refined to distinct kinds
+        // by a signal node. Bare/constructor/data classes carry neither the
+        // `interface` keyword nor an `enum` modifier, so they stay `class`.
+        let out = parse_src(
+            "kinds.kt",
+            "class C\ninterface I\nenum class E { A }\nclass Bare\nclass P(val x: Int)\ndata class D(val y: Int)\n",
+        );
+        let kind_of = |sig: &str| -> &str {
+            out.nodes
+                .iter()
+                .find(|n| n.vname.signature == sig)
+                .unwrap_or_else(|| panic!("no node {sig}; got {:?}", sigs(&out)))
+                .kind
+                .as_str()
+        };
+        assert_eq!(kind_of("class:C"), "class");
+        assert_eq!(kind_of("class:Bare"), "class");
+        assert_eq!(kind_of("class:P"), "class");
+        assert_eq!(kind_of("class:D"), "class");
+        assert_eq!(kind_of("interface:I"), "interface");
+        assert_eq!(kind_of("enum:E"), "enum");
+
+        // No stale `class:I` / `class:E` twin left behind, and nothing emitted
+        // twice.
+        assert!(
+            !out.nodes.iter().any(|n| n.vname.signature == "class:I"),
+            "interface must not also emit class:I"
+        );
+        assert!(
+            !out.nodes.iter().any(|n| n.vname.signature == "class:E"),
+            "enum must not also emit class:E"
+        );
+        for sig in ["class:C", "interface:I", "enum:E"] {
+            assert_eq!(
+                out.nodes
+                    .iter()
+                    .filter(|n| n.vname.signature == sig)
+                    .count(),
+                1,
+                "{sig} emitted more than once"
+            );
+        }
+    }
+
+    #[test]
+    fn n4d_methods_parent_to_refined_container_no_dangling() {
+        // R5: a method inside `enum class E` / `interface I` must have its
+        // containment edge parented to `enum:E` / `interface:I` (the refined
+        // container VName), not a nonexistent `class:E` / `class:I` — else the
+        // edge dangles.
+        let out = parse_src(
+            "members.kt",
+            "interface I {\n    fun ping() {}\n}\nenum class E {\n    A;\n    fun tick() {}\n}\n",
+        );
+        let node_id = |sig: &str| {
+            out.nodes
+                .iter()
+                .find(|n| n.vname.signature == sig)
+                .unwrap_or_else(|| panic!("no node {sig}; got {:?}", sigs(&out)))
+                .id
+        };
+        let iface = node_id("interface:I");
+        let enum_e = node_id("enum:E");
+        let ping = node_id("method:I.ping");
+        let tick = node_id("method:E.tick");
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == iface && e.dst == ping && e.kind == EdgeKind::DefinesBinding),
+            "interface:I → method:I.ping containment edge missing"
+        );
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == enum_e && e.dst == tick && e.kind == EdgeKind::DefinesBinding),
+            "enum:E → method:E.tick containment edge missing"
+        );
+
+        // No containment edge whose src is not an emitted node (0 dangling).
+        let ids: std::collections::HashSet<_> = out.nodes.iter().map(|n| n.id).collect();
+        for e in &out.edges {
+            if e.kind == EdgeKind::DefinesBinding {
+                assert!(ids.contains(&e.src), "dangling containment edge src");
+                assert!(ids.contains(&e.dst), "dangling containment edge dst");
+            }
+        }
     }
 }

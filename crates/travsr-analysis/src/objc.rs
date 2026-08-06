@@ -49,6 +49,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("protocol_declaration", "protocol"),
     ],
     decl_kinds: &["function_definition"],
+    type_refinements: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_objc::LANGUAGE),
 };
 
