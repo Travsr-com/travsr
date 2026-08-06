@@ -49,8 +49,23 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 
     let file_vname = VName::new(corpus, "", vname_path, "java", "file");
     let file_node = Node::new(file_vname, "file");
+    let file_id = file_node.id;
     let mut nodes: Vec<Node> = vec![file_node];
+    let mut edges: Vec<Edge> = vec![];
     let mut ffi_markers: Vec<FfiMarker> = vec![];
+
+    // N1/N3: a helper to push a node with its `DefinesBinding` edge parented to
+    // `parent` (the file, or the enclosing type node for methods/constructors).
+    let push =
+        |nodes: &mut Vec<Node>, edges: &mut Vec<Edge>, node: Node, parent: travsr_core::NodeId| {
+            let kind = if node.kind == "import" {
+                EdgeKind::Depends
+            } else {
+                EdgeKind::DefinesBinding
+            };
+            edges.push(Edge::new(parent, node.id, kind));
+            nodes.push(node);
+        };
 
     let names = query.capture_names();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
@@ -70,51 +85,76 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             match *cap_name {
                 "class.name" => {
                     let vn = VName::new(corpus, "", vname_path, "java", format!("class:{text}"));
-                    nodes.push(
+                    push(
+                        &mut nodes,
+                        &mut edges,
                         Node::new(vn, "class")
                             .with_line(line)
                             .with_end_line(end_line),
+                        file_id,
                     );
                 }
                 "interface.name" => {
                     let vn =
                         VName::new(corpus, "", vname_path, "java", format!("interface:{text}"));
-                    nodes.push(
+                    push(
+                        &mut nodes,
+                        &mut edges,
                         Node::new(vn, "interface")
                             .with_line(line)
                             .with_end_line(end_line),
+                        file_id,
                     );
                 }
                 "enum.name" => {
                     let vn = VName::new(corpus, "", vname_path, "java", format!("enum:{text}"));
-                    nodes.push(
+                    push(
+                        &mut nodes,
+                        &mut edges,
                         Node::new(vn, "enum")
                             .with_line(line)
                             .with_end_line(end_line),
+                        file_id,
                     );
                 }
                 "record.name" => {
                     // Java 14+ records are class-like — `class:` keeps the G1
                     // matcher's class-candidate list closed.
                     let vn = VName::new(corpus, "", vname_path, "java", format!("class:{text}"));
-                    nodes.push(
+                    push(
+                        &mut nodes,
+                        &mut edges,
                         Node::new(vn, "class")
                             .with_line(line)
                             .with_end_line(end_line),
+                        file_id,
                     );
                 }
                 "annotation.name" => {
                     // `@interface` annotation types are interface-like.
                     let vn =
                         VName::new(corpus, "", vname_path, "java", format!("interface:{text}"));
-                    nodes.push(
+                    push(
+                        &mut nodes,
+                        &mut edges,
                         Node::new(vn, "interface")
                             .with_line(line)
                             .with_end_line(end_line),
+                        file_id,
                     );
                 }
                 "method.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
+                    // N1: qualify by the enclosing type (`method:Type.name`) so
+                    // two same-named methods never collide on one VName.
+                    let (sig, parent) = match java_enclosing_type(cap.node, &source) {
+                        Some((prefix, ty)) => (
+                            format!("method:{ty}.{text}"),
+                            VName::new(corpus, "", vname_path, "java", format!("{prefix}:{ty}"))
+                                .id(),
+                        ),
+                        None => (format!("fn:{text}"), file_id),
+                    };
+                    let vn = VName::new(corpus, "", vname_path, "java", sig);
                     // Check for native modifier on the parent method_declaration node.
                     let is_native = cap
                         .node
@@ -126,7 +166,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .with_line(line)
                         .with_end_line(end_line);
                     let node_id = node.id;
-                    nodes.push(node);
+                    push(&mut nodes, &mut edges, node, parent);
                     if is_native {
                         if let Some(m) = FfiMarker::try_new(
                             node_id,
@@ -142,11 +182,22 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     }
                 }
                 "constructor.name" => {
-                    let vn = VName::new(corpus, "", vname_path, "java", format!("fn:{text}"));
-                    nodes.push(
+                    let (sig, parent) = match java_enclosing_type(cap.node, &source) {
+                        Some((prefix, ty)) => (
+                            format!("method:{ty}.{text}"),
+                            VName::new(corpus, "", vname_path, "java", format!("{prefix}:{ty}"))
+                                .id(),
+                        ),
+                        None => (format!("fn:{text}"), file_id),
+                    };
+                    let vn = VName::new(corpus, "", vname_path, "java", sig);
+                    push(
+                        &mut nodes,
+                        &mut edges,
                         Node::new(vn, "constructor")
                             .with_line(line)
                             .with_end_line(end_line),
+                        parent,
                     );
                 }
                 "import" => {
@@ -158,31 +209,56 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .trim()
                         .to_string();
                     let vn = VName::new(corpus, "", vname_path, "java", format!("import:{module}"));
-                    nodes.push(Node::new(vn, "import").with_line(line));
+                    push(
+                        &mut nodes,
+                        &mut edges,
+                        Node::new(vn, "import").with_line(line),
+                        file_id,
+                    );
                 }
                 _ => {}
             }
         }
     }
 
-    let file_id = nodes[0].id;
-    let edges: Vec<Edge> = nodes[1..]
-        .iter()
-        .map(|n| {
-            let kind = if n.kind == "import" {
-                EdgeKind::Depends
-            } else {
-                EdgeKind::DefinesBinding
-            };
-            Edge::new(file_id, n.id, kind)
-        })
-        .collect();
-
     Ok(ParseOutput {
         nodes,
         edges,
         ffi_markers,
     })
+}
+
+/// Walk up from a method/constructor name identifier to the nearest enclosing
+/// type declaration, returning `(sig_prefix, type_name)` so the caller can
+/// build both the qualified `method:Type.name` signature and the container's
+/// own VName (`{prefix}:{type_name}`) for the containment edge. The prefix
+/// mirrors the top-level capture arms: records map to `class`, annotation
+/// types to `interface`.
+fn java_enclosing_type(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(&'static str, String)> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        let prefix = match n.kind() {
+            "class_declaration" | "record_declaration" => Some("class"),
+            "interface_declaration" | "annotation_type_declaration" => Some("interface"),
+            "enum_declaration" => Some("enum"),
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            if let Some(name) = n
+                .child_by_field_name("name")
+                .and_then(|c| c.utf8_text(source).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                return Some((prefix, name));
+            }
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 /// Extensions handled by this parser.

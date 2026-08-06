@@ -150,15 +150,22 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
             match cap_name.as_str() {
                 "fn.name" => {
                     // Functions inside impl blocks become methods; the parent impl
-                    // type is the namespace so signatures are `fn:TypeName.method`.
+                    // type is the namespace so signatures are `method:TypeName.method` (N1).
                     let end_line = decl_end_line(capture.node);
-                    let parent_impl = find_parent_impl_type(capture.node, source.as_slice());
-                    let (node, src_id) = if let Some(impl_type) = parent_impl {
-                        let impl_id = rust_impl_node(corpus, vname_path, &impl_type).id;
-                        let n = rust_method_node(corpus, vname_path, &impl_type, text)
+                    let parent = find_parent_container(capture.node, source.as_slice());
+                    let (node, src_id) = if let Some((container, is_trait)) = parent {
+                        // N4c: a default method inside a `trait_item` is a method of
+                        // the trait (`method:Trait.name`), parented to the trait node,
+                        // not leaked to a file-level `fn:`.
+                        let parent_id = if is_trait {
+                            rust_trait_node(corpus, vname_path, &container).id
+                        } else {
+                            rust_impl_node(corpus, vname_path, &container).id
+                        };
+                        let n = rust_method_node(corpus, vname_path, &container, text)
                             .with_line(line)
                             .with_end_line(end_line);
-                        (n, impl_id)
+                        (n, parent_id)
                     } else {
                         let n = rust_fn_node(corpus, vname_path, text)
                             .with_line(line)
@@ -308,11 +315,13 @@ fn has_impl_or_trait_ancestor(node: tree_sitter::Node<'_>) -> bool {
 }
 
 /// Walk up the AST from `node` to find the nearest enclosing `impl_item`.
-/// Returns the implementing **type** name (not the trait name), e.g. for
-/// `impl Processor for Worker` returns `"Worker"`.
-/// Stops at `mod_item` — functions inside a module but outside any impl
-/// are free functions, not methods.
-fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+/// Returns the enclosing type container for a function, as `(name, is_trait)`.
+///
+/// For `impl Processor for Worker` returns `("Worker", false)` — the implementing
+/// **type**, not the trait name. For a default method inside `trait Speak`
+/// returns `("Speak", true)` (N4c). Stops at `mod_item` — functions inside a
+/// module but outside any impl/trait are free functions, not methods.
+fn find_parent_container(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<(String, bool)> {
     let mut current = node.parent()?;
     loop {
         match current.kind() {
@@ -320,7 +329,7 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
                 // `type:` field is the implementing type (e.g. `Worker` in
                 // `impl Processor for Worker`); `trait:` is the trait name.
                 let type_node = current.child_by_field_name("type")?;
-                return match type_node.kind() {
+                let name = match type_node.kind() {
                     "type_identifier" => type_node.utf8_text(source).ok().map(str::to_string),
                     "generic_type" => {
                         // e.g. `impl<T> Container<T>` — base name is first type_identifier child
@@ -331,6 +340,13 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
                     }
                     _ => None,
                 };
+                return name.map(|n| (n, false));
+            }
+            // N4c: a default method (`function_item` with a body) inside a trait
+            // belongs to the trait — `method:Trait.name`, not a file-level `fn:`.
+            "trait_item" => {
+                let name = current.child_by_field_name("name")?;
+                return name.utf8_text(source).ok().map(|n| (n.to_string(), true));
             }
             // Don't cross a module boundary — functions inside a mod are free functions.
             "mod_item" => return None,
@@ -445,8 +461,10 @@ fn rust_fn_node(corpus: &str, path: &str, name: &str) -> Node {
 }
 
 fn rust_method_node(corpus: &str, path: &str, impl_type: &str, method: &str) -> Node {
+    // N1: canonical `method:Type.name` (was `fn:Type.method`). Free functions
+    // stay `fn:name`; see rust_fn_node.
     Node::new(
-        rust_vname(corpus, path, &format!("fn:{impl_type}.{method}")),
+        rust_vname(corpus, path, &format!("method:{impl_type}.{method}")),
         "method",
     )
 }
@@ -518,6 +536,70 @@ fn rust_vname(corpus: &str, path: &str, signature: &str) -> VName {
 
 // ── FFI marker collection (RFC-005) ──────────────────────────────────────────
 
+/// Best-effort demangle of a JNI native-method name (the part of the mangled
+/// symbol after the `Java_` prefix, before any overload signature). The
+/// package/class/method boundary is genuinely ambiguous without the Java
+/// side (all three are `_`-separated), so this keeps the existing
+/// last-segment heuristic for that boundary but correctly unescapes JNI's
+/// underscore-escaping (`_1` -> `_`, `_2` -> `;`, `_3` -> `[`,
+/// `_0XXXX` -> unicode) so an escaped underscore inside the method name is
+/// not mistaken for a segment delimiter. Fails closed (`None`) on anything
+/// that does not look like an unambiguous bare method name.
+fn jni_demangle_method(rest: &str) -> Option<String> {
+    // Drop the overload-signature suffix (`__<argsig>`) before demangling.
+    let rest = rest.split("__").next().unwrap_or(rest);
+
+    let chars: Vec<char> = rest.chars().collect();
+    let mut segments: Vec<String> = vec![String::new()];
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '_' {
+            match chars.get(i + 1) {
+                Some('1') => {
+                    segments.last_mut().unwrap().push('_');
+                    i += 2;
+                }
+                Some('2') => {
+                    segments.last_mut().unwrap().push(';');
+                    i += 2;
+                }
+                Some('3') => {
+                    segments.last_mut().unwrap().push('[');
+                    i += 2;
+                }
+                Some('0') if chars.len() >= i + 6 => {
+                    let hex: String = chars[i + 2..i + 6].iter().collect();
+                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    segments.last_mut().unwrap().push(char::from_u32(code)?);
+                    i += 6;
+                }
+                _ => {
+                    // A real, unescaped underscore: package/class/method boundary.
+                    segments.push(String::new());
+                    i += 1;
+                }
+            }
+        } else {
+            segments.last_mut().unwrap().push(chars[i]);
+            i += 1;
+        }
+    }
+
+    // Require package + class + method (>= 3 segments) so a bare `Java_foo`
+    // is not misdetected as a JNI bridge.
+    if segments.len() < 3 {
+        return None;
+    }
+    let method = segments.last().unwrap();
+    // `;`/`[` are signature-escape artifacts (`_2`/`_3`) that should never
+    // appear in a bare method name; their presence means the split landed
+    // somewhere unexpected, so bail rather than emit a junk name.
+    if method.is_empty() || method.contains(';') || method.contains('[') {
+        return None;
+    }
+    Some(method.clone())
+}
+
 /// Walk the AST looking for #[napi] and #[pyfunction] attribute items on functions,
 /// emitting FfiMarker records for the ffi_resolver.
 pub fn collect_ffi_markers(
@@ -574,6 +656,30 @@ fn walk_for_ffi_attrs(
         let vname =
             travsr_core::VName::new(corpus, "", vname_path, "rust", format!("fn:{fn_name}"));
         let node_id = vname.id();
+
+        // L6: JNI native implementation — identified by the `Java_<pkg>_<Class>_
+        // <method>` naming the JNI spec mandates (typically `#[no_mangle] pub
+        // extern "system"/"C" fn Java_...`), not an attribute like napi/pyo3.
+        // The last `_`-delimited segment is a heuristic, not a real demangle: the
+        // package/class/method boundary is ambiguous without the Java side, since
+        // all three are `_`-separated. `jni_demangle_method` truncates the overload
+        // signature and unescapes `_1`/`_2`/`_3` in the extracted segment, but a
+        // method name containing an escaped underscore (`_1`) still can't be told
+        // apart from a package/class boundary here, so this remains fail-closed:
+        // ambiguous or unescapable input yields `None` rather than a junk name.
+        if let Some(java_method) = fn_name.strip_prefix("Java_").and_then(jni_demangle_method) {
+            if let Some(m) = FfiMarker::try_new(
+                node_id,
+                FfiMarkerKind::JniCall,
+                fn_name.clone(),
+                Some(java_method),
+                None,
+                None::<String>,
+                corpus,
+            ) {
+                out.push(m);
+            }
+        }
 
         for attr in &attrs {
             let attr_clean = attr.trim();
@@ -727,6 +833,60 @@ mod tests {
     }
 
     #[test]
+    fn n4c_default_trait_method_belongs_to_trait_not_file() {
+        // N4c: a default method with a body inside a trait must resolve to
+        // `method:Trait.name` parented to the trait node, not leak to a
+        // file-level `fn:`. A same-named impl override stays distinct (Invariant #1).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trait_default.rs");
+        std::fs::write(
+            &path,
+            b"trait Speak { fn speak(&self) { println!(\"...\"); } }\n\
+              struct Dog;\n\
+              impl Speak for Dog { fn speak(&self) { println!(\"woof\"); } }\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "trait_default.rs").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(
+            sigs.contains(&"method:Speak.speak"),
+            "trait default method must be method:Speak.speak, got {sigs:?}"
+        );
+        assert!(
+            sigs.contains(&"method:Dog.speak"),
+            "impl override must be method:Dog.speak, got {sigs:?}"
+        );
+        assert!(
+            !sigs.contains(&"fn:speak"),
+            "default trait method must not leak to file-level fn:speak, got {sigs:?}"
+        );
+
+        // Containment: trait:Speak → method:Speak.speak (parented to the trait).
+        let trait_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "trait:Speak")
+            .unwrap()
+            .id;
+        let method_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Speak.speak")
+            .unwrap()
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == trait_id
+                && e.dst == method_id
+                && e.kind == EdgeKind::DefinesBinding),
+            "expected trait:Speak → method:Speak.speak DefinesBinding edge"
+        );
+    }
+
+    #[test]
     fn parse_file_with_vname_uses_vname_path() {
         let out = parse("", &fixture_path(), "custom/path.rs").unwrap();
         for node in &out.nodes {
@@ -781,8 +941,8 @@ mod tests {
         assert!(
             out.nodes
                 .iter()
-                .any(|n| n.vname.signature == "fn:Worker.new" && n.kind == "method"),
-            "expected fn:Worker.new method node"
+                .any(|n| n.vname.signature == "method:Worker.new" && n.kind == "method"),
+            "expected method:Worker.new method node"
         );
     }
 
@@ -792,8 +952,8 @@ mod tests {
         assert!(
             out.nodes
                 .iter()
-                .any(|n| n.vname.signature == "fn:Worker.process" && n.kind == "method"),
-            "expected fn:Worker.process — impl Trait for Type must use the implementing type"
+                .any(|n| n.vname.signature == "method:Worker.process" && n.kind == "method"),
+            "expected method:Worker.process — impl Trait for Type must use the implementing type"
         );
     }
 
@@ -816,7 +976,7 @@ mod tests {
             "expected file → struct:Config DefinesBinding edge"
         );
 
-        // impl:Worker → fn:Worker.new
+        // impl:Worker → method:Worker.new
         let impl_id = out
             .nodes
             .iter()
@@ -826,14 +986,14 @@ mod tests {
         let method_id = out
             .nodes
             .iter()
-            .find(|n| n.vname.signature == "fn:Worker.new")
+            .find(|n| n.vname.signature == "method:Worker.new")
             .unwrap()
             .id;
         assert!(
             out.edges.iter().any(|e| e.src == impl_id
                 && e.dst == method_id
                 && e.kind == EdgeKind::DefinesBinding),
-            "expected impl:Worker → fn:Worker.new DefinesBinding edge"
+            "expected impl:Worker → method:Worker.new DefinesBinding edge"
         );
     }
 
@@ -917,5 +1077,119 @@ mod tests {
             "Rust function signature must start with fn:"
         );
         assert_eq!(fn_node.vname.language, "rust");
+    }
+
+    // L6: a JNI native implementation function (`Java_<pkg>_<Class>_<method>`)
+    // must emit a JniCall marker whose effective name is the bare Java method
+    // name, so it string-matches a JniExport's local_name in the resolver.
+    #[test]
+    fn jni_native_impl_emits_jnicall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jni_bridge.rs");
+        std::fs::write(
+            &path,
+            br#"#[no_mangle]
+pub extern "system" fn Java_com_example_Foo_bar() {}
+"#,
+        )
+        .unwrap();
+        let out = parse("", &path, "jni_bridge.rs").unwrap();
+        let marker = out
+            .ffi_markers
+            .iter()
+            .find(|m| m.kind == FfiMarkerKind::JniCall)
+            .expect("expected a JniCall marker");
+        assert_eq!(
+            marker.effective_name(),
+            "bar",
+            "effective_name must be the bare Java method name (after the last _)"
+        );
+    }
+
+    // A plain Rust function whose name merely contains underscores must not be
+    // misdetected as a JNI bridge.
+    #[test]
+    fn non_jni_function_emits_no_jnicall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.rs");
+        std::fs::write(&path, b"pub fn do_the_thing() {}\n").unwrap();
+        let out = parse("", &path, "plain.rs").unwrap();
+        assert!(
+            !out.ffi_markers
+                .iter()
+                .any(|m| m.kind == FfiMarkerKind::JniCall),
+            "a non-Java_-prefixed function must not emit a JniCall marker"
+        );
+    }
+
+    // Overloaded native: JNI appends `__<argsig>` for overload resolution.
+    // The demangler must drop the signature suffix, not treat it as part of
+    // the method name.
+    #[test]
+    fn jni_overloaded_native_emits_bare_method_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jni_overload.rs");
+        std::fs::write(
+            &path,
+            br#"#[no_mangle]
+pub extern "system" fn Java_com_example_Foo_bar__ILjava_lang_String_2() {}
+"#,
+        )
+        .unwrap();
+        let out = parse("", &path, "jni_overload.rs").unwrap();
+        let marker = out
+            .ffi_markers
+            .iter()
+            .find(|m| m.kind == FfiMarkerKind::JniCall)
+            .expect("expected a JniCall marker");
+        assert_eq!(
+            marker.effective_name(),
+            "bar",
+            "overload signature suffix must be dropped from the method name"
+        );
+    }
+
+    // Underscored method: JNI escapes a literal `_` in an identifier as `_1`.
+    // The demangler must unescape it back to a real underscore rather than
+    // treating it as a segment boundary.
+    #[test]
+    fn jni_underscored_method_name_is_unescaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jni_underscored.rs");
+        std::fs::write(
+            &path,
+            br#"#[no_mangle]
+pub extern "system" fn Java_com_example_Foo_do_1work() {}
+"#,
+        )
+        .unwrap();
+        let out = parse("", &path, "jni_underscored.rs").unwrap();
+        let marker = out
+            .ffi_markers
+            .iter()
+            .find(|m| m.kind == FfiMarkerKind::JniCall)
+            .expect("expected a JniCall marker");
+        assert_eq!(
+            marker.effective_name(),
+            "do_work",
+            "an escaped underscore (_1) in the method name must be unescaped, not treated as a boundary"
+        );
+    }
+
+    // A bare `Java_foo` (no package/class segments) must not emit a marker:
+    // without at least three `_`-separated segments there is no method
+    // boundary to anchor on, so this stays fail-closed.
+    #[test]
+    fn jni_bare_java_prefix_emits_no_jnicall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("java_foo.rs");
+        std::fs::write(&path, b"pub fn Java_foo() {}\n").unwrap();
+        let out = parse("", &path, "java_foo.rs").unwrap();
+        assert!(
+            !out.ffi_markers
+                .iter()
+                .any(|m| m.kind == FfiMarkerKind::JniCall),
+            "Java_foo has no package/class/method segments and must not emit a JniCall marker"
+        );
     }
 }

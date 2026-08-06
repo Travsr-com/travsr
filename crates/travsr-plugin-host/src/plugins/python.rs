@@ -40,15 +40,16 @@ impl Plugin for PythonPlugin {
             .map(|rel| rel.iter().map(|r| (req.root.join(r), r.clone())).collect());
 
         // Native Phase B: always runs, zero external-tool requirements.
-        let (mut nodes, mut edges) =
+        let (mut nodes, mut edges, unresolved_calls) =
             travsr_indexer::phase_b_native_python(&req.corpus, &req.root, files_owned.as_deref())
                 .unwrap_or_else(|e| {
                     tracing::warn!("python native phase_b: {e}");
-                    (vec![], vec![])
+                    (vec![], vec![], vec![])
                 });
         tracing::debug!(
             nodes = nodes.len(),
             edges = edges.len(),
+            unresolved_calls = unresolved_calls.len(),
             "python native phase_b complete"
         );
 
@@ -82,6 +83,7 @@ impl Plugin for PythonPlugin {
         InvokeResponse {
             nodes,
             edges,
+            unresolved_calls,
             ..Default::default()
         }
     }

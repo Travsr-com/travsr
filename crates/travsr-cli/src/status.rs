@@ -104,6 +104,17 @@ pub fn run() -> anyhow::Result<()> {
                     ["skipped_no_analyzer", lang] => eprintln!(
                         "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
                     ),
+                    // L5a: scip-clang (c/cpp) needs a compile_commands.json at the
+                    // repo root — without one it hangs, so it is skipped up front.
+                    ["skipped_no_compdb", lang] => eprintln!(
+                        "warning: '{lang}' semantic indexing needs a compile_commands.json at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS) to enable it"
+                    ),
+                    // E6: SCIP definitions that did not unify onto their Phase A
+                    // tree-sitter node — their references attribute to an orphaned
+                    // duplicate node instead. `rate` is missed/attempted.
+                    ["scip_unification_misses", rate] => eprintln!(
+                        "warning: {rate} SCIP definitions did not unify onto their tree-sitter nodes — some references may resolve to a duplicate node. Re-run `travsr init --semantic` if it persists."
+                    ),
                     _ => {}
                 }
             }

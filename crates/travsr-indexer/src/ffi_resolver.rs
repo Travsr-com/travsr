@@ -285,6 +285,44 @@ mod tests {
         );
     }
 
+    // L6: a Rust JNI native impl (`Java_com_example_Foo_bar`, JniCall marker
+    // with bound_name "bar") must resolve onto a Java `native` method's
+    // JniExport marker (local_name "bar") — mirrors the napi/pyo3 pair tests.
+    #[test]
+    fn resolver_emits_edge_for_matching_jni_pair() {
+        let export = FfiMarker::try_new(
+            NodeId(1),
+            FfiMarkerKind::JniExport,
+            "bar",
+            None::<String>,
+            None,
+            None::<String>,
+            "corpus:test",
+        )
+        .unwrap();
+        let call_site = FfiMarker::try_new(
+            NodeId(2),
+            FfiMarkerKind::JniCall,
+            "Java_com_example_Foo_bar",
+            Some("bar"),
+            None,
+            None::<String>,
+            "corpus:test",
+        )
+        .unwrap();
+
+        let output = output_with_markers(vec![export, call_site]);
+        let resolver = Resolver::build(&output);
+        let edges = resolver.resolve(&output.ffi_markers, &FfiConfig::default());
+
+        assert!(
+            edges.iter().any(|e| e.src == NodeId(2)
+                && e.dst == NodeId(1)
+                && e.kind == travsr_core::EdgeKind::FFICall),
+            "expected FFICall edge from the JNI call site to the Java native export"
+        );
+    }
+
     #[test]
     fn resolver_enforces_corpus_invariant() {
         // Export in corpus A, call site in corpus B — must produce no edge.

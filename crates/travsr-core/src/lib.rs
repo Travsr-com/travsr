@@ -552,6 +552,27 @@ pub struct ScipRef {
     pub callee_id: NodeId,
 }
 
+/// A positional reference occurrence from a rust-analyzer LSIF dump (E3 W3b).
+///
+/// Unlike [`ScipRef`], the callee is identified by its **definition location**
+/// (`callee_def_path`, `callee_def_line`) rather than a pre-resolved `NodeId`,
+/// because rust-analyzer LSIF carries no `travsr_vname` — only monikers and
+/// definition ranges. The store resolves the callee positionally (narrowest
+/// node span containing the def line) and fails closed when nothing resolves,
+/// turning these into `ScipRef`s. This is what replaces the old moniker-synth
+/// path whose callee VName (at `path = project_root`) matched no Phase A node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LsifPositionalRef {
+    /// Repo-relative path of the file containing the reference occurrence.
+    pub caller_path: String,
+    /// 1-based source line of the reference occurrence.
+    pub caller_line: u32,
+    /// Repo-relative path of the file containing the callee's definition.
+    pub callee_def_path: String,
+    /// 1-based source line of the callee's definition occurrence.
+    pub callee_def_line: u32,
+}
+
 /// A single reference occurrence returned by `find_references` (issue #299):
 /// the file path and 1-based line of one use site of a symbol.
 ///
@@ -692,6 +713,15 @@ pub struct UnresolvedCall {
     /// predate this field (serde default keeps old sidecar payloads valid).
     #[serde(default)]
     pub is_method_call: bool,
+    /// Receiver type for a method call (`recv.method()`), when the extractor
+    /// could recover it from the enclosing function's own text (#529). `Some(T)`
+    /// lets the daemon resolve `fn:T.method` exactly instead of guessing by
+    /// unique leaf name; `None` keeps the pre-#529 leaf-fallback behavior. Only
+    /// ever set alongside `is_method_call`. `#[serde(default)]` keeps older
+    /// sidecar payloads valid, matching how `caller_line` and `is_method_call`
+    /// were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_type: Option<String>,
 }
 
 // ── Import Resolution ────────────────────────────────────────────────────────
@@ -1486,6 +1516,48 @@ mod tests {
         let json = r#"{"src":1,"dst":2,"kind":"ref/call"}"#;
         let e: Edge = serde_json::from_str(json).unwrap();
         assert_eq!(e.confidence, None);
+    }
+
+    #[test]
+    fn unresolved_call_serde_roundtrip_without_recv_type_field() {
+        // T-11 (#529): a pre-#529 sidecar payload (no recv_type key at all)
+        // must still deserialize, with recv_type defaulting to None.
+        let json = r#"{"src":1,"callee_sig":"fn:filter","caller_line":42,"is_method_call":true}"#;
+        let u: UnresolvedCall = serde_json::from_str(json).unwrap();
+        assert_eq!(u.recv_type, None);
+        assert!(u.is_method_call);
+    }
+
+    #[test]
+    fn unresolved_call_serde_roundtrip_with_recv_type_field() {
+        let u = UnresolvedCall {
+            src: NodeId(1),
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 42,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains("\"recv_type\":\"Session\""));
+        let u2: UnresolvedCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(u2.recv_type, Some("Session".to_string()));
+    }
+
+    #[test]
+    fn unresolved_call_recv_type_omitted_from_json_when_none() {
+        // skip_serializing_if keeps wire payloads small when the extractor
+        // could not recover a receiver type (the overwhelming common case).
+        let u = UnresolvedCall {
+            src: NodeId(1),
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 42,
+            is_method_call: true,
+            recv_type: None,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(!json.contains("recv_type"));
     }
 
     #[test]

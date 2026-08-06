@@ -357,6 +357,13 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
                     pal.dim("ℹ"),
                 );
             }
+            if !report.skipped_no_compdb.is_empty() {
+                let langs = report.skipped_no_compdb.join(", ");
+                println!(
+                    "  {} no compile_commands.json for: {langs} — generate one to enable semantic analysis",
+                    pal.dim("ℹ"),
+                );
+            }
             if !report.crashed.is_empty() {
                 let langs = report.crashed.join(", ");
                 println!(

@@ -2652,14 +2652,18 @@ LIMIT 20",
 
     /// Bulk-lookup nodes by signature strings. Returns `(id, signature, path)` triples.
     /// Used by the daemon to resolve `UnresolvedCall`s emitted by Phase B.
+    /// Returns `(id, signature, path, language)`. Language is carried so the
+    /// daemon resolver can scope candidates to the caller's own language — a
+    /// call in one language must never resolve to a same-signature definition
+    /// in another (E4).
     pub fn nodes_by_signatures(
         &self,
         sigs: &[String],
-    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+    ) -> Result<Vec<(NodeId, String, String, String)>, StoreError> {
         if sigs.is_empty() {
             return Ok(Vec::new());
         }
-        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+        (|| -> AnyResult<Vec<(NodeId, String, String, String)>> {
             let placeholders = sigs
                 .iter()
                 .enumerate()
@@ -2667,7 +2671,7 @@ LIMIT 20",
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, signature, path FROM nodes WHERE signature IN ({placeholders})"
+                "SELECT id, signature, path, language FROM nodes WHERE signature IN ({placeholders})"
             );
             let mut stmt = self
                 .conn
@@ -2680,7 +2684,8 @@ LIMIT 20",
                     let id = i64_to_node_id(row.get::<_, i64>(0)?);
                     let sig: String = row.get(1)?;
                     let path: String = row.get(2)?;
-                    Ok((id, sig, path))
+                    let lang: String = row.get(3)?;
+                    Ok((id, sig, path, lang))
                 })
                 .context("executing nodes_by_signatures")?;
             let mut out = Vec::new();
@@ -2707,11 +2712,11 @@ LIMIT 20",
     pub fn fn_nodes_by_leaf_name(
         &self,
         names: &[String],
-    ) -> Result<Vec<(NodeId, String, String)>, StoreError> {
+    ) -> Result<Vec<(NodeId, String, String, String)>, StoreError> {
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        (|| -> AnyResult<Vec<(NodeId, String, String)>> {
+        (|| -> AnyResult<Vec<(NodeId, String, String, String)>> {
             // Each name contributes 3 params (exact + 2 LIKE). Chunk so a large
             // `names` slice never exceeds SQLite's SQLITE_MAX_VARIABLE_NUMBER
             // (default 999 on older builds) or the expression-tree depth limit:
@@ -2737,7 +2742,7 @@ LIMIT 20",
                 // by some Phase A parsers) so leaf-name resolution and span
                 // attribution consider the same node population.
                 let sql = format!(
-                    "SELECT id, signature, path FROM nodes \
+                    "SELECT id, signature, path, language FROM nodes \
                      WHERE kind IN ('function','method','fn') AND ({})",
                     clauses.join(" OR ")
                 );
@@ -2752,7 +2757,8 @@ LIMIT 20",
                         let id = i64_to_node_id(row.get::<_, i64>(0)?);
                         let sig: String = row.get(1)?;
                         let path: String = row.get(2)?;
-                        Ok((id, sig, path))
+                        let lang: String = row.get(3)?;
+                        Ok((id, sig, path, lang))
                     })
                     .context("executing fn_nodes_by_leaf_name")?;
                 for row in rows {
@@ -3223,6 +3229,7 @@ LIMIT 20",
         &mut self,
         nodes: &[travsr_core::Node],
         edges: &[travsr_core::Edge],
+        provenance: &str,
     ) -> anyhow::Result<()> {
         if nodes.is_empty() && edges.is_empty() {
             return Ok(());
@@ -3261,21 +3268,52 @@ LIMIT 20",
                 .context("write_phase_b_batch: put_node_fts_words")?;
         }
         for edge in edges {
+            // E1: label edges with their true provenance (SCIP relationships vs
+            // native tree-sitter leaf-name resolution) instead of hardcoding
+            // 'lsif'. Precedence-preserving: a compiler provenance ('lsif'/
+            // 'scip') already on the row is never demoted by a later write
+            // (ADR-002), so a heuristic 'tree-sitter' write cannot overwrite it.
             tx.execute(
                 "INSERT INTO edges(src, dst, kind, provenance, confidence) \
-                 VALUES(?1, ?2, ?3, 'lsif', ?4) \
+                 VALUES(?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT(src, dst, kind) DO UPDATE SET \
-                 provenance = 'lsif', confidence = excluded.confidence",
+                 provenance = CASE \
+                   WHEN excluded.provenance IN ('lsif','scip') THEN excluded.provenance \
+                   WHEN edges.provenance IN ('lsif','scip') THEN edges.provenance \
+                   ELSE excluded.provenance END, \
+                 confidence = excluded.confidence",
                 params![
                     node_id_to_i64(edge.src),
                     node_id_to_i64(edge.dst),
                     edge.kind.as_str(),
+                    provenance,
                     edge.confidence.map(|c| c as i64),
                 ],
             )
             .context("write_phase_b_batch: insert edge")?;
         }
         tx.commit().context("write_phase_b_batch: commit")
+    }
+
+    /// E1: reconcile every edge's `language` label to its endpoints' language.
+    ///
+    /// Edge language is a derived label, not authored data. Edge INSERTs across
+    /// the store omit it and rely on the schema default (`'typescript'`), which
+    /// mislabels every edge in a non-TypeScript graph. This single idempotent
+    /// pass sets each edge's language from its src node (falling back to dst,
+    /// then `'unknown'` for a dangling endpoint). Run at the end of indexing
+    /// (full and incremental); it is O(edges) and label-only (no edge is added
+    /// or removed). Returns the number of rows updated.
+    pub fn reconcile_edge_languages(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "UPDATE edges SET language = COALESCE( \
+                   (SELECT n.language FROM nodes n WHERE n.id = edges.src), \
+                   (SELECT n.language FROM nodes n WHERE n.id = edges.dst), \
+                   'unknown')",
+                [],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// G2 attribution-aware Phase B write.
@@ -3355,6 +3393,30 @@ LIMIT 20",
             };
 
             let callee_id = node_id_to_i64(scip_ref.callee_id);
+
+            // E3 (W3a) — fail closed (Invariant #4): never write a `ref/call`
+            // edge whose callee resolves to no node. The full node table is
+            // present here (Phase A nodes already persisted, this batch's
+            // `pb_nodes` inserted above in the same tx), so a missing callee is a
+            // genuine unresolved symbol (external/stdlib, or a positional lookup
+            // that found nothing) — not a not-yet-written node. A dangling
+            // `ref/call` pollutes `get_callers`/blast-radius, so drop it here
+            // rather than persist it. This gate is what lets the positional
+            // rust-analyzer LSIF path (W3b) and any external-symbol reference
+            // fail closed instead of leaving the 34% dangling this plan removes.
+            let callee_exists = tx
+                .query_row(
+                    "SELECT 1 FROM nodes WHERE id = ?1",
+                    params![callee_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .context("write_scip_attributed_batch: callee existence check")?
+                .is_some();
+            if !callee_exists {
+                continue;
+            }
+
             tx.execute(
                 "INSERT INTO edges(src, dst, kind, provenance, confidence) \
                  VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
@@ -3372,6 +3434,80 @@ LIMIT 20",
         }
 
         tx.commit().context("write_scip_attributed_batch: commit")
+    }
+
+    /// Resolve rust-analyzer LSIF positional references (E3 W3b) into `ScipRef`s.
+    ///
+    /// rust-analyzer LSIF identifies a callee only by its definition location,
+    /// not a `travsr_vname`. This maps each `callee_def_(path,line)` to the
+    /// **narrowest Phase A node whose span contains that line** — the same
+    /// positional rule `write_scip_attributed_batch` uses for the caller — and
+    /// emits a `ScipRef` whose `callee_id` is that real node. **Fails closed**:
+    /// a reference whose callee def resolves to no node (external symbol, or a
+    /// def line outside every span) is dropped, so no dangling edge is produced.
+    ///
+    /// Read-only. Caller attribution (`caller_line` → enclosing function) is left
+    /// to `write_scip_attributed_batch`, through which the returned refs flow.
+    ///
+    /// O(unique callee paths) span queries + O(refs) span scans.
+    pub fn resolve_lsif_positional_refs(
+        &self,
+        corpus: &str,
+        positional: &[travsr_core::LsifPositionalRef],
+    ) -> anyhow::Result<Vec<travsr_core::ScipRef>> {
+        if positional.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One span query per unique callee-definition path. Any node kind is a
+        // valid callee (method/fn/struct/enum/const/…); `.rs` files carry no
+        // span-bearing noise nodes (doc-chunks are markdown-only), so no kind
+        // filter is needed — the narrowest containing span is the symbol.
+        let unique_paths: std::collections::HashSet<&str> = positional
+            .iter()
+            .map(|p| p.callee_def_path.as_str())
+            .collect();
+        let mut span_cache: std::collections::HashMap<&str, Vec<FnSpan>> =
+            std::collections::HashMap::with_capacity(unique_paths.len());
+        for path in unique_paths {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "SELECT id, line, end_line FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 \
+                       AND line IS NOT NULL AND end_line IS NOT NULL \
+                     ORDER BY (end_line - line) ASC, id ASC",
+                )
+                .context("resolve_lsif_positional_refs: prepare")?;
+            let spans = stmt
+                .query_map(params![corpus, path], |row| {
+                    Ok(FnSpan {
+                        id: row.get(0)?,
+                        line: row.get(1)?,
+                        end_line: row.get(2)?,
+                    })
+                })
+                .context("resolve_lsif_positional_refs: query")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("resolve_lsif_positional_refs: collect")?;
+            span_cache.insert(path, spans);
+        }
+
+        let mut out = Vec::with_capacity(positional.len());
+        for p in positional {
+            let def_line = p.callee_def_line as i64;
+            let Some(callee_i64) = span_cache
+                .get(p.callee_def_path.as_str())
+                .and_then(|spans| find_narrowest_enclosing(spans, def_line))
+            else {
+                continue; // fail closed: callee def resolves to no node
+            };
+            out.push(travsr_core::ScipRef {
+                caller_path: p.caller_path.clone(),
+                caller_line: p.caller_line,
+                callee_id: i64_to_node_id(callee_i64),
+            });
+        }
+        Ok(out)
     }
 
     /// Occurrence sites (`path:line`) of every `ref/call` to `dst`, read from the
@@ -3589,13 +3725,26 @@ LIMIT 20",
             .join(" ");
         let line_p = n + 3;
         let delta_p = n + 4;
+        // E6: positional-first def-unification. A SCIP definition occurrence's
+        // `line` is the selector (name) line, so it falls inside the Phase A
+        // node's full `[line, end_line]` span (N2 spans). Prefer the candidate
+        // whose span *contains* the SCIP line — this unifies correctly across
+        // wide annotation/decorator/doc-comment gaps that the old ±max_delta
+        // proximity gate silently dropped (orphaned SCIP twin stealing edges).
+        // The ±max_delta window is kept only as a fallback for degenerate spans
+        // (NULL/zero-width `end_line`), so this change can only ADD unifications,
+        // never remove one that already matched. Ties: narrowest containing span,
+        // then candidate-signature priority, then proximity.
+        let contains = format!("?{line_p} BETWEEN line AND COALESCE(end_line, line)");
         let sql = format!(
             "SELECT id FROM nodes \
              WHERE corpus = ?1 AND path = ?2 \
                AND signature IN ({placeholders}) \
                AND line IS NOT NULL \
-               AND ABS(line - ?{line_p}) <= ?{delta_p} \
-             ORDER BY CASE signature {priority_case} END ASC, \
+               AND ( ({contains}) OR ABS(line - ?{line_p}) <= ?{delta_p} ) \
+             ORDER BY CASE WHEN {contains} THEN 0 ELSE 1 END ASC, \
+                      (COALESCE(end_line, line) - line) ASC, \
+                      CASE signature {priority_case} END ASC, \
                       ABS(line - ?{line_p}) ASC \
              LIMIT 1"
         );
@@ -6857,6 +7006,65 @@ mod tests {
     }
 
     #[test]
+    fn unification_matches_by_span_containment_across_wide_annotation_gap() {
+        // E6: the SCIP def line sits inside the Phase A node's [line, end_line]
+        // span but farther than max_delta below the name line (heavy
+        // annotation / decorator / doc-comment block). The old ±max_delta
+        // proximity gate silently dropped this, leaving an orphaned SCIP twin
+        // that stole the node's ref/call edges. Span-containment must unify it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ts = Node::new(
+            VName::new("c", "main", "src/S.java", "java", "fn:handle"),
+            "function",
+        )
+        .with_line(5)
+        .with_end_line(30);
+        store.put_node(&ts).unwrap();
+
+        let candidates = vec!["fn:handle".to_string()];
+        // SCIP def anchored at line 12 — delta 7 from the name line 5, beyond
+        // the max_delta of 5, but well inside the [5, 30] body span.
+        let found = store
+            .find_ts_node_for_unification("c", "src/S.java", &candidates, 12, 5)
+            .unwrap();
+        assert_eq!(
+            found,
+            Some(ts.id),
+            "span-containment must unify across the annotation gap"
+        );
+    }
+
+    #[test]
+    fn unification_prefers_narrowest_containing_span() {
+        // E6: when two candidate spans both contain the SCIP def line (a method
+        // nested inside an outer definition that share a same-leaf `fn:` sig
+        // candidate), the narrowest containing span is the correct target.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let outer = Node::new(
+            VName::new("c", "main", "src/n.go", "go", "fn:run"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(40);
+        let inner = Node::new(
+            VName::new("c", "main", "src/n.go", "go", "method:Job.run"),
+            "method",
+        )
+        .with_line(10)
+        .with_end_line(20);
+        store.put_node(&outer).unwrap();
+        store.put_node(&inner).unwrap();
+
+        // Candidates cover both signatures; SCIP def at line 15 is inside both
+        // [1,40] and [10,20] — the narrower [10,20] must win.
+        let candidates = vec!["method:Job.run".to_string(), "fn:run".to_string()];
+        let found = store
+            .find_ts_node_for_unification("c", "src/n.go", &candidates, 15, 5)
+            .unwrap();
+        assert_eq!(found, Some(inner.id), "narrowest containing span wins");
+    }
+
+    #[test]
     fn edge_sites_dedup_on_reinsert() {
         let store = SqliteStore::open_in_memory().unwrap();
         // The composite PK makes INSERT OR IGNORE an actual dedup: the same
@@ -7001,7 +7209,7 @@ mod tests {
             .fn_nodes_by_leaf_name(&["describe".to_string(), "add".to_string()])
             .unwrap()
             .into_iter()
-            .map(|(_, sig, _)| sig)
+            .map(|(_, sig, _, _)| sig)
             .collect();
         got.sort();
         assert_eq!(
@@ -7019,7 +7227,7 @@ mod tests {
             .fn_nodes_by_leaf_name(&["announce_all".to_string()])
             .unwrap()
             .into_iter()
-            .map(|(_, sig, _)| sig)
+            .map(|(_, sig, _, _)| sig)
             .collect();
         assert_eq!(hit, vec!["fn:Zoo.announce_all".to_string()]);
 
@@ -7141,7 +7349,7 @@ mod tests {
             .fn_nodes_by_leaf_name(&names)
             .unwrap()
             .into_iter()
-            .map(|(_, sig, _)| sig)
+            .map(|(_, sig, _, _)| sig)
             .collect();
         assert_eq!(got, vec!["fn:Zoo.feed".to_string()]);
     }
@@ -7722,6 +7930,61 @@ mod tests {
 
         let edges = store.all_edges().unwrap();
         assert_eq!(edges[0].3, "tree-sitter");
+    }
+
+    #[test]
+    fn e1_reconcile_edge_languages_derives_from_endpoints() {
+        // E1: an edge's language is derived from its src node, not the schema
+        // default 'typescript'. write_phase_b_batch labels provenance truthfully.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+            "function",
+        );
+        let b = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "a.rs", "rust", "method:T.b"),
+            "method",
+        );
+        let edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store
+            .write_phase_b_batch(&[a.clone(), b.clone()], &[edge], "tree-sitter")
+            .unwrap();
+
+        // Before reconcile: schema default mislabels the edge 'typescript'.
+        let lang_before: String = store
+            .conn
+            .query_row("SELECT language FROM edges LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lang_before, "typescript", "reproduces the mislabel default");
+
+        let n = store.reconcile_edge_languages().unwrap();
+        assert_eq!(n, 1);
+        let (lang, prov): (String, String) = store
+            .conn
+            .query_row("SELECT language, provenance FROM edges LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(lang, "rust", "edge language tracks its src node");
+        assert_eq!(prov, "tree-sitter", "native resolved edges are not 'lsif'");
+    }
+
+    #[test]
+    fn e1_write_phase_b_batch_does_not_demote_compiler_provenance() {
+        // E1 precedence: a 'tree-sitter' batch write must not overwrite an
+        // existing compiler ('lsif'/'scip') provenance (ADR-002).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let b = sample_node("fn:b");
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let edge = Edge::new(a.id, b.id, EdgeKind::RefCall);
+        store.put_edge_lsif(&edge).unwrap();
+        store
+            .write_phase_b_batch(&[], &[edge], "tree-sitter")
+            .unwrap();
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges[0].3, "lsif", "tree-sitter batch must not demote lsif");
     }
 
     #[test]

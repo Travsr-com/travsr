@@ -21,11 +21,14 @@ use tree_sitter::{Parser, Query, QueryCursor};
 
 /// Captures three call-site patterns:
 ///   `call.fn`     — bare identifier: `foo()`
-///   `call.method` — field call: `self.process()` / `obj.method()`
+///   `call.method` — field call: `self.process()` / `obj.method()`, with the
+///                   receiver expression bound as `call.recv` (#529) so the
+///                   extractor can attempt to recover its type instead of
+///                   discarding it.
 ///   `call.scoped` — scoped path: `Type::new()` / `std::mem::swap()`
 const CALL_QUERY: &str = "
 (call_expression function: (identifier) @call.fn)
-(call_expression function: (field_expression field: (field_identifier) @call.method))
+(call_expression function: (field_expression value: (_) @call.recv field: (field_identifier) @call.method))
 (call_expression function: (scoped_identifier name: (identifier) @call.scoped))
 ";
 
@@ -337,7 +340,7 @@ fn extract_file_call_edges(
                     "",
                     vname_path,
                     "rust",
-                    format!("fn:{t}.{caller_fn}"),
+                    format!("method:{t}.{caller_fn}"),
                 )
                 .id(),
                 None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
@@ -354,12 +357,29 @@ fn extract_file_call_edges(
                 // resolve it against the real global node table (exact `fn:method`
                 // or unique `fn:Type.method` leaf match), which knows every file.
                 "call.method" if !NOISE_NAMES.contains(&callee_name) => {
+                    // #529: the receiver expression is bound as a sibling
+                    // capture (`call.recv`) on this same query match. Recover
+                    // its type when syntactically possible (§4.5) so the
+                    // daemon can resolve `fn:T.method` exactly instead of
+                    // guessing by unique leaf name; `None` keeps the
+                    // pre-#529 leaf-fallback behavior unchanged.
+                    let recv_type = m
+                        .captures
+                        .iter()
+                        .find(|c| {
+                            cap_names.get(c.index as usize).map(String::as_str) == Some("call.recv")
+                        })
+                        .and_then(|recv_cap| {
+                            let enclosing_fn = enclosing_function_item(recv_cap.node)?;
+                            resolve_receiver_type(recv_cap.node, enclosing_fn, source.as_slice())
+                        });
                     unresolved.push(UnresolvedCall {
                         src: caller_id,
                         callee_sig: format!("fn:{callee_name}"),
                         hint_crate: None,
                         caller_line: occ_line,
                         is_method_call: true,
+                        recv_type,
                     });
                 }
                 "call.scoped" => {
@@ -382,10 +402,11 @@ fn extract_file_call_edges(
                             if !NOISE_NAMES.contains(&callee_name) {
                                 unresolved.push(UnresolvedCall {
                                     src: caller_id,
-                                    callee_sig: format!("fn:{qual}.{callee_name}"),
+                                    callee_sig: format!("method:{qual}.{callee_name}"),
                                     hint_crate: None,
                                     caller_line: occ_line,
                                     is_method_call: false,
+                                    recv_type: None,
                                 });
                             }
                         }
@@ -398,6 +419,7 @@ fn extract_file_call_edges(
                                     hint_crate: Some(qual.clone()),
                                     caller_line: occ_line,
                                     is_method_call: false,
+                                    recv_type: None,
                                 });
                             }
                         }
@@ -410,6 +432,7 @@ fn extract_file_call_edges(
                                     hint_crate: None,
                                     caller_line: occ_line,
                                     is_method_call: false,
+                                    recv_type: None,
                                 });
                             }
                         }
@@ -425,6 +448,7 @@ fn extract_file_call_edges(
                         hint_crate: None,
                         caller_line: occ_line,
                         is_method_call: false,
+                        recv_type: None,
                     });
                 }
                 _ => {}
@@ -489,7 +513,7 @@ fn extract_macro_calls(
                     "",
                     vname_path,
                     "rust",
-                    format!("fn:{t}.{caller_fn}"),
+                    format!("method:{t}.{caller_fn}"),
                 )
                 .id(),
                 None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
@@ -507,7 +531,7 @@ fn extract_macro_calls(
                         .filter(|n| n.kind() == "identifier")
                         .and_then(|n| n.utf8_text(source).ok());
                     match qual {
-                        Some(q) => format!("fn:{q}.{callee_name}"),
+                        Some(q) => format!("method:{q}.{callee_name}"),
                         None => format!("fn:{callee_name}"),
                     }
                 }
@@ -520,6 +544,10 @@ fn extract_macro_calls(
                 hint_crate: None,
                 caller_line: occ_line,
                 is_method_call,
+                // Macro-token recovery has no receiver AST node to inspect
+                // (it scans the raw token stream, not a parsed expression) —
+                // recv_type stays None, same as before #529 (unchanged tier).
+                recv_type: None,
             });
         }
     }
@@ -530,24 +558,15 @@ fn extract_macro_calls(
     }
 }
 
-/// Walk up the tree-sitter AST to find the nearest enclosing `function_item`.
-/// Returns `(fn_name, Option<impl_type>)` or `None` when outside any function.
-fn find_enclosing_fn(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-) -> Option<(String, Option<String>)> {
+/// Walk up from `node` to the nearest enclosing `function_item` node itself
+/// (as opposed to [`find_enclosing_fn`], which derives its name/impl-type).
+/// Shared with `resolve_receiver_type` (#529), which needs the node to scan
+/// the function body for local bindings.
+fn enclosing_function_item(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     let mut cur = node.parent()?;
     loop {
         match cur.kind() {
-            "function_item" => {
-                let fn_name = cur
-                    .child_by_field_name("name")?
-                    .utf8_text(source)
-                    .ok()?
-                    .to_string();
-                let impl_type = find_parent_impl_type(cur, source);
-                return Some((fn_name, impl_type));
-            }
+            "function_item" => return Some(cur),
             "source_file" => return None,
             _ => {}
         }
@@ -555,9 +574,27 @@ fn find_enclosing_fn(
     }
 }
 
-/// Walk up from `node` to find the nearest enclosing `impl_item` type name.
-/// Returns the implementing type (e.g. `"Worker"` for `impl Trait for Worker`).
-/// Stops at `mod_item` boundaries.
+/// Walk up the tree-sitter AST to find the nearest enclosing `function_item`.
+/// Returns `(fn_name, Option<impl_type>)` or `None` when outside any function.
+fn find_enclosing_fn(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(String, Option<String>)> {
+    let fn_node = enclosing_function_item(node)?;
+    let fn_name = fn_node
+        .child_by_field_name("name")?
+        .utf8_text(source)
+        .ok()?
+        .to_string();
+    let impl_type = find_parent_impl_type(fn_node, source);
+    Some((fn_name, impl_type))
+}
+
+/// Walk up from `node` to find the nearest enclosing type-container name.
+/// Returns the implementing type (e.g. `"Worker"` for `impl Trait for Worker`)
+/// or, for a default method inside a trait, the trait name (N4c) — matching the
+/// Phase A node identity `method:Trait.name`, so caller `src` ids and `self`
+/// receiver types stay consistent. Stops at `mod_item` boundaries.
 fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let mut cur = node.parent()?;
     loop {
@@ -573,10 +610,281 @@ fn find_parent_impl_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<S
                     _ => None,
                 };
             }
+            // N4c: a default method inside a trait belongs to the trait.
+            "trait_item" => {
+                return cur
+                    .child_by_field_name("name")?
+                    .utf8_text(source)
+                    .ok()
+                    .map(str::to_string);
+            }
             "mod_item" => return None,
             _ => {}
         }
         cur = cur.parent()?;
+    }
+}
+
+// ── Receiver-type resolution (#529) ─────────────────────────────────────────
+
+/// Recover the receiver's type name for `recv.method()`, using only information
+/// visible inside the enclosing function. File-local by construction: an
+/// incremental single-file reindex must reach the same answer as a full build,
+/// since nothing outside `enclosing_fn`'s own text is consulted.
+///
+/// O(k) in the number of statements in the enclosing fn; each call site walks
+/// its own function body once. No cross-file lookup, no store access.
+///
+/// Accepted, in order (see `docs/plans/issue-529-method-call-receiver-resolution.md`
+/// §4.5): `self` receivers resolve via the enclosing `impl`; plain-identifier
+/// receivers resolve via the nearest preceding `let`/parameter binding of that
+/// name. Anything else — chain/temporary receivers (`x.iter().filter()`),
+/// unbound identifiers, closure captures, `match`/`if let` bindings, tuple
+/// destructuring — returns `None`, which is exactly today's (pre-#529)
+/// behavior. `None` is always the safe answer: the daemon's fallback path is
+/// unchanged from before this feature existed.
+fn resolve_receiver_type(
+    recv: tree_sitter::Node<'_>,
+    enclosing_fn: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<String> {
+    match recv.kind() {
+        "self" => find_parent_impl_type(enclosing_fn, source),
+        "identifier" => {
+            let name = recv.utf8_text(source).ok()?;
+            nearest_preceding_binding_type(enclosing_fn, source, name, recv.start_byte())
+        }
+        _ => None,
+    }
+}
+
+/// Find the type of the nearest `let`/parameter binding of `name` that starts
+/// before `before_byte` (the receiver's own position). "Nearest" = greatest
+/// start byte among candidates, i.e. the textually closest earlier binding.
+///
+/// Deliberately flat: this scans the whole function body by source position,
+/// not by lexical scope. A binding inside a sibling `if`/`match` arm that
+/// happens to sit earlier in the text can shadow the real one — accepted per
+/// §4.5 ("shadowing across nested blocks beyond nearest-preceding-in-source-order
+/// ... rejected deliberately"). §6.1 R-4 measures how often this produces a
+/// wrong (non-`None`) answer before this ships.
+fn nearest_preceding_binding_type<'a>(
+    enclosing_fn: tree_sitter::Node<'a>,
+    source: &[u8],
+    name: &str,
+    before_byte: usize,
+) -> Option<String> {
+    let mut best: Option<(usize, tree_sitter::Node<'a>)> = None;
+
+    if let Some(params) = enclosing_fn.child_by_field_name("parameters") {
+        let mut c = params.walk();
+        for p in params.children(&mut c) {
+            if p.kind() != "parameter" {
+                continue;
+            }
+            let Some(pat) = p.child_by_field_name("pattern") else {
+                continue;
+            };
+            if pat.kind() != "identifier" || pat.utf8_text(source) != Ok(name) {
+                continue;
+            }
+            if p.start_byte() < before_byte && best.map_or(true, |(b, _)| p.start_byte() > b) {
+                best = Some((p.start_byte(), p));
+            }
+        }
+    }
+
+    if let Some(body) = enclosing_fn.child_by_field_name("body") {
+        collect_nearest_let_binding(body, source, name, before_byte, &mut best);
+    }
+
+    let (_, node) = best?;
+    let raw = match node.kind() {
+        "parameter" => extract_receiver_type_name(node.child_by_field_name("type")?, source),
+        "let_declaration" => extract_type_from_let(node, source),
+        _ => None,
+    }?;
+    // `Self` inside the binding's own type/constructor text (`let cfg = Self::new();`,
+    // `fn f(x: Self)`) means the enclosing impl's type, not a literal type named
+    // "Self" — resolve it the same way the `self` receiver already does.
+    if raw == "Self" {
+        return find_parent_impl_type(enclosing_fn, source);
+    }
+    // A receiver typed as one of the enclosing function's OWN generic type
+    // parameters (`fn f<S: Store>(store: &S)`) is not a concrete type — "S" is
+    // syntactically indistinguishable from a real type name, so without this
+    // check it would be treated as one (measured via §6.1 R-4: this produced a
+    // real wrong-resolution case on `crates/travsr-retrieval/src/ppr.rs`).
+    if fn_generic_param_names(enclosing_fn, source).contains(raw.as_str()) {
+        return None;
+    }
+    Some(raw)
+}
+
+/// Names declared in `enclosing_fn`'s own `<...>` generic parameter list
+/// (excluding lifetimes, which can never be a receiver type). Used to reject
+/// a resolved type name that is actually a generic parameter, not a concrete
+/// type — see the `Self`/generic-parameter guard in
+/// [`nearest_preceding_binding_type`].
+fn fn_generic_param_names(
+    enclosing_fn: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> std::collections::HashSet<String> {
+    let Some(type_params) = enclosing_fn.child_by_field_name("type_parameters") else {
+        return std::collections::HashSet::new();
+    };
+    let mut names = std::collections::HashSet::new();
+    let mut c = type_params.walk();
+    for p in type_params.children(&mut c) {
+        if p.kind() != "type_parameter" {
+            continue;
+        }
+        if let Some(name_node) = p.child_by_field_name("name") {
+            if let Ok(text) = name_node.utf8_text(source) {
+                names.insert(text.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Recurse through `node` collecting `let_declaration`s that bind `name` and
+/// start before `before_byte`, keeping only the one with the greatest start
+/// byte (nearest preceding) in `best`. Does not descend into nested
+/// `function_item`/`closure_expression` bodies — a binding local to a nested
+/// fn or closure is never visible to a receiver outside it, and matching one
+/// by source position alone (rather than scope) would be actively wrong
+/// rather than just imprecise.
+fn collect_nearest_let_binding<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &[u8],
+    name: &str,
+    before_byte: usize,
+    best: &mut Option<(usize, tree_sitter::Node<'a>)>,
+) {
+    if node.kind() == "let_declaration" {
+        if let Some(pat) = node.child_by_field_name("pattern") {
+            if pat.kind() == "identifier"
+                && pat.utf8_text(source) == Ok(name)
+                && node.start_byte() < before_byte
+                && best.map_or(true, |(b, _)| node.start_byte() > b)
+            {
+                *best = Some((node.start_byte(), node));
+            }
+        }
+    }
+    if matches!(node.kind(), "function_item" | "closure_expression") {
+        return;
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        collect_nearest_let_binding(child, source, name, before_byte, best);
+    }
+}
+
+/// Smart-pointer / interior-mutability constructors whose `Type::ctor(..)`
+/// call does NOT return `Type` itself (`Arc::new(x)` / `Arc::clone(&x)` both
+/// return `Arc<InnerType>`, not `Arc`). Excluded from the constructor-call
+/// inference below rather than peeled: unlike the `type:`-annotation case
+/// (`extract_receiver_type_name`), there is no type argument in the call
+/// syntax to peel — the inner type is not visible here at all, so `None` is
+/// the only correct answer. Measured via §6.1 R-4: `Arc::clone(&r)` was
+/// wrongly resolving to receiver type `"Arc"` on two real call sites
+/// (`crates/travsr-store/src/lib.rs`, `crates/travsr-mcp/src/lib.rs`).
+const WRAPPER_CONSTRUCTOR_NAMES: &[&str] = &[
+    "Option", "Arc", "Box", "Rc", "RefCell", "Mutex", "RwLock", "Cell", "Weak",
+];
+
+/// Resolve a `let_declaration`'s bound type per §4.5 bullet 2: prefer an
+/// explicit `type:` annotation; otherwise infer from a capitalized
+/// constructor call (`SqliteStore::open(..)`) or struct literal
+/// (`SqliteStore { .. }`) on the right-hand side. Anything else (a plain
+/// identifier, a method chain, a literal) is `None` — inferring through an
+/// arbitrary expression is exactly the unbounded problem #529 rejected doing
+/// with a denylist; only these two syntactically unambiguous shapes are used.
+fn extract_type_from_let(let_decl: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if let Some(ty) = let_decl.child_by_field_name("type") {
+        return extract_receiver_type_name(ty, source);
+    }
+    let value = let_decl.child_by_field_name("value")?;
+    match value.kind() {
+        "call_expression" => {
+            let func = value.child_by_field_name("function")?;
+            if func.kind() != "scoped_identifier" {
+                return None;
+            }
+            let path_node = func.child_by_field_name("path")?;
+            let path_text = path_node.utf8_text(source).ok()?;
+            let seg = path_text.rsplit("::").next().unwrap_or(path_text);
+            if seg.is_empty()
+                || !seg.starts_with(|c: char| c.is_uppercase())
+                || WRAPPER_CONSTRUCTOR_NAMES.contains(&seg)
+            {
+                return None;
+            }
+            Some(seg.to_string())
+        }
+        "struct_expression" => {
+            let name = value.child_by_field_name("name")?;
+            // Only a plain `Type { .. }` is unambiguous. A scoped name here
+            // (`SandboxPolicy::Elevated { .. }`) is syntactically identical
+            // whether it names a real nested-module type or (far more
+            // commonly) a struct-shaped enum variant — tree-sitter cannot
+            // tell these apart, and guessing either segment risks a wrong
+            // resolution (§6.1 R-4 measured this exact shape). `None`.
+            (name.kind() == "type_identifier")
+                .then(|| extract_receiver_type_name(name, source))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// Extract a receiver-usable type name from a type AST node: peel `&`/`&mut`
+/// wrappers, then peel a *single* `Arc<T>`/`Box<T>`/`Rc<T>` layer down to `T`
+/// (these smart pointers `Deref<Target = T>`, so `arc_foo.foo_method()` really
+/// dispatches to `T`'s method). `Option<T>` is deliberately NOT peeled: it does
+/// not implement `Deref`, so a method call on an `Option` receiver dispatches to
+/// `Option`'s own methods (`.map`, `.take`, `.filter`, `.as_ref`, ...), never
+/// `T`'s — peeling it would confidently mis-resolve those to `method:T.<name>`.
+/// `Vec<T>` and every other generic container are likewise NOT unwrapped: the
+/// receiver really is the container (`vec.push(x)` calls `Vec`'s own method, not
+/// `T`'s) — see §4.5.
+fn extract_receiver_type_name(ty: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let ty = peel_references(ty);
+    if ty.kind() == "generic_type" {
+        let base = peel_references(ty.child_by_field_name("type")?);
+        let base_name = type_identifier_text(base, source)?;
+        if matches!(base_name.as_str(), "Arc" | "Box" | "Rc") {
+            let args = ty.child_by_field_name("type_arguments")?;
+            let inner = peel_references(args.named_child(0)?);
+            return type_identifier_text(inner, source);
+        }
+        return Some(base_name);
+    }
+    type_identifier_text(ty, source)
+}
+
+/// Peel `&`/`&mut` reference wrappers down to the underlying type node.
+fn peel_references(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    while node.kind() == "reference_type" {
+        match node.child_by_field_name("type") {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    node
+}
+
+/// The bare name of a `type_identifier` or `scoped_type_identifier` node
+/// (`crate_a::SqliteStore` -> `"SqliteStore"`). `None` for any other shape
+/// (tuples, `dyn Trait`, primitives) — those are not resolvable receiver
+/// types under this design.
+fn type_identifier_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => node.utf8_text(source).ok().map(str::to_string),
+        "scoped_type_identifier" => type_identifier_text(node.child_by_field_name("name")?, source),
+        _ => None,
     }
 }
 
@@ -631,6 +939,266 @@ mod tests {
         parser.parse(source, None).unwrap()
     }
 
+    /// Run the real `CALL_QUERY` + `resolve_receiver_type` path end-to-end
+    /// (#529) against `source`, returning the recovered receiver type for the
+    /// `.method_name()` call site. Exercises the exact same query/capture
+    /// wiring as `extract_file_call_edges`, not a hand-rolled shortcut.
+    fn recv_type_for_call(source: &[u8], method_name: &str) -> Option<String> {
+        let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+        let query = Query::new(&language, CALL_QUERY).unwrap();
+        let tree = parse_rust(source);
+        let cap_names: Vec<String> = query
+            .capture_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut cursor = QueryCursor::new();
+        let mut iter = cursor.matches(&query, tree.root_node(), source);
+        while let Some(m) = iter.next() {
+            let Some(method_cap) = m.captures.iter().find(|c| {
+                cap_names.get(c.index as usize).map(String::as_str) == Some("call.method")
+            }) else {
+                continue;
+            };
+            if method_cap.node.utf8_text(source) != Ok(method_name) {
+                continue;
+            }
+            let recv_cap = m.captures.iter().find(|c| {
+                cap_names.get(c.index as usize).map(String::as_str) == Some("call.recv")
+            })?;
+            let enclosing_fn = enclosing_function_item(recv_cap.node)?;
+            return resolve_receiver_type(recv_cap.node, enclosing_fn, source);
+        }
+        None
+    }
+
+    #[test]
+    fn t1_self_receiver_resolves_to_enclosing_impl_type() {
+        let source = b"impl Foo { fn f(&self) { self.bar(); } }";
+        assert_eq!(recv_type_for_call(source, "bar"), Some("Foo".to_string()));
+    }
+
+    #[test]
+    fn t2_let_with_type_annotation_resolves() {
+        let source = b"fn f() { let s: SqliteStore = x; s.open(); }";
+        assert_eq!(
+            recv_type_for_call(source, "open"),
+            Some("SqliteStore".to_string())
+        );
+    }
+
+    #[test]
+    fn t2_let_with_constructor_call_resolves() {
+        let source = b"fn f() { let s = SqliteStore::open(p); s.close(); }";
+        assert_eq!(
+            recv_type_for_call(source, "close"),
+            Some("SqliteStore".to_string())
+        );
+    }
+
+    #[test]
+    fn t2_let_with_struct_literal_resolves() {
+        let source = b"fn f() { let s = SqliteStore { a: 1 }; s.close(); }";
+        assert_eq!(
+            recv_type_for_call(source, "close"),
+            Some("SqliteStore".to_string())
+        );
+    }
+
+    #[test]
+    fn t3_generic_container_keeps_its_own_name_not_the_type_argument() {
+        // The daemon, not the extractor, decides HashSet is not a graph type
+        // (#529 §4.3 branch 2) — here we only assert the extractor recovers
+        // "HashSet", not "NodeId".
+        let source = b"fn f() { let visited: HashSet<NodeId> = y; visited.insert(x); }";
+        assert_eq!(
+            recv_type_for_call(source, "insert"),
+            Some("HashSet".to_string())
+        );
+    }
+
+    #[test]
+    fn t3b_smart_pointer_wrapper_peels_to_inner_type() {
+        // Arc/Box/Rc are unwrapped one layer (they `Deref<Target = T>`, so
+        // `arc_foo.foo_method()` dispatches to `T`) — unlike Vec/HashSet above,
+        // which are not.
+        let source = b"fn f() { let store: Arc<SqliteStore> = z; store.open(); }";
+        assert_eq!(
+            recv_type_for_call(source, "open"),
+            Some("SqliteStore".to_string())
+        );
+    }
+
+    #[test]
+    fn t3b_option_is_not_peeled_to_its_inner_type() {
+        // `Option<T>` does NOT `Deref` to `T`: a method call on an Option
+        // receiver dispatches to Option's own methods (`.filter`, `.take`,
+        // `.map`, ...), never `T`'s. Peeling it would confidently mis-resolve
+        // `opt.filter(..)` to `method:QueryBuilder.filter`. The extractor must
+        // report the receiver as `Option`; the daemon (Option not being a graph
+        // type) then falls through to leaf-fallback rather than a wrong edge.
+        let source = b"fn f() { let q: Option<QueryBuilder> = z; q.filter(p); }";
+        assert_eq!(
+            recv_type_for_call(source, "filter"),
+            Some("Option".to_string())
+        );
+    }
+
+    // ── §6.1 R-4 regressions: real wrong-resolution sites found by the Phase 0
+    // measurement (bench/_529-recv-dump.tsv cross-referenced against this
+    // repo's own graph). Each of these produced a wrong non-None answer
+    // before the corresponding fix. ─────────────────────────────────────────
+
+    #[test]
+    fn r4_wrapper_constructor_call_does_not_resolve_to_the_wrapper_itself() {
+        // `Arc::clone(&r)` returns `Arc<T>`, not `Arc` — the call syntax gives
+        // no way to see `T`, so this must be None, not "Arc" (real repro:
+        // crates/travsr-store/src/lib.rs's embed_readiness_wait_returns_on_mark).
+        let source = b"fn f() { let r_bg = Arc::clone(&r); r_bg.mark_ready(); }";
+        assert_eq!(recv_type_for_call(source, "mark_ready"), None);
+    }
+
+    #[test]
+    fn r4_self_keyword_resolves_via_enclosing_impl_not_as_a_literal_type() {
+        // Real repro: crates/travsr-plugin-host/src/trust.rs's `from_disk`.
+        let source = b"impl TrustConfig { fn from_disk() -> Self { let mut cfg = Self::new(); cfg.trust(x); cfg } }";
+        assert_eq!(
+            recv_type_for_call(source, "trust"),
+            Some("TrustConfig".to_string())
+        );
+    }
+
+    #[test]
+    fn r4_generic_type_parameter_is_not_treated_as_a_concrete_type() {
+        // Real repro: crates/travsr-retrieval/src/ppr.rs's
+        // build_weighted_subgraph<S: Store>(store: &S, ...).
+        let source = b"fn f<S: Store>(store: &S) { store.iter_edges_from_batch(x); }";
+        assert_eq!(recv_type_for_call(source, "iter_edges_from_batch"), None);
+    }
+
+    #[test]
+    fn r4_struct_expression_with_scoped_name_is_ambiguous_and_resolves_to_none() {
+        // `SandboxPolicy::Elevated { .. }` is syntactically identical whether
+        // "Elevated" is a struct-shaped enum variant (the common case here)
+        // or a real nested type — tree-sitter cannot disambiguate, so this
+        // must stay None rather than guess either "SandboxPolicy" or
+        // "Elevated". Real repro: crates/travsr-plugin-host/src/resolver.rs.
+        let source =
+            b"fn f() { let policy = SandboxPolicy::Elevated { a: 1 }; policy.validate(); }";
+        assert_eq!(recv_type_for_call(source, "validate"), None);
+    }
+
+    #[test]
+    fn t4_chain_receiver_of_unknowable_type_resolves_to_none() {
+        let source = b"fn f() { x.iter().filter(|v| *v); }";
+        assert_eq!(recv_type_for_call(source, "filter"), None);
+        let source2 = b"fn f() { foo().bar(); }";
+        assert_eq!(recv_type_for_call(source2, "bar"), None);
+    }
+
+    #[test]
+    fn t4b_receiver_with_no_visible_binding_resolves_to_none() {
+        let source = b"fn f() { thing.process(); }";
+        assert_eq!(recv_type_for_call(source, "process"), None);
+    }
+
+    #[test]
+    fn t4c_parameter_binding_resolves() {
+        let source = b"fn f(store: &mut SqliteStore) { store.open(); }";
+        assert_eq!(
+            recv_type_for_call(source, "open"),
+            Some("SqliteStore".to_string())
+        );
+    }
+
+    /// Manual measurement tool for #529 Phase 0 (plan §6.1 R-2/R-3/R-4) — not
+    /// part of the regular suite (`#[ignore]`). Walks this repo's own `.rs`
+    /// files with the real extraction path and dumps every method-call site's
+    /// receiver classification to `bench/_529-recv-dump.tsv`, which
+    /// `bench/phase-b-edge-audit.py` cross-references against `.travsr/graph.db`
+    /// to compute the go/no-go gates before the daemon wiring lands. Not
+    /// wired into CI; a one-time (re-runnable) gate-check artifact.
+    ///
+    /// Run with: `cargo test -p travsr-analysis --release -- --ignored
+    /// dump_recv_type_measurement_529 --nocapture`
+    #[test]
+    #[ignore = "manual measurement tool for #529 Phase 0 gates, not a regression test"]
+    fn dump_recv_type_measurement_529() {
+        use std::io::Write;
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let out_path = repo_root.join("bench/_529-recv-dump.tsv");
+
+        let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+        let query = Query::new(&language, CALL_QUERY).unwrap();
+        let cap_names: Vec<String> = query
+            .capture_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let files = collect_source_files(repo_root, &["rs"]);
+        let mut out = std::fs::File::create(&out_path).expect("create dump file");
+        writeln!(
+            out,
+            "path\tline\tmethod\trecv_kind\trecv_multiline\trecv_type"
+        )
+        .unwrap();
+
+        for (abs_path, vname_path) in &files {
+            let Ok(source) = std::fs::read(abs_path) else {
+                continue;
+            };
+            let mut parser = Parser::new();
+            parser.set_language(&language).unwrap();
+            let Some(tree) = parser.parse(&source, None) else {
+                continue;
+            };
+            let mut cursor = QueryCursor::new();
+            let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
+            while let Some(m) = iter.next() {
+                let Some(method_cap) = m.captures.iter().find(|c| {
+                    cap_names.get(c.index as usize).map(String::as_str) == Some("call.method")
+                }) else {
+                    continue;
+                };
+                let Some(recv_cap) = m.captures.iter().find(|c| {
+                    cap_names.get(c.index as usize).map(String::as_str) == Some("call.recv")
+                }) else {
+                    continue;
+                };
+                let Ok(method) = method_cap.node.utf8_text(source.as_slice()) else {
+                    continue;
+                };
+                if method.len() < 2 || NOISE_NAMES.contains(&method) {
+                    continue;
+                }
+                let line = method_cap.node.start_position().row + 1;
+                let recv_kind = recv_cap.node.kind();
+                let recv_multiline =
+                    recv_cap.node.end_position().row < method_cap.node.start_position().row;
+                let recv_type = enclosing_function_item(recv_cap.node)
+                    .and_then(|f| resolve_receiver_type(recv_cap.node, f, source.as_slice()));
+                writeln!(
+                    out,
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    vname_path,
+                    line,
+                    method,
+                    recv_kind,
+                    recv_multiline,
+                    recv_type.as_deref().unwrap_or("")
+                )
+                .unwrap();
+            }
+        }
+        eprintln!("wrote {}", out_path.display());
+    }
+
     #[test]
     fn extract_macro_calls_recovers_method_assoc_and_bare_calls() {
         // #299 R1: tree-sitter does not expose call expressions inside a macro
@@ -658,7 +1226,7 @@ fn run(z: &Zoo) {
         assert_eq!(describe.caller_line, 3);
         // Associated call `Animal::speak()` (prev `::`) keeps the qualifier.
         let speak = by_sig
-            .get("fn:Animal.speak")
+            .get("method:Animal.speak")
             .expect("associated call recovered from macro");
         assert_eq!(speak.caller_line, 4);
         // Bare call `greet()`.

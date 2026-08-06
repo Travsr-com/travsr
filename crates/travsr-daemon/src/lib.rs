@@ -88,6 +88,9 @@ pub struct PhaseBReport {
     pub skipped_no_analyzer: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
+    /// Languages that need a `compile_commands.json` at the repo root
+    /// (scip-clang, for `c`/`cpp`) but don't have one (L5a).
+    pub skipped_no_compdb: Vec<String>,
     /// Languages that are RequiresElevated but have no PSE approval in lang.toml.
     /// Shown to the user with a `travsr lang approve` call-to-action.
     pub skipped_needs_approval: Vec<String>,
@@ -178,6 +181,16 @@ fn index_paths_parallel(
     // Divide `paths` into `jobs` slices (last shard may be smaller).
     let shard_size = paths.len().div_ceil(jobs);
 
+    // L5b: `.h` is ambiguous between C and Obj-C. `paths` is already the full
+    // indexable file list for this run, so checking it in memory is free (no
+    // extra walk) and gives an accurate repo-wide signal.
+    let objc_signal = paths.iter().any(|p| {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("m") | Some("mm")
+        )
+    });
+
     let (tx, rx) = mpsc::sync_channel::<anyhow::Result<ParseResult>>(jobs * 4);
 
     // ── spawn worker threads ──────────────────────────────────────────────────
@@ -221,8 +234,18 @@ fn index_paths_parallel(
                         continue;
                     }
 
-                    // Parse Phase A.
-                    let out = match indexer.parse_file_with_vname(abs_path, &vname_path) {
+                    // Parse Phase A. L5b: route `.h` to the Obj-C parser instead of
+                    // the default C dispatch when the repo has `.m`/`.mm` sources —
+                    // the C grammar cannot parse `@interface`/`@protocol` headers.
+                    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let parsed = if ext == "h" && objc_signal {
+                        travsr_analysis::objc::parse(&corpus, abs_path, &vname_path)
+                    } else {
+                        indexer
+                            .parse_file_with_vname(abs_path, &vname_path)
+                            .map_err(anyhow::Error::from)
+                    };
+                    let out = match parsed {
                         Ok(o) => o,
                         Err(e) => {
                             tracing::warn!(path=%abs_path.display(), err=%e, "parse error, skipping");
@@ -231,7 +254,6 @@ fn index_paths_parallel(
                     };
 
                     // Import resolution (read-only FS, no store access).
-                    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let import_edges = match Language::from_extension(ext) {
                         Some(Language::TypeScript) => {
                             link_imports(&out.nodes, &vname_path, &corpus)
@@ -1138,6 +1160,7 @@ pub fn init_repo_with_progress(
             indexable_paths.push(p);
         }
     }
+    reclassify_objc_headers(&mut present_languages, &indexable_paths);
 
     // L13: warn if a rebase is in progress — init during rebase risks indexing
     // conflict-marker noise into graph.db; the user should finish rebasing first.
@@ -1181,6 +1204,7 @@ pub fn init_repo_with_progress(
                     indexable_paths.push(p);
                 }
             }
+            reclassify_objc_headers(&mut present_languages, &indexable_paths);
         }
     }
 
@@ -1323,6 +1347,13 @@ pub fn init_repo_with_progress(
 
     let nodes_after = store.node_count().context("counting nodes after init")? as i64;
 
+    // E1: reconcile Phase A edge languages now so the graph is correctly
+    // labelled even when Phase B is deferred or unavailable (no analyzer). The
+    // Phase B paths re-run this after adding their own edges.
+    if let Err(e) = store.reconcile_edge_languages() {
+        tracing::warn!("reconciling edge languages after Phase A: {e:#}");
+    }
+
     // Decide whether to run Phase B inline now, defer it, or skip it entirely.
     //
     // Already-done path: `phase_b_commit == HEAD` means Phase B is current for
@@ -1376,17 +1407,49 @@ pub fn init_repo_with_progress(
                 // skip their own directory walks.
                 indexable_paths: &indexable_paths,
             };
-            let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+            let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
                 phase_b_indexer.invoke_phase_b_all(&inputs);
-            let (resolved, resolved_sites) =
-                resolve_unresolved_calls(&store, &pb_unresolved, &pb_nodes, &pb_edges);
+            // E3 W3b: resolve rust-analyzer LSIF positional refs against the full
+            // store (cross-file + incremental-safe) into attributable ScipRefs.
+            // Fail closed — a callee that resolves to no node is dropped here, so
+            // no dangling ref/call edge is ever written.
+            let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
+                std::collections::HashSet::new();
+            match store.resolve_lsif_positional_refs(&corpus, &pb_positional) {
+                Ok(resolved) => {
+                    tracing::debug!(
+                        positional_in = pb_positional.len(),
+                        resolved = resolved.len(),
+                        "Phase B: rust-analyzer positional refs resolved"
+                    );
+                    // E7: remember which call sites LSIF positionally resolved,
+                    // keyed by the resolved callee's leaf name too — a suppression
+                    // keyed only on (path, line) would drop a second real call
+                    // sharing the line with the one LSIF actually resolved (#I2).
+                    lsif_covered.extend(lsif_covered_keys(&store, &resolved));
+                    pb_refs.extend(resolved);
+                }
+                Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
+            }
+            let (resolved, resolved_sites) = resolve_unresolved_calls(
+                &store,
+                &pb_unresolved,
+                &pb_nodes,
+                &pb_edges,
+                &lsif_covered,
+            );
             tracing::debug!(
                 resolved_cross_crate_edges = resolved.len(),
                 "Phase B UnresolvedCall resolution complete"
             );
-            pb_edges.extend(resolved);
             let (report, alias_map) =
                 write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            // E1: edges resolved by native leaf-name heuristics are tree-sitter,
+            // not compiler-derived — write them separately with truthful
+            // provenance instead of folding them into the SCIP batch as 'lsif'.
+            if let Err(e) = store.write_phase_b_batch(&[], &resolved, "tree-sitter") {
+                tracing::warn!("phase B native resolved edges write error: {e:#}");
+            }
             // #299 WS-4: record cross-crate call occurrence lines after the edges
             // (and their callee nodes) are in the store. #299 F2: remap dst ids
             // through the unification alias map first so a site never points at a
@@ -1394,6 +1457,11 @@ pub fn init_repo_with_progress(
             let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
             if let Err(e) = store.record_edge_sites(&resolved_sites) {
                 tracing::warn!("recording cross-crate edge_sites: {e:#}");
+            }
+            // E1: label-only reconcile of edge languages to their endpoints
+            // (the schema default 'typescript' otherwise mislabels every edge).
+            if let Err(e) = store.reconcile_edge_languages() {
+                tracing::warn!("reconciling edge languages: {e:#}");
             }
             report
         };
@@ -1633,6 +1701,52 @@ fn call_target_reachable(caller_path: &str, candidate_path: &str, crates: &Crate
         .unwrap_or(false)
 }
 
+/// Leaf identifier from a `kind:Qualified.Name` signature, e.g. `"filter"`
+/// from `"fn:Session.filter"` or `"method:Type.method"`. Shared by the E7
+/// LSIF per-callee suppression key and the native leaf-uniqueness resolver
+/// below, so both sides agree on what "the same callee" means.
+fn leaf_of(sig: &str) -> String {
+    let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
+    body.rsplit('.').next().unwrap_or(body).to_string()
+}
+
+/// E7 (#I2): build the `(caller_path, caller_line, callee_leaf)` suppression
+/// keys for a batch of positionally-resolved `ScipRef`s. Batch-fetches each
+/// resolved callee's own node to recover its signature leaf, so suppression
+/// is scoped to the specific callee LSIF resolved rather than the whole
+/// source line — a second real call sharing that line is not also dropped.
+/// A ref whose callee node lookup fails is skipped (fail open on suppression,
+/// never fail closed on emission — the native heuristic may then duplicate
+/// it, which is the pre-existing worst case, not a new one).
+fn lsif_covered_keys(
+    store: &SqliteStore,
+    resolved: &[travsr_core::ScipRef],
+) -> Vec<(String, u32, String)> {
+    let callee_ids: Vec<travsr_core::NodeId> = {
+        let mut ids: Vec<travsr_core::NodeId> = resolved.iter().map(|r| r.callee_id).collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        ids
+    };
+    let callee_leaves: std::collections::HashMap<travsr_core::NodeId, String> = store
+        .get_nodes(&callee_ids)
+        .unwrap_or_else(|e| {
+            tracing::warn!("lsif_covered: callee node lookup failed: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|n| (n.id, leaf_of(&n.vname.signature)))
+        .collect();
+    resolved
+        .iter()
+        .filter_map(|r| {
+            callee_leaves
+                .get(&r.callee_id)
+                .map(|leaf| (r.caller_path.clone(), r.caller_line, leaf.clone()))
+        })
+        .collect()
+}
+
 /// Write the result of one Phase B (SCIP) pass into `store`, returning a
 /// [`PhaseBReport`].
 ///
@@ -1660,6 +1774,11 @@ fn resolve_unresolved_calls(
     unresolved: &[travsr_core::UnresolvedCall],
     pb_nodes: &[travsr_core::Node],
     pb_edges: &[travsr_core::Edge],
+    // E7: call sites (caller_path, caller_line, callee_leaf) already resolved
+    // by E3's positional rust-analyzer LSIF path. The native heuristic defers
+    // to them, per callee — not per line, so a second real call sharing the
+    // line with an LSIF-covered one is not also dropped (#I2).
+    lsif_covered: &std::collections::HashSet<(String, u32, String)>,
 ) -> (
     Vec<travsr_core::Edge>,
     Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
@@ -1683,14 +1802,14 @@ fn resolve_unresolved_calls(
         }
     };
 
-    // sig → Vec<(NodeId, path)>
-    let mut by_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str)>> =
+    // sig → Vec<(NodeId, path, language)>
+    let mut by_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str, &str)>> =
         std::collections::HashMap::new();
-    for (id, sig, path) in &candidates {
+    for (id, sig, path, lang) in &candidates {
         by_sig
             .entry(sig.as_str())
             .or_default()
-            .push((*id, path.as_str()));
+            .push((*id, path.as_str(), lang.as_str()));
     }
 
     // #299 R1: leaf-name fallback for method calls. `recv.method()` can't be
@@ -1698,10 +1817,6 @@ fn resolve_unresolved_calls(
     // a bare `fn:method` sig; when the definition is a qualified `fn:Type.method`
     // node the exact pass above misses it. Look up the still-unmatched sigs by
     // leaf identifier and resolve only when the leaf is unique (precision).
-    let leaf_of = |sig: &str| -> String {
-        let body = sig.split_once(':').map(|(_, r)| r).unwrap_or(sig);
-        body.rsplit('.').next().unwrap_or(body).to_string()
-    };
     let unmatched_leaves: Vec<String> = {
         let mut v: Vec<String> = unresolved
             .iter()
@@ -1723,18 +1838,100 @@ fn resolve_unresolved_calls(
                 Vec::new()
             })
     };
-    // leaf → Vec<(NodeId, path, signature)>. Signature is retained (unlike the
-    // exact `by_sig` pass, where it always equals the lookup key) so #521 F3
-    // can tell a qualified `fn:Type.method` candidate apart from a bare
-    // `fn:name` one — a method call can only ever target the former.
-    let mut by_leaf: std::collections::HashMap<String, Vec<(travsr_core::NodeId, &str, &str)>> =
-        std::collections::HashMap::new();
-    for (id, sig, path) in &leaf_candidates {
-        by_leaf
-            .entry(leaf_of(sig))
-            .or_default()
-            .push((*id, path.as_str(), sig.as_str()));
+    // leaf → Vec<(NodeId, path, signature, language)>. Signature is retained
+    // (unlike the exact `by_sig` pass, where it always equals the lookup key) so
+    // #521 F3 can tell a qualified `fn:Type.method` candidate apart from a bare
+    // `fn:name` one — a method call can only ever target the former. Language is
+    // retained so the caller's language can scope the candidate pool (E4).
+    let mut by_leaf: std::collections::HashMap<
+        String,
+        Vec<(travsr_core::NodeId, &str, &str, &str)>,
+    > = std::collections::HashMap::new();
+    for (id, sig, path, lang) in &leaf_candidates {
+        by_leaf.entry(leaf_of(sig)).or_default().push((
+            *id,
+            path.as_str(),
+            sig.as_str(),
+            lang.as_str(),
+        ));
     }
+
+    // #529: batch-resolve qualified `fn:T.method` candidates and graph-type
+    // existence for every method call whose receiver type extraction
+    // recovered (`UnresolvedCall::recv_type`). Two purposes:
+    //   (1) an exact `fn:T.method` match resolves the call precisely,
+    //       bypassing the unique-leaf ambiguity gate below entirely — the
+    //       receiver type already disambiguated it.
+    //   (2) when no such node exists AND `T` itself is not any node in the
+    //       graph, the call is almost certainly into a std/external type
+    //       (`HashSet::insert`, `Iterator::filter`) that collided with an
+    //       unrelated same-named user method under #521's leaf-uniqueness
+    //       rule. Emit nothing instead of guessing (the #529 fix). When `T`
+    //       IS a graph type but just doesn't have this method (trait impls,
+    //       `Deref` targets the extractor can't see), fall through to
+    //       today's leaf-pool resolution unchanged — see the three-way
+    //       branch below.
+    let recv_qualified_sigs: Vec<String> = {
+        let mut v: Vec<String> = unresolved
+            .iter()
+            .filter_map(|u| {
+                u.recv_type
+                    .as_ref()
+                    .map(|t| format!("method:{t}.{}", leaf_of(&u.callee_sig)))
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let recv_qualified_candidates = store
+        .nodes_by_signatures(&recv_qualified_sigs)
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_unresolved_calls: recv_type qualified lookup failed: {e}");
+            Vec::new()
+        });
+    let mut by_recv_sig: std::collections::HashMap<&str, Vec<(travsr_core::NodeId, &str, &str)>> =
+        std::collections::HashMap::new();
+    for (id, sig, path, lang) in &recv_qualified_candidates {
+        by_recv_sig
+            .entry(sig.as_str())
+            .or_default()
+            .push((*id, path.as_str(), lang.as_str()));
+    }
+
+    let recv_type_probe_sigs: Vec<String> = {
+        let mut types: Vec<&str> = unresolved
+            .iter()
+            .filter_map(|u| u.recv_type.as_deref())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        types
+            .iter()
+            .flat_map(|t| {
+                // E4: `class:` makes the receiver-type existence gate
+                // language-general — Python/TypeScript/Java/Go receivers are
+                // `class:T`, not Rust's `struct:`/`enum:`/`trait:`. Without it a
+                // real graph class was treated as an external type (#529 branch
+                // 2), dropping legitimate cross-file method edges.
+                [
+                    format!("struct:{t}"),
+                    format!("enum:{t}"),
+                    format!("trait:{t}"),
+                    format!("class:{t}"),
+                ]
+            })
+            .collect()
+    };
+    let known_graph_types: std::collections::HashSet<String> = store
+        .nodes_by_signatures(&recv_type_probe_sigs)
+        .unwrap_or_else(|e| {
+            tracing::warn!("resolve_unresolved_calls: recv_type existence lookup failed: {e}");
+            Vec::new()
+        })
+        .iter()
+        .filter_map(|(_, sig, _, _)| sig.split_once(':').map(|(_, name)| name.to_string()))
+        .collect();
 
     // #521 F1: crate dependency graph, built from this Phase B pass's own
     // in-memory output (see [`CrateGraph`] for why not the store).
@@ -1749,43 +1946,127 @@ fn resolve_unresolved_calls(
         ids.dedup();
         ids
     };
-    let caller_paths: std::collections::HashMap<travsr_core::NodeId, String> = store
-        .get_nodes(&caller_ids)
-        .unwrap_or_else(|e| {
-            tracing::warn!("resolve_unresolved_calls: caller path lookup failed: {e}");
-            Vec::new()
-        })
-        .into_iter()
-        .map(|n| (n.id, n.vname.path))
+    let caller_nodes = store.get_nodes(&caller_ids).unwrap_or_else(|e| {
+        tracing::warn!("resolve_unresolved_calls: caller path lookup failed: {e}");
+        Vec::new()
+    });
+    let caller_paths: std::collections::HashMap<travsr_core::NodeId, String> = caller_nodes
+        .iter()
+        .map(|n| (n.id, n.vname.path.clone()))
         .collect();
+    // E4: each caller's own language, so candidate resolution can be scoped to
+    // it — a Python/TS/Rust call must never resolve to a same-signature
+    // definition in another language (mixed-repo cross-language collision).
+    let caller_langs: std::collections::HashMap<travsr_core::NodeId, String> = caller_nodes
+        .into_iter()
+        .map(|n| (n.id, n.vname.language))
+        .collect();
+
+    // Shared by both the #529 recv_type fallback and the pre-#529 is_method_call
+    // path: qualified (`Type.method`) candidates from the unique-leaf pool.
+    // Each match carries `(NodeId, path, language)`.
+    let leaf_method_matches = |sig: &str| -> Vec<(travsr_core::NodeId, &str, &str)> {
+        by_leaf
+            .get(&leaf_of(sig))
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, s, _)| s.contains('.'))
+                    .map(|(id, path, _, lang)| (*id, *path, *lang))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
+        // E7: E3's positional rust-analyzer LSIF path resolves the same call
+        // sites at 99.89% precision; where it already covered this exact site,
+        // its `scip` edge supersedes the native leaf-guess heuristic (~8% precise
+        // on the overlap — the `Session::filter` vs `Iterator::filter` class of
+        // fabrication). Defer to it and keep only the residual LSIF did not
+        // cover. An empty set (LSIF absent or degraded) leaves the native
+        // heuristic as the full fallback — its intended E7 role.
+        if !lsif_covered.is_empty() {
+            let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+            let key = (
+                caller_path.to_owned(),
+                u.caller_line,
+                leaf_of(&u.callee_sig),
+            );
+            if lsif_covered.contains(&key) {
+                continue;
+            }
+        }
         // Exact signature first; fall back to a leaf-name match (R1). #521 F3:
         // a method call's `callee_sig` is always the bare `fn:{name}` form
         // (extraction never sets `is_method_call` with a qualified sig), so an
         // exact `by_sig` hit there is by construction a free function — never
         // a valid method-call target. Skip straight to the leaf pool and keep
         // only qualified (`Type.method`) candidates from it.
-        let matches: Vec<(travsr_core::NodeId, &str)> = if u.is_method_call {
-            by_leaf
-                .get(&leaf_of(&u.callee_sig))
-                .map(|v| {
-                    v.iter()
-                        .filter(|(_, _, sig)| sig.contains('.'))
-                        .map(|(id, path, _)| (*id, *path))
-                        .collect()
-                })
-                .unwrap_or_default()
+        let matches: Vec<(travsr_core::NodeId, &str, &str)> = if u.is_method_call {
+            match &u.recv_type {
+                // #529: receiver type recovered — resolve against it instead
+                // of guessing by leaf uniqueness. Three-way split (§4.3):
+                Some(t) => {
+                    let qsig = format!("method:{t}.{}", leaf_of(&u.callee_sig));
+                    match by_recv_sig.get(qsig.as_str()) {
+                        // (1) `fn:T.method` exists — exact resolution.
+                        Some(m) => m.clone(),
+                        // (2) `T` is not any node in the graph at all — the
+                        // receiver is a std/external type; emit nothing
+                        // rather than let it fall into the unique-leaf pool
+                        // and collide with an unrelated method (the #529 bug
+                        // itself, e.g. `Session::filter` vs `Iterator::filter`).
+                        None if !known_graph_types.contains(t.as_str()) => continue,
+                        // (3) `T` is a real graph type but doesn't have this
+                        // method (trait impls / `Deref` targets the
+                        // extractor can't see) — fall through unchanged.
+                        None => leaf_method_matches(&u.callee_sig),
+                    }
+                }
+                // recv_type not recovered — pre-#529 behavior, unchanged.
+                None => leaf_method_matches(&u.callee_sig),
+            }
         } else {
             match by_sig.get(u.callee_sig.as_str()) {
                 Some(m) => m.clone(),
                 None => by_leaf
                     .get(&leaf_of(&u.callee_sig))
-                    .map(|v| v.iter().map(|(id, path, _)| (*id, *path)).collect())
+                    .map(|v| {
+                        v.iter()
+                            .map(|(id, path, _, lang)| (*id, *path, *lang))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             }
+        };
+        if matches.is_empty() {
+            continue;
+        }
+        // E4: scope candidates to the caller's own language. This is the
+        // fuzzy leaf-name resolver; a cross-language name match here (e.g.
+        // Python `fn:parse` → a Rust `fn:parse`) is a coincidental collision,
+        // never real linkage — it is a false `ref/call` edge and also inflates
+        // the candidate count, breaking the CO-A1 uniqueness gate below.
+        // Genuine cross-language linkage (FFI: cgo / N-API / PyO3 / JNI) is
+        // modelled separately as `ffi/call` by the RFC-005 marker resolver
+        // (`ffi_resolver.rs`), which this filter does not touch — so no real
+        // cross-language edge is ever suppressed here.
+        let caller_lang = caller_langs.get(&u.src).map(String::as_str).unwrap_or("");
+        // #I3: an empty caller_lang would filter every candidate to nothing and
+        // silently drop a real call. No Phase A node-construction path leaves
+        // `vname.language` empty for a function/method node (verified across
+        // 16 fixture languages plus this repo's own multi-language index), but
+        // guard anyway — a future gap then degrades to pre-E4 behavior
+        // (candidates unfiltered by language) instead of dropping the call.
+        let matches: Vec<(travsr_core::NodeId, &str, &str)> = if caller_lang.is_empty() {
+            matches
+        } else {
+            matches
+                .into_iter()
+                .filter(|(_, _, lang)| *lang == caller_lang)
+                .collect()
         };
         if matches.is_empty() {
             continue;
@@ -1794,7 +2075,7 @@ fn resolve_unresolved_calls(
             let hint_dash = hint.replace('_', "-");
             matches
                 .iter()
-                .filter(|(_, path)| path.contains(hint.as_str()) || path.contains(&*hint_dash))
+                .filter(|(_, path, _)| path.contains(hint.as_str()) || path.contains(&*hint_dash))
                 .copied()
                 .collect()
         } else {
@@ -1807,7 +2088,7 @@ fn resolve_unresolved_calls(
             continue;
         }
         let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
-        for (dst, path) in filtered {
+        for (dst, path, _lang) in filtered {
             // #521 F1/F2: never emit an edge the caller's own crate could not
             // possibly reach.
             if u.src != dst && call_target_reachable(caller_path, path, &crates) {
@@ -1854,9 +2135,14 @@ fn write_phase_b_results(
     // unification drops. Empty for the no-attribution (old-style sidecar) path.
     let mut alias_map: std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId> =
         std::collections::HashMap::new();
+    // E6: SCIP def-unification attempt/miss counts, surfaced on the degradation
+    // channel below so silent non-unification (orphaned SCIP twins) is visible.
+    let mut scip_unify_attempted: usize = 0;
+    let mut scip_unify_missed: usize = 0;
     if pb_refs.is_empty() {
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
-        if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges) {
+        // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
+        if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges, "scip") {
             tracing::warn!("phase B batch write error: {e:#}");
         }
     } else {
@@ -1864,7 +2150,10 @@ fn write_phase_b_results(
         // writing. Mutates pb_refs in-place to redirect callee_id to unified
         // TS nodes, and returns the alias map (SCIP id → TS id).
         let mut pb_refs_mut = pb_refs;
-        alias_map = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
+        let unify = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
+        scip_unify_attempted = unify.attempted;
+        scip_unify_missed = unify.attempted.saturating_sub(unify.unified);
+        alias_map = unify.alias_map;
         let pb_refs = pb_refs_mut;
 
         // Drop unified SCIP definition nodes: the tree-sitter node already
@@ -1900,7 +2189,7 @@ fn write_phase_b_results(
         // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
         // need to be written — they are not represented in ScipRef records.
         if !pb_edges.is_empty() {
-            if let Err(e) = store.write_phase_b_batch(&[], &pb_edges) {
+            if let Err(e) = store.write_phase_b_batch(&[], &pb_edges, "scip") {
                 tracing::warn!("phase B structural edges write error: {e:#}");
             }
         }
@@ -1934,6 +2223,20 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_no_analyzer {
         warnings.push(format!("skipped_no_analyzer:{lang}"));
     }
+    // L5a: scip-clang (c/cpp) needs a compile_commands.json — surface it the
+    // same way as the other user-actionable skip classes above.
+    for lang in &pb_outcome.skipped_no_compdb {
+        warnings.push(format!("skipped_no_compdb:{lang}"));
+    }
+    // E6: surface SCIP def-unification misses (orphaned twins). Positional
+    // span-containment makes this near-zero; a non-zero rate means Phase A
+    // nodes the compiler defined were not matched, so their ref/call edges
+    // landed on a duplicate SCIP node instead. Format: missed/attempted.
+    if scip_unify_missed > 0 {
+        warnings.push(format!(
+            "scip_unification_misses:{scip_unify_missed}/{scip_unify_attempted}"
+        ));
+    }
     if !warnings.is_empty() {
         let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
     } else {
@@ -1955,6 +2258,7 @@ fn write_phase_b_results(
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
         skipped_unregistered: pb_outcome.skipped_unregistered,
+        skipped_no_compdb: pb_outcome.skipped_no_compdb,
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,
         version_mismatch: pb_outcome.version_mismatch,
@@ -2027,7 +2331,64 @@ fn collect_present_languages_and_paths(
             paths.push(p);
         }
     }
+
+    reclassify_objc_headers(&mut langs, &paths);
+
     (langs, paths)
+}
+
+/// L5b: `.h` is ambiguous between C and Obj-C headers. `Language::from_extension`
+/// has no repo context (deliberately — it stays a pure ext→lang map), so every
+/// file-discovery walk in this module always attributes `.h` to C first.
+/// Disambiguate after the fact using a repo-level signal (any `.m`/`.mm`
+/// present) that can only be known once every file in the walk has been seen.
+/// Shared by every `present_languages` builder (`collect_present_languages_and_paths`
+/// and both walk loops in `init_repo_with_progress`) so the reclassification is
+/// never applied to only one of them.
+fn reclassify_objc_headers(langs: &mut std::collections::HashSet<String>, paths: &[PathBuf]) {
+    let has_objc_source = paths.iter().any(|p| {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("m") | Some("mm")
+        )
+    });
+    let has_header = paths
+        .iter()
+        .any(|p| p.extension().and_then(|e| e.to_str()) == Some("h"));
+    if has_objc_source && has_header {
+        langs.insert(Language::ObjectiveC.as_str().to_string());
+        // Only drop "c" when no genuine .c source exists — a mixed C+Obj-C repo
+        // must still enroll the C analyzer for its real .c files.
+        let has_c_source = paths
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("c"));
+        if !has_c_source {
+            langs.remove(Language::C.as_str());
+        }
+    }
+}
+
+/// L5b: early-exit repo-wide scan for any `.m`/`.mm` file — the signal used to
+/// disambiguate a changed `.h` file's language on the commit-hook path, where
+/// `reindex_files`'s own `paths` batch is a diff and may not include a sibling
+/// `.m`/`.mm` that already establishes the repo as Obj-C. Callers gate this
+/// behind "batch touches a `.h` file" so it costs nothing on other commits.
+fn repo_has_objc_sources(repo_root: &Path) -> bool {
+    use ignore::WalkBuilder;
+    WalkBuilder::new(repo_root)
+        .hidden(false)
+        .git_ignore(true)
+        .follow_links(false)
+        .add_custom_ignore_filename(".travsrignore")
+        .build()
+        .flatten()
+        .any(|entry| {
+            entry.file_type().is_some_and(|t| t.is_file())
+                && matches!(
+                    entry.path().extension().and_then(|e| e.to_str()),
+                    Some("m") | Some("mm")
+                )
+        })
 }
 
 /// Background, single-flight Phase B refresh (#318 O3).
@@ -2338,19 +2699,38 @@ fn run_background_phase_b_inner(
         present_languages,
         indexable_paths: &indexable_paths,
     };
-    let (pb_nodes, mut pb_edges, pb_refs, pb_unresolved, pb_outcome) =
+    let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
         indexer.invoke_phase_b_all(&inputs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
 
+    // E3 W3b: resolve rust-analyzer LSIF positional refs against the full store
+    // (cross-file + incremental-safe). Fail closed — unresolved callees dropped,
+    // never dangled.
+    let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
+        std::collections::HashSet::new();
+    match s.resolve_lsif_positional_refs(&corpus, &pb_positional) {
+        Ok(resolved) => {
+            tracing::debug!(
+                positional_in = pb_positional.len(),
+                resolved = resolved.len(),
+                "Phase B: rust-analyzer positional refs resolved"
+            );
+            // E7: remember which call sites LSIF positionally resolved, keyed
+            // by the resolved callee's leaf name too (#I2) — see lsif_covered_keys.
+            lsif_covered.extend(lsif_covered_keys(&s, &resolved));
+            pb_refs.extend(resolved);
+        }
+        Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
+    }
+
     let (resolved, resolved_sites) =
-        resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges);
+        resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges, &lsif_covered);
     tracing::debug!(
         resolved_cross_crate_edges = resolved.len(),
         "Phase B UnresolvedCall resolution complete"
     );
-    pb_edges.extend(resolved);
 
     // Write LSIF edges first (pre-collected lock-free above).
     for edge in &lsif_edges {
@@ -2361,12 +2741,21 @@ fn run_background_phase_b_inner(
 
     let (report, alias_map) =
         write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    // E1: native leaf-name resolved edges are tree-sitter-heuristic — truthful
+    // provenance, not the SCIP batch's 'lsif'.
+    if let Err(e) = s.write_phase_b_batch(&[], &resolved, "tree-sitter") {
+        tracing::warn!("phase B native resolved edges write error: {e:#}");
+    }
     // #299 WS-4: record cross-crate call occurrence lines after their edges land.
     // #299 F2: remap dst ids through the unification alias map so a site never
     // points at a SCIP node that unification dropped.
     let resolved_sites = remap_resolved_sites(resolved_sites, &alias_map);
     if let Err(e) = s.record_edge_sites(&resolved_sites) {
         tracing::warn!("recording cross-crate edge_sites: {e:#}");
+    }
+    // E1: reconcile edge languages to their endpoints (label-only).
+    if let Err(e) = s.reconcile_edge_languages() {
+        tracing::warn!("reconciling edge languages: {e:#}");
     }
 
     // C4: only advance phase_b_commit when no language crashed. A partial result
@@ -2516,6 +2905,16 @@ pub fn reindex_files(
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
 
+    // L5b: unlike `index_paths_parallel`'s full-repo `paths`, this commit-hook
+    // batch only contains changed files — a `.m`/`.mm` sibling may not be in it
+    // even when the repo has Obj-C sources. Only pay for a repo-wide scan when
+    // this batch actually touches a `.h` file (the ambiguous case); every other
+    // commit costs nothing extra.
+    let objc_signal = paths
+        .iter()
+        .any(|p| p.extension().and_then(|e| e.to_str()) == Some("h"))
+        && repo_has_objc_sources(repo_root);
+
     for abs_path in paths {
         let vname_path = abs_path
             .strip_prefix(repo_root)
@@ -2562,7 +2961,18 @@ pub fn reindex_files(
         }
 
         // §2 GC keystone: parse FIRST — a syntax error never erases the old graph.
-        let out = match indexer.parse_file_with_vname(abs_path, &vname_path) {
+        // L5b: route `.h` to the Obj-C parser instead of the default C dispatch
+        // when the repo has `.m`/`.mm` sources — the C grammar cannot parse
+        // `@interface`/`@protocol` headers.
+        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let parsed = if ext == "h" && objc_signal {
+            travsr_analysis::objc::parse(&corpus, abs_path, &vname_path)
+        } else {
+            indexer
+                .parse_file_with_vname(abs_path, &vname_path)
+                .map_err(anyhow::Error::from)
+        };
+        let out = match parsed {
             Ok(o) => o,
             Err(err) => {
                 tracing::warn!("parse error for {}: {err}", abs_path.display());
@@ -2571,7 +2981,6 @@ pub fn reindex_files(
         };
 
         // Build import-resolver edges before the atomic reindex_replace call.
-        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let import_edges = match Language::from_extension(ext) {
             Some(Language::TypeScript) => link_imports(&out.nodes, &vname_path, &corpus),
             Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
@@ -2619,6 +3028,12 @@ pub fn reindex_files(
                 tracing::warn!("ffi edge write error: {err}");
             }
         }
+    }
+
+    // E1: label-only reconcile of edge languages to their endpoints (the schema
+    // default 'typescript' otherwise mislabels edges rewritten by this commit).
+    if let Err(e) = store.reconcile_edge_languages() {
+        tracing::warn!("reconciling edge languages: {e:#}");
     }
 
     // Record the current HEAD commit so `travsr status` can show freshness.
@@ -2796,6 +3211,121 @@ mod tests {
         assert_eq!(out, sites);
     }
 
+    // L5b: `.h` must be reclassified as Obj-C — not C — when the repo has any
+    // `.m`/`.mm` source, and "c" must be dropped from the enrolled language set
+    // when no genuine `.c` file backs it (pure Obj-C headers-only signal).
+    #[test]
+    fn collect_present_languages_and_paths_routes_h_to_objc_when_m_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cat.h"), "@interface Cat\n@end\n").unwrap();
+        std::fs::write(dir.path().join("Cat.m"), "@implementation Cat\n@end\n").unwrap();
+
+        let (langs, paths) = collect_present_languages_and_paths(dir.path());
+        assert!(
+            langs.contains("objectivec"),
+            "expected objectivec enrolled, got {langs:?}"
+        );
+        assert!(
+            !langs.contains("c"),
+            "c must not be enrolled from .h alone when no genuine .c file exists, got {langs:?}"
+        );
+        assert_eq!(paths.len(), 2, "both .h and .m must remain indexable paths");
+    }
+
+    // L5b: without any `.m`/`.mm` sibling, `.h` must keep its default C
+    // classification — pure C repos must never be reclassified.
+    #[test]
+    fn collect_present_languages_and_paths_keeps_h_as_c_without_objc_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("util.h"), "void f(void);\n").unwrap();
+        std::fs::write(dir.path().join("util.c"), "void f(void) {}\n").unwrap();
+
+        let (langs, _paths) = collect_present_languages_and_paths(dir.path());
+        assert!(langs.contains("c"), "expected c enrolled, got {langs:?}");
+        assert!(
+            !langs.contains("objectivec"),
+            "must not enroll objectivec without any .m/.mm, got {langs:?}"
+        );
+    }
+
+    // L5b: a mixed C + Obj-C repo (genuine .c files alongside .m) must enroll
+    // both analyzers — the "c" removal only applies when nothing backs it.
+    #[test]
+    fn collect_present_languages_and_paths_keeps_c_when_genuine_c_file_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared.h"), "void f(void);\n").unwrap();
+        std::fs::write(dir.path().join("shared.c"), "void f(void) {}\n").unwrap();
+        std::fs::write(dir.path().join("Cat.m"), "@implementation Cat\n@end\n").unwrap();
+
+        let (langs, _paths) = collect_present_languages_and_paths(dir.path());
+        assert!(
+            langs.contains("c") && langs.contains("objectivec"),
+            "mixed repo must enroll both c and objectivec, got {langs:?}"
+        );
+    }
+
+    #[test]
+    fn repo_has_objc_sources_detects_mm_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("view.mm"), "// objc++\n").unwrap();
+        assert!(repo_has_objc_sources(dir.path()));
+    }
+
+    #[test]
+    fn repo_has_objc_sources_false_for_pure_c_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        assert!(!repo_has_objc_sources(dir.path()));
+    }
+
+    // L5b regression: `reclassify_objc_headers` is the single shared
+    // implementation called from all three `present_languages` builders
+    // (`collect_present_languages_and_paths` plus both walk loops in
+    // `init_repo_with_progress` — the second loop, gated behind the
+    // large-dep-dir re-walk, initially lacked this call entirely, so a `.h`
+    // header in a pure Obj-C repo still enrolled the crashing "c" scip-clang
+    // pass on the full `travsr init` path even though the background-refresh
+    // path was already fixed). Test the shared function directly so every
+    // call site inherits the same, single-sourced correctness.
+    #[test]
+    fn reclassify_objc_headers_drops_c_for_header_only_objc_repo() {
+        let mut langs: std::collections::HashSet<String> =
+            ["c".to_string(), "objectivec".to_string()]
+                .into_iter()
+                .collect();
+        let paths = vec![PathBuf::from("/repo/Cat.h"), PathBuf::from("/repo/Cat.m")];
+        reclassify_objc_headers(&mut langs, &paths);
+        assert!(langs.contains("objectivec"));
+        assert!(
+            !langs.contains("c"),
+            "c must be dropped when no genuine .c file backs it"
+        );
+    }
+
+    #[test]
+    fn reclassify_objc_headers_keeps_c_when_genuine_c_file_present() {
+        let mut langs: std::collections::HashSet<String> =
+            ["c".to_string(), "objectivec".to_string()]
+                .into_iter()
+                .collect();
+        let paths = vec![
+            PathBuf::from("/repo/shared.h"),
+            PathBuf::from("/repo/shared.c"),
+            PathBuf::from("/repo/Cat.m"),
+        ];
+        reclassify_objc_headers(&mut langs, &paths);
+        assert!(langs.contains("c") && langs.contains("objectivec"));
+    }
+
+    #[test]
+    fn reclassify_objc_headers_noop_without_objc_signal() {
+        let mut langs: std::collections::HashSet<String> = ["c".to_string()].into_iter().collect();
+        let paths = vec![PathBuf::from("/repo/util.h"), PathBuf::from("/repo/util.c")];
+        reclassify_objc_headers(&mut langs, &paths);
+        assert!(langs.contains("c"));
+        assert!(!langs.contains("objectivec"));
+    }
+
     // ── #521: bare-name call resolution must never cross a crate boundary
     // the caller cannot compile against, or match a method call against an
     // unrelated free function. ──────────────────────────────────────────
@@ -2837,7 +3367,7 @@ mod tests {
                 "",
                 "crates/crate-a/src/store.rs",
                 "rust",
-                "fn:Store.prune",
+                "method:Store.prune",
             ),
             "method",
         );
@@ -2857,9 +3387,16 @@ mod tests {
             hint_crate: None,
             caller_line: 42,
             is_method_call: true,
+            recv_type: None,
         }];
 
-        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "method call must not resolve to an unrelated free function: {edges:?}"
@@ -2908,9 +3445,16 @@ mod tests {
             hint_crate: None,
             caller_line: 7,
             is_method_call: false,
+            recv_type: None,
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "bare call must not cross into a non-dependency crate: {edges:?}"
@@ -2960,9 +3504,16 @@ mod tests {
             hint_crate: None,
             caller_line: 3,
             is_method_call: false,
+            recv_type: None,
         }];
 
-        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             edges.len(),
             1,
@@ -3003,13 +3554,734 @@ mod tests {
             hint_crate: None,
             caller_line: 9,
             is_method_call: false,
+            recv_type: None,
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "src/ caller must not resolve into tests/: {edges:?}"
         );
+    }
+
+    // ── #529: receiver-type resolution (docs/plans/issue-529-method-call-
+    // receiver-resolution.md §6.2) ───────────────────────────────────────
+
+    #[test]
+    fn t5_recv_type_exact_match_resolves_precisely() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 5,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "recv_type exact match should resolve: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+        assert_eq!(sites, vec![(caller.id, callee.id, 5)]);
+    }
+
+    #[test]
+    fn t6_recv_type_not_a_graph_type_resolves_to_zero_edges() {
+        // The literal #529 repro: a `.filter()` call on a std-typed receiver
+        // (HashSet) must not fall back into the unique-leaf pool and collide
+        // with an unrelated `Session.filter` — this is the test that fails
+        // on pre-#529 master.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // The only `*.filter` node anywhere — same shape as real Session::filter.
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-b/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 12,
+            is_method_call: true,
+            recv_type: Some("HashSet".to_string()),
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "HashSet.filter must not resolve to Session.filter: {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn t7_recv_type_is_a_graph_type_without_this_method_falls_through() {
+        // `T` IS a real type in the graph, just doesn't have `.filter`
+        // (e.g. a trait-provided method the extractor can't see) — branch 3
+        // must fall through to today's unique-leaf resolution unchanged,
+        // not drop the call. Asserts we did not over-tighten.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // "Session" exists as a real type...
+        let session_type = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "struct:Session",
+            ),
+            "struct",
+        );
+        store.put_node(&session_type).unwrap();
+
+        // ...but the only `*.filter` method belongs to a different type.
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/other.rs",
+                "rust",
+                "method:Other.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 7,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "should fall through to unique-leaf match: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn t8_recv_type_exact_match_still_respects_crate_reachability() {
+        // Invariant 4: an exactly-resolved `fn:T.method` in a crate the
+        // caller cannot reach must still be rejected — the #529 fast path
+        // does not bypass #521's call_target_reachable gate.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let crate_a = Node::new(
+            VName::new("", "", "crates/crate-a/Cargo.toml", "rust", "crate:crate-a"),
+            "crate",
+        );
+        let crate_c = Node::new(
+            VName::new("", "", "crates/crate-c/Cargo.toml", "rust", "crate:crate-c"),
+            "crate",
+        );
+        let pb_nodes = vec![crate_a, crate_c];
+        let pb_edges: Vec<travsr_core::Edge> = Vec::new(); // no Depends edge
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-c/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 3,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "exact recv_type match must still respect crate reachability: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn t9_recv_type_none_is_byte_identical_to_pre_529_behavior() {
+        // No receiver type recovered — must go through the exact same
+        // leaf-unique-match path as before #529.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 8,
+            is_method_call: true,
+            recv_type: None,
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "unique-leaf match must still resolve when recv_type is None: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn t10_ambiguous_leaf_with_recv_type_resolves_where_master_drops() {
+        // §4.4 recall win: two types share the same method leaf, which
+        // makes today's CO-A1 uniqueness gate drop the call entirely. A
+        // known recv_type disambiguates it directly.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee_a = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:SqliteStore.get_nodes",
+            ),
+            "method",
+        );
+        store.put_node(&callee_a).unwrap();
+        let callee_b = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/other.rs",
+                "rust",
+                "method:OtherStore.get_nodes",
+            ),
+            "method",
+        );
+        store.put_node(&callee_b).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:get_nodes".to_string(),
+            hint_crate: None,
+            caller_line: 4,
+            is_method_call: true,
+            recv_type: Some("SqliteStore".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "recv_type should disambiguate a leaf that is globally ambiguous: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee_a.id);
+
+        // Sanity: without recv_type, master's ambiguity gate drops this same
+        // call site entirely (0 edges) — the recall win is real, not a no-op.
+        let unresolved_no_recv = vec![travsr_core::UnresolvedCall {
+            recv_type: None,
+            ..unresolved[0].clone()
+        }];
+        let (edges2, _sites2) = resolve_unresolved_calls(
+            &store,
+            &unresolved_no_recv,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges2.is_empty(),
+            "ambiguous leaf without recv_type must still be dropped: {edges2:?}"
+        );
+    }
+
+    #[test]
+    fn t11_e7_lsif_covered_call_site_suppresses_native_heuristic() {
+        // E7: where E3's positional rust-analyzer LSIF already resolved a call
+        // site, its precise `scip` edge supersedes the native leaf-guess
+        // heuristic. A call that WOULD resolve by unique-leaf must be suppressed
+        // when its (caller_path, caller_line) is in the covered set, and must
+        // still resolve at any line the LSIF path did not cover (the residual).
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let call_at = |line: u32| travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: line,
+            is_method_call: true,
+            recv_type: None,
+        };
+
+        // The LSIF positional path covered the `filter` call on line 8 of the
+        // caller's file, but not the one on line 12.
+        let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
+            std::collections::HashSet::new();
+        lsif_covered.insert((
+            "crates/crate-a/src/lib.rs".to_string(),
+            8,
+            "filter".to_string(),
+        ));
+
+        // Covered site → native heuristic must defer (0 edges) even though the
+        // unique-leaf match would otherwise fire (cf. t9, same setup).
+        let (edges_covered, _s) =
+            resolve_unresolved_calls(&store, &[call_at(8)], &[], &[], &lsif_covered);
+        assert!(
+            edges_covered.is_empty(),
+            "E7: LSIF-covered call site must suppress the native edge: {edges_covered:?}"
+        );
+
+        // Uncovered site → native heuristic still resolves (the residual E7 keeps).
+        let (edges_residual, _s) =
+            resolve_unresolved_calls(&store, &[call_at(12)], &[], &[], &lsif_covered);
+        assert_eq!(
+            edges_residual.len(),
+            1,
+            "E7: an uncovered call site must still resolve natively: {edges_residual:?}"
+        );
+        assert_eq!(edges_residual[0].dst, callee.id);
+    }
+
+    #[test]
+    fn t12_e7_suppression_is_per_callee_not_per_line() {
+        // I2: two calls on the same physical line, only one of which LSIF
+        // positionally resolved. Suppression keyed on (path, line) alone would
+        // drop both; keyed on (path, line, callee_leaf) it must drop only the
+        // LSIF-covered callee and still resolve the other one natively.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let filter_callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&filter_callee).unwrap();
+
+        let count_callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.count",
+            ),
+            "method",
+        );
+        store.put_node(&count_callee).unwrap();
+
+        // Both calls are on line 8 (e.g. `s.filter(x).count()`), but LSIF only
+        // resolved the `filter` callee on that line.
+        let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
+            std::collections::HashSet::new();
+        lsif_covered.insert((
+            "crates/crate-a/src/lib.rs".to_string(),
+            8,
+            "filter".to_string(),
+        ));
+
+        let calls = vec![
+            travsr_core::UnresolvedCall {
+                src: caller.id,
+                callee_sig: "fn:filter".to_string(),
+                hint_crate: None,
+                caller_line: 8,
+                is_method_call: true,
+                recv_type: None,
+            },
+            travsr_core::UnresolvedCall {
+                src: caller.id,
+                callee_sig: "fn:count".to_string(),
+                hint_crate: None,
+                caller_line: 8,
+                is_method_call: true,
+                recv_type: None,
+            },
+        ];
+
+        let (edges, _sites) = resolve_unresolved_calls(&store, &calls, &[], &[], &lsif_covered);
+        assert_eq!(
+            edges.len(),
+            1,
+            "only the LSIF-covered callee (filter) must be suppressed: {edges:?}"
+        );
+        assert_eq!(
+            edges[0].dst, count_callee.id,
+            "the uncovered callee (count) sharing the same line must still resolve natively"
+        );
+    }
+
+    #[test]
+    fn e4_empty_caller_language_falls_through_to_unfiltered_matches() {
+        // #I3: a caller node with an empty `vname.language` (should not occur
+        // in practice — see the guard's comment at the E4 filter site) must
+        // not have every candidate filtered to nothing by the language scope.
+        // It must fall through to pre-E4 behavior and still resolve.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/caller.rs", "", "fn:run"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "src/helper.rs", "rust", "fn:helper"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 4,
+            is_method_call: false,
+            recv_type: None,
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "empty caller_lang must not filter out the only candidate: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn e4_class_receiver_is_a_graph_type_falls_through_to_unique_leaf() {
+        // E4: a Python/TS receiver whose type is a real `class:T` in the graph
+        // but whose `method:T.leaf` node does not exist (inherited method) must
+        // fall through to unique-leaf resolution — NOT be dropped as external.
+        // This is the language-general analog of t7 and directly exercises the
+        // `class:{t}` addition to `recv_type_probe_sigs`; without it, `App`
+        // would be unknown → branch 2 → the call would be wrongly dropped.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/app.ts", "typescript", "fn:run"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // `App` is a real class in the graph...
+        let app = Node::new(
+            VName::new("", "", "src/app.ts", "typescript", "class:App"),
+            "class",
+        );
+        store.put_node(&app).unwrap();
+
+        // ...but the only `*.helper` method belongs to a different class,
+        // cross-file (inherited/mixed-in — the extractor can't see the link).
+        let callee = Node::new(
+            VName::new("", "", "src/base.ts", "typescript", "method:Base.helper"),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 4,
+            is_method_call: true,
+            recv_type: Some("App".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "class receiver that is a graph type must fall through to unique leaf: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn e4_chain_receiver_does_not_fabricate_false_self_class_edge() {
+        // E4 acceptance: `this.other.run()` where the enclosing class ALSO
+        // defines `run`. The receiver is an unrecoverable chain (recv_type =
+        // None); with two `method:*.run` in the graph the leaf is ambiguous, so
+        // NOTHING is emitted — no false self-class edge (the exact defect the
+        // old in-extractor `method:{enclosing_class}.{leaf}` guess produced).
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/app.ts", "typescript", "method:App.render"),
+            "method",
+        );
+        store.put_node(&caller).unwrap();
+
+        // Two distinct `run` methods → ambiguous leaf.
+        for (path, sig) in [
+            ("src/app.ts", "method:App.run"),
+            ("src/other.ts", "method:Other.run"),
+        ] {
+            store
+                .put_node(&Node::new(
+                    VName::new("", "", path, "typescript", sig),
+                    "method",
+                ))
+                .unwrap();
+        }
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:run".to_string(),
+            hint_crate: None,
+            caller_line: 5,
+            is_method_call: true,
+            recv_type: None, // chain receiver — unrecoverable
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "ambiguous chain-receiver call must emit no edge (no false self-class): {edges:?}"
+        );
+    }
+
+    #[test]
+    fn e4_call_is_scoped_to_caller_language() {
+        // E4: a call must resolve only within the caller's own language. A
+        // Python `helper()` must NOT resolve to a Rust `fn:helper` even when
+        // that Rust node is the unique bearer of the leaf — cross-language edges
+        // are false. Adding a Python `fn:helper` then makes it resolve.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(VName::new("", "", "app.py", "python", "fn:run"), "function");
+        store.put_node(&caller).unwrap();
+        // `helper` exists ONLY in Rust.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "lib.rs", "rust", "fn:helper"),
+                "function",
+            ))
+            .unwrap();
+
+        let call = travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:helper".to_string(),
+            hint_crate: None,
+            caller_line: 2,
+            is_method_call: false,
+            recv_type: None,
+        };
+
+        let (edges, _s) = resolve_unresolved_calls(
+            &store,
+            std::slice::from_ref(&call),
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "python call must not resolve to a rust definition: {edges:?}"
+        );
+
+        // Now add a Python `fn:helper` — the same call resolves, within language.
+        let py_helper = Node::new(
+            VName::new("", "", "util.py", "python", "fn:helper"),
+            "function",
+        );
+        store.put_node(&py_helper).unwrap();
+        let (edges2, _s) = resolve_unresolved_calls(
+            &store,
+            std::slice::from_ref(&call),
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges2.len(),
+            1,
+            "same-language call must resolve: {edges2:?}"
+        );
+        assert_eq!(edges2[0].dst, py_helper.id);
     }
 
     // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────
