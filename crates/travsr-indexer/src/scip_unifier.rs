@@ -200,11 +200,21 @@ pub fn native_name_kind<'a>(signature: &'a str, node_kind: &str) -> Option<ScipN
         _ => return None,
     };
 
-    // Strip a leading scheme (`swift::`) or single-word kind prefix (`fn:`,
-    // `class:`, `var:`, ...). Only an all-alphabetic prefix is stripped so we
-    // never truncate a qualified name that legitimately contains a colon.
-    let body = if let Some(rest) = signature.strip_prefix("swift::") {
-        rest
+    // Strip the bespoke-sidecar scheme so only the dotted `Container.name`
+    // remains. Two shapes:
+    //   • `<scheme>::<Dotted.Name>` — swift emitter (`swift::Animal.describe`)
+    //     and the Dart index emitter, whose symbols embed the *file path* before
+    //     the `::` separator (`file:///abs/x.dart::Animal.describe`,
+    //     `package:pkg/x.dart::Animal.describe`). The dotted name follows the
+    //     LAST `::`, so `rfind("::")` isolates it and drops the path — without
+    //     which the Dart container resolves to `…/x.dart::Animal` (path junk)
+    //     and the `method:Animal.describe` candidate is never generated.
+    //   • `<prefix>:<Dotted.Name>` — a single-word Phase-A-style kind prefix
+    //     (`fn:`, `class:`, `var:`, kotlin KLS `enum:`/`interface:`). Only an
+    //     all-alphabetic prefix is stripped so a qualified name that legitimately
+    //     contains a single colon is never truncated.
+    let body = if let Some(idx) = signature.rfind("::") {
+        &signature[idx + 2..]
     } else if let Some((prefix, rest)) = signature.split_once(':') {
         if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
             rest
@@ -365,12 +375,38 @@ mod tests {
 
     #[test]
     fn native_name_kind_dart_package_symbol() {
-        // dart `package:pkg/file.dart::Type.method` — the leaf name still resolves
-        // (the `fn:{name}` candidate matches the tree-sitter node).
-        let p = native_name_kind("package:pkg/animal.dart::Animal.describe", "function").unwrap();
-        assert_eq!(p.name, "describe");
-        assert_eq!(p.kind, "function");
-        assert!(candidate_signatures(&p).contains(&"fn:describe".to_string()));
+        // dart `package:pkg/file.dart::Type.method` and the real emitter's
+        // `file:///abs/x.dart::Type.method` — `rfind("::")` isolates the dotted
+        // name so the container leaf (`Animal`) is recovered and the
+        // `method:Animal.describe` candidate (Phase A N1 qualification) is
+        // generated, not just the bare `fn:describe`.
+        for sym in [
+            "package:pkg/animal.dart::Animal.describe",
+            "file:///private/tmp/app/lib/animal.dart::Animal.describe",
+        ] {
+            let p = native_name_kind(sym, "function").unwrap();
+            assert_eq!(p.container, Some("Animal"), "sym={sym}");
+            assert_eq!(p.name, "describe", "sym={sym}");
+            assert_eq!(p.kind, "function");
+            let cands = candidate_signatures(&p);
+            assert!(
+                cands.contains(&"method:Animal.describe".to_string()),
+                "sym={sym} cands={cands:?}"
+            );
+            assert!(cands.contains(&"fn:describe".to_string()), "sym={sym}");
+        }
+    }
+
+    #[test]
+    fn native_name_kind_dart_top_level_and_type() {
+        // Top-level fn `file:///abs/x.dart::main` → bare `main` (fn:main).
+        let p = native_name_kind("file:///abs/x.dart::main", "function").unwrap();
+        assert_eq!(p.container, None);
+        assert_eq!(p.name, "main");
+        // Class twin `file:///abs/x.dart::Animal` (kind class) → class family.
+        let c = native_name_kind("file:///abs/x.dart::Animal", "class").unwrap();
+        assert_eq!(c.name, "Animal");
+        assert!(candidate_signatures(&c).contains(&"class:Animal".to_string()));
     }
 
     #[test]

@@ -36,7 +36,14 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("extension_declaration", "class"),
         ("enum_declaration", "enum"),
     ],
-    decl_kinds: &[],
+    // N2: the `fn.name` capture sits in a `function_signature`, whose parent is
+    // just the signature — its `end_row` is the signature line, excluding the
+    // body. Walk up to the enclosing full declaration (`function_declaration`
+    // for top-level functions, `method_declaration` for class/mixin methods) so
+    // the span covers the body. Without this, every call site inside a Dart
+    // function fails span-containment and its `ref/call` mis-attributes to the
+    // file node instead of the enclosing function (E5).
+    decl_kinds: &["function_declaration", "method_declaration"],
     get_grammar: || tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
 };
 
@@ -51,6 +58,53 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn n2_function_and_method_spans_cover_body() {
+        // N2 (E5): a top-level function and a class method must span their whole
+        // body, so a call site inside attributes to the enclosing function (not
+        // the file). Before decl_kinds, both spans ended at the signature line.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.dart");
+        std::fs::write(
+            &path,
+            // line 1: class Animal {
+            // line 2:   String describe() {
+            // line 3:     return "a";
+            // line 4:   }
+            // line 5: }
+            // line 6: void main() {
+            // line 7:   print(1);
+            // line 8: }
+            "class Animal {\n  String describe() {\n    return \"a\";\n  }\n}\nvoid main() {\n  print(1);\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "s.dart").unwrap();
+
+        let main = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "fn:main")
+            .expect("fn:main");
+        assert_eq!(main.line, Some(6));
+        assert_eq!(
+            main.end_line,
+            Some(8),
+            "main span must reach the body brace"
+        );
+
+        let describe = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Animal.describe")
+            .expect("method:Animal.describe");
+        assert_eq!(describe.line, Some(2));
+        assert_eq!(
+            describe.end_line,
+            Some(4),
+            "method span must reach the body brace"
+        );
+    }
 
     #[test]
     fn parse_empty_file() {
