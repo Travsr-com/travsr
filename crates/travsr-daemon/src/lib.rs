@@ -2054,6 +2054,10 @@ fn write_phase_b_results(
     // unification drops. Empty for the no-attribution (old-style sidecar) path.
     let mut alias_map: std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId> =
         std::collections::HashMap::new();
+    // E6: SCIP def-unification attempt/miss counts, surfaced on the degradation
+    // channel below so silent non-unification (orphaned SCIP twins) is visible.
+    let mut scip_unify_attempted: usize = 0;
+    let mut scip_unify_missed: usize = 0;
     if pb_refs.is_empty() {
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
@@ -2065,7 +2069,10 @@ fn write_phase_b_results(
         // writing. Mutates pb_refs in-place to redirect callee_id to unified
         // TS nodes, and returns the alias map (SCIP id → TS id).
         let mut pb_refs_mut = pb_refs;
-        alias_map = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
+        let unify = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
+        scip_unify_attempted = unify.attempted;
+        scip_unify_missed = unify.attempted.saturating_sub(unify.unified);
+        alias_map = unify.alias_map;
         let pb_refs = pb_refs_mut;
 
         // Drop unified SCIP definition nodes: the tree-sitter node already
@@ -2134,6 +2141,15 @@ fn write_phase_b_results(
     }
     for lang in &pb_outcome.skipped_no_analyzer {
         warnings.push(format!("skipped_no_analyzer:{lang}"));
+    }
+    // E6: surface SCIP def-unification misses (orphaned twins). Positional
+    // span-containment makes this near-zero; a non-zero rate means Phase A
+    // nodes the compiler defined were not matched, so their ref/call edges
+    // landed on a duplicate SCIP node instead. Format: missed/attempted.
+    if scip_unify_missed > 0 {
+        warnings.push(format!(
+            "scip_unification_misses:{scip_unify_missed}/{scip_unify_attempted}"
+        ));
     }
     if !warnings.is_empty() {
         let _ = store.set_meta("phase_b_warnings", &warnings.join(","));

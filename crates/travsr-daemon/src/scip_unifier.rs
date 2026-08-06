@@ -16,8 +16,24 @@ use std::collections::HashMap;
 use travsr_core::{NodeId, ScipRef};
 use travsr_store::SqliteStore;
 
-/// Maximum line distance allowed between a SCIP definition and its TS match.
+/// Fallback line window used only when span-containment finds no match (E6:
+/// degenerate/zero-width Phase A spans). Positional span-containment is the
+/// primary matcher; this bound just keeps the proximity fallback conservative.
 const MAX_LINE_DELTA: i64 = 5;
+
+/// Outcome of a [`unify_all`] pass: the SCIP→TS alias map plus the counts that
+/// feed the E6 unification miss-rate on the `travsr status` degradation channel.
+#[derive(Debug, Default)]
+pub struct UnifyOutcome {
+    /// SCIP `NodeId` → unified tree-sitter `NodeId` (all kinds, for ref/edge
+    /// remapping — may exceed `unified`, which is callable/type-scoped).
+    pub alias_map: HashMap<NodeId, NodeId>,
+    /// Callable/type (`function`/`class`) SCIP defs that were real unification
+    /// candidates (parsed to a name *and* carried a definition line).
+    pub attempted: usize,
+    /// Callable/type candidates that matched an existing Phase A node.
+    pub unified: usize,
+}
 
 /// G1 unification pass for all SCIP-indexed languages.
 ///
@@ -32,11 +48,19 @@ pub fn unify_all(
     corpus: &str,
     nodes: &[travsr_core::Node],
     refs: &mut [ScipRef],
-) -> HashMap<NodeId, NodeId> {
+) -> UnifyOutcome {
     // Maps SCIP NodeId → unified TS NodeId for ref-patching.
     let mut alias_map: HashMap<NodeId, NodeId> = HashMap::new();
     // (scip_symbol, ts_id) pairs, registered in one batch transaction below.
     let mut aliases: Vec<(String, NodeId)> = Vec::new();
+    // E6: unification attempts/matches for the miss-rate signal. Scoped to
+    // callable/type defs (`function`/`class`) — the only kinds that own
+    // ref/call edges and can be stolen by an orphaned SCIP twin. `variable`
+    // defs (struct fields, module vars) are excluded: many Phase A parsers
+    // don't model them at all (e.g. Go struct fields), so counting them would
+    // inflate the rate with benign non-matches on every real repo.
+    let mut attempted: usize = 0;
+    let mut unified: usize = 0;
 
     for node in nodes {
         let scip_sym = travsr_indexer::scip_unifier::scip_symbol_from_sig(&node.vname.signature);
@@ -67,6 +91,10 @@ pub fn unify_all(
         };
         let candidates = travsr_indexer::scip_unifier::candidate_signatures(&parsed);
         let scip_line = line as i64;
+        let counts_toward_miss_rate = matches!(parsed.kind, "function" | "class");
+        if counts_toward_miss_rate {
+            attempted += 1;
+        }
 
         match store.find_ts_node_for_unification(
             corpus,
@@ -78,6 +106,9 @@ pub fn unify_all(
             Ok(Some(ts_id)) => {
                 aliases.push((scip_sym.to_string(), ts_id));
                 alias_map.insert(node.id, ts_id);
+                if counts_toward_miss_rate {
+                    unified += 1;
+                }
                 tracing::trace!(symbol = %scip_sym, ?ts_id, "G1: unified");
             }
             Ok(None) => {}
@@ -96,9 +127,15 @@ pub fn unify_all(
     }
 
     tracing::debug!(
-        unified = alias_map.len(),
+        aliased = alias_map.len(),
+        callable_unified = unified,
+        callable_attempted = attempted,
         total = nodes.len(),
         "G1: unification complete"
     );
-    alias_map
+    UnifyOutcome {
+        unified,
+        attempted,
+        alias_map,
+    }
 }

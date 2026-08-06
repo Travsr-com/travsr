@@ -115,8 +115,12 @@ fn strip_backticks(s: &str) -> &str {
 ///              and the only form for Java/Kotlin/Scala/C/C++/C#/Ruby/PHP/
 ///              Swift/Dart, whose parsers emit unqualified method names)
 ///   types:     `class:` `struct:` `interface:` `trait:` `enum:` `type:`
-///              (Kotlin objects, Scala traits, Dart mixins, Swift protocols
-///              all emit sig prefix `class:`, so no extra prefixes needed)
+///              `protocol:` `namespace:`
+///              (Kotlin/Scala `object`, Dart `mixin`/`extension`, and Swift
+///              `protocol` all emit sig prefix `class:` — already covered.
+///              Obj-C `protocol` emits `protocol:` and C++ `namespace` emits
+///              `namespace:` (verified in the Phase A parsers), so those two
+///              prefixes are the only extra type candidates needed. [E6])
 ///   terms:     `var:` `const:` `static:`
 pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
     let name = parsed.name;
@@ -142,10 +146,21 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
             }
             sigs
         }
-        "class" => ["class", "struct", "interface", "trait", "enum", "type"]
-            .iter()
-            .map(|p| format!("{p}:{name}"))
-            .collect(),
+        "class" => [
+            "class",
+            "struct",
+            "interface",
+            "trait",
+            "enum",
+            "type",
+            // E6: the only type prefixes not folded into `class:` by Phase A —
+            // Obj-C protocols (`protocol:`) and C++ namespaces (`namespace:`).
+            "protocol",
+            "namespace",
+        ]
+        .iter()
+        .map(|p| format!("{p}:{name}"))
+        .collect(),
         "variable" => ["var", "const", "static"]
             .iter()
             .map(|p| format!("{p}:{name}"))
@@ -423,9 +438,22 @@ mod tests {
                 "interface:Server",
                 "trait:Server",
                 "enum:Server",
-                "type:Server"
+                "type:Server",
+                "protocol:Server",
+                "namespace:Server"
             ]
         );
+    }
+
+    #[test]
+    fn candidates_class_covers_objc_protocol_and_cpp_namespace() {
+        // E6: an Obj-C protocol node signature is `protocol:Name` and a C++
+        // namespace is `namespace:Name` — a SCIP `#` (class) reference to
+        // either must produce the matching candidate so it unifies instead of
+        // orphaning a duplicate twin.
+        let sigs = candidate_signatures(&parsed(None, "Drawable", "class"));
+        assert!(sigs.contains(&"protocol:Drawable".to_string()));
+        assert!(sigs.contains(&"namespace:Drawable".to_string()));
     }
 
     #[test]

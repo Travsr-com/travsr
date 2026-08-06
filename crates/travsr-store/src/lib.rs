@@ -3725,13 +3725,26 @@ LIMIT 20",
             .join(" ");
         let line_p = n + 3;
         let delta_p = n + 4;
+        // E6: positional-first def-unification. A SCIP definition occurrence's
+        // `line` is the selector (name) line, so it falls inside the Phase A
+        // node's full `[line, end_line]` span (N2 spans). Prefer the candidate
+        // whose span *contains* the SCIP line — this unifies correctly across
+        // wide annotation/decorator/doc-comment gaps that the old ±max_delta
+        // proximity gate silently dropped (orphaned SCIP twin stealing edges).
+        // The ±max_delta window is kept only as a fallback for degenerate spans
+        // (NULL/zero-width `end_line`), so this change can only ADD unifications,
+        // never remove one that already matched. Ties: narrowest containing span,
+        // then candidate-signature priority, then proximity.
+        let contains = format!("?{line_p} BETWEEN line AND COALESCE(end_line, line)");
         let sql = format!(
             "SELECT id FROM nodes \
              WHERE corpus = ?1 AND path = ?2 \
                AND signature IN ({placeholders}) \
                AND line IS NOT NULL \
-               AND ABS(line - ?{line_p}) <= ?{delta_p} \
-             ORDER BY CASE signature {priority_case} END ASC, \
+               AND ( ({contains}) OR ABS(line - ?{line_p}) <= ?{delta_p} ) \
+             ORDER BY CASE WHEN {contains} THEN 0 ELSE 1 END ASC, \
+                      (COALESCE(end_line, line) - line) ASC, \
+                      CASE signature {priority_case} END ASC, \
                       ABS(line - ?{line_p}) ASC \
              LIMIT 1"
         );
@@ -6990,6 +7003,65 @@ mod tests {
             .find_ts_node_for_unification("c", "src/s.go", &candidates, 10, 5)
             .unwrap();
         assert_eq!(found, Some(lo.id), "falls back to line proximity");
+    }
+
+    #[test]
+    fn unification_matches_by_span_containment_across_wide_annotation_gap() {
+        // E6: the SCIP def line sits inside the Phase A node's [line, end_line]
+        // span but farther than max_delta below the name line (heavy
+        // annotation / decorator / doc-comment block). The old ±max_delta
+        // proximity gate silently dropped this, leaving an orphaned SCIP twin
+        // that stole the node's ref/call edges. Span-containment must unify it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ts = Node::new(
+            VName::new("c", "main", "src/S.java", "java", "fn:handle"),
+            "function",
+        )
+        .with_line(5)
+        .with_end_line(30);
+        store.put_node(&ts).unwrap();
+
+        let candidates = vec!["fn:handle".to_string()];
+        // SCIP def anchored at line 12 — delta 7 from the name line 5, beyond
+        // the max_delta of 5, but well inside the [5, 30] body span.
+        let found = store
+            .find_ts_node_for_unification("c", "src/S.java", &candidates, 12, 5)
+            .unwrap();
+        assert_eq!(
+            found,
+            Some(ts.id),
+            "span-containment must unify across the annotation gap"
+        );
+    }
+
+    #[test]
+    fn unification_prefers_narrowest_containing_span() {
+        // E6: when two candidate spans both contain the SCIP def line (a method
+        // nested inside an outer definition that share a same-leaf `fn:` sig
+        // candidate), the narrowest containing span is the correct target.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let outer = Node::new(
+            VName::new("c", "main", "src/n.go", "go", "fn:run"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(40);
+        let inner = Node::new(
+            VName::new("c", "main", "src/n.go", "go", "method:Job.run"),
+            "method",
+        )
+        .with_line(10)
+        .with_end_line(20);
+        store.put_node(&outer).unwrap();
+        store.put_node(&inner).unwrap();
+
+        // Candidates cover both signatures; SCIP def at line 15 is inside both
+        // [1,40] and [10,20] — the narrower [10,20] must win.
+        let candidates = vec!["method:Job.run".to_string(), "fn:run".to_string()];
+        let found = store
+            .find_ts_node_for_unification("c", "src/n.go", &candidates, 15, 5)
+            .unwrap();
+        assert_eq!(found, Some(inner.id), "narrowest containing span wins");
     }
 
     #[test]

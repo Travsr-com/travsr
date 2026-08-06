@@ -104,6 +104,12 @@ pub fn run() -> anyhow::Result<()> {
                     ["skipped_no_analyzer", lang] => eprintln!(
                         "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
                     ),
+                    // E6: SCIP definitions that did not unify onto their Phase A
+                    // tree-sitter node — their references attribute to an orphaned
+                    // duplicate node instead. `rate` is missed/attempted.
+                    ["scip_unification_misses", rate] => eprintln!(
+                        "warning: {rate} SCIP definitions did not unify onto their tree-sitter nodes — some references may resolve to a duplicate node. Re-run `travsr init --semantic` if it persists."
+                    ),
                     _ => {}
                 }
             }
