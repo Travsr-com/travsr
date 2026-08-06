@@ -13,7 +13,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     queries: r#"
 (class_declaration name: (name) @class.name)
 (interface_declaration name: (name) @interface.name)
-(trait_declaration name: (name) @class.name)
+(trait_declaration name: (name) @trait.name)
 (enum_declaration name: (name) @enum.name)
 (function_definition name: (name) @fn.name)
 (method_declaration name: (name) @fn.name)
@@ -22,6 +22,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     capture_kinds: &[
         ("class.name", "class", "class"),
         ("interface.name", "interface", "interface"),
+        // N4d: PHP traits are a distinct kind, not folded into `class`. The
+        // `trait:` signature unifies onto the SCIP trait def (scip-php emits a
+        // `#` type descriptor → `candidate_signatures` class-group, which
+        // already contains `trait:`).
+        ("trait.name", "trait", "trait"),
         ("enum.name", "enum", "enum"),
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
@@ -29,7 +34,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     method_containers: &[
         ("class_declaration", "class"),
         ("interface_declaration", "interface"),
-        ("trait_declaration", "class"),
+        // N4d: trait methods parent to the `trait:` node (was `class`, which
+        // would dangle now that the node is `trait:`).
+        ("trait_declaration", "trait"),
         ("enum_declaration", "enum"),
     ],
     decl_kinds: &[],
@@ -70,5 +77,37 @@ mod tests {
         assert!(kinds.contains(&"interface"));
         assert!(kinds.contains(&"function"));
         assert!(kinds.contains(&"import"));
+    }
+
+    #[test]
+    fn n4d_trait_distinct_kind_and_method_containment() {
+        // N4d: a PHP trait is kind `trait` with sig `trait:Logs`, and its method
+        // parents to the trait node (not a dangling `class:Logs`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.php");
+        std::fs::write(
+            &path,
+            "<?php\ntrait Logs {\n  public function log($m) {}\n}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "t.php").unwrap();
+
+        let trait_node = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "trait:Logs")
+            .expect("trait:Logs node");
+        assert_eq!(trait_node.kind, "trait");
+        let method = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Logs.log")
+            .expect("method:Logs.log node");
+        let contained = out.edges.iter().any(|e| {
+            e.kind == travsr_core::EdgeKind::DefinesBinding
+                && e.src == trait_node.id
+                && e.dst == method.id
+        });
+        assert!(contained, "trait:Logs must contain method:Logs.log");
     }
 }
