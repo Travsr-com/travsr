@@ -301,7 +301,12 @@ fn nearest_preceding_binding_type_py(
     name: &str,
     before_byte: usize,
 ) -> Option<String> {
-    let mut best: Option<(usize, String)> = None;
+    // Nearest binding of `name` before the call, as `(byte_pos, recovered_type)`.
+    // The type is `Option` because a binding may exist without a recoverable
+    // type (e.g. `x = make()`); we must still record its position so a later
+    // untyped rebinding supersedes an earlier typed one and the result is
+    // `None` (fail closed) rather than a stale earlier type.
+    let mut best: Option<(usize, Option<String>)> = None;
 
     // Annotated parameters — `typed_parameter` / `typed_default_parameter`.
     if let Some(params) = enclosing_fn.child_by_field_name("parameters") {
@@ -330,17 +335,17 @@ fn nearest_preceding_binding_type_py(
             if p.start_byte() < before_byte
                 && best.as_ref().map_or(true, |(b, _)| p.start_byte() > *b)
             {
-                best = Some((p.start_byte(), ty));
+                best = Some((p.start_byte(), Some(ty)));
             }
         }
     }
 
-    // Assignments `name = Type(...)` in the function body.
+    // Assignments to `name` in the function body (a later untyped one wins).
     if let Some(body) = enclosing_fn.child_by_field_name("body") {
         collect_nearest_assign_py(body, source, name, before_byte, &mut best);
     }
 
-    best.map(|(_, t)| t)
+    best.and_then(|(_, t)| t)
 }
 
 /// Bare type name from a Python annotation node. Accepts `Foo` (optionally
@@ -354,38 +359,28 @@ fn type_name_py(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
-/// Recurse through `node` collecting `name = Type(...)` assignments starting
-/// before `before_byte`, keeping the nearest preceding one in `best`. Does not
-/// descend into nested `function_definition` bodies — a binding local to a
-/// nested fn is never visible to a receiver outside it.
+/// Recurse through `node` collecting every assignment binding `name` starting
+/// before `before_byte`, keeping the nearest preceding one in `best`. The
+/// recorded type is the RHS constructor name for `name = Type(...)`, else `None`
+/// — a nearer binding whose type is unrecoverable (`x = make()`) must supersede
+/// an earlier typed one so the receiver resolves to `None`, never a stale type.
+/// Does not descend into nested `function_definition` bodies — a binding local
+/// to a nested fn is never visible to a receiver outside it.
 fn collect_nearest_assign_py(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     name: &str,
     before_byte: usize,
-    best: &mut Option<(usize, String)>,
+    best: &mut Option<(usize, Option<String>)>,
 ) {
     if node.kind() == "assignment" {
-        if let (Some(left), Some(right)) = (
-            node.child_by_field_name("left"),
-            node.child_by_field_name("right"),
-        ) {
+        if let Some(left) = node.child_by_field_name("left") {
             if left.kind() == "identifier"
                 && left.utf8_text(source) == Ok(name)
-                && right.kind() == "call"
+                && node.start_byte() < before_byte
+                && best.as_ref().map_or(true, |(b, _)| node.start_byte() > *b)
             {
-                if let Some(func) = right.child_by_field_name("function") {
-                    if func.kind() == "identifier" {
-                        if let Ok(t) = func.utf8_text(source) {
-                            if t.starts_with(|c: char| c.is_uppercase())
-                                && node.start_byte() < before_byte
-                                && best.as_ref().map_or(true, |(b, _)| node.start_byte() > *b)
-                            {
-                                *best = Some((node.start_byte(), t.to_string()));
-                            }
-                        }
-                    }
-                }
+                *best = Some((node.start_byte(), assign_ctor_type_py(node, source)));
             }
         }
     }
@@ -396,6 +391,24 @@ fn collect_nearest_assign_py(
     for child in node.children(&mut c) {
         collect_nearest_assign_py(child, source, name, before_byte, best);
     }
+}
+
+/// The receiver-usable type of an `assignment` node's RHS: the constructor name
+/// for a `name = Type(...)` call (an uppercase bare identifier), else `None`.
+/// A lowercase call (`x = make()`), attribute call, or any other RHS is not a
+/// resolvable receiver type.
+fn assign_ctor_type_py(assign: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let right = assign.child_by_field_name("right")?;
+    if right.kind() != "call" {
+        return None;
+    }
+    let func = right.child_by_field_name("function")?;
+    if func.kind() != "identifier" {
+        return None;
+    }
+    let t = func.utf8_text(source).ok()?;
+    t.starts_with(|c: char| c.is_uppercase())
+        .then(|| t.to_string())
 }
 
 // ── AST helpers ───────────────────────────────────────────────────────────────
@@ -560,6 +573,33 @@ def build():
             recv_type_for_call(source, "open"),
             Some("SqliteStore".to_string())
         );
+    }
+
+    #[test]
+    fn recv_reassignment_to_unrecoverable_type_supersedes_earlier_typed_binding() {
+        // Fail-closed: the nearest binding of `store` is `make_store()`, whose
+        // type is unrecoverable. It must supersede the earlier `SqliteStore()`
+        // so the receiver resolves to None (a missed edge), NOT a stale
+        // `SqliteStore` (a confidently-wrong edge).
+        let source = br#"
+def build():
+    store = SqliteStore()
+    store = make_store()
+    store.open()
+"#;
+        assert_eq!(recv_type_for_call(source, "open"), None);
+    }
+
+    #[test]
+    fn recv_typed_param_reassigned_to_unrecoverable_type_is_none() {
+        // Same fail-closed rule across the param/assignment boundary: a typed
+        // param rebound to an unrecoverable value must not leak the param type.
+        let source = br#"
+def handle(session: Session):
+    session = build()
+    session.close()
+"#;
+        assert_eq!(recv_type_for_call(source, "close"), None);
     }
 
     #[test]

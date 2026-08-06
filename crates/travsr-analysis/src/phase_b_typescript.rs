@@ -368,7 +368,12 @@ fn nearest_preceding_binding_type_ts(
     name: &str,
     before_byte: usize,
 ) -> Option<String> {
-    let mut best: Option<(usize, String)> = None;
+    // Nearest binding of `name` before the call, as `(byte_pos, recovered_type)`.
+    // The type is `Option` because a binding may exist without a recoverable
+    // type (a bare `x = other()` reassignment); its position is still recorded
+    // so a later untyped rebinding supersedes an earlier typed one and the
+    // result is `None` (fail closed) rather than a stale earlier type.
+    let mut best: Option<(usize, Option<String>)> = None;
 
     if let Some(params) = scope.child_by_field_name("parameters") {
         let mut c = params.walk();
@@ -391,7 +396,7 @@ fn nearest_preceding_binding_type_ts(
             if p.start_byte() < before_byte
                 && best.as_ref().map_or(true, |(b, _)| p.start_byte() > *b)
             {
-                best = Some((p.start_byte(), ty));
+                best = Some((p.start_byte(), Some(ty)));
             }
         }
     }
@@ -400,7 +405,7 @@ fn nearest_preceding_binding_type_ts(
         collect_nearest_var_ts(body, source, name, before_byte, &mut best);
     }
 
-    best.map(|(_, t)| t)
+    best.and_then(|(_, t)| t)
 }
 
 /// Bare type name from a `type_annotation` node. Accepts `type_identifier`
@@ -414,16 +419,36 @@ fn type_name_ts(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
-/// Recurse through `node` collecting `variable_declarator`s that bind `name`
-/// before `before_byte`, keeping the nearest preceding one. Prefers an explicit
-/// `: Type` annotation, else a `new Type()` initializer. Does not descend into
-/// nested function bodies (their locals are not visible to an outer receiver).
+/// The receiver-usable type of a value node: the constructor name of a
+/// `new Type()` expression (a bare identifier constructor), else `None`. A
+/// non-`new` initializer or a namespaced/generic constructor is not a single
+/// resolvable receiver type.
+fn new_ctor_type_ts(value: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if value.kind() != "new_expression" {
+        return None;
+    }
+    let ctor = value.child_by_field_name("constructor")?;
+    if ctor.kind() == "identifier" {
+        ctor.utf8_text(source).ok().map(str::to_string)
+    } else {
+        None
+    }
+}
+
+/// Recurse through `node` collecting bindings of `name` before `before_byte` —
+/// both `variable_declarator`s (`const name = ...`) and bare reassignments
+/// (`name = ...`, an `assignment_expression`) — keeping the nearest preceding
+/// one. The recorded type is an explicit `: Type` annotation or a `new Type()`
+/// initializer, else `None`: a nearer binding whose type is unrecoverable
+/// (`name = other()`) must supersede an earlier typed one so the receiver
+/// resolves to `None`, never a stale type. Does not descend into nested function
+/// bodies (their locals are not visible to an outer receiver).
 fn collect_nearest_var_ts(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     name: &str,
     before_byte: usize,
-    best: &mut Option<(usize, String)>,
+    best: &mut Option<(usize, Option<String>)>,
 ) {
     if node.kind() == "variable_declarator"
         && node
@@ -431,27 +456,29 @@ fn collect_nearest_var_ts(
             .and_then(|n| n.utf8_text(source).ok())
             == Some(name)
         && node.start_byte() < before_byte
+        && best.as_ref().map_or(true, |(b, _)| node.start_byte() > *b)
     {
         let ty = node
             .child_by_field_name("type")
             .and_then(|t| type_name_ts(t, source))
             .or_else(|| {
-                let v = node.child_by_field_name("value")?;
-                if v.kind() != "new_expression" {
-                    return None;
-                }
-                let ctor = v.child_by_field_name("constructor")?;
-                if ctor.kind() == "identifier" {
-                    ctor.utf8_text(source).ok().map(str::to_string)
-                } else {
-                    None
-                }
+                node.child_by_field_name("value")
+                    .and_then(|v| new_ctor_type_ts(v, source))
             });
-        if let Some(t) = ty {
-            if best.as_ref().map_or(true, |(b, _)| node.start_byte() > *b) {
-                *best = Some((node.start_byte(), t));
-            }
-        }
+        *best = Some((node.start_byte(), ty));
+    }
+    if node.kind() == "assignment_expression"
+        && node
+            .child_by_field_name("left")
+            .and_then(|n| n.utf8_text(source).ok())
+            == Some(name)
+        && node.start_byte() < before_byte
+        && best.as_ref().map_or(true, |(b, _)| node.start_byte() > *b)
+    {
+        let ty = node
+            .child_by_field_name("right")
+            .and_then(|v| new_ctor_type_ts(v, source));
+        *best = Some((node.start_byte(), ty));
     }
     if matches!(
         node.kind(),
@@ -644,6 +671,39 @@ class App {
         let source = br#"
 function build() {
     const store = new SqliteStore();
+    store.open();
+}
+"#;
+        assert_eq!(
+            recv_type_for_call(source, "open"),
+            Some("SqliteStore".to_string())
+        );
+    }
+
+    #[test]
+    fn recv_reassignment_to_unrecoverable_type_supersedes_earlier_new() {
+        // Fail-closed: a bare `store = other()` reassignment (an
+        // assignment_expression, not a declarator) is the nearest binding and
+        // its type is unrecoverable, so it must supersede the earlier
+        // `new SqliteStore()` — receiver resolves to None, not a stale type.
+        let source = br#"
+function build() {
+    let store = new SqliteStore();
+    store = other();
+    store.open();
+}
+"#;
+        assert_eq!(recv_type_for_call(source, "open"), None);
+    }
+
+    #[test]
+    fn recv_reassignment_to_new_type_wins_over_earlier_binding() {
+        // The nearest binding wins in both directions: a later `new Foo()`
+        // reassignment overrides an earlier binding of a different type.
+        let source = br#"
+function build() {
+    let store = new Widget();
+    store = new SqliteStore();
     store.open();
 }
 "#;

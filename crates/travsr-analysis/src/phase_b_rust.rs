@@ -841,18 +841,21 @@ fn extract_type_from_let(let_decl: tree_sitter::Node<'_>, source: &[u8]) -> Opti
 }
 
 /// Extract a receiver-usable type name from a type AST node: peel `&`/`&mut`
-/// wrappers, then peel a *single* `Option<T>`/`Arc<T>`/`Box<T>`/`Rc<T>` layer
-/// down to `T` (idiomatic Rust calls the inner type's methods through these
-/// via deref/smart-pointer coercion — `arc_foo.foo_method()`). `Vec<T>` and
-/// every other generic container are deliberately NOT unwrapped: the receiver
-/// really is the container (`vec.push(x)` calls `Vec`'s own method, not
+/// wrappers, then peel a *single* `Arc<T>`/`Box<T>`/`Rc<T>` layer down to `T`
+/// (these smart pointers `Deref<Target = T>`, so `arc_foo.foo_method()` really
+/// dispatches to `T`'s method). `Option<T>` is deliberately NOT peeled: it does
+/// not implement `Deref`, so a method call on an `Option` receiver dispatches to
+/// `Option`'s own methods (`.map`, `.take`, `.filter`, `.as_ref`, ...), never
+/// `T`'s — peeling it would confidently mis-resolve those to `method:T.<name>`.
+/// `Vec<T>` and every other generic container are likewise NOT unwrapped: the
+/// receiver really is the container (`vec.push(x)` calls `Vec`'s own method, not
 /// `T`'s) — see §4.5.
 fn extract_receiver_type_name(ty: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let ty = peel_references(ty);
     if ty.kind() == "generic_type" {
         let base = peel_references(ty.child_by_field_name("type")?);
         let base_name = type_identifier_text(base, source)?;
-        if matches!(base_name.as_str(), "Option" | "Arc" | "Box" | "Rc") {
+        if matches!(base_name.as_str(), "Arc" | "Box" | "Rc") {
             let args = ty.child_by_field_name("type_arguments")?;
             let inner = peel_references(args.named_child(0)?);
             return type_identifier_text(inner, source);
@@ -1016,12 +1019,28 @@ mod tests {
 
     #[test]
     fn t3b_smart_pointer_wrapper_peels_to_inner_type() {
-        // Arc/Box/Rc/Option are unwrapped one layer (deref-coercion pattern:
-        // `arc_foo.foo_method()`) — unlike Vec/HashSet above, which are not.
+        // Arc/Box/Rc are unwrapped one layer (they `Deref<Target = T>`, so
+        // `arc_foo.foo_method()` dispatches to `T`) — unlike Vec/HashSet above,
+        // which are not.
         let source = b"fn f() { let store: Arc<SqliteStore> = z; store.open(); }";
         assert_eq!(
             recv_type_for_call(source, "open"),
             Some("SqliteStore".to_string())
+        );
+    }
+
+    #[test]
+    fn t3b_option_is_not_peeled_to_its_inner_type() {
+        // `Option<T>` does NOT `Deref` to `T`: a method call on an Option
+        // receiver dispatches to Option's own methods (`.filter`, `.take`,
+        // `.map`, ...), never `T`'s. Peeling it would confidently mis-resolve
+        // `opt.filter(..)` to `method:QueryBuilder.filter`. The extractor must
+        // report the receiver as `Option`; the daemon (Option not being a graph
+        // type) then falls through to leaf-fallback rather than a wrong edge.
+        let source = b"fn f() { let q: Option<QueryBuilder> = z; q.filter(p); }";
+        assert_eq!(
+            recv_type_for_call(source, "filter"),
+            Some("Option".to_string())
         );
     }
 
