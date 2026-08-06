@@ -19,7 +19,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (protocol_declaration name: (type_identifier) @protocol.name)
 (typealias_declaration name: (type_identifier) @typealias.name)
 (function_declaration name: (simple_identifier) @fn.name)
-(init_declaration)    @init
+(init_declaration "init" @init.name)
 (import_declaration)  @import
 (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name))
 "#,
@@ -40,7 +40,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("protocol.name", "protocol", "class"),
         ("typealias.name", "type", "type"),
         ("fn.name", "function", "fn"),
-        ("init", "init", "fn"),
+        ("init.name", "init", "fn"),
         ("import", "import", "import"),
         // #449: properties (`static let shared`) gives `ClassC.shared` a
         // tree-sitter node so the Phase B field node unifies onto it and dotted
@@ -168,5 +168,30 @@ mod tests {
         let sigs: Vec<&str> = fields.iter().map(|n| n.vname.signature.as_str()).collect();
         assert!(sigs.contains(&"var:shared"), "got field sigs: {sigs:?}");
         assert!(sigs.contains(&"var:count"), "got field sigs: {sigs:?}");
+    }
+
+    // L2: an `init` declaration must emit a bare `method:Cat.init` node, not the
+    // full declaration text (`method:Cat.init(name: String) { ... }`) — the bare
+    // form is what the travsr-lang Swift emitter and the SCIP unifier expect a
+    // `.init` reference to resolve onto.
+    #[test]
+    fn init_declaration_emits_bare_method_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.swift");
+        std::fs::write(&path, "class Cat {\n  init(name: String) {}\n}\n").unwrap();
+        let out = parse("corp", &path, "cat.swift").unwrap();
+        let sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(
+            sigs.contains(&"method:Cat.init"),
+            "expected bare method:Cat.init, got: {sigs:?}"
+        );
+        assert!(
+            !sigs.iter().any(|s| s.starts_with("method:Cat.init(")),
+            "must not emit the full declaration text as the signature, got: {sigs:?}"
+        );
     }
 }
