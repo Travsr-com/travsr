@@ -168,13 +168,20 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 }
                 "method.name" => {
                     // Edge hierarchy (Tech Lead sign-off): class→method, not file→method.
-                    let class_name = find_parent_class_name(capture.node, source.as_slice())
-                        .unwrap_or_else(|| "<anonymous>".to_string());
-                    let class_id = emit::class_node(corpus, vname_path, &class_name).id;
-                    let node = emit::method_node(corpus, vname_path, &class_name, text)
+                    // Anonymous containers (class expressions, object-literal methods) have
+                    // no named class to bind to — parent the method to the file instead of
+                    // emitting a class:<anonymous> node that nothing else ever creates.
+                    let parent_class = find_parent_class_name(capture.node, source.as_slice());
+                    let (class_name, container_id) = match &parent_class {
+                        Some(name) => {
+                            (name.as_str(), emit::class_node(corpus, vname_path, name).id)
+                        }
+                        None => ("<anonymous>", file_id),
+                    };
+                    let node = emit::method_node(corpus, vname_path, class_name, text)
                         .with_line(line)
                         .with_end_line(decl_end_line(capture.node));
-                    let edge = emit::defines_edge(class_id, node.id);
+                    let edge = emit::defines_edge(container_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
                 }
@@ -456,6 +463,85 @@ mod tests {
         assert!(
             output.nodes.iter().any(|n| n.kind == "class"),
             "class node must be emitted for AuthService"
+        );
+    }
+
+    // L4: a method on an anonymous class expression has no named parent class —
+    // it must not emit an orphan `class:<anonymous>` node; its containment edge
+    // must parent to the file node instead, like a top-level function.
+    #[test]
+    fn anonymous_class_expr_method_no_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anon_class.ts");
+        std::fs::write(&path, "const x = class { write() {} };").unwrap();
+
+        let out = parse("", &path, "anon_class.ts").unwrap();
+        assert!(
+            !out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "class:<anonymous>"),
+            "must not emit a class:<anonymous> node; got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| n.vname.signature.as_str())
+                .collect::<Vec<_>>()
+        );
+        let file_id = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "file")
+            .expect("file node must exist")
+            .id;
+        let method_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:<anonymous>.write")
+            .expect("method:<anonymous>.write node must exist")
+            .id;
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == file_id && e.dst == method_id),
+            "write method's defines/binding must have src == file node id"
+        );
+    }
+
+    // L4: same defect for object-literal methods — the parent chain is `object`,
+    // never a class, so this must also parent to the file rather than dangle.
+    #[test]
+    fn object_literal_method_no_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anon_obj.ts");
+        std::fs::write(&path, "const x = { dispose() {} };").unwrap();
+
+        let out = parse("", &path, "anon_obj.ts").unwrap();
+        assert!(
+            !out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "class:<anonymous>"),
+            "must not emit a class:<anonymous> node; got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| n.vname.signature.as_str())
+                .collect::<Vec<_>>()
+        );
+        let file_id = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "file")
+            .expect("file node must exist")
+            .id;
+        let method_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:<anonymous>.dispose")
+            .expect("method:<anonymous>.dispose node must exist")
+            .id;
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == file_id && e.dst == method_id),
+            "dispose method's defines/binding must have src == file node id"
         );
     }
 }
