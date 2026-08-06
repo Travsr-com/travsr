@@ -56,6 +56,10 @@ const _: () = {
 //   @type.name   — type_spec name for any other type kind
 //   @var.name    — identifier in a var_spec or const_spec (top-level only)
 //   @import      — import_spec node
+//   @field.owner — type_spec name that owns a named struct field (L3)
+//   @field.name  — field_identifier of a named struct field; a separate
+//                  pattern from @class.name so embedded/anonymous fields
+//                  (no `name:` field) simply fail to match, no special-casing
 const QUERIES: &str = r#"
 (function_declaration name: (identifier) @fn.name)
 (method_declaration
@@ -104,6 +108,12 @@ const QUERIES: &str = r#"
 (import_spec) @import
 (package_clause
   (package_identifier) @pkg.name)
+(type_declaration
+  (type_spec
+    name: (type_identifier) @field.owner
+    type: (struct_type
+      (field_declaration_list
+        (field_declaration name: (field_identifier) @field.name)))))
 "#;
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
@@ -340,6 +350,30 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 output.edges.push(emit::defines_edge(file_id, pkg_node.id));
                 output.nodes.push(pkg_node);
             }
+            "field.owner" => {
+                let Some(struct_name) = find_cap_text(m, "field.owner") else {
+                    continue;
+                };
+                let Some(field_name) = find_cap_text(m, "field.name") else {
+                    continue;
+                };
+                let struct_name = strip_generics(&struct_name).to_owned();
+                let class_id = go_class_node(corpus, vname_path, &struct_name).id;
+                let line = m
+                    .captures
+                    .iter()
+                    .find(|c| {
+                        capture_names.get(c.index as usize).map(|s| s.as_str())
+                            == Some("field.name")
+                    })
+                    .map(|c| c.node.start_position().row as u32 + 1)
+                    .unwrap_or_else(|| anchor.node.start_position().row as u32 + 1);
+                let node = go_field_node(corpus, vname_path, &struct_name, &field_name)
+                    .with_line(line)
+                    .with_end_line(line);
+                output.edges.push(emit::defines_edge(class_id, node.id));
+                output.nodes.push(node);
+            }
             _ => {}
         }
     }
@@ -419,6 +453,13 @@ fn go_method_node(corpus: &str, path: &str, recv: &str, method: &str) -> Node {
 
 fn go_class_node(corpus: &str, path: &str, name: &str) -> Node {
     Node::new(go_vname(corpus, path, &format!("class:{name}")), "class")
+}
+
+fn go_field_node(corpus: &str, path: &str, struct_name: &str, field_name: &str) -> Node {
+    Node::new(
+        go_vname(corpus, path, &format!("field:{struct_name}.{field_name}")),
+        "field",
+    )
 }
 
 fn go_iface_node(corpus: &str, path: &str, name: &str) -> Node {
@@ -997,6 +1038,69 @@ mod tests {
         assert_ne!(
             pkg_id_a, pkg_id_b,
             "mypkg and mypkg_test must produce distinct go-pkg NodeIds"
+        );
+    }
+
+    // L3: named struct fields must emit field nodes with class containment so
+    // SCIP field references (`Session#name`) unify onto a real Phase A node
+    // instead of surviving as an orphan `scip:`-signature field node.
+    #[test]
+    fn struct_fields_emit_field_nodes_and_containment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.go");
+        std::fs::write(
+            &path,
+            b"package p\ntype Session struct { name string; items []int }\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "session.go").unwrap();
+
+        let field_sigs: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "field")
+            .map(|n| n.vname.signature.as_str())
+            .collect();
+        assert!(
+            field_sigs.contains(&"field:Session.name"),
+            "got field sigs: {field_sigs:?}"
+        );
+        assert!(
+            field_sigs.contains(&"field:Session.items"),
+            "got field sigs: {field_sigs:?}"
+        );
+
+        let class_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "class:Session")
+            .expect("class:Session node")
+            .id;
+        let field_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "field:Session.name")
+            .expect("field:Session.name node")
+            .id;
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == class_id && e.dst == field_id),
+            "class:Session must contain field:Session.name (no dangling)"
+        );
+    }
+
+    // L3: an embedded/anonymous field (no `name:` field on field_declaration)
+    // must be silently skipped — no field node, no panic.
+    #[test]
+    fn embedded_field_emits_no_field_node_and_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embed.go");
+        std::fs::write(&path, b"package p\ntype T struct { io.Reader }\n").unwrap();
+        let out = parse("", &path, "embed.go").unwrap();
+        assert!(
+            !out.nodes.iter().any(|n| n.kind == "field"),
+            "embedded field must not emit a field node"
         );
     }
 }
