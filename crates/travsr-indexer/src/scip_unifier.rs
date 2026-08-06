@@ -115,12 +115,15 @@ fn strip_backticks(s: &str) -> &str {
 ///              and the only form for Java/Kotlin/Scala/C/C++/C#/Ruby/PHP/
 ///              Swift/Dart, whose parsers emit unqualified method names)
 ///   types:     `class:` `struct:` `interface:` `trait:` `enum:` `type:`
-///              `protocol:` `namespace:`
+///              `protocol:` `namespace:` `actor:`
 ///              (Kotlin/Scala `object`, Dart `mixin`/`extension`, and Swift
 ///              `protocol` all emit sig prefix `class:` — already covered.
 ///              Obj-C `protocol` emits `protocol:` and C++ `namespace` emits
-///              `namespace:` (verified in the Phase A parsers), so those two
-///              prefixes are the only extra type candidates needed. [E6])
+///              `namespace:` [E6]. N4d split Swift's folded types into distinct
+///              prefixes, so `actor:` (a SCIP `#`-type target) is added here;
+///              `extension:` is deliberately omitted — an extension is not a
+///              SCIP definition target and must not steal the extended type's
+///              unification.)
 ///   terms:     `var:` `const:` `static:`
 pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
     let name = parsed.name;
@@ -157,6 +160,9 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
             // Obj-C protocols (`protocol:`) and C++ namespaces (`namespace:`).
             "protocol",
             "namespace",
+            // N4d: Swift `actor` is now a distinct Phase A prefix and a valid
+            // SCIP `#`-type unification target.
+            "actor",
         ]
         .iter()
         .map(|p| format!("{p}:{name}"))
@@ -440,7 +446,8 @@ mod tests {
                 "enum:Server",
                 "type:Server",
                 "protocol:Server",
-                "namespace:Server"
+                "namespace:Server",
+                "actor:Server"
             ]
         );
     }
@@ -454,6 +461,14 @@ mod tests {
         let sigs = candidate_signatures(&parsed(None, "Drawable", "class"));
         assert!(sigs.contains(&"protocol:Drawable".to_string()));
         assert!(sigs.contains(&"namespace:Drawable".to_string()));
+    }
+
+    #[test]
+    fn candidates_class_covers_swift_actor() {
+        // N4d: a Swift `actor` node signature is `actor:Name`; a SCIP `#` (class)
+        // reference to it must unify onto the Phase A actor node.
+        let sigs = candidate_signatures(&parsed(None, "Cache", "class"));
+        assert!(sigs.contains(&"actor:Cache".to_string()));
     }
 
     #[test]

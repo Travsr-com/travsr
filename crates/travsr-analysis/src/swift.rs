@@ -11,7 +11,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     language: Language::Swift,
     extensions: &["swift"],
     queries: r#"
-(class_declaration    name: (type_identifier) @class.name)
+(class_declaration declaration_kind: "class"     name: (type_identifier) @class.name)
+(class_declaration declaration_kind: "struct"    name: (type_identifier) @struct.name)
+(class_declaration declaration_kind: "enum"      name: (type_identifier) @enum.name)
+(class_declaration declaration_kind: "actor"     name: (type_identifier) @actor.name)
+(class_declaration declaration_kind: "extension" name: (user_type (type_identifier) @extension.name))
 (protocol_declaration name: (type_identifier) @protocol.name)
 (typealias_declaration name: (type_identifier) @typealias.name)
 (function_declaration name: (simple_identifier) @fn.name)
@@ -20,7 +24,19 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name))
 "#,
     capture_kinds: &[
+        // N4d: tree-sitter-swift folds all five type declarations into
+        // `class_declaration`, distinguished by the `declaration_kind` keyword.
+        // Emit distinct kinds AND distinct signature prefixes; the class-group
+        // signatures (struct/enum) already unify via `candidate_signatures`,
+        // `actor:` was added there in lockstep, and `extension:` stops an
+        // extension from colliding with the class it extends (both were
+        // `class:Foo` before). Members' containment edges follow the same
+        // prefix via `container_kind_prefix`.
         ("class.name", "class", "class"),
+        ("struct.name", "struct", "struct"),
+        ("enum.name", "enum", "enum"),
+        ("actor.name", "actor", "actor"),
+        ("extension.name", "extension", "extension"),
         ("protocol.name", "protocol", "class"),
         ("typealias.name", "type", "type"),
         ("fn.name", "function", "fn"),
@@ -48,6 +64,65 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn n4d_distinct_type_kinds() {
+        // N4d: struct/enum/actor/extension no longer collapse to kind `class`.
+        // Each gets a distinct kind and a distinct signature prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("types.swift");
+        std::fs::write(
+            &path,
+            "class C {}\nstruct S {}\nenum E { case a }\nactor A {}\nextension X {}\nprotocol P {}\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "types.swift").unwrap();
+        let by_sig: std::collections::HashMap<&str, &str> = out
+            .nodes
+            .iter()
+            .map(|n| (n.vname.signature.as_str(), n.kind.as_str()))
+            .collect();
+        assert_eq!(by_sig.get("class:C"), Some(&"class"));
+        assert_eq!(by_sig.get("struct:S"), Some(&"struct"));
+        assert_eq!(by_sig.get("enum:E"), Some(&"enum"));
+        assert_eq!(by_sig.get("actor:A"), Some(&"actor"));
+        assert_eq!(by_sig.get("extension:X"), Some(&"extension"));
+        assert_eq!(by_sig.get("class:P"), Some(&"protocol"));
+    }
+
+    #[test]
+    fn n4d_struct_method_containment_matches_struct_node() {
+        // N4d: a method inside a `struct` must have its containment edge parented
+        // to the `struct:S` node (via container_kind_prefix), not a nonexistent
+        // `class:S` — otherwise the edge dangles.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.swift");
+        std::fs::write(&path, "struct S {\n  func run() {}\n}\n").unwrap();
+        let out = parse("corp", &path, "m.swift").unwrap();
+
+        let struct_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "struct:S")
+            .map(|n| n.id)
+            .expect("struct:S node");
+        let method = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:S.run")
+            .expect("method:S.run node");
+        assert_eq!(method.kind, "method");
+        // The containment edge from struct:S -> method:S.run must exist.
+        let contained = out.edges.iter().any(|e| {
+            e.kind == travsr_core::EdgeKind::DefinesBinding
+                && e.src == struct_id
+                && e.dst == method.id
+        });
+        assert!(
+            contained,
+            "struct:S must contain method:S.run (no dangling)"
+        );
+    }
 
     #[test]
     fn parse_empty_file() {

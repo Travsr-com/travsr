@@ -228,12 +228,42 @@ fn enclosing_container<'a>(
     while let Some(n) = cur {
         if let Some((_, prefix)) = method_containers.iter().find(|(kind, _)| *kind == n.kind()) {
             if let Some(name) = container_name(n, source) {
+                // N4d: grammars that fold several type kinds into one AST node
+                // (tree-sitter-swift's `class_declaration` covers
+                // class/struct/enum/actor/extension) disambiguate via a
+                // `declaration_kind` keyword field. When present, the container
+                // is emitted under that keyword's signature prefix, so the
+                // method's containment edge must target `{keyword}:{name}`, not
+                // the static `method_containers` prefix. Absent that field the
+                // static prefix is used (every non-Swift grammar).
+                let prefix = container_kind_prefix(n, source).unwrap_or(prefix);
                 return Some((prefix, name));
             }
         }
         cur = n.parent();
     }
     None
+}
+
+/// N4d: if `node` carries a `declaration_kind` keyword field (tree-sitter-swift),
+/// return the matching `&'static` signature prefix so a folded type node
+/// (`struct`/`enum`/`actor`/`extension`/`class`) and its members' containment
+/// edges agree on the container's VName. Returns `None` for grammars without the
+/// field, leaving the caller's static prefix in force.
+fn container_kind_prefix(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<&'static str> {
+    let kw = node
+        .child_by_field_name("declaration_kind")?
+        .utf8_text(source)
+        .ok()?
+        .trim();
+    match kw {
+        "struct" => Some("struct"),
+        "enum" => Some("enum"),
+        "actor" => Some("actor"),
+        "extension" => Some("extension"),
+        "class" => Some("class"),
+        _ => None,
+    }
 }
 
 /// Extract a type container's declared name. Prefers the `name` field; falls
