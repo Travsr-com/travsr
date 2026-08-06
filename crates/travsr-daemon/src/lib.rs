@@ -1389,6 +1389,8 @@ pub fn init_repo_with_progress(
             // store (cross-file + incremental-safe) into attributable ScipRefs.
             // Fail closed — a callee that resolves to no node is dropped here, so
             // no dangling ref/call edge is ever written.
+            let mut lsif_covered: std::collections::HashSet<(String, u32)> =
+                std::collections::HashSet::new();
             match store.resolve_lsif_positional_refs(&corpus, &pb_positional) {
                 Ok(resolved) => {
                     tracing::debug!(
@@ -1396,12 +1398,24 @@ pub fn init_repo_with_progress(
                         resolved = resolved.len(),
                         "Phase B: rust-analyzer positional refs resolved"
                     );
+                    // E7: remember which call sites LSIF positionally resolved so
+                    // the native heuristic below can defer to them per-site.
+                    lsif_covered.extend(
+                        resolved
+                            .iter()
+                            .map(|r| (r.caller_path.clone(), r.caller_line)),
+                    );
                     pb_refs.extend(resolved);
                 }
                 Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
             }
-            let (resolved, resolved_sites) =
-                resolve_unresolved_calls(&store, &pb_unresolved, &pb_nodes, &pb_edges);
+            let (resolved, resolved_sites) = resolve_unresolved_calls(
+                &store,
+                &pb_unresolved,
+                &pb_nodes,
+                &pb_edges,
+                &lsif_covered,
+            );
             tracing::debug!(
                 resolved_cross_crate_edges = resolved.len(),
                 "Phase B UnresolvedCall resolution complete"
@@ -1692,6 +1706,9 @@ fn resolve_unresolved_calls(
     unresolved: &[travsr_core::UnresolvedCall],
     pb_nodes: &[travsr_core::Node],
     pb_edges: &[travsr_core::Edge],
+    // E7: call sites (caller_path, caller_line) already resolved by E3's
+    // positional rust-analyzer LSIF path. The native heuristic defers to them.
+    lsif_covered: &std::collections::HashSet<(String, u32)>,
 ) -> (
     Vec<travsr_core::Edge>,
     Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)>,
@@ -1879,6 +1896,19 @@ fn resolve_unresolved_calls(
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
+        // E7: E3's positional rust-analyzer LSIF path resolves the same call
+        // sites at 99.89% precision; where it already covered this exact site,
+        // its `scip` edge supersedes the native leaf-guess heuristic (~8% precise
+        // on the overlap — the `Session::filter` vs `Iterator::filter` class of
+        // fabrication). Defer to it and keep only the residual LSIF did not
+        // cover. An empty set (LSIF absent or degraded) leaves the native
+        // heuristic as the full fallback — its intended E7 role.
+        if !lsif_covered.is_empty() {
+            let caller_path = caller_paths.get(&u.src).map(String::as_str).unwrap_or("");
+            if lsif_covered.contains(&(caller_path.to_owned(), u.caller_line)) {
+                continue;
+            }
+        }
         // Exact signature first; fall back to a leaf-name match (R1). #521 F3:
         // a method call's `callee_sig` is always the bare `fn:{name}` form
         // (extraction never sets `is_method_call` with a qualified sig), so an
@@ -2479,6 +2509,8 @@ fn run_background_phase_b_inner(
     // E3 W3b: resolve rust-analyzer LSIF positional refs against the full store
     // (cross-file + incremental-safe). Fail closed — unresolved callees dropped,
     // never dangled.
+    let mut lsif_covered: std::collections::HashSet<(String, u32)> =
+        std::collections::HashSet::new();
     match s.resolve_lsif_positional_refs(&corpus, &pb_positional) {
         Ok(resolved) => {
             tracing::debug!(
@@ -2486,13 +2518,20 @@ fn run_background_phase_b_inner(
                 resolved = resolved.len(),
                 "Phase B: rust-analyzer positional refs resolved"
             );
+            // E7: remember which call sites LSIF positionally resolved so the
+            // native heuristic below can defer to them per-site.
+            lsif_covered.extend(
+                resolved
+                    .iter()
+                    .map(|r| (r.caller_path.clone(), r.caller_line)),
+            );
             pb_refs.extend(resolved);
         }
         Err(e) => tracing::warn!("positional ref resolution: {e:#}"),
     }
 
     let (resolved, resolved_sites) =
-        resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges);
+        resolve_unresolved_calls(&s, &pb_unresolved, &pb_nodes, &pb_edges, &lsif_covered);
     tracing::debug!(
         resolved_cross_crate_edges = resolved.len(),
         "Phase B UnresolvedCall resolution complete"
@@ -3015,7 +3054,13 @@ mod tests {
             recv_type: None,
         }];
 
-        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "method call must not resolve to an unrelated free function: {edges:?}"
@@ -3067,7 +3112,13 @@ mod tests {
             recv_type: None,
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "bare call must not cross into a non-dependency crate: {edges:?}"
@@ -3120,7 +3171,13 @@ mod tests {
             recv_type: None,
         }];
 
-        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             edges.len(),
             1,
@@ -3164,7 +3221,13 @@ mod tests {
             recv_type: None,
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "src/ caller must not resolve into tests/: {edges:?}"
@@ -3206,7 +3269,13 @@ mod tests {
             recv_type: Some("Session".to_string()),
         }];
 
-        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             edges.len(),
             1,
@@ -3253,7 +3322,13 @@ mod tests {
             recv_type: Some("HashSet".to_string()),
         }];
 
-        let (edges, sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "HashSet.filter must not resolve to Session.filter: {edges:?}"
@@ -3311,7 +3386,13 @@ mod tests {
             recv_type: Some("Session".to_string()),
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             edges.len(),
             1,
@@ -3366,7 +3447,13 @@ mod tests {
             recv_type: Some("Session".to_string()),
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &pb_nodes, &pb_edges);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &pb_nodes,
+            &pb_edges,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges.is_empty(),
             "exact recv_type match must still respect crate reachability: {edges:?}"
@@ -3407,7 +3494,13 @@ mod tests {
             recv_type: None,
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             edges.len(),
             1,
@@ -3462,7 +3555,13 @@ mod tests {
             recv_type: Some("SqliteStore".to_string()),
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(&store, &unresolved, &[], &[]);
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(
             edges.len(),
             1,
@@ -3476,11 +3575,80 @@ mod tests {
             recv_type: None,
             ..unresolved[0].clone()
         }];
-        let (edges2, _sites2) = resolve_unresolved_calls(&store, &unresolved_no_recv, &[], &[]);
+        let (edges2, _sites2) = resolve_unresolved_calls(
+            &store,
+            &unresolved_no_recv,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
         assert!(
             edges2.is_empty(),
             "ambiguous leaf without recv_type must still be dropped: {edges2:?}"
         );
+    }
+
+    #[test]
+    fn t11_e7_lsif_covered_call_site_suppresses_native_heuristic() {
+        // E7: where E3's positional rust-analyzer LSIF already resolved a call
+        // site, its precise `scip` edge supersedes the native leaf-guess
+        // heuristic. A call that WOULD resolve by unique-leaf must be suppressed
+        // when its (caller_path, caller_line) is in the covered set, and must
+        // still resolve at any line the LSIF path did not cover (the residual).
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let call_at = |line: u32| travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: line,
+            is_method_call: true,
+            recv_type: None,
+        };
+
+        // The LSIF positional path covered the call on line 8 of the caller's
+        // file, but not the one on line 12.
+        let mut lsif_covered: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
+        lsif_covered.insert(("crates/crate-a/src/lib.rs".to_string(), 8));
+
+        // Covered site → native heuristic must defer (0 edges) even though the
+        // unique-leaf match would otherwise fire (cf. t9, same setup).
+        let (edges_covered, _s) =
+            resolve_unresolved_calls(&store, &[call_at(8)], &[], &[], &lsif_covered);
+        assert!(
+            edges_covered.is_empty(),
+            "E7: LSIF-covered call site must suppress the native edge: {edges_covered:?}"
+        );
+
+        // Uncovered site → native heuristic still resolves (the residual E7 keeps).
+        let (edges_residual, _s) =
+            resolve_unresolved_calls(&store, &[call_at(12)], &[], &[], &lsif_covered);
+        assert_eq!(
+            edges_residual.len(),
+            1,
+            "E7: an uncovered call site must still resolve natively: {edges_residual:?}"
+        );
+        assert_eq!(edges_residual[0].dst, callee.id);
     }
 
     // ── #449 regression: full Phase A + Phase B pipeline for Swift ──────────
