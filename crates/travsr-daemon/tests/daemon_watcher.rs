@@ -135,3 +135,54 @@ async fn watcher_ignores_unix_socket_files() {
         "watcher must ignore socket files, but got: {got_event:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_ignores_travsrignore_directory() {
+    // #403: a directory excluded by .travsrignore (present at spawn) must be
+    // filtered exactly like a .gitignore'd path — editing a vendored source
+    // file must not re-add it to the graph.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(".travsrignore"), "vendor/\n").unwrap();
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let _handle = spawn(tmp.path(), tx, Instant::now()).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let vendor = tmp.path().join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(vendor.join("lib.ts"), "export class Lib {}").unwrap();
+
+    let got_event = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+    assert!(
+        got_event.is_err(),
+        "watcher must ignore .travsrignore'd vendor/, but got: {got_event:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_rebuilds_matcher_when_travsrignore_added() {
+    // #403: editing .travsrignore while the daemon runs must take effect
+    // without a restart. Before the rebuild fix the matcher snapshot was frozen
+    // at spawn, so a newly ignored directory kept getting indexed.
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let _handle = spawn(tmp.path(), tx, Instant::now()).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Introduce the ignore rule after the watcher is already running. Writing
+    // the file itself is not a source Upsert, but it triggers a matcher rebuild.
+    std::fs::write(tmp.path().join(".travsrignore"), "vendor/\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    let vendor = tmp.path().join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(vendor.join("lib.ts"), "export class Lib {}").unwrap();
+
+    let got_event = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+    assert!(
+        got_event.is_err(),
+        "watcher must honor a .travsrignore added at runtime, but got: {got_event:?}"
+    );
+}

@@ -94,7 +94,7 @@ pub fn spawn(
     start_time: Instant,
 ) -> anyhow::Result<WatcherHandle> {
     let repo_root = repo_root.to_path_buf();
-    let gitignore = build_gitignore(&repo_root);
+    let gitignore = build_ignore_matcher(&repo_root);
     let stop = Arc::new(AtomicBool::new(false));
 
     // Pending debounce table shared between the notify callback and the flush thread.
@@ -156,6 +156,10 @@ pub fn spawn(
     let event_thread = std::thread::Builder::new()
         .name("travsr-watcher-event".into())
         .spawn(move || {
+            // #403: the ignore matcher is rebuilt in-place when a
+            // .gitignore/.travsrignore changes, so it must be mutable. It lives
+            // only on this event thread, so no synchronisation is needed.
+            let mut gitignore = gitignore;
             let mut watcher = match RecommendedWatcher::new(
                 move |res: notify::Result<notify::Event>| {
                     if let Ok(ev) = res {
@@ -192,6 +196,14 @@ pub fn spawn(
                 }
                 match raw_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(event) => {
+                        // #403: a change to any .gitignore/.travsrignore
+                        // invalidates the cached matcher — rebuild it so newly
+                        // ignored paths stop being indexed without a daemon
+                        // restart. Done once per event before its paths are
+                        // filtered so the new rules apply to this batch too.
+                        if event.paths.iter().any(|p| is_ignore_file(p)) {
+                            gitignore = build_ignore_matcher(&repo_root);
+                        }
                         for path in &event.paths {
                             // Drop events predating daemon start (FSEvents replay guard).
                             if let Ok(meta) = std::fs::metadata(path) {
@@ -288,23 +300,53 @@ pub fn spawn(
     })
 }
 
-fn build_gitignore(repo_root: &Path) -> Gitignore {
+/// Build the combined ignore matcher used to filter watcher events.
+///
+/// Collects every `.gitignore` and `.travsrignore` under `repo_root` into one
+/// matcher (#403). `.travsrignore` files are added after `.gitignore` so their
+/// rules take precedence, mirroring `init_repo`'s
+/// `SKIP_DIRS < .gitignore < .travsrignore` ordering. The walk skips `SKIP_DIRS`
+/// so it never descends into `node_modules/`, `target/`, etc. looking for nested
+/// ignore files.
+pub(crate) fn build_ignore_matcher(repo_root: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(repo_root);
-    for entry in walkdir::WalkDir::new(repo_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() && entry.file_name() == ".gitignore" {
-            let _ = builder.add(entry.into_path());
+    // Two passes so all `.gitignore` rules are added before any `.travsrignore`
+    // rule: later-added patterns win in gitignore semantics, so `.travsrignore`
+    // (the user's Travsr-specific overrides) takes precedence.
+    for target in [".gitignore", ".travsrignore"] {
+        for entry in walkdir::WalkDir::new(repo_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                // Do not descend into SKIP_DIRS — matches init and avoids a slow
+                // first walk into node_modules/ on large repos.
+                !(e.file_type().is_dir()
+                    && e.file_name()
+                        .to_str()
+                        .is_some_and(|n| SKIP_DIRS.contains(&n)))
+            })
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_file() && entry.file_name() == target {
+                let _ = builder.add(entry.into_path());
+            }
         }
     }
     builder.build().unwrap_or(Gitignore::empty())
 }
 
+/// True when `path` is a `.gitignore` / `.travsrignore` file whose creation,
+/// edit, or removal should trigger a matcher rebuild (#403).
+pub(crate) fn is_ignore_file(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(".gitignore" | ".travsrignore")
+    )
+}
+
 /// Filter applied to ALL events (Upsert and Remove).
-/// Skips SKIP_DIRS components and gitignored paths.
-fn should_skip_all(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
+/// Skips SKIP_DIRS components and gitignored/travsrignored paths.
+pub(crate) fn should_skip_all(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool {
     let rel = path.strip_prefix(repo_root).unwrap_or(path);
     if rel
         .components()
@@ -312,7 +354,12 @@ fn should_skip_all(path: &Path, repo_root: &Path, gitignore: &Gitignore) -> bool
     {
         return true;
     }
-    gitignore.matched(rel, false).is_ignore()
+    // `matched_path_or_any_parents` (not `matched`) so a directory rule like
+    // `vendor/` or `**/generated/` excludes the files *under* it (#403). Plain
+    // `matched` only tests the exact path and never applies the parent-dir rule.
+    gitignore
+        .matched_path_or_any_parents(rel, false)
+        .is_ignore()
 }
 
 /// Additional filter applied only to Upsert events.
@@ -325,4 +372,77 @@ fn should_skip_upsert(path: &Path) -> bool {
     }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     Language::from_extension(ext).is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignore_matcher_honors_travsrignore_and_skip_dirs() {
+        // #403: the incremental matcher must read .travsrignore (not just
+        // .gitignore) so files init excluded stay excluded on edit, and must
+        // still hard-skip SKIP_DIRS.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".travsrignore"), "vendor/\n**/generated/\n").unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+
+        let m = build_ignore_matcher(root);
+
+        assert!(
+            should_skip_all(&root.join("vendor/lib.ts"), root, &m),
+            "vendor/ excluded by .travsrignore must be skipped"
+        );
+        assert!(
+            should_skip_all(&root.join("src/generated/api.ts"), root, &m),
+            "**/generated/ excluded by .travsrignore must be skipped"
+        );
+        assert!(
+            !should_skip_all(&root.join("src/app.ts"), root, &m),
+            "a normal source file must not be skipped"
+        );
+        assert!(
+            should_skip_all(&root.join("node_modules/x/index.js"), root, &m),
+            "node_modules is always skipped (SKIP_DIRS)"
+        );
+    }
+
+    #[test]
+    fn travsrignore_takes_precedence_over_gitignore() {
+        // .travsrignore is added after .gitignore, so its rules win: a negation
+        // there re-includes a file .gitignore excluded (no parent dir excluded,
+        // so gitignore re-inclusion semantics allow it).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "secret.ts\n").unwrap();
+        std::fs::write(root.join(".travsrignore"), "!secret.ts\n").unwrap();
+
+        let m = build_ignore_matcher(root);
+        assert!(
+            !should_skip_all(&root.join("secret.ts"), root, &m),
+            ".travsrignore negation must override the .gitignore exclusion"
+        );
+    }
+
+    #[test]
+    fn travsrignore_reincludes_gitignored_directory() {
+        // #599: `.gitignore` excludes a whole subtree that `.travsrignore`
+        // re-includes with `!vendored/`. init indexes it, so the watcher must
+        // NOT skip edits to files under it — otherwise those files go
+        // permanently stale (the state frozen at the last full init).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "vendored/\n").unwrap();
+        std::fs::write(root.join(".travsrignore"), "!vendored/\n").unwrap();
+        std::fs::create_dir_all(root.join("vendored")).unwrap();
+
+        let m = build_ignore_matcher(root);
+        assert!(
+            !should_skip_all(&root.join("vendored/dep.ts"), root, &m),
+            "#599: .travsrignore `!vendored/` must re-include a gitignored dir so \
+             the watcher keeps it fresh"
+        );
+    }
 }
