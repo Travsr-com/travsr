@@ -9709,6 +9709,128 @@ mod snippet_tests {
         assert!(travsrignore_reincluded_files(dir.path()).is_empty());
     }
 
+    /// A git repo with `.gitignore` / `.travsrignore` written verbatim and one
+    /// `fn charge() {}` at each of `files`. Committed empty, so every listed
+    /// file stays untracked and the ignore rules are what decide its fate.
+    fn ignore_rules_fixture(
+        gitignore: &str,
+        travsrignore: &str,
+        files: &[String],
+    ) -> tempfile::TempDir {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join(".gitignore"), gitignore).unwrap();
+        std::fs::write(root.join(".travsrignore"), travsrignore).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        for f in files {
+            let full = root.join(f);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, "fn charge() {}\n").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn travsrignore_reincluded_files_never_escapes_skip_dirs() {
+        // `!node_modules/` must not widen the search into it. The walker hard-
+        // skips SKIP_DIRS *after* applying the ignore files, so those paths are
+        // not in the graph no matter what `.travsrignore` says — and pass 2 has
+        // to make the same call or find_pattern starts reporting files the
+        // graph does not have.
+        let dir = ignore_rules_fixture(
+            "node_modules/\nvendored/\n",
+            "!node_modules/\n!vendored/\n",
+            &[
+                "node_modules/pkg/index.rs".to_string(),
+                "vendored/dep.rs".to_string(),
+            ],
+        );
+        let found = travsrignore_reincluded_files(dir.path());
+        if found.is_empty() {
+            return; // git unavailable in this sandbox
+        }
+        assert!(
+            !found.iter().any(|p| p.starts_with("node_modules/")),
+            "a SKIP_DIRS path must stay out even with an explicit `!` rule: {found:?}"
+        );
+        assert!(
+            found.contains(&"vendored/dep.rs".to_string()),
+            "the non-SKIP_DIRS re-inclusion must still be picked up: {found:?}"
+        );
+    }
+
+    #[test]
+    fn travsrignore_reincluded_files_handles_glob_negation() {
+        // A `!` rule is gitignore syntax, not just a bare directory name, so
+        // the whitelist test has to survive a glob and a nested path.
+        let dir = ignore_rules_fixture(
+            "vendored/\n",
+            "!vendored/**/*.rs\n",
+            &[
+                "vendored/deep/nested/dep.rs".to_string(),
+                "vendored/notes.txt".to_string(),
+            ],
+        );
+        let found = travsrignore_reincluded_files(dir.path());
+        if found.is_empty() {
+            return;
+        }
+        assert!(
+            found.contains(&"vendored/deep/nested/dep.rs".to_string()),
+            "a glob `!` rule must re-include the nested match: {found:?}"
+        );
+        assert!(
+            !found.contains(&"vendored/notes.txt".to_string()),
+            "a file the glob does not match must stay excluded: {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_reaches_every_reincluded_file_across_argv_chunks() {
+        // Pass 2 batches its paths to fit an argument vector. The batching is
+        // unit-tested above; this drives the real multi-chunk spawn loop, so a
+        // file landing in the second or third batch is not silently lost.
+        const N: usize = 2400; // > 2x MAX_ARGV_PATHS
+        let files: Vec<String> = (0..N).map(|i| format!("vendored/f{i:04}.rs")).collect();
+        let dir = ignore_rules_fixture("vendored/\n", "!vendored/\n", &files);
+
+        let reincluded = travsrignore_reincluded_files(dir.path());
+        if reincluded.is_empty() {
+            return;
+        }
+        assert_eq!(reincluded.len(), N, "every re-included file must be listed");
+        assert!(
+            argv_chunks(&reincluded).len() >= 3,
+            "fixture must actually span multiple batches"
+        );
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+        // MAX_PATTERN_MATCHES caps the printed list, so assert on the total in
+        // the header rather than on the truncated body.
+        let out = find_pattern(&store, "charge", None, false);
+        assert_eq!(
+            extract_match_count(&out),
+            N,
+            "matches from later batches must not be dropped: {}",
+            out.lines().next().unwrap_or("")
+        );
+    }
+
     // ── #517: honest find_pattern failures (D2/D3/D5) ────────────────────────
 
     /// A one-file git repo with `content` written to `path`, and a store whose
