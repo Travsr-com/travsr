@@ -54,11 +54,21 @@ pub fn run(cmd: ConfigCommand) -> Result<()> {
     }
 }
 
-/// Resolve the current repo root, if we are inside one (best-effort — config is
-/// still usable outside a repo, where only global + env + default apply).
+/// Resolve the current repo root for a **read** (`config get`/`list`), if we are
+/// inside one (best-effort — config is still usable outside a repo, where only
+/// global + env + default apply).
 fn current_repo_root() -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     crate::repo::find_git_root(&cwd).ok()
+}
+
+/// Write-path variant of [`current_repo_root`]. `config set --repo`/`--now`
+/// mutate the worktree's own `.travsr/` (repo-scoped config, or an immediate
+/// reindex), so they resolve the worktree we are standing in rather than
+/// redirecting to the main worktree (issue #586).
+fn current_repo_root_for_write() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    crate::repo::find_git_root_for_write(&cwd).ok()
 }
 
 fn cmd_get(key: &str) -> Result<()> {
@@ -73,7 +83,7 @@ fn cmd_get(key: &str) -> Result<()> {
 
 fn cmd_set(key: &str, value: &str, repo: bool, now: bool) -> Result<()> {
     let scope = if repo {
-        let root = current_repo_root()
+        let root = current_repo_root_for_write()
             .context("--repo requires being inside a git repository (no .travsr found)")?;
         Scope::Repo(root)
     } else {
@@ -93,7 +103,7 @@ fn cmd_set(key: &str, value: &str, repo: bool, now: bool) -> Result<()> {
             );
             return Ok(());
         }
-        let root = current_repo_root()
+        let root = current_repo_root_for_write()
             .context("--now needs to run inside a git repository (to locate the reindex target)")?;
         let db_path = root.join(".travsr/graph.db");
         anyhow::ensure!(

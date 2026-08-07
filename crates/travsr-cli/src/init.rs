@@ -1,7 +1,7 @@
 // Delegates to travsr_daemon::init_repo (DEBT-010 closed in Sprint 2).
 use anyhow::Context as _;
 
-use crate::repo::find_git_root;
+use crate::repo::find_git_root_for_write;
 
 pub fn run(
     quiet: bool,
@@ -11,7 +11,9 @@ pub fn run(
     allow_unsandboxed_lsif: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let repo_root = find_git_root(&cwd)?;
+    // Write command: index the worktree we are standing in, never redirect to
+    // the main worktree (issue #586).
+    let repo_root = find_git_root_for_write(&cwd)?;
 
     // Apply the operator opt-in before any indexing begins. This sets a
     // process-global flag consulted by run_ra_lsif via allow_unsandboxed_opt_in().

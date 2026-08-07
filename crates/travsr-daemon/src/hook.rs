@@ -31,7 +31,11 @@ const CMD_HOOK_BODY: &str =
 const CMD_CHAIN_HOOK_BODY: &str =
     "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0post-commit.travsr-pre.bak.cmd\" call \"%~dp0post-commit.travsr-pre.bak.cmd\"\r\ntravsr hook-run --from-hook\r\n";
 
-/// Install the Travsr `post-commit` hook in `repo_root/.git/hooks/`.
+/// Install the Travsr `post-commit` hook in the repo's git hooks directory.
+///
+/// For a standard repo this is `repo_root/.git/hooks`. For a **linked worktree**
+/// `.git` is a gitlink *file*, so hooks live in the shared common dir; the
+/// directory is resolved via git in both cases (see [`resolve_hooks_dir`]).
 ///
 /// On all platforms, writes a POSIX shell `post-commit` (works with Git Bash
 /// on Windows). On Windows, additionally writes `post-commit.cmd` so that git
@@ -40,9 +44,39 @@ const CMD_CHAIN_HOOK_BODY: &str =
 /// If a hook already exists that was NOT installed by Travsr, it is renamed to
 /// `post-commit.travsr-pre.bak` (or `.bak.cmd`) and a chain script is written
 /// instead so the existing hook continues to run.
+/// Resolve the git hooks directory for `repo_root`.
+///
+/// Git hooks are a *common* resource shared across a repo's worktrees, stored
+/// under the main git dir. For a standard repo that is `<repo_root>/.git/hooks`;
+/// for a linked worktree (`.git` is a gitlink *file*, so `.git/hooks` does not
+/// exist) it is `<main>/.git/hooks`. `git rev-parse --git-path hooks` returns
+/// the right directory in both cases — relative (`.git/hooks`) for a standard
+/// repo, absolute for a worktree — which we resolve against `repo_root`
+/// (joining an absolute path replaces, a relative path appends). Falls back to
+/// `<repo_root>/.git/hooks` when git is unavailable (issue #586).
+fn resolve_hooks_dir(repo_root: &Path) -> PathBuf {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return repo_root.join(trimmed);
+                }
+            }
+        }
+    }
+    repo_root.join(".git/hooks")
+}
+
 pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
-    let hooks_dir = repo_root.join(".git/hooks");
-    std::fs::create_dir_all(&hooks_dir).context("creating .git/hooks directory")?;
+    let hooks_dir = resolve_hooks_dir(repo_root);
+    std::fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
     // ── POSIX shell hook (all platforms) ─────────────────────────────────────
     let hook_path = hooks_dir.join("post-commit");

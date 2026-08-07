@@ -54,7 +54,14 @@ pub enum SynonymCommand {
 
 pub fn run(action: SynonymCommand) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo_root = repo::find_git_root(&cwd)?;
+    // `list` is a read (redirect to the main index if this worktree has none,
+    // #302); add/set/remove/reset mutate graph.db, so they must target the
+    // worktree's own index, never the main worktree's (#586).
+    let repo_root = if matches!(action, SynonymCommand::List { .. }) {
+        repo::find_git_root(&cwd)?
+    } else {
+        repo::find_git_root_for_write(&cwd)?
+    };
     let db_path = repo_root.join(".travsr/graph.db");
     anyhow::ensure!(
         db_path.exists(),

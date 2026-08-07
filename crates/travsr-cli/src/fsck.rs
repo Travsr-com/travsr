@@ -1,10 +1,12 @@
 use anyhow::Context as _;
 
-use crate::repo::find_git_root;
+use crate::repo::find_git_root_for_write;
 
 pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let repo_root = find_git_root(&cwd)?;
+    // Write command (may GC/repair the index): operate on the worktree we are
+    // standing in, never the main worktree (issue #586).
+    let repo_root = find_git_root_for_write(&cwd)?;
 
     let report = travsr_daemon::fsck_repo(&repo_root, fix, force)?;
 
