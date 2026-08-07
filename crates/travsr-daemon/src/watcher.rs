@@ -60,6 +60,10 @@ const DEBOUNCE_MS: u64 = 500;
 /// always fully recovers the graph.
 const MAX_PENDING: usize = 100_000;
 
+/// Mirrored by `travsr-mcp`'s own `SKIP_DIRS` so `find_pattern` searches the
+/// same file universe the graph is built from (#448). The dependency rules run
+/// `travsr-daemon → travsr-mcp`, so the constant cannot be shared; keep the two
+/// lists identical.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".claude",
     ".git",
