@@ -669,10 +669,46 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  for a textual search."
             );
         }
-        // The index is populated for this language and this symbol has neither
-        // occurrence rows nor ref/call edges: a genuine zero. (If the same name
-        // is also defined elsewhere, bare calls to it are left unindexed to
-        // avoid mis-targeting — precision over recall.)
+        // #450: the language has *some* occurrence data, but "some" is not
+        // "complete". Phase B routinely covers a language partially — an
+        // analyzer crash, a per-file timeout, or a provider that only indexes
+        // its own package all leave most files unanalysed while still producing
+        // enough rows to pass the gate above. Reporting a definitive zero for a
+        // symbol that lives in an unanalysed file states something the index
+        // cannot support.
+        //
+        // The gate is the target's OWN file, not a language-wide ratio (#551
+        // review): `find_references` resolves targets of any kind, so a ratio
+        // over one population of files can describe a set the target is not in —
+        // 52 of 221 Rust files here hold no function or method node at all.
+        //
+        // Still a proxy. A file that genuinely references nothing looks the same
+        // as an unanalysed one, so this can only ever soften a claim, never
+        // assert absence. RFC-024 / #549 would make it a recorded fact.
+        let file_analyzed = store
+            .file_has_occurrences(&target.vname.path)
+            .unwrap_or(false);
+        if !file_analyzed {
+            // Language-wide coverage is reported as context, not as the gate: it
+            // is what makes the softened answer interpretable — "4 of 78 files"
+            // reads very differently from "161 of 221".
+            let (files_with_occ, files_total) =
+                store.language_occurrence_coverage(lang).unwrap_or((0, 0));
+            let coverage_pct = (100 * files_with_occ).checked_div(files_total).unwrap_or(0) as u32;
+            return format!(
+                "{header}\n0 recorded reference(s) — not a definitive zero. No \
+                 reference occurrences are recorded for '{}' itself, so semantic \
+                 analysis may never have covered this file ({files_with_occ} of \
+                 {files_total} '{lang}' files in this repo carry occurrence data, \
+                 {coverage_pct}%). Run `travsr status` to check Phase B, or use \
+                 `find_pattern` for a textual search.",
+                target.vname.path
+            );
+        }
+        // Coverage is effectively complete for this language and this symbol has
+        // neither occurrence rows nor ref/call edges: a genuine zero. (If the
+        // same name is also defined elsewhere, bare calls to it are left
+        // unindexed to avoid mis-targeting — precision over recall.)
         return format!(
             "{header}\n0 reference(s). This symbol has no recorded uses. If this \
              name is also defined elsewhere, bare calls to it are left unindexed \
@@ -8884,6 +8920,91 @@ mod snippet_tests {
         assert!(out.contains("src/svc.rs:9"), "site 9 missing: {out}");
         assert!(out.contains("src/svc.rs:10"), "site 10 missing: {out}");
         assert!(out.contains("2 reference(s)"), "count missing: {out}");
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_target_file_has_no_occurrences() {
+        // #450: the language gate passes (another file of the same language has
+        // occurrence rows), but the target's OWN file has none — so a definitive
+        // "no recorded uses" would be a claim the index cannot support.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // covered.rs is analysed: it carries a real occurrence.
+        let caller = Node::new(
+            VName::new("", "", "src/covered.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/covered.rs", "rust", "fn:callee"),
+            "function",
+        );
+        // untouched.rs is not: same language, no occurrence rows at all.
+        let orphan = Node::new(
+            VName::new("", "", "src/untouched.rs", "rust", "fn:orphan"),
+            "function",
+        )
+        .with_line(3);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&orphan).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 11)])
+            .unwrap();
+
+        let out = find_references(&store, "orphan", None);
+        assert!(
+            out.contains("not a definitive zero"),
+            "should soften the claim: {out}"
+        );
+        assert!(
+            out.contains("src/untouched.rs"),
+            "should name the unanalysed file: {out}"
+        );
+        assert!(
+            !out.contains("has no recorded uses"),
+            "must not assert absence: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_keeps_definitive_zero_when_target_file_is_analyzed() {
+        // Converse of the above: the target's own file carries occurrence rows,
+        // so a zero for this symbol is a real zero and the existing confident
+        // wording must be preserved unchanged.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
+            "function",
+        );
+        // Same file, analysed, but nothing references it.
+        let unused = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
+            "function",
+        )
+        .with_line(20);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&unused).unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5)])
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("has no recorded uses"),
+            "analysed file should still give a definitive zero: {out}"
+        );
+        assert!(
+            !out.contains("not a definitive zero"),
+            "should not soften when the file was analysed: {out}"
+        );
     }
 
     #[test]
