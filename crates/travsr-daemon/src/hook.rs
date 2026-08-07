@@ -31,7 +31,40 @@ const CMD_HOOK_BODY: &str =
 const CMD_CHAIN_HOOK_BODY: &str =
     "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0post-commit.travsr-pre.bak.cmd\" call \"%~dp0post-commit.travsr-pre.bak.cmd\"\r\ntravsr hook-run --from-hook\r\n";
 
-/// Install the Travsr `post-commit` hook in `repo_root/.git/hooks/`.
+/// Resolve the git hooks directory for `repo_root`.
+///
+/// Git hooks are a *common* resource shared across a repo's worktrees, stored
+/// under the main git dir. For a standard repo that is `<repo_root>/.git/hooks`;
+/// for a linked worktree (`.git` is a gitlink *file*, so `.git/hooks` does not
+/// exist) it is `<main>/.git/hooks`. `git rev-parse --git-path hooks` returns
+/// the right directory in both cases — relative (`.git/hooks`) for a standard
+/// repo, absolute for a worktree — which we resolve against `repo_root`
+/// (joining an absolute path replaces, a relative path appends). Falls back to
+/// `<repo_root>/.git/hooks` when git is unavailable (issue #586).
+fn resolve_hooks_dir(repo_root: &Path) -> PathBuf {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return repo_root.join(trimmed);
+                }
+            }
+        }
+    }
+    repo_root.join(".git/hooks")
+}
+
+/// Install the Travsr `post-commit` hook in the repo's git hooks directory.
+///
+/// For a standard repo this is `repo_root/.git/hooks`. For a **linked worktree**
+/// `.git` is a gitlink *file*, so hooks live in the shared common dir; the
+/// directory is resolved via git in both cases (see [`resolve_hooks_dir`]).
 ///
 /// On all platforms, writes a POSIX shell `post-commit` (works with Git Bash
 /// on Windows). On Windows, additionally writes `post-commit.cmd` so that git
@@ -41,8 +74,9 @@ const CMD_CHAIN_HOOK_BODY: &str =
 /// `post-commit.travsr-pre.bak` (or `.bak.cmd`) and a chain script is written
 /// instead so the existing hook continues to run.
 pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
-    let hooks_dir = repo_root.join(".git/hooks");
-    std::fs::create_dir_all(&hooks_dir).context("creating .git/hooks directory")?;
+    let hooks_dir = resolve_hooks_dir(repo_root);
+    std::fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
     // ── POSIX shell hook (all platforms) ─────────────────────────────────────
     let hook_path = hooks_dir.join("post-commit");
@@ -281,6 +315,75 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".git/hooks")).unwrap();
         tmp
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Issue #586 downstream: in a linked worktree `.git` is a gitlink *file*,
+    /// so `<wt>/.git/hooks` does not exist. `install_hook` used to
+    /// `create_dir_all(repo_root/.git/hooks)` and fail with
+    /// `Not a directory (os error 20)`, leaving `init` half done. Git hooks are
+    /// a common resource, so the hook must land in the shared common hooks dir
+    /// (`<main>/.git/hooks`) and installing from the worktree must succeed.
+    #[test]
+    fn install_hook_from_worktree_uses_common_hooks_dir() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        assert!(git(&main, &["init", "-q"]));
+        assert!(git(&main, &["config", "user.email", "t@t.t"]));
+        assert!(git(&main, &["config", "user.name", "t"]));
+        std::fs::write(main.join("f.txt"), "x").unwrap();
+        assert!(git(&main, &["add", "."]));
+        assert!(git(&main, &["commit", "-qm", "init"]));
+
+        let wt = tmp.path().join("wt");
+        assert!(git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]));
+        // `.git` in a worktree is a gitlink file, not a directory.
+        assert!(wt.join(".git").is_file());
+
+        // A standard repo resolves to its own `.git/hooks`.
+        assert_eq!(
+            resolve_hooks_dir(&main).canonicalize().unwrap(),
+            main.join(".git/hooks").canonicalize().unwrap()
+        );
+        // A worktree resolves to the *shared* common hooks dir, never
+        // `<wt>/.git/hooks` (which does not exist).
+        assert_eq!(
+            resolve_hooks_dir(&wt).canonicalize().unwrap(),
+            main.join(".git/hooks").canonicalize().unwrap()
+        );
+
+        // The bug: this used to error with `Not a directory (os error 20)`.
+        install_hook(&wt).unwrap();
+        let hook = main.join(".git/hooks/post-commit");
+        assert!(
+            hook.exists(),
+            "hook must land in the shared common hooks dir"
+        );
+        assert!(std::fs::read_to_string(&hook)
+            .unwrap()
+            .contains(TRAVSR_MARKER_SH));
     }
 
     #[cfg(windows)]
