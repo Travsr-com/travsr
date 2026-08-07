@@ -209,6 +209,34 @@ suite("VSCODE-205: installer — verifyChecksum", () => {
     );
     assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sums));
   });
+
+  // release.yml's build matrix (.github/workflows/release.yml:152-173) publishes
+  // exactly these five artifact triples. Each must resolve against a SHA256SUMS
+  // built the way the real workflow builds it: `sha256sum dist/<tarball>` run
+  // from the repo root, combined with `cat dist/*.sha256 > SHA256SUMS`. Windows
+  // additionally gets the `*` binary-mode marker.
+  const releaseTriples = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+  ];
+
+  for (const triple of releaseTriples) {
+    test(`resolves the real release entry for ${triple}`, () => {
+      const tarName = `travsr-v0.11.0-${triple}.tar.gz`;
+      const tarball = Buffer.from(`tarball for ${triple}`);
+      const hash = crypto.createHash("sha256").update(tarball).digest("hex");
+      const marker = triple === "x86_64-pc-windows-msvc" ? "*" : "";
+      // Two spaces before a bare filename, one space + `*` before a binary-mode
+      // filename: this is coreutils sha256sum's own output format, not a
+      // convention this test invented.
+      const separator = marker ? " " : "  ";
+      const sums = Buffer.from(`${hash}${separator}${marker}dist/${tarName}\n`, "utf8");
+      assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sums));
+    });
+  }
 });
 
 // ── WS1: checkOnPath — Windows .cmd discrimination ────────────────────────
