@@ -2027,20 +2027,68 @@ fn resolve_unresolved_calls(
                         None => leaf_method_matches(&u.callee_sig),
                     }
                 }
-                // recv_type not recovered — pre-#529 behavior, unchanged.
-                None => leaf_method_matches(&u.callee_sig),
+                // #604: receiver type not recovered — no evidence of a call
+                // target. The pre-#529 behavior here resolved by leaf-name
+                // uniqueness ("exactly one `method:*.output` in the graph, so
+                // the call must be it"), which fabricated a false `ref/call`
+                // edge whenever a ubiquitous std/library method name
+                // (`.output()`, `.status()`, `.filter()`, `.insert()`) collided
+                // with a lone same-named user method — measured 99% false
+                // against rust-analyzer LSIF ground truth (201 false : 2 real).
+                // Uniqueness in-graph is an artifact of std/external types not
+                // being indexed, never proof of the target. Emit nothing; the
+                // E7 LSIF/scip path covers genuine receiver-less sites. This
+                // extends #529 (which only fail-closed the *recovered*-receiver
+                // branch) to the receiver-less residual it left behind.
+                None => continue,
             }
         } else {
             match by_sig.get(u.callee_sig.as_str()) {
                 Some(m) => m.clone(),
-                None => by_leaf
-                    .get(&leaf_of(&u.callee_sig))
-                    .map(|v| {
-                        v.iter()
-                            .map(|(id, path, _, lang)| (*id, *path, *lang))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                None => {
+                    // #604 (non-method paths): the leaf fallback exists only to
+                    // resolve a name whose type we could NOT determine. Two
+                    // fabrication routes through it are closed here, both demanding
+                    // positive type evidence:
+                    //
+                    // (a) A qualified callee (`method:Type.leaf`, i.e. an
+                    //     associated call `Type::method`) already names its type.
+                    //     If the exact `Type.method` node is absent from the store
+                    //     (the `by_sig` miss that got us here), `Type` is external
+                    //     (`rusqlite::Connection::open`, `File::open`) — matching a
+                    //     different type's same-named method is a fabrication.
+                    //     Fail closed. Only the exact `by_sig` hit above may
+                    //     resolve an associated call.
+                    //
+                    // (b) A bare `fn:name` call (`std::io::stderr()` extracts as
+                    //     `fn:stderr`) must not resolve into a qualified
+                    //     `Type.method` node — a free function can only target a
+                    //     free function. Keep only bare `fn:` definitions from the
+                    //     leaf pool (#521 F3, applied symmetrically to the method
+                    //     path, which conversely keeps only qualified candidates).
+                    let callee_qualified = u
+                        .callee_sig
+                        .split_once(':')
+                        .map(|(_, body)| body)
+                        .unwrap_or(u.callee_sig.as_str())
+                        .contains('.');
+                    if callee_qualified {
+                        Vec::new()
+                    } else {
+                        by_leaf
+                            .get(&leaf_of(&u.callee_sig))
+                            .map(|v| {
+                                v.iter()
+                                    .filter(|(_, _, s, _)| {
+                                        let body = s.split_once(':').map(|(_, b)| b).unwrap_or(s);
+                                        !body.contains('.')
+                                    })
+                                    .map(|(id, path, _, lang)| (*id, *path, *lang))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    }
+                }
             }
         };
         if matches.is_empty() {
@@ -3830,9 +3878,19 @@ mod tests {
     }
 
     #[test]
-    fn t9_recv_type_none_is_byte_identical_to_pre_529_behavior() {
-        // No receiver type recovered — must go through the exact same
-        // leaf-unique-match path as before #529.
+    fn t9_recv_type_none_unique_leaf_is_fail_closed_604() {
+        // #604: a method call whose receiver type could not be recovered must
+        // NOT resolve by leaf-name uniqueness. This is the exact scenario the
+        // native heuristic fabricated on: `something.filter()` on an unknown
+        // receiver (a `Vec`, an `Iterator` — std types absent from the graph),
+        // with a lone `method:Session.filter` as the only same-named user
+        // method. "Unique in-graph" is not evidence of the target; measured
+        // 99% false against rust-analyzer LSIF. Fail closed — emit nothing.
+        //
+        // This inverts the pre-#604 `t9_..._byte_identical_to_pre_529_behavior`
+        // assertion (which required 1 edge here); that behavior was the bug.
+        // `Session.filter` was the single largest offender in the #604
+        // measurement (98 fabricated edges on this repo alone).
         use travsr_core::{Node, VName};
         let mut store = SqliteStore::open_in_memory().unwrap();
 
@@ -3863,6 +3921,170 @@ mod tests {
             recv_type: None,
         }];
 
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "receiver-less method call must not resolve by unique-leaf guess (#604): {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn t14_bare_function_call_does_not_resolve_into_a_method_604() {
+        // #604 non-method sibling: a bare free/scoped-function call must never
+        // resolve into a qualified `Type.method` node by leaf uniqueness. The
+        // real-world trigger is `writeln!(std::io::stderr(), ...)`, extracted as
+        // a bare `fn:stderr` call (is_method_call = false); with a lone
+        // `method:SandboxedSpawn.stderr` in the graph the unfiltered leaf pool
+        // matched it and fabricated a `ref/call` into that method.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/progress.rs",
+                "rust",
+                "fn:render",
+            ),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // The only `stderr`-leaf node in the graph is a qualified method.
+        let method = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/sandbox.rs",
+                "rust",
+                "method:SandboxedSpawn.stderr",
+            ),
+            "method",
+        );
+        store.put_node(&method).unwrap();
+
+        // `std::io::stderr()` — a bare (non-method) function call.
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:stderr".to_string(),
+            hint_crate: None,
+            caller_line: 12,
+            is_method_call: false,
+            recv_type: None,
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "bare function call must not resolve into a qualified method (#604): {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn t15_associated_call_to_external_type_does_not_resolve_by_leaf_604() {
+        // #604 associated-call path: `rusqlite::Connection::open(..)` extracts as
+        // a non-method call with a qualified `callee_sig` (`method:Connection.open`).
+        // `Connection` is external (no graph node), so the exact `by_sig` lookup
+        // misses; the leaf fallback must NOT then match a lone same-leaf user
+        // method (`method:SqliteStore.open`). The named type is evidence: a call
+        // to `Connection::open` can only target `Connection.open`, never another
+        // type's `open`. Fail closed.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/embed.rs", "rust", "fn:write_db"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // Only qualified `.open` in the graph belongs to a DIFFERENT type.
+        let other = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:SqliteStore.open",
+            ),
+            "method",
+        );
+        store.put_node(&other).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "method:Connection.open".to_string(),
+            hint_crate: None,
+            caller_line: 45,
+            is_method_call: false,
+            recv_type: None,
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "associated call to an external type must not resolve to a same-leaf \
+             user method (#604): {edges:?}"
+        );
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn t16_associated_call_to_graph_type_still_resolves_604() {
+        // #604 guard: the associated-call fix must not drop a real one. When the
+        // named type IS in the graph, `Type::method` resolves via the exact
+        // `by_sig` match — recall preserved.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/main.rs", "rust", "fn:run"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/store.rs",
+                "rust",
+                "method:SqliteStore.open",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "method:SqliteStore.open".to_string(),
+            hint_crate: None,
+            caller_line: 7,
+            is_method_call: false,
+            recv_type: None,
+        }];
+
         let (edges, _sites) = resolve_unresolved_calls(
             &store,
             &unresolved,
@@ -3873,7 +4095,59 @@ mod tests {
         assert_eq!(
             edges.len(),
             1,
-            "unique-leaf match must still resolve when recv_type is None: {edges:?}"
+            "associated call to a graph type must still resolve exactly: {edges:?}"
+        );
+        assert_eq!(edges[0].dst, callee.id);
+    }
+
+    #[test]
+    fn t13_recv_type_some_exact_match_still_resolves_after_604() {
+        // #604 guard: fail-closing the receiver-less path must not touch the
+        // #529 recovered-receiver path. A call whose receiver type IS known and
+        // exactly matches a `method:T.method` node must still resolve — this is
+        // the recall the whole design keeps. Same `.filter` leaf as t9, but here
+        // the receiver is known to be `Session`, so it is real evidence.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/lib.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-a/src/session.rs",
+                "rust",
+                "method:Session.filter",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:filter".to_string(),
+            hint_crate: None,
+            caller_line: 8,
+            is_method_call: true,
+            recv_type: Some("Session".to_string()),
+        }];
+
+        let (edges, _sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "recovered receiver type must still resolve exactly (#529 path intact): {edges:?}"
         );
         assert_eq!(edges[0].dst, callee.id);
     }
@@ -3985,13 +4259,18 @@ mod tests {
         );
         store.put_node(&callee).unwrap();
 
+        // #604: the residual resolves via the recovered-receiver (#529) path,
+        // not the unique-leaf guess (which now fails closed). E7 suppression is
+        // orthogonal to how the uncovered site resolves — a known receiver is
+        // the evidence that lets it resolve at all so the suppression assertion
+        // stays meaningful.
         let call_at = |line: u32| travsr_core::UnresolvedCall {
             src: caller.id,
             callee_sig: "fn:filter".to_string(),
             hint_crate: None,
             caller_line: line,
             is_method_call: true,
-            recv_type: None,
+            recv_type: Some("Session".to_string()),
         };
 
         // The LSIF positional path covered the `filter` call on line 8 of the
@@ -4005,7 +4284,7 @@ mod tests {
         ));
 
         // Covered site → native heuristic must defer (0 edges) even though the
-        // unique-leaf match would otherwise fire (cf. t9, same setup).
+        // recovered-receiver match would otherwise fire on this line.
         let (edges_covered, _s) =
             resolve_unresolved_calls(&store, &[call_at(8)], &[], &[], &lsif_covered);
         assert!(
@@ -4073,6 +4352,10 @@ mod tests {
             "filter".to_string(),
         ));
 
+        // #604: both carry a recovered receiver so the uncovered `count` can
+        // resolve via the #529 exact-match path (the unique-leaf guess now
+        // fails closed). The point under test is per-callee suppression, not
+        // how the survivor resolves.
         let calls = vec![
             travsr_core::UnresolvedCall {
                 src: caller.id,
@@ -4080,7 +4363,7 @@ mod tests {
                 hint_crate: None,
                 caller_line: 8,
                 is_method_call: true,
-                recv_type: None,
+                recv_type: Some("Session".to_string()),
             },
             travsr_core::UnresolvedCall {
                 src: caller.id,
@@ -4088,7 +4371,7 @@ mod tests {
                 hint_crate: None,
                 caller_line: 8,
                 is_method_call: true,
-                recv_type: None,
+                recv_type: Some("Session".to_string()),
             },
         ];
 
