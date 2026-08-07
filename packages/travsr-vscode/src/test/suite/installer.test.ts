@@ -37,8 +37,14 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
     assert.strictEqual(resolveTargetTriple("win32", "x64"), "x86_64-pc-windows-msvc");
   });
 
-  test("win32/arm64 → aarch64-pc-windows-msvc", () => {
-    assert.strictEqual(resolveTargetTriple("win32", "arm64"), "aarch64-pc-windows-msvc");
+  // release.yml never builds/publishes an aarch64-pc-windows-msvc artifact
+  // (only x86_64-pc-windows-msvc), so this must throw rather than resolve to
+  // a triple that would 404 on download.
+  test("win32/arm64 throws (no such release artifact is published)", () => {
+    assert.throws(
+      () => resolveTargetTriple("win32", "arm64"),
+      (e: Error) => e.message.includes("win32") && e.message.includes("arm64")
+    );
   });
 
   test("unknown platform throws with platform and arch in message", () => {
@@ -176,6 +182,67 @@ suite("VSCODE-205: installer — verifyChecksum", () => {
     );
     assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sumsWithMultiple));
   });
+
+  // Regression coverage for #585: published SHA256SUMS entries are not bare
+  // filenames. The release workflow runs `sha256sum dist/<tarball>`, so every
+  // line carries a `dist/` prefix, and the Windows leg's sha256sum additionally
+  // emits a `*` binary-mode marker before the filename.
+  test("matches entry with a dist/ path prefix (real release format)", () => {
+    const tarball = Buffer.from("real tarball");
+    const tarName = "travsr-v0.10.0-aarch64-apple-darwin.tar.gz";
+    const hash = crypto.createHash("sha256").update(tarball).digest("hex");
+    const sums = Buffer.from(`${hash}  dist/${tarName}\n`, "utf8");
+    assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sums));
+  });
+
+  test("matches entry with a dist/ prefix and * binary-mode marker (Windows release format)", () => {
+    const tarball = Buffer.from("windows tarball");
+    const tarName = "travsr-v0.10.0-x86_64-pc-windows-msvc.tar.gz";
+    const hash = crypto.createHash("sha256").update(tarball).digest("hex");
+    const sums = Buffer.from(`${hash} *dist/${tarName}\n`, "utf8");
+    assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sums));
+  });
+
+  test("published SHA256SUMS shape (all five targets, dist/ prefix + Windows *)", () => {
+    const tarName = "travsr-v0.11.0-x86_64-unknown-linux-gnu.tar.gz";
+    const tarball = Buffer.from("linux tarball");
+    const hash = crypto.createHash("sha256").update(tarball).digest("hex");
+    const sums = Buffer.from(
+      `0fbdf07864bd8e9768459a3f013b40445ae82cb0eebac04c7df494cba26f03b5  dist/travsr-v0.11.0-aarch64-apple-darwin.tar.gz\n` +
+      `${hash}  dist/${tarName}\n` +
+      `c6257a587122f3b5773f0d5ee901c11394df214cc8fcb92a7c569dc63e6d4da0 *dist/travsr-v0.11.0-x86_64-pc-windows-msvc.tar.gz\n`,
+      "utf8"
+    );
+    assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sums));
+  });
+
+  // release.yml's build matrix (.github/workflows/release.yml:152-173) publishes
+  // exactly these five artifact triples. Each must resolve against a SHA256SUMS
+  // built the way the real workflow builds it: `sha256sum dist/<tarball>` run
+  // from the repo root, combined with `cat dist/*.sha256 > SHA256SUMS`. Windows
+  // additionally gets the `*` binary-mode marker.
+  const releaseTriples = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+  ];
+
+  for (const triple of releaseTriples) {
+    test(`resolves the real release entry for ${triple}`, () => {
+      const tarName = `travsr-v0.11.0-${triple}.tar.gz`;
+      const tarball = Buffer.from(`tarball for ${triple}`);
+      const hash = crypto.createHash("sha256").update(tarball).digest("hex");
+      const marker = triple === "x86_64-pc-windows-msvc" ? "*" : "";
+      // Two spaces before a bare filename, one space + `*` before a binary-mode
+      // filename: this is coreutils sha256sum's own output format, not a
+      // convention this test invented.
+      const separator = marker ? " " : "  ";
+      const sums = Buffer.from(`${hash}${separator}${marker}dist/${tarName}\n`, "utf8");
+      assert.doesNotThrow(() => verifyChecksum(tarball, tarName, sums));
+    });
+  }
 });
 
 // ── WS1: checkOnPath — Windows .cmd discrimination ────────────────────────
