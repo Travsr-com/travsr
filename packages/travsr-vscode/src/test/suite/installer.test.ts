@@ -37,8 +37,14 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
     assert.strictEqual(resolveTargetTriple("win32", "x64"), "x86_64-pc-windows-msvc");
   });
 
-  test("win32/arm64 → aarch64-pc-windows-msvc", () => {
-    assert.strictEqual(resolveTargetTriple("win32", "arm64"), "aarch64-pc-windows-msvc");
+  // release.yml never builds/publishes an aarch64-pc-windows-msvc artifact
+  // (only x86_64-pc-windows-msvc), so this must throw rather than resolve to
+  // a triple that would 404 on download.
+  test("win32/arm64 throws (no such release artifact is published)", () => {
+    assert.throws(
+      () => resolveTargetTriple("win32", "arm64"),
+      (e: Error) => e.message.includes("win32") && e.message.includes("arm64")
+    );
   });
 
   test("unknown platform throws with platform and arch in message", () => {

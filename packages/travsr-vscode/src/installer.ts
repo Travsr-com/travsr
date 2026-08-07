@@ -16,10 +16,14 @@ import * as path from "path";
 
 export const DOWNLOAD_VERSION = "0.10.0";
 
+// release.yml's build matrix (.github/workflows/release.yml:152-173) does not
+// publish an aarch64-pc-windows-msvc artifact, so win32/arm64 is intentionally
+// absent here — resolveTargetTriple throws a clear "unsupported" error for it
+// instead of constructing a download URL for a tarball that doesn't exist.
 const TARGET_MAP: Partial<Record<string, Partial<Record<string, string>>>> = {
   linux:  { x64: "x86_64-unknown-linux-gnu",  arm64: "aarch64-unknown-linux-gnu" },
   darwin: { x64: "x86_64-apple-darwin",        arm64: "aarch64-apple-darwin" },
-  win32:  { x64: "x86_64-pc-windows-msvc", arm64: "aarch64-pc-windows-msvc" },
+  win32:  { x64: "x86_64-pc-windows-msvc" },
 };
 
 export function resolveTargetTriple(
