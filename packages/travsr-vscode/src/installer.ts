@@ -82,6 +82,15 @@ async function fetchBuffer(url: string, maxRedirects = 5): Promise<Buffer> {
   });
 }
 
+/**
+ * Strips the sha256sum binary-mode marker (`*`) and any directory prefix
+ * (published SHA256SUMS lists files as `dist/travsr-...tar.gz`) so entries
+ * can be compared against a bare tarball name.
+ */
+function basename(field: string): string {
+  return field.replace(/^\*/, "").split("/").pop() ?? field;
+}
+
 export function verifyChecksum(
   tarball: Buffer,
   tarName: string,
@@ -93,7 +102,7 @@ export function verifyChecksum(
     .map((l) => l.trim())
     .find((l) => {
       const parts = l.split(/\s+/);
-      return parts.length >= 2 && parts[parts.length - 1] === tarName;
+      return parts.length >= 2 && basename(parts[parts.length - 1]) === tarName;
     });
   if (!entry) throw new Error(`SHA256SUMS entry not found for ${tarName}`);
   const expectedHash = entry.split(/\s+/)[0];
