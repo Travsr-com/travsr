@@ -22,6 +22,13 @@ pub struct PhaseBOutcome {
     /// `travsr lang add <lang>`.
     pub skipped_no_analyzer: Vec<String>,
     pub skipped_unregistered: Vec<String>,
+    /// Languages that require a `compile_commands.json` at the repo root
+    /// (scip-clang, for `c`/`cpp`) but don't have one. Without this gate the
+    /// scip-clang invoke hangs with no compilation database until the 300s
+    /// invoke timeout, then reports as `crashed`. User-actionable: generate a
+    /// compile_commands.json (e.g. via `bear` or CMake's
+    /// `CMAKE_EXPORT_COMPILE_COMMANDS`).
+    pub skipped_no_compdb: Vec<String>,
     /// Languages registered as RequiresElevated but lacking a PSE approval
     /// entry in lang.toml. User-actionable: `travsr lang approve <lang>`.
     pub skipped_needs_approval: Vec<String>,
@@ -201,6 +208,11 @@ impl PluginIndexer {
     /// repo pays `max(t_lang)` not `Σ t_lang`. Threads never touch the store;
     /// results are merged here and returned as a single batch for the caller's
     /// `unify_all` → `write_scip_attributed_batch` path (Option A, #322 P7).
+    // E3 W3b added a 6th return element (positional refs), crossing clippy's
+    // tuple-complexity threshold; the tuple shape is intentional and consumed by
+    // exactly the daemon/CLI Phase B drivers, so a named struct would only add
+    // indirection.
+    #[allow(clippy::type_complexity)]
     pub fn invoke_phase_b_all(
         &self,
         inputs: &PhaseBInputs<'_>,
@@ -209,6 +221,7 @@ impl PluginIndexer {
         Vec<travsr_core::Edge>,
         Vec<travsr_core::ScipRef>,
         Vec<travsr_core::UnresolvedCall>,
+        Vec<travsr_core::LsifPositionalRef>,
         PhaseBOutcome,
     ) {
         let repo_root = inputs.repo_root;
@@ -376,6 +389,23 @@ impl PluginIndexer {
                 continue;
             }
 
+            // L5a: scip-clang (c/cpp) requires a compile_commands.json at the repo
+            // root (`--compdb-path` in its catalog args). Without one it hangs
+            // with no compilation database until the invoke timeout fires and the
+            // whole batch reports `crashed`, blocking phase_b_commit forever.
+            // Detect the dependency from the catalog entry rather than hardcoding
+            // language names, so any future scip-clang-based language is covered.
+            let needs_compdb = crate::phase_b::catalog::lookup(lang.as_str())
+                .is_some_and(|entry| entry.command == "scip-clang");
+            if needs_compdb && !inputs.repo_root.join("compile_commands.json").exists() {
+                tracing::debug!(
+                    lang = %lang,
+                    "Phase B skipped — scip-clang requires compile_commands.json"
+                );
+                outcome.skipped_no_compdb.push(lang.clone());
+                continue;
+            }
+
             match resolver.resolve(&lang) {
                 Some(spec) => {
                     tracing::debug!(lang = %lang, program = %spec.program, "Phase B: resolved spec");
@@ -400,6 +430,9 @@ impl PluginIndexer {
             edges: Vec<travsr_core::Edge>,
             refs: Vec<travsr_core::ScipRef>,
             unresolved_calls: Vec<travsr_core::UnresolvedCall>,
+            /// E3 W3b: rust-analyzer LSIF references whose callee is identified by
+            /// definition location, resolved against the store in the daemon.
+            positional_refs: Vec<travsr_core::LsifPositionalRef>,
             ran: bool,
             skipped_no_analyzer: bool,
             crashed: bool,
@@ -435,6 +468,7 @@ impl PluginIndexer {
                                             edges,
                                             refs,
                                             unresolved_calls: Vec::new(),
+                                            positional_refs: Vec::new(),
                                             ran: true,
                                             skipped_no_analyzer: false,
                                             crashed: false,
@@ -451,6 +485,7 @@ impl PluginIndexer {
                                             edges: Vec::new(),
                                             refs: Vec::new(),
                                             unresolved_calls: Vec::new(),
+                                            positional_refs: Vec::new(),
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
@@ -491,20 +526,28 @@ impl PluginIndexer {
                                     allow_unsandboxed: travsr_indexer::sandbox::allow_unsandboxed_opt_in(),
                                     ..Default::default()
                                 };
+                                // E3 (W3b) — positional, fail-closed rust-analyzer
+                                // LSIF ingestion. Each reference carries its
+                                // callee's DEFINITION location; the daemon resolves
+                                // it to a real Phase A node against the full store
+                                // (works cross-file and incrementally — Invariant #2)
+                                // and drops anything that does not resolve. Replaces
+                                // the moniker-synth `ingest_rust` path whose callee
+                                // VName (at `path = project_root`) matched no Phase A
+                                // node — 100% dangling (18,530 dead edges here).
+                                let mut positional_refs: Vec<travsr_core::LsifPositionalRef> =
+                                    Vec::new();
                                 match travsr_indexer::run_ra_lsif(repo_root, &cfg) {
                                     Ok(Some(dump)) => {
-                                        match travsr_indexer::ingest_rust(&dump, corpus) {
-                                            Ok(lsif_out) => {
-                                                tracing::debug!(
-                                                    nodes = lsif_out.nodes.len(),
-                                                    edges = lsif_out.edges.len(),
-                                                    "Phase B: rust lsif enrichment merged"
-                                                );
-                                                nodes.extend(lsif_out.nodes);
-                                                edges.extend(lsif_out.edges);
-                                            }
-                                            Err(e) => tracing::warn!("rust lsif ingest: {e}"),
-                                        }
+                                        let prefs = travsr_indexer::ingest_rust_positional(
+                                            &dump,
+                                            &repo_root.to_string_lossy(),
+                                        );
+                                        tracing::debug!(
+                                            positional_refs = prefs.len(),
+                                            "Phase B: rust-analyzer LSIF positional refs parsed"
+                                        );
+                                        positional_refs = prefs;
                                     }
                                     Ok(None) => {
                                         tracing::debug!(
@@ -544,6 +587,7 @@ impl PluginIndexer {
                                     // ids don't reconcile to tree-sitter nodes).
                                     refs,
                                     unresolved_calls,
+                                    positional_refs,
                                     ran: true,
                                     skipped_no_analyzer: false,
                                     crashed: false,
@@ -557,7 +601,7 @@ impl PluginIndexer {
                                             .map(|r| (repo_root.join(r), r.clone()))
                                             .collect()
                                     });
-                                let (mut nodes, mut edges) =
+                                let (mut nodes, mut edges, mut unresolved_calls) =
                                     travsr_indexer::phase_b_native_typescript(
                                         corpus,
                                         repo_root,
@@ -565,11 +609,12 @@ impl PluginIndexer {
                                     )
                                     .unwrap_or_else(|e| {
                                         tracing::warn!("ts native phase_b: {e}");
-                                        (vec![], vec![])
+                                        (vec![], vec![], vec![])
                                     });
                                 tracing::debug!(
                                     nodes = nodes.len(),
                                     edges = edges.len(),
+                                    unresolved_calls = unresolved_calls.len(),
                                     "Phase B: native typescript complete"
                                 );
                                 // LSIF enrichment via travsr-lsif-ts when tsconfig.json exists.
@@ -604,12 +649,27 @@ impl PluginIndexer {
                                 edges.sort_unstable_by_key(|e| (e.src, e.dst));
                                 edges
                                     .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                // E4: keep caller_line in the dedup key so every
+                                // distinct call site survives (#299 find_references).
+                                unresolved_calls.sort_unstable_by(|a, b| {
+                                    a.src
+                                        .0
+                                        .cmp(&b.src.0)
+                                        .then(a.callee_sig.cmp(&b.callee_sig))
+                                        .then(a.caller_line.cmp(&b.caller_line))
+                                });
+                                unresolved_calls.dedup_by(|a, b| {
+                                    a.src == b.src
+                                        && a.callee_sig == b.callee_sig
+                                        && a.caller_line == b.caller_line
+                                });
                                 LangResult {
                                     lang,
                                     nodes,
                                     edges,
                                     refs,
-                                    unresolved_calls: Vec::new(),
+                                    unresolved_calls,
+                                    positional_refs: Vec::new(),
                                     ran: true,
                                     skipped_no_analyzer: false,
                                     crashed: false,
@@ -623,7 +683,7 @@ impl PluginIndexer {
                                             .map(|r| (repo_root.join(r), r.clone()))
                                             .collect()
                                     });
-                                let (mut nodes, mut edges) =
+                                let (mut nodes, mut edges, mut unresolved_calls) =
                                     travsr_indexer::phase_b_native_python(
                                         corpus,
                                         repo_root,
@@ -631,11 +691,12 @@ impl PluginIndexer {
                                     )
                                     .unwrap_or_else(|e| {
                                         tracing::warn!("python native phase_b: {e}");
-                                        (vec![], vec![])
+                                        (vec![], vec![], vec![])
                                     });
                                 tracing::debug!(
                                     nodes = nodes.len(),
                                     edges = edges.len(),
+                                    unresolved_calls = unresolved_calls.len(),
                                     "Phase B: native python complete"
                                 );
                                 // LSIF enrichment via travsr-lsif-py (bundled, PATH-independent).
@@ -667,12 +728,27 @@ impl PluginIndexer {
                                 edges.sort_unstable_by_key(|e| (e.src, e.dst));
                                 edges
                                     .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
+                                // E4: keep caller_line in the dedup key so every
+                                // distinct call site survives (#299 find_references).
+                                unresolved_calls.sort_unstable_by(|a, b| {
+                                    a.src
+                                        .0
+                                        .cmp(&b.src.0)
+                                        .then(a.callee_sig.cmp(&b.callee_sig))
+                                        .then(a.caller_line.cmp(&b.caller_line))
+                                });
+                                unresolved_calls.dedup_by(|a, b| {
+                                    a.src == b.src
+                                        && a.callee_sig == b.callee_sig
+                                        && a.caller_line == b.caller_line
+                                });
                                 LangResult {
                                     lang,
                                     nodes,
                                     edges,
                                     refs,
-                                    unresolved_calls: Vec::new(),
+                                    unresolved_calls,
+                                    positional_refs: Vec::new(),
                                     ran: true,
                                     skipped_no_analyzer: false,
                                     crashed: false,
@@ -714,6 +790,7 @@ impl PluginIndexer {
                                                     edges: resp.edges,
                                                     refs: resp.refs,
                                                     unresolved_calls: resp.unresolved_calls,
+                                                    positional_refs: Vec::new(),
                                                     ran: true,
                                                     skipped_no_analyzer: false,
                                                     crashed: false,
@@ -731,6 +808,7 @@ impl PluginIndexer {
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
                                                     unresolved_calls: Vec::new(),
+                                                    positional_refs: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: true,
                                                     crashed: false,
@@ -756,6 +834,7 @@ impl PluginIndexer {
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
                                                     unresolved_calls: Vec::new(),
+                                                    positional_refs: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: false,
                                                     crashed: false,
@@ -770,6 +849,7 @@ impl PluginIndexer {
                                                     edges: Vec::new(),
                                                     refs: Vec::new(),
                                                     unresolved_calls: Vec::new(),
+                                                    positional_refs: Vec::new(),
                                                     ran: false,
                                                     skipped_no_analyzer: false,
                                                     crashed: true,
@@ -788,6 +868,7 @@ impl PluginIndexer {
                                             edges: Vec::new(),
                                             refs: Vec::new(),
                                             unresolved_calls: Vec::new(),
+                                            positional_refs: Vec::new(),
                                             ran: false,
                                             skipped_no_analyzer: false,
                                             crashed: true,
@@ -811,6 +892,7 @@ impl PluginIndexer {
                         edges: Vec::new(),
                         refs: Vec::new(),
                         unresolved_calls: Vec::new(),
+                        positional_refs: Vec::new(),
                         ran: false,
                         skipped_no_analyzer: false,
                         crashed: true,
@@ -829,6 +911,7 @@ impl PluginIndexer {
         let mut all_edges: Vec<travsr_core::Edge> = Vec::new();
         let mut all_refs: Vec<travsr_core::ScipRef> = Vec::new();
         let mut all_unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
+        let mut all_positional_refs: Vec<travsr_core::LsifPositionalRef> = Vec::new();
 
         for r in lang_results {
             if r.ran {
@@ -844,6 +927,7 @@ impl PluginIndexer {
             all_edges.extend(r.edges);
             all_refs.extend(r.refs);
             all_unresolved.extend(r.unresolved_calls);
+            all_positional_refs.extend(r.positional_refs);
         }
 
         // Secondary sort within each language's contribution for full determinism.
@@ -877,7 +961,23 @@ impl PluginIndexer {
             a.src == b.src && a.callee_sig == b.callee_sig && a.caller_line == b.caller_line
         });
 
-        (all_nodes, all_edges, all_refs, all_unresolved, outcome)
+        // E3 W3b: deterministic order for the positional rust-analyzer refs.
+        all_positional_refs.sort_by(|a, b| {
+            a.callee_def_path
+                .cmp(&b.callee_def_path)
+                .then(a.callee_def_line.cmp(&b.callee_def_line))
+                .then(a.caller_path.cmp(&b.caller_path))
+                .then(a.caller_line.cmp(&b.caller_line))
+        });
+
+        (
+            all_nodes,
+            all_edges,
+            all_refs,
+            all_unresolved,
+            all_positional_refs,
+            outcome,
+        )
     }
 
     /// Resolve cross-language FFI edges from accumulated markers.
@@ -979,7 +1079,12 @@ mod tests {
             present_languages: ["__no_such_lang__".to_string()].into_iter().collect(),
             indexable_paths: &[],
         };
-        let (nodes, edges, refs, unresolved, outcome) = indexer.invoke_phase_b_all(&inputs);
+        let (nodes, edges, refs, unresolved, positional, outcome) =
+            indexer.invoke_phase_b_all(&inputs);
+        assert!(
+            positional.is_empty(),
+            "expected no positional refs when all langs absent"
+        );
         assert!(nodes.is_empty(), "expected no nodes when all langs absent");
         assert!(edges.is_empty(), "expected no edges when all langs absent");
         assert!(refs.is_empty(), "expected no refs when all langs absent");
@@ -1084,8 +1189,8 @@ mod tests {
             present_languages: HashSet::new(), // no gating
             indexable_paths: &[],
         };
-        let (_, _, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
-        let (_, _, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);
+        let (_, _, _, _, _, outcome1) = indexer.invoke_phase_b_all(&inputs);
+        let (_, _, _, _, _, outcome2) = indexer.invoke_phase_b_all(&inputs);
         assert_eq!(
             outcome1.skipped_not_in_repo, outcome2.skipped_not_in_repo,
             "skipped_not_in_repo must be deterministic across runs"

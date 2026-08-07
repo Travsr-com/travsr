@@ -24,12 +24,27 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     capture_kinds: &[
         ("class.name", "class", "class"),
         ("interface.name", "interface", "interface"),
-        ("struct.name", "class", "class"),
+        // N4d: C# structs are a distinct kind, not folded into `class`. The
+        // `struct:` signature unifies onto the SCIP struct def (scip-dotnet
+        // emits a `#` type descriptor → `candidate_signatures` class-group,
+        // which already contains `struct:`).
+        ("struct.name", "struct", "struct"),
         ("enum.name", "enum", "enum"),
         ("delegate.name", "delegate", "type"),
         ("fn.name", "function", "fn"),
         ("import", "import", "import"),
     ],
+    method_containers: &[
+        ("class_declaration", "class"),
+        // N4d: struct methods parent to the `struct:` node, matching the split
+        // above (was `class`, which would dangle now that the node is `struct:`).
+        ("struct_declaration", "struct"),
+        ("record_declaration", "class"),
+        ("interface_declaration", "interface"),
+        ("enum_declaration", "enum"),
+    ],
+    decl_kinds: &[],
+    type_refinements: &[],
     get_grammar: || tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
 };
 
@@ -65,7 +80,49 @@ mod tests {
         let kinds: Vec<&str> = out.nodes.iter().map(|n| n.kind.as_str()).collect();
         assert!(kinds.contains(&"class"));
         assert!(kinds.contains(&"interface"));
-        assert!(kinds.contains(&"function"));
         assert!(kinds.contains(&"import"));
+        // N1: `void Bar()` inside `class Foo` is a method, qualified by its type.
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| n.kind == "method" && n.vname.signature == "method:Foo.Bar"),
+            "expected method:Foo.Bar; got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn n4d_struct_distinct_kind_and_method_containment() {
+        // N4d: a C# struct is kind `struct` with sig `struct:Point`, and its
+        // method parents to the struct node (not a dangling `class:Point`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.cs");
+        std::fs::write(
+            &path,
+            "struct Point { public int X; public int Norm() { return 0; } }\n",
+        )
+        .unwrap();
+        let out = parse("corp", &path, "p.cs").unwrap();
+
+        let struct_node = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "struct:Point")
+            .expect("struct:Point node");
+        assert_eq!(struct_node.kind, "struct");
+        let method = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:Point.Norm")
+            .expect("method:Point.Norm node");
+        let contained = out.edges.iter().any(|e| {
+            e.kind == travsr_core::EdgeKind::DefinesBinding
+                && e.src == struct_node.id
+                && e.dst == method.id
+        });
+        assert!(contained, "struct:Point must contain method:Point.Norm");
     }
 }

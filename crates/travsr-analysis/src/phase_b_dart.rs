@@ -287,7 +287,12 @@ fn parse_emitter_output(
                 continue;
             }
             if let Some(&dst_id) = def_ids.get(sym) {
-                edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+                // E5: prefer an attributed occurrence record — the daemon's
+                // write_scip_attributed_batch resolves its `src` to the
+                // enclosing function and populates edge_sites. Emit a
+                // file-granular RefCall edge ONLY as a fallback when the emitter
+                // gave no line (otherwise every call also got a spurious
+                // file->callee edge alongside the attributed one).
                 // Emitter lines are 1-based (definitions store them as-is).
                 if let Some(line) = r["line"].as_u64() {
                     refs_out.push(ScipRef {
@@ -295,6 +300,8 @@ fn parse_emitter_output(
                         caller_line: line as u32,
                         callee_id: dst_id,
                     });
+                } else {
+                    edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
                 }
             }
         }
@@ -336,6 +343,7 @@ mod tests {
               "definitions": [],
               "references": [
                 {"symbol": "pkg:app/animal.dart::Animal.describe", "line": 16},
+                {"symbol": "pkg:app/animal.dart::Animal.describe"},
                 {"symbol": "pkg:ghost/x.dart::Ghost.method", "line": 99}
               ]
             }
@@ -361,16 +369,22 @@ mod tests {
         .id();
         assert_eq!(nodes[0].id, def_id);
 
-        // The resolved reference becomes exactly one occurrence record; the
-        // reference to the undefined `Ghost.method` symbol is dropped.
+        // E5: the line-bearing reference becomes exactly one occurrence record
+        // (attributed downstream to the enclosing function) with NO redundant
+        // file-granular edge; the undefined `Ghost.method` reference is dropped.
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].caller_path, "main.dart");
         assert_eq!(refs[0].caller_line, 16);
         assert_eq!(refs[0].callee_id, def_id);
 
-        // And a RefCall edge from the referencing file node to the definition.
+        // E5: only the line-less reference falls back to a file-granular RefCall
+        // edge (it cannot be attributed); the line-16 ref does NOT.
         let main_file_id = VName::new("c", "", "main.dart", "dart", "file").id();
-        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges.len(),
+            1,
+            "only the line-less ref emits a fallback edge"
+        );
         assert_eq!(edges[0].src, main_file_id);
         assert_eq!(edges[0].dst, def_id);
         assert_eq!(edges[0].kind, EdgeKind::RefCall);

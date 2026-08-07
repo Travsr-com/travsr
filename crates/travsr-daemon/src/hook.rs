@@ -173,6 +173,34 @@ pub fn changed_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
         .collect())
 }
 
+/// Every file git tracks in `repo_root`, as absolute paths.
+///
+/// Used as the ReindexCommit fallback (#405): when [`changed_files_from_git`]
+/// cannot resolve the commit's diff, reindexing the full tracked set keeps the
+/// graph correct. `reindex_files` is hash-delta gated, so on an already-fresh
+/// graph this pass only re-hashes files and writes nothing. Errors when git
+/// itself cannot be spawned, so the caller can refuse to stamp freshness.
+pub fn tracked_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(repo_root)
+        .output()
+        .context("running git ls-files in reindex fallback")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-files exited with status {}",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|l| !l.is_empty())
+        .map(|p| repo_root.join(p))
+        .collect())
+}
+
 /// Attempt to fire-and-forget a reindex request to the running daemon.
 ///
 /// Returns `true` if the daemon received the message; `false` if no daemon is

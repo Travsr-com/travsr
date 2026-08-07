@@ -732,6 +732,184 @@ pub fn ingest_rust_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
     Ok(ingest_rust_edges_from_dump(dump, corpus))
 }
 
+/// Positional, fail-closed ingestion of a rust-analyzer LSIF dump (E3 W3b).
+///
+/// Replaces [`ingest_rust`]'s moniker-synth path (whose callee VName, built at
+/// `path = project_root`, matched no Phase A node → 100% dangling). Emits one
+/// [`LsifPositionalRef`] per (call site, callee-definition) pair, with 1-based
+/// lines and repo-relative paths. The callee is left identified by its
+/// **definition location** for the store to resolve positionally against Phase A
+/// node spans, failing closed when it resolves to no node.
+///
+/// **Linkage.** Each occurrence is a `range` whose `next` edge points at its
+/// `resultSet`; that resultSet's `textDocument/definition` edge points at a
+/// `definitionResult` whose `item` edges list the definition range(s):
+///
+/// ```text
+/// range --next--> resultSet --textDocument/definition--> definitionResult
+/// definitionResult --item{document}--> [definition range, ...]
+/// document --contains--> [range, ...]
+/// ```
+///
+/// This is the same authoritative structure `bench/lsif_oracle.py` resolves
+/// against; the definition *position* — not the moniker — is the answer. An
+/// earlier version grouped `item property:{definitions,references}` under a
+/// shared vertex, which cross-linked distinct symbols (e.g. an `Iterator::filter`
+/// call misattributed to a same-file `Session::filter`); the per-occurrence
+/// `next → resultSet → definitionResult` walk is required to keep them apart.
+///
+/// The definition occurrence itself carries a `next` edge too; it is skipped so
+/// a definition never emits a self-reference edge. References whose definition is
+/// outside the project (`std`, crates) still resolve to their out-of-tree def
+/// path and are dropped later by the store's positional resolver (no matching
+/// node) — fail closed by construction.
+///
+/// O(N) over dump lines plus O(occurrences × defs-per-symbol) for the emit pass.
+///
+/// `repo_root` is the daemon's own repo root (the same base `Node::vname.path`
+/// is made relative to), NOT rust-analyzer's self-reported LSIF `projectRoot`.
+/// For a Cargo workspace member, rust-analyzer's `projectRoot` can diverge from
+/// the repo root (e.g. a member sub-root); using it here would make
+/// `caller_path`/`callee_def_path` relative to the wrong base, so they would
+/// never match a real `Node::vname.path` — silently failing every positional
+/// ref closed (#I4) instead of resolving. Always relativize against the
+/// caller-supplied `repo_root` so both sides of every downstream comparison
+/// (`resolve_lsif_positional_refs`, E7's `lsif_covered`) agree.
+pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::LsifPositionalRef> {
+    let mut doc_paths: HashMap<u64, String> = HashMap::new();
+    let mut range_lines: HashMap<u64, u32> = HashMap::new();
+    // range id → resultSet id (the `next` edge).
+    let mut next_edge: HashMap<u64, u64> = HashMap::new();
+    // range id → document id (from `contains`).
+    let mut range_doc: HashMap<u64, u64> = HashMap::new();
+    // resultSet id → definitionResult id (`textDocument/definition`).
+    let mut result_def: HashMap<u64, u64> = HashMap::new();
+    // vertex id (definitionResult) → its (doc_id, range_id) item targets.
+    let mut items: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+
+    for line in dump.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("vertex") => match v.get("label").and_then(|l| l.as_str()) {
+                Some("document") => {
+                    if let (Some(id), Some(uri)) = (
+                        v.get("id").and_then(|i| i.as_u64()),
+                        v.get("uri").and_then(|u| u.as_str()),
+                    ) {
+                        let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+                        doc_paths.insert(id, path);
+                    }
+                }
+                Some("range") => {
+                    if let (Some(id), Some(l)) = (
+                        v.get("id").and_then(|i| i.as_u64()),
+                        v.get("start")
+                            .and_then(|s| s.get("line"))
+                            .and_then(|l| l.as_u64()),
+                    ) {
+                        range_lines.insert(id, l as u32);
+                    }
+                }
+                _ => {}
+            },
+            Some("edge") => match v.get("label").and_then(|l| l.as_str()) {
+                Some("contains") => {
+                    if let (Some(doc), Some(in_vs)) = (
+                        v.get("outV").and_then(|i| i.as_u64()),
+                        v.get("inVs").and_then(|a| a.as_array()),
+                    ) {
+                        for r in in_vs {
+                            if let Some(rid) = r.as_u64() {
+                                range_doc.insert(rid, doc);
+                            }
+                        }
+                    }
+                }
+                Some("next") => {
+                    if let (Some(out_v), Some(in_v)) = (
+                        v.get("outV").and_then(|i| i.as_u64()),
+                        v.get("inV").and_then(|i| i.as_u64()),
+                    ) {
+                        next_edge.insert(out_v, in_v);
+                    }
+                }
+                Some("textDocument/definition") => {
+                    if let (Some(out_v), Some(in_v)) = (
+                        v.get("outV").and_then(|i| i.as_u64()),
+                        v.get("inV").and_then(|i| i.as_u64()),
+                    ) {
+                        result_def.insert(out_v, in_v);
+                    }
+                }
+                Some("item") => {
+                    if let (Some(out_v), Some(doc), Some(in_vs)) = (
+                        v.get("outV").and_then(|i| i.as_u64()),
+                        v.get("document").and_then(|i| i.as_u64()),
+                        v.get("inVs").and_then(|a| a.as_array()),
+                    ) {
+                        let entry = items.entry(out_v).or_default();
+                        for r in in_vs {
+                            if let Some(rid) = r.as_u64() {
+                                entry.push((doc, rid));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    // Every range that is some symbol's definition target — skipped as an
+    // occurrence so a definition site never emits a self-reference edge.
+    let def_range_ids: std::collections::HashSet<u64> = result_def
+        .values()
+        .filter_map(|defres| items.get(defres))
+        .flat_map(|targets| targets.iter().map(|(_, rid)| *rid))
+        .collect();
+
+    let mut out = Vec::new();
+    for (&range_id, &caller_line0) in &range_lines {
+        if def_range_ids.contains(&range_id) {
+            continue;
+        }
+        let (Some(&doc), Some(&rs)) = (range_doc.get(&range_id), next_edge.get(&range_id)) else {
+            continue;
+        };
+        let Some(caller_abs) = doc_paths.get(&doc) else {
+            continue;
+        };
+        let Some(defres) = result_def.get(&rs) else {
+            continue; // occurrence with no definition (e.g. a keyword range)
+        };
+        let Some(targets) = items.get(defres) else {
+            continue;
+        };
+        let caller_path = make_relative(repo_root, caller_abs);
+        for (tdoc, trid) in targets {
+            let (Some(def_abs), Some(&def_line0)) = (doc_paths.get(tdoc), range_lines.get(trid))
+            else {
+                continue;
+            };
+            out.push(travsr_core::LsifPositionalRef {
+                caller_path: caller_path.clone(),
+                caller_line: caller_line0 + 1,
+                callee_def_path: make_relative(repo_root, def_abs),
+                callee_def_line: def_line0 + 1,
+            });
+        }
+    }
+    out
+}
+
 // ── Rust LSIF unit tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -785,6 +963,109 @@ mod rust_lsif_tests {
         let out = ingest_rust(rust_dump_one_ref(), "corp").unwrap();
         assert_eq!(out.nodes.len(), 0, "Rust LSIF must not emit nodes");
         assert_eq!(out.edges.len(), 1);
+    }
+
+    #[test]
+    fn ingest_rust_positional_discriminates_same_leaf_by_definition() {
+        // Real rust-analyzer LSIF shape (range --next--> resultSet
+        // --textDocument/definition--> definitionResult --item--> def range):
+        // two `filter` methods (Session::filter def types.rs:2, Bag::filter def
+        // types.rs:6) each called on the SAME source line main.rs:6 — the
+        // positional discrimination leaf-guessing cannot make. Plus an external
+        // call (println at main.rs:9) whose definition lives outside the project;
+        // it resolves to its out-of-tree def path here and is dropped later by
+        // the store's positional resolver (no matching node). Definition ranges
+        // (10, 11) must not emit self-reference edges.
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo","positionEncoding":"utf-16","toolInfo":{"name":"rust-analyzer","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///repo/src/types.rs"}
+{"id":3,"type":"vertex","label":"document","uri":"file:///repo/src/main.rs"}
+{"id":99,"type":"vertex","label":"document","uri":"file:///ext/std.rs"}
+{"id":10,"type":"vertex","label":"range","start":{"line":2,"character":11},"end":{"line":2,"character":17}}
+{"id":11,"type":"vertex","label":"range","start":{"line":6,"character":11},"end":{"line":6,"character":17}}
+{"id":20,"type":"vertex","label":"range","start":{"line":6,"character":6},"end":{"line":6,"character":12}}
+{"id":21,"type":"vertex","label":"range","start":{"line":6,"character":16},"end":{"line":6,"character":22}}
+{"id":30,"type":"vertex","label":"range","start":{"line":9,"character":4},"end":{"line":9,"character":11}}
+{"id":70,"type":"vertex","label":"range","start":{"line":100,"character":0},"end":{"line":100,"character":7}}
+{"id":50,"type":"vertex","label":"resultSet"}
+{"id":51,"type":"vertex","label":"resultSet"}
+{"id":52,"type":"vertex","label":"resultSet"}
+{"id":60,"type":"vertex","label":"definitionResult"}
+{"id":61,"type":"vertex","label":"definitionResult"}
+{"id":62,"type":"vertex","label":"definitionResult"}
+{"id":200,"type":"edge","label":"contains","outV":2,"inVs":[10,11]}
+{"id":201,"type":"edge","label":"contains","outV":3,"inVs":[20,21,30]}
+{"id":202,"type":"edge","label":"contains","outV":99,"inVs":[70]}
+{"id":210,"type":"edge","label":"next","outV":10,"inV":50}
+{"id":211,"type":"edge","label":"next","outV":20,"inV":50}
+{"id":212,"type":"edge","label":"next","outV":11,"inV":51}
+{"id":213,"type":"edge","label":"next","outV":21,"inV":51}
+{"id":214,"type":"edge","label":"next","outV":30,"inV":52}
+{"id":220,"type":"edge","label":"textDocument/definition","outV":50,"inV":60}
+{"id":221,"type":"edge","label":"textDocument/definition","outV":51,"inV":61}
+{"id":222,"type":"edge","label":"textDocument/definition","outV":52,"inV":62}
+{"id":230,"type":"edge","label":"item","document":2,"property":"definitions","inVs":[10],"outV":60}
+{"id":231,"type":"edge","label":"item","document":2,"property":"definitions","inVs":[11],"outV":61}
+{"id":232,"type":"edge","label":"item","document":99,"property":"definitions","inVs":[70],"outV":62}
+"#;
+        let mut out = ingest_rust_positional(dump, "/repo");
+        out.sort_by(|a, b| {
+            a.callee_def_path
+                .cmp(&b.callee_def_path)
+                .then(a.callee_def_line.cmp(&b.callee_def_line))
+        });
+        assert_eq!(out.len(), 3, "def ranges 10/11 must not self-emit");
+
+        // External println: resolves to its out-of-tree def path (store drops it).
+        assert_eq!(out[0].callee_def_path, "/ext/std.rs");
+        assert_eq!(out[0].callee_def_line, 101);
+        assert_eq!(out[0].caller_path, "src/main.rs");
+        assert_eq!(out[0].caller_line, 10);
+        // Session::filter: def types.rs:2(0-based)→3, ref main.rs:6(0-based)→7.
+        assert_eq!(out[1].callee_def_path, "src/types.rs");
+        assert_eq!(out[1].callee_def_line, 3);
+        assert_eq!(out[1].caller_line, 7);
+        // Bag::filter: def types.rs:6(0-based)→7, ref main.rs:6(0-based)→7.
+        assert_eq!(out[2].callee_def_path, "src/types.rs");
+        assert_eq!(out[2].callee_def_line, 7);
+        assert_eq!(out[2].caller_line, 7);
+    }
+
+    #[test]
+    fn ingest_rust_positional_ignores_dump_project_root_divergence() {
+        // #I4: rust-analyzer's self-reported LSIF `projectRoot` can diverge from
+        // the daemon's actual repo root (e.g. a Cargo workspace member
+        // sub-root). Relativizing against the dump's `projectRoot` here would
+        // produce a `caller_path`/`callee_def_path` that never matches a real
+        // `Node::vname.path` downstream, silently dropping every positional
+        // ref. The dump below self-reports `projectRoot":"file:///repo/crates/foo"`
+        // (a workspace member sub-root), but the caller passes the real repo
+        // root `/repo` — paths must come out relative to `/repo`, not the
+        // dump's claim.
+        let dump = r#"
+{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file:///repo/crates/foo","positionEncoding":"utf-16","toolInfo":{"name":"rust-analyzer","version":"0"}}
+{"id":2,"type":"vertex","label":"document","uri":"file:///repo/crates/foo/src/lib.rs"}
+{"id":3,"type":"vertex","label":"document","uri":"file:///repo/crates/foo/src/helper.rs"}
+{"id":10,"type":"vertex","label":"range","start":{"line":1,"character":0},"end":{"line":1,"character":4}}
+{"id":20,"type":"vertex","label":"range","start":{"line":5,"character":6},"end":{"line":5,"character":12}}
+{"id":50,"type":"vertex","label":"resultSet"}
+{"id":60,"type":"vertex","label":"definitionResult"}
+{"id":200,"type":"edge","label":"contains","outV":3,"inVs":[10]}
+{"id":201,"type":"edge","label":"contains","outV":2,"inVs":[20]}
+{"id":210,"type":"edge","label":"next","outV":20,"inV":50}
+{"id":220,"type":"edge","label":"textDocument/definition","outV":50,"inV":60}
+{"id":230,"type":"edge","label":"item","document":3,"property":"definitions","inVs":[10],"outV":60}
+"#;
+        let out = ingest_rust_positional(dump, "/repo");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].caller_path, "crates/foo/src/lib.rs",
+            "caller_path must be relative to the real repo root, not the dump's projectRoot"
+        );
+        assert_eq!(
+            out[0].callee_def_path, "crates/foo/src/helper.rs",
+            "callee_def_path must be relative to the real repo root, not the dump's projectRoot"
+        );
     }
 
     #[test]

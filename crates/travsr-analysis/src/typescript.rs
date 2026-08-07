@@ -33,8 +33,10 @@ const QUERIES: &str = r"
 (function_declaration name: (identifier) @fn.name)
 (function_signature name: (identifier) @fn.name)
 (method_definition name: (property_identifier) @method.name)
-(lexical_declaration (variable_declarator name: (identifier) @var.name))
-(variable_declaration (variable_declarator name: (identifier) @var.name))
+(program (lexical_declaration (variable_declarator) @topvar))
+(program (export_statement (lexical_declaration (variable_declarator) @topvar)))
+(program (variable_declaration (variable_declarator) @topvar))
+(program (export_statement (variable_declaration (variable_declarator) @topvar)))
 (import_statement source: (string (string_fragment) @import.source))
 ";
 
@@ -166,18 +168,52 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 }
                 "method.name" => {
                     // Edge hierarchy (Tech Lead sign-off): class→method, not file→method.
-                    let class_name = find_parent_class_name(capture.node, source.as_slice())
-                        .unwrap_or_else(|| "<anonymous>".to_string());
-                    let class_id = emit::class_node(corpus, vname_path, &class_name).id;
-                    let node = emit::method_node(corpus, vname_path, &class_name, text)
+                    // Anonymous containers (class expressions, object-literal methods) have
+                    // no named class to bind to — parent the method to the file instead of
+                    // emitting a class:<anonymous> node that nothing else ever creates.
+                    let parent_class = find_parent_class_name(capture.node, source.as_slice());
+                    let (class_name, container_id) = match &parent_class {
+                        Some(name) => {
+                            (name.as_str(), emit::class_node(corpus, vname_path, name).id)
+                        }
+                        None => ("<anonymous>", file_id),
+                    };
+                    let node = emit::method_node(corpus, vname_path, class_name, text)
                         .with_line(line)
                         .with_end_line(decl_end_line(capture.node));
-                    let edge = emit::defines_edge(class_id, node.id);
+                    let edge = emit::defines_edge(container_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
                 }
-                "var.name" => {
-                    let node = emit::var_node(corpus, vname_path, text).with_line(line);
+                "topvar" => {
+                    // N4a: only top-level (program-child) declarators become
+                    // nodes — locals inside function bodies no longer pollute
+                    // the graph. A top-level arrow (`const f = () => {}`) or
+                    // function expression is a function, not a variable.
+                    let Some(name_node) = capture.node.child_by_field_name("name") else {
+                        continue;
+                    };
+                    // Skip destructuring patterns (`const { a, b } = ...`) — not
+                    // a single named symbol.
+                    if name_node.kind() != "identifier" {
+                        continue;
+                    }
+                    let Ok(name) = name_node.utf8_text(source.as_slice()) else {
+                        continue;
+                    };
+                    let name_line = name_node.start_position().row as u32 + 1;
+                    let is_fn = capture
+                        .node
+                        .child_by_field_name("value")
+                        .map(|v| matches!(v.kind(), "arrow_function" | "function_expression"))
+                        .unwrap_or(false);
+                    let node = if is_fn {
+                        emit::fn_node(corpus, vname_path, name)
+                            .with_line(name_line)
+                            .with_end_line(decl_end_line(capture.node))
+                    } else {
+                        emit::var_node(corpus, vname_path, name).with_line(name_line)
+                    };
                     let edge = emit::defines_edge(file_id, node.id);
                     output.nodes.push(node);
                     output.edges.push(edge);
@@ -336,6 +372,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn n4a_top_level_arrow_is_function_locals_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.ts");
+        std::fs::write(
+            &path,
+            "export const handler = () => { const local = 1; return local; };\n\
+             const MAX = 42;\n\
+             function outer() { const inner = 2; return inner; }\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "m.ts").unwrap();
+        let sigs: Vec<(&str, &str)> = out
+            .nodes
+            .iter()
+            .map(|n| (n.kind.as_str(), n.vname.signature.as_str()))
+            .collect();
+        // Top-level arrow → function, not var.
+        assert!(
+            sigs.contains(&("function", "fn:handler")),
+            "top-level arrow must be a function node; got {sigs:?}"
+        );
+        // Top-level non-arrow const → variable.
+        assert!(
+            sigs.contains(&("variable", "var:MAX")),
+            "top-level const literal stays a var node; got {sigs:?}"
+        );
+        // Locals inside function bodies must NOT pollute the graph.
+        assert!(
+            !sigs
+                .iter()
+                .any(|(_, s)| *s == "var:local" || *s == "var:inner"),
+            "locals must be dropped; got {sigs:?}"
+        );
+    }
+
     // Error message must include the file path so operators know which file triggered it.
     #[test]
     fn oversized_error_message_contains_file_path() {
@@ -391,6 +463,85 @@ mod tests {
         assert!(
             output.nodes.iter().any(|n| n.kind == "class"),
             "class node must be emitted for AuthService"
+        );
+    }
+
+    // L4: a method on an anonymous class expression has no named parent class —
+    // it must not emit an orphan `class:<anonymous>` node; its containment edge
+    // must parent to the file node instead, like a top-level function.
+    #[test]
+    fn anonymous_class_expr_method_no_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anon_class.ts");
+        std::fs::write(&path, "const x = class { write() {} };").unwrap();
+
+        let out = parse("", &path, "anon_class.ts").unwrap();
+        assert!(
+            !out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "class:<anonymous>"),
+            "must not emit a class:<anonymous> node; got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| n.vname.signature.as_str())
+                .collect::<Vec<_>>()
+        );
+        let file_id = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "file")
+            .expect("file node must exist")
+            .id;
+        let method_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:<anonymous>.write")
+            .expect("method:<anonymous>.write node must exist")
+            .id;
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == file_id && e.dst == method_id),
+            "write method's defines/binding must have src == file node id"
+        );
+    }
+
+    // L4: same defect for object-literal methods — the parent chain is `object`,
+    // never a class, so this must also parent to the file rather than dangle.
+    #[test]
+    fn object_literal_method_no_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anon_obj.ts");
+        std::fs::write(&path, "const x = { dispose() {} };").unwrap();
+
+        let out = parse("", &path, "anon_obj.ts").unwrap();
+        assert!(
+            !out.nodes
+                .iter()
+                .any(|n| n.vname.signature == "class:<anonymous>"),
+            "must not emit a class:<anonymous> node; got {:?}",
+            out.nodes
+                .iter()
+                .map(|n| n.vname.signature.as_str())
+                .collect::<Vec<_>>()
+        );
+        let file_id = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "file")
+            .expect("file node must exist")
+            .id;
+        let method_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "method:<anonymous>.dispose")
+            .expect("method:<anonymous>.dispose node must exist")
+            .id;
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.src == file_id && e.dst == method_id),
+            "dispose method's defines/binding must have src == file node id"
         );
     }
 }

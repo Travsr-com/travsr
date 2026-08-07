@@ -56,8 +56,17 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
         // skip their own directory walks.
         indexable_paths: &files,
     };
-    let (phase_b_nodes, phase_b_edges, _phase_b_refs, _phase_b_unresolved, _phase_b_outcome) =
-        indexer.invoke_phase_b_all(&phase_b_inputs);
+    // E3 W3b note: `_phase_b_positional` (rust-analyzer LSIF positional refs) is
+    // resolved only in the daemon path, which has a persistent store to resolve
+    // callee definition locations against; this offline JSON emitter has none.
+    let (
+        phase_b_nodes,
+        phase_b_edges,
+        _phase_b_refs,
+        _phase_b_unresolved,
+        _phase_b_positional,
+        _phase_b_outcome,
+    ) = indexer.invoke_phase_b_all(&phase_b_inputs);
     for node in phase_b_nodes {
         all_nodes.insert(node.id, node);
     }

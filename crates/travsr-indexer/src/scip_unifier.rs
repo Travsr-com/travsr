@@ -34,6 +34,23 @@ pub struct ScipName<'a> {
 /// can feed every Phase B node through without pre-filtering by language.
 pub fn scip_name_kind(symbol: &str) -> Option<ScipName<'_>> {
     let descriptor_chain = symbol.split_whitespace().last()?;
+
+    // Namespace descriptor `Name/`: Obj-C emits protocols this way
+    // (`Speakable/`), and a protocol is a unifiable type (Phase A `protocol:`).
+    // Restrict to a SINGLE-segment name — multi-segment package paths
+    // (`github.com/org/repo/pkg/`, `com/example/`) are Go/Java packages that
+    // Phase A does not model, so they stay unparsed to avoid false unification.
+    if let Some(name) = descriptor_chain.strip_suffix('/') {
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        return Some(ScipName {
+            container: None,
+            name: strip_backticks(name),
+            kind: "class",
+        });
+    }
+
     let leaf = descriptor_chain
         .rsplit('/')
         .next()
@@ -115,8 +132,15 @@ fn strip_backticks(s: &str) -> &str {
 ///              and the only form for Java/Kotlin/Scala/C/C++/C#/Ruby/PHP/
 ///              Swift/Dart, whose parsers emit unqualified method names)
 ///   types:     `class:` `struct:` `interface:` `trait:` `enum:` `type:`
-///              (Kotlin objects, Scala traits, Dart mixins, Swift protocols
-///              all emit sig prefix `class:`, so no extra prefixes needed)
+///              `protocol:` `namespace:` `actor:`
+///              (Kotlin/Scala `object`, Dart `mixin`/`extension`, and Swift
+///              `protocol` all emit sig prefix `class:` — already covered.
+///              Obj-C `protocol` emits `protocol:` and C++ `namespace` emits
+///              `namespace:` [E6]. N4d split Swift's folded types into distinct
+///              prefixes, so `actor:` (a SCIP `#`-type target) is added here;
+///              `extension:` is deliberately omitted — an extension is not a
+///              SCIP definition target and must not steal the extended type's
+///              unification.)
 ///   terms:     `var:` `const:` `static:`
 pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
     let name = parsed.name;
@@ -142,10 +166,24 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
             }
             sigs
         }
-        "class" => ["class", "struct", "interface", "trait", "enum", "type"]
-            .iter()
-            .map(|p| format!("{p}:{name}"))
-            .collect(),
+        "class" => [
+            "class",
+            "struct",
+            "interface",
+            "trait",
+            "enum",
+            "type",
+            // E6: the only type prefixes not folded into `class:` by Phase A —
+            // Obj-C protocols (`protocol:`) and C++ namespaces (`namespace:`).
+            "protocol",
+            "namespace",
+            // N4d: Swift `actor` is now a distinct Phase A prefix and a valid
+            // SCIP `#`-type unification target.
+            "actor",
+        ]
+        .iter()
+        .map(|p| format!("{p}:{name}"))
+        .collect(),
         "variable" => ["var", "const", "static"]
             .iter()
             .map(|p| format!("{p}:{name}"))
@@ -179,11 +217,21 @@ pub fn native_name_kind<'a>(signature: &'a str, node_kind: &str) -> Option<ScipN
         _ => return None,
     };
 
-    // Strip a leading scheme (`swift::`) or single-word kind prefix (`fn:`,
-    // `class:`, `var:`, ...). Only an all-alphabetic prefix is stripped so we
-    // never truncate a qualified name that legitimately contains a colon.
-    let body = if let Some(rest) = signature.strip_prefix("swift::") {
-        rest
+    // Strip the bespoke-sidecar scheme so only the dotted `Container.name`
+    // remains. Two shapes:
+    //   • `<scheme>::<Dotted.Name>` — swift emitter (`swift::Animal.describe`)
+    //     and the Dart index emitter, whose symbols embed the *file path* before
+    //     the `::` separator (`file:///abs/x.dart::Animal.describe`,
+    //     `package:pkg/x.dart::Animal.describe`). The dotted name follows the
+    //     LAST `::`, so `rfind("::")` isolates it and drops the path — without
+    //     which the Dart container resolves to `…/x.dart::Animal` (path junk)
+    //     and the `method:Animal.describe` candidate is never generated.
+    //   • `<prefix>:<Dotted.Name>` — a single-word Phase-A-style kind prefix
+    //     (`fn:`, `class:`, `var:`, kotlin KLS `enum:`/`interface:`). Only an
+    //     all-alphabetic prefix is stripped so a qualified name that legitimately
+    //     contains a single colon is never truncated.
+    let body = if let Some(idx) = signature.rfind("::") {
+        &signature[idx + 2..]
     } else if let Some((prefix, rest)) = signature.split_once(':') {
         if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
             rest
@@ -312,6 +360,25 @@ mod tests {
     }
 
     #[test]
+    fn objc_protocol_namespace_descriptor_parses_as_class() {
+        // #596: ObjC protocols are emitted as `Name/`; they must parse as a
+        // type so they unify with the Phase A `protocol:` node.
+        let p = scip_name_kind("objc . local/objc 0.0.0 Speakable/").unwrap();
+        assert_eq!(p, parsed(None, "Speakable", "class"));
+        assert!(candidate_signatures(&p).contains(&"protocol:Speakable".to_string()));
+    }
+
+    #[test]
+    fn multi_segment_package_descriptor_is_none() {
+        // Go/Java package paths end in `/` too but are multi-segment and have
+        // no Phase A node — must stay unparsed to avoid false unification.
+        assert_eq!(
+            scip_name_kind("scip-go go github.com/org/repo v1.0.0 github.com/org/repo/pkg/"),
+            None
+        );
+    }
+
+    #[test]
     fn native_phase_a_sig_is_none() {
         // Non-SCIP signatures from builtin Phase B plugins must fall through.
         assert_eq!(scip_name_kind("fn:Type.method"), None);
@@ -344,12 +411,38 @@ mod tests {
 
     #[test]
     fn native_name_kind_dart_package_symbol() {
-        // dart `package:pkg/file.dart::Type.method` — the leaf name still resolves
-        // (the `fn:{name}` candidate matches the tree-sitter node).
-        let p = native_name_kind("package:pkg/animal.dart::Animal.describe", "function").unwrap();
-        assert_eq!(p.name, "describe");
-        assert_eq!(p.kind, "function");
-        assert!(candidate_signatures(&p).contains(&"fn:describe".to_string()));
+        // dart `package:pkg/file.dart::Type.method` and the real emitter's
+        // `file:///abs/x.dart::Type.method` — `rfind("::")` isolates the dotted
+        // name so the container leaf (`Animal`) is recovered and the
+        // `method:Animal.describe` candidate (Phase A N1 qualification) is
+        // generated, not just the bare `fn:describe`.
+        for sym in [
+            "package:pkg/animal.dart::Animal.describe",
+            "file:///private/tmp/app/lib/animal.dart::Animal.describe",
+        ] {
+            let p = native_name_kind(sym, "function").unwrap();
+            assert_eq!(p.container, Some("Animal"), "sym={sym}");
+            assert_eq!(p.name, "describe", "sym={sym}");
+            assert_eq!(p.kind, "function");
+            let cands = candidate_signatures(&p);
+            assert!(
+                cands.contains(&"method:Animal.describe".to_string()),
+                "sym={sym} cands={cands:?}"
+            );
+            assert!(cands.contains(&"fn:describe".to_string()), "sym={sym}");
+        }
+    }
+
+    #[test]
+    fn native_name_kind_dart_top_level_and_type() {
+        // Top-level fn `file:///abs/x.dart::main` → bare `main` (fn:main).
+        let p = native_name_kind("file:///abs/x.dart::main", "function").unwrap();
+        assert_eq!(p.container, None);
+        assert_eq!(p.name, "main");
+        // Class twin `file:///abs/x.dart::Animal` (kind class) → class family.
+        let c = native_name_kind("file:///abs/x.dart::Animal", "class").unwrap();
+        assert_eq!(c.name, "Animal");
+        assert!(candidate_signatures(&c).contains(&"class:Animal".to_string()));
     }
 
     #[test]
@@ -423,9 +516,31 @@ mod tests {
                 "interface:Server",
                 "trait:Server",
                 "enum:Server",
-                "type:Server"
+                "type:Server",
+                "protocol:Server",
+                "namespace:Server",
+                "actor:Server"
             ]
         );
+    }
+
+    #[test]
+    fn candidates_class_covers_objc_protocol_and_cpp_namespace() {
+        // E6: an Obj-C protocol node signature is `protocol:Name` and a C++
+        // namespace is `namespace:Name` — a SCIP `#` (class) reference to
+        // either must produce the matching candidate so it unifies instead of
+        // orphaning a duplicate twin.
+        let sigs = candidate_signatures(&parsed(None, "Drawable", "class"));
+        assert!(sigs.contains(&"protocol:Drawable".to_string()));
+        assert!(sigs.contains(&"namespace:Drawable".to_string()));
+    }
+
+    #[test]
+    fn candidates_class_covers_swift_actor() {
+        // N4d: a Swift `actor` node signature is `actor:Name`; a SCIP `#` (class)
+        // reference to it must unify onto the Phase A actor node.
+        let sigs = candidate_signatures(&parsed(None, "Cache", "class"));
+        assert!(sigs.contains(&"actor:Cache".to_string()));
     }
 
     #[test]

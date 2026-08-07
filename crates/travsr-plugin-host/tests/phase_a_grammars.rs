@@ -43,7 +43,9 @@ object Main { def run(): Unit = () }
 trait Logger { def log(): Unit }
 "#;
     let k = kinds(src, "scala");
-    for expected in ["class", "object", "trait", "function", "import"] {
+    // N1: `def hi/run/log` are all nested in a type container, so they are
+    // `method` nodes (qualified by their enclosing type), not free functions.
+    for expected in ["class", "object", "trait", "method", "import"] {
         assert!(
             k.contains(expected),
             "scala: missing {expected:?} node — got {k:?}"
@@ -174,8 +176,12 @@ fn dart_enum_and_typedef_emitted() {
 
 #[test]
 fn swift_typealias_and_struct_emitted() {
-    // tree-sitter-swift parses struct/enum/actor as class_declaration — the
-    // existing class capture must cover them (sig prefix `class:`).
+    // N4d: struct/enum/actor/extension no longer collapse to kind `class` —
+    // each gets its own distinct signature prefix (see
+    // travsr_analysis::swift::tests::n4d_distinct_type_kinds). The SCIP
+    // unifier's `class`-kind candidate set was extended in lockstep to accept
+    // `struct:`/`enum:`/`actor:` as valid unification targets, so this split
+    // does not break G1 unification.
     let s = sigs(
         "typealias Velocity = Double\nstruct Point { var x: Double }\nenum Direction { case north }\n",
         "swift",
@@ -185,12 +191,12 @@ fn swift_typealias_and_struct_emitted() {
         "swift: missing type:Velocity — got {s:?}"
     );
     assert!(
-        s.contains("class:Point"),
-        "swift: struct must emit class:Point — got {s:?}"
+        s.contains("struct:Point"),
+        "swift: missing struct:Point — got {s:?}"
     );
     assert!(
-        s.contains("class:Direction"),
-        "swift: enum must emit class:Direction — got {s:?}"
+        s.contains("enum:Direction"),
+        "swift: missing enum:Direction — got {s:?}"
     );
 }
 
@@ -262,13 +268,16 @@ fn objc_class_impl_and_protocol_sigs_emitted() {
 @end
 "#;
     let s = sigs(src, "m");
+    // N1: selectors are qualified by their enclosing @interface/@implementation
+    // /@protocol type. `draw` lives in both protocol Drawable and impl Shape.
     for expected in [
         "class:Shape",
         "impl:Shape",
         "protocol:Drawable",
-        "fn:render",
-        "fn:unit",
-        "fn:draw",
+        "method:Shape.render",
+        "method:Shape.unit",
+        "method:Shape.draw",
+        "method:Drawable.draw",
     ] {
         assert!(
             s.contains(expected),
