@@ -26,7 +26,9 @@ use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
-pub use hook::{changed_files_from_git, install_hook, try_dispatch_to_daemon};
+pub use hook::{
+    changed_files_from_git, install_hook, tracked_files_from_git, try_dispatch_to_daemon,
+};
 
 /// Set the process-level opt-in flag that allows `rust-analyzer` to run
 /// unconfined when the OS sandbox is unavailable.
@@ -2640,10 +2642,41 @@ fn run_background_phase_b(
     store: &std::sync::Mutex<SqliteStore>,
     sched: &phase_b_sched::PhaseBScheduler,
 ) {
-    // Delegate to an inner fn so we can capture its outcome and always call
-    // finish_with_outcome, even on early returns — without unsafe raw pointers.
-    let outcome = run_background_phase_b_inner(repo_root, store);
-    sched.finish_with_outcome(outcome);
+    // Delegate to an inner fn so we can capture its outcome. The finish guard
+    // (#404) releases the scheduler's single-flight slot on ALL exits — early
+    // returns and panics alike. A bare `finish_with_outcome` after the call is
+    // skipped when the inner unwinds (plugin-host sidecar, k-core, store batch
+    // writes); the panic is then swallowed by the fire-and-forget
+    // `spawn_blocking` join handle and `running` stays `true` forever, freezing
+    // every future Phase B refresh with no error surfaced to the user.
+    run_with_phase_b_finish_guard(sched, || run_background_phase_b_inner(repo_root, store));
+}
+
+/// Run `work` and release the scheduler's single-flight slot via
+/// [`finish_with_outcome`](phase_b_sched::PhaseBScheduler::finish_with_outcome)
+/// even if `work` panics (#404). A drop guard reports the real outcome on a
+/// normal return and [`AllCrashed`](phase_b_sched::RunOutcome::AllCrashed) on an
+/// unwind, so a panicking run still advances the `MAX_FAILURES` back-off instead
+/// of silently wedging the slot. The panic itself is re-raised after the slot is
+/// released.
+fn run_with_phase_b_finish_guard(
+    sched: &phase_b_sched::PhaseBScheduler,
+    work: impl FnOnce() -> phase_b_sched::RunOutcome,
+) {
+    struct FinishGuard<'a> {
+        sched: &'a phase_b_sched::PhaseBScheduler,
+        outcome: phase_b_sched::RunOutcome,
+    }
+    impl Drop for FinishGuard<'_> {
+        fn drop(&mut self) {
+            self.sched.finish_with_outcome(self.outcome);
+        }
+    }
+    let mut guard = FinishGuard {
+        sched,
+        outcome: phase_b_sched::RunOutcome::AllCrashed,
+    };
+    guard.outcome = work();
 }
 
 /// Inner worker for [`run_background_phase_b`].
@@ -5612,6 +5645,169 @@ mod tests {
     }
 
     #[test]
+    fn phase_b_finish_guard_releases_slot_on_panic() {
+        // #404: if the background Phase B worker unwinds, the single-flight slot
+        // must still be released. Before the drop guard, a panic skipped
+        // finish_with_outcome and `running` stayed true forever, silently
+        // freezing every future Phase B refresh.
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(0));
+        sched.mark_dirty();
+        assert!(sched.try_claim(), "first claim succeeds");
+        assert!(sched.is_running(), "slot held while the run is in flight");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_with_phase_b_finish_guard(&sched, || panic!("simulated Phase B unwind"));
+        }));
+        assert!(panicked.is_err(), "the panic must propagate past the guard");
+        assert!(
+            !sched.is_running(),
+            "#404: slot must be released after the worker panics"
+        );
+        // A panic maps to AllCrashed, which counts toward MAX_FAILURES but does
+        // not block the next claim after a single failure.
+        assert_eq!(sched.consecutive_failures(), 1);
+        sched.mark_dirty();
+        assert!(sched.try_claim(), "scheduler must be able to claim again");
+    }
+
+    #[test]
+    fn tracked_files_from_git_lists_committed_and_errors_off_repo() {
+        // #405: the fallback enumerates the full tracked set. Happy path returns
+        // committed files; a path git cannot enter surfaces as an error so the
+        // caller can refuse to claim freshness.
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export const x = 1;").unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+
+        let tracked = tracked_files_from_git(tmp.path()).unwrap();
+        assert!(
+            tracked.iter().any(|p| p.ends_with("a.ts")),
+            "tracked set must include the committed file: {tracked:?}"
+        );
+
+        let missing = tmp.path().join("does-not-exist");
+        assert!(
+            tracked_files_from_git(&missing).is_err(),
+            "must error when git cannot be spawned"
+        );
+    }
+
+    #[test]
+    fn reindex_commit_errors_without_stamping_when_git_unavailable() {
+        // #405: when neither the commit diff nor the tracked-file fallback can be
+        // resolved (git cannot be spawned), the handler must report failure and
+        // must NOT stamp last_commit. The old code logged "reindexing all tracked
+        // files", reindexed nothing, stamped last_commit, and returned success —
+        // silently dropping the commit's changes while status claimed freshness.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        // repo_root does not exist, so git cannot spawn there and both
+        // changed_files_from_git and tracked_files_from_git error.
+        let missing_repo = tmp.path().join("no-such-repo");
+        let msg = serde_json::to_string(&travsr_ipc::ControlMessage::ReindexCommit {
+            sha: "deadbeef".to_string(),
+        })
+        .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            &missing_repo,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+        );
+        assert!(
+            !resp.ok,
+            "#405: reindex must report failure when git is unavailable: {resp:?}"
+        );
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            s.get_meta("last_commit").unwrap().is_none(),
+            "#405: last_commit must NOT be stamped when the reindex did not happen"
+        );
+    }
+
+    #[test]
+    fn reindex_commit_skips_travsrignored_paths() {
+        // #403: a commit touching only .travsrignore'd files must index nothing.
+        // The hook path must apply the same ignore rules as init and the watcher
+        // so vendored/generated files init excluded are not re-added on commit.
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join(".travsrignore"), "vendor/\n").unwrap();
+        let vendor = tmp.path().join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("lib.ts"), "export class Lib { go() {} }").unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        let msg = serde_json::to_string(&travsr_ipc::ControlMessage::ReindexCommit {
+            sha: "deadbeef".to_string(),
+        })
+        .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            tmp.path(),
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+        );
+        assert!(resp.ok, "control message must succeed: {resp:?}");
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.node_count().unwrap(),
+            0,
+            "#403: a .travsrignore'd vendored file must not be indexed by the hook path"
+        );
+    }
+
+    #[test]
     fn maybe_spawn_embed_does_not_trigger_phase2_when_phase2_flag_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, store) = setup_repo_with_phase_b(5, Some("deadbeef"));
@@ -6426,13 +6622,36 @@ fn handle_control_message(
     match serde_json::from_str::<ControlMessage>(line) {
         Ok(ControlMessage::ReindexCommit { sha }) => {
             tracing::info!(sha=%sha, "control: reindex-commit");
-            let paths = match changed_files_from_git(repo_root) {
+            let mut paths = match changed_files_from_git(repo_root) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(err=%e, "changed_files_from_git failed — reindexing all tracked files");
-                    vec![]
+                    // #405: the commit diff is unavailable. Fall back to the
+                    // full tracked set (reindex_files is hash-delta gated, so
+                    // this is cheap on an already-fresh graph) instead of
+                    // silently reindexing nothing and claiming success.
+                    tracing::warn!(err=%e, "changed_files_from_git failed — falling back to full tracked-file reindex");
+                    match tracked_files_from_git(repo_root) {
+                        Ok(p) => p,
+                        Err(e2) => {
+                            // Both git paths failed: report the failure so
+                            // last_commit is NOT stamped and the hook-side
+                            // caller learns the reindex did not happen.
+                            tracing::warn!(err=%e2, "tracked-file fallback also failed — reindex skipped");
+                            return (
+                                ControlResponse::err(format!(
+                                    "reindex-commit could not enumerate files: {e2}"
+                                )),
+                                false,
+                            );
+                        }
+                    }
                 }
             };
+            // #403: apply the same ignore rules as init and the watcher so a
+            // commit touching .travsrignore'd paths (vendor/, **/generated/, …)
+            // does not reintroduce the ghost nodes init excluded.
+            let ignore = watcher::build_ignore_matcher(repo_root);
+            paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             let dirty = match reindex_files(&paths, repo_root, &mut s) {
                 Ok(d) => d,
