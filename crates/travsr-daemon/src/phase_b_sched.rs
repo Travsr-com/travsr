@@ -112,10 +112,9 @@ impl PhaseBScheduler {
     }
 
     /// Arm (or re-arm) a re-run for `debounce` from now. Called after a
-    /// commit-triggered reindex, and (#583) once per watcher reindex that
-    /// changed content without moving HEAD. Re-arming pushes `deadline` forward
-    /// so a burst of commits settles into one run, but keeps `first_arm` fixed
-    /// so a fast commit stream cannot defer Phase B past `max_defer` (FT-M6).
+    /// commit-triggered reindex. Re-arming pushes `deadline` forward so a burst
+    /// of commits settles into one run, but keeps `first_arm` fixed so a fast
+    /// commit stream cannot defer Phase B past `max_defer` (FT-M6).
     pub fn mark_dirty(&self) {
         let now = Instant::now();
         let mut d = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
