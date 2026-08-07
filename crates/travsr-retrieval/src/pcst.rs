@@ -43,7 +43,8 @@ const EXPAND_DEPTH: u8 = 5;
 /// Find a path from `source` to `sink`, respecting `filter`, within `token_budget`.
 ///
 /// Returns nodes on (or near) the optimal PCST path, in approximate traversal
-/// order. Falls back to BFS depth-3 on timeout or when no path is found.
+/// order. Falls back to BFS depth-3 when either endpoint is missing from the
+/// local subgraph, or when no path exists. There is no wall-clock timeout.
 ///
 /// The returned vector includes both `source` and `sink` when they exist and
 /// are accessible. Returns an empty vector when either node is not found (SEC
