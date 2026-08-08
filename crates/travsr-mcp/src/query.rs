@@ -606,21 +606,24 @@ fn is_containment_edge(kind: &str) -> bool {
 /// language-level "semantic unavailable" note is decided once in `graph_query`
 /// from coverage — NOT here — so a single caller-less leaf cannot trip it.
 ///
-/// Returns `(edge_kind, next_id, expand)`. `expand` is `false` for a
+/// Returns `(edge_kind, next_id, expand, incoming)`. `expand` is `false` for a
 /// containment edge reached in `Callers`/`Both` direction (#517 DD-1): the
 /// node is still recorded and displayed, but the traversal does not walk
 /// further from it, so a file's other definitions never enter the BFS queue.
+/// `incoming` records which end of the stored edge `next_id` is (`true` means
+/// `next_id` is the source), so `Both` mode can reconstruct the true
+/// orientation instead of guessing it from the direction flag (#564).
 fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
     is_seed: bool,
-) -> anyhow::Result<Vec<(String, NodeId, bool)>> {
+) -> anyhow::Result<Vec<(String, NodeId, bool, bool)>> {
     let mut out = Vec::new();
     if matches!(direction, QueryDirection::Deps | QueryDirection::Both) {
         for e in store.iter_edges_from(node_id)? {
-            out.push((e.kind.as_str().to_string(), e.dst, true));
+            out.push((e.kind.as_str().to_string(), e.dst, true, false));
         }
     }
     if matches!(direction, QueryDirection::Callers | QueryDirection::Both) {
@@ -662,7 +665,7 @@ fn next_edges(
                 for e in &incoming {
                     let s = e.kind.as_str();
                     if is_semantic_edge(s) || s == "defines/binding" {
-                        out.push((s.to_string(), e.src, !is_containment_edge(s)));
+                        out.push((s.to_string(), e.src, !is_containment_edge(s), true));
                     }
                 }
             } else {
@@ -672,24 +675,24 @@ fn next_edges(
                 // judged from coverage in graph_query, not from this one node.
                 for e in &incoming {
                     let s = e.kind.as_str();
-                    out.push((s.to_string(), e.src, !is_containment_edge(s)));
+                    out.push((s.to_string(), e.src, !is_containment_edge(s), true));
                 }
             }
         } else {
             for e in &incoming {
                 let s = e.kind.as_str();
-                out.push((s.to_string(), e.src, !is_containment_edge(s)));
+                out.push((s.to_string(), e.src, !is_containment_edge(s), true));
             }
         }
     }
     // Multiple call sites (and the file-node definition splice) can yield the
-    // same (kind, src) pair — collapse them for display.
+    // same (kind, src, orientation) triple — collapse them for display.
     let mut seen = HashSet::new();
-    out.retain(|(kind, id, _)| seen.insert((kind.clone(), *id)));
+    out.retain(|(kind, id, _, incoming)| seen.insert((kind.clone(), *id, *incoming)));
     // #517 DD-1: non-containment edges (the answer) precede containment edges
     // (orientation) from the same parent. Stable sort preserves DB order
     // within each group, so output stays deterministic.
-    out.sort_by_key(|(kind, _, _)| is_containment_edge(kind));
+    out.sort_by_key(|(kind, _, _, _)| is_containment_edge(kind));
     Ok(out)
 }
 
@@ -747,16 +750,19 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             continue;
         }
 
-        for (edge_kind, next_id, child_expand) in next_edges(
+        for (edge_kind, next_id, child_expand, edge_incoming) in next_edges(
             store,
             current_id,
             args.direction,
             args.edge_mode,
             depth == 0,
         )? {
-            let (src, dst) = match args.direction {
-                QueryDirection::Callers => (next_id, current_id),
-                _ => (current_id, next_id),
+            // #564: orient from the edge itself, not the direction flag — in
+            // `Both` mode a single expansion mixes incoming and outgoing edges.
+            let (src, dst) = if edge_incoming {
+                (next_id, current_id)
+            } else {
+                (current_id, next_id)
             };
             // DEBT(travsr-75): iter_edges_from/to do not return provenance, so
             // BFS-traversed edges always show "tree-sitter" in JSON output even
@@ -1026,6 +1032,40 @@ mod tests {
         let before = payload.nodes.len();
         assert_eq!(apply_token_budget(&mut payload, 0), 0);
         assert_eq!(payload.nodes.len(), before);
+    }
+
+    // ── #564: every direction mode must preserve true edge orientation ───────
+
+    #[test]
+    fn both_direction_preserves_edge_orientation() {
+        let (store, _, class, caller) = seeded_store();
+        let args = |direction| GraphQueryArgs {
+            query: "PaymentService".to_string(),
+            depth: 3,
+            direction,
+            edge_mode: QueryEdgeMode::Semantic,
+            include_noise: false,
+        };
+
+        // The store holds exactly one call edge: caller --ref/call--> class.
+        // Every mode that surfaces it must report that stored orientation.
+        for direction in [QueryDirection::Callers, QueryDirection::Both] {
+            let payload = graph_query(&store, &args(direction)).unwrap();
+            assert!(
+                payload
+                    .edges
+                    .iter()
+                    .any(|e| e.kind == "ref/call" && e.src == caller.id.0 && e.dst == class.id.0),
+                "{direction:?}: true edge caller -> class missing from payload"
+            );
+            assert!(
+                !payload
+                    .edges
+                    .iter()
+                    .any(|e| e.kind == "ref/call" && e.src == class.id.0 && e.dst == caller.id.0),
+                "{direction:?}: reversed edge class -> caller reported"
+            );
+        }
     }
 
     // ── #517: containment edges terminal in caller traversal ──────────────────
