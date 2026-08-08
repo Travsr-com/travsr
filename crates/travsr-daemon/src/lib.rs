@@ -1964,21 +1964,6 @@ fn resolve_unresolved_calls(
         .map(|n| (n.id, n.vname.language))
         .collect();
 
-    // Shared by both the #529 recv_type fallback and the pre-#529 is_method_call
-    // path: qualified (`Type.method`) candidates from the unique-leaf pool.
-    // Each match carries `(NodeId, path, language)`.
-    let leaf_method_matches = |sig: &str| -> Vec<(travsr_core::NodeId, &str, &str)> {
-        by_leaf
-            .get(&leaf_of(sig))
-            .map(|v| {
-                v.iter()
-                    .filter(|(_, _, s, _)| s.contains('.'))
-                    .map(|(id, path, _, lang)| (*id, *path, *lang))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-
     let mut edges: Vec<travsr_core::Edge> = Vec::new();
     let mut sites: Vec<(travsr_core::NodeId, travsr_core::NodeId, u32)> = Vec::new();
     for u in unresolved {
@@ -2021,10 +2006,26 @@ fn resolve_unresolved_calls(
                         // and collide with an unrelated method (the #529 bug
                         // itself, e.g. `Session::filter` vs `Iterator::filter`).
                         None if !known_graph_types.contains(t.as_str()) => continue,
-                        // (3) `T` is a real graph type but doesn't have this
-                        // method (trait impls / `Deref` targets the
-                        // extractor can't see) — fall through unchanged.
-                        None => leaf_method_matches(&u.callee_sig),
+                        // (3) #606: `T` is a real graph type but doesn't have
+                        // this method. Pre-#606 this fell through to leaf-name
+                        // uniqueness to recover trait-impl / `Deref` calls the
+                        // extractor can't see — but a same-named *graph* type
+                        // is not evidence the call targets it: the receiver is
+                        // just as likely a std/external type whose name
+                        // collides with a user type (`std::process::Command`
+                        // vs the CLI's clap `enum Command`). Measured against
+                        // rust-analyzer LSIF over a full native index of this
+                        // repo: 1 false : 0 real — the only edge this branch
+                        // emitted was `Command.stdin` fabricated onto
+                        // `SandboxedSpawn.stdin`, and zero genuine trait-impl/
+                        // `Deref` recoveries survived the CO-A1 uniqueness
+                        // gate. Same verdict as #604 (201:2): unique-in-graph
+                        // is an artifact of std/external types not being
+                        // indexed. Fail closed; only an exact `by_recv_sig`
+                        // hit may resolve a receiver-recovered method call.
+                        // Genuine sites remain covered by the E7 LSIF/scip
+                        // path.
+                        None => continue,
                     }
                 }
                 // #604: receiver type not recovered — no evidence of a call
@@ -3772,11 +3773,18 @@ mod tests {
     }
 
     #[test]
-    fn t7_recv_type_is_a_graph_type_without_this_method_falls_through() {
-        // `T` IS a real type in the graph, just doesn't have `.filter`
-        // (e.g. a trait-provided method the extractor can't see) — branch 3
-        // must fall through to today's unique-leaf resolution unchanged,
-        // not drop the call. Asserts we did not over-tighten.
+    fn t7_recv_type_is_a_graph_type_without_this_method_fails_closed_606() {
+        // #606: `T` IS a real type in the graph but doesn't have `.filter`.
+        // Pre-#606 this fell through to unique-leaf resolution to recover
+        // trait-provided / `Deref` methods — measured 1 false : 0 real
+        // against rust-analyzer LSIF on a full native index of this repo,
+        // so it now fails closed like the other #529/#604 branches.
+        //
+        // This inverts the pre-#606 `t7_..._falls_through` assertion (which
+        // required exactly this edge); that behavior was the residual bug:
+        // `Session` having no `.filter` node means the call dispatches to a
+        // trait/std method, and the lone same-leaf `Other.filter` is an
+        // unrelated type's method, not the target.
         use travsr_core::{Node, VName};
         let mut store = SqliteStore::open_in_memory().unwrap();
 
@@ -3821,19 +3829,82 @@ mod tests {
             recv_type: Some("Session".to_string()),
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(
+        let (edges, sites) = resolve_unresolved_calls(
             &store,
             &unresolved,
             &[],
             &[],
             &std::collections::HashSet::new(),
         );
-        assert_eq!(
-            edges.len(),
-            1,
-            "should fall through to unique-leaf match: {edges:?}"
+        assert!(
+            edges.is_empty(),
+            "graph-type receiver without the method must not resolve by unique-leaf guess (#606): {edges:?}"
         );
-        assert_eq!(edges[0].dst, callee.id);
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn t17_recv_type_collides_with_unrelated_graph_type_fails_closed_606() {
+        // #606: the exact fabrication the measurement caught on this repo.
+        // A call `cmd.stdin(..)` on `std::process::Command` recovers
+        // `recv_type: Some("Command")`, which collides with an unrelated
+        // user type of the same name (`enum Command` — the CLI's clap enum)
+        // in a third crate, defeating the #529 branch-(2) external-type
+        // gate. With no `method:Command.stdin` node, the pre-#606 fall-
+        // through resolved it to the lone same-leaf `SandboxedSpawn.stdin`
+        // in a crate the caller depends on — a fabricated cross-crate
+        // ref/call edge. Must emit nothing.
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "crates/crate-a/src/tools.rs", "rust", "fn:caller"),
+            "function",
+        );
+        store.put_node(&caller).unwrap();
+
+        // The colliding user type lives in an unrelated crate and is an
+        // enum, exercising the `enum:` arm of the graph-type probe.
+        let clap_command = Node::new(
+            VName::new("", "", "crates/crate-c/src/main.rs", "rust", "enum:Command"),
+            "enum",
+        );
+        store.put_node(&clap_command).unwrap();
+
+        // The only `.stdin` method in the graph, on an unrelated type.
+        let callee = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/crate-b/src/sandbox.rs",
+                "rust",
+                "method:SandboxedSpawn.stdin",
+            ),
+            "method",
+        );
+        store.put_node(&callee).unwrap();
+
+        let unresolved = vec![travsr_core::UnresolvedCall {
+            src: caller.id,
+            callee_sig: "fn:stdin".to_string(),
+            hint_crate: None,
+            caller_line: 9773,
+            is_method_call: true,
+            recv_type: Some("Command".to_string()),
+        }];
+
+        let (edges, sites) = resolve_unresolved_calls(
+            &store,
+            &unresolved,
+            &[],
+            &[],
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            edges.is_empty(),
+            "std-type receiver colliding with a user type name must not fabricate an edge (#606): {edges:?}"
+        );
+        assert!(sites.is_empty());
     }
 
     #[test]
@@ -4451,13 +4522,16 @@ mod tests {
     }
 
     #[test]
-    fn e4_class_receiver_is_a_graph_type_falls_through_to_unique_leaf() {
-        // E4: a Python/TS receiver whose type is a real `class:T` in the graph
-        // but whose `method:T.leaf` node does not exist (inherited method) must
-        // fall through to unique-leaf resolution — NOT be dropped as external.
-        // This is the language-general analog of t7 and directly exercises the
-        // `class:{t}` addition to `recv_type_probe_sigs`; without it, `App`
-        // would be unknown → branch 2 → the call would be wrongly dropped.
+    fn e4_class_receiver_is_a_graph_type_without_method_fails_closed_606() {
+        // #606: a Python/TS receiver whose type is a real `class:T` in the
+        // graph but whose `method:T.leaf` node does not exist (inherited
+        // method) no longer falls through to unique-leaf resolution — the
+        // language-general analog of the inverted t7. A same-leaf method on
+        // an unrelated class is not evidence of inheritance; the branch-(3)
+        // measurement (see the resolver) found the fall-through fabricates
+        // whenever a receiver's type name collides with an in-graph type.
+        // Genuine inherited-method sites are covered by the scip/LSIF path
+        // (E7); the native heuristic emits nothing here.
         use travsr_core::{Node, VName};
         let mut store = SqliteStore::open_in_memory().unwrap();
 
@@ -4491,19 +4565,18 @@ mod tests {
             recv_type: Some("App".to_string()),
         }];
 
-        let (edges, _sites) = resolve_unresolved_calls(
+        let (edges, sites) = resolve_unresolved_calls(
             &store,
             &unresolved,
             &[],
             &[],
             &std::collections::HashSet::new(),
         );
-        assert_eq!(
-            edges.len(),
-            1,
-            "class receiver that is a graph type must fall through to unique leaf: {edges:?}"
+        assert!(
+            edges.is_empty(),
+            "class receiver without the method must not resolve by unique-leaf guess (#606): {edges:?}"
         );
-        assert_eq!(edges[0].dst, callee.id);
+        assert!(sites.is_empty());
     }
 
     #[test]
