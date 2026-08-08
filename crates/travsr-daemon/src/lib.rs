@@ -5023,6 +5023,53 @@ mod tests {
         );
     }
 
+    /// #583 review: the flag can be set while the working tree is *clean*.
+    ///
+    /// The motivating cases (branch switch, `git stash pop`, revert) all end
+    /// with the file back at its committed content, so `git status` is clean
+    /// and there is nothing to stage — but the reindex in between already
+    /// dropped that file's `ref/call` edges, and the flag is still set. That
+    /// combination is why `travsr status` names the condition rather than
+    /// telling the user to commit: at this point `git commit` reports
+    /// "nothing to commit" and the user is stuck.
+    #[test]
+    fn reindex_files_flags_phase_b_dirty_even_when_the_tree_ends_up_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let ts_path = tmp.path().join("svc.ts");
+        let committed = "export class OldSvc { foo() {} }";
+        std::fs::write(&ts_path, committed).unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        // Index the committed content, then let a Phase B run settle.
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+
+        // Edit and reindex — the watcher path. Phase A nodes are rewritten.
+        std::fs::write(&ts_path, "export class NewSvc { bar() {} }").unwrap();
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap(); // pretend a run cleared it
+
+        // Now revert to the committed content and reindex again, which is what
+        // `git checkout <file>` / `stash pop` / a branch switch produce. The
+        // tree is clean afterwards, yet the content changed relative to what is
+        // indexed, so the semantic layer is degraded and must say so.
+        std::fs::write(&ts_path, committed).unwrap();
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("1"),
+            "a revert back to committed content still degrades Phase B, so the \
+             flag must be set even though the working tree is now clean"
+        );
+    }
+
     /// RFC-002: when the stored signature format version differs from the binary's
     /// version, `reindex_files` must return `Ok(())` without touching the graph.
     /// This is the core correctness guarantee — a version mismatch must never

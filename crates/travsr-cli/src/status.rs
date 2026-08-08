@@ -20,13 +20,20 @@ use crate::repo::find_git_root;
 /// themselves return on the next commit's Phase B run.
 ///
 /// The dirty flag therefore only changes the verdict inside that one window.
-/// Once the markers diverge, `pending` already tells the user a run is coming,
-/// and saying "commit to refresh" would be wrong advice.
+/// Once the markers diverge, `pending` already tells the user a run is coming.
+///
+/// The wording names the condition, not a remedy, because there is no single
+/// correct remedy. The motivating cases (branch switch, `git stash pop`,
+/// revert) all restore the file to its committed content, so the working tree
+/// ends up equal to HEAD with the flag still set and the `ref/call` edge still
+/// missing. Telling the user to commit is a dead end there: there is nothing
+/// to stage. Recovery is `travsr init`, or any later commit that fires the
+/// hook.
 fn phase_b_state(payload: &StatusPayload) -> &'static str {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (commit to refresh)"
+                "stale (needs Phase B refresh)"
             } else {
                 "complete"
             }
@@ -189,7 +196,7 @@ mod tests {
         // old logic said `complete`, but the file's `ref/call` edges are gone.
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
-            "stale (commit to refresh)"
+            "stale (needs Phase B refresh)"
         );
     }
 
