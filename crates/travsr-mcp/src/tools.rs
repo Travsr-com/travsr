@@ -1468,9 +1468,19 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         let new_srcs: Vec<NodeId> = incoming
             .into_iter()
             .filter(|edge| match mode {
+                // ResolvesTo is required for the two-hop import chain that the
+                // indexer emits for TypeScript/JS/Rust:
+                //   file --Depends--> import:pkg --ResolvesTo--> target file
+                // Walking incoming edges from the target reaches the import node
+                // only via ResolvesTo; from there Depends reaches the importer.
+                // Without it, blast radius on those files returns just the file
+                // itself (#582).
                 AnalysisMode::TreeSitter => matches!(
                     edge.kind,
-                    EdgeKind::DefinesBinding | EdgeKind::RefCall | EdgeKind::Depends
+                    EdgeKind::DefinesBinding
+                        | EdgeKind::RefCall
+                        | EdgeKind::Depends
+                        | EdgeKind::ResolvesTo
                 ),
                 AnalysisMode::Semantic => matches!(edge.kind, EdgeKind::RefCall),
             })
@@ -5948,6 +5958,61 @@ mod tests {
         assert!(
             result.contains("b.ts") && result.contains("c.ts"),
             "TreeSitter mode must follow both RefCall and Depends"
+        );
+    }
+
+    /// Regression for #582. The indexer never emits a direct file→file Depends
+    /// edge for an import; it emits the two-hop chain
+    ///   importer.ts --Depends--> import:./target --ResolvesTo--> target.ts
+    /// Blast radius on target.ts must walk ResolvesTo backwards to the import
+    /// node, then Depends back to the importer. Before the fix this returned
+    /// only target.ts.
+    #[test]
+    fn blast_radius_tree_sitter_follows_import_resolves_to_chain() {
+        use travsr_core::EdgeKind;
+        let target = make_node("src/target.ts", "fn:target");
+        let importer = make_node("src/importer.ts", "fn:importer");
+        // The import node the indexer materialises for `import ... from './target'`.
+        let import_node = travsr_core::Node::new(
+            travsr_core::VName::new("", "", "src/importer.ts", "typescript", "import:./target"),
+            "import",
+        );
+        let store = make_store(
+            &[target.clone(), importer.clone(), import_node.clone()],
+            &[
+                (importer.id, import_node.id, EdgeKind::Depends),
+                (import_node.id, target.id, EdgeKind::ResolvesTo),
+            ],
+        );
+        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::TreeSitter);
+        assert!(
+            result.contains("src/importer.ts"),
+            "importer reached via the Depends→import→ResolvesTo chain must appear, got: {result}"
+        );
+    }
+
+    /// Semantic mode must NOT follow the import ResolvesTo chain — it walks only
+    /// precise RefCall edges, so a Depends/ResolvesTo-only importer is excluded.
+    #[test]
+    fn blast_radius_semantic_excludes_import_resolves_to_chain() {
+        use travsr_core::EdgeKind;
+        let target = make_node("src/target.ts", "fn:target");
+        let importer = make_node("src/importer.ts", "fn:importer");
+        let import_node = travsr_core::Node::new(
+            travsr_core::VName::new("", "", "src/importer.ts", "typescript", "import:./target"),
+            "import",
+        );
+        let store = make_store(
+            &[target.clone(), importer.clone(), import_node.clone()],
+            &[
+                (importer.id, import_node.id, EdgeKind::Depends),
+                (import_node.id, target.id, EdgeKind::ResolvesTo),
+            ],
+        );
+        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::Semantic);
+        assert!(
+            !result.contains("src/importer.ts"),
+            "semantic mode must not follow the import chain, got: {result}"
         );
     }
 
