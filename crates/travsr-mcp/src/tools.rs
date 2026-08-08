@@ -1712,9 +1712,9 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
 
     // Phase-2 memoization, shared across every pass of the outer fixpoint.
     // `phase2_done`: files whose importers have already been resolved via the
-    //   language-aware resolvers, so we never re-resolve the same file.
-    // `checked_pairs`: (import node, target file) pairs already tested —
-    //   `resolves_to` is pure, so each pair need be checked at most once.
+    //   language-aware resolvers, so we never re-resolve the same file. (Per
+    //   target file, a local `seen_here` set dedups candidate import nodes so
+    //   the pure `resolves_to` runs at most once per candidate.)
     let mut phase2_done: HashSet<String> = HashSet::new();
 
     // Phase-2 candidate index, built once per call from a single bulk load.
@@ -1728,7 +1728,17 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
     // Built only in TreeSitter mode (Semantic skips Phase 2 entirely).
     let import_records: Vec<(travsr_core::NodeId, String, String, String)> =
         if mode == AnalysisMode::TreeSitter {
-            store.import_nodes_lite().unwrap_or_default()
+            store.import_nodes_lite().unwrap_or_else(|e| {
+                // Fail open (Phase 1 still ran), but never silently: a bulk-load
+                // error drops the entire Phase-2 pass, so the result would
+                // under-report importers with no other signal.
+                tracing::warn!(
+                    "get_blast_radius: import_nodes_lite failed for '{file}' \
+                     ({e}); Phase-2 (file-level import) resolution skipped, \
+                     result may be incomplete"
+                );
+                Vec::new()
+            })
         } else {
             Vec::new()
         };
