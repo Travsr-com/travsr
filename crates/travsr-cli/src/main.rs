@@ -442,7 +442,9 @@ async fn run(cli: Cli) -> Result<()> {
         } => init::run(quiet, json, jobs, semantic, allow_unsandboxed_lsif)?,
         Command::Daemon { action } => {
             let cwd = std::env::current_dir()?;
-            let repo_root = repo::find_git_root(&cwd)?;
+            // The daemon indexes/watches the resolved root: bind it to the
+            // worktree we are in, never the main worktree (issue #586).
+            let repo_root = repo::find_git_root_for_write(&cwd)?;
             match action {
                 DaemonAction::Start { foreground } => {
                     if foreground {
@@ -682,7 +684,18 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Command::HookRun { from_hook, paths } => {
             let cwd = std::env::current_dir()?;
-            let repo_root = repo::find_git_root(&cwd)?;
+            // A commit reindexes the worktree it happened in, never the main
+            // worktree (issue #586).
+            let repo_root = repo::find_git_root_for_write(&cwd)?;
+
+            // travsr git hooks live in the shared `$GIT_COMMON_DIR/hooks` and
+            // fire for every linked worktree. A worktree that was never
+            // `travsr init`-ed has no index of its own; skip rather than let
+            // SqliteStore::open create a stray empty graph.db for a tree the
+            // user never opted into (issue #586).
+            if !repo_root.join(".travsr/graph.db").exists() {
+                return Ok(());
+            }
 
             // Prefer dispatching to a running daemon — it reindexes async and
             // never blocks the git commit. Fall back to in-process indexing when

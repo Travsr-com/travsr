@@ -256,7 +256,9 @@ fn resolve_graph_db(db_override: Option<PathBuf>) -> Result<PathBuf> {
         Some(p) => Ok(p),
         None => {
             let cwd = std::env::current_dir().context("getting cwd")?;
-            let repo_root = crate::repo::find_git_root(&cwd)?;
+            // Callers (reindex/reconfigure/gc/calibrate) mutate this db, so
+            // resolve the worktree's own index, never the main worktree (#586).
+            let repo_root = crate::repo::find_git_root_for_write(&cwd)?;
             let p = repo_root.join(".travsr/graph.db");
             anyhow::ensure!(
                 p.exists(),
@@ -415,9 +417,10 @@ fn cmd_init(
 
     // Write per-repo config so the daemon only auto-embeds repos the user
     // explicitly opted into. The repo must already be initialised (graph.db exists).
+    // Write path: target the worktree we are in, never the main worktree (#586).
     let repo_root = std::env::current_dir()
         .ok()
-        .and_then(|c| crate::repo::find_git_root(&c).ok());
+        .and_then(|c| crate::repo::find_git_root_for_write(&c).ok());
     let db_path = repo_root
         .as_ref()
         .map(|r| r.join(".travsr/graph.db"))
@@ -1668,7 +1671,8 @@ fn cmd_switch(backend_id: &str, global: bool) -> Result<()> {
     } else {
         std::env::current_dir()
             .ok()
-            .and_then(|c| crate::repo::find_git_root(&c).ok())
+            // Write path: switch this worktree's model, never the main worktree's (#586).
+            .and_then(|c| crate::repo::find_git_root_for_write(&c).ok())
             .filter(|r| r.join(".travsr/graph.db").exists())
     };
 
