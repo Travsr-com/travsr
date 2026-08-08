@@ -29,6 +29,11 @@ pub use sse::{router as sse_router, AppState};
 // which run the same occurrence-store read as the MCP tools against a locally
 // opened store. The rest of `tools` stays private (MCP-only surface).
 pub use tools::{find_pattern, find_references};
+// #448: exported solely so `travsr-daemon` can assert its own `SKIP_DIRS` still
+// matches this copy. The dependency edge runs daemon → mcp, so the equality can
+// only be checked from that side; without it a future edit to the daemon's list
+// silently widens `find_pattern` past the graph's file set.
+pub use tools::SKIP_DIRS;
 // RFC-021 P5: model distribution. The daemon auto-fetches on warm; the
 // `travsr rerank` CLI subcommand drives the same install path. The rest of
 // `rerank` stays private (query-path internals).
