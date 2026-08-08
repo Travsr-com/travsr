@@ -755,8 +755,8 @@ pub fn resolver_for_language(language: &str) -> &'static dyn ImportResolver {
         "cpp" | "c++" | "c" => &CppResolver,
         "swift" => &SwiftResolver,
         "dart" => &DartResolver,
+        "ruby" => &RubyResolver,
         // TypeScript/JS/Rust: link_imports* already emits ResolvesTo — noop here.
-        // Ruby: no import nodes emitted by the indexer — noop.
         _ => &NoopResolver,
     }
 }
@@ -1003,6 +1003,49 @@ impl ImportResolver for DartResolver {
     }
 }
 
+// ── Ruby ───────────────────────────────────────────────────────────────────
+// Signature: `import:animal` (require_relative 'animal') or `import:foo/bar`.
+// Ruby's `require`/`require_relative` usually take a path without the `.rb`
+// extension; the indexer emits the import node but no ResolvesTo chain, so
+// resolve the bare require path against the file here.
+//
+// Limitations (blast radius is deliberately over-inclusive, so these fail
+// toward over- rather than under-reporting):
+//   * `require 'json'` (a gem) and `require_relative 'json'` both emit
+//     `import:json`, so a local `json.rb` matches either. The analyzer does
+//     not record which keyword produced the import, so they cannot be told
+//     apart here.
+//   * `require_relative '../lib/foo'` is caller-relative, but the importer's
+//     path is not threaded into this trait; leading `./`/`../` segments are
+//     stripped and the remainder is suffix-matched, which can over-match a
+//     same-named file under a different root.
+
+struct RubyResolver;
+impl ImportResolver for RubyResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let mut spec = match import_sig.strip_prefix("import:") {
+            Some(s) => s,
+            None => return false,
+        };
+        // Drop leading "./"/"../" segments from a relative require. The
+        // importer's directory is not available here, so match on the suffix.
+        loop {
+            if let Some(s) = spec.strip_prefix("../") {
+                spec = s;
+            } else if let Some(s) = spec.strip_prefix("./") {
+                spec = s;
+            } else {
+                break;
+            }
+        }
+        // A require may already carry the extension (`require_relative 'foo.rb'`);
+        // strip it so we don't build `foo.rb.rb`.
+        let spec = spec.strip_suffix(".rb").unwrap_or(spec);
+        let fp = file_path.replace('\\', "/");
+        path_suffix_match(&fp, &format!("{spec}.rb"))
+    }
+}
+
 // ── Graph GC types ────────────────────────────────────────────────────────────
 
 /// Paths of files that held inbound edges to deleted/changed symbols.
@@ -1076,6 +1119,26 @@ mod tests {
             "rust",
             "fn:sample",
         )
+    }
+
+    #[test]
+    fn ruby_resolver_matches_require_relative_path() {
+        let r = resolver_for_language("ruby");
+        // `require_relative 'animal'` in cat.rb resolves to animal.rb.
+        assert!(r.resolves_to("import:animal", "ruby/src/animal.rb"));
+        assert!(r.resolves_to("import:./animal", "ruby/src/animal.rb"));
+        // Nested require path.
+        assert!(r.resolves_to("import:lib/animal", "app/lib/animal.rb"));
+        // A require that already carries the extension must not become foo.rb.rb.
+        assert!(r.resolves_to("import:animal.rb", "ruby/src/animal.rb"));
+        // Parent-relative require: leading ../ is stripped, suffix still matches.
+        assert!(r.resolves_to("import:../lib/animal", "app/lib/animal.rb"));
+        // Different stem must not match.
+        assert!(!r.resolves_to("import:animal", "ruby/src/cat.rb"));
+        // A subpath must actually constrain the match.
+        assert!(!r.resolves_to("import:lib/animal", "app/other/animal.rb"));
+        // A bare import prefix or malformed spec resolves to nothing.
+        assert!(!r.resolves_to("animal", "ruby/src/animal.rb"));
     }
 
     #[test]
