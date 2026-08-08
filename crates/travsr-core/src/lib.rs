@@ -730,14 +730,28 @@ pub struct UnresolvedCall {
 // Query-time bridge over missing `ResolvesTo` edges.
 // When the indexer has not emitted `ResolvesTo` edges (Java, Go cross-module,
 // PHP, C#, C/C++, Swift, Dart), these resolvers answer at query time:
-// "does import node `import_sig` point to this `file_path`?"
+// "does the import statement `import_sig`, written in `importer_path`, point to
+//  this `target_path`?"
 //
-// Used by `travsr-mcp::tools::get_blast_radius_raw` (Phase 2).
+// `importer_path` (the path of the file that holds the import — the import
+// node's own `VName::path`) is the deterministic anchor for *relative* imports:
+// Ruby `require_relative` and C/C++ quoted `#include "…"` are resolved against
+// the importing file's directory, so a bare `import:animal` can only match the
+// `animal.rb` next to its importer, never a same-named file under an unrelated
+// root. Languages whose imports are absolute/namespace-rooted (Go module paths,
+// Java/Kotlin/Scala/C# packages, PHP PSR-4, Swift modules, Python absolute)
+// carry their own path in the signature and ignore `importer_path`; their match
+// is structural and deliberately over-inclusive, since classpath/module
+// resolution is not available in the graph.
+//
+// Used by `travsr-mcp::tools::get_blast_radius_raw` (Phase 2). Determinism here
+// matters because that consumer walks importers transitively — a false match
+// would compound across hops.
 // Lives in `travsr-core` so all downstream crates can use it without
 // violating the crate dependency DAG.
 
 pub trait ImportResolver: Send + Sync {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool;
+    fn resolves_to(&self, import_sig: &str, importer_path: &str, target_path: &str) -> bool;
 }
 
 /// Return the correct resolver for a `VName::language` string.
@@ -756,19 +770,52 @@ pub fn resolver_for_language(language: &str) -> &'static dyn ImportResolver {
         "swift" => &SwiftResolver,
         "dart" => &DartResolver,
         "ruby" => &RubyResolver,
+        // Objective-C `#import "Foo.h"` / `#include "Foo.h"` are importer-relative
+        // exactly like C/C++, so they share the same resolver. Angle-bracket
+        // framework imports and `@import Module` resolve to no project file.
+        // "objc" is the plugin-protocol alias; "objectivec" is core's canonical
+        // storage string (see Language::as_str).
+        "objectivec" | "objc" => &CppResolver,
         // TypeScript/JS/Rust: link_imports* already emits ResolvesTo — noop here.
+        // Data/config formats (JSON/YAML/TOML/XML) and Markdown never emit
+        // `import:` nodes, so NoopResolver is correct for them too.
         _ => &NoopResolver,
     }
 }
 
 struct NoopResolver;
 impl ImportResolver for NoopResolver {
-    fn resolves_to(&self, _: &str, _: &str) -> bool {
+    fn resolves_to(&self, _: &str, _: &str, _: &str) -> bool {
         false
     }
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────
+
+/// Resolve a relative import `spec` (e.g. `animal`, `../lib/animal`) written in
+/// `importer_path` into a normalized, repo-relative path by walking `.` / `..`
+/// segments against the importer's directory. Returns `None` if the spec climbs
+/// above the repo root. Deterministic: the result depends only on the importer's
+/// location, so it can never match a same-named file under an unrelated root.
+fn resolve_relative_to_importer(importer_path: &str, spec: &str) -> Option<String> {
+    let dir = file_parent_dir(&importer_path.replace('\\', "/"));
+    let mut parts: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split('/').collect()
+    };
+    let spec = spec.replace('\\', "/");
+    for seg in spec.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?; // None if the spec escapes above the repo root
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
 
 fn file_parent_dir(fp: &str) -> String {
     std::path::Path::new(fp)
@@ -815,7 +862,7 @@ fn dot_lang_resolves_to(import_sig: &str, file_path: &str, exts: &[&str]) -> boo
 
 struct GoResolver;
 impl ImportResolver for GoResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         let import_path = match import_sig.strip_prefix("import:") {
             Some(p) => p,
             None => return false,
@@ -835,7 +882,7 @@ impl ImportResolver for GoResolver {
 
 struct JavaResolver;
 impl ImportResolver for JavaResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         dot_lang_resolves_to(import_sig, file_path, &[".java"])
     }
 }
@@ -845,7 +892,7 @@ impl ImportResolver for JavaResolver {
 
 struct KotlinResolver;
 impl ImportResolver for KotlinResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         dot_lang_resolves_to(import_sig, file_path, &[".kt", ".kts"])
     }
 }
@@ -855,7 +902,7 @@ impl ImportResolver for KotlinResolver {
 
 struct ScalaResolver;
 impl ImportResolver for ScalaResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         dot_lang_resolves_to(import_sig, file_path, &[".scala", ".sc"])
     }
 }
@@ -867,7 +914,7 @@ impl ImportResolver for ScalaResolver {
 
 struct PythonResolver;
 impl ImportResolver for PythonResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         let spec = match import_sig.strip_prefix("import:") {
             Some(s) => s,
             None => return false,
@@ -898,7 +945,7 @@ impl ImportResolver for PythonResolver {
 
 struct PhpResolver;
 impl ImportResolver for PhpResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         let import_path = match import_sig.strip_prefix("import:") {
             Some(p) => p,
             None => return false,
@@ -920,29 +967,36 @@ impl ImportResolver for PhpResolver {
 
 struct CsharpResolver;
 impl ImportResolver for CsharpResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         dot_lang_resolves_to(import_sig, file_path, &[".cs"])
     }
 }
 
-// ── C / C++ ────────────────────────────────────────────────────────────────
-// Signature: `import:<stdio.h>` (system) or `import:"local/header.h"` (local).
-// Angle-bracket includes are external — cannot map to a project file.
-// Quote includes carry a relative path that directly matches the file.
+// ── C / C++ / Objective-C ─────────────────────────────────────────────────────
+// Signature: `import:<stdio.h>` (system) or `import:local/header.h` (local,
+// quotes already stripped by the analyzer). Angle-bracket includes are external
+// and cannot map to a project file. Quoted `#include "…"` / `#import "…"` are,
+// by the C standard, resolved relative to the including file first — so we
+// anchor them to the importer's directory and require an exact match. This is
+// deterministic: `#include "util.h"` in `src/a.c` can only mean `src/util.h`,
+// never a same-named `util.h` under an unrelated directory.
 
 struct CppResolver;
 impl ImportResolver for CppResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, importer_path: &str, target_path: &str) -> bool {
         let include = match import_sig.strip_prefix("import:") {
             Some(p) => p,
             None => return false,
         };
         if include.starts_with('<') {
-            return false; // system header
+            return false; // system / framework header
         }
         let bare = include.trim_matches('"');
-        let fp = file_path.replace('\\', "/");
-        path_suffix_match(&fp, bare)
+        let fp = target_path.replace('\\', "/");
+        match resolve_relative_to_importer(importer_path, bare) {
+            Some(resolved) => fp == resolved,
+            None => false,
+        }
     }
 }
 
@@ -954,7 +1008,7 @@ impl ImportResolver for CppResolver {
 
 struct SwiftResolver;
 impl ImportResolver for SwiftResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         let module = match import_sig.strip_prefix("import:") {
             Some(m) => m,
             None => return false,
@@ -978,7 +1032,7 @@ impl ImportResolver for SwiftResolver {
 
 struct DartResolver;
 impl ImportResolver for DartResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+    fn resolves_to(&self, import_sig: &str, _importer_path: &str, file_path: &str) -> bool {
         let uri = match import_sig.strip_prefix("import:") {
             Some(u) => u,
             None => return false,
@@ -1009,40 +1063,33 @@ impl ImportResolver for DartResolver {
 // extension; the indexer emits the import node but no ResolvesTo chain, so
 // resolve the bare require path against the file here.
 //
-// Limitations (blast radius is deliberately over-inclusive, so these fail
-// toward over- rather than under-reporting):
-//   * `require 'json'` (a gem) and `require_relative 'json'` both emit
-//     `import:json`, so a local `json.rb` matches either. The analyzer does
-//     not record which keyword produced the import, so they cannot be told
-//     apart here.
-//   * `require_relative '../lib/foo'` is caller-relative, but the importer's
-//     path is not threaded into this trait; leading `./`/`../` segments are
-//     stripped and the remainder is suffix-matched, which can over-match a
-//     same-named file under a different root.
+// The require path is anchored to the importer's directory and matched
+// exactly, so `require_relative '../lib/foo'` in `app/src/main.rb` resolves
+// deterministically to `app/lib/foo.rb` and can never over-match a same-named
+// file under an unrelated root.
+//
+// Limitation: `require 'json'` (a gem, load-path relative) and
+// `require_relative 'json'` both emit `import:json`; the analyzer does not
+// record which keyword produced the import, so a load-path `require` is
+// resolved as if importer-relative. This may miss a gem-style require whose
+// target lives outside the importer's subtree — an acceptable, deterministic
+// trade over silently matching every same-named file in the repo.
 
 struct RubyResolver;
 impl ImportResolver for RubyResolver {
-    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
-        let mut spec = match import_sig.strip_prefix("import:") {
+    fn resolves_to(&self, import_sig: &str, importer_path: &str, target_path: &str) -> bool {
+        let spec = match import_sig.strip_prefix("import:") {
             Some(s) => s,
             None => return false,
         };
-        // Drop leading "./"/"../" segments from a relative require. The
-        // importer's directory is not available here, so match on the suffix.
-        loop {
-            if let Some(s) = spec.strip_prefix("../") {
-                spec = s;
-            } else if let Some(s) = spec.strip_prefix("./") {
-                spec = s;
-            } else {
-                break;
-            }
-        }
         // A require may already carry the extension (`require_relative 'foo.rb'`);
         // strip it so we don't build `foo.rb.rb`.
         let spec = spec.strip_suffix(".rb").unwrap_or(spec);
-        let fp = file_path.replace('\\', "/");
-        path_suffix_match(&fp, &format!("{spec}.rb"))
+        let Some(resolved) = resolve_relative_to_importer(importer_path, spec) else {
+            return false;
+        };
+        let fp = target_path.replace('\\', "/");
+        fp == format!("{resolved}.rb")
     }
 }
 
@@ -1122,23 +1169,54 @@ mod tests {
     }
 
     #[test]
-    fn ruby_resolver_matches_require_relative_path() {
+    fn ruby_resolver_anchors_require_to_importer_dir() {
         let r = resolver_for_language("ruby");
-        // `require_relative 'animal'` in cat.rb resolves to animal.rb.
-        assert!(r.resolves_to("import:animal", "ruby/src/animal.rb"));
-        assert!(r.resolves_to("import:./animal", "ruby/src/animal.rb"));
-        // Nested require path.
-        assert!(r.resolves_to("import:lib/animal", "app/lib/animal.rb"));
+        // `require_relative 'animal'` in cat.rb resolves to the sibling animal.rb.
+        assert!(r.resolves_to("import:animal", "ruby/src/cat.rb", "ruby/src/animal.rb"));
+        assert!(r.resolves_to("import:./animal", "ruby/src/cat.rb", "ruby/src/animal.rb"));
+        // Nested require path, relative to the importer's dir.
+        assert!(r.resolves_to("import:lib/animal", "app/main.rb", "app/lib/animal.rb"));
         // A require that already carries the extension must not become foo.rb.rb.
-        assert!(r.resolves_to("import:animal.rb", "ruby/src/animal.rb"));
-        // Parent-relative require: leading ../ is stripped, suffix still matches.
-        assert!(r.resolves_to("import:../lib/animal", "app/lib/animal.rb"));
+        assert!(r.resolves_to("import:animal.rb", "ruby/src/cat.rb", "ruby/src/animal.rb"));
+        // Parent-relative require is resolved *through* ../, not merely stripped.
+        assert!(r.resolves_to(
+            "import:../lib/animal",
+            "app/src/main.rb",
+            "app/lib/animal.rb"
+        ));
         // Different stem must not match.
-        assert!(!r.resolves_to("import:animal", "ruby/src/cat.rb"));
+        assert!(!r.resolves_to("import:animal", "ruby/src/cat.rb", "ruby/src/cat.rb"));
         // A subpath must actually constrain the match.
-        assert!(!r.resolves_to("import:lib/animal", "app/other/animal.rb"));
+        assert!(!r.resolves_to("import:lib/animal", "app/main.rb", "app/other/animal.rb"));
         // A bare import prefix or malformed spec resolves to nothing.
-        assert!(!r.resolves_to("animal", "ruby/src/animal.rb"));
+        assert!(!r.resolves_to("animal", "ruby/src/cat.rb", "ruby/src/animal.rb"));
+        // Determinism (#613): a same-named file under an unrelated root must NOT
+        // match, even though the bare stem is identical. This is the transitive
+        // false-positive class the fixpoint would otherwise compound.
+        assert!(!r.resolves_to("import:animal", "ruby/src/cat.rb", "pkg/other/animal.rb"));
+    }
+
+    #[test]
+    fn cpp_and_objc_anchor_quoted_include_to_importer_dir() {
+        // `#include "util.h"` in src/net/client.c resolves to src/net/util.h.
+        let cpp = resolver_for_language("cpp");
+        assert!(cpp.resolves_to("import:util.h", "src/net/client.c", "src/net/util.h"));
+        // Parent-relative include is resolved through ../.
+        assert!(cpp.resolves_to("import:../util.h", "src/net/client.c", "src/util.h"));
+        // Angle-bracket system/framework header never maps to a project file.
+        assert!(!cpp.resolves_to("import:<stdio.h>", "src/net/client.c", "src/net/stdio.h"));
+        // A same-named header under an unrelated dir must NOT match (#613).
+        assert!(!cpp.resolves_to("import:util.h", "src/net/client.c", "src/other/util.h"));
+
+        // Objective-C shares the C/C++ resolver: `#import "Model.h"` is
+        // importer-relative. Before this it fell through to NoopResolver and
+        // Objective-C had no Phase-2 blast radius at all.
+        let objc = resolver_for_language("objectivec");
+        assert!(objc.resolves_to("import:Model.h", "app/View.m", "app/Model.h"));
+        assert!(!objc.resolves_to("import:Model.h", "app/View.m", "vendor/Model.h"));
+        // The plugin-protocol "objc" alias resolves to the same resolver.
+        let objc_alias = resolver_for_language("objc");
+        assert!(objc_alias.resolves_to("import:Model.h", "app/View.m", "app/Model.h"));
     }
 
     #[test]

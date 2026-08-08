@@ -2770,6 +2770,36 @@ LIMIT 20",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Return every import node as `(id, signature, language, path)`.
+    /// `path` is the importing file (the import node's own VName path), which
+    /// the query-time `ImportResolver`s use to anchor relative imports.
+    /// Used by `get_blast_radius` (Phase 2) to build an in-memory index once per
+    /// call, so transitive resolution never issues a per-file FTS lookup (#613).
+    pub fn import_nodes_lite(&self) -> Result<Vec<(NodeId, String, String, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(NodeId, String, String, String)>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, signature, language, path FROM nodes WHERE kind = 'import'")
+                .context("preparing import_nodes_lite query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        i64_to_node_id(row.get::<_, i64>(0)?),
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .context("executing import_nodes_lite query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding import_nodes_lite row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Return all (src_path, dst_path) pairs via the two-hop import chain:
     /// any_node --[depends]--> import_node --[resolves-to]--> file.
     /// src_path is the path of the node making the import (any kind: file, function, etc.).
@@ -9167,6 +9197,30 @@ mod tests {
             stage_results.len(),
             "staging+flush FTS must return same results as row-by-row"
         );
+    }
+
+    #[test]
+    fn import_nodes_lite_returns_only_import_rows_with_fields() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // One import node (importer path carried in VName::path) and one non-import.
+        let import = Node::new(
+            VName::new("c", "", "ruby/src/cat.rb", "ruby", "import:animal"),
+            "import",
+        );
+        let func = Node::new(
+            VName::new("c", "", "ruby/src/cat.rb", "ruby", "fn:cat"),
+            "function",
+        );
+        store.put_node(&import).unwrap();
+        store.put_node(&func).unwrap();
+
+        let rows = store.import_nodes_lite().unwrap();
+        assert_eq!(rows.len(), 1, "only the import node must be returned");
+        let (id, sig, lang, path) = &rows[0];
+        assert_eq!(*id, import.id);
+        assert_eq!(sig, "import:animal");
+        assert_eq!(lang, "ruby");
+        assert_eq!(path, "ruby/src/cat.rb", "path must be the importing file");
     }
 
     #[test]
