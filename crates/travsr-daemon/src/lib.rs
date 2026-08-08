@@ -2680,6 +2680,12 @@ fn arm_phase_b_if_pending(
         .ok()
         .flatten()
         .unwrap_or_default();
+    // #583: deliberately not armed by `phase_b_dirty`. Phase B is whole-project
+    // (a full `rust-analyzer lsif .` plus the SCIP sidecars, ~40-60s regardless
+    // of which file changed), so arming it per watcher reindex means
+    // near-continuous whole-project analysis while editing, on possibly
+    // non-compiling code that yields degraded LSIF. Phase B stays commit-gated;
+    // `phase_b_dirty` reports the degradation instead of acting on it.
     if !last.is_empty() && last != pb {
         sched.arm_immediate();
     }
@@ -2844,6 +2850,9 @@ fn run_background_phase_b_inner(
     // be retried once the user installs the missing tool or clears disk space.
     if report.crashed.is_empty() {
         let _ = s.set_meta("phase_b_commit", &target_sha);
+        // #583: the semantic layer now matches the working tree again. Left set
+        // on a crash so the next tick retries, same as `phase_b_commit`.
+        let _ = s.set_meta("phase_b_dirty", "0");
     }
 
     let outcome = if report.crashed.is_empty() {
@@ -3124,6 +3133,15 @@ pub fn reindex_files(
         if let Ok(sha) = read_head_commit_sha(repo_root) {
             let _ = store.set_meta("last_commit", &sha);
         }
+
+        // #583: rewriting a file's Phase A nodes drops that file's Phase B
+        // `ref/call` edges. On the commit path `last_commit` moves and
+        // `last != phase_b` catches it; on the watcher path HEAD never moves,
+        // so the two markers stay equal while the graph is degraded below the
+        // committed snapshot. Record that here so `travsr status` can say so
+        // instead of reporting `complete`. Cleared by the next completed Phase
+        // B run, which is still commit-gated on purpose.
+        let _ = store.set_meta("phase_b_dirty", "1");
 
         // Recompute k-core shell numbers so they stay fresh after every commit.
         // O(V + E) — fast enough to run inline on the hook path at MVP scale.
@@ -4955,6 +4973,100 @@ mod tests {
         assert!(
             results.is_empty(),
             "old class node must be deleted after reindex"
+        );
+    }
+
+    /// #583: a reindex that rewrites a file's Phase A nodes also drops that
+    /// file's Phase B `ref/call` edges, and on the watcher path HEAD never
+    /// moves, so `last_commit` cannot signal it. `reindex_files` must record
+    /// the staleness itself, and only when something actually changed.
+    #[test]
+    fn reindex_files_flags_phase_b_dirty_only_when_content_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let ts_path = tmp.path().join("svc.ts");
+        std::fs::write(&ts_path, "export class OldSvc { foo() {} }").unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("1"),
+            "first index of a file must flag Phase B as stale"
+        );
+
+        // A completed Phase B run clears the flag.
+        store.set_meta("phase_b_dirty", "0").unwrap();
+
+        // Re-running over unchanged content must not re-flag: the hash guard
+        // means nothing was rewritten, so the semantic layer is still valid.
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("0"),
+            "an unchanged file must not flag Phase B as stale"
+        );
+
+        // Editing it must flag again. This is the #583 path.
+        std::fs::write(&ts_path, "export class NewSvc { bar() {} }").unwrap();
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("1"),
+            "a changed file must flag Phase B as stale"
+        );
+    }
+
+    /// #583 review: the flag can be set while the working tree is *clean*.
+    ///
+    /// The motivating cases (branch switch, `git stash pop`, revert) all end
+    /// with the file back at its committed content, so `git status` is clean
+    /// and there is nothing to stage — but the reindex in between already
+    /// dropped that file's `ref/call` edges, and the flag is still set. That
+    /// combination is why `travsr status` names the condition rather than
+    /// telling the user to commit: at this point `git commit` reports
+    /// "nothing to commit" and the user is stuck.
+    #[test]
+    fn reindex_files_flags_phase_b_dirty_even_when_the_tree_ends_up_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let ts_path = tmp.path().join("svc.ts");
+        let committed = "export class OldSvc { foo() {} }";
+        std::fs::write(&ts_path, committed).unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        // Index the committed content, then let a Phase B run settle.
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+
+        // Edit and reindex — the watcher path. Phase A nodes are rewritten.
+        std::fs::write(&ts_path, "export class NewSvc { bar() {} }").unwrap();
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap(); // pretend a run cleared it
+
+        // Now revert to the committed content and reindex again, which is what
+        // `git checkout <file>` / `stash pop` / a branch switch produce. The
+        // tree is clean afterwards, yet the content changed relative to what is
+        // indexed, so the semantic layer is degraded and must say so.
+        std::fs::write(&ts_path, committed).unwrap();
+        reindex_files(std::slice::from_ref(&ts_path), tmp.path(), &mut store).unwrap();
+        assert_eq!(
+            store.get_meta("phase_b_dirty").unwrap().as_deref(),
+            Some("1"),
+            "a revert back to committed content still degrades Phase B, so the \
+             flag must be set even though the working tree is now clean"
         );
     }
 

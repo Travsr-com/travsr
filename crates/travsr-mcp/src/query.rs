@@ -199,6 +199,13 @@ pub struct StatusPayload {
     /// old JSON → empty.
     #[serde(default)]
     pub rerank: String,
+    /// #583: a watcher reindex rewrote a file's Phase A nodes, dropping that
+    /// file's `ref/call` edges, without moving HEAD. `last_commit` and
+    /// `phase_b_commit` therefore still agree even though the semantic layer
+    /// is degraded below the committed snapshot. Old daemons omit the field
+    /// (serde default false), which reads as the pre-#583 behaviour.
+    #[serde(default)]
+    pub phase_b_dirty: bool,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -220,6 +227,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         phase_b_warnings: store.get_meta("phase_b_warnings")?,
         rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
         rerank: crate::rerank::rerank_status().to_string(),
+        phase_b_dirty: store.get_meta("phase_b_dirty")?.as_deref() == Some("1"),
     })
 }
 

@@ -10,6 +10,39 @@ use travsr_mcp::query::{self, StatusPayload};
 use crate::daemon_client;
 use crate::repo::find_git_root;
 
+/// M7: compare `last_commit` vs `phase_b_commit` to describe Phase B freshness.
+///
+/// #583: equal markers are not sufficient evidence of freshness. A watcher
+/// reindex rewrites a file's Phase A nodes and drops that file's `ref/call`
+/// edges without moving HEAD, so both markers still agree while `get_callers`
+/// and `get_blast_radius` answer from a graph degraded below the committed
+/// snapshot. Reporting `complete` there is the actual harm; the edges
+/// themselves return on the next commit's Phase B run.
+///
+/// The dirty flag therefore only changes the verdict inside that one window.
+/// Once the markers diverge, `pending` already tells the user a run is coming.
+///
+/// The wording names the condition, not a remedy, because there is no single
+/// correct remedy. The motivating cases (branch switch, `git stash pop`,
+/// revert) all restore the file to its committed content, so the working tree
+/// ends up equal to HEAD with the flag still set and the `ref/call` edge still
+/// missing. Telling the user to commit is a dead end there: there is nothing
+/// to stage. Recovery is `travsr init`, or any later commit that fires the
+/// hook.
+fn phase_b_state(payload: &StatusPayload) -> &'static str {
+    match payload.phase_b_commit.as_deref() {
+        Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
+            if payload.phase_b_dirty {
+                "stale (needs Phase B refresh)"
+            } else {
+                "complete"
+            }
+        }
+        Some(pb) if !pb.is_empty() => "pending",
+        _ => "not run",
+    }
+}
+
 pub fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = find_git_root(&cwd)?;
@@ -31,12 +64,7 @@ pub fn run() -> anyhow::Result<()> {
         };
 
     let last_commit = payload.last_commit.as_deref().unwrap_or("(none)");
-    // M7: compare last_commit vs phase_b_commit to show Phase B freshness.
-    let phase_b_state = match payload.phase_b_commit.as_deref() {
-        Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => "complete",
-        Some(pb) if !pb.is_empty() => "pending",
-        _ => "not run",
-    };
+    let phase_b_state = phase_b_state(&payload);
     // RFC-021 P5: reranker state. Old daemons omit the field (serde default
     // empty) — suppress the segment then so mixed CLI/daemon versions stay clean.
     let rerank_segment = if payload.rerank.is_empty() {
@@ -134,4 +162,54 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {
+        StatusPayload {
+            nodes: 1,
+            fts_nodes: 1,
+            edges: 0,
+            schema: 21,
+            journal: "wal".into(),
+            last_commit: Some(last.to_string()),
+            signature_format_version: travsr_core::SIGNATURE_FORMAT_VERSION,
+            phase_b_commit: Some(phase_b.to_string()),
+            phase_b_warnings: None,
+            rust_lsif_degraded: None,
+            rerank: String::new(),
+            phase_b_dirty: dirty,
+        }
+    }
+
+    #[test]
+    fn phase_b_reports_complete_when_markers_agree_and_nothing_is_dirty() {
+        assert_eq!(phase_b_state(&payload("abc", "abc", false)), "complete");
+    }
+
+    #[test]
+    fn phase_b_reports_stale_when_a_watcher_reindex_degraded_the_graph() {
+        // #583: the exact window this PR exists for. Both markers agree, so the
+        // old logic said `complete`, but the file's `ref/call` edges are gone.
+        assert_eq!(
+            phase_b_state(&payload("abc", "abc", true)),
+            "stale (needs Phase B refresh)"
+        );
+    }
+
+    #[test]
+    fn phase_b_still_reports_pending_when_markers_diverge() {
+        // A run is already coming, so "commit to refresh" would be wrong
+        // advice. The dirty flag must not override this.
+        assert_eq!(phase_b_state(&payload("def", "abc", false)), "pending");
+        assert_eq!(phase_b_state(&payload("def", "abc", true)), "pending");
+    }
+
+    #[test]
+    fn phase_b_reports_not_run_before_the_first_run() {
+        assert_eq!(phase_b_state(&payload("abc", "", true)), "not run");
+    }
 }
