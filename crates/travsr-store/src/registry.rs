@@ -14,6 +14,60 @@ pub fn registry_path() -> PathBuf {
     home_dir().join(".travsr").join("registry.json")
 }
 
+/// SEC (#507, Windows): mirror the Unix owner-only restriction via `icacls`,
+/// following the daemon's graph.db pattern. `/inheritance:r` strips all
+/// inherited ACEs; `/grant:r` re-grants to the current user only —
+/// `(OI)(CI)F` on directories so children inherit the restriction, plain `F`
+/// on files. `USERDOMAIN\USERNAME` avoids ambiguity on domain-joined
+/// machines. Best-effort with loud warnings, matching the Unix branches.
+#[cfg(windows)]
+fn restrict_to_owner_windows(path: &Path) {
+    let Some(path_str) = path.to_str() else {
+        tracing::warn!(
+            path = %path.display(),
+            "path is not valid UTF-8 — skipping icacls permission restriction"
+        );
+        return;
+    };
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            "USERNAME env var not set — skipping permission restriction on Windows"
+        );
+        return;
+    }
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    let account = if domain.is_empty() {
+        user
+    } else {
+        format!("{domain}\\{user}")
+    };
+    let grant = if path.is_dir() {
+        format!("{account}:(OI)(CI)F")
+    } else {
+        format!("{account}:(F)")
+    };
+    let status = std::process::Command::new("icacls")
+        .args([path_str, "/inheritance:r", "/grant:r", &grant])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => tracing::warn!(
+            path = %path.display(),
+            exit_code = ?s.code(),
+            "icacls failed to restrict permissions — may be readable by other users on this machine"
+        ),
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            err = %e,
+            "icacls not available — permissions not restricted on Windows"
+        ),
+    }
+}
+
 /// Register `repo_name → db_path` in the global registry.
 ///
 /// Reads the existing registry (or starts fresh if missing), upserts the
@@ -41,6 +95,9 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
             );
         }
     }
+    // SEC (#507): Windows equivalent of the 0o700 restriction above.
+    #[cfg(windows)]
+    restrict_to_owner_windows(travsr_home);
 
     // M1: serialize concurrent `travsr init` registry writes with an exclusive
     // flock on registry.lock. The atomic rename protects against crash-corruption
@@ -183,6 +240,10 @@ fn write_registry_atomic(path: &Path, repos: &HashMap<String, PathBuf>) -> anyho
             );
         }
     }
+    // SEC (#507): Windows equivalent of the 0o600 restriction above — the
+    // registry lists every indexed repo path, same sensitivity as graph.db.
+    #[cfg(windows)]
+    restrict_to_owner_windows(path);
     Ok(())
 }
 

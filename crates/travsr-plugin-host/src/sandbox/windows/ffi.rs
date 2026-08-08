@@ -1,11 +1,14 @@
-//! Unsafe Win32 FFI wrappers for AppContainer + Job Object sandbox (RFC-014).
-//! All `unsafe` blocks in travsr-plugin-host are confined to this file.
+//! Unsafe Win32 FFI wrappers for AppContainer + Job Object sandbox (ADR-017).
+//! All `unsafe` blocks in travsr-plugin-host are confined to this file
+//! (sanctioned by ADR-017 Amendment A2, which records the confinement,
+//! encapsulation, and verification invariants this file must uphold).
 #![allow(unsafe_code)]
 #![allow(clippy::io_other_error)]
 
 use std::io;
 use std::path::Path;
 
+use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
     HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_FAILED,
@@ -19,8 +22,9 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, DACL_SECURITY_INFORMATION, PSID,
-    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    CreateWellKnownSid, EqualSid, FreeSid, GetAce, WinCapabilityInternetClientSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    OBJECT_INHERIT_ACE, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::System::JobObjects::{
@@ -33,16 +37,20 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, GetProcessId,
-    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, IO_COUNTERS, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, IO_COUNTERS,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 // ── Access masks ──────────────────────────────────────────────────────────────
 
 pub(super) const ACCESS_GENERIC_READ: u32 = 0x8000_0000;
 pub(super) const ACCESS_GENERIC_ALL: u32 = 0x1000_0000;
+/// Read + execute (GENERIC_READ | GENERIC_EXECUTE): the minimum an
+/// AppContainer token needs to map and run a program image (PR #577 review).
+pub(super) const ACCESS_GENERIC_READ_EXECUTE: u32 = 0x8000_0000 | 0x2000_0000;
 
 // ── SE_GROUP_ENABLED for capability SID attributes ────────────────────────────
 
@@ -51,8 +59,26 @@ const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 // ── Job Object limits (ADR-017 Rule 1) ────────────────────────────────────────
 
 const JOB_MEMORY_LIMIT: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
-const JOB_TIME_LIMIT: i64 = 3_000_000_000; // 300 s in 100-ns intervals
 const JOB_ACTIVE_PROC_LIMIT: u32 = 64;
+
+/// #504: per-job user CPU time cap, in 100-ns intervals.
+///
+/// `PerJobUserTimeLimit` accumulates CPU time across every thread of every
+/// process in the job. The old flat 300 s was chosen as a wall-clock analogue
+/// of the transport's `INVOKE_TIMEOUT_SECS`, so a multithreaded Phase B pass
+/// on 8 cores burned it in ~40 s of wall time and Windows terminated the
+/// whole job (PluginCrashed, faster machines failing sooner). Scaling by the
+/// logical core count restores the intended meaning — the cap cannot fire
+/// before ~300 s of wall time even at full parallelism, so it only catches a
+/// genuine runaway spin the transport watchdog has not already killed.
+fn job_cpu_time_limit() -> i64 {
+    const BASE_SECS: i64 = 300;
+    const HUNDRED_NS_PER_SEC: i64 = 10_000_000;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as i64)
+        .unwrap_or(1);
+    BASE_SECS * cores * HUNDRED_NS_PER_SEC
+}
 
 // ── SECURITY_MAX_SID_SIZE ─────────────────────────────────────────────────────
 
@@ -229,7 +255,54 @@ pub(super) fn ensure_appcontainer_profile(profile_name: &str) -> io::Result<()> 
     Ok(())
 }
 
+/// ACE type byte for `ACCESS_ALLOWED_ACE` (Win32 `ACCESS_ALLOWED_ACE_TYPE`).
+const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
+
+/// #505: true when `dacl` already carries an inheritable allow ACE for `sid`
+/// whose mask covers `access_mask`.
+///
+/// # Safety
+/// `dacl` must be null or a valid, readable `ACL` (as returned by
+/// `GetNamedSecurityInfoW`); `sid` must be a valid SID.
+unsafe fn dacl_has_inheritable_allow_ace(dacl: *const ACL, sid: PSID, access_mask: u32) -> bool {
+    if dacl.is_null() {
+        return false;
+    }
+    const INHERIT_BOTH: u8 = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
+    for i in 0..u32::from((*dacl).AceCount) {
+        let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        if GetAce(dacl, i, &mut ace_ptr) == 0 {
+            continue;
+        }
+        let header = ace_ptr as *const ACE_HEADER;
+        if (*header).AceType != ACE_TYPE_ACCESS_ALLOWED {
+            continue;
+        }
+        if (*header).AceFlags & INHERIT_BOTH != INHERIT_BOTH {
+            continue;
+        }
+        let ace = ace_ptr as *const ACCESS_ALLOWED_ACE;
+        if (*ace).Mask & access_mask != access_mask {
+            continue;
+        }
+        let ace_sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
+        if EqualSid(ace_sid, sid) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Adds an allow ACE for `sid` with `access_mask` to the DACL of `path`.
+///
+/// #505: idempotent. `SetNamedSecurityInfoW` with an inheritable ACE
+/// propagates through the whole subtree — a full DACL rewrite of every file
+/// under `path`. The AppContainer profile SID is deterministic per repo, so
+/// once the grant exists this returns after a single security-descriptor
+/// read instead of re-churning the tree on every sidecar spawn (minutes on a
+/// monorepo, permanent MFT/USN write traffic, EDR alarms). Exactly one ACE
+/// per (repo, SID, mask) persists on the tree; it is intentionally left in
+/// place across spawns — see the issue for the uninstall-cleanup discussion.
 pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io::Result<()> {
     let path_wide = path_to_wide(path);
 
@@ -259,6 +332,11 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
         }
     }
     let _sd_guard = SdGuard(sd);
+
+    // #505: grant already present → skip the subtree rewrite entirely.
+    if unsafe { dacl_has_inheritable_allow_ace(old_dacl, sid, access_mask) } {
+        return Ok(());
+    }
 
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access_mask,
@@ -305,17 +383,39 @@ pub(super) fn grant_path_access(path: &Path, sid: PSID, access_mask: u32) -> io:
     Ok(())
 }
 
+/// #499: owns the storage a `SECURITY_CAPABILITIES` points into, so the
+/// self-referential pointers stay valid however the value is moved.
+///
+/// `caps.Capabilities` points at the boxed `SID_AND_ATTRIBUTES`, whose `Sid`
+/// points at the boxed SID buffer. Box gives both stable heap addresses:
+/// moving `OwnedSecurityCapabilities` moves only the box pointers, never the
+/// pointees. `AppContainerSid` is caller-owned and not covered here.
+pub(super) struct OwnedSecurityCapabilities {
+    _sid_buf: Option<Box<[u8; SECURITY_MAX_SID_SIZE]>>,
+    _cap_attr: Option<Box<SID_AND_ATTRIBUTES>>,
+    caps: SECURITY_CAPABILITIES,
+}
+
+impl OwnedSecurityCapabilities {
+    /// The `SECURITY_CAPABILITIES` to hand to `UpdateProcThreadAttribute`.
+    /// Valid for as long as `self` is alive (PSE R5).
+    pub(super) fn caps(&self) -> &SECURITY_CAPABILITIES {
+        &self.caps
+    }
+}
+
 /// Builds `SECURITY_CAPABILITIES` for Standard or Elevated policy.
+///
+/// #499: previously returned `(sid_buf, cap_attr, caps)` by value, which
+/// moved the buffers while `caps` kept pointers into the callee's dead stack
+/// frame — every Elevated spawn read freed memory. The capability data is now
+/// heap-pinned before the internal pointers are taken.
 pub(super) fn build_security_capabilities(
     container_sid: PSID,
     elevated: bool,
-) -> io::Result<(
-    [u8; SECURITY_MAX_SID_SIZE],
-    Option<SID_AND_ATTRIBUTES>,
-    SECURITY_CAPABILITIES,
-)> {
+) -> io::Result<OwnedSecurityCapabilities> {
     if elevated {
-        let mut sid_buf = [0u8; SECURITY_MAX_SID_SIZE];
+        let mut sid_buf = Box::new([0u8; SECURITY_MAX_SID_SIZE]);
         let mut sid_size = SECURITY_MAX_SID_SIZE as u32;
         let ok = unsafe {
             CreateWellKnownSid(
@@ -328,25 +428,32 @@ pub(super) fn build_security_capabilities(
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        let cap_attr = SID_AND_ATTRIBUTES {
+        let cap_attr = Box::new(SID_AND_ATTRIBUTES {
             Sid: sid_buf.as_ptr() as PSID,
             Attributes: SE_GROUP_ENABLED,
-        };
+        });
         let caps = SECURITY_CAPABILITIES {
             AppContainerSid: container_sid,
-            Capabilities: &cap_attr as *const SID_AND_ATTRIBUTES as *mut SID_AND_ATTRIBUTES,
+            Capabilities: &*cap_attr as *const SID_AND_ATTRIBUTES as *mut SID_AND_ATTRIBUTES,
             CapabilityCount: 1,
             Reserved: 0,
         };
-        Ok((sid_buf, Some(cap_attr), caps))
+        Ok(OwnedSecurityCapabilities {
+            _sid_buf: Some(sid_buf),
+            _cap_attr: Some(cap_attr),
+            caps,
+        })
     } else {
-        let caps = SECURITY_CAPABILITIES {
-            AppContainerSid: container_sid,
-            Capabilities: std::ptr::null_mut(),
-            CapabilityCount: 0,
-            Reserved: 0,
-        };
-        Ok(([0u8; SECURITY_MAX_SID_SIZE], None, caps))
+        Ok(OwnedSecurityCapabilities {
+            _sid_buf: None,
+            _cap_attr: None,
+            caps: SECURITY_CAPABILITIES {
+                AppContainerSid: container_sid,
+                Capabilities: std::ptr::null_mut(),
+                CapabilityCount: 0,
+                Reserved: 0,
+            },
+        })
     }
 }
 
@@ -366,7 +473,7 @@ pub(super) fn create_job_with_limits() -> io::Result<OwnedJobHandle> {
     let jeli = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
         BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
             PerProcessUserTimeLimit: 0,
-            PerJobUserTimeLimit: JOB_TIME_LIMIT,
+            PerJobUserTimeLimit: job_cpu_time_limit(),
             LimitFlags: limit_flags,
             MinimumWorkingSetSize: 0,
             MaximumWorkingSetSize: 0,
@@ -450,15 +557,35 @@ fn build_command_line(program: &str, args: &[String]) -> String {
     line
 }
 
+/// Insert or (case-insensitively, matching Windows env-name semantics)
+/// overwrite an entry, so the final block never carries duplicate names.
+fn upsert_env(entries: &mut Vec<(String, String)>, key: &str, val: String) {
+    if let Some(e) = entries
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+    {
+        e.1 = val;
+    } else {
+        entries.push((key.to_string(), val));
+    }
+}
+
 /// Build a UTF-16 double-null-terminated environment block.
-/// Contains an allowlist of non-sensitive parent variables plus
-/// TEMP/TMP/TMPDIR forced to `scratch_dir` (PSE R2).
+/// Contains an allowlist of non-sensitive parent variables, the language's
+/// toolchain env passthrough (#501), `~/.travsr/bin` prepended to `PATH`
+/// (#501), and TEMP/TMP/TMPDIR forced to `scratch_dir` (PSE R2).
 ///
 /// SYSTEMROOT, SystemDrive, COMPUTERNAME, OS, PROCESSOR_ARCHITECTURE are
 /// included because the Windows AppContainer setup path expands %SYSTEMROOT%
 /// internally using the child env block; omitting them causes CreateProcessW
 /// to fail with ERROR_ENVVAR_NOT_FOUND (203).
-pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
+///
+/// #501: this explicit block replaces the child env entirely — nothing is
+/// inherited. Toolchain env (JAVA_HOME/GOPATH/GRADLE_USER_HOME/…) must
+/// therefore be forwarded here, mirroring what linux.rs and macos.rs do for
+/// their cleared sandbox envs; without it the sandbox ACL-grants the cache
+/// directories but the analyzer has no variables telling it where they are.
+pub(super) fn build_env_block(scratch_dir: &Path, toolchain_env: &[(String, String)]) -> Vec<u16> {
     const ALLOWLIST: &[&str] = &[
         // Shell / locale
         "PATH",
@@ -481,20 +608,48 @@ pub(super) fn build_env_block(scratch_dir: &Path) -> Vec<u16> {
         "APPDATA",
         "PUBLIC",
     ];
-    let scratch = scratch_dir.to_string_lossy().to_string();
-    let mut block: Vec<u16> = Vec::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
 
     for var in ALLOWLIST {
         if let Ok(val) = std::env::var(var) {
-            let entry = format!("{var}={val}");
-            block.extend(entry.encode_utf16());
-            block.push(0);
+            upsert_env(&mut entries, var, val);
         }
     }
-    // TEMP/TMP/TMPDIR → scratch dir (PSE R2: child may only write to scratch)
+
+    // #501: per-language toolchain env so the analyzer's build tool can locate
+    // the caches the sandbox ACL-grants (windows.rs grants the paths).
+    for (key, val) in toolchain_env {
+        upsert_env(&mut entries, key, val.clone());
+    }
+
+    // #501: prepend ~/.travsr/bin so tools installed by `travsr lang install`
+    // (e.g. scip-java, scip-go) resolve inside the sandbox.
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let travsr_bin = format!("{profile}\\.travsr\\bin");
+        let base = entries
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let joined = if base.is_empty() {
+            travsr_bin
+        } else {
+            format!("{travsr_bin};{base}")
+        };
+        upsert_env(&mut entries, "PATH", joined);
+    }
+
+    // TEMP/TMP/TMPDIR → scratch dir (PSE R2: child may only write to scratch).
+    // Applied last so nothing above — toolchain env included — can redirect
+    // the child's temp dir outside the scratch grant.
+    let scratch = scratch_dir.to_string_lossy().to_string();
     for var in &["TEMP", "TMP", "TMPDIR"] {
-        let entry = format!("{var}={scratch}");
-        block.extend(entry.encode_utf16());
+        upsert_env(&mut entries, var, scratch.clone());
+    }
+
+    let mut block: Vec<u16> = Vec::new();
+    for (key, val) in &entries {
+        block.extend(format!("{key}={val}").encode_utf16());
         block.push(0);
     }
     block.push(0); // final double-null terminator
@@ -572,14 +727,15 @@ pub(super) fn handle_into_read_file(h: OwnedHandle) -> std::fs::File {
 /// Spawn `program` with `args` inside an AppContainer + Job Object.
 ///
 /// # Safety contract (PSE R5)
-/// `security_caps` must remain alive on the caller's stack until this function
-/// returns. The `_cap_sid_buf` and `_cap_attr` from `build_security_capabilities`
-/// must be bound as named locals in the calling frame.
+/// `security_caps` must come from a live `OwnedSecurityCapabilities` (#499):
+/// the owner heap-pins the capability SID and `SID_AND_ATTRIBUTES` storage the
+/// struct points into, and must outlive this call.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_in_appcontainer(
     program: &str,
     args: &[String],
     scratch_dir: &Path,
+    toolchain_env: &[(String, String)],
     security_caps: &SECURITY_CAPABILITIES,
     job: OwnedJobHandle,
     stdin_mode: StdioMode,
@@ -781,7 +937,7 @@ pub(super) fn spawn_in_appcontainer(
     let cmdline = build_command_line(program, args);
     let mut cmdline_wide = to_wide(&cmdline);
     let scratch_wide = path_to_wide(scratch_dir);
-    let mut env_block = build_env_block(scratch_dir);
+    let mut env_block = build_env_block(scratch_dir, toolchain_env);
 
     // ── 5. CreateProcessW ─────────────────────────────────────────────────────
     // PSE R3: CREATE_NO_WINDOW | PSE R2: CREATE_UNICODE_ENVIRONMENT
@@ -881,5 +1037,573 @@ pub(super) fn terminate_process(handle: HANDLE) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// #500: true if a process with `pid` is currently running.
+///
+/// Opens the process with `PROCESS_QUERY_LIMITED_INFORMATION` (works for
+/// non-child processes and across integrity levels) and checks
+/// `GetExitCodeProcess` for `STILL_ACTIVE`. Returns `false` when the PID
+/// cannot be opened (already exited and reaped) or an exit code is recorded.
+/// Sends no signal. `pub(crate)`: `embed_catalog::pid_alive` delegates here so
+/// the daemon-shutdown grace poll can observe the sidecar, keeping all unsafe
+/// confined to this file.
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let handle = OwnedHandle(handle);
+    let mut code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(handle.as_handle(), &mut code) };
+    ok != 0 && code == STILL_ACTIVE as u32
+}
+
+/// Walk the `GetLogicalProcessorInformationEx(RelationProcessorCore)` buffer and
+/// count processor cores whose `EfficiencyClass` equals the maximum observed value.
+/// On homogeneous systems every core has the same class → returns total physical cores.
+/// On Intel hybrid (12th gen+) P-cores have a higher class than E-cores.
+///
+/// `pub(crate)`: `embed_catalog::p_core_count` delegates here (as with
+/// `pid_alive`), keeping all unsafe confined to this file per ADR-017
+/// Amendment A2 Invariant 1.
+pub(crate) fn windows_p_core_count() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+
+    // First call: discover required buffer size.
+    let mut buf_size: u32 = 0;
+    // SAFETY: passing null buffer is the documented way to query size.
+    unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            std::ptr::null_mut(),
+            &mut buf_size,
+        );
+    }
+    if buf_size == 0 {
+        return None;
+    }
+
+    let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
+    // SAFETY: buf is correctly sized from the previous call.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+            &mut buf_size,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    // Walk the variable-length buffer.  Each entry starts with a `Size` field
+    // that gives its own byte length (entries are not fixed-size).
+    let mut offset = 0usize;
+    let mut max_class: u8 = 0;
+    let mut class_counts: Vec<(u8, usize)> = Vec::new();
+
+    while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+        <= buf_size as usize
+    {
+        // SAFETY: we bounds-check before casting.
+        let entry = unsafe {
+            &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+        };
+        let entry_size = entry.Size as usize;
+        if entry_size == 0 || offset + entry_size > buf_size as usize {
+            break;
+        }
+        // SAFETY: Relationship == RelationProcessorCore, so the union field is Processor.
+        let efficiency_class = unsafe { entry.Anonymous.Processor.EfficiencyClass };
+        if efficiency_class > max_class {
+            max_class = efficiency_class;
+        }
+        match class_counts
+            .iter_mut()
+            .find(|(c, _)| *c == efficiency_class)
+        {
+            Some((_, n)) => *n += 1,
+            None => class_counts.push((efficiency_class, 1)),
+        }
+        offset += entry_size;
+    }
+
+    let p_count = class_counts
+        .iter()
+        .find(|(c, _)| *c == max_class)
+        .map(|(_, n)| *n)
+        .unwrap_or(0);
+    if p_count > 0 {
+        Some(p_count)
+    } else {
+        None
+    }
+}
+
+/// Best-effort AVAILABLE physical RAM in MiB via `GlobalMemoryStatusEx` →
+/// `ullAvailPhys`. Returns `None` on API failure — the caller falls back to
+/// skipping its RAM guard.
+///
+/// `pub(crate)`: `embed_catalog::available_memory_mb` delegates here (as with
+/// `pid_alive`), keeping all unsafe confined to this file per ADR-017
+/// Amendment A2 Invariant 1.
+pub(crate) fn available_physical_memory_mb() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut mem = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: mem is zero-initialised with dwLength correctly set.
+    if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 {
+        Some(mem.ullAvailPhys / (1024 * 1024))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Security::{EqualSid, IsValidSid};
+
+    fn well_known_sid() -> Box<[u8; SECURITY_MAX_SID_SIZE]> {
+        let mut buf = Box::new([0u8; SECURITY_MAX_SID_SIZE]);
+        let mut size = SECURITY_MAX_SID_SIZE as u32;
+        let ok = unsafe {
+            CreateWellKnownSid(
+                WinCapabilityInternetClientSid,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as PSID,
+                &mut size,
+            )
+        };
+        assert_ne!(ok, 0, "CreateWellKnownSid failed");
+        buf
+    }
+
+    /// #499 regression: the SECURITY_CAPABILITIES internal pointers must
+    /// target the owner's heap storage, so they survive the owner being
+    /// moved (returning it from build_security_capabilities was the bug).
+    #[test]
+    fn elevated_capability_pointers_survive_moves() {
+        let container = well_known_sid();
+        let owned = build_security_capabilities(container.as_ptr() as PSID, true).unwrap();
+
+        // Move the owner to a new address; heap pointees must not move.
+        let moved = Box::new(owned);
+        let caps = moved.caps();
+        assert_eq!(caps.CapabilityCount, 1);
+
+        let cap_attr_ptr = caps.Capabilities as *const SID_AND_ATTRIBUTES;
+        let expected_attr: &SID_AND_ATTRIBUTES = moved._cap_attr.as_ref().unwrap();
+        assert_eq!(
+            cap_attr_ptr, expected_attr as *const SID_AND_ATTRIBUTES,
+            "Capabilities must point at the owner's boxed SID_AND_ATTRIBUTES"
+        );
+
+        let sid_ptr = unsafe { (*cap_attr_ptr).Sid };
+        let expected_sid = moved._sid_buf.as_ref().unwrap().as_ptr() as PSID;
+        assert_eq!(
+            sid_ptr, expected_sid,
+            "capability Sid must point at the owner's boxed SID buffer"
+        );
+
+        assert_ne!(
+            unsafe { IsValidSid(sid_ptr) },
+            0,
+            "capability SID must be valid"
+        );
+        let reference = well_known_sid();
+        assert_ne!(
+            unsafe { EqualSid(sid_ptr, reference.as_ptr() as PSID) },
+            0,
+            "capability SID must be WinCapabilityInternetClientSid"
+        );
+    }
+
+    /// Standard (non-elevated) policy must carry no capability list at all.
+    #[test]
+    fn standard_capabilities_have_no_capability_list() {
+        let container = well_known_sid();
+        let owned = build_security_capabilities(container.as_ptr() as PSID, false).unwrap();
+        let caps = owned.caps();
+        assert_eq!(caps.CapabilityCount, 0);
+        assert!(caps.Capabilities.is_null());
+        assert_eq!(caps.AppContainerSid, container.as_ptr() as PSID);
+    }
+
+    // ── #501: build_env_block — toolchain env passthrough ──────────────────
+
+    fn decode_env_block(block: &[u16]) -> Vec<String> {
+        String::from_utf16_lossy(block)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn env_value<'a>(entries: &'a [String], key: &str) -> Option<&'a str> {
+        entries.iter().find_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            k.eq_ignore_ascii_case(key).then_some(v)
+        })
+    }
+
+    /// #501 regression: toolchain env must reach the child env block, and
+    /// ~/.travsr/bin must lead PATH — previously the fixed allowlist silently
+    /// dropped both, so Phase B analyzers could not find the caches the
+    /// sandbox had ACL-granted.
+    #[test]
+    fn env_block_forwards_toolchain_env_and_prepends_travsr_bin() {
+        let scratch = std::env::temp_dir();
+        let tc = vec![
+            ("GOPATH".to_string(), "C:\\test-gopath".to_string()),
+            ("JAVA_HOME".to_string(), "C:\\test-jdk".to_string()),
+        ];
+        let entries = decode_env_block(&build_env_block(&scratch, &tc));
+
+        assert_eq!(env_value(&entries, "GOPATH"), Some("C:\\test-gopath"));
+        assert_eq!(env_value(&entries, "JAVA_HOME"), Some("C:\\test-jdk"));
+
+        let profile = std::env::var("USERPROFILE").expect("USERPROFILE set on Windows");
+        let path = env_value(&entries, "PATH").expect("PATH present");
+        assert!(
+            path.starts_with(&format!("{profile}\\.travsr\\bin")),
+            "PATH must start with ~/.travsr/bin, got: {path}"
+        );
+
+        // Allowlisted system vars still present (AppContainer setup needs them).
+        assert!(env_value(&entries, "SYSTEMROOT").is_some());
+    }
+
+    /// PSE R2 must win over toolchain env: TEMP/TMP/TMPDIR always point at the
+    /// scratch dir even if a toolchain entry tries to redirect them.
+    #[test]
+    fn env_block_scratch_temp_overrides_toolchain_env() {
+        let scratch = std::env::temp_dir();
+        let scratch_s = scratch.to_string_lossy().to_string();
+        let tc = vec![("TEMP".to_string(), "C:\\somewhere-else".to_string())];
+        let entries = decode_env_block(&build_env_block(&scratch, &tc));
+
+        for var in ["TEMP", "TMP", "TMPDIR"] {
+            assert_eq!(
+                env_value(&entries, var),
+                Some(scratch_s.as_str()),
+                "{var} must be forced to the scratch dir"
+            );
+        }
+    }
+
+    // ── #505: grant_path_access idempotence ─────────────────────────────────
+
+    /// DACL of a path plus the guard keeping its backing SD allocation alive.
+    struct DaclHandle {
+        dacl: *mut ACL,
+        sd: HLOCAL,
+    }
+    impl Drop for DaclHandle {
+        fn drop(&mut self) {
+            if !self.sd.is_null() {
+                unsafe { LocalFree(self.sd) };
+            }
+        }
+    }
+
+    fn read_dacl(path: &Path) -> DaclHandle {
+        let path_wide = to_wide(&path.to_string_lossy());
+        let mut dacl = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        let err = unsafe {
+            GetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(err, ERROR_SUCCESS, "GetNamedSecurityInfoW failed");
+        DaclHandle {
+            dacl,
+            sd: sd as HLOCAL,
+        }
+    }
+
+    /// #505 regression: a repeated grant must detect the existing ACE and
+    /// skip the subtree DACL rewrite — previously every sidecar spawn
+    /// re-propagated ACLs across the entire repo tree.
+    #[test]
+    fn grant_path_access_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("travsr-acl-505-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sid = derive_appcontainer_sid("travsr-test-505-acl").expect("derive sid");
+
+        // Before any grant: the ACE must not be reported present.
+        {
+            let h = read_dacl(&dir);
+            assert!(
+                !unsafe {
+                    dacl_has_inheritable_allow_ace(h.dacl, sid.as_psid(), ACCESS_GENERIC_READ)
+                },
+                "fresh dir must not carry the AppContainer ACE"
+            );
+        }
+
+        grant_path_access(&dir, sid.as_psid(), ACCESS_GENERIC_READ).expect("first grant");
+
+        // After the grant: detectable, so the second grant takes the skip
+        // path and the ACE count stays put.
+        let count_after_first = {
+            let h = read_dacl(&dir);
+            assert!(
+                unsafe {
+                    dacl_has_inheritable_allow_ace(h.dacl, sid.as_psid(), ACCESS_GENERIC_READ)
+                },
+                "granted ACE must be detected on re-read"
+            );
+            unsafe { (*h.dacl).AceCount }
+        };
+
+        grant_path_access(&dir, sid.as_psid(), ACCESS_GENERIC_READ).expect("second grant");
+        let count_after_second = {
+            let h = read_dacl(&dir);
+            unsafe { (*h.dacl).AceCount }
+        };
+        assert_eq!(
+            count_after_first, count_after_second,
+            "repeat grant must not touch the DACL"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Like `dacl_has_inheritable_allow_ace` but ignoring inherit flags —
+    /// ACEs inherited BY a file carry INHERITED_ACE, not the inherit bits,
+    /// so file-level assertions need a flag-agnostic scan.
+    unsafe fn dacl_has_allow_ace_any_flags(dacl: *const ACL, sid: PSID, mask: u32) -> bool {
+        if dacl.is_null() {
+            return false;
+        }
+        for i in 0..u32::from((*dacl).AceCount) {
+            let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, i, &mut ace_ptr) == 0 {
+                continue;
+            }
+            let header = ace_ptr as *const ACE_HEADER;
+            if (*header).AceType != ACE_TYPE_ACCESS_ALLOWED {
+                continue;
+            }
+            let ace = ace_ptr as *const ACCESS_ALLOWED_ACE;
+            if (*ace).Mask & mask != mask {
+                continue;
+            }
+            let ace_sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
+            if EqualSid(ace_sid, sid) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// PR #577 review: after travsr-store's owner-only hardening of ~/.travsr
+    /// (#507: icacls /inheritance:r + user-only (OI)(CI)F), an AppContainer
+    /// token has no path to binaries under ~/.travsr/bin unless the spawn
+    /// grants one explicitly. This pins the exact sequence the spawn now
+    /// performs: restriction strips the AppContainer's access, the
+    /// read+execute grant restores it on the directory AND propagates to a
+    /// pre-existing file inside (the plugin binary the child must map).
+    #[test]
+    fn grant_read_execute_restores_access_after_owner_only_restriction() {
+        let dir = std::env::temp_dir().join(format!("travsr-acl-577-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("plugin.exe");
+        std::fs::write(&binary, b"MZ").unwrap();
+
+        // Replicate restrict_to_owner_windows (travsr-store/src/registry.rs).
+        let user = std::env::var("USERNAME").expect("USERNAME set on Windows");
+        let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+        let account = if domain.is_empty() {
+            user
+        } else {
+            format!("{domain}\\{user}")
+        };
+        let status = std::process::Command::new("icacls")
+            .args([
+                dir.to_str().unwrap(),
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{account}:(OI)(CI)F"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("icacls runs");
+        assert!(status.success(), "icacls restriction must apply");
+
+        let sid = derive_appcontainer_sid("travsr-test-577-rx").expect("derive sid");
+
+        // Post-restriction: the AppContainer has no ACE on the dir.
+        {
+            let h = read_dacl(&dir);
+            assert!(
+                !unsafe {
+                    dacl_has_inheritable_allow_ace(
+                        h.dacl,
+                        sid.as_psid(),
+                        ACCESS_GENERIC_READ_EXECUTE,
+                    )
+                },
+                "restricted dir must carry no AppContainer ACE"
+            );
+        }
+
+        // The spawn-path grant restores read+execute...
+        grant_path_access(&dir, sid.as_psid(), ACCESS_GENERIC_READ_EXECUTE)
+            .expect("grant read+execute");
+        {
+            let h = read_dacl(&dir);
+            assert!(
+                unsafe {
+                    dacl_has_inheritable_allow_ace(
+                        h.dacl,
+                        sid.as_psid(),
+                        ACCESS_GENERIC_READ_EXECUTE,
+                    )
+                },
+                "grant must be present on the directory"
+            );
+        }
+
+        // ...and inheritance propagation reaches the pre-existing binary,
+        // which is what the AppContainer child must be able to map. Windows
+        // maps GENERIC_* to file-specific rights when an inheritable ACE
+        // lands on a file, so assert the two specific bits image loading
+        // needs: FILE_READ_DATA (0x1) and FILE_EXECUTE (0x20).
+        {
+            const FILE_READ_DATA_AND_EXECUTE: u32 = 0x1 | 0x20;
+            let h = read_dacl(&binary);
+            assert!(
+                unsafe {
+                    dacl_has_allow_ace_any_flags(h.dacl, sid.as_psid(), FILE_READ_DATA_AND_EXECUTE)
+                },
+                "grant must propagate read+execute to the existing plugin binary"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A different SID or a wider mask must NOT be treated as already
+    /// granted — only an exact-or-superset mask for the same SID skips.
+    #[test]
+    fn grant_skip_requires_matching_sid_and_mask() {
+        let dir = std::env::temp_dir().join(format!("travsr-acl-505b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sid_a = derive_appcontainer_sid("travsr-test-505-sid-a").expect("derive sid a");
+        let sid_b = derive_appcontainer_sid("travsr-test-505-sid-b").expect("derive sid b");
+
+        grant_path_access(&dir, sid_a.as_psid(), ACCESS_GENERIC_READ).expect("grant read");
+
+        let h = read_dacl(&dir);
+        assert!(
+            !unsafe {
+                dacl_has_inheritable_allow_ace(h.dacl, sid_b.as_psid(), ACCESS_GENERIC_READ)
+            },
+            "another profile's SID must not match"
+        );
+        assert!(
+            !unsafe { dacl_has_inheritable_allow_ace(h.dacl, sid_a.as_psid(), ACCESS_GENERIC_ALL) },
+            "a read grant must not satisfy an ALL request"
+        );
+        drop(h);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── #504: Job Object CPU cap ────────────────────────────────────────────
+
+    /// #504 regression: the per-job CPU cap must scale with core count so a
+    /// multithreaded Phase B pass cannot exhaust it in a fraction of the
+    /// intended 300 s wall-clock window (the old flat cap died in ~40 s of
+    /// wall time on 8 cores).
+    #[test]
+    fn job_cpu_cap_scales_with_core_count() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as i64)
+            .unwrap_or(1);
+        assert_eq!(job_cpu_time_limit(), 300 * cores * 10_000_000);
+        assert!(job_cpu_time_limit() >= 300 * 10_000_000);
+    }
+
+    /// The scaled cap (and the JOB_TIME flag) must actually land on the
+    /// created Job Object, read back via QueryInformationJobObject.
+    #[test]
+    fn job_object_carries_scaled_cpu_cap() {
+        use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
+
+        let job = create_job_with_limits().expect("create job object");
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_handle(),
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *mut _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "QueryInformationJobObject failed");
+        assert_eq!(
+            info.BasicLimitInformation.PerJobUserTimeLimit,
+            job_cpu_time_limit(),
+            "job must carry the core-scaled CPU cap"
+        );
+        assert_ne!(
+            info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_JOB_TIME,
+            0,
+            "JOB_TIME limit flag must stay set (runaway-spin backstop)"
+        );
+    }
+
+    /// The block must never carry case-insensitive duplicate names —
+    /// CreateProcessW env lookups treat names case-insensitively.
+    #[test]
+    fn env_block_has_no_duplicate_names() {
+        let entries = decode_env_block(&build_env_block(
+            &std::env::temp_dir(),
+            &[("path".to_string(), "C:\\override".to_string())],
+        ));
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.split_once('=').map(|(k, _)| k.to_ascii_lowercase()))
+            .collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            total,
+            names.len(),
+            "duplicate env names in block: {entries:?}"
+        );
     }
 }

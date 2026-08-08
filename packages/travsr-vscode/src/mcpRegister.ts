@@ -15,6 +15,72 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import {
+  assertExecutableBinary,
+  resolveNpmShimExe,
+  resolveInstallDir,
+  resolveInstallPath,
+  resolveOnPath,
+  findCmdShimPath,
+} from "./installer";
+
+// ── Export binary resolution ────────────────────────────────────────────────
+
+/**
+ * #498: resolve the binary path to export into an external agent config.
+ *
+ * The export boundary must be at least as strict as our own spawn boundary
+ * (#275): a `.cmd` shim or a bare "travsr" written into Claude Desktop or
+ * Cursor fails in *their* process, where the user sees no error from us.
+ * Mirrors the connect-path recovery ladder (#486, #495): configured value,
+ * then the default install dir, then PATH, then an npm shim's packaged exe.
+ * Returns null when nothing spawnable exists — callers must not write a
+ * config in that case.
+ */
+export function resolveExportBinaryPath(
+  configured: string,
+  platform: string = process.platform,
+  existsFn: (p: string) => boolean = fs.existsSync,
+  onPathFn: (name: string) => string | null = resolveOnPath,
+  shimPathFn: (name: string) => string | null = findCmdShimPath
+): string | null {
+  // 1. Configured value: valid as-is, or an npm shim whose packaged native
+  //    binary sits next to it.
+  if (configured) {
+    try {
+      assertExecutableBinary(configured, platform);
+      return configured;
+    } catch {
+      const substituted = resolveNpmShimExe(configured, platform, existsFn);
+      if (substituted) return substituted;
+      // Unusable configured value must never be exported — fall through.
+    }
+  }
+
+  // 2. Default install location (~/.travsr/bin).
+  const installPath = resolveInstallPath(resolveInstallDir(), platform);
+  if (existsFn(installPath)) {
+    try {
+      assertExecutableBinary(installPath, platform);
+      return installPath;
+    } catch {
+      // fall through
+    }
+  }
+
+  // 3. PATH resolution — prefers .exe, skips .cmd/.bat shims (#495).
+  const onPath = onPathFn("travsr");
+  if (onPath) return onPath;
+
+  // 4. npm shim on PATH: substitute the packaged native binary (#486).
+  const shim = shimPathFn("travsr");
+  if (shim) {
+    const substituted = resolveNpmShimExe(shim, platform, existsFn);
+    if (substituted) return substituted;
+  }
+
+  return null;
+}
 
 // ── Config-path resolution ───────────────────────────────────────────────────
 
@@ -94,11 +160,33 @@ export function mergeServerEntry(
 
 // ── Command implementation ───────────────────────────────────────────────────
 
-export function registerMcpServerCommand(binary: string): vscode.Disposable {
+export function registerMcpServerCommand(): vscode.Disposable {
   return vscode.commands.registerCommand("travsr.registerMcpServer", async () => {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const binaryPath =
-      vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || binary;
+    const configured =
+      vscode.workspace.getConfiguration("travsr").get<string>("binaryPath", "") ?? "";
+
+    // #498: never export an unvalidated path — a .cmd shim or bare "travsr"
+    // fails inside the external agent, where the user sees no error from us.
+    const binaryPath = resolveExportBinaryPath(configured);
+    if (!binaryPath) {
+      const action = await vscode.window.showErrorMessage(
+        "Travsr: no usable travsr binary found to register. External agents " +
+        "need an absolute path to the native binary — download it, or set " +
+        "travsr.binaryPath first.",
+        "Download",
+        "Open Settings"
+      );
+      if (action === "Download") {
+        await vscode.commands.executeCommand("travsr.downloadBinary");
+      } else if (action === "Open Settings") {
+        await vscode.commands.executeCommand(
+          "workbench.action.openSettings",
+          "travsr.binaryPath"
+        );
+      }
+      return;
+    }
 
     const targets = resolveAgentTargets(workspaceRoot);
 

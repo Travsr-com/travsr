@@ -818,7 +818,13 @@ fn cmd_add(language: &str, corpus: Option<&str>) -> Result<()> {
         Some(_) => {
             if let Some(pkg) = entry.npm_package {
                 println!("Installing {pkg} via npm...");
-                match std::process::Command::new("npm")
+                // #502: on Windows npm is npm.cmd, which a bare Command::new
+                // never finds (CreateProcessW only appends .exe). Resolve the
+                // real path; std spawns .cmd via cmd.exe with strict escaping.
+                let npm = travsr_core::exec::resolve_executable("npm")
+                    .map(|p| p.into_os_string())
+                    .unwrap_or_else(|| "npm".into());
+                match std::process::Command::new(npm)
                     .args(["install", "-g", pkg])
                     .status()
                 {
@@ -1211,9 +1217,10 @@ fn save_config(config: &LangConfig) -> Result<()> {
     Ok(())
 }
 
+/// #502: PATHEXT-aware — on Windows tools are `scip-go.exe` / `npm.cmd`,
+/// which a bare-name `dir.join(name).is_file()` probe never finds.
 fn which(name: &str) -> bool {
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .any(|dir| dir.join(name).is_file())
+    travsr_core::exec::resolve_executable(name).is_some()
 }
 
 /// Like `which`, but also checks tool-managed directories not always in PATH:
@@ -1227,34 +1234,26 @@ fn tool_available(name: &str) -> bool {
     if which(name) {
         return true;
     }
+    // #502: the extra dirs get the same PATHEXT-aware probe as PATH.
+    let mut extra_dirs: Vec<std::path::PathBuf> = Vec::new();
     // $GOBIN takes precedence over $GOPATH/bin per go toolchain semantics.
     if let Some(gobin) = std::env::var_os("GOBIN") {
-        if std::path::Path::new(&gobin).join(name).is_file() {
-            return true;
-        }
+        extra_dirs.push(std::path::PathBuf::from(gobin));
     }
     let gopath = std::env::var_os("GOPATH")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join("go")));
     if let Some(gp) = gopath {
-        if gp.join("bin").join(name).is_file() {
-            return true;
-        }
+        extra_dirs.push(gp.join("bin"));
     }
     if let Some(home) = dirs::home_dir() {
-        if home.join(".cargo").join("bin").join(name).is_file() {
-            return true;
-        }
+        extra_dirs.push(home.join(".cargo").join("bin"));
         // ~/.travsr/bin — travsr's own managed directory for downloaded scip-* binaries.
-        if home.join(".travsr").join("bin").join(name).is_file() {
-            return true;
-        }
+        extra_dirs.push(home.join(".travsr").join("bin"));
         // ~/.dotnet/tools — dotnet global tool install location (`dotnet tool install --global`).
-        if home.join(".dotnet").join("tools").join(name).is_file() {
-            return true;
-        }
+        extra_dirs.push(home.join(".dotnet").join("tools"));
     }
-    false
+    travsr_core::exec::resolve_executable_in(extra_dirs, name).is_some()
 }
 
 fn sandbox_available() -> bool {

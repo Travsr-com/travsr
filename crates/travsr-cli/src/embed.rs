@@ -683,7 +683,9 @@ async fn download_model_file_with_progress(
 
     let tmp = dest.with_extension("tmp");
     std::fs::write(&tmp, &bytes).with_context(|| format!("writing model file {file_name}"))?;
-    std::fs::rename(&tmp, dest).with_context(|| format!("installing model file {file_name}"))?;
+    // #506: a running sidecar holds the model file open; displace, not delete.
+    crate::install::replace_file(&tmp, dest)
+        .with_context(|| format!("installing model file {file_name}"))?;
 
     let actual_mb = bytes.len() / 1_048_576;
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
@@ -824,7 +826,10 @@ async fn download_embed_binary(
             .context("chmod +x embed binary")?;
     }
 
-    std::fs::rename(&tmp, &dest).with_context(|| format!("renaming into {}", dest.display()))?;
+    // #506: upgrading while the daemon runs this sidecar previously failed
+    // with Access Denied — replace_file displaces the running image aside.
+    crate::install::replace_file(&tmp, &dest)
+        .with_context(|| format!("renaming into {}", dest.display()))?;
 
     Ok(dest)
 }

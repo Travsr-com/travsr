@@ -851,8 +851,14 @@ fn find_pattern_body(
                 }
             } else {
                 // Plain path prefix. Confine to the repo: reject absolute paths and
-                // parent-directory escapes.
-                if s.starts_with('/') || s.split('/').any(|c| c == "..") {
+                // parent-directory escapes. #507: normalize `\` to `/` first so
+                // `..\..\x` is caught, and reject drive-letter (`C:\...`) and
+                // UNC (`\\server\share`) absolute forms too.
+                let normalized = s.replace('\\', "/");
+                if normalized.starts_with('/')
+                    || normalized.split('/').any(|c| c == "..")
+                    || s.as_bytes().get(1) == Some(&b':')
+                {
                     tracing::warn!("find_pattern rejected out-of-repo scope: {s}");
                     return String::new();
                 }
@@ -9471,6 +9477,49 @@ mod snippet_tests {
             empty,
             "a percent-containing pattern must not smuggle a traversal scope past validation"
         );
+    }
+
+    /// #507: the scope guard was separator-blind — backslash traversal,
+    /// drive-letter, and UNC absolute forms sailed through on Windows.
+    #[test]
+    fn pattern_scope_rejects_windows_absolute_and_backslash_traversal() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", "/tmp/whatever").unwrap();
+        let empty = "<travsr-data></travsr-data>";
+        for scope in [
+            r"..\..\etc",
+            r"src\..\..\etc",
+            r"C:\Windows\System32",
+            r"c:/windows",
+            r"\\server\share",
+            "/etc",
+            "../etc",
+            "src/../../etc",
+        ] {
+            assert_eq!(
+                find_pattern(&store, "alpha", Some(scope), false),
+                empty,
+                "scope {scope:?} must be rejected"
+            );
+        }
+    }
+
+    /// Plain repo-relative prefixes, including ones with inner dots, stay valid.
+    #[test]
+    fn pattern_scope_accepts_normal_relative_prefixes() {
+        let (_dir, store) = pattern_fixture("src/fix.rs", "let alpha = 1;\n");
+        for scope in ["src", "src/fix.rs", "a.b/c"] {
+            // Must not be rejected by the guard (a no-match result is fine —
+            // rejection returns the empty envelope before git even runs, and
+            // for the existing file the match must actually surface).
+            let out = find_pattern(&store, "alpha", Some(scope), false);
+            if scope == "src" || scope == "src/fix.rs" {
+                assert!(
+                    out.contains("alpha"),
+                    "valid scope {scope:?} must reach git grep and match: {out}"
+                );
+            }
+        }
     }
 
     /// #517 DD-5: `\d` is a PCRE digit-class escape with no POSIX ERE

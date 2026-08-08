@@ -73,23 +73,11 @@ fn find_pyright() -> Option<PathBuf> {
         }
     }
 
-    // Walk PATH entries looking for a `pyright` (or `pyright.cmd` on Windows) binary.
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("pyright");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        // Windows: also check `.cmd` wrapper
-        #[cfg(windows)]
-        {
-            let candidate_cmd = dir.join("pyright.cmd");
-            if candidate_cmd.is_file() {
-                return Some(candidate_cmd);
-            }
-        }
-    }
-    None
+    // #502: PATHEXT-aware lookup. npm installs a bare extensionless POSIX
+    // shim NEXT TO pyright.cmd; probing the bare name first picked the shim,
+    // which is not a valid Win32 executable. The shared resolver prefers
+    // .exe, then .cmd, and tries the bare name last.
+    travsr_core::exec::resolve_executable("pyright")
 }
 
 /// Invoke `pyright --outputjson <path>` with hardened subprocess settings.
@@ -128,6 +116,29 @@ fn run_pyright(pyright: &Path, target: &Path, timeout: Duration) -> anyhow::Resu
         .env("HOME", &tmpdir)
         .env("LANG", "C.UTF-8")
         .env("LC_ALL", "C.UTF-8");
+
+    // #502: pyright on Windows is a .cmd wrapper running under cmd.exe +
+    // Node, which need the system vars a full env_clear drops. Keep the
+    // non-secret minimum, point the temp vars at the per-invocation tempdir,
+    // and set USERPROFILE (Windows' home variable — HOME means nothing here).
+    #[cfg(windows)]
+    {
+        for var in [
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "SystemDrive",
+            "PROCESSOR_ARCHITECTURE",
+        ] {
+            if let Some(val) = std::env::var_os(var) {
+                cmd.env(var, val);
+            }
+        }
+        cmd.env("USERPROFILE", &tmpdir);
+        cmd.env("TEMP", &tmpdir);
+        cmd.env("TMP", &tmpdir);
+    }
 
     // SEC P1-A4: resource limits on Unix
     // TODO(S14): add RLIMIT_AS / RLIMIT_CPU / RLIMIT_NOFILE via the `nix` crate

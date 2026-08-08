@@ -1,7 +1,12 @@
-//! Windows AppContainer + Job Object sandbox (RFC-014 / ADR-017 Rule 2).
+//! Windows AppContainer + Job Object sandbox (ADR-017 Rules 1-2).
 //! Safe wrapper — no `unsafe` code in this file; all unsafe is in `ffi.rs`.
 
 mod ffi;
+
+/// #500: process-liveness probe for the embed sidecar's shutdown grace poll.
+/// ADR-017 A2 Invariant 1: the sizing probes live here too, so every unsafe
+/// block in this crate stays confined to ffi.rs.
+pub(crate) use ffi::{available_physical_memory_mb, pid_alive, windows_p_core_count};
 
 use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 use crate::sandbox::StdioCfg;
@@ -123,9 +128,10 @@ pub struct AppContainerSpawn {
     repo_root: PathBuf,
     scratch_dir: PathBuf,
     policy: SandboxPolicy,
-    /// Per-language toolchain cache grants (read/write paths). Env passthrough is
-    /// unnecessary on Windows: AppContainer does not clear the env, so the child
-    /// inherits GOPATH/USERPROFILE/etc. from the daemon.
+    /// Per-language toolchain cache grants (read/write paths) and env.
+    /// #501: the child env is an explicit allowlist block (`build_env_block`),
+    /// NOT inherited — `toolchain.env` (JAVA_HOME/GOPATH/…) is forwarded into
+    /// it and `~/.travsr/bin` is prepended to PATH, mirroring linux.rs/macos.rs.
     toolchain: crate::sandbox::toolchain::ToolchainAccess,
     stdin: StdioCfg,
     stdout: StdioCfg,
@@ -161,10 +167,41 @@ impl AppContainerSpawn {
         for path in &self.toolchain.write_paths {
             let _ = ffi::grant_path_access(path, sid.as_psid(), ffi::ACCESS_GENERIC_ALL);
         }
+        // PR #577 review: an AppContainer token cannot map an image whose DACL
+        // carries no AppContainer ACE — user-profile trees don't carry ALL
+        // APPLICATION PACKAGES, and the owner-only hardening of ~/.travsr
+        // (#507, travsr-store restrict_to_owner_windows) strips inherited ACEs
+        // for anything created under it afterwards. The resolver hands us
+        // plugin binaries from exactly ~/.travsr/bin, so grant read+execute on
+        // that dir and on the program's own directory; without this the
+        // sandbox spawn fails ERROR_ACCESS_DENIED at image load and the PATH
+        // prepend (#501) points at files the child could not execute anyway.
+        // Best-effort like the toolchain grants: the dir may not exist yet,
+        // and a program under a machine-wide tree (Program Files) already
+        // carries the needed ACEs. Idempotent per #505 — a repeat is one read.
+        if let Some(home) = dirs::home_dir() {
+            let travsr_bin = home.join(".travsr").join("bin");
+            if travsr_bin.is_dir() {
+                let _ = ffi::grant_path_access(
+                    &travsr_bin,
+                    sid.as_psid(),
+                    ffi::ACCESS_GENERIC_READ_EXECUTE,
+                );
+            }
+        }
+        if let Some(program_dir) = std::path::Path::new(&self.program).parent() {
+            if program_dir.is_dir() {
+                let _ = ffi::grant_path_access(
+                    program_dir,
+                    sid.as_psid(),
+                    ffi::ACCESS_GENERIC_READ_EXECUTE,
+                );
+            }
+        }
 
-        // PSE R5: all three bound on this stack frame; must outlive CreateProcessW.
-        let (_cap_sid_buf, _cap_attr, security_caps) =
-            ffi::build_security_capabilities(sid.as_psid(), elevated)?;
+        // PSE R5 (#499): capability storage is heap-pinned inside the owner;
+        // the binding only needs to stay alive until CreateProcessW returns.
+        let security_caps = ffi::build_security_capabilities(sid.as_psid(), elevated)?;
 
         if let SandboxPolicy::Elevated {
             permitted_hosts, ..
@@ -185,7 +222,8 @@ impl AppContainerSpawn {
             &self.program,
             &self.args,
             &self.scratch_dir,
-            &security_caps, // PSE R5: _cap_sid_buf + _cap_attr still live here
+            &self.toolchain.env,  // #501: forwarded into the child env block
+            security_caps.caps(), // PSE R5: owner `security_caps` still live here
             job,
             to_mode(self.stdin),
             to_mode(self.stdout),

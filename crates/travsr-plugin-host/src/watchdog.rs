@@ -30,14 +30,22 @@ use std::time::Duration;
 /// actually terminate the sidecar — otherwise the watchdog kill is a silent
 /// no-op and a wedged plugin never gets killed.
 pub(crate) fn kill_pid(pid: u32) {
+    // #507: silence the kill subprocess. taskkill prints "SUCCESS: The
+    // process with PID … has been terminated." to stdout, which interleaved
+    // into `travsr init --json` / `embed reindex` output and broke JSON
+    // consumers; `kill` prints to stderr when the process is already gone.
     #[cfg(windows)]
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
 
     #[cfg(not(windows))]
     let _ = std::process::Command::new("kill")
         .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
 }
 

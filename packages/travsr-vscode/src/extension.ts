@@ -21,9 +21,11 @@ import { showWelcome, showWelcomeIfFirstRun } from "./welcome";
 import { GraphPanel } from "./graph";
 import {
   installBinary,
-  checkOnPath,
-  hasCmdShimOnPath,
+  resolveOnPath,
+  findCmdShimPath,
+  resolveNpmShimExe,
   assertExecutableBinary,
+  isDownloadSupported,
   resolveInstallDir,
   resolveInstallPath,
   DOWNLOAD_VERSION,
@@ -86,7 +88,12 @@ export function activate(context: vscode.ExtensionContext): void {
   const onDaemonFailed = (): void => sendEvent(reporter, EVT_DAEMON_FAILED);
 
   wireDisconnectHandler(rawClient, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
-  void rawClient.connect();
+  // An invalid binaryPath (e.g. an npm .cmd shim, #486) makes connect() reject
+  // before spawning — log it; checkBinaryAndPrompt below runs the recovery.
+  rawClient.connect().catch((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    channel.appendLine(`Initial connect failed: ${msg}`);
+  });
 
   // Watch for graph.db creation so the daemon reconnects automatically after
   // `travsr init` runs on a fresh repo, without requiring a window reload.
@@ -462,8 +469,10 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  // ITEM 2: MCP server registration for external agents.
-  context.subscriptions.push(registerMcpServerCommand(binary));
+  // ITEM 2: MCP server registration for external agents. #498: the command
+  // resolves and validates the binary itself at invocation time — the raw
+  // activation-time fallback must never reach an external agent config.
+  context.subscriptions.push(registerMcpServerCommand());
 
   // ITEM 2 (part 3): pull graph context onto the clipboard for chat agents that
   // can't take the MCP-register route (Copilot). Lightbulb CodeAction + palette.
@@ -555,30 +564,87 @@ async function checkBinaryAndPrompt(
   configured: string,
   onDaemonFailed?: () => void
 ): Promise<void> {
-  // 1. Explicit path configured and exists on disk → nothing to do.
-  if (configured && configured !== "travsr" && fs.existsSync(configured)) return;
+  // 1. Explicit path configured → validate it, not just check existence.
+  //    A path that exists but can't be spawned (e.g. an npm .cmd shim, #486)
+  //    must fall through to recovery instead of dead-ending at connect().
+  if (configured && configured !== "travsr" && fs.existsSync(configured)) {
+    try {
+      assertExecutableBinary(configured);
+      return; // valid — nothing to do
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      channel.appendLine(`Configured travsr.binaryPath is not usable: ${msg}`);
+      // npm installs ship the real native binary next to the shim — adopt it.
+      const resolved = resolveNpmShimExe(configured);
+      if (resolved) {
+        channel.appendLine(`Resolved npm shim to native binary: ${resolved}`);
+        await adoptBinary(resolved, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+        void vscode.window.showInformationMessage(
+          `Travsr: travsr.binaryPath pointed at an npm shim — switched to the native binary at ${resolved}.`
+        );
+        return;
+      }
+      // No packaged binary next to it — fall through to the install flow.
+    }
+  }
 
-  // 2. Check ~/.travsr/bin (default install location).
+  // 2. Check ~/.travsr/bin (default install location). Persist the path and
+  //    reconnect so the status bar turns green without a window reload.
   const installPath = resolveInstallPath(resolveInstallDir());
   if (fs.existsSync(installPath)) {
-    // Found at default location — persist the path and reconnect so the
-    // status bar turns green without requiring a window reload.
-    await vscode.workspace
-      .getConfiguration("travsr")
-      .update("binaryPath", installPath, vscode.ConfigurationTarget.Global);
-    const newRaw = new StdioMcpClient(installPath, workspaceRoot, version);
-    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
-    await newRaw.connect();
-    proxy.swapAndDispose(newRaw);
+    await adoptBinary(installPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
     return;
   }
 
-  // 3. Check PATH — daemon may have been installed via npm or Homebrew.
-  if (checkOnPath("travsr")) return;
+  // 3. Check PATH — daemon may have been installed via npm, Homebrew, or
+  //    cargo. #495: returning early on a bare hit left the client dead — it
+  //    rejects the non-absolute "travsr" fallback — so capture the resolved
+  //    absolute path, persist it, and reconnect (same pattern as step 2).
+  //    resolveOnPath prefers .exe hits and skips .cmd/.bat shims; shim-only
+  //    installs fall through to the npm-shim resolution in step 4 (#486).
+  const onPath = resolveOnPath("travsr");
+  if (onPath) {
+    channel.appendLine(`Resolved travsr on PATH: ${onPath}`);
+    await adoptBinary(onPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+    return;
+  }
 
-  // 4. Binary not found anywhere — prompt once.
-  const isCmdOnly = process.platform === "win32" && hasCmdShimOnPath("travsr");
-  const promptMsg = isCmdOnly
+  // 4. Windows npm install: only a .cmd shim on PATH, but the package ships
+  //    the real exe next to it (#486) — adopt it instead of prompting.
+  const cmdShim = findCmdShimPath("travsr");
+  if (cmdShim) {
+    const resolved = resolveNpmShimExe(cmdShim);
+    if (resolved) {
+      channel.appendLine(`Resolved npm shim on PATH to native binary: ${resolved}`);
+      await adoptBinary(resolved, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+      void vscode.window.showInformationMessage(
+        `Travsr: using the native binary from your npm install at ${resolved}.`
+      );
+      return;
+    }
+  }
+
+  // 5. Binary not found anywhere. #497: only offer the download when a
+  //    prebuilt binary is actually published for this platform/arch —
+  //    e.g. Windows-on-ARM releases don't exist, so the prompt used to
+  //    lead straight into an HTTP 404.
+  if (!isDownloadSupported()) {
+    const msg =
+      `Travsr binary not found, and no prebuilt binary is published for ` +
+      `${process.platform}/${process.arch}. Build travsr from source and ` +
+      `point travsr.binaryPath at it.`;
+    channel.appendLine(msg);
+    const action = await vscode.window.showWarningMessage(msg, "Open Settings");
+    if (action === "Open Settings") {
+      await vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "travsr.binaryPath"
+      );
+    }
+    return;
+  }
+
+  const promptMsg = cmdShim
     ? `travsr.cmd detected on PATH but the VS Code extension requires the native binary — Download v${DOWNLOAD_VERSION}?`
     : `Travsr binary not found — Download v${DOWNLOAD_VERSION}?`;
   const choice = await vscode.window.showInformationMessage(
@@ -587,8 +653,30 @@ async function checkBinaryAndPrompt(
     "Dismiss"
   );
   if (choice === "Download") {
-    await runDownloadFlow(proxy, context, workspaceRoot, version, channel);
+    await runDownloadFlow(proxy, context, workspaceRoot, version, channel, onDaemonFailed);
   }
+}
+
+/**
+ * #486: persist a resolved binary path to settings and hot-swap the MCP
+ * client so the status bar turns green without requiring a window reload.
+ */
+async function adoptBinary(
+  binPath: string,
+  proxy: MutableMcpClientProxy,
+  context: vscode.ExtensionContext,
+  workspaceRoot: string | undefined,
+  version: string,
+  channel: vscode.OutputChannel,
+  onDaemonFailed?: () => void
+): Promise<void> {
+  await vscode.workspace
+    .getConfiguration("travsr")
+    .update("binaryPath", binPath, vscode.ConfigurationTarget.Global);
+  const newRaw = new StdioMcpClient(binPath, workspaceRoot, version);
+  wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
+  await newRaw.connect();
+  proxy.swapAndDispose(newRaw);
 }
 
 async function runDownloadFlow(
@@ -613,15 +701,8 @@ async function runDownloadFlow(
         })
     );
 
-    await vscode.workspace
-      .getConfiguration("travsr")
-      .update("binaryPath", binPath, vscode.ConfigurationTarget.Global);
-
-    // Auto-reconnect: spin up a new client with the installed binary.
-    const newRaw = new StdioMcpClient(binPath, workspaceRoot, version);
-    wireDisconnectHandler(newRaw, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
-    await newRaw.connect();
-    proxy.swapAndDispose(newRaw); // fires onReconnect → status bar re-polls
+    // Persist + auto-reconnect — fires onReconnect → status bar re-polls.
+    await adoptBinary(binPath, proxy, context, workspaceRoot, version, channel, onDaemonFailed);
 
     void vscode.window.showInformationMessage(
       `Travsr v${DOWNLOAD_VERSION} installed successfully.`

@@ -11,6 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub mod exec;
 pub mod ident;
 pub mod noise;
 

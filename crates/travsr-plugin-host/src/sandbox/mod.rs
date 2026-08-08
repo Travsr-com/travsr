@@ -95,7 +95,7 @@ impl SandboxedChild {
 pub enum SandboxedSpawn {
     /// Linux (bwrap) or macOS (sandbox-exec): wraps the outer wrapper process.
     Wrapped(std::process::Command),
-    /// Windows: AppContainer + Job Object (RFC-014 / ADR-017 Rule 2).
+    /// Windows: AppContainer + Job Object (ADR-017 Rules 1-2).
     #[cfg(target_os = "windows")]
     AppContainer(windows::AppContainerSpawn),
 }

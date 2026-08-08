@@ -1,16 +1,22 @@
 import * as assert from "assert";
 import * as crypto from "crypto";
+import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import {
   resolveTargetTriple,
+  isDownloadSupported,
   resolveInstallDir,
   resolveInstallPath,
   buildDownloadUrl,
   buildSumsUrl,
   verifyChecksum,
   checkOnPath,
+  pickPathCandidate,
+  resolveOnPath,
   hasCmdShimOnPath,
+  findCmdShimPath,
+  resolveNpmShimExe,
   assertExecutableBinary,
 } from "../../installer";
 
@@ -37,7 +43,7 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
     assert.strictEqual(resolveTargetTriple("win32", "x64"), "x86_64-pc-windows-msvc");
   });
 
-  // release.yml never builds/publishes an aarch64-pc-windows-msvc artifact
+  // #497: release.yml never builds/publishes an aarch64-pc-windows-msvc artifact
   // (only x86_64-pc-windows-msvc), so this must throw rather than resolve to
   // a triple that would 404 on download.
   test("win32/arm64 throws (no such release artifact is published)", () => {
@@ -59,6 +65,32 @@ suite("VSCODE-205: installer — resolveTargetTriple", () => {
       () => resolveTargetTriple("linux", "mips"),
       (e: Error) => e.message.includes("linux") && e.message.includes("mips")
     );
+  });
+});
+
+// ── #497: isDownloadSupported — prompt gating ──────────────────────────────
+
+suite("#497: installer — isDownloadSupported", () => {
+  test("true for every published release target", () => {
+    assert.strictEqual(isDownloadSupported("linux", "x64"), true);
+    assert.strictEqual(isDownloadSupported("linux", "arm64"), true);
+    assert.strictEqual(isDownloadSupported("darwin", "x64"), true);
+    assert.strictEqual(isDownloadSupported("darwin", "arm64"), true);
+    assert.strictEqual(isDownloadSupported("win32", "x64"), true);
+  });
+
+  test("false for win32/arm64 — no published artifact", () => {
+    assert.strictEqual(isDownloadSupported("win32", "arm64"), false);
+  });
+
+  test("false for unknown platform or arch", () => {
+    assert.strictEqual(isDownloadSupported("freebsd", "x64"), false);
+    assert.strictEqual(isDownloadSupported("linux", "mips"), false);
+  });
+
+  test("agrees with resolveTargetTriple for supported and unsupported targets", () => {
+    assert.doesNotThrow(() => resolveTargetTriple("win32", "x64"));
+    assert.throws(() => resolveTargetTriple("win32", "arm64"));
   });
 });
 
@@ -260,6 +292,128 @@ suite("WS1: checkOnPath — Windows .cmd discrimination", () => {
   test("hasCmdShimOnPath returns false for nonexistent binary on Windows", () => {
     if (process.platform !== "win32") return;
     assert.strictEqual(hasCmdShimOnPath("__travsr_definitely_not_on_path_xyz__"), false);
+  });
+
+  test("findCmdShimPath returns null on non-Windows platforms", () => {
+    if (process.platform === "win32") return;
+    assert.strictEqual(findCmdShimPath("__anything__"), null);
+  });
+
+  test("findCmdShimPath returns null for nonexistent binary on Windows", () => {
+    if (process.platform !== "win32") return;
+    assert.strictEqual(findCmdShimPath("__travsr_definitely_not_on_path_xyz__"), null);
+  });
+});
+
+// ── #495: pickPathCandidate / resolveOnPath — PATH auto-detect ────────────
+
+suite("#495: installer — pickPathCandidate", () => {
+  // Candidates are built with host path semantics: assertExecutableBinary
+  // checks absoluteness with the host's path.isAbsolute, so hardcoded
+  // Windows-style paths would be skipped as non-absolute on POSIX runners.
+  const abs = (...segs: string[]): string => path.resolve(os.tmpdir(), ...segs);
+
+  test("win32: prefers the .exe hit over a preceding .cmd shim", () => {
+    const shim = abs("npm", "travsr.cmd");
+    const exe = abs("cargo", "travsr.exe");
+    assert.strictEqual(pickPathCandidate([shim, exe], "win32"), exe);
+  });
+
+  test("win32: returns null when only .cmd/.bat shims are on PATH", () => {
+    const lines = [abs("npm", "travsr.cmd"), abs("tools", "travsr.bat")];
+    assert.strictEqual(pickPathCandidate(lines, "win32"), null);
+  });
+
+  test("posix: returns the first absolute hit", () => {
+    assert.strictEqual(
+      pickPathCandidate(["/usr/local/bin/travsr"], "linux"),
+      "/usr/local/bin/travsr"
+    );
+  });
+
+  test("skips candidates that fail assertExecutableBinary (metacharacters)", () => {
+    const lines = ["/opt/bad&dir/travsr", "/usr/local/bin/travsr"];
+    assert.strictEqual(pickPathCandidate(lines, "linux"), "/usr/local/bin/travsr");
+  });
+
+  test("skips non-absolute candidates", () => {
+    assert.strictEqual(pickPathCandidate(["travsr"], "linux"), null);
+  });
+
+  test("ignores blank and whitespace-only lines", () => {
+    assert.strictEqual(pickPathCandidate(["", "  ", "\r"], "win32"), null);
+    assert.strictEqual(
+      pickPathCandidate(["", "  /usr/local/bin/travsr  "], "darwin"),
+      "/usr/local/bin/travsr"
+    );
+  });
+});
+
+suite("#495: installer — resolveOnPath", () => {
+  test("returns null for a binary not on PATH", () => {
+    assert.strictEqual(resolveOnPath("__travsr_definitely_not_on_path_xyz__"), null);
+  });
+
+  test("resolves a binary from PATH to its absolute location", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-path-"));
+    const name = "__travsr_resolve_test__";
+    const file = path.join(dir, process.platform === "win32" ? `${name}.exe` : name);
+    fs.writeFileSync(file, "MZ");
+    if (process.platform !== "win32") fs.chmodSync(file, 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = dir + path.delimiter + (oldPath ?? "");
+    try {
+      const resolved = resolveOnPath(name);
+      assert.ok(resolved !== null, "expected the binary to resolve from PATH");
+      // where/which may return long-form paths while os.tmpdir() can use
+      // Windows 8.3 short names; canonicalize both before comparing.
+      assert.strictEqual(
+        fs.realpathSync.native(resolved).toLowerCase(),
+        fs.realpathSync.native(file).toLowerCase()
+      );
+    } finally {
+      process.env.PATH = oldPath;
+    }
+  });
+});
+
+// ── #486: resolveNpmShimExe — npm shim → packaged native binary ───────────
+
+suite("#486: installer — resolveNpmShimExe", () => {
+  /** Build <tmp>/travsr.cmd + <tmp>/node_modules/@travsr.com/travsr/bin/<binName>. */
+  function makeNpmPrefix(binName: string | null): { prefix: string; shim: string; exe: string } {
+    const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-shim-"));
+    const shim = path.join(prefix, "travsr.cmd");
+    fs.writeFileSync(shim, "@echo off\r\n");
+    const binDir = path.join(prefix, "node_modules", "@travsr.com", "travsr", "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const exe = path.join(binDir, binName ?? "travsr.exe");
+    if (binName !== null) fs.writeFileSync(exe, "MZ");
+    return { prefix, shim, exe };
+  }
+
+  test("resolves the packaged exe next to an npm .cmd shim (win32 layout)", () => {
+    const { shim, exe } = makeNpmPrefix("travsr.exe");
+    assert.strictEqual(resolveNpmShimExe(shim, "win32"), exe);
+  });
+
+  test("resolves the packaged binary without .exe on unix layout", () => {
+    const { shim, exe } = makeNpmPrefix("travsr");
+    assert.strictEqual(resolveNpmShimExe(shim, "linux"), exe);
+  });
+
+  test("returns null when the packaged binary is missing", () => {
+    const { shim } = makeNpmPrefix(null); // bin dir exists but no exe inside
+    assert.strictEqual(resolveNpmShimExe(shim, "win32"), null);
+  });
+
+  test("returns null when the resolved path fails assertExecutableBinary (metacharacters)", () => {
+    const shimInBadDir =
+      process.platform === "win32"
+        ? "C:\\npm&prefix\\travsr.cmd"
+        : "/npm&prefix/travsr.cmd";
+    // existsFn stubbed true so the metacharacter validation is what rejects it.
+    assert.strictEqual(resolveNpmShimExe(shimInBadDir, process.platform, () => true), null);
   });
 });
 

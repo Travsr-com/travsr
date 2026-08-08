@@ -14,12 +14,13 @@ import * as https from "https";
 import * as os from "os";
 import * as path from "path";
 
-export const DOWNLOAD_VERSION = "0.10.0";
+export const DOWNLOAD_VERSION = "0.11.0";
 
-// release.yml's build matrix (.github/workflows/release.yml:152-173) does not
-// publish an aarch64-pc-windows-msvc artifact, so win32/arm64 is intentionally
-// absent here — resolveTargetTriple throws a clear "unsupported" error for it
-// instead of constructing a download URL for a tarball that doesn't exist.
+// #497: must stay in lockstep with the release workflow matrix
+// (.github/workflows/release.yml) and the npm TARGETS map
+// (packages/travsr-npm/scripts/install.js). Releases ship no
+// aarch64-pc-windows-msvc artifact, so claiming win32/arm64 here sent
+// Windows-on-ARM users into a guaranteed-404 download.
 const TARGET_MAP: Partial<Record<string, Partial<Record<string, string>>>> = {
   linux:  { x64: "x86_64-unknown-linux-gnu",  arm64: "aarch64-unknown-linux-gnu" },
   darwin: { x64: "x86_64-apple-darwin",        arm64: "aarch64-apple-darwin" },
@@ -31,8 +32,25 @@ export function resolveTargetTriple(
   arch: string = process.arch
 ): string {
   const triple = TARGET_MAP[platform]?.[arch];
-  if (!triple) throw new Error(`Unsupported platform/arch: ${platform}/${arch}`);
+  if (!triple) {
+    throw new Error(
+      `Unsupported platform/arch: ${platform}/${arch} — no prebuilt travsr ` +
+      `binary is published for this target`
+    );
+  }
   return triple;
+}
+
+/**
+ * #497: whether a prebuilt binary is published for this platform/arch.
+ * Lets callers skip the download prompt entirely instead of offering a
+ * download that resolveTargetTriple (or GitHub, with a 404) will reject.
+ */
+export function isDownloadSupported(
+  platform: string = process.platform,
+  arch: string = process.arch
+): boolean {
+  return TARGET_MAP[platform]?.[arch] !== undefined;
 }
 
 export function resolveInstallDir(): string {
@@ -168,25 +186,110 @@ export function checkOnPath(binaryName: string): boolean {
   }
 }
 
-export function hasCmdShimOnPath(binaryName: string): boolean {
-  if (process.platform !== "win32") return false;
+/**
+ * #495: pick the first spawnable hit from `where`/`which` output. On Windows
+ * only `.exe` hits qualify; `.cmd`/`.bat` shims are skipped (the npm-shim
+ * resolution path, #486, handles those). Candidates that fail
+ * assertExecutableBinary (relative, metacharacters) are skipped too.
+ */
+export function pickPathCandidate(
+  lines: string[],
+  platform: string = process.platform
+): string | null {
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (platform === "win32" && !line.toLowerCase().endsWith(".exe")) continue;
+    try {
+      assertExecutableBinary(line, platform);
+      return line;
+    } catch {
+      // unusable candidate; try the next hit
+    }
+  }
+  return null;
+}
+
+/**
+ * #495: resolve a binary on PATH to an absolute path the spawn gate accepts.
+ * checkOnPath only answers "is it there?" and discards the location, but the
+ * client rejects the bare binary name, so callers need the resolved path to
+ * persist into travsr.binaryPath and reconnect with.
+ */
+export function resolveOnPath(binaryName: string): string | null {
   try {
-    const out = cp.execFileSync("where", [binaryName], { encoding: "utf8" });
-    return out.split(/\r?\n/).some((l) => l.trim().toLowerCase().endsWith(".cmd"));
+    const lookup = process.platform === "win32" ? "where" : "which";
+    const out = cp.execFileSync(lookup, [binaryName], { encoding: "utf8" });
+    return pickPathCandidate(out.split(/\r?\n/));
   } catch {
-    return false;
+    return null;
   }
 }
 
-export function assertExecutableBinary(binary: string): void {
+export function findCmdShimPath(binaryName: string): string | null {
+  if (process.platform !== "win32") return null;
+  try {
+    const out = cp.execFileSync("where", [binaryName], { encoding: "utf8" });
+    const shim = out
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => /\.(cmd|bat)$/i.test(l));
+    return shim ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function hasCmdShimOnPath(binaryName: string): boolean {
+  return findCmdShimPath(binaryName) !== null;
+}
+
+/**
+ * #486: an npm install is a complete install — the real native binary ships
+ * inside the package, right next to the shim npm puts on PATH:
+ *
+ *   <npm prefix>\travsr.cmd                                       ← shim
+ *   <npm prefix>\node_modules\@travsr.com\travsr\bin\travsr.exe   ← real binary
+ *
+ * Given a shim path, return the packaged binary when it exists and is
+ * spawnable, else null.
+ */
+export function resolveNpmShimExe(
+  shimPath: string,
+  platform: string = process.platform,
+  existsFn: (p: string) => boolean = fs.existsSync
+): string | null {
+  const exe = path.join(
+    path.dirname(shimPath),
+    "node_modules",
+    "@travsr.com",
+    "travsr",
+    "bin",
+    platform === "win32" ? "travsr.exe" : "travsr"
+  );
+  if (!existsFn(exe)) return null;
+  try {
+    assertExecutableBinary(exe, platform);
+  } catch {
+    return null;
+  }
+  return exe;
+}
+
+export function assertExecutableBinary(
+  binary: string,
+  platform: string = process.platform
+): void {
   if (!path.isAbsolute(binary)) {
     throw new Error(`travsr binary must be an absolute path, got: ${binary}`);
   }
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     if (!binary.toLowerCase().endsWith(".exe")) {
       throw new Error(
         `travsr binary on Windows must end in .exe, got: ${binary}. ` +
-        `.cmd/.bat shims are not supported — reinstall via the extension.`
+        `.cmd/.bat shims are not supported — point travsr.binaryPath at the ` +
+        `packaged travsr.exe under node_modules\\@travsr.com\\travsr\\bin, ` +
+        `or reinstall via the extension.`
       );
     }
   }

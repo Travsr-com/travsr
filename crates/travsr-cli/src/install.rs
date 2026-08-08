@@ -202,10 +202,7 @@ pub async fn download_scip_binary(
             .context("setting executable permission")?;
     }
 
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("moving {} to {}", tmp.display(), dest.display()));
-    }
+    replace_file(&tmp, &dest)?;
 
     Ok(dest)
 }
@@ -281,10 +278,7 @@ pub async fn download_and_install_wrapper(
             .context("setting executable permission")?;
     }
 
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("moving {} to {}", tmp.display(), dest.display()));
-    }
+    replace_file(&tmp, &dest)?;
 
     Ok(dest)
 }
@@ -351,6 +345,128 @@ pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()
     Ok(())
 }
 
+/// #506: move a freshly written `tmp` into `dest`, displacing a currently
+/// running image when needed.
+///
+/// On Windows, `fs::rename` maps to `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`,
+/// which must delete `dest` first — and Windows refuses to delete a file
+/// backing a running process. Upgrading a binary the daemon is currently
+/// running therefore failed with "Access is denied (os error 5)", the common
+/// case for `travsr embed init` / `travsr lang install`. Renaming the running
+/// image ASIDE is allowed, so this applies the standard self-update dance
+/// (rustup, VS Code updater): `dest` → `dest.old.<uuid>`, move `tmp` into
+/// place, and best-effort sweep stale `*.old.*` leftovers — the displaced
+/// image stays locked until its process exits, so a later install removes it.
+///
+/// On Unix the first rename simply succeeds (the old inode lives on until the
+/// process exits) and the dance is never entered. `tmp` is cleaned up on
+/// every failure path.
+pub(crate) fn replace_file(tmp: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let first_err = match std::fs::rename(tmp, dest) {
+        Ok(()) => {
+            sweep_displaced_siblings(dest);
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+
+    // The dance only helps when an existing dest blocked the replace.
+    if !dest.exists() {
+        let _ = std::fs::remove_file(tmp);
+        return Err(first_err)
+            .with_context(|| format!("moving {} to {}", tmp.display(), dest.display()));
+    }
+
+    let displaced = {
+        let mut name = dest.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".old.{}", uuid::Uuid::new_v4()));
+        dest.with_file_name(name)
+    };
+    if let Err(aside_err) = rename_with_retry(dest, &displaced) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(first_err).with_context(|| {
+            format!(
+                "moving {} to {} (displacing the existing file also failed: {aside_err})",
+                tmp.display(),
+                dest.display()
+            )
+        });
+    }
+    if let Err(e) = rename_with_retry(tmp, dest) {
+        // Roll the displaced original back so the tool keeps working.
+        let _ = std::fs::rename(&displaced, dest);
+        let _ = std::fs::remove_file(tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "moving {} into place after displacing {}",
+                tmp.display(),
+                dest.display()
+            )
+        });
+    }
+
+    sweep_displaced_siblings(dest);
+    Ok(())
+}
+
+/// Rename with a short bounded retry on transient Windows errors.
+///
+/// Antivirus scanners briefly hold freshly written or freshly executed files
+/// with no-share handles (ERROR_SHARING_VIOLATION, 32) and can surface
+/// transient ERROR_ACCESS_DENIED (5); rustup's file ops retry on Windows for
+/// the same reason. Non-transient errors and non-Windows failures return
+/// immediately.
+fn rename_with_retry(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 20;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempt += 1;
+                let transient = cfg!(windows) && matches!(e.raw_os_error(), Some(5) | Some(32));
+                if !transient || attempt >= ATTEMPTS {
+                    return Err(e);
+                }
+                std::thread::sleep(BACKOFF);
+            }
+        }
+    }
+}
+
+/// True when `name` has the exact displacement shape [`replace_file`]
+/// creates: `<original>.old.<uuid>`, with the trailing component parsing as
+/// a real UUID.
+///
+/// PR #577 review: a plain `.old.` substring match also hit unrelated files
+/// a user parked in the directory (e.g. `notes.old.txt`), silently deleting
+/// them on every install. Requiring the UUID suffix confines the sweep to
+/// artifacts this module itself created, while still collecting leftovers
+/// of sibling binaries displaced by earlier installs.
+fn is_displaced_leftover(name: &str) -> bool {
+    name.rfind(".old.")
+        .map(|i| &name[i + ".old.".len()..])
+        .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+        .is_some()
+}
+
+/// Best-effort removal of `<name>.old.<uuid>` files left by earlier
+/// [`replace_file`] displacements in `dest`'s directory. Files still backing
+/// a running process refuse deletion — they are picked up by the sweep of a
+/// later install.
+fn sweep_displaced_siblings(dest: &std::path::Path) {
+    let Some(dir) = dest.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if is_displaced_leftover(&entry.file_name().to_string_lossy()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn hex_encode_sha256(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     use std::fmt::Write as _;
@@ -408,6 +524,15 @@ pub async fn download_zip_and_extract(
     let tmp = dest.join("_download.zip");
     std::fs::write(&tmp, &bytes).with_context(|| format!("writing zip to {}", tmp.display()))?;
 
+    // #502: Windows ships no `unzip`, but its tar.exe is bsdtar, which
+    // extracts zip archives natively (already used for tarballs above).
+    #[cfg(windows)]
+    let status = std::process::Command::new("tar")
+        .args(["-xf", &tmp.to_string_lossy(), "-C", &dest.to_string_lossy()])
+        .status()
+        .context("running tar to extract zip")?;
+
+    #[cfg(not(windows))]
     let status = std::process::Command::new("unzip")
         .args(["-qo", &tmp.to_string_lossy(), "-d", &dest.to_string_lossy()])
         .status()
@@ -416,7 +541,7 @@ pub async fn download_zip_and_extract(
     let _ = std::fs::remove_file(&tmp);
 
     if !status.success() {
-        bail!("unzip exited with {status}");
+        bail!("zip extraction exited with {status}");
     }
 
     Ok(dest)
@@ -439,6 +564,113 @@ fn parse_sha256_line(line: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #506: replace_file — displace-aside self-update dance ──────────────
+
+    #[test]
+    fn replace_file_over_plain_existing_file_and_sweeps_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tool.exe");
+        std::fs::write(&dest, b"old").unwrap();
+        // Leftover from a previous displaced upgrade — must be swept.
+        let leftover = dir
+            .path()
+            .join(format!("tool.exe.old.{}", uuid::Uuid::new_v4()));
+        std::fs::write(&leftover, b"stale").unwrap();
+        // PR #577 review: files that merely CONTAIN ".old." are not ours and
+        // must survive the sweep untouched.
+        let user_note = dir.path().join("notes.old.txt");
+        std::fs::write(&user_note, b"keep me").unwrap();
+        let near_miss = dir.path().join("tool.exe.old.deadbeef");
+        std::fs::write(&near_miss, b"keep me too").unwrap();
+
+        let tmp = dir.path().join("tool.exe.tmp.1");
+        std::fs::write(&tmp, b"new").unwrap();
+
+        replace_file(&tmp, &dest).expect("replace over plain file");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!tmp.exists(), "tmp must be consumed");
+        assert!(
+            !leftover.exists(),
+            "stale .old.<uuid> leftovers must be swept"
+        );
+        assert!(user_note.exists(), "unrelated .old. files must survive");
+        assert!(near_miss.exists(), "non-UUID .old. suffixes must survive");
+    }
+
+    /// PR #577 review: the sweep predicate itself, exhaustively.
+    #[test]
+    fn displaced_leftover_shape_is_exact() {
+        let uuid = uuid::Uuid::new_v4();
+        assert!(is_displaced_leftover(&format!(
+            "travsr-embed.exe.old.{uuid}"
+        )));
+        assert!(is_displaced_leftover(&format!("scip-java.old.{uuid}")));
+        assert!(!is_displaced_leftover("notes.old.txt"));
+        assert!(!is_displaced_leftover("tool.exe.old.deadbeef"));
+        assert!(!is_displaced_leftover("archive.old."));
+        assert!(!is_displaced_leftover("plain-file.exe"));
+    }
+
+    #[test]
+    fn replace_file_into_empty_slot_is_a_plain_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("fresh-install");
+        let tmp = dir.path().join("fresh-install.tmp.1");
+        std::fs::write(&tmp, b"payload").unwrap();
+        replace_file(&tmp, &dest).expect("fresh install");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn replace_file_missing_tmp_errors_and_leaves_dest_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep-me");
+        std::fs::write(&dest, b"precious").unwrap();
+        let tmp = dir.path().join("does-not-exist.tmp");
+        assert!(replace_file(&tmp, &dest).is_err());
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"precious",
+            "a failed replace must not damage the existing file"
+        );
+    }
+
+    /// #506 regression, the exact reported scenario: dest is the image of a
+    /// RUNNING process. Plain fs::rename fails with Access Denied on Windows;
+    /// replace_file must displace the running image aside and succeed.
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_displaces_a_running_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("victim.exe");
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        std::fs::copy(&comspec, &dest).expect("copy cmd.exe as victim");
+
+        // Keep the image busy for ~5 s (ping is available headless, unlike timeout).
+        let mut child = std::process::Command::new(&dest)
+            .args(["/C", "ping -n 6 127.0.0.1 >nul"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn victim");
+
+        // Precondition of the bug: the direct replace is refused.
+        let probe = dir.path().join("probe.tmp");
+        std::fs::write(&probe, b"probe").unwrap();
+        assert!(
+            std::fs::rename(&probe, &dest).is_err(),
+            "test precondition: plain rename over a running image must fail"
+        );
+
+        let tmp = dir.path().join("victim.exe.tmp.1");
+        std::fs::write(&tmp, b"upgraded").unwrap();
+        replace_file(&tmp, &dest).expect("replace over running image must succeed");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"upgraded");
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn current_target_returns_known_triple() {

@@ -738,7 +738,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// Check whether a process with the given PID is currently alive.
-/// Uses `kill -0` on Unix (no signal sent, just existence check).
+/// Uses `kill -0` on Unix and `tasklist` on Windows (no signal sent).
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -751,7 +751,23 @@ fn pid_is_alive(pid: u32) -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // #503: the previous hardcoded `false` broke both fallbacks that
+        // exist for the window before the control transport binds — `daemon
+        // status` reported "not running" against a live daemon still
+        // scanning, and daemon_is_running callers spawned a doomed duplicate.
+        // tasklist CSV output quotes the PID as a field only when the
+        // process exists; the localized "no tasks" INFO line never does.
+        // (forbid(unsafe_code) rules out OpenProcess here; spawning a probe
+        // process matches the Unix `kill -0` pattern above.)
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -801,5 +817,32 @@ mod tests {
         // No daemon running in tmp — transport connect should fail immediately.
         // Attempts=1, delay=0 — must not block.
         assert!(!daemon_is_running(tmp.path(), 1, 0));
+    }
+
+    /// #503 regression: pid_is_alive must report real liveness on every
+    /// platform. The Windows branch was hardcoded `false`, which made the
+    /// startup race guard treat a live-but-still-scanning daemon as absent.
+    #[test]
+    fn pid_is_alive_reports_running_and_exited_processes() {
+        assert!(
+            pid_is_alive(std::process::id()),
+            "the current process must be reported alive"
+        );
+
+        let mut child = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        }
+        .spawn()
+        .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait for child");
+        assert!(
+            !pid_is_alive(pid),
+            "an exited, reaped child must be reported dead"
+        );
     }
 }
