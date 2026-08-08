@@ -4,7 +4,9 @@
 mod ffi;
 
 /// #500: process-liveness probe for the embed sidecar's shutdown grace poll.
-pub(crate) use ffi::pid_alive;
+/// ADR-017 A2 Invariant 1: the sizing probes live here too, so every unsafe
+/// block in this crate stays confined to ffi.rs.
+pub(crate) use ffi::{available_physical_memory_mb, pid_alive, windows_p_core_count};
 
 use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 use crate::sandbox::StdioCfg;

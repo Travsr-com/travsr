@@ -714,7 +714,7 @@ fn p_core_count() -> usize {
 
     #[cfg(windows)]
     {
-        if let Some(n) = windows_p_core_count() {
+        if let Some(n) = crate::sandbox::windows::windows_p_core_count() {
             return n;
         }
     }
@@ -765,89 +765,6 @@ fn linux_p_core_count() -> Option<usize> {
         .iter()
         .find(|(f, _)| *f == max_freq)
         .map(|(_, c)| *c)
-        .unwrap_or(0);
-    if p_count > 0 {
-        Some(p_count)
-    } else {
-        None
-    }
-}
-
-/// Walk the `GetLogicalProcessorInformationEx(RelationProcessorCore)` buffer and
-/// count processor cores whose `EfficiencyClass` equals the maximum observed value.
-/// On homogeneous systems every core has the same class → returns total physical cores.
-/// On Intel hybrid (12th gen+) P-cores have a higher class than E-cores.
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn windows_p_core_count() -> Option<usize> {
-    use windows_sys::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationProcessorCore,
-        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-    };
-
-    // First call: discover required buffer size.
-    let mut buf_size: u32 = 0;
-    // SAFETY: passing null buffer is the documented way to query size.
-    unsafe {
-        GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            std::ptr::null_mut(),
-            &mut buf_size,
-        );
-    }
-    if buf_size == 0 {
-        return None;
-    }
-
-    let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
-    // SAFETY: buf is correctly sized from the previous call.
-    let ok = unsafe {
-        GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-            &mut buf_size,
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
-
-    // Walk the variable-length buffer.  Each entry starts with a `Size` field
-    // that gives its own byte length (entries are not fixed-size).
-    let mut offset = 0usize;
-    let mut max_class: u8 = 0;
-    let mut class_counts: Vec<(u8, usize)> = Vec::new();
-
-    while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
-        <= buf_size as usize
-    {
-        // SAFETY: we bounds-check before casting.
-        let entry = unsafe {
-            &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
-        };
-        let entry_size = entry.Size as usize;
-        if entry_size == 0 || offset + entry_size > buf_size as usize {
-            break;
-        }
-        // SAFETY: Relationship == RelationProcessorCore, so the union field is Processor.
-        let efficiency_class = unsafe { entry.Anonymous.Processor.EfficiencyClass };
-        if efficiency_class > max_class {
-            max_class = efficiency_class;
-        }
-        match class_counts
-            .iter_mut()
-            .find(|(c, _)| *c == efficiency_class)
-        {
-            Some((_, n)) => *n += 1,
-            None => class_counts.push((efficiency_class, 1)),
-        }
-        offset += entry_size;
-    }
-
-    let p_count = class_counts
-        .iter()
-        .find(|(c, _)| *c == max_class)
-        .map(|(_, n)| *n)
         .unwrap_or(0);
     if p_count > 0 {
         Some(p_count)
@@ -915,9 +832,9 @@ fn derive_num_workers_inner(
 ///
 /// macOS:   parses `vm_stat` for free + inactive pages × page_size.
 /// Linux:   reads `MemAvailable` from `/proc/meminfo`.
-/// Windows: calls `GlobalMemoryStatusEx` → `ullAvailPhys`.
+/// Windows: calls `GlobalMemoryStatusEx` → `ullAvailPhys` (via sandbox ffi.rs,
+///          where ADR-017 A2 confines all unsafe in this crate).
 /// Returns 0 when unavailable — caller skips the RAM guard.
-#[allow(unsafe_code)]
 fn available_memory_mb() -> u64 {
     #[cfg(target_os = "macos")]
     {
@@ -965,21 +882,8 @@ fn available_memory_mb() -> u64 {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        let mut mem = MEMORYSTATUSEX {
-            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
-            dwMemoryLoad: 0,
-            ullTotalPhys: 0,
-            ullAvailPhys: 0,
-            ullTotalPageFile: 0,
-            ullAvailPageFile: 0,
-            ullTotalVirtual: 0,
-            ullAvailVirtual: 0,
-            ullAvailExtendedVirtual: 0,
-        };
-        // SAFETY: mem is zero-initialised with dwLength correctly set.
-        if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 {
-            return mem.ullAvailPhys / (1024 * 1024);
+        if let Some(mb) = crate::sandbox::windows::available_physical_memory_mb() {
+            return mb;
         }
     }
     0
