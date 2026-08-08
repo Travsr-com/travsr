@@ -449,4 +449,22 @@ mod tests {
              the watcher keeps it fresh"
         );
     }
+
+    /// #448: `travsr-mcp` keeps its own copy of this list so `find_pattern`
+    /// searches the same file universe the walker builds the graph from. The
+    /// crate dependency edge runs daemon -> mcp, so this side is the only one
+    /// that can assert the two never drift.
+    ///
+    /// If this fails, a directory was added to or removed from one list only.
+    /// Update `SKIP_DIRS` in `travsr-mcp/src/tools.rs` to match, or
+    /// `find_pattern` will report matches from files the graph does not
+    /// contain (or miss files it does).
+    #[test]
+    fn skip_dirs_matches_the_mcp_copy() {
+        assert_eq!(
+            SKIP_DIRS,
+            travsr_mcp::SKIP_DIRS,
+            "travsr-daemon and travsr-mcp SKIP_DIRS have drifted apart"
+        );
+    }
 }

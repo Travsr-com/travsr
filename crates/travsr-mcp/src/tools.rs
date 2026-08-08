@@ -955,10 +955,19 @@ fn scope_files_importing(store: &SqliteStore, symbol: &str) -> Option<Vec<String
 /// `travsr-daemon::init`). Duplicated here because the crate dependency rules
 /// point `travsr-daemon → travsr-mcp`, so this crate cannot read it from there.
 ///
-/// Keep the two lists identical: together with `.gitignore` / `.travsrignore`
-/// they define the one file universe both the graph and `find_pattern` must
-/// agree on (#448).
-const SKIP_DIRS: &[&str] = &[
+/// Together with `.gitignore` / `.travsrignore` these define the one file
+/// universe both the graph and `find_pattern` must agree on (#448), so the two
+/// lists drifting apart silently re-opens that issue.
+///
+/// `pub` only so the drift cannot happen quietly: the dependency edge runs the
+/// other way, so `travsr-daemon` can import this and assert the two are equal.
+/// See `skip_dirs_matches_the_mcp_copy` in `travsr-daemon::watcher`. Not part
+/// of this crate's intended API otherwise.
+///
+/// Unrelated to `travsr-cli`'s own `SKIP_DIRS` in `lang.rs`, which is a
+/// different list (`build`, `.cache`, `__pycache__`, and no `.travsr`) serving
+/// language detection rather than the graph's file set.
+pub const SKIP_DIRS: &[&str] = &[
     ".claude",
     ".git",
     ".travsr",
@@ -983,7 +992,14 @@ const SKIP_DIRS: &[&str] = &[
 /// has no negation rule. That is the overwhelmingly common case, and without a
 /// negation every walked file is also a file git does not ignore, so
 /// `--untracked --exclude-standard` already reaches all of them.
-fn travsrignore_reincluded_files(repo_root: &std::path::Path) -> Vec<String> {
+///
+/// `remaining` is what is left of the caller's [`GREP_TIMEOUT`], not a fresh
+/// budget: this runs between the two grep passes, so giving it its own ceiling
+/// would make the real worst case a multiple of the documented one.
+fn travsrignore_reincluded_files(
+    repo_root: &std::path::Path,
+    remaining: std::time::Duration,
+) -> Vec<String> {
     let contents = match std::fs::read_to_string(repo_root.join(".travsrignore")) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -1011,7 +1027,7 @@ fn travsrignore_reincluded_files(repo_root: &std::path::Path) -> Vec<String> {
         .arg("--ignored")
         .arg("--exclude-standard")
         .arg("-z");
-    let (status, stdout, _stderr) = match spawn_with_deadline(cmd, GREP_TIMEOUT) {
+    let (status, stdout, _stderr) = match spawn_with_deadline(cmd, remaining) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("find_pattern could not list ignored files: {e}");
@@ -1294,7 +1310,10 @@ fn run_git_grep(
     // `!` rule in `.travsrignore` re-included. `--no-index` searches the given
     // paths directly instead of consulting the index or the ignore rules that
     // excluded them in the first place. Empty for any repo without a `!` rule.
-    let reincluded = scoped_to_pathspecs(travsrignore_reincluded_files(repo_root), pathspecs);
+    let reincluded = scoped_to_pathspecs(
+        travsrignore_reincluded_files(repo_root, remaining()),
+        pathspecs,
+    );
     let mut pass2_error: Option<String> = None;
     for chunk in argv_chunks(&reincluded) {
         let mut cmd = Command::new("git");
@@ -1306,6 +1325,17 @@ fn run_git_grep(
         match grep_pass(cmd, remaining()) {
             Ok(lines) => all.extend(lines),
             Err(detail) => {
+                // Abandon the remaining batches rather than press on. The
+                // batches are one logical search split only to fit an argument
+                // vector, so continuing would report a subset of the
+                // re-included files as if it were all of them — the same
+                // silent under-reporting #448 exists to remove. Stopping keeps
+                // the outcome honest: `pass2_error` below either surfaces or,
+                // if pass 1 already matched, warns.
+                //
+                // Reachable if a re-included file is deleted between the
+                // `git ls-files` listing and this grep (exit 128). Rare, and
+                // the next call re-lists.
                 pass2_error = Some(detail);
                 break;
             }
@@ -1330,23 +1360,45 @@ fn run_git_grep(
         tracing::warn!("find_pattern re-included pass failed: {detail}");
     }
 
-    // `git grep` honors `.gitignore` but knows nothing about `.travsrignore`, so a
-    // git-tracked file the user excluded from the graph would still appear here —
-    // making find_pattern and find_references disagree on the same repo. Filter
-    // matches through the same gitignore-syntax `.travsrignore` the indexer's
-    // walker applies (`add_custom_ignore_filename`), so both tools see one set of
-    // files. Each grep line is `path:line:col:text`, so the path is the prefix
-    // before the first ':'. Pass-2 paths are whitelisted by construction, so this
-    // only ever drops pass-1 lines.
+    // Two filters, both closing the same gap from the other direction: git can
+    // see files the walker refuses to index, so a match from one of them would
+    // be a file `find_references` can never corroborate.
+    //
+    // 1. `SKIP_DIRS` is hard-excluded by the walker *ahead of* any ignore file
+    //    (`SKIP_DIRS (hard) < .gitignore < .travsrignore`), so a `dist/` or
+    //    `target/` that happens not to be gitignored is in git's universe and
+    //    never in the graph. `--untracked` widened pass 1 into exactly those,
+    //    and no ignore rule excludes them, so the component check is the only
+    //    thing that can. Pass 2 already applies it when building its file list.
+    // 2. `git grep` honors `.gitignore` but knows nothing about
+    //    `.travsrignore`, so a git-tracked file the user excluded from the
+    //    graph would still appear. Filtering through the same gitignore-syntax
+    //    matcher the walker applies (`add_custom_ignore_filename`) keeps both
+    //    tools on one set of files. Pass-2 paths are whitelisted by
+    //    construction, so this half only ever drops pass-1 lines.
+    //
+    // Each grep line is `path:line:col:text`, so the path is the prefix before
+    // the first ':'.
     let travsrignore = build_travsrignore_matcher(repo_root);
     let all: Vec<&str> = all
         .iter()
         .map(String::as_str)
-        .filter(|line| match (&travsrignore, line.split(':').next()) {
-            (Some(ig), Some(path)) if !path.is_empty() => !ig
-                .matched_path_or_any_parents(repo_root.join(path), false)
-                .is_ignore(),
-            _ => true,
+        .filter(|line| {
+            let Some(path) = line.split(':').next().filter(|p| !p.is_empty()) else {
+                return true;
+            };
+            let in_skip_dir = std::path::Path::new(path)
+                .components()
+                .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip));
+            if in_skip_dir {
+                return false;
+            }
+            match &travsrignore {
+                Some(ig) => !ig
+                    .matched_path_or_any_parents(repo_root.join(path), false)
+                    .is_ignore(),
+                None => true,
+            }
         })
         .collect();
     if all.is_empty() {
@@ -9640,6 +9692,51 @@ mod snippet_tests {
     }
 
     #[test]
+    fn find_pattern_still_excludes_skip_dirs_that_no_ignore_rule_covers() {
+        // #448 review: `--untracked` widened pass 1 to every file git does not
+        // ignore, but the walker hard-skips SKIP_DIRS *ahead of* any ignore
+        // file (`SKIP_DIRS (hard) < .gitignore < .travsrignore`). A `dist/`
+        // that nothing gitignores is therefore in git's universe and never in
+        // the graph, and no ignore rule exists to filter it back out — only the
+        // component check can. Same over-inclusion the gitignored control
+        // guards, arriving through a different door.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        // No .gitignore at all, so nothing excludes dist/ or target/ from git.
+        std::fs::write(root.join("tracked.rs"), "fn charge() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        for skipped in ["dist", "target"] {
+            std::fs::create_dir_all(root.join(skipped)).unwrap();
+            std::fs::write(root.join(skipped).join("bundle.rs"), "fn charge() {}\n").unwrap();
+        }
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "charge", None, false);
+        if !out.contains("tracked.rs") {
+            return; // git unavailable in this sandbox
+        }
+        assert!(
+            !out.contains("dist/bundle.rs") && !out.contains("target/bundle.rs"),
+            "a SKIP_DIRS path the walker never indexes must not be searchable, \
+             even when no ignore rule covers it: {out}"
+        );
+    }
+
+    #[test]
     fn find_pattern_scope_confines_reincluded_files() {
         // Pass 2 has to honor `scope` the same way git honors a pathspec,
         // otherwise scoping a search would widen it.
@@ -9703,10 +9800,10 @@ mod snippet_tests {
         // means no `git ls-files` call and no second grep.
         let (dir, _store) = pattern_fixture("fix.rs", "fn charge() {}\n");
         std::fs::write(dir.path().join(".travsrignore"), "gen/\n#!not-a-rule\n").unwrap();
-        assert!(travsrignore_reincluded_files(dir.path()).is_empty());
+        assert!(travsrignore_reincluded_files(dir.path(), GREP_TIMEOUT).is_empty());
         // Absent file is the same story.
         std::fs::remove_file(dir.path().join(".travsrignore")).unwrap();
-        assert!(travsrignore_reincluded_files(dir.path()).is_empty());
+        assert!(travsrignore_reincluded_files(dir.path(), GREP_TIMEOUT).is_empty());
     }
 
     /// A git repo with `.gitignore` / `.travsrignore` written verbatim and one
@@ -9757,7 +9854,7 @@ mod snippet_tests {
                 "vendored/dep.rs".to_string(),
             ],
         );
-        let found = travsrignore_reincluded_files(dir.path());
+        let found = travsrignore_reincluded_files(dir.path(), GREP_TIMEOUT);
         if found.is_empty() {
             return; // git unavailable in this sandbox
         }
@@ -9783,7 +9880,7 @@ mod snippet_tests {
                 "vendored/notes.txt".to_string(),
             ],
         );
-        let found = travsrignore_reincluded_files(dir.path());
+        let found = travsrignore_reincluded_files(dir.path(), GREP_TIMEOUT);
         if found.is_empty() {
             return;
         }
@@ -9806,7 +9903,7 @@ mod snippet_tests {
         let files: Vec<String> = (0..N).map(|i| format!("vendored/f{i:04}.rs")).collect();
         let dir = ignore_rules_fixture("vendored/\n", "!vendored/\n", &files);
 
-        let reincluded = travsrignore_reincluded_files(dir.path());
+        let reincluded = travsrignore_reincluded_files(dir.path(), GREP_TIMEOUT);
         if reincluded.is_empty() {
             return;
         }
