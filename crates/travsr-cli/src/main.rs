@@ -567,7 +567,8 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     let exe = std::env::current_exe().context("finding current exe")?;
                     match daemon_client::spawn_background_daemon(&repo_root, &exe) {
-                        daemon_client::SpawnOutcome::Failed => match daemon_start_error(&repo_root) {
+                        daemon_client::SpawnOutcome::Failed => match daemon_start_error(&repo_root)
+                        {
                             Some(r) => eprintln!("travsr daemon failed to restart: {r}"),
                             None => eprintln!(
                                 "travsr daemon failed to restart (see .travsr/daemon.log)"
