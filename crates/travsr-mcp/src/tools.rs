@@ -1710,16 +1710,138 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         }
     }
 
-    while let Some(current_id) = queue.pop_front() {
-        let incoming = match store.iter_edges_to(current_id) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("get_blast_radius edge error: {e}");
-                continue;
-            }
-        };
+    // Phase-2 memoization, shared across every pass of the outer fixpoint.
+    // `phase2_done`: files whose importers have already been resolved via the
+    //   language-aware resolvers, so we never re-resolve the same file. (Per
+    //   target file, a local `seen_here` set dedups candidate import nodes so
+    //   the pure `resolves_to` runs at most once per candidate.)
+    let mut phase2_done: HashSet<String> = HashSet::new();
 
-        if visited.len() >= MAX_BLAST_RADIUS_NODES {
+    // Phase-2 candidate index, built once per call from a single bulk load.
+    // Transitive resolution (#613) re-resolves importers for every newly reached
+    // file; issuing a SQLite FTS lookup per file was ~50x slower on k8s. Instead
+    // load all import nodes once and index them by the alphanumeric tokens of
+    // their signature. An import node can only resolve to a file whose directory
+    // or stem appears as a path element in its signature, so a token lookup is a
+    // superset of the true importers for a hint — `resolves_to` stays the
+    // arbiter, and this replicates the FTS prefilter without per-file queries.
+    // Built only in TreeSitter mode (Semantic skips Phase 2 entirely).
+    let import_records: Vec<(travsr_core::NodeId, String, String, String)> =
+        if mode == AnalysisMode::TreeSitter {
+            store.import_nodes_lite().unwrap_or_else(|e| {
+                // Fail open (Phase 1 still ran), but never silently: a bulk-load
+                // error drops the entire Phase-2 pass, so the result would
+                // under-report importers with no other signal.
+                tracing::warn!(
+                    "get_blast_radius: import_nodes_lite failed for '{file}' \
+                     ({e}); Phase-2 (file-level import) resolution skipped, \
+                     result may be incomplete"
+                );
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+    let mut import_token_index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, (_, sig, _, _)) in import_records.iter().enumerate() {
+        for tok in import_sig_tokens(sig) {
+            import_token_index
+                .entry(tok.to_string())
+                .or_default()
+                .push(idx);
+        }
+    }
+
+    // Outer fixpoint (#613). Each pass:
+    //   1. Drains the edge-following reverse BFS (Phase 1). This handles the
+    //      TS/JS/Rust `Depends → import → ResolvesTo` chain and `Depends`
+    //      co-package siblings transitively, for every node currently queued.
+    //   2. Resolves file-level imports for the languages that emit NO
+    //      ResolvesTo edge (Phase 2), pushing every newly discovered importer
+    //      *node* back onto the BFS queue so pass 1 can walk its edges next.
+    // A Phase-2 importer has no ResolvesTo edge, so re-draining the BFS alone
+    // finds nothing new — transitivity comes from re-running Phase 2 on each
+    // newly reached file, which this loop does until a full pass adds nothing.
+    // Labeled so the hard ceiling can abort the whole fixpoint from the
+    // innermost Phase-2 insertion with no per-pass overshoot.
+    'fixpoint: loop {
+        // ── Phase 1: edge-following reverse BFS ──
+        while let Some(current_id) = queue.pop_front() {
+            let incoming = match store.iter_edges_to(current_id) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("get_blast_radius edge error: {e}");
+                    continue;
+                }
+            };
+
+            if visited.len() >= MAX_BLAST_RADIUS_NODES {
+                tracing::warn!(
+                    "get_blast_radius hit ceiling ({MAX_BLAST_RADIUS_NODES} nodes) \
+                     for file '{file}'; result may be incomplete"
+                );
+                break;
+            }
+
+            // Batch: collect followable new-src ids, enqueue, then fetch paths once.
+            let new_srcs: Vec<NodeId> = incoming
+                .into_iter()
+                .filter(|edge| match mode {
+                    // ResolvesTo is required for the two-hop import chain that the
+                    // indexer emits for TypeScript/JS/Rust:
+                    //   file --Depends--> import:pkg --ResolvesTo--> target file
+                    // Walking incoming edges from the target reaches the import node
+                    // only via ResolvesTo; from there Depends reaches the importer.
+                    // Without it, blast radius on those files returns just the file
+                    // itself (#582).
+                    AnalysisMode::TreeSitter => matches!(
+                        edge.kind,
+                        EdgeKind::DefinesBinding
+                            | EdgeKind::RefCall
+                            | EdgeKind::Depends
+                            | EdgeKind::ResolvesTo
+                    ),
+                    AnalysisMode::Semantic => matches!(edge.kind, EdgeKind::RefCall),
+                })
+                .filter(|edge| visited.insert(edge.src))
+                .map(|edge| edge.src)
+                .collect();
+            for &id in &new_srcs {
+                queue.push_back(id);
+            }
+            let node_map: HashMap<NodeId, CoreNode> = store
+                .get_nodes(&new_srcs)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|n| (n.id, n))
+                .collect();
+            for id in &new_srcs {
+                if let Some(src_node) = node_map.get(id) {
+                    if !src_node.vname.path.is_empty() {
+                        affected_files.insert(src_node.vname.path.clone());
+                        // Hard ceiling on the result set (see the Phase-2 note).
+                        if affected_files.len() >= MAX_BLAST_RADIUS_NODES {
+                            tracing::warn!(
+                                "get_blast_radius hit ceiling \
+                                 ({MAX_BLAST_RADIUS_NODES} nodes) for file '{file}'; \
+                                 result may be incomplete"
+                            );
+                            break 'fixpoint;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2: language-aware file-level import resolution ──
+        // Many languages store deps as file --[Depends]--> import:pkg with no
+        // ResolvesTo chain back; ImportResolver bridges this per language.
+        // Semantic mode uses only precise RefCall edges, so Phase 2 is skipped.
+        if mode != AnalysisMode::TreeSitter {
+            break;
+        }
+        if visited.len() >= MAX_BLAST_RADIUS_NODES || affected_files.len() >= MAX_BLAST_RADIUS_NODES
+        {
             tracing::warn!(
                 "get_blast_radius hit ceiling ({MAX_BLAST_RADIUS_NODES} nodes) \
                  for file '{file}'; result may be incomplete"
@@ -1727,116 +1849,86 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
             break;
         }
 
-        // Batch: collect followable new-src ids, enqueue, then fetch paths once.
-        let new_srcs: Vec<NodeId> = incoming
-            .into_iter()
-            .filter(|edge| match mode {
-                // ResolvesTo is required for the two-hop import chain that the
-                // indexer emits for TypeScript/JS/Rust:
-                //   file --Depends--> import:pkg --ResolvesTo--> target file
-                // Walking incoming edges from the target reaches the import node
-                // only via ResolvesTo; from there Depends reaches the importer.
-                // Without it, blast radius on those files returns just the file
-                // itself (#582).
-                AnalysisMode::TreeSitter => matches!(
-                    edge.kind,
-                    EdgeKind::DefinesBinding
-                        | EdgeKind::RefCall
-                        | EdgeKind::Depends
-                        | EdgeKind::ResolvesTo
-                ),
-                AnalysisMode::Semantic => matches!(edge.kind, EdgeKind::RefCall),
-            })
-            .filter(|edge| visited.insert(edge.src))
-            .map(|edge| edge.src)
+        // Files reached so far whose importers we have not yet resolved. Newly
+        // discovered importer files land here on the next pass, giving
+        // transitivity. TS/JS/Rust files map to NoopResolver, so re-processing
+        // them is a cheap no-op.
+        let todo: Vec<String> = affected_files
+            .iter()
+            .filter(|f| !phase2_done.contains(*f))
+            .cloned()
             .collect();
-        for &id in &new_srcs {
-            queue.push_back(id);
-        }
-        let node_map: HashMap<NodeId, CoreNode> = store
-            .get_nodes(&new_srcs)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|n| (n.id, n))
-            .collect();
-        for id in &new_srcs {
-            if let Some(src_node) = node_map.get(id) {
-                if !src_node.vname.path.is_empty() {
-                    affected_files.insert(src_node.vname.path.clone());
-                }
-            }
-        }
-    }
-
-    // Phase 2: file-level blast radius via language-aware import resolution.
-    // Many languages store deps as file --[Depends]--> import:pkg with no
-    // ResolvesTo chain back. ImportResolver bridges this for all 14 languages.
-    // Skipped in Semantic mode — RefCall edges are already precise.
-    //
-    // Two search hints: the package directory (Go, Java packages, PHP, C#) and
-    // the file stem (Java/Kotlin/Scala class-level imports like import:com.Foo).
-    if mode == AnalysisMode::TreeSitter {
-        let fp_normalized = file.replace('\\', "/");
-        let p = std::path::Path::new(&fp_normalized);
-        let dir_hint = p
-            .parent()
-            .and_then(|d| d.file_name()) // last component of directory
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty());
-        let stem_hint = p.file_stem().and_then(|s| s.to_str());
-
-        let mut hints: Vec<&str> = Vec::new();
-        if let Some(d) = dir_hint {
-            hints.push(d);
-        }
-        if let Some(s) = stem_hint {
-            if Some(s) != dir_hint {
-                hints.push(s);
-            }
+        if todo.is_empty() {
+            break; // fixpoint reached — no new file to resolve importers for
         }
 
-        let mut checked_import_ids: std::collections::HashSet<travsr_core::NodeId> =
-            std::collections::HashSet::new();
-
-        for hint in hints {
-            let Ok(import_nodes) = store.search_nodes_by_name(hint) else {
-                continue;
-            };
-            for imp in import_nodes {
-                if imp.kind != "import" {
-                    continue;
-                }
-                if !checked_import_ids.insert(imp.id) {
-                    continue;
-                } // dedup across hints
-                let resolver = travsr_core::resolver_for_language(&imp.vname.language);
-                if !resolver.resolves_to(&imp.vname.signature, file) {
-                    continue;
-                }
-                let Ok(edges) = store.iter_edges_to(imp.id) else {
-                    continue;
-                };
-                // Batch: all Depends src ids (visited+queue separately; path fetch once).
-                let dep_srcs: Vec<NodeId> = edges
-                    .iter()
-                    .filter(|e| matches!(e.kind, EdgeKind::Depends))
-                    .map(|e| e.src)
-                    .collect();
-                for &id in &dep_srcs {
-                    if visited.insert(id) {
-                        queue.push_back(id);
-                    }
-                }
-                let node_map: HashMap<NodeId, CoreNode> = store
-                    .get_nodes(&dep_srcs)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|n| (n.id, n))
-                    .collect();
-                for id in &dep_srcs {
-                    if let Some(src_node) = node_map.get(id) {
-                        if !src_node.vname.path.is_empty() {
-                            affected_files.insert(src_node.vname.path.clone());
+        for target_file in todo {
+            phase2_done.insert(target_file.clone());
+            // Two search hints per file: the parent directory (Go/Java package,
+            // PHP, C#) and the file stem (Java/Kotlin/Scala class-level imports
+            // like import:com.Foo; Ruby/C/C++/Objective-C relative includes).
+            // Each hint is tokenised the same way as the import signatures so a
+            // lookup returns a superset of the import nodes that could resolve.
+            // `seen_here` dedups candidates whose signature shares more than one
+            // token with the hints, so `resolves_to` runs once per candidate.
+            let mut seen_here: HashSet<usize> = HashSet::new();
+            for hint in blast_radius_hints(&target_file) {
+                for tok in import_sig_tokens(&hint) {
+                    let Some(cands) = import_token_index.get(tok) else {
+                        continue;
+                    };
+                    for &idx in cands {
+                        if !seen_here.insert(idx) {
+                            continue;
+                        }
+                        let (imp_id, imp_sig, imp_lang, imp_path) = &import_records[idx];
+                        let resolver = travsr_core::resolver_for_language(imp_lang);
+                        // The import node's own path is the importer's file — the
+                        // deterministic anchor for relative imports (#613).
+                        // `seen_here` already guarantees each import node is
+                        // resolved at most once per target file.
+                        if !resolver.resolves_to(imp_sig, imp_path, &target_file) {
+                            continue;
+                        }
+                        let Ok(edges) = store.iter_edges_to(*imp_id) else {
+                            continue;
+                        };
+                        let dep_srcs: Vec<NodeId> = edges
+                            .iter()
+                            .filter(|e| matches!(e.kind, EdgeKind::Depends))
+                            .map(|e| e.src)
+                            .collect();
+                        let node_map: HashMap<NodeId, CoreNode> = store
+                            .get_nodes(&dep_srcs)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|n| (n.id, n))
+                            .collect();
+                        for id in &dep_srcs {
+                            // Push the importer node onto the BFS queue so the
+                            // next Phase-1 pass walks its co-package Depends
+                            // siblings and any ResolvesTo importers. This is the
+                            // line that was dead before #613.
+                            if visited.insert(*id) {
+                                queue.push_back(*id);
+                            }
+                            if let Some(src_node) = node_map.get(id) {
+                                if !src_node.vname.path.is_empty() {
+                                    affected_files.insert(src_node.vname.path.clone());
+                                    // Hard ceiling: abort the whole fixpoint the
+                                    // instant the result reaches the cap, so a
+                                    // hub file imported by tens of thousands
+                                    // cannot overshoot within a single pass.
+                                    if affected_files.len() >= MAX_BLAST_RADIUS_NODES {
+                                        tracing::warn!(
+                                            "get_blast_radius hit ceiling \
+                                             ({MAX_BLAST_RADIUS_NODES} nodes) for file \
+                                             '{file}'; result may be incomplete"
+                                        );
+                                        break 'fixpoint;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1845,6 +1937,43 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
     }
 
     affected_files.into_iter().collect::<Vec<_>>().join("\n")
+}
+
+/// Blast-radius Phase-2 search hints for a file: the parent directory's last
+/// component and the file stem. These narrow the FTS lookup of candidate import
+/// nodes before the language-aware resolver confirms an exact match.
+fn blast_radius_hints(file: &str) -> Vec<String> {
+    let fp = file.replace('\\', "/");
+    let p = std::path::Path::new(&fp);
+    let dir_hint = p
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty());
+    let stem_hint = p.file_stem().and_then(|s| s.to_str());
+
+    let mut hints: Vec<String> = Vec::new();
+    if let Some(d) = dir_hint {
+        hints.push(d.to_string());
+    }
+    if let Some(s) = stem_hint {
+        if Some(s) != dir_hint {
+            hints.push(s.to_string());
+        }
+    }
+    hints
+}
+
+/// Split an import signature into its alphanumeric path tokens (dropping the
+/// `import:` prefix and every separator: `/`, `\`, `.`, `:`, `_`, quotes,
+/// angle brackets). Used to index import nodes for the blast-radius Phase-2
+/// candidate lookup, and to tokenise search hints the same way. Case-sensitive,
+/// which matches how case-significant languages (Java classes) name their files.
+fn import_sig_tokens(sig: &str) -> impl Iterator<Item = &str> {
+    sig.strip_prefix("import:")
+        .unwrap_or(sig)
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
 }
 
 /// Global variant of `get_blast_radius`.
@@ -6365,6 +6494,114 @@ mod tests {
         assert!(
             result.contains("ruby/src/dog.rb"),
             "dog.rb requires animal (Phase-2 RubyResolver) and must appear, got: {result}"
+        );
+    }
+
+    /// #613 keystone. A Phase-2 language (Ruby, no ResolvesTo edge) must report
+    /// blast radius *transitively*: main.rb requires cat, cat.rb requires animal.
+    /// Editing animal.rb must reach cat.rb (one hop) AND main.rb (two hops).
+    /// Before the fixpoint this returned only cat.rb.
+    #[test]
+    fn blast_radius_phase2_is_transitive_across_hops() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let ruby = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("", "", path, "ruby", sig), kind)
+        };
+        let animal = ruby("ruby/src/animal.rb", "fn:animal", "function");
+        let cat = ruby("ruby/src/cat.rb", "fn:cat", "function");
+        let main = ruby("ruby/src/main.rb", "fn:main", "function");
+        // cat.rb `require_relative 'animal'`; main.rb `require_relative 'cat'`.
+        // Import node path == the requiring file; no ResolvesTo edges anywhere.
+        let cat_import = ruby("ruby/src/cat.rb", "import:animal", "import");
+        let main_import = ruby("ruby/src/main.rb", "import:cat", "import");
+        let store = make_store(
+            &[
+                animal.clone(),
+                cat.clone(),
+                main.clone(),
+                cat_import.clone(),
+                main_import.clone(),
+            ],
+            &[
+                (cat.id, cat_import.id, EdgeKind::Depends),
+                (main.id, main_import.id, EdgeKind::Depends),
+            ],
+        );
+        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter);
+        assert!(
+            result.contains("ruby/src/cat.rb"),
+            "direct importer cat.rb must appear, got: {result}"
+        );
+        assert!(
+            result.contains("ruby/src/main.rb"),
+            "transitive importer main.rb (main → cat → animal) must appear, got: {result}"
+        );
+    }
+
+    /// #613 determinism guard. Phase-2 resolution must anchor a relative require
+    /// to the importer's directory, never a same-named file under an unrelated
+    /// root. Here `other/helper.rb` requires 'animal' meaning `other/animal.rb`;
+    /// it must NOT be dragged into the blast radius of `ruby/src/animal.rb`
+    /// merely because both files are named animal.rb. Without importer-anchoring
+    /// this false positive would also compound transitively.
+    #[test]
+    fn blast_radius_phase2_does_not_match_same_name_unrelated_file() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let ruby = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("", "", path, "ruby", sig), kind)
+        };
+        let animal = ruby("ruby/src/animal.rb", "fn:animal", "function");
+        let cat = ruby("ruby/src/cat.rb", "fn:cat", "function");
+        let cat_import = ruby("ruby/src/cat.rb", "import:animal", "import");
+        // Unrelated file with the same stem, in a different directory.
+        let other_helper = ruby("other/helper.rb", "fn:helper", "function");
+        let other_import = ruby("other/helper.rb", "import:animal", "import");
+        let store = make_store(
+            &[
+                animal.clone(),
+                cat.clone(),
+                cat_import.clone(),
+                other_helper.clone(),
+                other_import.clone(),
+            ],
+            &[
+                (cat.id, cat_import.id, EdgeKind::Depends),
+                (other_helper.id, other_import.id, EdgeKind::Depends),
+            ],
+        );
+        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter);
+        assert!(
+            result.contains("ruby/src/cat.rb"),
+            "sibling importer cat.rb must appear, got: {result}"
+        );
+        assert!(
+            !result.contains("other/helper.rb"),
+            "helper.rb requires its own other/animal.rb — must NOT appear for \
+             ruby/src/animal.rb, got: {result}"
+        );
+    }
+
+    /// Objective-C previously fell through to NoopResolver and had no Phase-2
+    /// blast radius. `#import "Model.h"` is importer-relative, so editing
+    /// Model.h must reach the .m file that imports it.
+    #[test]
+    fn blast_radius_phase2_resolves_objective_c_import() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let objc = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("", "", path, "objectivec", sig), kind)
+        };
+        let model = objc("app/Model.h", "type:Model", "type");
+        let view = objc("app/View.m", "type:View", "type");
+        // `#import "Model.h"` in View.m → import:Model.h, path == View.m.
+        let view_import = objc("app/View.m", "import:Model.h", "import");
+        let store = make_store(
+            &[model.clone(), view.clone(), view_import.clone()],
+            &[(view.id, view_import.id, EdgeKind::Depends)],
+        );
+        let result = get_blast_radius(&store, "app/Model.h", AnalysisMode::TreeSitter);
+        assert!(
+            result.contains("app/View.m"),
+            "View.m imports Model.h and must appear in its blast radius, got: {result}"
         );
     }
 
