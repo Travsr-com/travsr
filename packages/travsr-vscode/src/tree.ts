@@ -13,6 +13,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
+import { stripEnvelope } from "./commands";
 import type { McpClient } from "./mcp";
 
 // ── tree node types ────────────────────────────────────────────────────────
@@ -164,7 +165,7 @@ export class TravsrTreeDataProvider
   private async loadDeps(file: string): Promise<EntryNode[]> {
     try {
       const raw = await this.mcp.callTool("get_dependencies", { file });
-      const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+      const lines = stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
       return lines.map((line) => {
         // Format: "import:./mcp", "import:@scope/pkg", "type-import:./bar"
         const m = /^([^:]+):(.+)$/.exec(line);
@@ -184,7 +185,7 @@ export class TravsrTreeDataProvider
     try {
       const raw = await this.mcp.callTool("get_callers", { symbol }, signal);
       if (signal?.aborted) return [];
-      const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+      const lines = stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
       return lines.map((line) => {
         // Format: "[call] fn:bar (function) — src/bar.ts"
         const m = /^(\[[^\]]+\])\s+(\S+)(?:\s+\([^)]+\))?\s+—\s+(.+)$/.exec(
