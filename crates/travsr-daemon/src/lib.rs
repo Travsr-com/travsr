@@ -6280,6 +6280,20 @@ fn prepare_fallback_socket_dir(
         .uid();
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating control-socket dir {}", dir.display()))?;
+    // Never operate through a symlink. `create_dir_all` silently succeeds when
+    // the leaf already exists as a symlink to a directory; without this check the
+    // set_permissions/metadata calls below would follow it and we could end up
+    // binding through an attacker-chosen redirect. Reject a symlinked leaf before
+    // we touch it. (The parent runtime base carries the sticky bit, so a
+    // non-owner cannot swap this entry after the check.)
+    let leaf_type = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("stat control-socket dir {}", dir.display()))?
+        .file_type();
+    anyhow::ensure!(
+        !leaf_type.is_symlink(),
+        "refusing to bind control socket: {} is a symlink",
+        dir.display()
+    );
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("locking down control-socket dir {}", dir.display()))?;
     let md = std::fs::metadata(dir)
@@ -6295,6 +6309,31 @@ fn prepare_fallback_socket_dir(
         dir.display()
     );
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod fallback_socket_dir_tests {
+    use super::prepare_fallback_socket_dir;
+    use std::os::unix::fs::symlink;
+
+    // #592 hardening: a symlinked leaf must be rejected so the daemon never
+    // binds through an attacker-chosen redirect on a shared runtime base.
+    #[test]
+    fn rejects_symlinked_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let target = tmp.path().join("real-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let leaf = tmp.path().join("travsr-uid");
+        symlink(&target, &leaf).unwrap();
+        let sock = leaf.join("daemon-deadbeef.sock");
+        let err = prepare_fallback_socket_dir(&travsr_dir, &sock).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got: {err}"
+        );
+    }
 }
 
 impl Daemon {

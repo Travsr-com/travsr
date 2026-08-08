@@ -65,9 +65,23 @@ impl ControlAddr {
         if unix_socket_path_fits(&primary) {
             return primary;
         }
-        runtime_base()
-            .join(format!("travsr-{}", owner_uid(travsr_dir)))
-            .join(format!("daemon-{}.sock", self.hex))
+        // Long-path fallback. Try each candidate base in order and pick the
+        // first whose *resulting* socket path actually fits sun_path — a base
+        // that is itself long (an unusual `$TMPDIR`/`$XDG_RUNTIME_DIR`) must not
+        // silently defeat the fix by producing another over-long path. `/tmp`
+        // is always the last resort and is short enough that the path always
+        // fits, so this is guaranteed to return a fitting path.
+        let leaf = format!("travsr-{}", owner_uid(travsr_dir));
+        let sock = format!("daemon-{}.sock", self.hex);
+        let mut last = PathBuf::new();
+        for base in runtime_bases() {
+            let candidate = base.join(&leaf).join(&sock);
+            if unix_socket_path_fits(&candidate) {
+                return candidate;
+            }
+            last = candidate;
+        }
+        last
     }
 
     /// Windows named pipe path: `\\.\pipe\travsr-<hex>`
@@ -99,20 +113,23 @@ fn unix_socket_path_fits(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() < SUN_PATH_MAX
 }
 
-/// Short, per-user base directory for the SUN_LEN fallback socket. Prefers
-/// `$XDG_RUNTIME_DIR` (Linux, user-private 0700), then `$TMPDIR` (macOS,
-/// per-user 0700), then `/tmp`. Daemon and clients resolve it identically
-/// because the daemon inherits the launching CLI's environment.
+/// Candidate base directories for the SUN_LEN fallback socket, in preference
+/// order: `$XDG_RUNTIME_DIR` (Linux, user-private 0700), then `$TMPDIR` (macOS,
+/// per-user 0700), then `/tmp` (always last, always short). The caller picks the
+/// first whose resulting socket path fits. Daemon and clients resolve the same
+/// list because the daemon inherits the launching CLI's environment.
 #[cfg(unix)]
-fn runtime_base() -> PathBuf {
+fn runtime_bases() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
     for key in ["XDG_RUNTIME_DIR", "TMPDIR"] {
         if let Some(v) = std::env::var_os(key) {
             if !v.is_empty() {
-                return PathBuf::from(v);
+                bases.push(PathBuf::from(v));
             }
         }
     }
-    PathBuf::from("/tmp")
+    bases.push(PathBuf::from("/tmp"));
+    bases
 }
 
 /// Owner uid of `path`, used as a per-user discriminator so distinct users
