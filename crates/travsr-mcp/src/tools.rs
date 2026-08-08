@@ -432,10 +432,10 @@ enum RefTarget {
 /// first (handles full headers like `fn:charge` from `get_context`), then an
 /// exact simple-name match over the FTS candidates. An optional `path` suffix
 /// pins overloaded names to one file.
-fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&str>) -> RefTarget {
+fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
     // Tier 1: exact signature (+ optional path pin).
     let mut candidates = store.lookup_nodes_exact(symbol, path).unwrap_or_else(|e| {
-        tracing::warn!("find_references lookup_nodes_exact '{symbol}': {e}");
+        tracing::warn!("resolve_symbol_nodes lookup_nodes_exact '{symbol}': {e}");
         Vec::new()
     });
 
@@ -446,11 +446,7 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
                 .into_iter()
                 .filter(|n| {
                     // Exclude non-definition nodes: `file` container nodes and
-                    // `import`/`use` nodes (kind == "import"). An import node
-                    // shares the imported symbol's simple name, so without this
-                    // guard `refs find_pattern` reads as "ambiguous — 2 defs"
-                    // (the real `fn:` plus `use:...::find_pattern`), and pinning
-                    // the import node yields an empty, misleading "0 references".
+                    // `import`/`use` nodes (kind == "import").
                     n.kind != "file"
                         && n.kind != "import"
                         && (n.vname.signature == symbol
@@ -458,25 +454,19 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
                 })
                 .collect(),
             Err(e) => {
-                tracing::warn!("find_references search '{symbol}': {e}");
+                tracing::warn!("resolve_symbol_nodes search '{symbol}': {e}");
                 Vec::new()
             }
         };
     }
 
     // Tier 3 (#449): dotted static/member access like `ClassC.shared` or
-    // `Type.method`. Stored signatures qualify the member (`swift::ClassC.shared`,
-    // `method:ClassC.shared`, `scip:...ClassC#shared.`) but never equal the
-    // dotted query, and `simple_name` reduces them to the bare member, so both
-    // tiers above miss. Split at the last `.`, search the member, and keep
-    // candidates whose signature carries the container qualifier; fall back to
-    // a bare-member match only when it is unique AND genuinely unqualified
-    // (never a match with some OTHER, unrelated container).
+    // `Type.method`.
     if candidates.is_empty() {
         if let Some((container, member)) = symbol.rsplit_once('.') {
             if !container.is_empty() && !member.is_empty() {
                 let found = store.search_nodes_by_name(member).unwrap_or_else(|e| {
-                    tracing::warn!("find_references dotted search '{member}': {e}");
+                    tracing::warn!("resolve_symbol_nodes dotted search '{member}': {e}");
                     Vec::new()
                 });
                 let matches: Vec<CoreNode> = found
@@ -509,9 +499,7 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
         }
     }
 
-    // Apply the path suffix pin if the caller supplied one (Tier 2 didn't use it).
-    // Match on a `/`-boundary so a hint like `tools.rs` pins `src/tools.rs` but
-    // never `src/mytools.rs` — mirroring the store's `LIKE '%/' || hint` pin.
+    // Apply the path suffix pin if the caller supplied one.
     if let Some(p) = path {
         let boundary = format!("/{p}");
         candidates.retain(|n| n.vname.path == p || n.vname.path.ends_with(&boundary));
@@ -520,6 +508,13 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
     // Distinct definitions by node id.
     candidates.sort_by_key(|n| n.id.0);
     candidates.dedup_by_key(|n| n.id);
+    
+    candidates
+}
+
+/// Helper to map `resolve_symbol_nodes` candidates to a `RefTarget` for find_references.
+fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&str>) -> RefTarget {
+    let mut candidates = resolve_symbol_nodes(store, symbol, path);
 
     // C/C++ split a symbol into a header declaration and a source definition
     // (`utils.h` decl + `utils.c` def). They share the simple name, so both
@@ -6833,14 +6828,13 @@ fn get_snippets_body(
                 resolved.push(syn);
             }
 
-            // Tier 3: bare signature — exact index, returns up to
+            // Tier 3: bare signature — uses the shared resolution ladder
+            // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
-            SymbolToken::BareSig(sig) => match store.lookup_nodes_exact(sig, None) {
-                Ok(nodes) => {
-                    resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
-                }
-                Err(e) => tracing::warn!("get_snippets BareSig lookup '{sig}': {e}"),
-            },
+            SymbolToken::BareSig(sig) => {
+                let nodes = resolve_symbol_nodes(store, sig, None);
+                resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
+            }
         }
     }
 
@@ -7015,19 +7009,26 @@ mod snippet_tests {
         let db_path = root.join(".travsr").join("graph.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let mut store = SqliteStore::open(&db_path).unwrap();
+        
+        let mut by_path: std::collections::HashMap<String, Vec<CoreNode>> = std::collections::HashMap::new();
         for n in nodes {
+            by_path.entry(n.vname.path.clone()).or_default().push(n.clone());
+        }
+        
+        for (path, file_nodes) in by_path {
             store
                 .write_file_graphs_batch(
                     &[travsr_store::FileGraph {
-                        nodes: vec![n.clone()],
+                        nodes: file_nodes,
                         edges: vec![],
-                        vname_path: n.vname.path.clone(),
+                        vname_path: path,
                         new_hash: "deadbeef".to_string(),
                     }],
                     false,
                 )
                 .unwrap();
         }
+        
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
         store
     }
@@ -7048,6 +7049,37 @@ mod snippet_tests {
             result.contains("1 symbols, 1 with snippets"),
             "footer missing"
         );
+    }
+
+    #[test]
+    fn get_snippets_body_resolves_plain_and_dotted_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.ts");
+        std::fs::write(&src, "class ClassA {\n  enableSupportForFeatureX() {\n    return true;\n  }\n}\n").unwrap();
+
+        let class_node = make_fn_node("lib.ts", "class:ClassA", 1, 5);
+        let fn_node = make_fn_node("lib.ts", "method:ClassA.enableSupportForFeatureX", 2, 4);
+        let store = make_store_with_meta(&[class_node, fn_node], dir.path());
+
+        // 1. Exact signature still works
+        let exact = get_snippets_body(&store, "method:ClassA.enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        assert!(exact.contains("enableSupportForFeatureX() {"), "exact sig failed");
+
+        // 2. Plain function name works
+        let plain = get_snippets_body(&store, "enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        assert!(plain.contains("enableSupportForFeatureX() {"), "plain function name failed");
+
+        // 3. Bare class name works
+        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto);
+        assert!(class.contains("class ClassA"), "bare class name failed");
+
+        // 4. Dotted symbol name works
+        let dotted = get_snippets_body(&store, "ClassA.enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        assert!(dotted.contains("enableSupportForFeatureX() {"), "dotted symbol name failed");
+
+        // 5. Unknown symbol
+        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto);
+        assert!(unknown.contains("No symbols matching the provided names found in the graph."), "unknown symbol failed");
     }
 
     #[test]
