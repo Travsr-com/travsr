@@ -463,8 +463,20 @@ async fn run(cli: Cli) -> Result<()> {
                             daemon_client::SpawnOutcome::Started => {
                                 eprintln!("travsr daemon started in background");
                             }
+                            daemon_client::SpawnOutcome::Starting => {
+                                eprintln!(
+                                    "travsr daemon starting in background (scanning file tree)"
+                                );
+                            }
                             daemon_client::SpawnOutcome::Failed => {
-                                eprintln!("travsr daemon failed to start (see .travsr/daemon.log)");
+                                match daemon_start_error(&repo_root) {
+                                    Some(r) => {
+                                        eprintln!("travsr daemon failed to start: {r}")
+                                    }
+                                    None => eprintln!(
+                                        "travsr daemon failed to start (see .travsr/daemon.log)"
+                                    ),
+                                }
                                 return Ok(());
                             }
                         }
@@ -531,7 +543,12 @@ async fn run(cli: Cli) -> Result<()> {
                                     "daemon: starting (scanning file tree — socket not ready yet)"
                                 );
                             } else {
-                                println!("daemon: not running");
+                                match daemon_start_error(&repo_root) {
+                                    Some(r) => {
+                                        println!("daemon: not running (last start failed: {r})")
+                                    }
+                                    None => println!("daemon: not running"),
+                                }
                             }
                         }
                     }
@@ -550,9 +567,13 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     let exe = std::env::current_exe().context("finding current exe")?;
                     match daemon_client::spawn_background_daemon(&repo_root, &exe) {
-                        daemon_client::SpawnOutcome::Failed => {
-                            eprintln!("travsr daemon failed to restart (see .travsr/daemon.log)");
-                        }
+                        daemon_client::SpawnOutcome::Failed => match daemon_start_error(&repo_root)
+                        {
+                            Some(r) => eprintln!("travsr daemon failed to restart: {r}"),
+                            None => eprintln!(
+                                "travsr daemon failed to restart (see .travsr/daemon.log)"
+                            ),
+                        },
                         _ => eprintln!("travsr daemon restarted in background"),
                     }
                 }
@@ -735,6 +756,18 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Fsck { fix, json, force } => fsck::run(fix, json, force)?,
     }
     Ok(())
+}
+
+/// Read the daemon's startup-error breadcrumb (`.travsr/daemon-start.err`),
+/// written when a detached daemon crashes during startup (e.g. a control-socket
+/// bind failure). `None` when the file is absent or empty. Lets `daemon
+/// start`/`status`/`restart` surface a background failure that would otherwise
+/// be silent (travsr #592).
+fn daemon_start_error(repo_root: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(repo_root.join(".travsr").join("daemon-start.err"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Check whether a process with the given PID is currently alive.

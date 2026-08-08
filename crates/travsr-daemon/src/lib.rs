@@ -6234,6 +6234,108 @@ pub struct Daemon {
     _private: (),
 }
 
+/// Path of the startup-error breadcrumb the daemon writes when it fails to come
+/// up (e.g. a control-socket bind failure). Because `daemon start` detaches the
+/// child, a startup crash is otherwise silent; `daemon start` and `daemon
+/// status` read this file so the failure is surfaced (travsr #592). Cleared on
+/// a successful bind. Unix-only: Windows uses named pipes, which have no
+/// SUN_LEN limit and bind synchronously in-process.
+#[cfg(unix)]
+fn startup_error_path(travsr_dir: &std::path::Path) -> std::path::PathBuf {
+    travsr_dir.join("daemon-start.err")
+}
+
+#[cfg(unix)]
+fn record_startup_error(travsr_dir: &std::path::Path, msg: &str) {
+    let _ = std::fs::write(startup_error_path(travsr_dir), msg);
+}
+
+#[cfg(unix)]
+fn clear_startup_error(travsr_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(startup_error_path(travsr_dir));
+}
+
+/// When the control socket lives outside the repo (the SUN_LEN fallback,
+/// travsr #592), create and lock down its parent directory before binding.
+///
+/// Fail closed: the directory must be owned by the same uid that owns `.travsr`
+/// and be mode 0700, so a hostile user on a shared `/tmp` cannot pre-create a
+/// world-accessible directory and either block the daemon (squat the socket
+/// name) or stand up a rogue listener the CLI would connect to. In-`.travsr`
+/// sockets need no handling — travsr already created and owns that directory.
+#[cfg(unix)]
+fn prepare_fallback_socket_dir(
+    travsr_dir: &std::path::Path,
+    sock_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let Some(dir) = sock_path.parent() else {
+        return Ok(());
+    };
+    if dir == travsr_dir {
+        return Ok(());
+    }
+    let our_uid = std::fs::metadata(travsr_dir)
+        .context("stat .travsr for socket-dir ownership check")?
+        .uid();
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating control-socket dir {}", dir.display()))?;
+    // Never operate through a symlink. `create_dir_all` silently succeeds when
+    // the leaf already exists as a symlink to a directory; without this check the
+    // set_permissions/metadata calls below would follow it and we could end up
+    // binding through an attacker-chosen redirect. Reject a symlinked leaf before
+    // we touch it. (The parent runtime base carries the sticky bit, so a
+    // non-owner cannot swap this entry after the check.)
+    let leaf_type = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("stat control-socket dir {}", dir.display()))?
+        .file_type();
+    anyhow::ensure!(
+        !leaf_type.is_symlink(),
+        "refusing to bind control socket: {} is a symlink",
+        dir.display()
+    );
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("locking down control-socket dir {}", dir.display()))?;
+    let md = std::fs::metadata(dir)
+        .with_context(|| format!("stat control-socket dir {}", dir.display()))?;
+    anyhow::ensure!(
+        md.uid() == our_uid,
+        "refusing to bind control socket: {} is not owned by the current user",
+        dir.display()
+    );
+    anyhow::ensure!(
+        md.permissions().mode() & 0o777 == 0o700,
+        "refusing to bind control socket: {} is not private (mode not 0700)",
+        dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod fallback_socket_dir_tests {
+    use super::prepare_fallback_socket_dir;
+    use std::os::unix::fs::symlink;
+
+    // #592 hardening: a symlinked leaf must be rejected so the daemon never
+    // binds through an attacker-chosen redirect on a shared runtime base.
+    #[test]
+    fn rejects_symlinked_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let target = tmp.path().join("real-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let leaf = tmp.path().join("travsr-uid");
+        symlink(&target, &leaf).unwrap();
+        let sock = leaf.join("daemon-deadbeef.sock");
+        let err = prepare_fallback_socket_dir(&travsr_dir, &sock).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got: {err}"
+        );
+    }
+}
+
 impl Daemon {
     pub fn new() -> Self {
         Self::default()
@@ -6308,6 +6410,21 @@ impl Daemon {
         (&lock_file).write_all(pid.as_bytes())?;
         lock_file.set_len(pid.len() as u64)?;
 
+        // #592: resolve the control-socket path and, when it falls back outside
+        // the repo (long-path case), create and permission-verify its directory
+        // NOW — right after taking the lock, before the multi-second store open
+        // and watcher scan. A fail-closed rejection then surfaces within the
+        // `daemon start` confirmation window instead of after the daemon has
+        // done all its startup work. Record the reason so the detached child is
+        // not silent.
+        #[cfg(unix)]
+        let sock_path = travsr_ipc::ControlAddr::for_repo(&repo_root).socket_path(&travsr_dir);
+        #[cfg(unix)]
+        if let Err(e) = prepare_fallback_socket_dir(&travsr_dir, &sock_path) {
+            record_startup_error(&travsr_dir, &format!("{e:#}"));
+            return Err(e);
+        }
+
         let db_path = travsr_dir.join("graph.db");
         let store = Arc::new(Mutex::new(
             SqliteStore::open(&db_path).context("opening graph.db")?,
@@ -6375,8 +6492,6 @@ impl Daemon {
         // scan; a leftover socket from a previous run causes open() → ENOTSUP
         // which aborts the entire watch setup and silently kills file watching.
         #[cfg(unix)]
-        let sock_path = travsr_ipc::ControlAddr::for_repo(&repo_root).socket_path(&travsr_dir);
-        #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
 
         // watcher::spawn() blocks until the initial kqueue/inotify scan is fully
@@ -6387,12 +6502,22 @@ impl Daemon {
             watcher::spawn(&repo_root, tx.clone(), start_time).context("starting file watcher")?;
 
         // Control socket bound AFTER watcher scan completes (see above).
+        // #592: on bind failure, record the reason before the detached child
+        // exits so `daemon start`/`daemon status` can surface it; clear the
+        // breadcrumb once we are actually listening.
         #[cfg(unix)]
-        let mut listener = UnixListener::bind(&sock_path).context("binding control socket")?;
+        let mut listener = match UnixListener::bind(&sock_path).context("binding control socket") {
+            Ok(l) => l,
+            Err(e) => {
+                record_startup_error(&travsr_dir, &format!("{e:#}"));
+                return Err(e);
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
+            clear_startup_error(&travsr_dir);
         }
 
         let mut gc_tick = tokio::time::interval(std::time::Duration::from_secs(300));

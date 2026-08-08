@@ -14,11 +14,15 @@ use travsr_store::SqliteStore;
 /// Outcome of an attempt to bring up the background daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpawnOutcome {
-    /// We spawned it (and confirmed it took the lock) — or a concurrent starter did.
+    /// The daemon is up and answering on its control socket.
     Started,
+    /// The daemon is alive and holding the lock but has not finished its
+    /// initial scan / socket bind yet (large repo). Not a failure.
+    Starting,
     /// A daemon already holds the lock; nothing was spawned.
     AlreadyRunning,
-    /// We spawned a child but no daemon took the lock within the timeout.
+    /// We spawned a child but it never came up (spawn error, or it died during
+    /// startup — e.g. a control-socket bind failure, see [`crate::daemon_start_error`]).
     Failed,
 }
 
@@ -81,19 +85,48 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path) -> SpawnOutc
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
+    // #592: clear any breadcrumb from a previous failed start so we only observe
+    // THIS start's outcome.
+    let err_path = repo_root.join(".travsr").join("daemon-start.err");
+    let _ = std::fs::remove_file(&err_path);
+
     let spawned = cmd.spawn();
     if spawned.is_err() {
         return SpawnOutcome::Failed;
     }
-    // Poll ≤2 s for the lock to become held (by our child, or by whoever won a
-    // concurrent race — either way a single daemon is now running).
-    for _ in 0..40 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        if daemon_lock_held(repo_root) {
+    // Confirm the child actually came up. Polling only the lock reports a false
+    // "Started" (travsr #592): the daemon takes the lock early, then opens its
+    // stores, scans the tree, and only then binds its control socket — a bind
+    // failure (a path over SUN_LEN, a hostile fallback dir) happens well after
+    // the lock is held. So we wait for a *terminal* state instead of a timer:
+    //   • the daemon answers on its socket            → Started (truly up)
+    //   • it wrote a startup-error breadcrumb          → Failed
+    //   • the lock was held then released (child died) → Failed
+    //   • still holding the lock at the deadline       → Starting (big-repo scan)
+    let mut saw_lock = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Positive terminal state: a round-trip to the control socket succeeds.
+        if send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status).is_ok() {
             return SpawnOutcome::Started;
         }
+        if err_path.exists() {
+            return SpawnOutcome::Failed;
+        }
+        if daemon_lock_held(repo_root) {
+            saw_lock = true;
+        } else if saw_lock {
+            // Lock was held then released → the child died during startup.
+            return SpawnOutcome::Failed;
+        }
     }
-    SpawnOutcome::Failed
+    // Deadline reached: alive and scanning is fine; never having taken the lock
+    // means the child never really started.
+    if saw_lock {
+        SpawnOutcome::Starting
+    } else {
+        SpawnOutcome::Failed
+    }
 }
 
 /// Send one control message to the daemon for `repo_root`.
