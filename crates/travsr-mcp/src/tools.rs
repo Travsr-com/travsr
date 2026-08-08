@@ -754,7 +754,7 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
     // Distinct definitions by node id.
     candidates.sort_by_key(|n| n.id.0);
     candidates.dedup_by_key(|n| n.id);
-    
+
     candidates
 }
 
@@ -9038,12 +9038,16 @@ mod snippet_tests {
         let db_path = root.join(".travsr").join("graph.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let mut store = SqliteStore::open(&db_path).unwrap();
-        
-        let mut by_path: std::collections::HashMap<String, Vec<CoreNode>> = std::collections::HashMap::new();
+
+        let mut by_path: std::collections::HashMap<String, Vec<CoreNode>> =
+            std::collections::HashMap::new();
         for n in nodes {
-            by_path.entry(n.vname.path.clone()).or_default().push(n.clone());
+            by_path
+                .entry(n.vname.path.clone())
+                .or_default()
+                .push(n.clone());
         }
-        
+
         for (path, file_nodes) in by_path {
             store
                 .write_file_graphs_batch(
@@ -9057,7 +9061,7 @@ mod snippet_tests {
                 )
                 .unwrap();
         }
-        
+
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
         store
     }
@@ -9084,31 +9088,57 @@ mod snippet_tests {
     fn get_snippets_body_resolves_plain_and_dotted_names() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("lib.ts");
-        std::fs::write(&src, "class ClassA {\n  enableSupportForFeatureX() {\n    return true;\n  }\n}\n").unwrap();
+        std::fs::write(
+            &src,
+            "class ClassA {\n  enableSupportForFeatureX() {\n    return true;\n  }\n}\n",
+        )
+        .unwrap();
 
         let class_node = make_fn_node("lib.ts", "class:ClassA", 1, 5);
         let fn_node = make_fn_node("lib.ts", "method:ClassA.enableSupportForFeatureX", 2, 4);
         let store = make_store_with_meta(&[class_node, fn_node], dir.path());
 
         // 1. Exact signature still works
-        let exact = get_snippets_body(&store, "method:ClassA.enableSupportForFeatureX", 2000, SnippetMode::Auto);
-        assert!(exact.contains("enableSupportForFeatureX() {"), "exact sig failed");
+        let exact = get_snippets_body(
+            &store,
+            "method:ClassA.enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+        );
+        assert!(
+            exact.contains("enableSupportForFeatureX() {"),
+            "exact sig failed"
+        );
 
         // 2. Plain function name works
         let plain = get_snippets_body(&store, "enableSupportForFeatureX", 2000, SnippetMode::Auto);
-        assert!(plain.contains("enableSupportForFeatureX() {"), "plain function name failed");
+        assert!(
+            plain.contains("enableSupportForFeatureX() {"),
+            "plain function name failed"
+        );
 
         // 3. Bare class name works
         let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto);
         assert!(class.contains("class ClassA"), "bare class name failed");
 
         // 4. Dotted symbol name works
-        let dotted = get_snippets_body(&store, "ClassA.enableSupportForFeatureX", 2000, SnippetMode::Auto);
-        assert!(dotted.contains("enableSupportForFeatureX() {"), "dotted symbol name failed");
+        let dotted = get_snippets_body(
+            &store,
+            "ClassA.enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+        );
+        assert!(
+            dotted.contains("enableSupportForFeatureX() {"),
+            "dotted symbol name failed"
+        );
 
         // 5. Unknown symbol
         let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto);
-        assert!(unknown.contains("No symbols matching the provided names found in the graph."), "unknown symbol failed");
+        assert!(
+            unknown.contains("No symbols matching the provided names found in the graph."),
+            "unknown symbol failed"
+        );
     }
 
     #[test]
