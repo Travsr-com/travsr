@@ -755,8 +755,8 @@ pub fn resolver_for_language(language: &str) -> &'static dyn ImportResolver {
         "cpp" | "c++" | "c" => &CppResolver,
         "swift" => &SwiftResolver,
         "dart" => &DartResolver,
+        "ruby" => &RubyResolver,
         // TypeScript/JS/Rust: link_imports* already emits ResolvesTo — noop here.
-        // Ruby: no import nodes emitted by the indexer — noop.
         _ => &NoopResolver,
     }
 }
@@ -1003,6 +1003,26 @@ impl ImportResolver for DartResolver {
     }
 }
 
+// ── Ruby ───────────────────────────────────────────────────────────────────
+// Signature: `import:animal` (require_relative 'animal') or `import:foo/bar`.
+// Ruby's `require`/`require_relative` take a path without the `.rb` extension;
+// the indexer emits the import node but no ResolvesTo chain, so resolve the
+// bare require path against the file here.
+
+struct RubyResolver;
+impl ImportResolver for RubyResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let spec = match import_sig.strip_prefix("import:") {
+            Some(s) => s,
+            None => return false,
+        };
+        // Drop any leading "./" from a relative require.
+        let spec = spec.strip_prefix("./").unwrap_or(spec);
+        let fp = file_path.replace('\\', "/");
+        path_suffix_match(&fp, &format!("{spec}.rb"))
+    }
+}
+
 // ── Graph GC types ────────────────────────────────────────────────────────────
 
 /// Paths of files that held inbound edges to deleted/changed symbols.
@@ -1076,6 +1096,20 @@ mod tests {
             "rust",
             "fn:sample",
         )
+    }
+
+    #[test]
+    fn ruby_resolver_matches_require_relative_path() {
+        let r = resolver_for_language("ruby");
+        // `require_relative 'animal'` in cat.rb resolves to animal.rb.
+        assert!(r.resolves_to("import:animal", "ruby/src/animal.rb"));
+        assert!(r.resolves_to("import:./animal", "ruby/src/animal.rb"));
+        // Nested require path.
+        assert!(r.resolves_to("import:lib/animal", "app/lib/animal.rb"));
+        // Different stem must not match.
+        assert!(!r.resolves_to("import:animal", "ruby/src/cat.rb"));
+        // A bare import prefix or malformed spec resolves to nothing.
+        assert!(!r.resolves_to("animal", "ruby/src/animal.rb"));
     }
 
     #[test]
