@@ -2262,6 +2262,24 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Read-only orphan-edge count: how many edges have a `src` or `dst` absent
+    /// from `nodes`, without deleting anything. This is the detection half of
+    /// [`sweep_orphans`], so `fsck` can report orphans in the default (no-`--fix`)
+    /// mode instead of only ever removing them (issue #580).
+    pub fn count_orphans(&self) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM edges \
+                 WHERE src NOT IN (SELECT id FROM nodes) \
+                    OR dst NOT IN (SELECT id FROM nodes)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting orphan edges")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Orphan-edge sweep: deletes every edge whose src or dst is absent from
     /// `nodes`. Should return 0 in correct operation after Tiers 0–2; a non-zero
     /// count indicates a write-path invariant violation.

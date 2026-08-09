@@ -1113,6 +1113,10 @@ pub struct ReplaceReport {
 pub struct GcReport {
     /// VName paths ghost-deleted from the graph.
     pub ghost_paths: Vec<String>,
+    /// Number of orphan edges detected in report mode (`fsck` without `--fix`).
+    /// Counted read-only so the default integrity check surfaces edges with a
+    /// missing endpoint instead of staying silent about them (issue #580).
+    pub orphan_edges_detected: u64,
     /// Number of orphan edges swept (should be 0 in normal operation).
     pub orphan_edges_swept: u64,
     /// Total node count at reconcile start.
