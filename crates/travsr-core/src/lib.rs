@@ -753,6 +753,9 @@ pub fn resolver_for_language(language: &str) -> &'static dyn ImportResolver {
         "php" => &PhpResolver,
         "csharp" | "c#" | "cs" => &CsharpResolver,
         "cpp" | "c++" | "c" => &CppResolver,
+        // #610: was falling through to NoopResolver, so an Obj-C header's
+        // importers were never found.
+        "objectivec" | "objc" | "objective-c" => &ObjcResolver,
         "swift" => &SwiftResolver,
         "dart" => &DartResolver,
         "ruby" => &RubyResolver,
@@ -941,6 +944,42 @@ impl ImportResolver for CppResolver {
             return false; // system header
         }
         let bare = include.trim_matches('"');
+        let fp = file_path.replace('\\', "/");
+        path_suffix_match(&fp, bare)
+    }
+}
+
+// ── Objective-C ────────────────────────────────────────────────────────────
+// Signature: `import:"Animal.h"` / `import:Animal.h` from `#import "Animal.h"`,
+// `import:<Foundation/Foundation.h>` from a framework import, and
+// `import:Foundation` from the module form `@import Foundation;`.
+//
+// #610: `objectivec` previously routed to `NoopResolver`, so an Obj-C header's
+// importers were never discovered and `get_blast_radius` on it returned only
+// the queried file. Quote imports are the resolvable case — they name a path
+// relative to the importing file, exactly like a C quote include. Angle
+// includes and bare module names address a framework or module rather than a
+// file in this repo, so neither can map to one.
+
+struct ObjcResolver;
+impl ImportResolver for ObjcResolver {
+    fn resolves_to(&self, import_sig: &str, file_path: &str) -> bool {
+        let include = match import_sig.strip_prefix("import:") {
+            Some(p) => p,
+            None => return false,
+        };
+        // `<Foundation/Foundation.h>` is a framework header, never a repo file.
+        if include.starts_with('<') {
+            return false;
+        }
+        let bare = include.trim_matches('"');
+        // `@import Foundation;` yields a bare module name with no extension.
+        // It names a module, not a file, and matching it against a path would
+        // let `Foundation` claim any file whose last component happened to
+        // equal it.
+        if !bare.contains('.') {
+            return false;
+        }
         let fp = file_path.replace('\\', "/");
         path_suffix_match(&fp, bare)
     }
@@ -1139,6 +1178,41 @@ mod tests {
         assert!(!r.resolves_to("import:lib/animal", "app/other/animal.rb"));
         // A bare import prefix or malformed spec resolves to nothing.
         assert!(!r.resolves_to("animal", "ruby/src/animal.rb"));
+    }
+
+    /// #610 (B): `objectivec` fell through to `NoopResolver`, so no `#import`
+    /// ever resolved and `get_blast_radius` on an Obj-C header returned only
+    /// the queried file.
+    #[test]
+    fn objc_resolver_matches_quote_imports() {
+        let r = resolver_for_language("objectivec");
+        // `#import "Animal.h"` in Animal.m resolves to the header beside it.
+        assert!(r.resolves_to("import:Animal.h", "objc/Animal.h"));
+        assert!(r.resolves_to("import:\"Animal.h\"", "objc/Animal.h"));
+        // Nested import path, matched on a path-component boundary.
+        assert!(r.resolves_to("import:Models/Animal.h", "app/Models/Animal.h"));
+        // The language is also reachable under its other spellings.
+        assert!(resolver_for_language("objc").resolves_to("import:Animal.h", "objc/Animal.h"));
+        assert!(
+            resolver_for_language("objective-c").resolves_to("import:Animal.h", "objc/Animal.h")
+        );
+    }
+
+    #[test]
+    fn objc_resolver_rejects_what_cannot_be_a_repo_file() {
+        let r = resolver_for_language("objectivec");
+        // Framework header — never a file in this repo.
+        assert!(!r.resolves_to("import:<Foundation/Foundation.h>", "objc/Foundation.h"));
+        // `@import Foundation;` names a module, not a file. Without this guard
+        // a bare name would claim any path whose last component matched it.
+        assert!(!r.resolves_to("import:Foundation", "vendor/Foundation"));
+        // A different header must not match.
+        assert!(!r.resolves_to("import:Animal.h", "objc/Plant.h"));
+        // Suffix matching is on a path boundary, not a substring: `Animal.h`
+        // must not claim `MyAnimal.h`.
+        assert!(!r.resolves_to("import:Animal.h", "objc/MyAnimal.h"));
+        // A malformed signature with no `import:` prefix resolves to nothing.
+        assert!(!r.resolves_to("Animal.h", "objc/Animal.h"));
     }
 
     #[test]
