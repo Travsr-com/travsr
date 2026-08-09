@@ -45,7 +45,7 @@ fn git_init(dir: &Path) {
 fn install_backend_files(home: &Path, backend: &EmbedBackend) {
     let bin_dir = home.join(".travsr").join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::write(bin_dir.join(&backend.binary_name), b"").unwrap();
+    std::fs::write(bin_dir.join(backend.binary_filename()), b"").unwrap();
 
     let model_dir = home.join(".travsr").join("models").join(&backend.id);
     std::fs::create_dir_all(&model_dir).unwrap();
@@ -241,7 +241,7 @@ fn list_reports_installed_from_model_files_not_the_shared_binary() {
     // model weights never were.
     let bin_dir = home.path().join(".travsr").join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::write(bin_dir.join(&binary_only.binary_name), b"").unwrap();
+    std::fs::write(bin_dir.join(binary_only.binary_filename()), b"").unwrap();
 
     // `cmd_list` resolves the repo's active model from the *cwd*'s git root.
     // Without this the child walks up into the real travsr checkout and reads

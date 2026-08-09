@@ -7560,7 +7560,10 @@ pub fn try_inject_embed_hook(
         return;
     };
 
-    let binary = home.join(".travsr").join("bin").join(&backend.binary_name);
+    let binary = home
+        .join(".travsr")
+        .join("bin")
+        .join(backend.binary_filename());
     let supervisor = EmbedSupervisor::try_start(&binary, db_path, &backend.id);
     if !supervisor.is_active() {
         return;
