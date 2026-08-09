@@ -30,8 +30,39 @@ pub fn get_dependencies(store: &SqliteStore, file: &str, transitive: bool, depth
     } else {
         get_dependencies_raw(store, file)
     };
+    // #619: an empty answer for an argument that is not actually a file (a
+    // symbol name passed by mistake, or an unknown path) reads as "this file
+    // has no dependencies" — misleading. Replace it with a short hint.
+    if raw.is_empty() {
+        if let Some(hint) = dependency_arg_hint(store, file) {
+            return sanitize_for_mcp(&hint);
+        }
+    }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
     sanitize_for_mcp(&raw)
+}
+
+/// Diagnose an empty `get_dependencies` answer (#619).
+///
+/// Returns `Some(hint)` when the argument did not resolve to a file node:
+/// either it matched only symbol nodes (the reported case — a function name
+/// passed where a path belongs) or it matched nothing at all. Returns `None`
+/// when a file node did match, because an existing file with zero `depends`
+/// edges is a legitimate empty answer that must stay empty.
+fn dependency_arg_hint(store: &SqliteStore, file: &str) -> Option<String> {
+    let nodes = store.search_nodes_by_name(file).ok()?;
+    if nodes.iter().any(|n| n.kind == "file") {
+        return None;
+    }
+    match nodes.first() {
+        Some(n) => Some(format!(
+            "'{file}' resolved to {} '{}', not a file — get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
+            n.kind, n.vname.signature
+        )),
+        None => Some(format!(
+            "no file matched '{file}' — get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
+        )),
+    }
 }
 
 /// Transitive variant of `get_dependencies`: BFS over `depends` edges from the
@@ -407,6 +438,12 @@ pub fn get_dependencies_global(
     // Aggregate raw results, prefix per-repo, then sanitize once.
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         let result = get_dependencies_raw(store, file);
+        // #619: in single-repo mode, diagnose an empty answer exactly like the
+        // stdio path. In multi-repo mode leave per-repo empties silent — a
+        // hint per non-matching repo would spam the aggregate.
+        if result.is_empty() && single {
+            return dependency_arg_hint(store, file).unwrap_or(result);
+        }
         if result.is_empty() || single {
             result
         } else {
@@ -6965,6 +7002,76 @@ mod tests {
         assert!(
             result.contains("get_context for ranked coverage"),
             "footer must include get_context hint, got: {result}"
+        );
+    }
+
+    // ── #619 get_dependencies wrong-argument hint ────────────────────────────
+
+    /// A symbol name passed where a file path belongs must return a hint, not
+    /// a silent empty answer that reads as "this file has no dependencies".
+    #[test]
+    fn get_dependencies_symbol_arg_returns_hint() {
+        use travsr_core::{Node, VName};
+        let sym = Node::new(
+            VName::new("", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let store = make_store(std::slice::from_ref(&sym), &[]);
+        let result = get_dependencies(&store, "docs_section", false, 1);
+        assert!(
+            result.contains("not a file"),
+            "symbol arg must produce the not-a-file hint; got: {result}"
+        );
+        assert!(
+            result.contains("get_callers"),
+            "hint must point at the symbol tools; got: {result}"
+        );
+    }
+
+    /// An argument matching nothing at all must say so.
+    #[test]
+    fn get_dependencies_unknown_arg_returns_hint() {
+        let a = make_node("a.ts", "fn:a");
+        let store = make_store(std::slice::from_ref(&a), &[]);
+        let result = get_dependencies(&store, "zzz_nonexistent", false, 1);
+        assert!(
+            result.contains("no file matched"),
+            "unknown arg must produce the no-match hint; got: {result}"
+        );
+    }
+
+    /// A real file with zero depends edges is a legitimate empty answer and
+    /// must stay empty — the hint only fires when the arg is not a file.
+    #[test]
+    fn get_dependencies_file_without_deps_stays_empty() {
+        use travsr_core::{Node, VName};
+        let file = Node::new(
+            VName::new("", "", "src/lone.ts", "typescript", "src/lone.ts"),
+            "file",
+        );
+        let store = make_store(std::slice::from_ref(&file), &[]);
+        let result = get_dependencies(&store, "src/lone.ts", false, 1);
+        // sanitize_for_mcp wraps empty output in an empty envelope; the point
+        // here is that no hint text is injected into a legitimate empty answer.
+        assert!(
+            !result.contains("not a file") && !result.contains("no file matched"),
+            "file with no deps must stay a plain empty answer; got: {result}"
+        );
+    }
+
+    /// The transitive variant shares the entry point and must hint the same way.
+    #[test]
+    fn get_dependencies_transitive_symbol_arg_returns_hint() {
+        use travsr_core::{Node, VName};
+        let sym = Node::new(
+            VName::new("", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let store = make_store(std::slice::from_ref(&sym), &[]);
+        let result = get_dependencies(&store, "docs_section", true, 3);
+        assert!(
+            result.contains("not a file"),
+            "transitive path must hint too; got: {result}"
         );
     }
 
