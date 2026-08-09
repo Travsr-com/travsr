@@ -5422,6 +5422,37 @@ fn get_graph_json_raw(
             .collect()
     };
 
+    // #618: in symbol mode, a bare-name query used to promote every substring
+    // match to a root, flooding the graph with unrelated symbols (e.g.
+    // "docs_section" seeding build_docs_section_* and its whole test
+    // neighbourhood). Resolve like get_callers / find_references instead:
+    // exact signature first, then exact simple-name; the original substring
+    // set survives only as a fuzzy fallback when neither tier matches, so a
+    // partial query still renders something rather than nothing.
+    let seed_nodes: Vec<_> = if kind_filter.is_empty() && !query.is_empty() {
+        let exact_sig: Vec<_> = seed_nodes
+            .iter()
+            .filter(|n| n.vname.signature == query)
+            .cloned()
+            .collect();
+        if !exact_sig.is_empty() {
+            exact_sig
+        } else {
+            let exact_name: Vec<_> = seed_nodes
+                .iter()
+                .filter(|n| simple_name(&n.vname.signature) == query)
+                .cloned()
+                .collect();
+            if !exact_name.is_empty() {
+                exact_name
+            } else {
+                seed_nodes
+            }
+        }
+    } else {
+        seed_nodes
+    };
+
     if seed_nodes.is_empty() {
         return r#"{"nodes":[],"edges":[]}"#.to_string();
     }
@@ -9273,6 +9304,193 @@ mod snippet_tests {
         assert!(
             parsed.get("signals").is_none(),
             "complete graph must not emit signals; got: {raw}"
+        );
+    }
+
+    // ── #618 get_graph_json seed resolution ───────────────────────────────────
+
+    fn graph_params(query: &str) -> GraphJsonParams<'_> {
+        GraphJsonParams {
+            query,
+            direction: "both",
+            depth: 1,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        }
+    }
+
+    fn root_count(raw: &str) -> usize {
+        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+        parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["root"].as_bool() == Some(true))
+            .count()
+    }
+
+    /// A bare name with an exact-symbol match must resolve to that single
+    /// root instead of promoting every substring cousin to a root.
+    #[test]
+    fn get_graph_json_bare_name_resolves_single_root() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let exact = Node::new(
+            VName::new("t", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let cousin = Node::new(
+            VName::new(
+                "t",
+                "",
+                "src/build.ts",
+                "typescript",
+                "fn:build_docs_section",
+            ),
+            "function",
+        );
+        let helper = Node::new(
+            VName::new(
+                "t",
+                "",
+                "src/help.ts",
+                "typescript",
+                "fn:docs_section_helper",
+            ),
+            "function",
+        );
+        store.put_node(&exact).unwrap();
+        store.put_node(&cousin).unwrap();
+        store.put_node(&helper).unwrap();
+        // Precondition: the raw search really does return all three, so this
+        // test exercises the narrowing rather than passing trivially.
+        assert!(
+            store.search_nodes_by_name("docs_section").unwrap().len() >= 3,
+            "substring search must surface all candidates"
+        );
+        let raw = get_graph_json(&store, &graph_params("docs_section"));
+        assert_eq!(root_count(&raw), 1, "exactly one root expected; got: {raw}");
+        assert!(
+            !raw.contains("build_docs_section"),
+            "unconnected substring cousin must not appear; got: {raw}"
+        );
+    }
+
+    /// A full kind-qualified signature must keep resolving exactly (tier 1).
+    #[test]
+    fn get_graph_json_signature_query_single_root() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let exact = Node::new(
+            VName::new("t", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let cousin = Node::new(
+            VName::new(
+                "t",
+                "",
+                "src/build.ts",
+                "typescript",
+                "fn:build_docs_section",
+            ),
+            "function",
+        );
+        store.put_node(&exact).unwrap();
+        store.put_node(&cousin).unwrap();
+        let raw = get_graph_json(&store, &graph_params("fn:docs_section"));
+        assert_eq!(root_count(&raw), 1, "exactly one root expected; got: {raw}");
+    }
+
+    /// With no exact match at either tier, the substring set must survive as
+    /// a fuzzy fallback (a partial query still renders something).
+    #[test]
+    fn get_graph_json_substring_fallback_when_no_exact_match() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha_beta"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "fn:alpha_gamma"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let raw = get_graph_json(&store, &graph_params("alpha"));
+        assert_eq!(
+            root_count(&raw),
+            2,
+            "fuzzy fallback must keep both roots; got: {raw}"
+        );
+    }
+
+    /// Overloads: several nodes sharing the exact bare name are all genuine
+    /// resolutions and must all stay roots.
+    #[test]
+    fn get_graph_json_same_name_overloads_stay_multi_root() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:charge"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "method:Billing.charge"),
+            "method",
+        );
+        let noise = Node::new(
+            VName::new("t", "", "src/c.ts", "typescript", "fn:supercharged"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&noise).unwrap();
+        let raw = get_graph_json(&store, &graph_params("charge"));
+        assert_eq!(
+            root_count(&raw),
+            2,
+            "both same-name definitions stay roots, noise dropped; got: {raw}"
+        );
+        assert!(
+            !raw.contains("supercharged"),
+            "substring noise must be dropped; got: {raw}"
+        );
+    }
+
+    /// File mode is untouched: path queries keep their substring semantics.
+    #[test]
+    fn get_graph_json_file_mode_keeps_substring_seeds() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/pay/a.ts", "typescript", "src/pay/a.ts"),
+            "file",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/pay/b.ts", "typescript", "src/pay/b.ts"),
+            "file",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "src/pay",
+                direction: "both",
+                depth: 1,
+                kind_filter: "file",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
+        assert_eq!(
+            root_count(&raw),
+            2,
+            "file mode substring seeding must be unchanged; got: {raw}"
         );
     }
 
