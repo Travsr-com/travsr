@@ -171,6 +171,51 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
     phase_b.is_none() && last.is_some()
 }
 
+/// Degraded-state note for the structural graph tools (#617).
+///
+/// `phase_b_pending` only catches the never-ran case (marker absent). Two more
+/// states leave the RefCall edge set incomplete while looking healthy:
+///  - `phase_b_commit` present but behind `last_commit` (HEAD moved while the
+///    daemon was down, or a rebuild is still queued), and
+///  - `phase_b_dirty` set (#583: a watcher reindex dropped a file's call edges
+///    without moving HEAD).
+///
+/// Mirrors `travsr status`'s freshness classification so the tools and the CLI
+/// never disagree about completeness. Returns the note to append, or `None`
+/// when Phase B is complete for the current commit.
+fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
+    const PENDING: &str = "[note: call-graph index incomplete — Phase B has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
+    const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last Phase B run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    let phase_b = store
+        .get_meta("phase_b_commit")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let last = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+    match (phase_b, last) {
+        (None, Some(_)) => Some(PENDING),
+        (Some(pb), Some(lc)) if pb != lc => Some(PENDING),
+        _ if dirty => Some(STALE),
+        _ => None,
+    }
+}
+
+/// Append the Phase-B degraded note (when any) to a structural tool response.
+/// An empty body becomes the note alone: the note IS the answer then — it is
+/// exactly the empty-but-unreliable case #617 exists to flag.
+fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
+    match phase_b_degraded_note(store) {
+        Some(note) if body.is_empty() => note.to_string(),
+        Some(note) => format!("{body}\n{note}"),
+        None => body,
+    }
+}
+
 /// Return all nodes that have an incoming edge to the given symbol, tagged
 /// by provenance so both semantic and structural callers are visible.
 ///
@@ -200,7 +245,9 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
         return r#"{"status":"pending","message":"Semantic call-edge index is building in the background. Call edges will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
-    sanitize_for_mcp(&get_callers_raw(store, symbol))
+    // #617: append the staleness note (marker behind HEAD / dirty flag) so an
+    // empty caller list is never mistaken for an authoritative "no callers".
+    with_phase_b_note(store, sanitize_for_mcp(&get_callers_raw(store, symbol)))
 }
 
 /// Raw (unsanitized) variant used by global aggregation.
@@ -386,7 +433,8 @@ pub fn get_callers_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_callers_raw(store, symbol);
+        // #617: per-repo note — each store carries its own Phase B freshness.
+        let result = with_phase_b_note(store, get_callers_raw(store, symbol));
         if result.is_empty() || single {
             result
         } else {
@@ -1671,7 +1719,12 @@ pub fn get_blast_radius(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         tracing::warn!("get_blast_radius rejected invalid arg: {reason}");
         return String::new();
     }
-    sanitize_for_mcp(&get_blast_radius_raw(store, file, mode))
+    // #617: append the Phase-B staleness note so a partial radius is not
+    // trusted as the complete impact set.
+    with_phase_b_note(
+        store,
+        sanitize_for_mcp(&get_blast_radius_raw(store, file, mode)),
+    )
 }
 
 fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> String {
@@ -1988,7 +2041,8 @@ pub fn get_blast_radius_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_blast_radius_raw(store, file, mode);
+        // #617: per-repo note — each store carries its own Phase B freshness.
+        let result = with_phase_b_note(store, get_blast_radius_raw(store, file, mode));
         if result.is_empty() || single {
             result
         } else {
@@ -2668,7 +2722,12 @@ fn get_execution_path_with_filter(
         tracing::warn!("get_execution_path rejected invalid sink arg: {reason}");
         return String::new();
     }
-    sanitize_for_mcp(&get_execution_path_raw(store, source, sink, filter))
+    // #617: append the Phase-B staleness note so "no path" is never trusted
+    // while the call-edge set is known-incomplete.
+    with_phase_b_note(
+        store,
+        sanitize_for_mcp(&get_execution_path_raw(store, source, sink, filter)),
+    )
 }
 
 fn get_execution_path_raw(
@@ -2744,7 +2803,8 @@ pub fn get_execution_path_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_execution_path_raw(store, source, sink, filter);
+        // #617: per-repo note — each store carries its own Phase B freshness.
+        let result = with_phase_b_note(store, get_execution_path_raw(store, source, sink, filter));
         if result.is_empty() || single {
             result
         } else {
@@ -5642,6 +5702,11 @@ fn get_graph_json_raw(
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
     }
+    // #617: degraded-state signal — additive envelope field; first-party
+    // consumers read only `nodes`/`edges` and ignore extra keys.
+    if let Some(note) = phase_b_degraded_note(store) {
+        out["signals"] = serde_json::json!([note]);
+    }
     match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
@@ -5706,6 +5771,9 @@ pub fn get_graph_json_global(
     let mut seen_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_edge_keys: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // #617: union of per-repo degraded-state signals, deduped.
+    let mut all_signals: Vec<serde_json::Value> = Vec::new();
+    let mut seen_signals: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_repo_name, db_path) in candidates {
         if !db_path.exists() {
@@ -5731,15 +5799,26 @@ pub fn get_graph_json_global(
                         all_edges.push(edge.clone());
                     }
                 }
+                for signal in parsed["signals"].as_array().into_iter().flatten() {
+                    if let Some(text) = signal.as_str() {
+                        if seen_signals.insert(text.to_string()) {
+                            all_signals.push(signal.clone());
+                        }
+                    }
+                }
             }
             Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
         }
     }
 
-    match serde_json::to_string(&serde_json::json!({
+    let mut out = serde_json::json!({
         "nodes": all_nodes,
         "edges": all_edges,
-    })) {
+    });
+    if !all_signals.is_empty() {
+        out["signals"] = serde_json::Value::Array(all_signals);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("get_graph_json_global serialization error: {e}");
@@ -9029,6 +9108,171 @@ mod snippet_tests {
         assert!(
             !result.contains("warming"),
             "armed readiness must not emit warming note; got: {result}"
+        );
+    }
+
+    // ── #617 structural-tool Phase-B degraded signals ─────────────────────────
+
+    #[test]
+    fn phase_b_note_none_when_marker_matches_head_and_clean() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    #[test]
+    fn phase_b_note_none_on_no_commit_repo() {
+        // Both markers absent: Phase B ran inline during init (no daemon defer).
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    #[test]
+    fn phase_b_note_pending_when_marker_absent() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        let note = phase_b_degraded_note(&store).expect("must flag pending");
+        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_pending_when_marker_behind_head() {
+        // The exact #617 repro: HEAD moved while the daemon was down, so the
+        // marker is set but stale. `phase_b_pending` misses this state.
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "def456").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let note = phase_b_degraded_note(&store).expect("must flag pending");
+        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_stale_when_dirty_flag_set() {
+        // #583 window: markers agree but a watcher reindex dropped edges.
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let note = phase_b_degraded_note(&store).expect("must flag stale");
+        assert!(note.contains("call-graph edges degraded"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_none_when_dirty_flag_cleared() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+        assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    /// get_callers must carry the note alongside real results when the marker
+    /// is behind HEAD (results may be partial, not absent).
+    #[test]
+    fn get_callers_appends_note_when_phase_b_behind_head() {
+        use travsr_core::{Edge, EdgeKind};
+        let dir = tempfile::tempdir().unwrap();
+        let caller = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let callee = make_fn_node_with_pkg("src/b.ts", "fn:beta", 1, 3);
+        let mut store = make_store_with_root(&dir, &[]);
+        let caller_id = store.put_node(&caller).unwrap();
+        let callee_id = store.put_node(&callee).unwrap();
+        store
+            .put_edge(&Edge::new(caller_id, callee_id, EdgeKind::RefCall))
+            .unwrap();
+        store.set_meta("last_commit", "def456").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let result = get_callers(&store, "beta");
+        assert!(
+            result.contains("fn:alpha"),
+            "existing edges must still be reported; got: {result}"
+        );
+        assert!(
+            result.contains("call-graph index incomplete"),
+            "must append pending note; got: {result}"
+        );
+    }
+
+    /// An empty structural answer during a degraded state must be the note, not
+    /// a silent empty string — the false negative #617 exists to prevent.
+    #[test]
+    fn get_blast_radius_empty_result_becomes_note_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = make_store_with_root(&dir, &[]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let result = get_blast_radius(&store, "src/missing.ts", AnalysisMode::TreeSitter);
+        assert!(
+            result.contains("call-graph edges degraded"),
+            "empty result must surface the stale note; got: {result}"
+        );
+    }
+
+    #[test]
+    fn get_execution_path_appends_note_when_phase_b_behind_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = make_store_with_root(&dir, &[]);
+        store.set_meta("last_commit", "def456").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let result = get_execution_path(&store, "alpha", "beta");
+        assert!(
+            result.contains("call-graph index incomplete"),
+            "disconnected/no-result path must carry the pending note; got: {result}"
+        );
+    }
+
+    #[test]
+    fn get_graph_json_emits_signals_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let signals = parsed["signals"].as_array().expect("signals array");
+        assert!(
+            signals.iter().any(|s| s
+                .as_str()
+                .unwrap_or("")
+                .contains("call-graph edges degraded")),
+            "graph JSON must carry the degraded signal; got: {raw}"
+        );
+    }
+
+    #[test]
+    fn get_graph_json_no_signals_when_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed.get("signals").is_none(),
+            "complete graph must not emit signals; got: {raw}"
         );
     }
 
