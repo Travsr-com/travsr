@@ -1,5 +1,3 @@
-use std::io::{BufRead as _, BufReader, Write as _};
-
 use crate::{ControlAddr, ControlMessage, ControlResponse, ControlTransport};
 
 /// Synchronous Windows Named Pipe client for the daemon control plane.
@@ -27,16 +25,11 @@ impl NamedPipeTransport {
 
 impl ControlTransport for NamedPipeTransport {
     fn send_request(&mut self, msg: &ControlMessage) -> anyhow::Result<ControlResponse> {
-        let line = serde_json::to_string(msg)?;
-        writeln!(self.file, "{line}")?;
-        let mut reader = BufReader::new(&self.file);
-        let mut buf = String::new();
-        reader.read_line(&mut buf)?;
-        let trimmed = buf.trim();
-        anyhow::ensure!(
-            !trimmed.is_empty(),
-            "daemon closed connection without a response"
-        );
-        Ok(serde_json::from_str::<ControlResponse>(trimmed)?)
+        // #541: shares the retrying helper with the Unix transport. Named-pipe
+        // client I/O here is blocking, so the would-block retries should not
+        // fire — but the partial-write resume and the deadline-shaped error
+        // message apply to both, and the daemon-lifecycle races tracked for
+        // Windows in #500/#503 are the same class of bug.
+        crate::transport::send_request_line(&mut self.file, msg)
     }
 }
