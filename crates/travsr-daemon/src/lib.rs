@@ -845,6 +845,10 @@ pub fn fsck_repo(
     let ghosts: Vec<String> = db_paths.difference(&walked_paths).cloned().collect();
     report.ghost_paths = ghosts.clone();
 
+    // Count orphan edges read-only so the default (no-`--fix`) report is honest
+    // about them; `sweep_orphans` below only runs under `fix` (issue #580).
+    report.orphan_edges_detected = store.count_orphans()?;
+
     if !fix {
         return Ok(report);
     }
@@ -5499,6 +5503,70 @@ mod tests {
         assert_eq!(
             orphans, 0,
             "delete_file must leave no orphan edges; sweep found {orphans}"
+        );
+    }
+
+    /// #580: `fsck` in report mode (no `--fix`) must surface orphan edges rather
+    /// than reporting the graph clean. An injected `ref/call` edge whose `dst`
+    /// is absent from `nodes` must be counted in `orphan_edges_detected` and
+    /// must NOT be deleted by the report path.
+    #[test]
+    fn fsck_report_mode_counts_orphan_edges_without_deleting() {
+        use travsr_core::{Edge, EdgeKind, NodeId};
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { run() {} }").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+
+        // Inject an orphan ref/call edge: both endpoints reference node ids that
+        // do not exist, mirroring the write-path defect from #578/#579.
+        {
+            let mut store = SqliteStore::open(&db_path).unwrap();
+            store
+                .put_edge(&Edge::new(
+                    NodeId(u64::MAX),
+                    NodeId(u64::MAX - 1),
+                    EdgeKind::RefCall,
+                ))
+                .unwrap();
+        }
+
+        let edges_before = SqliteStore::open(&db_path).unwrap().edge_count().unwrap();
+
+        // Report mode (fix=false): must detect the orphan and leave it in place.
+        let report = fsck_repo(tmp.path(), false, false).unwrap();
+        assert_eq!(
+            report.orphan_edges_detected, 1,
+            "report mode must count the injected orphan edge"
+        );
+
+        let edges_after = SqliteStore::open(&db_path).unwrap().edge_count().unwrap();
+        assert_eq!(
+            edges_before, edges_after,
+            "report mode must not delete edges ({edges_before} -> {edges_after})"
+        );
+
+        // Fix mode: sweeps the orphan and reports it swept.
+        let fixed = fsck_repo(tmp.path(), true, false).unwrap();
+        assert_eq!(
+            fixed.orphan_edges_swept, 1,
+            "fix mode must sweep the injected orphan edge"
+        );
+        assert_eq!(
+            SqliteStore::open(&db_path)
+                .unwrap()
+                .count_orphans()
+                .unwrap(),
+            0,
+            "no orphan edges must remain after --fix"
         );
     }
 
