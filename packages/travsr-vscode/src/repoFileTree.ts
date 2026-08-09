@@ -48,11 +48,19 @@ export class DirNode extends vscode.TreeItem {
      */
     readonly topPkg: string,
     displayName: string,
-    fileCount: number
+    fileCount: number,
+    /** Component-level dependents count; shown only for top-level components. */
+    dependents?: number
   ) {
     super(displayName, vscode.TreeItemCollapsibleState.Collapsed);
-    this.description = `${fileCount}`;
-    this.tooltip = `${prefix} (${fileCount} files)`;
+    this.description =
+      dependents !== undefined
+        ? `${dependents} deps · ${fileCount} files`
+        : `${fileCount}`;
+    this.tooltip =
+      dependents !== undefined
+        ? `${prefix} — ${dependents} components depend on this (${fileCount} files)`
+        : `${prefix} (${fileCount} files)`;
     this.iconPath = new vscode.ThemeIcon("folder");
     this.contextValue = "travsrDir";
   }
@@ -89,6 +97,8 @@ interface OverviewNode {
   label?: string;
   kind: string;
   file_count?: number;
+  /** How many other components transitively depend on this one (spine signal). */
+  dependents?: number;
   path?: string;
   ghost?: boolean;
 }
@@ -204,12 +214,17 @@ export class TravsrRepoFileTreeProvider
       return [new PlaceholderNode("No indexed files — run travsr init")];
     }
 
-    pkgNodes.sort((a, b) => (b.file_count ?? 0) - (a.file_count ?? 0));
+    // Rank by dependents (most load-bearing first), then file count — mirrors
+    // the get_repo_map ordering so the tree and the agent map agree.
+    pkgNodes.sort((a, b) => {
+      const byDeps = (b.dependents ?? 0) - (a.dependents ?? 0);
+      return byDeps !== 0 ? byDeps : (b.file_count ?? 0) - (a.file_count ?? 0);
+    });
 
     this.rootCache = pkgNodes.map((n) => {
       const name = n.label ?? n.id.replace(/^pkg:/, "");
       const prefix = name === "(root)" ? "" : name + "/";
-      return new DirNode(prefix, prefix, name, n.file_count ?? 0);
+      return new DirNode(prefix, prefix, name, n.file_count ?? 0, n.dependents);
     });
     return this.rootCache;
   }

@@ -2832,6 +2832,70 @@ LIMIT 20",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Return distinct resolved cross-file dependency pairs `(src_path, dst_path)`
+    /// meaning "the file at src_path depends on the file at dst_path".
+    ///
+    /// Language-agnostic by construction — it reads only already-resolved graph
+    /// edges and node paths, never import syntax. Three complementary sources:
+    ///   - two-hop import chain `x --depends--> import --resolves-to--> target`,
+    ///     taking the depends *source* as the importer (Phase A; robust to how a
+    ///     language models the import node's own path).
+    ///   - direct `resolves-to` (import-node path = importer file, #613). Phase A.
+    ///   - direct `ref/call` (caller symbol -> callee symbol). Phase B call graph.
+    ///
+    /// Both endpoints must carry a real path and differ. Used by the repo-map and
+    /// graph-overview aggregations to build a directory-level dependency graph
+    /// without any per-language logic at query time.
+    pub fn resolved_dep_pairs(&self) -> Result<Vec<(String, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, String)>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT DISTINCT src, dst FROM (
+                         SELECT n1.path AS src, n2.path AS dst
+                         FROM edges e1
+                         JOIN nodes n1 ON n1.id = e1.src
+                         JOIN edges e2 ON e2.src = e1.dst AND e2.kind = 'resolves-to'
+                         JOIN nodes n2 ON n2.id = e2.dst
+                         WHERE e1.kind = 'depends'
+                         UNION ALL
+                         SELECT ns.path AS src, nd.path AS dst
+                         FROM edges e
+                         JOIN nodes ns ON ns.id = e.src
+                         JOIN nodes nd ON nd.id = e.dst
+                         WHERE e.kind IN ('resolves-to', 'ref/call')
+                     )
+                     WHERE src <> '' AND dst <> '' AND src <> dst",
+                )
+                .context("preparing resolved_dep_pairs query")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("executing resolved_dep_pairs query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding resolved_dep_pairs row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// True when at least one `ref/call` edge exists anywhere in the graph — i.e.
+    /// Phase B (SCIP/LSIF semantic analysis) has produced call-graph data. Used to
+    /// disclose degraded state in the repo map. `false` on query error (safe:
+    /// surfaces the "semantic not available" note rather than hiding it).
+    pub fn has_any_refcall_edges(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM edges WHERE kind = 'ref/call' LIMIT 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
     pub fn all_edges(&self) -> Result<Vec<(NodeId, NodeId, String, String)>, StoreError> {
         (|| -> AnyResult<Vec<(NodeId, NodeId, String, String)>> {
             let mut stmt = self
@@ -9326,6 +9390,59 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "pkg/a/mod.ts");
         assert_eq!(pairs[0].1, "test/b/util.ts");
+    }
+
+    // ── resolved_dep_pairs ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolved_dep_pairs_from_refcall_and_resolvesto() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // ref/call: caller (a) -> callee (b), both real files.
+        let a = Node::new(
+            VName::new("", "", "crates/x/a.rs", "rust", "fn:a"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("", "", "crates/y/b.rs", "rust", "fn:b"),
+            "function",
+        );
+        // resolves-to: import node (path = importer) -> target file.
+        let imp = Node::new(
+            VName::new("", "", "crates/x/a.rs", "rust", "use:z"),
+            "import",
+        );
+        let z = Node::new(
+            VName::new("", "", "crates/z/z.rs", "rust", "crates/z/z.rs"),
+            "file",
+        );
+        // same-file ref/call must be excluded.
+        let a2 = Node::new(
+            VName::new("", "", "crates/x/a.rs", "rust", "fn:a2"),
+            "function",
+        );
+        for n in [&a, &b, &imp, &z, &a2] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(a.id, b.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(imp.id, z.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(a.id, a2.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let mut pairs = store.resolved_dep_pairs().unwrap();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("crates/x/a.rs".to_string(), "crates/y/b.rs".to_string()),
+                ("crates/x/a.rs".to_string(), "crates/z/z.rs".to_string()),
+            ],
+            "must return cross-file ref/call + resolves-to pairs, excluding same-file"
+        );
     }
 
     // P4 golden test: grouped span fetch produces identical (ref → enclosing_id) mapping

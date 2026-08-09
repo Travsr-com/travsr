@@ -2322,11 +2322,225 @@ pub fn search_symbol_global(
 ///   index.ts    [1 symbol]   fn:activate
 /// ```
 pub fn get_repo_map(store: &SqliteStore) -> String {
-    sanitize_for_mcp(&get_repo_map_raw(store))
+    sanitize_for_mcp(&get_repo_map_raw(store, 0))
 }
 
-fn get_repo_map_raw(store: &SqliteStore) -> String {
-    use std::collections::BTreeMap;
+/// True when a node kind counts as "code volume" (the surface signal). Excludes
+/// imports, external-crate/package refs, doc chunks, and file/module container
+/// nodes — none of which are symbols an agent would edit or navigate to.
+fn repo_map_is_symbol_kind(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "file" | "go-pkg" | "import" | "crate" | "package" | "doc-chunk" | "file-module"
+    )
+}
+
+/// A path we can place on the directory skeleton: not external, absolute,
+/// protocol-prefixed (SCIP `scip://`, build caches, `..`), or a synthetic
+/// pseudo-path (angle-bracket sentinels like `<cgo_synthetic>` — the successor
+/// to the old `<unknown>` bucket, which carry no real directory location).
+fn repo_map_is_local_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with("..")
+        && !path.starts_with('/')
+        && !path.starts_with('<')
+        && !path.contains("://")
+}
+
+/// Parent directory of a path, or `(root)` for a top-level file.
+fn repo_map_dir_of(path: &str) -> String {
+    match path.rfind('/') {
+        Some(i) => path[..i].to_string(),
+        None => "(root)".to_string(),
+    }
+}
+
+/// Derive directory-level "regions" from a set of distinct local file paths,
+/// adaptively. A directory becomes its own region when its subtree holds few
+/// files or has no subdirectories; otherwise it splits into its child
+/// directories (files directly in a split directory stay attached to it).
+///
+/// This is the language-agnostic replacement for manifest/crate detection: it
+/// reads only the path structure, so `crates/` (large) splits into per-crate
+/// regions while `docs/` (small) stays whole — on any language, any repo size.
+/// Returned longest-first so callers assign a path by longest-prefix match.
+///
+/// Known tradeoff: a single very large unit splits one level deeper than its
+/// siblings (e.g. `crates/travsr-plugin-host/src/sandbox` alongside whole
+/// smaller crates), because the ceiling is uniform across the tree. This is
+/// governed entirely by `TARGET_REGIONS`; it was tuned for legibility on both a
+/// Rust monorepo and kubernetes, so changing it is a measurement-gated decision
+/// (re-validate region granularity on both), not a free knob to nudge.
+fn repo_regions(file_paths: &std::collections::HashSet<String>) -> Vec<String> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    // Aim for a legible number of regions; split any subtree larger than this.
+    const TARGET_REGIONS: usize = 24;
+    const MIN_CEIL: usize = 4;
+
+    let total = file_paths.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let ceil = (total / TARGET_REGIONS).max(MIN_CEIL);
+
+    let mut subtree: HashMap<String, usize> = HashMap::new(); // files under a dir
+    let mut children: HashMap<String, BTreeSet<String>> = HashMap::new(); // immediate subdirs
+    let mut direct: HashMap<String, usize> = HashMap::new(); // files directly in a dir
+    let mut top: BTreeSet<String> = BTreeSet::new(); // top-level dirs
+
+    for path in file_paths {
+        let dir = repo_map_dir_of(path);
+        *direct.entry(dir.clone()).or_default() += 1;
+        if dir == "(root)" {
+            *subtree.entry("(root)".to_string()).or_default() += 1;
+            top.insert("(root)".to_string());
+            continue;
+        }
+        // Accumulate the ancestor chain: "a", "a/b", "a/b/c" for dir "a/b/c".
+        let mut prev: Option<String> = None;
+        let mut acc = String::new();
+        for (i, seg) in dir.split('/').enumerate() {
+            if i == 0 {
+                acc.push_str(seg);
+                top.insert(acc.clone());
+            } else {
+                acc.push('/');
+                acc.push_str(seg);
+            }
+            *subtree.entry(acc.clone()).or_default() += 1;
+            if let Some(p) = &prev {
+                children.entry(p.clone()).or_default().insert(acc.clone());
+            }
+            prev = Some(acc.clone());
+        }
+    }
+
+    fn walk(
+        dir: &str,
+        ceil: usize,
+        subtree: &HashMap<String, usize>,
+        children: &HashMap<String, BTreeSet<String>>,
+        direct: &HashMap<String, usize>,
+        regions: &mut HashSet<String>,
+    ) {
+        let count = *subtree.get(dir).unwrap_or(&0);
+        let kids = children.get(dir);
+        if count <= ceil || kids.map_or(true, |k| k.is_empty()) {
+            regions.insert(dir.to_string());
+        } else {
+            for c in kids.unwrap() {
+                walk(c, ceil, subtree, children, direct, regions);
+            }
+            if *direct.get(dir).unwrap_or(&0) > 0 {
+                regions.insert(dir.to_string()); // host files that live directly here
+            }
+        }
+    }
+
+    let mut regions: HashSet<String> = HashSet::new();
+    for t in &top {
+        if t == "(root)" {
+            regions.insert("(root)".to_string());
+        } else {
+            walk(t, ceil, &subtree, &children, &direct, &mut regions);
+        }
+    }
+
+    let mut out: Vec<String> = regions.into_iter().collect();
+    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    out
+}
+
+/// Assign a path to its region: the longest region directory that is an
+/// ancestor. Top-level files map to `(root)`. `regions` MUST be longest-first.
+fn repo_map_region_of(path: &str, regions: &[String]) -> String {
+    if !path.contains('/') {
+        return "(root)".to_string();
+    }
+    for r in regions {
+        if r == "(root)" {
+            continue;
+        }
+        if path.len() > r.len() && path.as_bytes()[r.len()] == b'/' && path.starts_with(r.as_str())
+        {
+            return r.clone();
+        }
+    }
+    // Fallback (regions should cover every local path): top-level segment.
+    match path.find('/') {
+        Some(i) => path[..i].to_string(),
+        None => "(root)".to_string(),
+    }
+}
+
+/// Aggregate resolved cross-file dependency pairs into a deduped region→region
+/// dependency edge set ("src region depends on dst region"), for the repo map's
+/// dependents ranking. The graph overview computes its own weighted edge set with
+/// the same region primitives (`repo_regions` / `repo_map_region_of` /
+/// `repo_region_dependents`) but over the file-node universe rather than the
+/// symbol-bearing one, so the two surfaces share the aggregation logic — not an
+/// identical graph, and their dependent counts may differ by a small margin.
+fn repo_region_dep_edges(
+    pairs: &[(String, String)],
+    regions: &[String],
+    known: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<(String, String)> {
+    let mut edges = std::collections::HashSet::new();
+    for (sp, dp) in pairs {
+        if !repo_map_is_local_path(sp) || !repo_map_is_local_path(dp) {
+            continue;
+        }
+        let sr = repo_map_region_of(sp, regions);
+        let dr = repo_map_region_of(dp, regions);
+        if sr != dr && known.contains(&sr) && known.contains(&dr) {
+            edges.insert((sr, dr));
+        }
+    }
+    edges
+}
+
+/// Transitive-dependent count per region: distinct regions that can reach `R`
+/// through the reverse dependency edges. Integer counts → deterministic.
+fn repo_region_dependents(
+    regions_universe: &std::collections::HashSet<String>,
+    dep_edges: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashMap<String, usize> {
+    use std::collections::{HashMap, HashSet};
+    let mut rev: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (a, b) in dep_edges {
+        rev.entry(b.as_str()).or_default().push(a.as_str());
+    }
+    let mut dependents = HashMap::new();
+    for region in regions_universe {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![region.as_str()];
+        while let Some(cur) = stack.pop() {
+            if let Some(ins) = rev.get(cur) {
+                for &a in ins {
+                    if seen.insert(a) {
+                        stack.push(a);
+                    }
+                }
+            }
+        }
+        seen.remove(region.as_str());
+        dependents.insert(region.clone(), seen.len());
+    }
+    dependents
+}
+
+/// Build the agent cold-start orientation map: directory-level components ranked
+/// by how depended-upon they are (from the resolved graph), each with their top
+/// files/symbols, an honest footer, and cold-start state disclosure. Language-
+/// agnostic — it reads only paths, kinds, and resolved edges. See
+/// docs/plans/get-repo-map-pagerank-rework.md for the full derivation.
+///
+/// `reserve_per_line` is the byte cost of a per-line prefix the caller adds to
+/// every returned line afterward (global multi-repo mode prefixes `[repo] `);
+/// it is charged against the byte cap here so a prefixed section still fits.
+/// Pass 0 for single-repo / local rendering (no prefix).
+fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     let nodes = match store.all_nodes() {
         Ok(n) => n,
@@ -2336,55 +2550,182 @@ fn get_repo_map_raw(store: &SqliteStore) -> String {
         }
     };
 
+    // State 1: not indexed. An empty string is indistinguishable to an agent from
+    // "empty repo" or "error"; give it an actionable line instead.
     if nodes.is_empty() {
+        return "Repo not indexed by Travsr — run `travsr init` to build the graph.".to_string();
+    }
+
+    // Directory skeleton from all local file paths → adaptive regions.
+    let mut file_paths: HashSet<String> = HashSet::new();
+    for n in &nodes {
+        if repo_map_is_local_path(&n.vname.path) {
+            file_paths.insert(n.vname.path.clone());
+        }
+    }
+    let regions = repo_regions(&file_paths);
+
+    // ── Surface: per-region symbol count + per-file symbol previews. ──
+    let mut region_symbols: HashMap<String, usize> = HashMap::new();
+    let mut region_files: HashMap<String, BTreeMap<String, Vec<String>>> = HashMap::new();
+    for n in &nodes {
+        if !repo_map_is_local_path(&n.vname.path) {
+            continue; // drops external / absolute / protocol paths.
+        }
+        if repo_map_is_symbol_kind(&n.kind) && !n.vname.signature.is_empty() {
+            let region = repo_map_region_of(&n.vname.path, &regions);
+            *region_symbols.entry(region.clone()).or_default() += 1;
+            region_files
+                .entry(region)
+                .or_default()
+                .entry(n.vname.path.clone())
+                .or_default()
+                .push(n.vname.signature.clone());
+        }
+    }
+    if region_symbols.is_empty() {
         return String::new();
     }
 
-    // Group nodes by file path.
-    let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for node in &nodes {
-        let path = if node.vname.path.is_empty() {
-            "<unknown>".to_string()
+    // ── Spine: dependents from the RESOLVED graph (ref/call + resolves-to),
+    // aggregated to regions. Language-agnostic — no import syntax is parsed. ──
+    let known: HashSet<String> = region_symbols.keys().cloned().collect();
+    let pairs = store.resolved_dep_pairs().unwrap_or_default();
+    let dep_edges = repo_region_dep_edges(&pairs, &regions, &known);
+    let dependents = repo_region_dependents(&known, &dep_edges);
+    let has_refcall = store.has_any_refcall_edges();
+
+    // Fail-open: no cross-region edges (e.g. Phase-A-only repo with sparse resolved
+    // edges) => rank by surface. The map never regresses to alphabetical, never
+    // empty because ranking failed.
+    let fail_open = dep_edges.is_empty();
+
+    let mut ordered: Vec<String> = region_symbols.keys().cloned().collect();
+    ordered.sort_by(|a, b| {
+        if fail_open {
+            region_symbols[b]
+                .cmp(&region_symbols[a])
+                .then_with(|| a.cmp(b))
         } else {
-            node.vname.path.clone()
+            dependents[b]
+                .cmp(&dependents[a])
+                .then_with(|| region_symbols[b].cmp(&region_symbols[a]))
+                .then_with(|| a.cmp(b))
+        }
+    });
+
+    // ── Render. Every component gets a one-line entry (names = routing coverage
+    // for the agent), and the top components additionally get file detail — but
+    // only while detailing them does not crowd out naming the rest. Built under
+    // the 4 KB SEC-001 cap so the footer is honest, not a silent guillotine. ──
+    const MAX_SYMBOLS_PER_FILE: usize = 5;
+    const MAX_FILES_PER_REGION: usize = 6;
+    // Upper bound on components that get file detail. The naming reserve below
+    // scales this down under the byte cap: on a large repo (many components to
+    // name) only the top few actually receive detail, since routing coverage
+    // (naming every component) is prioritized over detailing one further.
+    const DETAIL_COMPONENTS: usize = 6;
+    const SOFT_CAP: usize = 3800;
+    const AVG_HDR_BYTES: usize = 64; // reserve so every remaining name still fits
+
+    let total_regions = ordered.len();
+
+    let mut header = String::new();
+    if fail_open {
+        header.push_str(
+            "Repo map — components ranked by code volume (symbols); \
+             no cross-component dependencies detected.\n",
+        );
+    } else {
+        header.push_str(
+            "Repo map — components ranked by dependents (most load-bearing first); \
+             symbols = code volume.\n",
+        );
+    }
+    // State 2: Phase B (semantic) never ran — the ranking is still valid but
+    // call-graph data is absent, which affects the tools the agent calls next.
+    if !has_refcall {
+        header.push_str(
+            "Note: semantic analysis (Phase B) has not run — dependents are from \
+             import structure only; call-graph data is unavailable. Commit to \
+             trigger Phase B.\n",
+        );
+    }
+
+    // A caller (global multi-repo mode) prefixes every emitted line with
+    // `[repo] ` after we return; `reserve_per_line` is that per-line cost. We
+    // budget for it here so a prefixed section still fits the per-response cap
+    // instead of being silently truncated mid-line. Single-repo/local = 0.
+    let header_lines = header.matches('\n').count();
+    let mut body_lines = 0usize;
+
+    let mut body = String::new();
+    let mut named = 0usize;
+    for (i, region) in ordered.iter().enumerate() {
+        let hdr = if fail_open {
+            format!("{region}  symbols: {}\n", region_symbols[region])
+        } else {
+            format!(
+                "{region}  dependents: {}  symbols: {}\n",
+                dependents[region], region_symbols[region]
+            )
         };
-        // Only include named symbols (skip file nodes and internal go-pkg nodes).
-        if !node.vname.signature.is_empty() && node.kind != "file" && node.kind != "go-pkg" {
-            by_file
-                .entry(path)
-                .or_default()
-                .push(node.vname.signature.clone());
+        // + this line + the footer line, each prefixed later.
+        let prefix_cost = (header_lines + body_lines + 2) * reserve_per_line;
+        if header.len() + body.len() + hdr.len() + prefix_cost > SOFT_CAP {
+            break; // out of budget — remaining components go to the footer count.
+        }
+        body.push_str(&hdr);
+        body_lines += 1;
+        named += 1;
+
+        if i >= DETAIL_COMPONENTS {
+            continue; // name-only for lower-ranked components.
+        }
+        let mut file_list: Vec<(&String, &Vec<String>)> = region_files[region].iter().collect();
+        file_list.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+        for (fpath, sigs) in file_list.into_iter().take(MAX_FILES_PER_REGION) {
+            let mut s: Vec<String> = sigs.clone();
+            s.sort();
+            s.dedup();
+            let count = s.len();
+            let preview: Vec<&str> = s
+                .iter()
+                .take(MAX_SYMBOLS_PER_FILE)
+                .map(|x| x.as_str())
+                .collect();
+            let suffix = if count > MAX_SYMBOLS_PER_FILE {
+                format!(", … (+{})", count - MAX_SYMBOLS_PER_FILE)
+            } else {
+                String::new()
+            };
+            let line = format!(
+                "  {fpath}  [{count} symbol{}]  {}{}\n",
+                if count == 1 { "" } else { "s" },
+                preview.join(", "),
+                suffix,
+            );
+            // Reserve budget so every not-yet-named component still fits — naming
+            // (routing coverage) wins over detailing one component further. Each
+            // reserved future name and each emitted line also carries the caller's
+            // per-line prefix, so both are counted at the reserved rate.
+            let reserve = total_regions.saturating_sub(named) * (AVG_HDR_BYTES + reserve_per_line);
+            let prefix_cost = (header_lines + body_lines + 2) * reserve_per_line;
+            if header.len() + body.len() + line.len() + reserve + prefix_cost > SOFT_CAP {
+                break;
+            }
+            body.push_str(&line);
+            body_lines += 1;
         }
     }
 
-    const MAX_SYMBOLS_PER_FILE: usize = 5;
-    let mut lines: Vec<String> = Vec::with_capacity(by_file.len() + 1);
-
-    for (path, mut symbols) in by_file {
-        symbols.sort();
-        symbols.dedup();
-        let count = symbols.len();
-        let preview: Vec<&str> = symbols
-            .iter()
-            .take(MAX_SYMBOLS_PER_FILE)
-            .map(|s| s.as_str())
-            .collect();
-        let suffix = if count > MAX_SYMBOLS_PER_FILE {
-            format!(", … (+{})", count - MAX_SYMBOLS_PER_FILE)
-        } else {
-            String::new()
-        };
-        lines.push(format!(
-            "{}  [{} symbol{}]  {}{}",
-            path,
-            count,
-            if count == 1 { "" } else { "s" },
-            preview.join(", "),
-            suffix,
-        ));
+    let mut footer = String::new();
+    let more_regions = total_regions - named;
+    if more_regions > 0 {
+        footer = format!("+{more_regions} more components (of {total_regions})\n");
     }
 
-    lines.join("\n")
+    format!("{header}{body}{footer}")
 }
 
 // ── get_graph_stats ───────────────────────────────────────────────────────────
@@ -2762,7 +3103,11 @@ pub fn get_execution_path_global(
 pub fn get_repo_map_global(repos: &HashMap<String, PathBuf>, repo: Option<&str>) -> String {
     // repo arg validated inside collect_global.
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_repo_map_raw(store);
+        // Multi-repo mode prefixes every line with `[repo] `; reserve those bytes
+        // in the render so a prefixed section is not truncated mid-line by the
+        // per-response cap. Single-repo mode adds no prefix, so it reserves none.
+        let reserve_per_line = if single { 0 } else { repo_name.len() + 3 };
+        let result = get_repo_map_raw(store, reserve_per_line);
         if result.is_empty() || single {
             result
         } else {
@@ -5047,10 +5392,14 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
             return r#"{"nodes":[],"edges":[]}"#.to_string();
         }
     };
-    let pairs = match store.file_import_pairs() {
+    // Resolved cross-file dependency pairs (ref/call + resolves-to) — the same
+    // language-agnostic primitive the repo map uses. Replaces the old
+    // depends+resolves-to-only `file_import_pairs`, which produced ~0 edges here
+    // because top-level-dir buckets collapsed every intra-monorepo edge.
+    let pairs = match store.resolved_dep_pairs() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("overview_graph: file_import_pairs error: {e}");
+            tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
             vec![]
         }
     };
@@ -5061,53 +5410,69 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
     }
 }
 
-/// Aggregate all file nodes into synthetic package tiles + cross-package import edges.
-// O(F + P) where F = file nodes, P = import pairs
+/// Aggregate file nodes into directory-level component tiles + cross-component
+/// dependency edges. Granularity is the adaptive directory rollup (`repo_regions`)
+/// — NOT the top-level folder — so a monorepo's internal architecture
+/// (crates/mcp -> crates/core) actually appears instead of collapsing into one
+/// `crates` self-edge. Nodes carry `dependents` so renderers can rank by it.
+// O(F + P) where F = file nodes, P = resolved pairs
 fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, String)]) -> String {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
-    let mut pkg_files: BTreeMap<String, u32> = BTreeMap::new();
-
+    let mut file_paths: HashSet<String> = HashSet::new();
     for node in file_nodes {
-        let key = pkg_key_from_path(&node.vname.path);
-        if key.is_empty() {
-            continue; // skip build-cache, absolute, or protocol paths
+        if repo_map_is_local_path(&node.vname.path) {
+            file_paths.insert(node.vname.path.clone());
         }
-        *pkg_files.entry(key).or_default() += 1;
+    }
+    let regions = repo_regions(&file_paths);
+
+    let mut region_files: BTreeMap<String, u32> = BTreeMap::new();
+    for node in file_nodes {
+        if !repo_map_is_local_path(&node.vname.path) {
+            continue;
+        }
+        *region_files
+            .entry(repo_map_region_of(&node.vname.path, &regions))
+            .or_default() += 1;
     }
 
-    if pkg_files.is_empty() {
+    if region_files.is_empty() {
         return r#"{"nodes":[],"edges":[],"mode":"overview"}"#.to_string();
     }
 
-    let nodes_out: Vec<serde_json::Value> = pkg_files
+    // Cross-component edges with weight = distinct file pairs crossing the border.
+    let known: HashSet<String> = region_files.keys().cloned().collect();
+    let mut cross: HashMap<(String, String), u32> = HashMap::new();
+    for (src_path, dst_path) in pairs {
+        if !repo_map_is_local_path(src_path) || !repo_map_is_local_path(dst_path) {
+            continue;
+        }
+        let src_r = repo_map_region_of(src_path, &regions);
+        let dst_r = repo_map_region_of(dst_path, &regions);
+        if src_r != dst_r && known.contains(&src_r) && known.contains(&dst_r) {
+            *cross.entry((src_r, dst_r)).or_default() += 1;
+        }
+    }
+
+    let dep_edges: HashSet<(String, String)> = cross.keys().cloned().collect();
+    let dependents = repo_region_dependents(&known, &dep_edges);
+
+    let nodes_out: Vec<serde_json::Value> = region_files
         .iter()
-        .map(|(pkg, file_count)| {
+        .map(|(region, file_count)| {
             serde_json::json!({
-                "id":         format!("pkg:{pkg}"),
-                "label":      pkg,
+                "id":         format!("pkg:{region}"),
+                "label":      region,
                 "kind":       "pkg",
                 "file_count": file_count,
+                "dependents": dependents.get(region).copied().unwrap_or(0),
                 "ghost":      false,
             })
         })
         .collect();
 
-    let mut cross_pkg: HashMap<(String, String), u32> = HashMap::new();
-    for (src_path, dst_path) in pairs {
-        let src_pkg = pkg_key_from_path(src_path);
-        let dst_pkg = pkg_key_from_path(dst_path);
-        if src_pkg.is_empty() || dst_pkg.is_empty() || src_pkg == dst_pkg {
-            continue;
-        }
-        // Only emit edges where both packages are known (present in file_nodes)
-        if !pkg_files.contains_key(&src_pkg) || !pkg_files.contains_key(&dst_pkg) {
-            continue;
-        }
-        *cross_pkg.entry((src_pkg, dst_pkg)).or_default() += 1;
-    }
-
-    let edges_out: Vec<serde_json::Value> = cross_pkg
+    let edges_out: Vec<serde_json::Value> = cross
         .iter()
         .map(|((src, dst), count)| {
             serde_json::json!({
@@ -7095,6 +7460,66 @@ mod tests {
     }
 
     #[test]
+    fn overview_graph_splits_monorepo_into_components() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mk = |p: &str| Node::new(VName::new("", "", p, "rust", p), "file");
+        let mut core_ids = Vec::new();
+        let mut mcp_ids = Vec::new();
+        for f in ["a", "b", "c"] {
+            let c = mk(&format!("crates/travsr-core/src/{f}.rs"));
+            let m = mk(&format!("crates/travsr-mcp/src/{f}.rs"));
+            store.put_node(&c).unwrap();
+            store.put_node(&m).unwrap();
+            core_ids.push(c.id);
+            mcp_ids.push(m.id);
+        }
+        // mcp depends on core (a real call edge).
+        store
+            .put_edge(&Edge::new(mcp_ids[0], core_ids[0], EdgeKind::RefCall))
+            .unwrap();
+
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "overview",
+                path_prefix: "",
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nodes = v["nodes"].as_array().unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        // The monorepo must roll up to crate-level components, NOT collapse into
+        // a single "crates" tile (which would hide all internal architecture).
+        assert!(
+            ids.contains(&"pkg:crates/travsr-core") && ids.contains(&"pkg:crates/travsr-mcp"),
+            "monorepo must split into crate-level components: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"pkg:crates"),
+            "must not collapse to a single 'crates' tile: {ids:?}"
+        );
+
+        let core = nodes
+            .iter()
+            .find(|n| n["id"] == "pkg:crates/travsr-core")
+            .unwrap();
+        assert_eq!(core["dependents"], 1, "core is depended upon by mcp");
+
+        let edges = v["edges"].as_array().unwrap();
+        assert!(
+            edges.iter().any(|e| e["source"] == "pkg:crates/travsr-mcp"
+                && e["target"] == "pkg:crates/travsr-core"),
+            "cross-component edge mcp -> core must be present: {edges:?}"
+        );
+    }
+
+    #[test]
     fn overview_graph_package_drill_emits_files_and_ghost() {
         let store = make_file_graph_store();
         let raw = get_graph_json(
@@ -7261,6 +7686,162 @@ mod tests {
         assert!(
             result.contains("[1 symbol]"),
             "file-kind node must be excluded from symbol count"
+        );
+    }
+
+    /// A node with an explicit kind, for repo-map region/edge tests.
+    fn make_kind(path: &str, sig: &str, kind: &str) -> travsr_core::Node {
+        use travsr_core::VName;
+        travsr_core::Node::new(VName::new("", "", path, "typescript", sig), kind)
+    }
+
+    /// Two crates (core + mcp) where mcp depends on core via a resolved edge.
+    /// core must rank first (higher dependents). Enough files under crates/ that
+    /// the adaptive rollup splits it into per-crate regions.
+    fn two_crate_store(with_refcall: bool) -> travsr_store::SqliteStore {
+        use travsr_core::EdgeKind;
+        let mut nodes = Vec::new();
+        for f in ["a", "b", "c"] {
+            nodes.push(make_node(
+                &format!("crates/travsr-core/src/{f}.rs"),
+                &format!("fn:core_{f}"),
+            ));
+            nodes.push(make_node(
+                &format!("crates/travsr-mcp/src/{f}.rs"),
+                &format!("fn:mcp_{f}"),
+            ));
+        }
+        // core_a is nodes[0], core_b nodes[2]; mcp_b nodes[3].
+        let core_a = nodes[0].id;
+        let core_b = nodes[2].id;
+        let mcp_b = nodes[3].id;
+        // resolves-to (Phase A): import node in mcp (path = importer) -> core file.
+        // So dependents exist even without Phase B.
+        let mcp_import = make_kind("crates/travsr-mcp/src/a.rs", "use:core", "import");
+        nodes.push(mcp_import.clone());
+        let mut edges = vec![(mcp_import.id, core_a, EdgeKind::ResolvesTo)];
+        if with_refcall {
+            // A real call edge flips the Phase-B disclosure off.
+            edges.push((mcp_b, core_b, EdgeKind::RefCall));
+        }
+        make_store(&nodes, &edges)
+    }
+
+    #[test]
+    fn get_repo_map_ranks_regions_by_dependents() {
+        let store = two_crate_store(false);
+        let result = get_repo_map(&store);
+        let core = result
+            .find("crates/travsr-core")
+            .expect("core region present");
+        let mcp = result
+            .find("crates/travsr-mcp")
+            .expect("mcp region present");
+        assert!(
+            core < mcp,
+            "depended-upon core must rank before leaf mcp:\n{result}"
+        );
+        assert!(
+            result.contains("dependents: 1"),
+            "core dependents shown:\n{result}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_excludes_unknown_bucket() {
+        // An external-crate ref (empty path) must not surface as "<unknown>".
+        let ext = make_kind("", "crate:anyhow", "crate");
+        let fn_node = make_node("crates/travsr-core/src/lib.rs", "fn:a");
+        let store = make_store(&[ext, fn_node], &[]);
+        let result = get_repo_map(&store);
+        assert!(
+            !result.contains("<unknown>"),
+            "external-ref bucket must be dropped:\n{result}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_not_indexed_message() {
+        let store = make_store(&[], &[]);
+        let result = get_repo_map(&store);
+        assert!(
+            result.contains("travsr init"),
+            "empty store must return an actionable not-indexed message, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_discloses_missing_phase_b() {
+        // No ref/call edges => semantic note present.
+        let without = get_repo_map(&two_crate_store(false));
+        assert!(
+            without.contains("Phase B"),
+            "missing-Phase-B state must be disclosed:\n{without}"
+        );
+        // ref/call present => note omitted.
+        let with = get_repo_map(&two_crate_store(true));
+        assert!(
+            !with.contains("Phase B) has not run"),
+            "semantic note must be omitted once Phase B has run:\n{with}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_is_deterministic() {
+        let store = two_crate_store(false);
+        assert_eq!(get_repo_map(&store), get_repo_map(&store));
+    }
+
+    #[test]
+    fn get_repo_map_excludes_synthetic_pseudo_paths() {
+        // A synthetic angle-bracket path (e.g. Go cgo) carries no real directory
+        // location and must not surface as a region — the successor to the old
+        // dropped `<unknown>` bucket.
+        let synth = make_kind("<cgo_synthetic>/x.go", "fn:cgo_thing", "function");
+        let real = make_node("crates/travsr-core/src/lib.rs", "fn:real");
+        let store = make_store(&[synth, real], &[]);
+        let result = get_repo_map(&store);
+        assert!(
+            !result.contains("cgo_synthetic"),
+            "synthetic pseudo-path must be excluded:\n{result}"
+        );
+        assert!(
+            result.contains("crates/travsr-core"),
+            "real region must still be present:\n{result}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_reserves_prefix_budget() {
+        // Global multi-repo mode prefixes every line with `[repo] ` after render.
+        // Build a store large enough to fill toward the cap, render with that
+        // per-line reserve, and confirm the prefixed output still fits the 4 KB
+        // response cap — the mid-line-truncation guard for the global path.
+        let mut nodes = Vec::new();
+        for i in 0..40 {
+            for f in 0..4 {
+                for s in 0..6 {
+                    nodes.push(make_node(
+                        &format!("crates/crate-{i:02}/src/file{f}.rs"),
+                        &format!("fn:crate{i}_file{f}_sym{s}"),
+                    ));
+                }
+            }
+        }
+        let store = make_store(&nodes, &[]);
+        // A realistic prefix width, e.g. "[some-repo-name] ".
+        let reserve = 17usize;
+        let raw = get_repo_map_raw(&store, reserve);
+        let line_count = raw.lines().count();
+        let prefixed = raw.len() + line_count * reserve;
+        assert!(
+            prefixed <= 4096,
+            "prefixed map exceeds the 4 KB cap: {prefixed} bytes over {line_count} lines"
+        );
+        // Reserving budget must not empty the map or drop the header.
+        assert!(
+            raw.contains("Repo map"),
+            "header must survive the reserve:\n{raw}"
         );
     }
 }

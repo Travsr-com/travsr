@@ -471,7 +471,7 @@ fn tools_list() -> serde_json::Value {
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
                         "token_budget": { "type": "integer", "description": "Cap the payload to roughly this many tokens (0 or omitted = unlimited). Truncation is reported via truncated_by_budget." },
-                        "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns synthetic package-level tile nodes sized by file count plus cross-package import edges. Combine with path_prefix to drill into a package." },
+                        "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns directory-level component tiles (each with file_count and dependents) plus cross-component dependency edges from the resolved graph, ranked by how depended-upon each component is. Combine with path_prefix to drill into a component." },
                         "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix (e.g. 'src/components/'). Returns file nodes inside the prefix plus ghost-port package nodes for cross-boundary deps." }
                     },
                     "required": [],
@@ -1053,7 +1053,7 @@ fn tools_list_global() -> serde_json::Value {
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." },
-                        "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns synthetic package-level tile nodes sized by file count plus cross-package import edges." },
+                        "mode": { "type": "string", "enum": ["", "overview"], "description": "'overview' returns directory-level component tiles (each with file_count and dependents) plus cross-component dependency edges from the resolved graph." },
                         "path_prefix": { "type": "string", "description": "When mode='overview', scope to files under this path prefix. Returns file nodes inside the prefix plus ghost-port package nodes for cross-boundary deps." }
                     },
                     "required": [],
