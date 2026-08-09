@@ -425,7 +425,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST.",
+                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Answers explicitly when the symbols do not resolve or resolve but are disconnected ('no path found'), so an empty-looking result is never ambiguous.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1003,7 +1003,7 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Supply `repo` to scope to a single codebase.",
+                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Supply `repo` to scope to a single codebase; scoped queries answer explicitly when the symbols do not resolve or are disconnected ('no path found').",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

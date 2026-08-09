@@ -2714,16 +2714,23 @@ pub fn repos_remove(name: &str) -> String {
 
 /// Find a traversal path from `source` symbol to `sink` symbol through the graph.
 ///
-/// Uses PCST (Prize-Collecting Steiner Tree) approximation when a path exists,
-/// falls back to BFS depth-3 on timeout (> 80ms) or disconnected graphs.
+/// Uses PCST (Prize-Collecting Steiner Tree) approximation when a path exists.
+/// A result that does not reach the sink (pcst_path's BFS fallback on
+/// disconnected graphs) is reported as "no path found" rather than relayed
+/// as if it were a path (#620).
 ///
 /// Output format (one line per node on path):
 ///   `fn:charge (function) — src/payment.ts`
 ///   `fn:processPayment (function) — src/processor.ts`
 ///
 /// # SEC P0
-/// Returns empty string for both "symbol not found" and "symbol access denied".
-/// These cases are indistinguishable to the caller (prevents existence oracle).
+/// "Symbol not found" and "symbol access denied" produce byte-identical
+/// output (a single could-not-resolve message that names neither the failing
+/// endpoint nor the reason), preventing an existence oracle.
+///
+/// #620: an empty answer is never silent — unresolved endpoints and
+/// resolved-but-disconnected endpoints each return an explicit message
+/// instead of an empty envelope an agent would misread as authoritative.
 pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> String {
     // Phase B deferred: execution paths require call edges which are not yet indexed.
     if phase_b_pending(store) {
@@ -2763,15 +2770,20 @@ fn get_execution_path_with_filter(
     // while the call-edge set is known-incomplete.
     with_phase_b_note(
         store,
-        sanitize_for_mcp(&get_execution_path_raw(store, source, sink, filter)),
+        sanitize_for_mcp(&get_execution_path_body(store, source, sink, filter, true)),
     )
 }
 
-fn get_execution_path_raw(
+/// Shared search body. `diagnose` controls whether the empty outcomes are
+/// explained (#620): single-repo callers pass `true` so an agent never gets a
+/// silent blank; the multi-repo aggregator passes `false` because a repo
+/// without the symbols is normal, not an error.
+fn get_execution_path_body(
     store: &SqliteStore,
     source: &str,
     sink: &str,
     filter: &dyn EdgeFilter,
+    diagnose: bool,
 ) -> String {
     // SEC P0: resolve source and sink; treat "not found" == "access denied" identically.
     let src_node = match store.search_nodes_by_name(source) {
@@ -2794,10 +2806,19 @@ fn get_execution_path_raw(
         }
     };
 
-    // SEC P0: both outcomes (not found and access denied) produce the same empty result.
+    // SEC P0: both failure modes (not found and access denied) land here and
+    // produce the same message, which names neither the failing endpoint nor
+    // the reason — no existence oracle.
     let (src, snk) = match (src_node, sink_node) {
         (Some(a), Some(b)) => (a, b),
-        _ => return String::new(),
+        _ => {
+            if diagnose {
+                return format!(
+                    "could not resolve source '{source}' and/or sink '{sink}' — verify the names with search_symbol, or pass full signatures (e.g. fn:charge)."
+                );
+            }
+            return String::new();
+        }
     };
 
     let path = match travsr_retrieval::pcst_path(store, src.id, snk.id, filter, 4096) {
@@ -2808,7 +2829,18 @@ fn get_execution_path_raw(
         }
     };
 
-    if path.is_empty() {
+    // #620: when the sink is unreachable, pcst_path falls back to a
+    // source-rooted BFS neighbourhood — so "no path" manifests as a result
+    // that never includes the sink, not as an empty vector. Relaying that
+    // neighbourhood as if it were an execution path is the silent false
+    // signal this issue exists to fix.
+    if path.is_empty() || !path.iter().any(|n| n.id == snk.id) {
+        if diagnose {
+            return format!(
+                "no path found: '{}' and '{}' both resolved, but no connecting call chain was found within traversal limits.",
+                src.vname.signature, snk.vname.signature
+            );
+        }
         return String::new();
     }
 
@@ -2841,7 +2873,12 @@ pub fn get_execution_path_global(
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         // #617: per-repo note — each store carries its own Phase B freshness.
-        let result = with_phase_b_note(store, get_execution_path_raw(store, source, sink, filter));
+        // #620: diagnose empty outcomes only in single-repo mode; a repo that
+        // simply doesn't contain the symbols must stay silent in an aggregate.
+        let result = with_phase_b_note(
+            store,
+            get_execution_path_body(store, source, sink, filter, single),
+        );
         if result.is_empty() || single {
             result
         } else {
@@ -9598,6 +9635,123 @@ mod snippet_tests {
             root_count(&raw),
             2,
             "file mode substring seeding must be unchanged; got: {raw}"
+        );
+    }
+
+    // ── #620 get_execution_path empty-outcome signals ─────────────────────────
+
+    /// Disconnected endpoints must return an explicit no-path answer, never a
+    /// silent empty envelope.
+    #[test]
+    fn get_execution_path_disconnected_says_no_path_found() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "fn:beta"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let result = get_execution_path(&store, "alpha", "beta");
+        assert!(
+            result.contains("no path found"),
+            "disconnected endpoints must be reported; got: {result}"
+        );
+        assert!(
+            result.contains("fn:alpha") && result.contains("fn:beta"),
+            "the resolved signatures confirm resolution succeeded; got: {result}"
+        );
+    }
+
+    /// An endpoint that does not resolve must get the could-not-resolve
+    /// message, distinct from the no-path case.
+    #[test]
+    fn get_execution_path_unknown_symbol_says_could_not_resolve() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        let result = get_execution_path(&store, "alpha", "zzz_nonexistent");
+        assert!(
+            result.contains("could not resolve"),
+            "unresolved endpoint must be reported; got: {result}"
+        );
+        assert!(
+            !result.contains("no path found"),
+            "must not claim a path search happened; got: {result}"
+        );
+    }
+
+    /// SEC P0: an access-denied endpoint must be byte-identical to a
+    /// nonexistent one — no existence oracle through the new messages.
+    #[test]
+    fn get_execution_path_denied_matches_not_found() {
+        use travsr_core::{Node, VName};
+        use travsr_retrieval::RbacFilter;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("secret", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("secret", "", "src/b.ts", "typescript", "fn:beta"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        // Filter allows nothing in corpus "secret": beta exists but is denied.
+        let deny = RbacFilter::new(["public"]);
+        let denied = get_execution_path_authed(&store, "alpha", "beta", &deny);
+        // Same query where the sink genuinely does not exist.
+        let missing = get_execution_path_authed(&store, "alpha", "zzz_nope", &deny);
+        // Both go through the same unresolved branch; the messages differ only
+        // by the echoed query text, never by reason. Normalize the echoes out.
+        let denied_norm = denied.replace("beta", "X").replace("zzz_nope", "X");
+        let missing_norm = missing.replace("beta", "X").replace("zzz_nope", "X");
+        assert_eq!(
+            denied_norm, missing_norm,
+            "denied and missing must be indistinguishable"
+        );
+        assert!(
+            denied.contains("could not resolve"),
+            "denied case must use the same could-not-resolve message; got: {denied}"
+        );
+    }
+
+    /// A connected pair keeps returning the plain path lines with no
+    /// diagnostic text mixed in.
+    #[test]
+    fn get_execution_path_connected_returns_plain_path() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "fn:beta"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge(&Edge::new(a.id, b.id, EdgeKind::RefCall))
+            .unwrap();
+        let result = get_execution_path(&store, "alpha", "beta");
+        assert!(
+            result.contains("fn:alpha") && result.contains("fn:beta"),
+            "path endpoints must appear; got: {result}"
+        );
+        assert!(
+            !result.contains("no path found") && !result.contains("could not resolve"),
+            "successful path must carry no diagnostics; got: {result}"
         );
     }
 
