@@ -59,6 +59,125 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     parse_with_config(&CONFIG, &grammar, None, corpus, abs_path, vname_path)
 }
 
+/// Bytes of a header inspected by [`header_is_objc`]. Declarations that
+/// identify a header's dialect appear near the top; this bounds the read on a
+/// generated header without changing the answer for a real one.
+const HEADER_SNIFF_BYTES: usize = 64 * 1024;
+
+/// Whether an ambiguous `.h` header is Objective-C, judged from its own text.
+///
+/// `.h` is shared by C, C++ and Objective-C, and the extension cannot say
+/// which. The caller previously decided this from a single repo-wide "does any
+/// `.m`/`.mm` exist" flag applied to every header at once, so one Objective-C
+/// file anywhere claimed every header in the repo — including C++ headers in
+/// unrelated directories.
+///
+/// The cost is silent symbol loss, not a broken edge: the Objective-C grammar
+/// cannot parse C++ declarations, so a misfiled header yields a file node and
+/// nothing else. `class Animal { public: void speak(); };` contributed no
+/// `fn:speak`, and `search_symbol` / `find_references` / `get_callers` then
+/// answered "not found" for a symbol that is plainly in the source, with no
+/// error to explain why.
+///
+/// The header's own text settles it: Objective-C declarations have no C or C++
+/// spelling, so finding one is conclusive. `None` means the text carries no
+/// dialect marker either way (a plain C-style declarations header), leaving the
+/// choice to the caller's repo-level signal — which is the pre-#610 behaviour,
+/// and the right default for a repo already known to be Objective-C.
+pub fn header_is_objc(source: &str) -> Option<bool> {
+    let head = source.get(..HEADER_SNIFF_BYTES).unwrap_or(source);
+
+    // Objective-C wins outright when present: a header carrying `@interface`
+    // is Objective-C even if it also uses C++ constructs (ObjC++ headers do).
+    const OBJC: &[&str] = &[
+        "@interface",
+        "@protocol",
+        "@implementation",
+        "@property",
+        "@end",
+        "NS_ASSUME_NONNULL",
+        "#import",
+    ];
+    if OBJC.iter().any(|m| head.contains(m)) {
+        return Some(true);
+    }
+
+    // C++-only spellings. None of these parse as Objective-C's supersets of C,
+    // so their presence rules Objective-C out.
+    const CPP: &[&str] = &[
+        "template<",
+        "template <",
+        "namespace ",
+        "public:",
+        "private:",
+        "protected:",
+        "std::",
+        "class ",
+    ];
+    if CPP.iter().any(|m| head.contains(m)) {
+        return Some(false);
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod header_sniff_tests {
+    use super::header_is_objc;
+
+    #[test]
+    fn objc_declarations_are_conclusive() {
+        assert_eq!(header_is_objc("@interface Animal\n@end\n"), Some(true));
+        assert_eq!(header_is_objc("@protocol Speaker\n@end\n"), Some(true));
+        assert_eq!(
+            header_is_objc("#import <Foundation/Foundation.h>\n"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cpp_declarations_rule_objc_out() {
+        // #610: the exact shape that was being misfiled. A C++ header in a repo
+        // that happens to contain an unrelated `.m` file.
+        assert_eq!(
+            header_is_objc("#pragma once\nclass Animal { public: void speak(); };\n"),
+            Some(false)
+        );
+        assert_eq!(
+            header_is_objc("template <typename T> T id(T x);\n"),
+            Some(false)
+        );
+        assert_eq!(header_is_objc("namespace zoo { void f(); }\n"), Some(false));
+    }
+
+    #[test]
+    fn objc_wins_over_cpp_markers_in_an_objcpp_header() {
+        // ObjC++ headers legitimately carry both; the Objective-C parser is the
+        // one that can read `@interface`, so it must win.
+        let src = "#import <Foundation/Foundation.h>\nclass Impl;\n@interface Wrapper\n@end\n";
+        assert_eq!(header_is_objc(src), Some(true));
+    }
+
+    #[test]
+    fn a_plain_c_header_is_ambiguous_and_defers_to_the_caller() {
+        // No dialect marker: the caller's repo-level signal decides, which
+        // preserves the pre-#610 behaviour for genuinely ambiguous headers.
+        assert_eq!(
+            header_is_objc("#pragma once\nint add(int a, int b);\n"),
+            None
+        );
+        assert_eq!(header_is_objc(""), None);
+    }
+
+    #[test]
+    fn sniffing_is_bounded_and_does_not_panic_on_multibyte_text() {
+        // `get(..N)` returns None on a non-char-boundary split, which must fall
+        // back to the whole string rather than panic.
+        let src = format!("// {}\n@interface Late\n@end\n", "é".repeat(40_000));
+        assert_eq!(header_is_objc(&src), Some(true));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -237,10 +237,11 @@ fn index_paths_parallel(
                     }
 
                     // Parse Phase A. L5b: route `.h` to the Obj-C parser instead of
-                    // the default C dispatch when the repo has `.m`/`.mm` sources —
-                    // the C grammar cannot parse `@interface`/`@protocol` headers.
+                    // the default C dispatch — the C grammar cannot parse
+                    // `@interface`/`@protocol` headers. #610: decided per header
+                    // from its own text, not from one repo-wide flag applied to all.
                     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    let parsed = if ext == "h" && objc_signal {
+                    let parsed = if ext == "h" && header_parses_as_objc(abs_path, objc_signal) {
                         travsr_analysis::objc::parse(&corpus, abs_path, &vname_path)
                     } else {
                         indexer
@@ -2419,6 +2420,33 @@ fn reclassify_objc_headers(langs: &mut std::collections::HashSet<String>, paths:
     }
 }
 
+/// Whether a `.h` header should be parsed as Objective-C rather than C.
+///
+/// `repo_has_objc` alone used to decide this for every header at once, so a
+/// single `.m` anywhere claimed every `.h` in the repo — including C++ headers
+/// in unrelated directories, which the Objective-C grammar cannot parse. Those
+/// headers indexed to a file node and nothing else, silently losing every
+/// symbol they declare.
+///
+/// The header's own text is consulted first and is conclusive when it carries a
+/// dialect marker. The repo-level signal remains the tiebreak for a plain
+/// declarations header that says nothing either way, which is both the previous
+/// behaviour and the right default in a repo already known to be Objective-C.
+///
+/// Only reached when `repo_has_objc` is already true, so a repo with no
+/// Objective-C in it never pays for the read.
+fn header_parses_as_objc(abs_path: &Path, repo_has_objc: bool) -> bool {
+    if !repo_has_objc {
+        return false;
+    }
+    match std::fs::read_to_string(abs_path) {
+        Ok(src) => travsr_analysis::objc::header_is_objc(&src).unwrap_or(true),
+        // Unreadable or non-UTF-8: fall back to the repo signal rather than
+        // guessing. The parse below will surface any real read failure.
+        Err(_) => true,
+    }
+}
+
 /// L5b: early-exit repo-wide scan for any `.m`/`.mm` file — the signal used to
 /// disambiguate a changed `.h` file's language on the commit-hook path, where
 /// `reindex_files`'s own `paths` batch is a diff and may not include a sibling
@@ -3053,10 +3081,11 @@ pub fn reindex_files(
 
         // §2 GC keystone: parse FIRST — a syntax error never erases the old graph.
         // L5b: route `.h` to the Obj-C parser instead of the default C dispatch
-        // when the repo has `.m`/`.mm` sources — the C grammar cannot parse
-        // `@interface`/`@protocol` headers.
+        // — the C grammar cannot parse `@interface`/`@protocol` headers.
+        // #610: decided per header from its own text, not from one repo-wide
+        // flag applied to every header at once.
         let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let parsed = if ext == "h" && objc_signal {
+        let parsed = if ext == "h" && header_parses_as_objc(abs_path, objc_signal) {
             travsr_analysis::objc::parse(&corpus, abs_path, &vname_path)
         } else {
             indexer
@@ -3330,6 +3359,44 @@ mod tests {
             "c must not be enrolled from .h alone when no genuine .c file exists, got {langs:?}"
         );
         assert_eq!(paths.len(), 2, "both .h and .m must remain indexable paths");
+    }
+
+    /// The `.h` routing decision must come from the header's own text, not
+    /// from one repo-wide flag applied to every header at once.
+    ///
+    /// One `.m` file anywhere used to reclassify every `.h` in the repo. The
+    /// Obj-C grammar cannot parse C++ declarations, so a C++ header caught by
+    /// that produced a file node and nothing else — every symbol it declared
+    /// vanished from the graph, with no error to say why.
+    #[test]
+    fn header_parses_as_objc_judges_each_header_by_its_own_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let objc_header = dir.path().join("Animal.h");
+        let cpp_header = dir.path().join("animal_cpp.h");
+        let plain_header = dir.path().join("util.h");
+        std::fs::write(&objc_header, "@interface Animal\n@end\n").unwrap();
+        std::fs::write(&cpp_header, "class Animal { public: void speak(); };\n").unwrap();
+        std::fs::write(&plain_header, "void f(void);\n").unwrap();
+
+        // The repo signal is true throughout — that is the whole point: it must
+        // no longer be enough on its own to claim a header for Obj-C.
+        assert!(
+            header_parses_as_objc(&objc_header, true),
+            "a header declaring @interface is Objective-C"
+        );
+        assert!(
+            !header_parses_as_objc(&cpp_header, true),
+            "a C++ header must not be claimed by Obj-C just because the repo has a .m somewhere"
+        );
+        assert!(
+            header_parses_as_objc(&plain_header, true),
+            "a header with no dialect marker still defers to the repo signal"
+        );
+
+        // With no Obj-C in the repo at all, nothing is routed to the Obj-C
+        // parser and no file is read.
+        assert!(!header_parses_as_objc(&objc_header, false));
+        assert!(!header_parses_as_objc(&cpp_header, false));
     }
 
     // L5b: without any `.m`/`.mm` sibling, `.h` must keep its default C
