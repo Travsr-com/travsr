@@ -425,7 +425,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST.",
+                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Answers explicitly when the symbols do not resolve or resolve but are disconnected ('no path found'), so an empty-looking result is never ambiguous.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -466,7 +466,7 @@ fn tools_list() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file' or mode is 'overview'." },
+                        "query": { "type": "string", "description": "Symbol name (1–200 chars). Resolved exact-first: full signature (e.g. 'fn:charge'), then exact bare name; substring matching is only a fallback when neither matches, so prefer the exact name for a precise single-root graph. May be empty when kind_filter is 'file' or mode is 'overview'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },
@@ -1003,7 +1003,7 @@ fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_execution_path",
-                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Supply `repo` to scope to a single codebase.",
+                "description": "Find a traversal path from source symbol to sink symbol through the code graph using PCST. Supply `repo` to scope to a single codebase; scoped queries answer explicitly when the symbols do not resolve or are disconnected ('no path found').",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1048,7 +1048,7 @@ fn tools_list_global() -> serde_json::Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Symbol name or partial match (1–200 chars). May be empty when kind_filter is 'file' or mode is 'overview'." },
+                        "query": { "type": "string", "description": "Symbol name (1–200 chars). Resolved exact-first: full signature (e.g. 'fn:charge'), then exact bare name; substring matching is only a fallback when neither matches, so prefer the exact name for a precise single-root graph. May be empty when kind_filter is 'file' or mode is 'overview'." },
                         "direction": { "type": "string", "enum": ["deps", "callers", "both"], "description": "Edge direction. Default: both" },
                         "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "BFS depth. Default: 2" },
                         "kind_filter": { "type": "string", "enum": ["file", ""], "description": "Restrict nodes to a specific kind. 'file' returns only file nodes and imports edges (project module map). Default: empty (all kinds)." },

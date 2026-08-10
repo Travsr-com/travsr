@@ -30,8 +30,39 @@ pub fn get_dependencies(store: &SqliteStore, file: &str, transitive: bool, depth
     } else {
         get_dependencies_raw(store, file)
     };
+    // #619: an empty answer for an argument that is not actually a file (a
+    // symbol name passed by mistake, or an unknown path) reads as "this file
+    // has no dependencies" — misleading. Replace it with a short hint.
+    if raw.is_empty() {
+        if let Some(hint) = dependency_arg_hint(store, file) {
+            return sanitize_for_mcp(&hint);
+        }
+    }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
     sanitize_for_mcp(&raw)
+}
+
+/// Diagnose an empty `get_dependencies` answer (#619).
+///
+/// Returns `Some(hint)` when the argument did not resolve to a file node:
+/// either it matched only symbol nodes (the reported case — a function name
+/// passed where a path belongs) or it matched nothing at all. Returns `None`
+/// when a file node did match, because an existing file with zero `depends`
+/// edges is a legitimate empty answer that must stay empty.
+fn dependency_arg_hint(store: &SqliteStore, file: &str) -> Option<String> {
+    let nodes = store.search_nodes_by_name(file).ok()?;
+    if nodes.iter().any(|n| n.kind == "file") {
+        return None;
+    }
+    match nodes.first() {
+        Some(n) => Some(format!(
+            "'{file}' resolved to {} '{}', not a file — get_dependencies takes a repo-relative file path. For a symbol, use get_callers or find_references.",
+            n.kind, n.vname.signature
+        )),
+        None => Some(format!(
+            "no file matched '{file}' — get_dependencies takes a repo-relative file path (run get_repo_map to list files)."
+        )),
+    }
 }
 
 /// Transitive variant of `get_dependencies`: BFS over `depends` edges from the
@@ -171,6 +202,51 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
     phase_b.is_none() && last.is_some()
 }
 
+/// Degraded-state note for the structural graph tools (#617).
+///
+/// `phase_b_pending` only catches the never-ran case (marker absent). Two more
+/// states leave the RefCall edge set incomplete while looking healthy:
+///  - `phase_b_commit` present but behind `last_commit` (HEAD moved while the
+///    daemon was down, or a rebuild is still queued), and
+///  - `phase_b_dirty` set (#583: a watcher reindex dropped a file's call edges
+///    without moving HEAD).
+///
+/// Mirrors `travsr status`'s freshness classification so the tools and the CLI
+/// never disagree about completeness. Returns the note to append, or `None`
+/// when Phase B is complete for the current commit.
+fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
+    const PENDING: &str = "[note: call-graph index incomplete — Phase B has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
+    const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last Phase B run; empty results are not authoritative. Run `travsr init` to rebuild.]";
+    let phase_b = store
+        .get_meta("phase_b_commit")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let last = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let dirty = store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+    match (phase_b, last) {
+        (None, Some(_)) => Some(PENDING),
+        (Some(pb), Some(lc)) if pb != lc => Some(PENDING),
+        _ if dirty => Some(STALE),
+        _ => None,
+    }
+}
+
+/// Append the Phase-B degraded note (when any) to a structural tool response.
+/// An empty body becomes the note alone: the note IS the answer then — it is
+/// exactly the empty-but-unreliable case #617 exists to flag.
+fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
+    match phase_b_degraded_note(store) {
+        Some(note) if body.is_empty() => note.to_string(),
+        Some(note) => format!("{body}\n{note}"),
+        None => body,
+    }
+}
+
 /// Return all nodes that have an incoming edge to the given symbol, tagged
 /// by provenance so both semantic and structural callers are visible.
 ///
@@ -200,7 +276,9 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
         return r#"{"status":"pending","message":"Semantic call-edge index is building in the background. Call edges will be available in ~2 minutes. Run `travsr status` to check progress."}"#.to_string();
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
-    sanitize_for_mcp(&get_callers_raw(store, symbol))
+    // #617: append the staleness note (marker behind HEAD / dirty flag) so an
+    // empty caller list is never mistaken for an authoritative "no callers".
+    with_phase_b_note(store, sanitize_for_mcp(&get_callers_raw(store, symbol)))
 }
 
 /// Raw (unsanitized) variant used by global aggregation.
@@ -360,6 +438,12 @@ pub fn get_dependencies_global(
     // Aggregate raw results, prefix per-repo, then sanitize once.
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         let result = get_dependencies_raw(store, file);
+        // #619: in single-repo mode, diagnose an empty answer exactly like the
+        // stdio path. In multi-repo mode leave per-repo empties silent — a
+        // hint per non-matching repo would spam the aggregate.
+        if result.is_empty() && single {
+            return dependency_arg_hint(store, file).unwrap_or(result);
+        }
         if result.is_empty() || single {
             result
         } else {
@@ -386,7 +470,8 @@ pub fn get_callers_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_callers_raw(store, symbol);
+        // #617: per-repo note — each store carries its own Phase B freshness.
+        let result = with_phase_b_note(store, get_callers_raw(store, symbol));
         if result.is_empty() || single {
             result
         } else {
@@ -1671,7 +1756,12 @@ pub fn get_blast_radius(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         tracing::warn!("get_blast_radius rejected invalid arg: {reason}");
         return String::new();
     }
-    sanitize_for_mcp(&get_blast_radius_raw(store, file, mode))
+    // #617: append the Phase-B staleness note so a partial radius is not
+    // trusted as the complete impact set.
+    with_phase_b_note(
+        store,
+        sanitize_for_mcp(&get_blast_radius_raw(store, file, mode)),
+    )
 }
 
 fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> String {
@@ -1988,7 +2078,8 @@ pub fn get_blast_radius_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_blast_radius_raw(store, file, mode);
+        // #617: per-repo note — each store carries its own Phase B freshness.
+        let result = with_phase_b_note(store, get_blast_radius_raw(store, file, mode));
         if result.is_empty() || single {
             result
         } else {
@@ -2964,16 +3055,23 @@ pub fn repos_remove(name: &str) -> String {
 
 /// Find a traversal path from `source` symbol to `sink` symbol through the graph.
 ///
-/// Uses PCST (Prize-Collecting Steiner Tree) approximation when a path exists,
-/// falls back to BFS depth-3 on timeout (> 80ms) or disconnected graphs.
+/// Uses PCST (Prize-Collecting Steiner Tree) approximation when a path exists.
+/// A result that does not reach the sink (pcst_path's BFS fallback on
+/// disconnected graphs) is reported as "no path found" rather than relayed
+/// as if it were a path (#620).
 ///
 /// Output format (one line per node on path):
 ///   `fn:charge (function) — src/payment.ts`
 ///   `fn:processPayment (function) — src/processor.ts`
 ///
 /// # SEC P0
-/// Returns empty string for both "symbol not found" and "symbol access denied".
-/// These cases are indistinguishable to the caller (prevents existence oracle).
+/// "Symbol not found" and "symbol access denied" produce byte-identical
+/// output (a single could-not-resolve message that names neither the failing
+/// endpoint nor the reason), preventing an existence oracle.
+///
+/// #620: an empty answer is never silent — unresolved endpoints and
+/// resolved-but-disconnected endpoints each return an explicit message
+/// instead of an empty envelope an agent would misread as authoritative.
 pub fn get_execution_path(store: &SqliteStore, source: &str, sink: &str) -> String {
     // Phase B deferred: execution paths require call edges which are not yet indexed.
     if phase_b_pending(store) {
@@ -3009,14 +3107,24 @@ fn get_execution_path_with_filter(
         tracing::warn!("get_execution_path rejected invalid sink arg: {reason}");
         return String::new();
     }
-    sanitize_for_mcp(&get_execution_path_raw(store, source, sink, filter))
+    // #617: append the Phase-B staleness note so "no path" is never trusted
+    // while the call-edge set is known-incomplete.
+    with_phase_b_note(
+        store,
+        sanitize_for_mcp(&get_execution_path_body(store, source, sink, filter, true)),
+    )
 }
 
-fn get_execution_path_raw(
+/// Shared search body. `diagnose` controls whether the empty outcomes are
+/// explained (#620): single-repo callers pass `true` so an agent never gets a
+/// silent blank; the multi-repo aggregator passes `false` because a repo
+/// without the symbols is normal, not an error.
+fn get_execution_path_body(
     store: &SqliteStore,
     source: &str,
     sink: &str,
     filter: &dyn EdgeFilter,
+    diagnose: bool,
 ) -> String {
     // SEC P0: resolve source and sink; treat "not found" == "access denied" identically.
     let src_node = match store.search_nodes_by_name(source) {
@@ -3039,10 +3147,19 @@ fn get_execution_path_raw(
         }
     };
 
-    // SEC P0: both outcomes (not found and access denied) produce the same empty result.
+    // SEC P0: both failure modes (not found and access denied) land here and
+    // produce the same message, which names neither the failing endpoint nor
+    // the reason — no existence oracle.
     let (src, snk) = match (src_node, sink_node) {
         (Some(a), Some(b)) => (a, b),
-        _ => return String::new(),
+        _ => {
+            if diagnose {
+                return format!(
+                    "could not resolve source '{source}' and/or sink '{sink}' — verify the names with search_symbol, or pass full signatures (e.g. fn:charge)."
+                );
+            }
+            return String::new();
+        }
     };
 
     let path = match travsr_retrieval::pcst_path(store, src.id, snk.id, filter, 4096) {
@@ -3053,7 +3170,18 @@ fn get_execution_path_raw(
         }
     };
 
-    if path.is_empty() {
+    // #620: when the sink is unreachable, pcst_path falls back to a
+    // source-rooted BFS neighbourhood — so "no path" manifests as a result
+    // that never includes the sink, not as an empty vector. Relaying that
+    // neighbourhood as if it were an execution path is the silent false
+    // signal this issue exists to fix.
+    if path.is_empty() || !path.iter().any(|n| n.id == snk.id) {
+        if diagnose {
+            return format!(
+                "no path found: '{}' and '{}' both resolved, but no connecting call chain was found within traversal limits.",
+                src.vname.signature, snk.vname.signature
+            );
+        }
         return String::new();
     }
 
@@ -3085,7 +3213,13 @@ pub fn get_execution_path_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_execution_path_raw(store, source, sink, filter);
+        // #617: per-repo note — each store carries its own Phase B freshness.
+        // #620: diagnose empty outcomes only in single-repo mode; a repo that
+        // simply doesn't contain the symbols must stay silent in an aggregate.
+        let result = with_phase_b_note(
+            store,
+            get_execution_path_body(store, source, sink, filter, single),
+        );
         if result.is_empty() || single {
             result
         } else {
@@ -5727,6 +5861,37 @@ fn get_graph_json_raw(
             .collect()
     };
 
+    // #618: in symbol mode, a bare-name query used to promote every substring
+    // match to a root, flooding the graph with unrelated symbols (e.g.
+    // "docs_section" seeding build_docs_section_* and its whole test
+    // neighbourhood). Resolve like get_callers / find_references instead:
+    // exact signature first, then exact simple-name; the original substring
+    // set survives only as a fuzzy fallback when neither tier matches, so a
+    // partial query still renders something rather than nothing.
+    let seed_nodes: Vec<_> = if kind_filter.is_empty() && !query.is_empty() {
+        let exact_sig: Vec<_> = seed_nodes
+            .iter()
+            .filter(|n| n.vname.signature == query)
+            .cloned()
+            .collect();
+        if !exact_sig.is_empty() {
+            exact_sig
+        } else {
+            let exact_name: Vec<_> = seed_nodes
+                .iter()
+                .filter(|n| simple_name(&n.vname.signature) == query)
+                .cloned()
+                .collect();
+            if !exact_name.is_empty() {
+                exact_name
+            } else {
+                seed_nodes
+            }
+        }
+    } else {
+        seed_nodes
+    };
+
     if seed_nodes.is_empty() {
         return r#"{"nodes":[],"edges":[]}"#.to_string();
     }
@@ -6007,6 +6172,11 @@ fn get_graph_json_raw(
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
     }
+    // #617: degraded-state signal — additive envelope field; first-party
+    // consumers read only `nodes`/`edges` and ignore extra keys.
+    if let Some(note) = phase_b_degraded_note(store) {
+        out["signals"] = serde_json::json!([note]);
+    }
     match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
@@ -6071,6 +6241,9 @@ pub fn get_graph_json_global(
     let mut seen_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_edge_keys: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // #617: union of per-repo degraded-state signals, deduped.
+    let mut all_signals: Vec<serde_json::Value> = Vec::new();
+    let mut seen_signals: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_repo_name, db_path) in candidates {
         if !db_path.exists() {
@@ -6096,15 +6269,26 @@ pub fn get_graph_json_global(
                         all_edges.push(edge.clone());
                     }
                 }
+                for signal in parsed["signals"].as_array().into_iter().flatten() {
+                    if let Some(text) = signal.as_str() {
+                        if seen_signals.insert(text.to_string()) {
+                            all_signals.push(signal.clone());
+                        }
+                    }
+                }
             }
             Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
         }
     }
 
-    match serde_json::to_string(&serde_json::json!({
+    let mut out = serde_json::json!({
         "nodes": all_nodes,
         "edges": all_edges,
-    })) {
+    });
+    if !all_signals.is_empty() {
+        out["signals"] = serde_json::Value::Array(all_signals);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("get_graph_json_global serialization error: {e}");
@@ -7220,6 +7404,76 @@ mod tests {
         assert!(
             result.contains("get_context for ranked coverage"),
             "footer must include get_context hint, got: {result}"
+        );
+    }
+
+    // ── #619 get_dependencies wrong-argument hint ────────────────────────────
+
+    /// A symbol name passed where a file path belongs must return a hint, not
+    /// a silent empty answer that reads as "this file has no dependencies".
+    #[test]
+    fn get_dependencies_symbol_arg_returns_hint() {
+        use travsr_core::{Node, VName};
+        let sym = Node::new(
+            VName::new("", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let store = make_store(std::slice::from_ref(&sym), &[]);
+        let result = get_dependencies(&store, "docs_section", false, 1);
+        assert!(
+            result.contains("not a file"),
+            "symbol arg must produce the not-a-file hint; got: {result}"
+        );
+        assert!(
+            result.contains("get_callers"),
+            "hint must point at the symbol tools; got: {result}"
+        );
+    }
+
+    /// An argument matching nothing at all must say so.
+    #[test]
+    fn get_dependencies_unknown_arg_returns_hint() {
+        let a = make_node("a.ts", "fn:a");
+        let store = make_store(std::slice::from_ref(&a), &[]);
+        let result = get_dependencies(&store, "zzz_nonexistent", false, 1);
+        assert!(
+            result.contains("no file matched"),
+            "unknown arg must produce the no-match hint; got: {result}"
+        );
+    }
+
+    /// A real file with zero depends edges is a legitimate empty answer and
+    /// must stay empty — the hint only fires when the arg is not a file.
+    #[test]
+    fn get_dependencies_file_without_deps_stays_empty() {
+        use travsr_core::{Node, VName};
+        let file = Node::new(
+            VName::new("", "", "src/lone.ts", "typescript", "src/lone.ts"),
+            "file",
+        );
+        let store = make_store(std::slice::from_ref(&file), &[]);
+        let result = get_dependencies(&store, "src/lone.ts", false, 1);
+        // sanitize_for_mcp wraps empty output in an empty envelope; the point
+        // here is that no hint text is injected into a legitimate empty answer.
+        assert!(
+            !result.contains("not a file") && !result.contains("no file matched"),
+            "file with no deps must stay a plain empty answer; got: {result}"
+        );
+    }
+
+    /// The transitive variant shares the entry point and must hint the same way.
+    #[test]
+    fn get_dependencies_transitive_symbol_arg_returns_hint() {
+        use travsr_core::{Node, VName};
+        let sym = Node::new(
+            VName::new("", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let store = make_store(std::slice::from_ref(&sym), &[]);
+        let result = get_dependencies(&store, "docs_section", true, 3);
+        assert!(
+            result.contains("not a file"),
+            "transitive path must hint too; got: {result}"
         );
     }
 
@@ -9610,6 +9864,475 @@ mod snippet_tests {
         assert!(
             !result.contains("warming"),
             "armed readiness must not emit warming note; got: {result}"
+        );
+    }
+
+    // ── #617 structural-tool Phase-B degraded signals ─────────────────────────
+
+    #[test]
+    fn phase_b_note_none_when_marker_matches_head_and_clean() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    #[test]
+    fn phase_b_note_none_on_no_commit_repo() {
+        // Both markers absent: Phase B ran inline during init (no daemon defer).
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    #[test]
+    fn phase_b_note_pending_when_marker_absent() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        let note = phase_b_degraded_note(&store).expect("must flag pending");
+        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_pending_when_marker_behind_head() {
+        // The exact #617 repro: HEAD moved while the daemon was down, so the
+        // marker is set but stale. `phase_b_pending` misses this state.
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "def456").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let note = phase_b_degraded_note(&store).expect("must flag pending");
+        assert!(note.contains("call-graph index incomplete"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_stale_when_dirty_flag_set() {
+        // #583 window: markers agree but a watcher reindex dropped edges.
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let note = phase_b_degraded_note(&store).expect("must flag stale");
+        assert!(note.contains("call-graph edges degraded"), "got: {note}");
+    }
+
+    #[test]
+    fn phase_b_note_none_when_dirty_flag_cleared() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+        assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    /// get_callers must carry the note alongside real results when the marker
+    /// is behind HEAD (results may be partial, not absent).
+    #[test]
+    fn get_callers_appends_note_when_phase_b_behind_head() {
+        use travsr_core::{Edge, EdgeKind};
+        let dir = tempfile::tempdir().unwrap();
+        let caller = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let callee = make_fn_node_with_pkg("src/b.ts", "fn:beta", 1, 3);
+        let mut store = make_store_with_root(&dir, &[]);
+        let caller_id = store.put_node(&caller).unwrap();
+        let callee_id = store.put_node(&callee).unwrap();
+        store
+            .put_edge(&Edge::new(caller_id, callee_id, EdgeKind::RefCall))
+            .unwrap();
+        store.set_meta("last_commit", "def456").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let result = get_callers(&store, "beta");
+        assert!(
+            result.contains("fn:alpha"),
+            "existing edges must still be reported; got: {result}"
+        );
+        assert!(
+            result.contains("call-graph index incomplete"),
+            "must append pending note; got: {result}"
+        );
+    }
+
+    /// An empty structural answer during a degraded state must be the note, not
+    /// a silent empty string — the false negative #617 exists to prevent.
+    #[test]
+    fn get_blast_radius_empty_result_becomes_note_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = make_store_with_root(&dir, &[]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let result = get_blast_radius(&store, "src/missing.ts", AnalysisMode::TreeSitter);
+        assert!(
+            result.contains("call-graph edges degraded"),
+            "empty result must surface the stale note; got: {result}"
+        );
+    }
+
+    #[test]
+    fn get_execution_path_appends_note_when_phase_b_behind_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = make_store_with_root(&dir, &[]);
+        store.set_meta("last_commit", "def456").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        let result = get_execution_path(&store, "alpha", "beta");
+        assert!(
+            result.contains("call-graph index incomplete"),
+            "disconnected/no-result path must carry the pending note; got: {result}"
+        );
+    }
+
+    #[test]
+    fn get_graph_json_emits_signals_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let signals = parsed["signals"].as_array().expect("signals array");
+        assert!(
+            signals.iter().any(|s| s
+                .as_str()
+                .unwrap_or("")
+                .contains("call-graph edges degraded")),
+            "graph JSON must carry the degraded signal; got: {raw}"
+        );
+    }
+
+    #[test]
+    fn get_graph_json_no_signals_when_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let mut store = make_store_with_root(&dir, &[node]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed.get("signals").is_none(),
+            "complete graph must not emit signals; got: {raw}"
+        );
+    }
+
+    // ── #618 get_graph_json seed resolution ───────────────────────────────────
+
+    fn graph_params(query: &str) -> GraphJsonParams<'_> {
+        GraphJsonParams {
+            query,
+            direction: "both",
+            depth: 1,
+            kind_filter: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        }
+    }
+
+    fn root_count(raw: &str) -> usize {
+        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+        parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["root"].as_bool() == Some(true))
+            .count()
+    }
+
+    /// A bare name with an exact-symbol match must resolve to that single
+    /// root instead of promoting every substring cousin to a root.
+    #[test]
+    fn get_graph_json_bare_name_resolves_single_root() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let exact = Node::new(
+            VName::new("t", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let cousin = Node::new(
+            VName::new(
+                "t",
+                "",
+                "src/build.ts",
+                "typescript",
+                "fn:build_docs_section",
+            ),
+            "function",
+        );
+        let helper = Node::new(
+            VName::new(
+                "t",
+                "",
+                "src/help.ts",
+                "typescript",
+                "fn:docs_section_helper",
+            ),
+            "function",
+        );
+        store.put_node(&exact).unwrap();
+        store.put_node(&cousin).unwrap();
+        store.put_node(&helper).unwrap();
+        // Precondition: the raw search really does return all three, so this
+        // test exercises the narrowing rather than passing trivially.
+        assert!(
+            store.search_nodes_by_name("docs_section").unwrap().len() >= 3,
+            "substring search must surface all candidates"
+        );
+        let raw = get_graph_json(&store, &graph_params("docs_section"));
+        assert_eq!(root_count(&raw), 1, "exactly one root expected; got: {raw}");
+        assert!(
+            !raw.contains("build_docs_section"),
+            "unconnected substring cousin must not appear; got: {raw}"
+        );
+    }
+
+    /// A full kind-qualified signature must keep resolving exactly (tier 1).
+    #[test]
+    fn get_graph_json_signature_query_single_root() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let exact = Node::new(
+            VName::new("t", "", "src/docs.ts", "typescript", "fn:docs_section"),
+            "function",
+        );
+        let cousin = Node::new(
+            VName::new(
+                "t",
+                "",
+                "src/build.ts",
+                "typescript",
+                "fn:build_docs_section",
+            ),
+            "function",
+        );
+        store.put_node(&exact).unwrap();
+        store.put_node(&cousin).unwrap();
+        let raw = get_graph_json(&store, &graph_params("fn:docs_section"));
+        assert_eq!(root_count(&raw), 1, "exactly one root expected; got: {raw}");
+    }
+
+    /// With no exact match at either tier, the substring set must survive as
+    /// a fuzzy fallback (a partial query still renders something).
+    #[test]
+    fn get_graph_json_substring_fallback_when_no_exact_match() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha_beta"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "fn:alpha_gamma"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let raw = get_graph_json(&store, &graph_params("alpha"));
+        assert_eq!(
+            root_count(&raw),
+            2,
+            "fuzzy fallback must keep both roots; got: {raw}"
+        );
+    }
+
+    /// Overloads: several nodes sharing the exact bare name are all genuine
+    /// resolutions and must all stay roots.
+    #[test]
+    fn get_graph_json_same_name_overloads_stay_multi_root() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:charge"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "method:Billing.charge"),
+            "method",
+        );
+        let noise = Node::new(
+            VName::new("t", "", "src/c.ts", "typescript", "fn:supercharged"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.put_node(&noise).unwrap();
+        let raw = get_graph_json(&store, &graph_params("charge"));
+        assert_eq!(
+            root_count(&raw),
+            2,
+            "both same-name definitions stay roots, noise dropped; got: {raw}"
+        );
+        assert!(
+            !raw.contains("supercharged"),
+            "substring noise must be dropped; got: {raw}"
+        );
+    }
+
+    /// File mode is untouched: path queries keep their substring semantics.
+    #[test]
+    fn get_graph_json_file_mode_keeps_substring_seeds() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/pay/a.ts", "typescript", "src/pay/a.ts"),
+            "file",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/pay/b.ts", "typescript", "src/pay/b.ts"),
+            "file",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "src/pay",
+                direction: "both",
+                depth: 1,
+                kind_filter: "file",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
+        assert_eq!(
+            root_count(&raw),
+            2,
+            "file mode substring seeding must be unchanged; got: {raw}"
+        );
+    }
+
+    // ── #620 get_execution_path empty-outcome signals ─────────────────────────
+
+    /// Disconnected endpoints must return an explicit no-path answer, never a
+    /// silent empty envelope.
+    #[test]
+    fn get_execution_path_disconnected_says_no_path_found() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "fn:beta"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        let result = get_execution_path(&store, "alpha", "beta");
+        assert!(
+            result.contains("no path found"),
+            "disconnected endpoints must be reported; got: {result}"
+        );
+        assert!(
+            result.contains("fn:alpha") && result.contains("fn:beta"),
+            "the resolved signatures confirm resolution succeeded; got: {result}"
+        );
+    }
+
+    /// An endpoint that does not resolve must get the could-not-resolve
+    /// message, distinct from the no-path case.
+    #[test]
+    fn get_execution_path_unknown_symbol_says_could_not_resolve() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        let result = get_execution_path(&store, "alpha", "zzz_nonexistent");
+        assert!(
+            result.contains("could not resolve"),
+            "unresolved endpoint must be reported; got: {result}"
+        );
+        assert!(
+            !result.contains("no path found"),
+            "must not claim a path search happened; got: {result}"
+        );
+    }
+
+    /// SEC P0: an access-denied endpoint must be byte-identical to a
+    /// nonexistent one — no existence oracle through the new messages.
+    #[test]
+    fn get_execution_path_denied_matches_not_found() {
+        use travsr_core::{Node, VName};
+        use travsr_retrieval::RbacFilter;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("secret", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("secret", "", "src/b.ts", "typescript", "fn:beta"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        // Filter allows nothing in corpus "secret": beta exists but is denied.
+        let deny = RbacFilter::new(["public"]);
+        let denied = get_execution_path_authed(&store, "alpha", "beta", &deny);
+        // Same query where the sink genuinely does not exist.
+        let missing = get_execution_path_authed(&store, "alpha", "zzz_nope", &deny);
+        // Both go through the same unresolved branch; the messages differ only
+        // by the echoed query text, never by reason. Normalize the echoes out.
+        let denied_norm = denied.replace("beta", "X").replace("zzz_nope", "X");
+        let missing_norm = missing.replace("beta", "X").replace("zzz_nope", "X");
+        assert_eq!(
+            denied_norm, missing_norm,
+            "denied and missing must be indistinguishable"
+        );
+        assert!(
+            denied.contains("could not resolve"),
+            "denied case must use the same could-not-resolve message; got: {denied}"
+        );
+    }
+
+    /// A connected pair keeps returning the plain path lines with no
+    /// diagnostic text mixed in.
+    #[test]
+    fn get_execution_path_connected_returns_plain_path() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let a = Node::new(
+            VName::new("t", "", "src/a.ts", "typescript", "fn:alpha"),
+            "function",
+        );
+        let b = Node::new(
+            VName::new("t", "", "src/b.ts", "typescript", "fn:beta"),
+            "function",
+        );
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge(&Edge::new(a.id, b.id, EdgeKind::RefCall))
+            .unwrap();
+        let result = get_execution_path(&store, "alpha", "beta");
+        assert!(
+            result.contains("fn:alpha") && result.contains("fn:beta"),
+            "path endpoints must appear; got: {result}"
+        );
+        assert!(
+            !result.contains("no path found") && !result.contains("could not resolve"),
+            "successful path must carry no diagnostics; got: {result}"
         );
     }
 

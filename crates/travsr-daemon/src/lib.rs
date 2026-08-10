@@ -3277,6 +3277,77 @@ fn read_head_commit_sha(repo_root: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// #621: reconcile the stored `last_commit` marker against live `git rev-parse
+/// HEAD`. History can move while the daemon is down (reset, checkout, branch
+/// switch, rebase, pull); the watcher never saw those edits, so the graph
+/// stays pinned to a stale — possibly discarded — commit while `travsr status`
+/// reports `phase_b: complete`. The freshness markers only ever compared
+/// against each other, never against the repository.
+///
+/// On mismatch, run the same recovery the post-commit hook triggers, except
+/// over the full tracked set: the diff between the stale graph and the new
+/// HEAD is unknowable (it is not the last commit's diff), and `reindex_files`
+/// is hash-delta gated so unchanged files cost one hash each. Then stamp
+/// `last_commit` to HEAD (same signature-format guard as the hook path) and
+/// arm a whole-project Phase B rebuild.
+///
+/// Skips (returns `false`) when: HEAD is unreadable (no commits / not a git
+/// repo), the marker is absent (init never stamped a commit — fabricating
+/// freshness here would claim an index that never ran), or marker == HEAD.
+fn reconcile_head_drift(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
+    index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+) -> bool {
+    let head = match read_head_commit_sha(repo_root) {
+        Ok(h) if !h.is_empty() => h,
+        _ => return false,
+    };
+    let stored = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        s.get_meta("last_commit").ok().flatten().unwrap_or_default()
+    };
+    if stored.is_empty() || stored == head {
+        return false;
+    }
+    tracing::info!(
+        stored = %stored,
+        head = %head,
+        "last_commit does not match live HEAD (history moved during daemon downtime) — reconciling"
+    );
+    let mut paths = match tracked_files_from_git(repo_root) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(err = %e, "head reconcile: could not enumerate tracked files — skipped");
+            return false;
+        }
+    };
+    // Same ignore rules as init / the watcher / the hook path (#403).
+    let ignore = watcher::build_ignore_matcher(repo_root);
+    paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    let dirty = match reindex_files(&paths, repo_root, &mut s) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(err = %e, "head reconcile: reindex failed");
+            return false;
+        }
+    };
+    // Same guard as the ReindexCommit path: never claim freshness for a HEAD
+    // whose reindex was skipped due to a signature-format mismatch.
+    if s.get_signature_format_version().ok() == Some(SIGNATURE_FORMAT_VERSION) {
+        let _ = s.set_meta("last_commit", &head);
+    }
+    drop(s);
+    enqueue_dirty_callers(dirty, repo_root, index_tx);
+    // Phase A is now aligned with HEAD; the RefCall edge set is not. Arm the
+    // debounced whole-project Phase B rebuild, same as the hook path.
+    phase_b_scheduler.mark_dirty();
+    tracing::info!(head = %head, files = paths.len(), "head reconcile complete — Phase B rebuild armed");
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6180,6 +6251,186 @@ mod tests {
         );
     }
 
+    // ── #621 startup / tick HEAD reconciliation ──────────────────────────────
+
+    /// Commit a snapshot of the working tree and return the short HEAD sha.
+    fn git_commit_all(dir: &std::path::Path, msg: &str) -> String {
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", msg])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        read_head_commit_sha(dir).unwrap()
+    }
+
+    /// The #621 repro: `last_commit` points at a commit that is no longer
+    /// HEAD (history moved during daemon downtime). Reconcile must reindex
+    /// the working tree, advance the marker to live HEAD, and arm Phase B.
+    #[test]
+    fn reconcile_head_drift_reindexes_and_stamps_on_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(
+            tmp.path().join("svc.ts"),
+            "export class NewSvc { callee_good() {} }",
+        )
+        .unwrap();
+        let head = git_commit_all(tmp.path(), "p");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        // The graph is pinned to a commit that no longer exists as HEAD.
+        store.set_meta("last_commit", "f0f0f0f").unwrap();
+        let store = std::sync::Mutex::new(store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        assert!(
+            reconcile_head_drift(tmp.path(), &store, &sched, &index_tx),
+            "mismatched marker must trigger a reconcile"
+        );
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get_meta("last_commit").unwrap().as_deref(),
+            Some(head.as_str()),
+            "marker must advance to live HEAD"
+        );
+        assert!(
+            s.node_count().unwrap() > 0,
+            "working tree must have been reindexed"
+        );
+        drop(s);
+        assert!(
+            sched.is_pending(),
+            "whole-project Phase B rebuild must be armed"
+        );
+    }
+
+    /// Marker == HEAD is the healthy steady state: the periodic tick must be
+    /// a cheap no-op that neither reindexes nor arms Phase B.
+    #[test]
+    fn reconcile_head_drift_noop_when_marker_matches_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        let head = git_commit_all(tmp.path(), "p");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        store.set_meta("last_commit", &head).unwrap();
+        let store = std::sync::Mutex::new(store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        assert!(
+            !reconcile_head_drift(tmp.path(), &store, &sched, &index_tx),
+            "matching marker must be a no-op"
+        );
+        assert!(!sched.is_pending(), "no-op must not arm Phase B");
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.node_count().unwrap(),
+            0,
+            "no-op must not reindex anything"
+        );
+    }
+
+    /// An absent marker means init never stamped a commit; reconcile must not
+    /// fabricate freshness for an index that never ran.
+    #[test]
+    fn reconcile_head_drift_skips_when_marker_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        git_commit_all(tmp.path(), "p");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let store = std::sync::Mutex::new(store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        assert!(!reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            s.get_meta("last_commit").unwrap().is_none(),
+            "absent marker must stay absent"
+        );
+    }
+
+    /// A repo with no commits has no HEAD to pin to; reconcile must bail
+    /// before touching the store.
+    #[test]
+    fn reconcile_head_drift_skips_without_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        let store = std::sync::Mutex::new(store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        assert!(!reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get_meta("last_commit").unwrap().as_deref(),
+            Some("abc123"),
+            "marker untouched when HEAD is unreadable"
+        );
+    }
+
+    /// Signature-format mismatch: the reindex is skipped inside reindex_files,
+    /// so the marker must NOT advance — same guard as the hook path (#405).
+    #[test]
+    fn reconcile_head_drift_does_not_stamp_on_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        git_commit_all(tmp.path(), "p");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        // DB built by an older binary.
+        store.set_signature_format_version(0).unwrap();
+        store.set_meta("last_commit", "f0f0f0f").unwrap();
+        let store = std::sync::Mutex::new(store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        reconcile_head_drift(tmp.path(), &store, &sched, &index_tx);
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get_meta("last_commit").unwrap().as_deref(),
+            Some("f0f0f0f"),
+            "marker must not claim freshness for a skipped reindex"
+        );
+    }
+
     #[test]
     fn phase_b_finish_guard_releases_slot_on_panic() {
         // #404: if the background Phase B worker unwinds, the single-flight slot
@@ -6774,6 +7025,10 @@ impl Daemon {
         }
 
         let mut gc_tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        // #621: single-flight guard for HEAD reconciliation. The gc_tick's
+        // first firing is immediate, so the reconcile doubles as the startup
+        // check; the flag stops a slow reconcile from overlapping the next tick.
+        let head_reconcile_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // #318 O3: poll the Phase B scheduler often enough to honour the debounce
         // window without busy-waiting. The tick is cheap (a single mutex peek);
         // it only spawns work when a re-run is actually due.
@@ -7021,6 +7276,27 @@ impl Daemon {
                             "daemon heartbeat — uptime {}s",
                             start_time.elapsed().as_secs()
                         );
+                        // #621: HEAD may have moved while the daemon was down
+                        // (reset/checkout/rebase/pull) — the watcher never saw
+                        // those edits, so the graph would stay pinned to a
+                        // stale commit while reporting healthy. First tick is
+                        // immediate → this is also the startup reconciliation.
+                        if !head_reconcile_running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            let store_rc = Arc::clone(&store);
+                            let repo_rc = Arc::clone(&repo_root_arc);
+                            let sched_rc = Arc::clone(&phase_b_scheduler);
+                            let index_tx_rc = index_tx.clone();
+                            let flag = Arc::clone(&head_reconcile_running);
+                            tokio::task::spawn_blocking(move || {
+                                reconcile_head_drift(
+                                    repo_rc.as_path(),
+                                    &store_rc,
+                                    &sched_rc,
+                                    &index_tx_rc,
+                                );
+                                flag.store(false, std::sync::atomic::Ordering::Release);
+                            });
+                        }
                     }
                     _ = phase_b_tick.tick() => {
                         // C3: .travsr is in SKIP_DIRS so the file watcher never fires
@@ -7105,6 +7381,24 @@ impl Daemon {
                             "daemon heartbeat — uptime {}s",
                             start_time.elapsed().as_secs()
                         );
+                        // #621: see the unix gc_tick arm — startup + periodic
+                        // reconciliation of last_commit against live HEAD.
+                        if !head_reconcile_running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            let store_rc = Arc::clone(&store);
+                            let repo_rc = Arc::clone(&repo_root_arc);
+                            let sched_rc = Arc::clone(&phase_b_scheduler);
+                            let index_tx_rc = index_tx.clone();
+                            let flag = Arc::clone(&head_reconcile_running);
+                            tokio::task::spawn_blocking(move || {
+                                reconcile_head_drift(
+                                    repo_rc.as_path(),
+                                    &store_rc,
+                                    &sched_rc,
+                                    &index_tx_rc,
+                                );
+                                flag.store(false, std::sync::atomic::Ordering::Release);
+                            });
+                        }
                     }
                     _ = phase_b_tick.tick() => {
                         // C3: poll every 5 s since .travsr is in SKIP_DIRS.
