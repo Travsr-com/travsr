@@ -82,8 +82,19 @@ const HEADER_SNIFF_BYTES: usize = 64 * 1024;
 /// The header's own text settles it: Objective-C declarations have no C or C++
 /// spelling, so finding one is conclusive. `None` means the text carries no
 /// dialect marker either way (a plain C-style declarations header), leaving the
-/// choice to the caller's repo-level signal — which is the pre-#610 behaviour,
+/// choice to the caller's repo-level signal — which is the previous behaviour,
 /// and the right default for a repo already known to be Objective-C.
+///
+/// Sniffing is deliberately lexical: raw substring matching, with no comment or
+/// string-literal stripping. A marker inside a comment counts, `#import` counts
+/// even though clang accepts it in C and C++, and `class ` matches an
+/// Objective-C `@class Foo;` forward declaration. All of those are rare, all
+/// only reachable inside a repo already known to contain Objective-C, and the
+/// alternative is a second parser to decide which parser to use.
+///
+/// `Some(false)` means "not Objective-C", which routes to the C grammar. It
+/// does not mean the header is parsed as C++ — plain `.h` maps to
+/// `Language::C` regardless.
 pub fn header_is_objc(source: &str) -> Option<bool> {
     let head = source.get(..HEADER_SNIFF_BYTES).unwrap_or(source);
 
@@ -123,7 +134,7 @@ pub fn header_is_objc(source: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod header_sniff_tests {
-    use super::header_is_objc;
+    use super::{header_is_objc, HEADER_SNIFF_BYTES};
 
     #[test]
     fn objc_declarations_are_conclusive() {
@@ -170,11 +181,57 @@ mod header_sniff_tests {
     }
 
     #[test]
-    fn sniffing_is_bounded_and_does_not_panic_on_multibyte_text() {
-        // `get(..N)` returns None on a non-char-boundary split, which must fall
-        // back to the whole string rather than panic.
+    fn a_non_char_boundary_cut_falls_back_instead_of_panicking() {
+        // `get(..N)` returns None when byte 65536 lands inside a multi-byte
+        // character, and the whole string is scanned instead. This covers that
+        // fallback, not truncation — the marker here is still found.
         let src = format!("// {}\n@interface Late\n@end\n", "é".repeat(40_000));
         assert_eq!(header_is_objc(&src), Some(true));
+    }
+
+    #[test]
+    fn a_marker_past_the_sniff_bound_is_not_seen() {
+        // The truncation path proper: ASCII padding, so HEADER_SNIFF_BYTES is a
+        // clean boundary and the slice really is cut. A marker beyond it is
+        // invisible, which yields None and leaves the decision to the caller's
+        // repo-level signal rather than to a partial read.
+        let src = format!(
+            "// {}\n@interface Late\n@end\n",
+            "x".repeat(HEADER_SNIFF_BYTES)
+        );
+        assert_eq!(header_is_objc(&src), None);
+        // The same marker inside the bound is found, so the difference above is
+        // the bound and not the content.
+        assert_eq!(header_is_objc("// x\n@interface Early\n@end\n"), Some(true));
+    }
+
+    /// The routing boolean is only half the claim. #630 was a *symbol* loss:
+    /// the recovered header has to actually yield `fn:speak`.
+    ///
+    /// Worth pinning at parse level because plain `.h` maps to `Language::C`,
+    /// not `Cpp` — only `.hpp`/`.hh`/`.hxx` map to C++ — so the symbol survives
+    /// on tree-sitter-c error-recovering `void speak();` out of a C++ class
+    /// body. That works today, and a grammar bump could take it away with every
+    /// boolean assertion still green.
+    #[test]
+    fn a_recovered_cpp_header_still_yields_its_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animal.h");
+        std::fs::write(
+            &path,
+            "#pragma once\nclass Animal { public: void speak(); };\n",
+        )
+        .unwrap();
+
+        let out = crate::c::parse("", &path, "cpp/animal.h").expect("C grammar parses the header");
+        assert!(
+            out.nodes.iter().any(|n| n.vname.signature == "fn:speak"),
+            "the C grammar must still recover fn:speak from a C++ header: {:?}",
+            out.nodes
+                .iter()
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
+        );
     }
 }
 
