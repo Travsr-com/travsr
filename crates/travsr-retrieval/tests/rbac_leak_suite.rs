@@ -245,3 +245,128 @@ fn bfs_with_filter(
 
     result
 }
+
+// ── PPR RBAC tests (#413) ─────────────────────────────────────────────────────
+//
+// H2: this suite is the "rbac-leak-gate" CI check, but until #413 every case
+// above exercised either PCST or `bfs_with_filter`, a helper defined in this
+// file. Nothing drove the production PPR path that powers `get_context` and
+// `ask` — so the gate could report green while that path had no filter wired
+// at all. These cases call the real `ppr` / `ppr_weighted`.
+
+/// Resolve scored ids back to nodes so `no_denied_corpus` can inspect corpora.
+fn nodes_of(store: &SqliteStore, scored: &[(NodeId, f32)]) -> Vec<Node> {
+    store
+        .get_nodes(&scored.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+        .unwrap()
+}
+
+#[test]
+fn ppr_does_not_rank_a_node_behind_a_direct_denied_edge() {
+    let allowed = node("corp:allowed", "fn:seed");
+    let denied = node("corp:denied", "fn:secret");
+    let store = make_store(
+        &[allowed.clone(), denied.clone()],
+        &[(allowed.id, denied.id, EdgeKind::RefCall)],
+    );
+    let filter = RbacFilter::new(["corp:allowed"]);
+
+    let scored = travsr_retrieval::ppr(&store, &[allowed.id], 0, &filter).unwrap();
+    no_denied_corpus(&nodes_of(&store, &scored), &["corp:denied"]);
+}
+
+#[test]
+fn ppr_does_not_reach_an_allowed_node_only_through_a_denied_one() {
+    // a -> b(denied) -> c(allowed). `c` is reachable only by crossing `b`, so a
+    // filter applied at traversal time must not surface it. Post-filtering the
+    // ranked list would drop `b` but keep `c`, leaking that the bridge exists.
+    let a = node("corp:allowed", "fn:a");
+    let b = node("corp:denied", "fn:b");
+    let c = node("corp:allowed", "fn:c");
+    let store = make_store(
+        &[a.clone(), b.clone(), c.clone()],
+        &[
+            (a.id, b.id, EdgeKind::RefCall),
+            (b.id, c.id, EdgeKind::RefCall),
+        ],
+    );
+    let filter = RbacFilter::new(["corp:allowed"]);
+
+    let scored = travsr_retrieval::ppr(&store, &[a.id], 0, &filter).unwrap();
+    let ids: Vec<NodeId> = scored.iter().map(|(id, _)| *id).collect();
+    no_denied_corpus(&nodes_of(&store, &scored), &["corp:denied"]);
+    assert!(
+        !ids.contains(&c.id),
+        "RBAC LEAK: reached an allowed node only via a denied one"
+    );
+}
+
+#[test]
+fn ppr_weighted_enforces_the_filter_too() {
+    // `get_context` uses the weighted entry point, so it needs its own case —
+    // the uniform one passing does not cover it.
+    let allowed = node("corp:allowed", "fn:seed");
+    let denied = node("corp:denied", "fn:secret");
+    let store = make_store(
+        &[allowed.clone(), denied.clone()],
+        &[(allowed.id, denied.id, EdgeKind::RefCall)],
+    );
+    let filter = RbacFilter::new(["corp:allowed"]);
+
+    let scored = travsr_retrieval::ppr_weighted(&store, &[(allowed.id, 1.0)], 0, &filter).unwrap();
+    no_denied_corpus(&nodes_of(&store, &scored), &["corp:denied"]);
+}
+
+#[test]
+fn ppr_weighted_still_enforces_the_filter_on_the_degenerate_weight_fallback() {
+    // Non-finite weights make `ppr_weighted` fall back to uniform `ppr`. The
+    // filter has to survive that hand-off, or a caller could disable RBAC by
+    // supplying a NaN weight.
+    let allowed = node("corp:allowed", "fn:seed");
+    let denied = node("corp:denied", "fn:secret");
+    let store = make_store(
+        &[allowed.clone(), denied.clone()],
+        &[(allowed.id, denied.id, EdgeKind::RefCall)],
+    );
+    let filter = RbacFilter::new(["corp:allowed"]);
+
+    let scored =
+        travsr_retrieval::ppr_weighted(&store, &[(allowed.id, f32::NAN)], 0, &filter).unwrap();
+    no_denied_corpus(&nodes_of(&store, &scored), &["corp:denied"]);
+}
+
+#[test]
+fn ppr_denies_a_destination_missing_from_the_store() {
+    // Fail-closed: an edge pointing at a node that is not in the store yields
+    // an unknown corpus, which every filter must treat as a denial.
+    let allowed = node("corp:allowed", "fn:seed");
+    let ghost = NodeId(999_999);
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    store.put_node(&allowed).unwrap();
+    store
+        .put_edge(&Edge::new(allowed.id, ghost, EdgeKind::RefCall))
+        .unwrap();
+    let filter = RbacFilter::new(["corp:allowed"]);
+
+    let scored = travsr_retrieval::ppr(&store, &[allowed.id], 0, &filter).unwrap();
+    assert!(
+        !scored.iter().any(|(id, _)| *id == ghost),
+        "RBAC LEAK: a node with an unknown corpus was traversed"
+    );
+}
+
+#[test]
+fn open_filter_still_traverses_every_corpus() {
+    // The local single-repo path must be unchanged by #413: OpenFilter declines
+    // the corpus lookups entirely, so this also pins that declining them does
+    // not accidentally deny.
+    let a = node("corp:one", "fn:a");
+    let b = node("corp:two", "fn:b");
+    let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+
+    let scored = travsr_retrieval::ppr(&store, &[a.id], 0, &travsr_retrieval::OpenFilter).unwrap();
+    assert!(
+        scored.iter().any(|(id, _)| *id == b.id),
+        "OpenFilter must still cross corpus boundaries"
+    );
+}

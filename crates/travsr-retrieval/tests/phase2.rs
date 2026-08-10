@@ -4,7 +4,7 @@
 //! required.  They are the gating assertions for Issue #33.
 
 use travsr_core::{Edge, EdgeKind, Node, NodeId, VName};
-use travsr_retrieval::ppr;
+use travsr_retrieval::{ppr, OpenFilter};
 use travsr_store::{SqliteStore, Store};
 
 fn make_node(sig: &str) -> Node {
@@ -43,7 +43,7 @@ fn build_1k_fan() -> (SqliteStore, NodeId, Vec<NodeId>) {
 #[test]
 fn ppr_top_k_hub_is_highest_on_1k_fan() {
     let (store, hub_id, _) = build_1k_fan();
-    let scores = ppr(&store, &[hub_id], 10).expect("PPR must succeed");
+    let scores = ppr(&store, &[hub_id], 10, &OpenFilter).expect("PPR must succeed");
     assert!(
         !scores.is_empty(),
         "PPR must return at least one scored node"
@@ -58,7 +58,7 @@ fn ppr_top_k_hub_is_highest_on_1k_fan() {
 #[test]
 fn ppr_returns_all_nodes_when_k_is_zero() {
     let (store, hub_id, _) = build_1k_fan();
-    let scores = ppr(&store, &[hub_id], 0).expect("PPR must succeed");
+    let scores = ppr(&store, &[hub_id], 0, &OpenFilter).expect("PPR must succeed");
     assert_eq!(
         scores.len(),
         1_000,
@@ -70,7 +70,7 @@ fn ppr_returns_all_nodes_when_k_is_zero() {
 #[test]
 fn ppr_top_5_descending() {
     let (store, hub_id, _) = build_1k_fan();
-    let scores = ppr(&store, &[hub_id], 5).expect("PPR must succeed");
+    let scores = ppr(&store, &[hub_id], 5, &OpenFilter).expect("PPR must succeed");
     assert_eq!(scores.len(), 5);
     for window in scores.windows(2) {
         assert!(

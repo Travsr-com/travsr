@@ -79,6 +79,8 @@ use travsr_core::NodeId;
 use travsr_error::TravsrError;
 use travsr_store::Store;
 
+use crate::rbac::EdgeFilter;
+
 /// Personalized PageRank with uniform seed weights.
 ///
 /// Returns the top-`k` nodes by PPR score, sorted descending.
@@ -111,6 +113,7 @@ pub fn ppr<S: Store>(
     store: &S,
     seeds: &[NodeId],
     k: usize,
+    filter: &dyn EdgeFilter,
 ) -> Result<Vec<(NodeId, f32)>, TravsrError> {
     if seeds.is_empty() {
         return Ok(Vec::new());
@@ -120,7 +123,7 @@ pub fn ppr<S: Store>(
         *m.entry(id).or_insert(0.0) += seed_score;
         m
     });
-    ppr_inner(store, &personalization, k).map_err(|e| TravsrError::Internal(e.to_string()))
+    ppr_inner(store, &personalization, k, filter).map_err(|e| TravsrError::Internal(e.to_string()))
 }
 
 /// Personalized PageRank with KNN-derived cosine-similarity weights on seeds.
@@ -137,6 +140,7 @@ pub fn ppr_weighted<S: Store>(
     store: &S,
     seeds: &[(NodeId, f32)],
     k: usize,
+    filter: &dyn EdgeFilter,
 ) -> Result<Vec<(NodeId, f32)>, TravsrError> {
     if seeds.is_empty() {
         return Ok(Vec::new());
@@ -145,13 +149,13 @@ pub fn ppr_weighted<S: Store>(
     if !total.is_finite() || total <= 0.0 {
         // Degenerate weights — fall back to uniform rather than producing NaN scores.
         let ids: Vec<NodeId> = seeds.iter().map(|(id, _)| *id).collect();
-        return ppr(store, &ids, k);
+        return ppr(store, &ids, k, filter);
     }
     let mut personalization: HashMap<NodeId, f32> = HashMap::with_capacity(seeds.len());
     for &(id, w) in seeds {
         *personalization.entry(id).or_insert(0.0) += w / total;
     }
-    ppr_inner(store, &personalization, k).map_err(|e| TravsrError::Internal(e.to_string()))
+    ppr_inner(store, &personalization, k, filter).map_err(|e| TravsrError::Internal(e.to_string()))
 }
 
 /// Core PPR power-iteration over a pre-normalised personalisation vector.
@@ -162,6 +166,7 @@ fn ppr_inner<S: Store>(
     store: &S,
     personalization: &HashMap<NodeId, f32>,
     k: usize,
+    filter: &dyn EdgeFilter,
 ) -> AnyResult<Vec<(NodeId, f32)>> {
     let _span = tracing::debug_span!("ppr", seeds = personalization.len(), k = k).entered();
 
@@ -177,7 +182,7 @@ fn ppr_inner<S: Store>(
     // We materialise the subgraph once so the inner iteration loop never hits
     // the store — critical for meeting the p95 < 50ms budget.
     let seed_ids: Vec<NodeId> = personalization.keys().copied().collect();
-    let (adj, reverse_adj) = build_weighted_subgraph(store, &seed_ids)?;
+    let (adj, reverse_adj) = build_weighted_subgraph(store, &seed_ids, filter)?;
 
     if adj.is_empty() {
         // Seeds not in the graph — return seeds scored by their personalisation weight.
@@ -280,6 +285,7 @@ type WeightedAdj = HashMap<NodeId, Vec<(NodeId, f32)>>;
 fn build_weighted_subgraph<S: Store>(
     store: &S,
     seeds: &[NodeId],
+    filter: &dyn EdgeFilter,
 ) -> AnyResult<(WeightedAdj, HashMap<NodeId, ()>)> {
     use std::collections::HashSet;
     let _span = tracing::debug_span!("ppr.bfs_expand", seeds = seeds.len()).entered();
@@ -323,7 +329,43 @@ fn build_weighted_subgraph<S: Store>(
 
         for chunk in frontier.chunks(EDGE_BATCH_SIZE) {
             let edges = store.iter_edges_from_batch(chunk)?;
+
+            // #413: gate every edge before it enters the subgraph, not after
+            // scoring. Post-filtering a ranked list still lets a denied node's
+            // existence show through timing and through the mass it steals from
+            // permitted neighbours, which is what RFC-006 enforces against.
+            //
+            // The corpus of each destination is fetched once per chunk, beside
+            // the edge query it belongs to, rather than per edge — a depth-6
+            // BFS over a large repo would otherwise turn ~500 batch queries
+            // into hundreds of thousands. A filter that ignores the corpus
+            // skips the lookup entirely, so the local `OpenFilter` path costs
+            // exactly what it did before.
+            let dst_corpus: HashMap<NodeId, String> = if filter.needs_corpus() {
+                let mut dsts: Vec<NodeId> = edges.iter().map(|e| e.dst).collect();
+                dsts.sort_unstable();
+                dsts.dedup();
+                store
+                    .get_nodes(&dsts)?
+                    .into_iter()
+                    .map(|n| (n.id, n.vname.corpus))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+
             for edge in &edges {
+                if filter.needs_corpus()
+                    && !filter.allow(
+                        edge.src,
+                        edge.dst,
+                        dst_corpus.get(&edge.dst).map(String::as_str),
+                    )
+                {
+                    // A destination missing from the store yields `None` here,
+                    // which every filter must treat as a denial (fail-closed).
+                    continue;
+                }
                 let w = edge.kind.ppr_weight();
                 adj.entry(edge.src).or_default().push((edge.dst, w));
                 reverse_adj.entry(edge.dst).or_insert(());
@@ -499,7 +541,7 @@ mod tests {
     #[test]
     fn ppr_empty_seeds_returns_empty() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let result = ppr(&store, &[], 5).unwrap();
+        let result = ppr(&store, &[], 5, &crate::OpenFilter).unwrap();
         assert!(result.is_empty());
     }
 
@@ -508,7 +550,7 @@ mod tests {
     fn ppr_isolated_seed_returns_seed_with_positive_score() {
         let a = make_node("fn:a");
         let store = store_with(std::slice::from_ref(&a), &[]);
-        let result = ppr(&store, &[a.id], 5).unwrap();
+        let result = ppr(&store, &[a.id], 5, &crate::OpenFilter).unwrap();
         assert!(!result.is_empty(), "must return at least the seed");
         assert_eq!(result[0].0, a.id, "seed must be first");
         assert!(result[0].1 > 0.0, "score must be positive");
@@ -524,7 +566,7 @@ mod tests {
             &[caller.clone(), callee.clone(), unrelated.clone()],
             &[(caller.id, callee.id, EdgeKind::RefCall)],
         );
-        let result = ppr(&store, &[caller.id], 10).unwrap();
+        let result = ppr(&store, &[caller.id], 10, &crate::OpenFilter).unwrap();
         let score_of = |id: NodeId| result.iter().find(|&&(n, _)| n == id).map(|&(_, s)| s);
 
         let callee_score = score_of(callee.id).unwrap_or(0.0);
@@ -548,7 +590,7 @@ mod tests {
                 (a.id, c.id, EdgeKind::Depends),
             ],
         );
-        let result = ppr(&store, &[a.id], 10).unwrap();
+        let result = ppr(&store, &[a.id], 10, &crate::OpenFilter).unwrap();
         for window in result.windows(2) {
             assert!(
                 window[0].1 >= window[1].1,
@@ -570,7 +612,7 @@ mod tests {
                 (a.id, c.id, EdgeKind::RefCall),
             ],
         );
-        let result = ppr(&store, &[a.id], 1).unwrap();
+        let result = ppr(&store, &[a.id], 1, &crate::OpenFilter).unwrap();
         assert_eq!(result.len(), 1, "k=1 must return exactly 1 result");
     }
 
@@ -587,7 +629,7 @@ mod tests {
                 (seed.id, via_dep.id, EdgeKind::Depends),
             ],
         );
-        let result = ppr(&store, &[seed.id], 10).unwrap();
+        let result = ppr(&store, &[seed.id], 10, &crate::OpenFilter).unwrap();
         let score_of = |id: NodeId| result.iter().find(|&&(n, _)| n == id).map(|&(_, s)| s);
         let call_score = score_of(via_call.id).unwrap_or(0.0);
         let dep_score = score_of(via_dep.id).unwrap_or(0.0);
@@ -610,7 +652,7 @@ mod tests {
             ],
         );
         // Must terminate — no infinite loop.
-        let result = ppr(&store, &[a.id], 10).unwrap();
+        let result = ppr(&store, &[a.id], 10, &crate::OpenFilter).unwrap();
         assert!(!result.is_empty());
     }
 
@@ -619,7 +661,7 @@ mod tests {
     #[test]
     fn ppr_weighted_empty_seeds_returns_empty() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let result = ppr_weighted(&store, &[], 5).unwrap();
+        let result = ppr_weighted(&store, &[], 5, &crate::OpenFilter).unwrap();
         assert!(result.is_empty());
     }
 
@@ -638,7 +680,8 @@ mod tests {
                 (b.id, y.id, EdgeKind::RefCall),
             ],
         );
-        let result = ppr_weighted(&store, &[(a.id, 0.9), (b.id, 0.1)], 10).unwrap();
+        let result =
+            ppr_weighted(&store, &[(a.id, 0.9), (b.id, 0.1)], 10, &crate::OpenFilter).unwrap();
         let score_of = |id: NodeId| {
             result
                 .iter()
@@ -660,8 +703,9 @@ mod tests {
         let a = make_node("fn:a");
         let b = make_node("fn:b");
         let store = store_with(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
-        let uniform = ppr(&store, &[a.id, b.id], 10).unwrap();
-        let weighted = ppr_weighted(&store, &[(a.id, 1.0), (b.id, 1.0)], 10).unwrap();
+        let uniform = ppr(&store, &[a.id, b.id], 10, &crate::OpenFilter).unwrap();
+        let weighted =
+            ppr_weighted(&store, &[(a.id, 1.0), (b.id, 1.0)], 10, &crate::OpenFilter).unwrap();
         // Both must return the same set of node IDs in the same order.
         let ids_uniform: Vec<NodeId> = uniform.iter().map(|&(id, _)| id).collect();
         let ids_weighted: Vec<NodeId> = weighted.iter().map(|&(id, _)| id).collect();
@@ -676,7 +720,7 @@ mod tests {
     fn ppr_weighted_degenerate_zero_total_falls_back() {
         let a = make_node("fn:a");
         let store = store_with(std::slice::from_ref(&a), &[]);
-        let result = ppr_weighted(&store, &[(a.id, 0.0)], 5);
+        let result = ppr_weighted(&store, &[(a.id, 0.0)], 5, &crate::OpenFilter);
         assert!(result.is_ok(), "zero-weight seeds must not error");
         assert!(
             !result.unwrap().is_empty(),
