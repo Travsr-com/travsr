@@ -47,9 +47,18 @@ const PCST_LAMBDA: f32 = 0.5;
 /// Rejects non-finite and negative values; 0.0 is allowed and means "route
 /// only, no corridor".
 fn pcst_lambda() -> f32 {
-    std::env::var("TRAVSR_PCST_LAMBDA")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    parse_lambda(std::env::var("TRAVSR_PCST_LAMBDA").ok())
+}
+
+/// The validation half of [`pcst_lambda`], split out so it can be tested.
+///
+/// Reading the variable inside the test would race: `pcst_path` calls
+/// `pcst_lambda`, so a test that sets `TRAVSR_PCST_LAMBDA` changes the corridor
+/// under every other pcst test running concurrently in the same binary. Taking
+/// the raw value as an argument tests the shipped predicate without touching
+/// the process environment.
+fn parse_lambda(raw: Option<String>) -> f32 {
+    raw.and_then(|v| v.parse().ok())
         .filter(|x: &f32| x.is_finite() && *x >= 0.0)
         .unwrap_or(PCST_LAMBDA)
 }
@@ -77,7 +86,16 @@ fn pcst_lambda() -> f32 {
 /// negative cost and quietly corrupt Dijkstra, so it is clamped rather than
 /// trusted.
 fn edge_cost(kind: &travsr_core::EdgeKind) -> f32 {
-    let w = kind.ppr_weight();
+    cost_from_weight(kind.ppr_weight())
+}
+
+/// The arithmetic half of [`edge_cost`], split out so the clamp can be tested.
+///
+/// `EdgeKind::ppr_weight` is a closed match with no zero and no catch-all, so
+/// the clamp branch is unreachable through `edge_cost` and there is no way to
+/// exercise it from the enum. Taking the weight directly is the only way to
+/// prove the guard does what its comment claims.
+fn cost_from_weight(w: f32) -> f32 {
     if w > 0.0 {
         1.0 / w
     } else {
@@ -472,7 +490,9 @@ fn bfs_fallback(
 
 #[cfg(test)]
 mod edge_cost_tests {
-    use super::{edge_cost, pcst_lambda, MAX_EDGE_COST, PCST_LAMBDA};
+    use super::{
+        cost_from_weight, edge_cost, parse_lambda, pcst_lambda, MAX_EDGE_COST, PCST_LAMBDA,
+    };
     use travsr_core::EdgeKind;
 
     /// #527: the defect. `1.0 - ppr_weight` gave `ref/call` (weight 1.00) a
@@ -518,7 +538,20 @@ mod edge_cost_tests {
     /// to the most expensive cost instead, never to free.
     #[test]
     fn a_hypothetical_zero_weight_is_expensive_not_infinite() {
-        assert_eq!(MAX_EDGE_COST, 10.0);
+        assert_eq!(
+            cost_from_weight(0.0),
+            MAX_EDGE_COST,
+            "a zero weight must clamp, not divide to infinity"
+        );
+        assert_eq!(
+            cost_from_weight(-1.0),
+            MAX_EDGE_COST,
+            "a negative weight must clamp, not produce a negative cost"
+        );
+        assert!(
+            cost_from_weight(0.0).is_finite(),
+            "an infinite cost would corrupt Dijkstra silently"
+        );
         assert!(
             MAX_EDGE_COST > edge_cost(&EdgeKind::Overrides),
             "the fallback must be costlier than every real edge"
@@ -532,23 +565,26 @@ mod edge_cost_tests {
     fn the_lambda_override_rejects_nonsense_and_defaults_otherwise() {
         // No env var set in this process: the ADR-007 constant stands.
         assert_eq!(pcst_lambda(), PCST_LAMBDA);
-        // Parsing rules, checked without mutating the process environment —
-        // a test that sets env vars races every other test in the binary.
-        let accept = |v: &str| {
-            v.parse::<f32>()
-                .ok()
-                .filter(|x: &f32| x.is_finite() && *x >= 0.0)
-        };
-        assert_eq!(accept("0.0"), Some(0.0), "0 means route-distance only");
-        assert_eq!(accept("0.25"), Some(0.25));
-        assert_eq!(
-            accept("-0.1"),
-            None,
-            "negative would shrink below the route"
-        );
-        assert_eq!(accept("NaN"), None);
-        assert_eq!(accept("inf"), None);
-        assert_eq!(accept("abc"), None);
+
+        // Accepted: values the sweep would legitimately pass.
+        let lam = |v: &str| parse_lambda(Some(v.to_string()));
+        assert_eq!(lam("0.0"), 0.0, "0 means route-distance only");
+        assert_eq!(lam("0.25"), 0.25);
+        assert_eq!(lam("1.0"), 1.0);
+
+        // Rejected: each of these falls back to the constant rather than
+        // reaching the threshold. A negative λ shrinks the corridor below the
+        // route itself; NaN makes every `c <= threshold` comparison false and
+        // empties the corridor; inf admits the whole local subgraph.
+        for bad in ["-0.1", "NaN", "inf", "-inf", "abc", ""] {
+            assert_eq!(
+                lam(bad),
+                PCST_LAMBDA,
+                "{bad:?} must fall back to the ADR-007 default"
+            );
+        }
+        // Unset behaves the same as unparseable.
+        assert_eq!(parse_lambda(None), PCST_LAMBDA);
     }
 }
 
