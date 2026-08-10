@@ -517,6 +517,12 @@ async fn run(cli: Cli) -> Result<()> {
                             }
                             // No lock file to check against: report what was
                             // actually established rather than overclaiming.
+                            //
+                            // This is the one branch where the exit status
+                            // means "accepted", not "confirmed gone" — there is
+                            // no PID to verify against, so there is nothing to
+                            // verify. The wording carries that distinction
+                            // because the exit code cannot.
                             None => eprintln!("travsr daemon stop acknowledged"),
                             Some(_) => eprintln!("travsr daemon stopped"),
                         },
@@ -821,6 +827,16 @@ fn daemon_lock_pid(repo_root: &std::path::Path) -> Option<u32> {
 /// #541: `Shutdown` being acknowledged only means the daemon *received* the
 /// request. The process tears down a watcher, a scheduler and a store after
 /// that, so "stopped" is a claim that has to be checked rather than assumed.
+///
+/// Races with PID reuse: if the daemon exits and the OS recycles its number
+/// onto an unrelated process inside the window, this reports "still running"
+/// and `daemon stop` fails where it should have succeeded. The failure
+/// direction is the safe one — it tells the user to check rather than claiming
+/// a stop that did not happen — and `pid_is_alive` is the convention the rest
+/// of this file already uses for liveness. A stronger signal exists (a clean
+/// exit releases the `flock` on `daemon.lock`, so re-acquirability
+/// distinguishes "my daemon" from "some new process with its number"), and is
+/// the right upgrade if this ever misfires in practice.
 fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
     let cutoff = std::time::Instant::now() + timeout;
     loop {

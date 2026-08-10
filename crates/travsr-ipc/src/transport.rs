@@ -94,24 +94,40 @@ fn write_all_before<S: Write>(
     Ok(())
 }
 
+/// Chunk size for [`read_line_before`]. Matches the order of magnitude
+/// `BufReader` used before this function existed, so a large response costs a
+/// handful of syscalls rather than one per byte.
+const READ_CHUNK_BYTES: usize = 4096;
+
 /// Read one `\n`-terminated line, retrying a would-block until `deadline`.
 ///
-/// Reads a byte at a time rather than through a `BufReader` because the buffer
-/// would have to be rebuilt on every would-block retry, discarding whatever it
-/// had already consumed past the line. Control responses are one short JSON
-/// line, so the syscall count is not worth optimising against that risk.
+/// Reads in chunks rather than through a `BufReader` because the reader would
+/// have to be rebuilt on every would-block retry. The accumulator survives
+/// those retries instead, which gives bulk reads and would-block resilience at
+/// once.
+///
+/// Anything the final chunk holds past the newline is dropped: this transport
+/// carries exactly one response per connection, so there is no next message to
+/// lose. That is what makes chunking safe here.
+///
+/// Sized deliberately, not by the control plane's own traffic: `send_request`
+/// is shared with the daemon-served query fast-path (#318 O1), where responses
+/// are `get_context` payloads and `ask` tables running to multiple KB. Reading
+/// those a byte at a time would cost thousands of syscalls on the exact path
+/// that exists to be fast.
 fn read_line_before<S: Read>(stream: &mut S, deadline: Duration) -> anyhow::Result<String> {
     let cutoff = Instant::now() + deadline;
     let mut out = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
     loop {
-        match stream.read(&mut byte) {
+        match stream.read(&mut chunk) {
             Ok(0) => break, // peer closed — caller reports the empty response
-            Ok(_) => {
-                if byte[0] == b'\n' {
+            Ok(n) => {
+                if let Some(nl) = chunk[..n].iter().position(|&b| b == b'\n') {
+                    out.extend_from_slice(&chunk[..nl]);
                     break;
                 }
-                out.push(byte[0]);
+                out.extend_from_slice(&chunk[..n]);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -144,6 +160,10 @@ mod tests {
         read_pos: usize,
         /// Bytes accepted per successful write, to force partial writes.
         chunk: usize,
+        /// Bytes returned per successful read, to force short reads.
+        read_chunk: usize,
+        /// Number of `read` calls made, so a test can assert syscall shape.
+        reads: std::cell::Cell<usize>,
     }
 
     impl Write for StallingStream {
@@ -163,16 +183,21 @@ mod tests {
 
     impl Read for StallingStream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
             if self.read_stalls > 0 {
                 self.read_stalls -= 1;
                 return Err(std::io::Error::from(ErrorKind::WouldBlock));
             }
-            if self.read_pos >= self.response.len() {
+            let remaining = &self.response[self.read_pos.min(self.response.len())..];
+            if remaining.is_empty() {
                 return Ok(0);
             }
-            buf[0] = self.response[self.read_pos];
-            self.read_pos += 1;
-            Ok(1)
+            // Honour `buf.len()` rather than assuming a one-byte reader, so the
+            // test cannot quietly bless a byte-at-a-time implementation.
+            let n = remaining.len().min(buf.len()).min(self.read_chunk);
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.read_pos += n;
+            Ok(n)
         }
     }
 
@@ -184,6 +209,8 @@ mod tests {
             response: b"{\"ok\":true,\"message\":null}\n".to_vec(),
             read_pos: 0,
             chunk,
+            read_chunk: usize::MAX,
+            reads: std::cell::Cell::new(0),
         }
     }
 
@@ -226,6 +253,44 @@ mod tests {
             .to_string();
         assert!(err.contains("timed out"), "{err}");
         assert!(err.contains("daemon status"), "{err}");
+    }
+
+    /// `send_request` is shared with the daemon-served query fast-path (#318
+    /// O1), so this reader carries multi-KB `get_context` and `ask` payloads,
+    /// not just short control acks. Reading those a byte at a time would cost
+    /// one syscall per byte on the path that exists to be fast.
+    #[test]
+    fn a_large_response_is_read_in_bulk_not_byte_at_a_time() {
+        let payload = "x".repeat(30_000);
+        let mut s = stream(0, 0, usize::MAX);
+        s.response = format!("{{\"ok\":true,\"message\":\"{payload}\"}}\n").into_bytes();
+        let total = s.response.len();
+
+        let resp = send_request_line(&mut s, &ControlMessage::Status).unwrap();
+        assert_eq!(resp.message.as_deref().map(str::len), Some(payload.len()));
+
+        // Bound stated in absolute terms, not derived from READ_CHUNK_BYTES:
+        // a bound computed from that constant scales with it, so shrinking the
+        // chunk back to 1 would still "pass". At least 1 KB per read is the
+        // property worth pinning, whatever the chunk size happens to be.
+        let reads = s.reads.get();
+        assert!(
+            reads <= total / 1024,
+            "a {total}-byte response took {reads} reads; expected bulk reads, not one per byte"
+        );
+    }
+
+    #[test]
+    fn a_response_split_across_short_reads_is_reassembled() {
+        // A real socket returns whatever has arrived, not a full buffer. The
+        // accumulator has to survive that, and a would-block landing mid-line.
+        let mut s = stream(0, 0, usize::MAX);
+        s.response = b"{\"ok\":true,\"message\":\"abcdefghij\"}\n".to_vec();
+        s.read_chunk = 3;
+        s.read_stalls = 2;
+
+        let resp = send_request_line(&mut s, &ControlMessage::Status).unwrap();
+        assert_eq!(resp.message.as_deref(), Some("abcdefghij"));
     }
 
     #[test]
