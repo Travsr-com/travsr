@@ -36,11 +36,25 @@ pub fn run(fix: bool, json: bool, force: bool) -> anyhow::Result<()> {
         if report.orphan_edges_swept > 0 {
             println!("swept {} orphan edge(s)", report.orphan_edges_swept);
         }
-    } else if report.orphan_edges_detected > 0 {
-        println!(
-            "{} orphan edge(s) with a missing endpoint (run with --fix to sweep)",
-            report.orphan_edges_detected
-        );
+        if report.self_ref_call_edges_swept > 0 {
+            println!(
+                "swept {} self-referential ref/call edge(s) (#650)",
+                report.self_ref_call_edges_swept
+            );
+        }
+    } else {
+        if report.orphan_edges_detected > 0 {
+            println!(
+                "{} orphan edge(s) with a missing endpoint (run with --fix to sweep)",
+                report.orphan_edges_detected
+            );
+        }
+        if report.self_ref_call_edges_detected > 0 {
+            println!(
+                "{} self-referential ref/call edge(s) (run with --fix to sweep) (#650)",
+                report.self_ref_call_edges_detected
+            );
+        }
     }
 
     if let Some(issue) = &report.lexical_index_parity_issue {

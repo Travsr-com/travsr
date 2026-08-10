@@ -1119,6 +1119,13 @@ pub struct GcReport {
     pub orphan_edges_detected: u64,
     /// Number of orphan edges swept (should be 0 in normal operation).
     pub orphan_edges_swept: u64,
+    /// #650: self-referential (`src == dst`) `ref/call` edges detected in report
+    /// mode. Zero once the write-path guard is in effect; a non-zero count means
+    /// the DB predates the guard (or a producer bypassed the choke point).
+    pub self_ref_call_edges_detected: u64,
+    /// #650: self-referential `ref/call` edges swept under `--fix` (edge + its
+    /// occurrence sites). Should be 0 in normal operation.
+    pub self_ref_call_edges_swept: u64,
     /// Total node count at reconcile start.
     pub node_count: u64,
     /// Total edge count at reconcile start.
