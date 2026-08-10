@@ -6,9 +6,18 @@
 //!   TRAVSR_LANG_API_URL       — GitHub API URL for latest release lookup
 //!   TRAVSR_SKIP_DOWNLOAD=1    — skip network entirely; return expected dest path
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+
+/// Returns ".exe" when the given target triple indicates Windows, empty string otherwise.
+fn exe_suffix_for_target(target: &str) -> &'static str {
+    if target.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    }
+}
 
 const RELEASES_BASE_ENV: &str = "TRAVSR_LANG_RELEASES_BASE";
 const API_URL_ENV: &str = "TRAVSR_LANG_API_URL";
@@ -228,10 +237,16 @@ async fn fetch_verified(
     };
 
     if !bin_resp.status().is_success() {
+        if bin_resp.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("download failed (404 Not Found): {bin_url}");
+        }
         bail!("download failed ({}): {bin_url}", bin_resp.status());
     }
     if let Some(s) = &sha_resp {
         if !s.status().is_success() {
+            if s.status() == reqwest::StatusCode::NOT_FOUND {
+                bail!("sha256 sidecar download failed (404 Not Found): {sha_url}");
+            }
             bail!("sha256 sidecar download failed ({}): {sha_url}", s.status());
         }
     }
@@ -290,7 +305,8 @@ async fn fetch_and_verify_binary(
     binary_name: &str,
     target: &str,
 ) -> Result<Vec<u8>> {
-    let bin_url = format!("{base}/download/{version}/{binary_name}-{target}");
+    let suffix = exe_suffix_for_target(target);
+    let bin_url = format!("{base}/download/{version}/{binary_name}-{target}{suffix}");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -298,6 +314,12 @@ async fn fetch_and_verify_binary(
         .build()
         .context("building HTTP client")?;
 
+    // fetch_verified is shared with the SCIP download paths, so its 404 message is
+    // deliberately generic. Re-attach the wrapper-specific, actionable context here,
+    // where `version` and `target` are in scope. This restores the honest
+    // "unavailable on this platform" message from #588/#622 that the rebase dropped.
+    // starts_with (not contains) mirrors the assertion style in this file's own
+    // download_tests, and distinguishes the binary-missing 404 from the sidecar 404.
     fetch_verified(
         &client,
         &bin_url,
@@ -306,6 +328,20 @@ async fn fetch_and_verify_binary(
         Integrity::Sidecar,
     )
     .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.starts_with("download failed (404 Not Found)") {
+            anyhow!(
+                "release {version} has no prebuilt binary for target platform '{target}' ({bin_url})"
+            )
+        } else if msg.starts_with("sha256 sidecar download failed (404 Not Found)") {
+            anyhow!(
+                "release {version} has no SHA256 checksum file for target platform '{target}' ({bin_url}.sha256)"
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// Downloads and installs a travsr-lang-* wrapper binary into ~/.travsr/bin/.
@@ -317,8 +353,11 @@ pub async fn download_and_install_wrapper(
     binary_name: &str,
     target: &str,
 ) -> Result<PathBuf> {
+    let suffix = exe_suffix_for_target(target);
+    let install_name = format!("{binary_name}{suffix}");
+
     if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
-        return Ok(travsr_bin_dir()?.join(binary_name));
+        return Ok(travsr_bin_dir()?.join(&install_name));
     }
 
     let base =
@@ -328,8 +367,8 @@ pub async fn download_and_install_wrapper(
 
     // Atomic write: write to a temp path, then rename into place.
     let dest_dir = travsr_bin_dir()?;
-    let dest = dest_dir.join(binary_name);
-    let tmp = dest_dir.join(format!("{binary_name}.tmp.{}", uuid::Uuid::new_v4()));
+    let dest = dest_dir.join(&install_name);
+    let tmp = dest_dir.join(format!("{install_name}.tmp.{}", uuid::Uuid::new_v4()));
 
     std::fs::write(&tmp, &bin_bytes)
         .with_context(|| format!("writing temp file {}", tmp.display()))?;
@@ -713,9 +752,21 @@ mod tests {
             || cfg!(all(target_os = "macos", target_arch = "x86_64"))
             || cfg!(all(target_os = "linux", target_arch = "x86_64"))
             || cfg!(all(target_os = "linux", target_arch = "aarch64"))
+            || cfg!(all(target_os = "windows", target_arch = "x86_64"))
         {
             assert!(t.is_ok(), "expected Ok triple, got {t:?}");
         }
+    }
+
+    #[test]
+    fn exe_suffix_for_windows_target() {
+        assert_eq!(exe_suffix_for_target("x86_64-pc-windows-msvc"), ".exe");
+    }
+
+    #[test]
+    fn exe_suffix_for_non_windows_target() {
+        assert_eq!(exe_suffix_for_target("x86_64-unknown-linux-gnu"), "");
+        assert_eq!(exe_suffix_for_target("aarch64-apple-darwin"), "");
     }
 
     #[test]
@@ -765,6 +816,39 @@ mod tests {
         drop(_guard);
         // Only check it doesn't error; bin dir creation may fail in sandbox envs.
         let _ = result; // result is Ok or Err depending on home dir availability
+    }
+
+    #[test]
+    fn skip_download_windows_target_appends_exe() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(SKIP_DOWNLOAD_ENV, "1");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(download_and_install_wrapper(
+            "v0.1.0",
+            "travsr-lang-go",
+            "x86_64-pc-windows-msvc",
+        ));
+        std::env::remove_var(SKIP_DOWNLOAD_ENV);
+        drop(_guard);
+        match result {
+            Ok(path) => {
+                let filename = path.file_name().unwrap().to_string_lossy();
+                assert!(
+                    filename.ends_with(".exe"),
+                    "Windows install path should end with .exe, got: {filename}"
+                );
+            }
+            Err(e) => {
+                // bin dir creation may fail in restricted sandbox CI envs (e.g. no home dir)
+                assert!(
+                    dirs::home_dir().is_none()
+                        || e.to_string().contains("home directory")
+                        || e.to_string().contains("creating"),
+                    "unexpected error in skip_download test: {e:#}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1271,7 +1355,7 @@ mod download_tests {
 
         let err = fetch(&base).await.unwrap_err().to_string();
         assert!(
-            err.starts_with("sha256 sidecar download failed"),
+            err.contains("has no SHA256 checksum file for target platform"),
             "unexpected error: {err}"
         );
     }
@@ -1282,12 +1366,8 @@ mod download_tests {
         let base = serve(vec![route(&sha_path(), 200, sha_line(&body))]);
 
         let err = fetch(&base).await.unwrap_err().to_string();
-        // `starts_with`, not `contains`: the sidecar's failure message ends in
-        // the same words, and `sha_url` contains `bin_path()` because it is
-        // that URL plus `.sha256`, so a `contains` pair would pass on a
-        // sha-side error too.
         assert!(
-            err.starts_with("download failed"),
+            err.contains("has no prebuilt binary for target platform"),
             "unexpected error: {err}"
         );
         assert!(
