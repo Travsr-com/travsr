@@ -199,6 +199,12 @@ enum Command {
     },
     /// Start the SSE/HTTP MCP server for cloud and team deployments.
     Serve {
+        /// Address to bind on. Defaults to loopback: this server speaks
+        /// plaintext HTTP with bearer-token auth, so exposing it beyond this
+        /// machine should be deliberate. Pass `0.0.0.0` when a TLS terminator
+        /// sits in front (#410).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         /// TCP port to bind the SSE server on.
         #[arg(long, default_value = "3000")]
         port: u16,
@@ -745,8 +751,12 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Command::Serve { port, tenants_dir } => {
-            serve::run(port, tenants_dir).await?;
+        Command::Serve {
+            host,
+            port,
+            tenants_dir,
+        } => {
+            serve::run(host, port, tenants_dir).await?;
         }
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
