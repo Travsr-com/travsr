@@ -122,6 +122,10 @@ pub async fn download_scip_binary(
     asset_name: &str,
     install_name: &str,
     verify_sha256: bool,
+    // #410 M2: expected sha256 vendored in the catalog, for upstreams that
+    // publish no sidecar. Checked after download and before anything is
+    // written, so a replaced asset never reaches disk.
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
     if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
         return Ok(travsr_bin_dir()?.join(install_name));
@@ -184,6 +188,16 @@ pub async fn download_scip_binary(
         let bytes = resp.bytes().await.context("reading binary body")?;
         if bytes.len() as u64 > SCIP_SIZE_LIMIT {
             bail!("binary exceeds size limit after download");
+        }
+        if let Some(expected) = expected_sha256 {
+            let actual = hex_encode_sha256(&bytes);
+            if actual != expected {
+                bail!(
+                    "SHA256 mismatch for {asset_name} at {tag}: expected {expected}, got {actual}. \
+                     The pinned asset does not match the hash recorded in the catalog — it may have \
+                     been replaced upstream."
+                );
+            }
         }
         bytes
     };
