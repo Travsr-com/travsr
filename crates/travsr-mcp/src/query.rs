@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use travsr_core::{display_label, is_noise_node, NodeId};
 
 type KnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
-use travsr_retrieval::{context_candidates, knapsack, ppr_weighted, token_cost, OpenFilter};
+use travsr_retrieval::{
+    context_candidates, knapsack, ppr_weighted, token_cost, EdgeFilter, OpenFilter,
+};
 use travsr_store::{SqliteStore, Store, StoreMigratable};
 
 // #478 RFC-023 §6.1/WS-8: `explain_query`'s report type lives in `seed` (an
@@ -296,6 +298,28 @@ pub fn ask_query(
     query: &str,
     knn_fn: Option<KnnFn<'_>>,
 ) -> anyhow::Result<AskPayload> {
+    // Local single-repo mode: process isolation is the auth boundary
+    // (RFC-006 §3.1), so every corpus in this store is already the caller's.
+    ask_query_with_filter(store, query, knn_fn, &OpenFilter)
+}
+
+/// `ask_query` with an explicit traversal filter.
+///
+/// #413: PPR powers `get_context` and `ask`, and it used to expand its
+/// subgraph with no RBAC gate at all — so once RBAC is switched on for the
+/// cloud path, ranking would cross corpus boundaries freely and return nodes
+/// the caller may not see. PCST was already gated; this was the one primary
+/// retrieval path where the wire was missing.
+///
+/// Pass `&OpenFilter` for unauthenticated local mode; pass the session's
+/// filter in authenticated mode. Do not hardcode `&OpenFilter` here once
+/// `SessionStore` reaches this call path.
+pub fn ask_query_with_filter(
+    store: &SqliteStore,
+    query: &str,
+    knn_fn: Option<KnnFn<'_>>,
+    filter: &dyn EdgeFilter,
+) -> anyhow::Result<AskPayload> {
     // Strip a leading `:` so VS Code graph-panel queries pass through cleanly.
     let query = query.strip_prefix(':').unwrap_or(query).trim();
     // CO-C1: normalize once at the top so both FTS and embed see the same
@@ -409,7 +433,7 @@ pub fn ask_query(
     }
 
     // ── PPR with confidence-weighted personalisation ───────────────────────────
-    let ppr_scores = ppr_weighted(store, &seeds, context_candidates())?;
+    let ppr_scores = ppr_weighted(store, &seeds, context_candidates(), filter)?;
     if ppr_scores.is_empty() {
         return Ok(AskPayload {
             matched: true,

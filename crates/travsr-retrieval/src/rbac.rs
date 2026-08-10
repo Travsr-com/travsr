@@ -28,6 +28,22 @@ pub trait EdgeFilter: Send + Sync {
     /// (e.g. the node is missing from the store). Implementations must fail
     /// **closed**: when the corpus is unknown, deny access.
     fn allow(&self, _src: NodeId, dst: NodeId, dst_corpus: Option<&str>) -> bool;
+
+    /// Whether this filter's verdict can depend on `dst_corpus`.
+    ///
+    /// #413: PPR's BFS has to know each destination's corpus to gate on it,
+    /// and that means one extra batched node lookup per edge chunk on the
+    /// primary retrieval path. A filter that ignores the corpus entirely gains
+    /// nothing from those queries, so it can decline them and keep the local
+    /// single-repo path at exactly the cost it had before RBAC was threaded
+    /// through.
+    ///
+    /// Defaults to `true`: a filter that does not override this is assumed to
+    /// need the corpus, so a new implementation fails safe rather than
+    /// silently receiving `None` and denying (or worse, allowing) everything.
+    fn needs_corpus(&self) -> bool {
+        true
+    }
 }
 
 /// Open filter — allows all traversal. Used in unauthenticated local mode
@@ -37,6 +53,12 @@ pub struct OpenFilter;
 impl EdgeFilter for OpenFilter {
     fn allow(&self, _src: NodeId, _dst: NodeId, _dst_corpus: Option<&str>) -> bool {
         true
+    }
+
+    /// Allows everything regardless of corpus, so the lookups that would
+    /// supply it are pure cost (#413).
+    fn needs_corpus(&self) -> bool {
+        false
     }
 }
 

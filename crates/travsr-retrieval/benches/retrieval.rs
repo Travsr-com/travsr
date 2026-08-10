@@ -103,7 +103,7 @@ fn bench_ppr_chain(c: &mut Criterion) {
     for n in [100usize, 1_000] {
         let (store, seed) = chain(n);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| ppr(&store, &[seed], 20).unwrap());
+            b.iter(|| ppr(&store, &[seed], 20, &OpenFilter).unwrap());
         });
     }
     group.finish();
@@ -142,7 +142,7 @@ fn bench_ppr_1k_fixture(c: &mut Criterion) {
     let mut group = c.benchmark_group("ppr/1k_fixture");
     let (store, seed) = fan(FIXTURE_1K);
     group.bench_function("fan-1000", |b| {
-        b.iter(|| ppr(&store, &[seed], 20).unwrap());
+        b.iter(|| ppr(&store, &[seed], 20, &OpenFilter).unwrap());
     });
     group.finish();
 }

@@ -4451,14 +4451,18 @@ fn get_context_body(
     // PPR with confidence-weighted personalisation (#365 Step 1 + Step 3).
     // FTS-only path: weights 1.0/0.6 strictly better than previous uniform ppr().
     // Embed path: cosine scores steer the walk toward semantic neighbours.
-    let ppr_scores =
-        match travsr_retrieval::ppr_weighted(store, &weighted_seeds, context_candidates()) {
-            Ok(scores) => scores,
-            Err(e) => {
-                tracing::warn!("get_context ppr error: {e}");
-                return String::new();
-            }
-        };
+    let ppr_scores = match travsr_retrieval::ppr_weighted(
+        store,
+        &weighted_seeds,
+        context_candidates(),
+        filter,
+    ) {
+        Ok(scores) => scores,
+        Err(e) => {
+            tracing::warn!("get_context ppr error: {e}");
+            return String::new();
+        }
+    };
 
     if ppr_scores.is_empty() {
         // #515: the query is echoed back, so this exit is sanitized too. Body
