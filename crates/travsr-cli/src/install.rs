@@ -487,6 +487,9 @@ pub async fn download_zip_and_extract(
     tag: &str,
     asset_name: &str,
     extract_dir: &str,
+    // #410 M2: expected sha256 of the archive, for upstreams that publish no
+    // sidecar. Checked before extraction, so a replaced asset is never opened.
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
     if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
         let dest = dirs::home_dir()
@@ -522,11 +525,7 @@ pub async fn download_zip_and_extract(
         .join(extract_dir);
     std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
 
-    // #410 M1: extracted in-process with per-entry path validation. Shelling
-    // out meant `unzip` had to exist (it does not on plenty of systems, and
-    // Windows needed a separate bsdtar branch), and traversal behaviour varied
-    // by implementation. No temp file: the bytes are already in memory.
-    extract_zip(&bytes, &dest).with_context(|| format!("extracting {asset_name}"))?;
+    verify_and_extract_zip(&bytes, &dest, expected_sha256, asset_name, tag)?;
 
     Ok(dest)
 }
@@ -855,6 +854,34 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Check an archive against its expected hash, then extract it.
+///
+/// #410 M2: the two steps live together because the ordering is the point.
+/// Extraction is where a hostile archive acts, so the hash has to gate it
+/// rather than follow it. Split out from `download_zip_and_extract` so the
+/// gate can be tested without a network fetch — the review that found the zip
+/// path unverified noted, correctly, that a hash which is never compared
+/// cannot mismatch, so the comparison itself needs a test.
+pub(crate) fn verify_and_extract_zip(
+    bytes: &[u8],
+    dest: &std::path::Path,
+    expected_sha256: Option<&str>,
+    asset_name: &str,
+    tag: &str,
+) -> Result<()> {
+    if let Some(expected) = expected_sha256 {
+        let actual = hex_encode_sha256(bytes);
+        if actual != expected {
+            bail!(
+                "SHA256 mismatch for {asset_name} at {tag}: expected {expected}, got {actual}. \
+                 The pinned asset does not match the hash recorded in the catalog — it may have \
+                 been replaced upstream."
+            );
+        }
+    }
+    extract_zip(bytes, dest).with_context(|| format!("extracting {asset_name}"))
+}
+
 #[cfg(test)]
 mod extraction_tests {
     use super::{extract_tar_gz, extract_zip, safe_entry_path, MAX_ARCHIVE_BYTES};
@@ -950,6 +977,58 @@ mod extraction_tests {
     /// either guard does — removing `safe_entry_path` alone leaves it green.
     /// The equivalent tar test *is* load-bearing for our own check, since the
     /// `tar` crate hands the declared path through unexamined.
+    /// #410 M2 review: the zip path carried `sha256_fn` on its spec but never
+    /// read it, so kotlin-language-server — one of the three tools M2b claims
+    /// to protect — was neither pinned nor verified, and `kls_sha256` was dead
+    /// code. Nothing failed, because a hash that is never compared cannot
+    /// mismatch.
+    ///
+    /// Drives the real gate rather than re-implementing the comparison, so it
+    /// fails if the check is removed, reordered after extraction, or wired to
+    /// the wrong bytes.
+    #[test]
+    fn a_zip_that_does_not_match_its_vendored_hash_is_never_extracted() {
+        fn zip_with(body: &[u8]) -> Vec<u8> {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            w.start_file::<_, ()>("server/bin/tool", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut w, body).unwrap();
+            w.finish().unwrap().into_inner()
+        }
+        let genuine = zip_with(b"genuine");
+        let tampered = zip_with(b"swapped");
+        let expected = super::hex_encode_sha256(&genuine);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let err = super::verify_and_extract_zip(
+            &tampered,
+            &dest,
+            Some(&expected),
+            "server.zip",
+            "1.3.13",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SHA256 mismatch"), "{err}");
+        assert!(
+            !dest.join("server/bin/tool").exists(),
+            "a mismatching archive must not be extracted at all — the hash gates \
+             extraction rather than following it"
+        );
+
+        // The genuine archive still installs, so the gate is not simply refusing
+        // everything.
+        super::verify_and_extract_zip(&genuine, &dest, Some(&expected), "server.zip", "1.3.13")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("server/bin/tool")).unwrap(),
+            b"genuine"
+        );
+    }
+
     #[test]
     fn a_traversing_zip_entry_is_refused() {
         let dir = tempfile::tempdir().unwrap();

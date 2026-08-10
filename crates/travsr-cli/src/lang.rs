@@ -618,17 +618,24 @@ fn install_zip_binary(
     entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
     spec: &ZipBinarySpec,
 ) -> Result<()> {
+    // #410 M2: same rule as the binary path — an entry carrying a vendored
+    // hash is pinned, because the hash only means anything against one exact
+    // asset. This was previously wired on the `GithubBinary` path only, which
+    // left the single `ZipBinary` entry (kotlin-language-server) reading
+    // `releases/latest` and never checking its hash at all.
     let repo = spec.repo.to_string();
-    let tag = match run_async(
-        async move { crate::install::fetch_latest_version_for_repo(&repo).await },
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "warning: could not fetch latest {} version ({e:#}), using {}",
-                spec.install_name, spec.version_fallback
-            );
-            spec.version_fallback.to_string()
+    let tag = if spec.sha256_fn.is_some() {
+        spec.version_fallback.to_string()
+    } else {
+        match run_async(async move { crate::install::fetch_latest_version_for_repo(&repo).await }) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not fetch latest {} version ({e:#}), using {}",
+                    spec.install_name, spec.version_fallback
+                );
+                spec.version_fallback.to_string()
+            }
         }
     };
 
@@ -639,9 +646,17 @@ fn install_zip_binary(
     let tag2 = tag.clone();
     let asset2 = asset_name.clone();
     let extract_dir = spec.extract_dir.to_string();
+    let expected = spec.sha256_fn.and_then(|f| f(&tag)).map(str::to_string);
 
     let extract_path = match run_async(async move {
-        crate::install::download_zip_and_extract(&repo2, &tag2, &asset2, &extract_dir).await
+        crate::install::download_zip_and_extract(
+            &repo2,
+            &tag2,
+            &asset2,
+            &extract_dir,
+            expected.as_deref(),
+        )
+        .await
     }) {
         Ok(p) => p,
         Err(e) => {
