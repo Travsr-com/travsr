@@ -508,7 +508,7 @@ fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
     println!("  Available embedding models:\n");
     for (i, b) in embed_backends().iter().enumerate() {
         let is_active = active.as_deref() == Some(b.id.as_str());
-        let installed = bin_dir.join(&b.binary_name).exists()
+        let installed = bin_dir.join(b.binary_filename()).exists()
             && embed_model_dir(&b.id)
                 .map(|d| b.model_files.iter().all(|f| d.join(&f.name).exists()))
                 .unwrap_or(false);
@@ -563,7 +563,7 @@ fn pick_backend_interactive() -> Result<Option<&'static EmbedBackend>> {
 fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool) -> Result<()> {
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     let bin_dir = embed_bin_dir()?;
-    let dest = bin_dir.join(&backend.binary_name);
+    let dest = bin_dir.join(backend.binary_filename());
 
     if dest.exists() && !reinstall {
         println!("  {} {} ready", pal.green("\u{25cf}"), backend.binary_name);
@@ -769,8 +769,12 @@ async fn download_embed_binary(
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
 
+    // Windows release assets carry `.exe` (travsr-embed #12); the sha256
+    // sidecar is named after the full asset (`<asset>.exe.sha256`).
+    let win = target.contains("windows");
+    let asset_ext = if win { ".exe" } else { "" };
     let url = format!(
-        "{EMBED_RELEASES_BASE}/{github_repo}/releases/download/{version}/{binary_name}-{target}"
+        "{EMBED_RELEASES_BASE}/{github_repo}/releases/download/{version}/{binary_name}-{target}{asset_ext}"
     );
     let sha_url = format!("{url}.sha256");
 
@@ -784,8 +788,25 @@ async fn download_embed_binary(
         tokio::try_join!(client.get(&url).send(), client.get(&sha_url).send())
             .context("sending download requests")?;
 
+    // A 404 on either the binary or its .sha256 sidecar gets the same hint: a
+    // partial release (binary present, sidecar missing) is just as much a
+    // "this release has no usable asset for this target" as a missing binary.
+    let hint_404 = |what: &str, u: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "{what} download failed (404 Not Found): {u}\n\
+             {github_repo} {version} has no prebuilt binary for {target} — \
+             this platform may not be supported by that release yet \
+             (see https://github.com/{github_repo}/issues)"
+        )
+    };
+    if bin_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(hint_404("binary", &url));
+    }
     if !bin_resp.status().is_success() {
         bail!("download failed ({}): {url}", bin_resp.status());
+    }
+    if sha_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(hint_404("SHA256", &sha_url));
     }
     if !sha_resp.status().is_success() {
         bail!("SHA256 download failed ({}): {sha_url}", sha_resp.status());
@@ -811,10 +832,13 @@ async fn download_embed_binary(
     }
 
     let dest_dir = embed_bin_dir()?;
-    let dest = dest_dir.join(binary_name);
+    // On-disk name mirrors the asset extension so Windows gets `travsr-embed.exe`
+    // (spawn paths resolve via `EmbedBackend::binary_filename`).
+    let file_name = format!("{binary_name}{asset_ext}");
+    let dest = dest_dir.join(&file_name);
     // L4: use a UUID suffix so concurrent installs don't clobber each other's tmp file.
     let tmp = dest_dir.join(format!(
-        "{binary_name}.{}.tmp",
+        "{file_name}.{}.tmp",
         uuid::Uuid::new_v4().as_simple()
     ));
     std::fs::write(&tmp, &bin_bytes).with_context(|| format!("writing {}", tmp.display()))?;
@@ -1413,7 +1437,7 @@ fn cmd_status() -> Result<()> {
                 return Ok(());
             }
             Some(b) => {
-                let installed = bin_dir.join(&b.binary_name).exists();
+                let installed = bin_dir.join(b.binary_filename()).exists();
                 // #391: the sidecar requires a `model.toml` descriptor and exits code 1
                 // without it, so a present-but-descriptor-less install is NOT ready.
                 // Check it alongside the model weights to avoid the old false positive.
@@ -1656,7 +1680,7 @@ fn cmd_switch(backend_id: &str, global: bool) -> Result<()> {
     // reporting `installed=false` and `embed status` `✗ missing` for the model
     // it had just made active. Check the model's own files, as list/status do.
     let bin_dir = embed_bin_dir()?;
-    if !bin_dir.join(&backend.binary_name).exists() || !model_files_installed(backend) {
+    if !bin_dir.join(backend.binary_filename()).exists() || !model_files_installed(backend) {
         bail!(
             "Backend '{backend_id}' is not installed. Run `travsr embed init --backend {backend_id}` first."
         );

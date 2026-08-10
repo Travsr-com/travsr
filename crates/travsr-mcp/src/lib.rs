@@ -110,7 +110,10 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
         .cloned();
     let Some(backend) = backend else { return };
 
-    let binary = home.join(".travsr").join("bin").join(backend.binary_name);
+    let binary = home
+        .join(".travsr")
+        .join("bin")
+        .join(backend.binary_filename());
     // Fast path: if the binary isn't installed there's nothing to do.
     if !binary.exists() {
         return;

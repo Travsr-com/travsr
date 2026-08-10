@@ -509,6 +509,17 @@ impl EmbedBackend {
             self.dim
         }
     }
+
+    /// On-disk file name of the sidecar under `~/.travsr/bin/`: `binary_name`
+    /// plus `.exe` on Windows (#12 travsr-embed). Release *asset* names carry
+    /// the target triple and are built by the CLI installer, not here.
+    pub fn binary_filename(&self) -> String {
+        if cfg!(windows) {
+            format!("{}.exe", self.binary_name)
+        } else {
+            self.binary_name.clone()
+        }
+    }
 }
 
 /// The merged model catalog: bundled defaults + optional user override, loaded once.
@@ -1370,7 +1381,10 @@ fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
     let backend_id = repo_backend_id(repo_root).or_else(active_backend_id)?;
     let backend = lookup(&backend_id)?;
     let home = dirs::home_dir()?;
-    let bin_path = home.join(".travsr").join("bin").join(&backend.binary_name);
+    let bin_path = home
+        .join(".travsr")
+        .join("bin")
+        .join(backend.binary_filename());
     if !bin_path.exists() {
         return None;
     }
@@ -1933,7 +1947,7 @@ mod tests {
         let backend = &backends()[0];
         let bin_dir = home.path().join(".travsr").join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::write(bin_dir.join(&backend.binary_name), b"").unwrap();
+        std::fs::write(bin_dir.join(backend.binary_filename()), b"").unwrap();
         let model_dir = home.path().join(".travsr").join("models").join(&backend.id);
         std::fs::create_dir_all(&model_dir).unwrap();
         for f in &backend.model_files {
@@ -1981,7 +1995,7 @@ mod tests {
         for b in [repo_backend, global_backend] {
             let bin_dir = home.path().join(".travsr").join("bin");
             std::fs::create_dir_all(&bin_dir).unwrap();
-            std::fs::write(bin_dir.join(&b.binary_name), b"").unwrap();
+            std::fs::write(bin_dir.join(b.binary_filename()), b"").unwrap();
             let model_dir = home.path().join(".travsr").join("models").join(&b.id);
             std::fs::create_dir_all(&model_dir).unwrap();
             for f in &b.model_files {
