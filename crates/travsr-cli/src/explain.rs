@@ -124,6 +124,21 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
                 .map(|s| format!("  top_node={s}"))
                 .unwrap_or_default()
         );
+        // #540: only a token that reached the anchor stage can lose matches to
+        // capacity. A token below `anchor_emit_cut` is suppressed before the
+        // loop and emits nothing at all — its absence is a relevance decision,
+        // so claiming "cut on capacity, not relevance" there states the exact
+        // opposite of what happened. Same class of error as the earlier "add a
+        // distinguishing term" line: a note that is right in one case and
+        // actively wrong in another.
+        if t.is_anchor_emit && t.symbol_freq > t.anchors_emitted {
+            println!(
+                "      note: names {} symbols, {} became anchors — {} did not reach the anchor set",
+                t.symbol_freq,
+                t.anchors_emitted,
+                t.symbol_freq - t.anchors_emitted
+            );
+        }
     }
 
     if let Some(legs) = &report.legs {
