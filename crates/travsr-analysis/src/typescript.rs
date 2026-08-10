@@ -38,6 +38,9 @@ const QUERIES: &str = r"
 (program (variable_declaration (variable_declarator) @topvar))
 (program (export_statement (variable_declaration (variable_declarator) @topvar)))
 (import_statement source: (string (string_fragment) @import.source))
+(call_expression
+  function: (identifier) @require.fn
+  arguments: (arguments . (string (string_fragment) @require.source)))
 ";
 
 /// Parse `abs_path` and emit graph records using `vname_path` as the stable
@@ -115,6 +118,18 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     };
 
     while let Some(m) = iter.next() {
+        // #610: the `require.*` pattern matches every single-string call, so the
+        // callee has to be checked before its argument is treated as an import.
+        // The query cannot do it alone — matching an identifier's *text* needs a
+        // `#eq?` predicate, and nothing in this crate evaluates predicates, so
+        // the check lives here where the whole match is in scope.
+        let is_require_call = m.captures.iter().any(|c| {
+            capture_names
+                .get(c.index as usize)
+                .is_some_and(|n| n == "require.fn")
+                && c.node.utf8_text(source.as_slice()) == Ok("require")
+        });
+
         for &capture in m.captures {
             let Some(cap_name) = capture_names.get(capture.index as usize) else {
                 continue;
@@ -220,6 +235,20 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                 }
                 "import.source" => {
                     // Import nodes are synthetic — no definition line.
+                    let node = emit::import_node(corpus, vname_path, text);
+                    let edge = emit::depends_edge(file_id, node.id);
+                    output.nodes.push(node);
+                    output.edges.push(edge);
+                }
+                // #610: CommonJS. `const { X } = require("./animal")` carries
+                // the same dependency as an ES import, but it is a call
+                // expression, so the `import_statement` pattern never saw it and
+                // a `require`-only file produced no import node at all — leaving
+                // `get_blast_radius` on the required module with nothing to
+                // traverse back through. Emitted identically to the ES form so
+                // everything downstream (Depends, ResolvesTo, blast radius) is
+                // unchanged.
+                "require.source" if is_require_call => {
                     let node = emit::import_node(corpus, vname_path, text);
                     let edge = emit::depends_edge(file_id, node.id);
                     output.nodes.push(node);
@@ -336,6 +365,71 @@ fn find_parent_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse `src` as `name` and return every `import:` signature it emitted.
+    fn imports_of(name: &str, src: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, src).unwrap();
+        parse("", &path, name)
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter(|n| n.kind == "import")
+            .map(|n| n.vname.signature)
+            .collect()
+    }
+
+    /// #610: `require()` is a call expression, so the `import_statement`
+    /// pattern never matched it and a CommonJS file emitted no import node at
+    /// all — leaving `get_blast_radius` on the required module with nothing to
+    /// traverse back through.
+    #[test]
+    fn commonjs_require_emits_an_import_node() {
+        assert_eq!(
+            imports_of("jobs.js", "const { Animal } = require(\"./animal\");\n"),
+            vec!["import:./animal"]
+        );
+        // Bare call form, no binding.
+        assert_eq!(
+            imports_of("side.js", "require(\"./register\");\n"),
+            vec!["import:./register"]
+        );
+        // Package requires are emitted like package ES imports; `link_imports`
+        // is what declines to resolve non-relative specifiers.
+        assert_eq!(
+            imports_of("pkg.js", "const fs = require(\"fs\");\n"),
+            vec!["import:fs"]
+        );
+    }
+
+    /// The query matches any single-string call, so the callee check is what
+    /// keeps unrelated calls out of the import set.
+    #[test]
+    fn only_calls_named_require_become_imports() {
+        assert!(
+            imports_of("t.js", "describe(\"./animal\", () => {});\n").is_empty(),
+            "a test helper taking a string must not register as an import"
+        );
+        assert!(
+            imports_of("t2.js", "console.log(\"./animal\");\n").is_empty(),
+            "a member call must not register as an import"
+        );
+        assert!(
+            imports_of("t3.js", "import(\"./animal\");\n").is_empty(),
+            "dynamic import() is a different construct and is not handled here"
+        );
+    }
+
+    /// ES and CommonJS produce the same node shape, so everything downstream
+    /// treats them identically.
+    #[test]
+    fn es_and_commonjs_imports_are_indistinguishable_downstream() {
+        assert_eq!(
+            imports_of("a.js", "import { Animal } from \"./animal\";\n"),
+            imports_of("b.js", "const { Animal } = require(\"./animal\");\n")
+        );
+    }
 
     #[test]
     fn oversized_file_returns_err() {

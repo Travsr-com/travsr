@@ -181,7 +181,27 @@ pub fn link_imports(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge>
         let raw = parent.join(module);
         let normalized = normalize_vname_path(&raw);
 
-        for ext in ["ts", "tsx"] {
+        // #610: only `ts`/`tsx` used to be tried, so no JavaScript import ever
+        // resolved — `./animal` from a `.js` file produced candidates for
+        // `animal.ts` and `animal.tsx`, neither of which exists in a JS
+        // project. That broke JS dependency traversal for *both* module styles,
+        // not only CommonJS.
+        //
+        // Candidates are scoped by the importer's own extension rather than
+        // emitting the whole family for everyone: each one is a speculative
+        // edge whose target node may never be created, and `fsck` counts those
+        // as orphans. A TypeScript file still gets `js` too, since `allowJs`
+        // interop is common in real projects.
+        let importer_ext = std::path::Path::new(vname_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let candidates: &[&str] = match importer_ext {
+            "js" | "jsx" | "mjs" | "cjs" => &["js", "jsx", "mjs", "cjs"],
+            _ => &["ts", "tsx", "js"],
+        };
+
+        for ext in candidates.iter().copied() {
             let candidate = normalized.with_extension(ext);
             let candidate_str = candidate.to_string_lossy().replace('\\', "/");
             let target = travsr_analysis::emit::file_node(corpus, &candidate_str);
