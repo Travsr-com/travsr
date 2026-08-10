@@ -394,6 +394,15 @@ pub(crate) struct ResolvedTerm {
     /// The top-ranked node ID for this token (if resolved). Ties G1 rarity to
     /// the specific term that produced the exact anchor (RFC-021 F3).
     pub top_node: Option<NodeId>,
+    /// #540: anchors this token actually emitted.
+    ///
+    /// Measured, not derived. `min(symbol_freq, MAX_ANCHORS_PER_TOKEN)` is an
+    /// upper bound that the loop then reduces further — `is_anchor_noise`,
+    /// the RBAC filter, the `contains_token` boundary check and the per-path
+    /// cap all drop candidates — so reporting the bound would attribute
+    /// relevance and quality drops to capacity. A token suppressed by the IDF
+    /// cut never enters the loop at all and stays 0.
+    pub anchors_emitted: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2129,12 +2138,17 @@ pub(crate) fn build_seed_set(
 
         let idf_w = idf_weight(freq, n_total);
 
+        // #540: filled in after the anchor loop below with what it actually
+        // emitted. Stays 0 for a token suppressed by the IDF cut, which never
+        // reaches the loop.
+        let term_idx = terms.len();
         terms.push(ResolvedTerm {
             token: token.clone(),
             resolved,
             symbol_freq: freq,
             idf_w,
             top_node,
+            anchors_emitted: 0,
         });
 
         // Only emit high-IDF tokens as anchors (suppresses generic "queue", "run" etc.)
@@ -2196,6 +2210,9 @@ pub(crate) fn build_seed_set(
                 specific_token_anchor_ids.insert(node.id);
             }
         }
+
+        // #540: the measured count, after every drop the loop applies.
+        terms[term_idx].anchors_emitted = added_for_this_token;
     }
 
     // `rrf_fuse` (below) requires every source sorted descending by score —
@@ -2856,11 +2873,11 @@ pub struct ExplainToken {
     pub resolved: bool,
     pub is_anchor_emit: bool,
     pub top_node_signature: Option<String>,
-    /// #540: how many of this token's `symbol_freq` matches could reach the
-    /// anchor stage. When it is lower, the rest lost to a capacity cut rather
-    /// than to any relevance signal, and nothing else in the output says so —
-    /// which is the difference between a diagnosable answer and a silent one.
-    pub anchor_considered: usize,
+    /// #540: anchors this token actually emitted, measured rather than
+    /// derived. `min(symbol_freq, MAX_ANCHORS_PER_TOKEN)` was an upper bound
+    /// the loop reduces further, so reporting it attributed noise, RBAC and
+    /// boundary drops to capacity.
+    pub anchors_emitted: usize,
 }
 
 /// One leg's raw (pre-fusion) rank + score for the explained node, from
@@ -2967,7 +2984,7 @@ pub(crate) fn explain_seed_set(
             idf_w: t.idf_w,
             resolved: t.resolved,
             is_anchor_emit: t.idf_w >= anchor_emit_cut(),
-            anchor_considered: t.symbol_freq.min(MAX_ANCHORS_PER_TOKEN),
+            anchors_emitted: t.anchors_emitted,
             top_node_signature: t
                 .top_node
                 .and_then(|id| store.get_node(id).ok().flatten())
@@ -3331,6 +3348,7 @@ mod tests {
             symbol_freq: freq,
             idf_w: idf,
             top_node: node,
+            anchors_emitted: 0,
         }
     }
 
@@ -3881,6 +3899,7 @@ mod tests {
             symbol_freq: 1,
             idf_w: 0.98, // very rare → specific anchor
             top_node: Some(NodeId(42)),
+            anchors_emitted: 0,
         }];
         let c = classify_confidence_lexical_fallback(
             &terms,
@@ -3904,6 +3923,7 @@ mod tests {
             symbol_freq: 50,
             idf_w: 0.0, // not resolved — idf_w irrelevant
             top_node: None,
+            anchors_emitted: 0,
         }];
         let c = classify_confidence_lexical_fallback(
             &terms,
@@ -3934,6 +3954,7 @@ mod tests {
                 symbol_freq: 8, // > rare_max(3) → not a rare anchor
                 idf_w: 0.81,    // >= idf_coverage_min(0.55) → specific anchor
                 top_node: Some(tweak),
+                anchors_emitted: 0,
             },
             ResolvedTerm {
                 token: "type".into(),
@@ -3941,6 +3962,7 @@ mod tests {
                 symbol_freq: 5000,
                 idf_w: 0.2,
                 top_node: Some(NodeId(200)),
+                anchors_emitted: 0,
             },
         ];
         // Confident oracle that AGREES the anchor is near the query (cosine 0.95).
@@ -3975,6 +3997,7 @@ mod tests {
             symbol_freq: 2,
             idf_w: 0.9,
             top_node: Some(anchor),
+            anchors_emitted: 0,
         }];
         // Confident oracle whose top hit is a DIFFERENT node — anchor absent (cosine 0).
         let oracle = HashMap::from([(NodeId(999), 0.88_f32)]);
@@ -4011,6 +4034,7 @@ mod tests {
             symbol_freq: 8, // recurs across packages → not rare (not Exact)
             idf_w: 0.58,    // >= idf_coverage_min → specific anchor
             top_node: Some(anchor),
+            anchors_emitted: 0,
         }];
         // Confident oracle (top 0.79) whose near cluster does NOT contain the anchor,
         // and only one node clears the floor (so semantic_strong can't fire — this
@@ -4048,6 +4072,7 @@ mod tests {
             symbol_freq: 8,
             idf_w: 0.58,
             top_node: Some(anchor),
+            anchors_emitted: 0,
         }];
         let oracle = HashMap::from([(NodeId(999), 0.79_f32)]);
         let c = classify_confidence_lexical_fallback(
@@ -4085,6 +4110,7 @@ mod tests {
             symbol_freq: 100,
             idf_w: 0.63,
             top_node: Some(sem),
+            anchors_emitted: 0,
         }];
         // Cluster oracle_top 0.659 (confident, but below promote 0.72 → no
         // semantic_strong). Anchor oracle scores "semantic" at 0.615 (present, but
@@ -4143,6 +4169,7 @@ mod tests {
                 symbol_freq: 1361,
                 idf_w: 0.42, // generic — does not count toward coverage/specific anchor
                 top_node: Some(NodeId(1)),
+                anchors_emitted: 0,
             },
             ResolvedTerm {
                 token: "mutationg".into(),
@@ -4150,6 +4177,7 @@ mod tests {
                 symbol_freq: 0,
                 idf_w: 1.0,
                 top_node: None,
+                anchors_emitted: 0,
             },
             ResolvedTerm {
                 token: "manifests".into(),
@@ -4157,6 +4185,7 @@ mod tests {
                 symbol_freq: 71,
                 idf_w: 0.66,
                 top_node: Some(manifests),
+                anchors_emitted: 0,
             },
         ];
         // Confident oracle (top 0.773) that AGREES the anchor is near (cos 0.71 ≥ floor 0.643).
@@ -4192,7 +4221,8 @@ mod tests {
                 resolved: true,
                 symbol_freq: 100,
                 idf_w: 0.63,
-                top_node: Some(semantic), // NOT in the oracle below → unconfirmed
+                top_node: Some(semantic), // NOT in the oracle below → unconfirmed,
+                anchors_emitted: 0,
             },
             ResolvedTerm {
                 token: "code".into(),
@@ -4200,6 +4230,7 @@ mod tests {
                 symbol_freq: 2260,
                 idf_w: 0.38,
                 top_node: Some(NodeId(2)),
+                anchors_emitted: 0,
             },
         ];
         // Confident oracle (top 0.659) whose neighbours do NOT include the anchor.
@@ -4231,6 +4262,7 @@ mod tests {
             symbol_freq: 200,
             idf_w: 0.40, // too generic to count as specific anchor
             top_node: Some(NodeId(7)),
+            anchors_emitted: 0,
         }];
         let c = classify_confidence_lexical_fallback(
             &terms,
@@ -4256,6 +4288,7 @@ mod tests {
             symbol_freq: 2,
             idf_w: 0.93, // rare → counts as specific anchor
             top_node: Some(NodeId(9)),
+            anchors_emitted: 0,
         }];
         let c = classify_confidence_lexical_fallback(
             &terms,
@@ -4286,6 +4319,7 @@ mod tests {
             symbol_freq: 65,
             idf_w: 0.526, // real idf for "map" in a 6940-node corpus
             top_node: Some(NodeId(5)),
+            anchors_emitted: 0,
         }];
         let c = classify_confidence_lexical_fallback(
             &terms,
@@ -4315,6 +4349,7 @@ mod tests {
             symbol_freq: 0,
             idf_w: 0.0,
             top_node: None,
+            anchors_emitted: 0,
         }];
         let c = classify_confidence_lexical_fallback(
             &terms,
@@ -4347,6 +4382,7 @@ mod tests {
             symbol_freq: 14_000, // generic → not rare, not specific
             idf_w: 0.30,
             top_node: None,
+            anchors_emitted: 0,
         }];
         // oracle_top 0.83 → floor 0.70; 5 candidates ≥ floor → coherent cluster.
         let oracle: HashMap<NodeId, f32> = [
@@ -4386,6 +4422,7 @@ mod tests {
             symbol_freq: 0,
             idf_w: 0.0,
             top_node: None,
+            anchors_emitted: 0,
         }];
         // oracle_top 0.64 < promote(0.72), and > veto(0.55) → neither promote nor veto.
         let oracle: HashMap<NodeId, f32> =
@@ -4422,6 +4459,7 @@ mod tests {
             symbol_freq: 40, // specific (high idf) but not rare
             idf_w: 0.62,
             top_node: Some(anchor),
+            anchors_emitted: 0,
         }];
         // oracle present but far (top 0.49 < veto 0.55); anchor absent from oracle.
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
@@ -4454,6 +4492,7 @@ mod tests {
             symbol_freq: 2, // rare → exact anchor the user named
             idf_w: 0.93,
             top_node: Some(anchor),
+            anchors_emitted: 0,
         }];
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.49)].into_iter().collect();
         // Low coverage so it doesn't hit the Exact branch; must land on Weak, not None.
@@ -4485,6 +4524,7 @@ mod tests {
             symbol_freq: 50,
             idf_w: 0.0,
             top_node: None,
+            anchors_emitted: 0,
         }];
         // Oracle present but weak (0.50 < veto 0.55) — would veto if lexical were weak.
         let oracle: HashMap<NodeId, f32> = [(NodeId(99), 0.50)].into_iter().collect();
@@ -4914,6 +4954,7 @@ mod tests {
             symbol_freq: 1,
             idf_w: 0.9,
             top_node: Some(NodeId(1)),
+            anchors_emitted: 0,
         }];
         let via_gate = classify_confidence(
             &terms,
@@ -4958,6 +4999,7 @@ mod tests {
             symbol_freq: 1,
             idf_w: 0.9,
             top_node: Some(NodeId(1)),
+            anchors_emitted: 0,
         }];
         let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
         let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
@@ -5006,6 +5048,7 @@ mod tests {
             symbol_freq: 50, // common — dozens of Drop impls, nowhere near rare
             idf_w: 0.6,
             top_node: Some(NodeId(1)),
+            anchors_emitted: 0,
         }];
         let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
         let g1_bypass = compute_g1_bypass(&terms, &exact_anchor_ids);
@@ -5044,6 +5087,7 @@ mod tests {
                 symbol_freq: 50, // common — this is the term that produced the exact anchor
                 idf_w: 0.6,
                 top_node: Some(NodeId(1)),
+                anchors_emitted: 0,
             },
             ResolvedTerm {
                 token: "incidental".into(),
@@ -5051,6 +5095,7 @@ mod tests {
                 symbol_freq: 1, // rare, but resolves to an unrelated node — not an exact anchor
                 idf_w: 0.9,
                 top_node: Some(NodeId(2)),
+                anchors_emitted: 0,
             },
         ];
         let exact_anchor_ids: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
@@ -5398,6 +5443,79 @@ mod tests {
                 .map(|s| (s.node, s.source))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// #540 review: the note claimed "cut on capacity, not relevance" for
+    /// tokens that never entered the anchor loop at all.
+    ///
+    /// A token below `anchor_emit_cut` is suppressed by the IDF gate — a
+    /// relevance signal — and emits zero anchors. The old field reported
+    /// `min(symbol_freq, 3)`, so it said 3 reached when 0 did, and attributed
+    /// an explicitly relevance-based drop to capacity.
+    ///
+    /// Drives the real `explain_seed_set` rather than re-deriving the formula.
+    /// The previous test defined its own `min(freq, cap)` inside the test
+    /// module and asserted against that, so it mirrored the production line
+    /// instead of exercising it and could not have caught this.
+    #[test]
+    fn a_suppressed_token_reports_zero_anchors_not_the_cap() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // Many symbols sharing one generic token, so its IDF lands low enough
+        // to be suppressed, plus one specific token that does anchor.
+        for i in 0..40 {
+            let n = Node::new(
+                VName::new(
+                    "corpus",
+                    "",
+                    format!("src/mod{i}.rs"),
+                    "rust",
+                    format!("fn:get_thing{i}"),
+                ),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+        }
+        let special = Node::new(
+            VName::new("corpus", "", "src/special.rs", "rust", "fn:zarquon"),
+            "function",
+        );
+        store.put_node(&special).unwrap();
+
+        // Force the generic token below the cut so the suppressed path is the
+        // one under test, using the documented env knob rather than relying on
+        // this fixture's IDF happening to fall the right side of the default.
+        std::env::set_var("TRAVSR_ANCHOR_EMIT_CUT", "0.90");
+        let empty: HashMap<NodeId, f32> = HashMap::new();
+        let report = explain_seed_set(
+            &store,
+            "get zarquon",
+            "fn:zarquon",
+            &travsr_retrieval::OpenFilter,
+            Vec::new(),
+            &empty,
+            None,
+        );
+        std::env::remove_var("TRAVSR_ANCHOR_EMIT_CUT");
+
+        for t in &report.tokens {
+            if !t.is_anchor_emit {
+                assert_eq!(
+                    t.anchors_emitted, 0,
+                    "token {:?} was suppressed before the anchor loop, so it emitted nothing — \
+                     reporting a non-zero count would attribute a relevance drop to capacity",
+                    t.token
+                );
+            }
+            assert!(
+                t.anchors_emitted <= t.symbol_freq,
+                "token {:?}: emitted {} anchors but only {} symbols name it",
+                t.token,
+                t.anchors_emitted,
+                t.symbol_freq
+            );
+        }
     }
 
     /// #478 RFC-023 §6.1 (WS-8): `travsr explain`'s own report on the exact

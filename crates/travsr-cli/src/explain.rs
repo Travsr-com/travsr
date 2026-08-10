@@ -124,23 +124,19 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
                 .map(|s| format!("  top_node={s}"))
                 .unwrap_or_default()
         );
-        // #540: a token that legitimately names more symbols than the anchor
-        // stage can hold loses the rest to a capacity cut, not to any relevance
-        // signal. Nothing else in this output distinguishes "ranked low" from
-        // "never considered", so a symbol the user expected can be absent with
-        // no trace at all.
-        //
-        // States the condition and stops there. An earlier draft appended "add
-        // a distinguishing term", which is sound advice for a single-token
-        // query and wrong for a multi-token one — the note fires per token, so
-        // it also prints beside a token whose siblings already resolved the
-        // query successfully, where there is nothing to fix.
-        if t.symbol_freq > t.anchor_considered {
+        // #540: only a token that reached the anchor stage can lose matches to
+        // capacity. A token below `anchor_emit_cut` is suppressed before the
+        // loop and emits nothing at all — its absence is a relevance decision,
+        // so claiming "cut on capacity, not relevance" there states the exact
+        // opposite of what happened. Same class of error as the earlier "add a
+        // distinguishing term" line: a note that is right in one case and
+        // actively wrong in another.
+        if t.is_anchor_emit && t.symbol_freq > t.anchors_emitted {
             println!(
-                "      note: names {} symbols, {} reached the anchor set — {} were cut on capacity, not relevance",
+                "      note: names {} symbols, {} became anchors — {} did not reach the anchor set",
                 t.symbol_freq,
-                t.anchor_considered,
-                t.symbol_freq - t.anchor_considered
+                t.anchors_emitted,
+                t.symbol_freq - t.anchors_emitted
             );
         }
     }
