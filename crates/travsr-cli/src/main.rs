@@ -490,12 +490,42 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DaemonAction::Stop => {
+                    // #541: capture the PID first — a clean shutdown removes the
+                    // lock file, so this is the only chance to learn who to
+                    // check. Everything below turns "the request was accepted"
+                    // into "the process is gone", which is what callers of
+                    // `daemon stop` actually need the exit status to mean: a
+                    // stale daemon left alive keeps serving queries from an old
+                    // binary image and silently invalidates any live check made
+                    // against it.
+                    let pid_before = daemon_lock_pid(&repo_root);
+
                     // M2/L1: if the daemon is not running, tell the user clearly
                     // and exit 0 — it's not an error to stop something already stopped.
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown) {
-                        Ok(_) => {
-                            eprintln!("travsr daemon stopped");
-                        }
+                        Ok(_) => match pid_before {
+                            Some(pid) if !wait_for_exit(pid, STOP_EXIT_TIMEOUT) => {
+                                anyhow::bail!(
+                                    "travsr daemon acknowledged the stop request but process \
+                                     {pid} is still running after {}s.\n  \
+                                     Any `travsr` query may still be answered by it, from the \
+                                     binary image it started with.\n  \
+                                     Check with `travsr daemon status`, or stop it directly \
+                                     with `kill {pid}`.",
+                                    STOP_EXIT_TIMEOUT.as_secs()
+                                );
+                            }
+                            // No lock file to check against: report what was
+                            // actually established rather than overclaiming.
+                            //
+                            // This is the one branch where the exit status
+                            // means "accepted", not "confirmed gone" — there is
+                            // no PID to verify against, so there is nothing to
+                            // verify. The wording carries that distinction
+                            // because the exit code cannot.
+                            None => eprintln!("travsr daemon stop acknowledged"),
+                            Some(_) => eprintln!("travsr daemon stopped"),
+                        },
                         Err(e) => {
                             let msg = e.to_string();
                             if msg.contains("No such file")
@@ -505,6 +535,17 @@ async fn run(cli: Cli) -> Result<()> {
                                 || msg.contains("os error 61")
                             {
                                 eprintln!("travsr daemon is not running");
+                            } else if let Some(pid) = pid_before.filter(|p| pid_is_alive(*p)) {
+                                // #541: the original report. The transport now
+                                // retries a would-block, so reaching here means
+                                // something worse than a transient stall — but
+                                // the daemon is demonstrably still up, and that
+                                // is the part the user has to act on, not the
+                                // errno.
+                                return Err(e.context(format!(
+                                    "the daemon (process {pid}) is still running and was NOT \
+                                     stopped; stop it directly with `kill {pid}` if it stays wedged"
+                                )));
                             } else {
                                 return Err(e);
                             }
@@ -770,6 +811,50 @@ fn daemon_start_error(repo_root: &std::path::Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// PID recorded in `.travsr/daemon.lock`, if the file exists and parses.
+///
+/// #541: read *before* sending `Shutdown`, because a daemon that exits cleanly
+/// takes the lock file with it — after the fact there is nothing left to check
+/// liveness against.
+fn daemon_lock_pid(repo_root: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(repo_root.join(".travsr/daemon.lock"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// Wait up to `timeout` for `pid` to disappear. Returns `true` if it did.
+///
+/// #541: `Shutdown` being acknowledged only means the daemon *received* the
+/// request. The process tears down a watcher, a scheduler and a store after
+/// that, so "stopped" is a claim that has to be checked rather than assumed.
+///
+/// Races with PID reuse: if the daemon exits and the OS recycles its number
+/// onto an unrelated process inside the window, this reports "still running"
+/// and `daemon stop` fails where it should have succeeded. The failure
+/// direction is the safe one — it tells the user to check rather than claiming
+/// a stop that did not happen — and `pid_is_alive` is the convention the rest
+/// of this file already uses for liveness. A stronger signal exists (a clean
+/// exit releases the `flock` on `daemon.lock`, so re-acquirability
+/// distinguishes "my daemon" from "some new process with its number"), and is
+/// the right upgrade if this ever misfires in practice.
+fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let cutoff = std::time::Instant::now() + timeout;
+    loop {
+        if !pid_is_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= cutoff {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// How long `daemon stop` waits for the process to actually exit before
+/// reporting that it is still running (#541). Generous enough for a teardown
+/// that has to flush a store, short enough to stay scriptable.
+const STOP_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Check whether a process with the given PID is currently alive.
 /// Uses `kill -0` on Unix and `tasklist` on Windows (no signal sent).
 fn pid_is_alive(pid: u32) -> bool {
@@ -876,6 +961,57 @@ mod tests {
         assert!(
             !pid_is_alive(pid),
             "an exited, reaped child must be reported dead"
+        );
+    }
+
+    /// #541: `daemon stop` reports success only once the process is actually
+    /// gone, so the wait has to distinguish "exited" from "still there" rather
+    /// than trusting the Shutdown acknowledgement.
+    #[test]
+    fn wait_for_exit_detects_an_exited_process() {
+        let mut child = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        }
+        .spawn()
+        .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait for child");
+        assert!(
+            wait_for_exit(pid, std::time::Duration::from_secs(5)),
+            "an exited process must be observed as gone"
+        );
+    }
+
+    #[test]
+    fn wait_for_exit_times_out_on_a_process_that_stays_up() {
+        // The #541 case: Shutdown was acknowledged but the daemon never went
+        // away. This must be reported, not silently treated as success.
+        assert!(
+            !wait_for_exit(std::process::id(), std::time::Duration::from_millis(150)),
+            "a process that is still running must not be reported as exited"
+        );
+    }
+
+    /// The PID has to be read before the stop request, since a clean shutdown
+    /// deletes the lock file and leaves nothing to check liveness against.
+    #[test]
+    fn daemon_lock_pid_reads_the_lock_file_and_tolerates_its_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(daemon_lock_pid(dir.path()), None, "no .travsr yet");
+
+        std::fs::create_dir_all(dir.path().join(".travsr")).unwrap();
+        std::fs::write(dir.path().join(".travsr/daemon.lock"), "4242\n").unwrap();
+        assert_eq!(daemon_lock_pid(dir.path()), Some(4242));
+
+        std::fs::write(dir.path().join(".travsr/daemon.lock"), "not-a-pid").unwrap();
+        assert_eq!(
+            daemon_lock_pid(dir.path()),
+            None,
+            "a corrupt lock file must not panic or yield a bogus pid"
         );
     }
 }
