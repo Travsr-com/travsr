@@ -70,6 +70,9 @@ opentelemetry-otlp    = { version = "0.32", default-features = false, features =
 tracing-opentelemetry = "0.33"
 rusqlite = { version = "0.39", features = ["bundled"] }
 sha2 = "0.11"
+tar = "0.4"
+flate2 = "1.1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 tempfile = "3"

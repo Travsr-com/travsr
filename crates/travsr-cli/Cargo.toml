@@ -43,6 +43,9 @@ dirs = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+zip = { workspace = true }
 uuid = { workspace = true }
 fs2  = { workspace = true }
 ctrlc = { workspace = true }

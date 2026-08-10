@@ -322,26 +322,13 @@ pub async fn install_share_assets(version: &str, binary_name: &str) -> Result<()
     std::fs::create_dir_all(&share_dir)
         .with_context(|| format!("creating {}", share_dir.display()))?;
 
-    let tmp = share_dir
-        .parent()
-        .unwrap()
-        .join(format!("{asset}.tmp.{}", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, &bytes)
-        .with_context(|| format!("writing temp tarball {}", tmp.display()))?;
-
-    let status = std::process::Command::new("tar")
-        .args([
-            "-xzf",
-            tmp.to_str().unwrap(),
-            "-C",
-            share_dir.to_str().unwrap(),
-        ])
-        .status()
-        .context("running tar to extract share assets")?;
-
-    let _ = std::fs::remove_file(&tmp);
-
-    anyhow::ensure!(status.success(), "tar extraction failed for {asset}");
+    // #410 M1: extracted in-process, with every entry path checked against the
+    // destination first. Shelling out to `tar` left traversal behaviour up to
+    // whichever implementation the host shipped, and needed the two
+    // `to_str().unwrap()` calls that panicked on a non-UTF-8 home directory.
+    // No temp file either: the bytes are already in memory.
+    extract_tar_gz(&bytes, &share_dir)
+        .with_context(|| format!("extracting {asset} into {}", share_dir.display()))?;
     Ok(())
 }
 
@@ -521,28 +508,11 @@ pub async fn download_zip_and_extract(
         .join(extract_dir);
     std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
 
-    let tmp = dest.join("_download.zip");
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing zip to {}", tmp.display()))?;
-
-    // #502: Windows ships no `unzip`, but its tar.exe is bsdtar, which
-    // extracts zip archives natively (already used for tarballs above).
-    #[cfg(windows)]
-    let status = std::process::Command::new("tar")
-        .args(["-xf", &tmp.to_string_lossy(), "-C", &dest.to_string_lossy()])
-        .status()
-        .context("running tar to extract zip")?;
-
-    #[cfg(not(windows))]
-    let status = std::process::Command::new("unzip")
-        .args(["-qo", &tmp.to_string_lossy(), "-d", &dest.to_string_lossy()])
-        .status()
-        .context("running unzip — ensure unzip is installed")?;
-
-    let _ = std::fs::remove_file(&tmp);
-
-    if !status.success() {
-        bail!("zip extraction exited with {status}");
-    }
+    // #410 M1: extracted in-process with per-entry path validation. Shelling
+    // out meant `unzip` had to exist (it does not on plenty of systems, and
+    // Windows needed a separate bsdtar branch), and traversal behaviour varied
+    // by implementation. No temp file: the bytes are already in memory.
+    extract_zip(&bytes, &dest).with_context(|| format!("extracting {asset_name}"))?;
 
     Ok(dest)
 }
@@ -740,5 +710,264 @@ mod tests {
         let h = hex_encode_sha256(b"hello world");
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
+
+// ── #410 M1: in-process archive extraction ────────────────────────────────────
+//
+// The download paths used to shell out to `tar -xzf` and `unzip -qo`. Two
+// problems with that, beyond the obvious dependency on those binaries existing:
+//
+//  1. A release asset carrying `../` entries could write outside the
+//     destination (zip-slip / tar traversal), and whether it did depended on
+//     which implementation the host shipped — GNU tar, bsdtar and busybox all
+//     differ, so the safety of an install varied by machine.
+//  2. `unzip` is simply absent on many systems, failing the install with an
+//     error that says nothing useful.
+//
+// Extracting in-process fixes both, and makes the traversal check something
+// this repo owns and can test rather than something it inherits.
+
+/// Largest archive accepted for extraction.
+///
+/// The binary download paths already cap at 100 MB (`SIZE_LIMIT`) and 200 MB
+/// (`SCIP_SIZE_LIMIT`); the archive paths had no cap at all and buffered the
+/// whole response in memory. This matches the larger of the two, since share
+/// bundles and language toolchains are the biggest things fetched.
+const MAX_ARCHIVE_BYTES: usize = 200 * 1024 * 1024;
+
+/// Resolve `entry` against `dest`, rejecting anything that escapes it.
+///
+/// Rejects absolute paths, drive prefixes and any `..` component. Checked on
+/// the *declared* entry name before a single byte is written, so a hostile
+/// archive cannot act through a path that is only assembled later.
+///
+/// Symlink entries are refused outright by the callers rather than resolved:
+/// a link written first can redirect a later regular-file entry outside the
+/// destination even when both names look harmless on their own.
+fn safe_entry_path(dest: &std::path::Path, entry: &std::path::Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let mut out = dest.to_path_buf();
+    for c in entry.components() {
+        match c {
+            Component::Normal(part) => out.push(part),
+            // `.` is meaningless but harmless; everything else can escape.
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("archive entry escapes the destination: {}", entry.display())
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("archive entry is absolute: {}", entry.display())
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Extract a gzipped tarball into `dest`, in-process.
+pub(crate) fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(
+        bytes.len() <= MAX_ARCHIVE_BYTES,
+        "archive is {} bytes, over the {MAX_ARCHIVE_BYTES}-byte limit",
+        bytes.len()
+    );
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().context("reading tar entries")? {
+        let mut entry = entry.context("reading a tar entry")?;
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            bail!(
+                "archive contains a link entry ({}), which is not extracted",
+                entry.path().unwrap_or_default().display()
+            );
+        }
+        if !kind.is_file() && !kind.is_dir() {
+            continue; // devices, fifos and the like have no place in a release asset
+        }
+        let declared = entry
+            .path()
+            .context("tar entry has no usable path")?
+            .into_owned();
+        let target = safe_entry_path(dest, &declared)?;
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target)
+                .with_context(|| format!("creating {}", target.display()))?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        entry
+            .unpack(&target)
+            .with_context(|| format!("writing {}", target.display()))?;
+    }
+    Ok(())
+}
+
+/// Extract a zip archive into `dest`, in-process.
+pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(
+        bytes.len() <= MAX_ARCHIVE_BYTES,
+        "archive is {} bytes, over the {MAX_ARCHIVE_BYTES}-byte limit",
+        bytes.len()
+    );
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("reading zip archive")?;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).context("reading a zip entry")?;
+        // `enclosed_name` is the crate's own traversal guard; `safe_entry_path`
+        // is applied as well so the rule this repo enforces is stated here and
+        // covered by its own tests, rather than resting on an upstream default.
+        let declared = file
+            .enclosed_name()
+            .ok_or_else(|| anyhow::anyhow!("zip entry has an unsafe name: {}", file.name()))?;
+        let target = safe_entry_path(dest, &declared)?;
+        if file.is_dir() {
+            std::fs::create_dir_all(&target)
+                .with_context(|| format!("creating {}", target.display()))?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut out = std::fs::File::create(&target)
+            .with_context(|| format!("creating {}", target.display()))?;
+        std::io::copy(&mut file, &mut out)
+            .with_context(|| format!("writing {}", target.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::{extract_tar_gz, extract_zip, safe_entry_path, MAX_ARCHIVE_BYTES};
+    use std::path::Path;
+
+    #[test]
+    fn safe_entry_path_rejects_escapes() {
+        let dest = Path::new("/tmp/dest");
+        assert!(safe_entry_path(dest, Path::new("a/b.txt")).is_ok());
+        assert!(safe_entry_path(dest, Path::new("./a/b.txt")).is_ok());
+
+        // The zip-slip / tar-traversal shapes.
+        assert!(safe_entry_path(dest, Path::new("../evil")).is_err());
+        assert!(safe_entry_path(dest, Path::new("a/../../evil")).is_err());
+        assert!(safe_entry_path(dest, Path::new("/etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn safe_entry_path_keeps_everything_under_dest() {
+        let dest = Path::new("/tmp/dest");
+        let got = safe_entry_path(dest, Path::new("./nested/./file.txt")).unwrap();
+        assert_eq!(got, Path::new("/tmp/dest/nested/file.txt"));
+        assert!(got.starts_with(dest));
+    }
+
+    /// Build a gzipped tar in memory containing one entry named `name`.
+    ///
+    /// The name is written straight into the raw header field rather than
+    /// through `append_data`, because the `tar` crate's *writer* refuses to
+    /// emit a `..` path. A hostile archive would not be produced by that
+    /// writer, so a test that could only build well-formed names would never
+    /// exercise the case the extractor exists to reject.
+    fn tar_gz_with(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        {
+            let raw = header.as_old_mut();
+            raw.name[..name.len()].copy_from_slice(name.as_bytes());
+        }
+        header.set_cksum();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append(&header, body).unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn a_traversing_tar_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let err = extract_tar_gz(&tar_gz_with("../escaped.txt", b"pwned"), &dest).unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err}");
+        assert!(
+            !dir.path().join("escaped.txt").exists(),
+            "nothing may be written outside the destination"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_tar_entry_extracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_tar_gz(&tar_gz_with("share/data.txt", b"hello"), &dest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("share/data.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn an_oversized_archive_is_refused_before_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized = vec![0u8; MAX_ARCHIVE_BYTES + 1];
+        let err = extract_tar_gz(&oversized, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
+        let err = extract_zip(&oversized, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
+    }
+
+    /// Note on what this proves: the zip path has two independent guards, the
+    /// crate's `enclosed_name` and `safe_entry_path`. This asserts the property
+    /// that matters (nothing lands outside the destination), so it holds while
+    /// either guard does — removing `safe_entry_path` alone leaves it green.
+    /// The equivalent tar test *is* load-bearing for our own check, since the
+    /// `tar` crate hands the declared path through unexamined.
+    #[test]
+    fn a_traversing_zip_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>("../escaped.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut w, b"pwned").unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+
+        assert!(extract_zip(&bytes, &dest).is_err());
+        assert!(
+            !dir.path().join("escaped.txt").exists(),
+            "nothing may be written outside the destination"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_zip_entry_extracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file::<_, ()>("bin/tool", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut w, b"binary").unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+
+        extract_zip(&bytes, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
     }
 }
