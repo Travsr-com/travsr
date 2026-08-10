@@ -5483,10 +5483,14 @@ mod tests {
         );
         store.put_node(&special).unwrap();
 
-        // Force the generic token below the cut so the suppressed path is the
-        // one under test, using the documented env knob rather than relying on
-        // this fixture's IDF happening to fall the right side of the default.
-        std::env::set_var("TRAVSR_ANCHOR_EMIT_CUT", "0.90");
+        // No env knob: `get` appears in 40 of 41 nodes, so
+        // `idf_weight(40, 41) = ln(42/41)/ln(42)` clamps to 0.05, below the
+        // 0.15 default cut. An earlier draft set `TRAVSR_ANCHOR_EMIT_CUT`
+        // instead, which is process-global — Rust runs tests as threads in one
+        // process, so it changed the cut underneath whatever else was running
+        // and broke an unrelated seed test on macOS CI. A test that has to
+        // mutate global state to reach its case is testing the knob, not the
+        // behaviour.
         let empty: HashMap<NodeId, f32> = HashMap::new();
         let report = explain_seed_set(
             &store,
@@ -5497,7 +5501,6 @@ mod tests {
             &empty,
             None,
         );
-        std::env::remove_var("TRAVSR_ANCHOR_EMIT_CUT");
 
         for t in &report.tokens {
             if !t.is_anchor_emit {
