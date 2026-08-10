@@ -124,6 +124,25 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
                 .map(|s| format!("  top_node={s}"))
                 .unwrap_or_default()
         );
+        // #540: a token that legitimately names more symbols than the anchor
+        // stage can hold loses the rest to a capacity cut, not to any relevance
+        // signal. Nothing else in this output distinguishes "ranked low" from
+        // "never considered", so a symbol the user expected can be absent with
+        // no trace at all.
+        //
+        // States the condition and stops there. An earlier draft appended "add
+        // a distinguishing term", which is sound advice for a single-token
+        // query and wrong for a multi-token one — the note fires per token, so
+        // it also prints beside a token whose siblings already resolved the
+        // query successfully, where there is nothing to fix.
+        if t.symbol_freq > t.anchor_considered {
+            println!(
+                "      note: names {} symbols, {} reached the anchor set — {} were cut on capacity, not relevance",
+                t.symbol_freq,
+                t.anchor_considered,
+                t.symbol_freq - t.anchor_considered
+            );
+        }
     }
 
     if let Some(legs) = &report.legs {

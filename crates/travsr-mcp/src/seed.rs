@@ -1880,7 +1880,48 @@ const ANCHOR_NEIGHBORHOOD_CAP: usize = 2_000;
 const ANCHOR_NEIGHBORHOOD_HOPS: usize = 2;
 /// Max forward callees seeded per query from the exact anchors (ranked by
 /// `kind_boost`), so anchor-callee seeding cannot flood the personalisation vector.
+/// Anchors emitted per query token.
+///
+/// #540: named rather than repeated inline so `travsr explain` can report the
+/// shortfall against the value actually used, instead of restating a literal
+/// that could drift away from it.
+pub(crate) const MAX_ANCHORS_PER_TOKEN: usize = 3;
+
 const MAX_ANCHOR_CALLEE_SEEDS: usize = 8;
+
+#[cfg(test)]
+mod anchor_capacity_tests {
+    use super::MAX_ANCHORS_PER_TOKEN;
+
+    /// #540: `explain` reports the shortfall as
+    /// `symbol_freq - min(symbol_freq, MAX_ANCHORS_PER_TOKEN)`. Pinning the
+    /// arithmetic here keeps that report honest if the cap ever moves — the
+    /// whole point of naming the constant was that the note must not restate a
+    /// literal that has drifted away from the code.
+    fn considered(symbol_freq: usize) -> usize {
+        symbol_freq.min(MAX_ANCHORS_PER_TOKEN)
+    }
+
+    #[test]
+    fn a_token_naming_more_symbols_than_the_cap_reports_the_shortfall() {
+        // The issue's own case: "sqlite" naming ~168 symbols.
+        assert_eq!(considered(168), MAX_ANCHORS_PER_TOKEN);
+        assert_eq!(168 - considered(168), 168 - MAX_ANCHORS_PER_TOKEN);
+    }
+
+    #[test]
+    fn a_token_within_the_cap_reports_no_shortfall() {
+        // "journal" named 2 symbols in the same query and carried it — no note
+        // should fire for a token that lost nothing.
+        assert_eq!(considered(2), 2);
+        assert_eq!(2 - considered(2), 0);
+        assert_eq!(
+            MAX_ANCHORS_PER_TOKEN - considered(MAX_ANCHORS_PER_TOKEN),
+            0,
+            "exactly at the cap is not a shortfall"
+        );
+    }
+}
 /// Base weight for an anchor-callee seed before `kind_boost`. High enough that the
 /// delegated function body ranks as a real dependency, below an exact anchor's
 /// floated weight so it never outranks the named symbol itself.
@@ -2118,9 +2159,9 @@ pub(crate) fn build_seed_set(
         let ordered: Vec<&CoreNode> = if anchor_kind_priority {
             order_anchor_candidates(&exact_nodes, anchor_reorder_window)
         } else {
-            exact_nodes.iter().take(3).collect()
+            exact_nodes.iter().take(MAX_ANCHORS_PER_TOKEN).collect()
         };
-        for node in ordered.into_iter().take(3) {
+        for node in ordered.into_iter().take(MAX_ANCHORS_PER_TOKEN) {
             // RFC-022 D3: stricter anchor-pool gate than the general `is_noise_seed`
             // — also drops CI/workflow `pkg:` nodes and in-src test symbols so they
             // cannot out-anchor the real implementation or trigger a false G1 bypass.
@@ -2815,6 +2856,11 @@ pub struct ExplainToken {
     pub resolved: bool,
     pub is_anchor_emit: bool,
     pub top_node_signature: Option<String>,
+    /// #540: how many of this token's `symbol_freq` matches could reach the
+    /// anchor stage. When it is lower, the rest lost to a capacity cut rather
+    /// than to any relevance signal, and nothing else in the output says so —
+    /// which is the difference between a diagnosable answer and a silent one.
+    pub anchor_considered: usize,
 }
 
 /// One leg's raw (pre-fusion) rank + score for the explained node, from
@@ -2921,6 +2967,7 @@ pub(crate) fn explain_seed_set(
             idf_w: t.idf_w,
             resolved: t.resolved,
             is_anchor_emit: t.idf_w >= anchor_emit_cut(),
+            anchor_considered: t.symbol_freq.min(MAX_ANCHORS_PER_TOKEN),
             top_node_signature: t
                 .top_node
                 .and_then(|id| store.get_node(id).ok().flatten())
