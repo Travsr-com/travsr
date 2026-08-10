@@ -788,16 +788,25 @@ async fn download_embed_binary(
         tokio::try_join!(client.get(&url).send(), client.get(&sha_url).send())
             .context("sending download requests")?;
 
-    if bin_resp.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!(
-            "download failed (404 Not Found): {url}\n\
+    // A 404 on either the binary or its .sha256 sidecar gets the same hint: a
+    // partial release (binary present, sidecar missing) is just as much a
+    // "this release has no usable asset for this target" as a missing binary.
+    let hint_404 = |what: &str, u: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "{what} download failed (404 Not Found): {u}\n\
              {github_repo} {version} has no prebuilt binary for {target} — \
              this platform may not be supported by that release yet \
              (see https://github.com/{github_repo}/issues)"
-        );
+        )
+    };
+    if bin_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(hint_404("binary", &url));
     }
     if !bin_resp.status().is_success() {
         bail!("download failed ({}): {url}", bin_resp.status());
+    }
+    if sha_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(hint_404("SHA256", &sha_url));
     }
     if !sha_resp.status().is_success() {
         bail!("SHA256 download failed ({}): {sha_url}", sha_resp.status());
