@@ -11,7 +11,9 @@
 //!
 //! # Algorithm (ADR-007 for λ only)
 //! 1. Build a bounded local subgraph via bidirectional BFS from source + sink (depth 5).
-//! 2. Map to a petgraph `DiGraph` with edge costs = `1.0 - ppr_weight`.
+//! 2. Map to a petgraph `DiGraph` with edge costs = `1.0 / ppr_weight`
+//!    (#527: was `1.0 - ppr_weight`, which made `ref/call` free and the λ
+//!    corridor unbounded — see `edge_cost`).
 //! 3. Run Dijkstra from source; extract the minimum-cost path to sink.
 //! 4. Include nodes within λ of the optimal path cost (λ = 0.5, ADR-007).
 //! 5. On missing source/sink, or when no path exists: fall back to BFS depth-3.
@@ -33,6 +35,79 @@ use crate::rbac::EdgeFilter;
 
 /// PCST penalty parameter λ (ADR-007). Controls node-exclusion penalty weight.
 const PCST_LAMBDA: f32 = 0.5;
+
+/// λ, overridable via `TRAVSR_PCST_LAMBDA` for experimentation.
+///
+/// Mirrors the `TRAVSR_PPR_*` knobs in `ppr.rs` (ADR-003 §Overrides): a way to
+/// sweep the constant against a benchmark, **not** a production configuration
+/// surface. Added for #527, where λ could not previously be evaluated at all —
+/// `ref/call` cost 0 made the corridor threshold 0 for every λ, so no sweep
+/// could have distinguished one value from another.
+///
+/// Rejects non-finite and negative values; 0.0 is allowed and means "route
+/// only, no corridor".
+fn pcst_lambda() -> f32 {
+    parse_lambda(std::env::var("TRAVSR_PCST_LAMBDA").ok())
+}
+
+/// The validation half of [`pcst_lambda`], split out so it can be tested.
+///
+/// Reading the variable inside the test would race: `pcst_path` calls
+/// `pcst_lambda`, so a test that sets `TRAVSR_PCST_LAMBDA` changes the corridor
+/// under every other pcst test running concurrently in the same binary. Taking
+/// the raw value as an argument tests the shipped predicate without touching
+/// the process environment.
+fn parse_lambda(raw: Option<String>) -> f32 {
+    raw.and_then(|v| v.parse().ok())
+        .filter(|x: &f32| x.is_finite() && *x >= 0.0)
+        .unwrap_or(PCST_LAMBDA)
+}
+
+/// Traversal cost of an edge: the reciprocal of its PPR weight.
+///
+/// #527: this was `1.0 - ppr_weight`, which gives `ref/call` — the strongest
+/// edge kind, weight 1.00 — a cost of **exactly zero**. A route made of
+/// `ref/call` edges then has `total_cost = 0`, and the λ corridor threshold is
+///
+/// ```text
+/// total_cost * (1.0 + PCST_LAMBDA)  ==  0 * anything  ==  0
+/// ```
+///
+/// so `c <= threshold` admits every node sitting at cost 0 — the source's
+/// entire `ref/call`-reachable component. That is why ~78% of a
+/// `get_execution_path` response was corridor padding, and why λ had no
+/// observable effect at any value: the corridor was never actually bounded by
+/// it. Tuning λ first would have been measuring a knob that was disconnected.
+///
+/// The reciprocal keeps the ordering the weights encode (a stronger edge is
+/// still cheaper to traverse) while making nothing free, so λ becomes a real
+/// bound. Weights are a closed set in `EdgeKind::ppr_weight` with no zero and
+/// no catch-all arm, but a non-positive weight would produce an infinite or
+/// negative cost and quietly corrupt Dijkstra, so it is clamped rather than
+/// trusted.
+fn edge_cost(kind: &travsr_core::EdgeKind) -> f32 {
+    cost_from_weight(kind.ppr_weight())
+}
+
+/// The arithmetic half of [`edge_cost`], split out so the clamp can be tested.
+///
+/// `EdgeKind::ppr_weight` is a closed match with no zero and no catch-all, so
+/// the clamp branch is unreachable through `edge_cost` and there is no way to
+/// exercise it from the enum. Taking the weight directly is the only way to
+/// prove the guard does what its comment claims.
+fn cost_from_weight(w: f32) -> f32 {
+    if w > 0.0 {
+        1.0 / w
+    } else {
+        // Unreachable with today's table; a new zero-weight kind should be
+        // maximally expensive, not free or infinite.
+        MAX_EDGE_COST
+    }
+}
+
+/// Cost assigned to an edge whose PPR weight is non-positive. Above every real
+/// cost in the table (`overrides` is the most expensive at 1/0.30 = 3.33).
+const MAX_EDGE_COST: f32 = 10.0;
 
 /// Maximum nodes in the local subgraph built by the bidirectional BFS expansion.
 const MAX_LOCAL_NODES: usize = 2_000;
@@ -99,19 +174,20 @@ pub fn pcst_path(
         return bfs_fallback(store, source, filter, token_budget);
     };
 
-    // Dijkstra from source: cost = 1.0 - ppr_weight (lower = more traversable).
+    // Dijkstra from source: cost = 1.0 / ppr_weight (lower = more traversable).
     // Determinism: pass `None` as the goal so the FULL local component settles.
-    // With an early-exit goal, zero-cost ref/call edges leave many nodes tied
-    // at cost 0 and WHICH of them settle before the sink varies with HashMap
-    // iteration order run-to-run. The component is capped at MAX_LOCAL_NODES
-    // (2000), so settling the full component is cheap.
+    // Cost depends only on edge kind, so every route of the same shape scores
+    // the same and ties are common (every `ref/call` hop costs exactly 1.0).
+    // With an early-exit goal, WHICH of the tied nodes settle before the sink
+    // varies with HashMap iteration order run-to-run. The component is capped
+    // at MAX_LOCAL_NODES (2000), so settling the full component is cheap.
     let costs = dijkstra(&graph, src_idx, None, |e| *e.weight());
 
     // Reconstruct the actual source→sink route. The route must LEAD the result:
     // downstream consumers truncate (token budget here, 4 KiB sanitizer at the
-    // MCP boundary), and ref/call edges cost 0 (ppr_weight 1.0) so the λ
-    // threshold can admit the source's whole zero-cost component — a sink
-    // appended after that blob would be cut off every time.
+    // MCP boundary), and the λ corridor still admits far more than the route —
+    // measured at ~37-43 nodes for a 3-to-5 node route on this repo's own graph
+    // (#527). A sink appended after that blob would be cut off every time.
     let Some((total_cost, route)) = astar(
         &graph,
         src_idx,
@@ -136,7 +212,7 @@ pub fn pcst_path(
 
     // Then context: nodes whose cheapest-path cost is within λ × total_cost of
     // optimal, cheapest first (deterministic — `costs` is a HashMap).
-    let threshold = total_cost * (1.0 + PCST_LAMBDA);
+    let threshold = total_cost * (1.0 + pcst_lambda());
     let mut context: Vec<(f32, NodeId)> = costs
         .iter()
         .filter(|(_, &c)| c <= threshold)
@@ -261,7 +337,7 @@ fn expand_local_subgraph(
             }
             // C-1: Only add edge if not already present (dedup forward+reverse overlap).
             if edge_set.insert((current, edge.dst)) {
-                let cost = 1.0 - edge.kind.ppr_weight();
+                let cost = edge_cost(&edge.kind);
                 edges.push((current, edge.dst, cost));
             }
             if depth < max_depth && fwd_visited.insert(edge.dst) {
@@ -303,7 +379,7 @@ fn expand_local_subgraph(
             // Add the forward edge (src→current) to the local graph.
             // C-1: deduplicate against edges already added by the forward pass.
             if edge_set.insert((edge.src, current)) {
-                let cost = 1.0 - edge.kind.ppr_weight();
+                let cost = edge_cost(&edge.kind);
                 edges.push((edge.src, current, cost));
             }
             if depth < max_depth && rev_visited.insert(edge.src) {
@@ -413,6 +489,106 @@ fn bfs_fallback(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod edge_cost_tests {
+    use super::{
+        cost_from_weight, edge_cost, parse_lambda, pcst_lambda, MAX_EDGE_COST, PCST_LAMBDA,
+    };
+    use travsr_core::EdgeKind;
+
+    /// #527: the defect. `1.0 - ppr_weight` gave `ref/call` (weight 1.00) a
+    /// cost of exactly zero, so a route of `ref/call` edges had `total_cost =
+    /// 0` and the corridor threshold `total_cost * (1.0 + λ)` was zero for
+    /// **every** λ. The filter `c <= 0` then admitted the source's whole
+    /// zero-cost component, and no λ value could have changed that.
+    #[test]
+    fn no_edge_kind_is_free_to_traverse() {
+        for kind in [
+            EdgeKind::RefCall,
+            EdgeKind::FFICall,
+            EdgeKind::DefinesBinding,
+            EdgeKind::Exports,
+            EdgeKind::Depends,
+            EdgeKind::ResolvesTo,
+            EdgeKind::RefImports,
+            EdgeKind::IsImplementation,
+            EdgeKind::Configures,
+            EdgeKind::Overrides,
+            EdgeKind::ExternalDependency,
+        ] {
+            let c = edge_cost(&kind);
+            assert!(
+                c > 0.0 && c.is_finite(),
+                "{kind:?} costs {c}, which makes the λ corridor unbounded"
+            );
+        }
+    }
+
+    /// The weights encode a preference order; the cost function must not
+    /// invert it. A stronger edge stays cheaper to traverse.
+    #[test]
+    fn a_stronger_edge_stays_cheaper() {
+        assert!(edge_cost(&EdgeKind::RefCall) < edge_cost(&EdgeKind::Depends));
+        assert!(edge_cost(&EdgeKind::Depends) < edge_cost(&EdgeKind::Overrides));
+        assert!(edge_cost(&EdgeKind::FFICall) < edge_cost(&EdgeKind::DefinesBinding));
+    }
+
+    /// `ppr_weight` is a closed match with no zero and no catch-all today, so
+    /// this is unreachable — which is the point. A future zero-weight kind
+    /// would divide to infinity and corrupt Dijkstra silently; it is clamped
+    /// to the most expensive cost instead, never to free.
+    #[test]
+    fn a_hypothetical_zero_weight_is_expensive_not_infinite() {
+        assert_eq!(
+            cost_from_weight(0.0),
+            MAX_EDGE_COST,
+            "a zero weight must clamp, not divide to infinity"
+        );
+        assert_eq!(
+            cost_from_weight(-1.0),
+            MAX_EDGE_COST,
+            "a negative weight must clamp, not produce a negative cost"
+        );
+        assert!(
+            cost_from_weight(0.0).is_finite(),
+            "an infinite cost would corrupt Dijkstra silently"
+        );
+        assert!(
+            MAX_EDGE_COST > edge_cost(&EdgeKind::Overrides),
+            "the fallback must be costlier than every real edge"
+        );
+    }
+
+    /// The λ override exists to sweep the constant against the #533 harness,
+    /// not as a configuration surface. It must refuse values that would make
+    /// the threshold meaningless.
+    #[test]
+    fn the_lambda_override_rejects_nonsense_and_defaults_otherwise() {
+        // No env var set in this process: the ADR-007 constant stands.
+        assert_eq!(pcst_lambda(), PCST_LAMBDA);
+
+        // Accepted: values the sweep would legitimately pass.
+        let lam = |v: &str| parse_lambda(Some(v.to_string()));
+        assert_eq!(lam("0.0"), 0.0, "0 means route-distance only");
+        assert_eq!(lam("0.25"), 0.25);
+        assert_eq!(lam("1.0"), 1.0);
+
+        // Rejected: each of these falls back to the constant rather than
+        // reaching the threshold. A negative λ shrinks the corridor below the
+        // route itself; NaN makes every `c <= threshold` comparison false and
+        // empties the corridor; inf admits the whole local subgraph.
+        for bad in ["-0.1", "NaN", "inf", "-inf", "abc", ""] {
+            assert_eq!(
+                lam(bad),
+                PCST_LAMBDA,
+                "{bad:?} must fall back to the ADR-007 default"
+            );
+        }
+        // Unset behaves the same as unparseable.
+        assert_eq!(parse_lambda(None), PCST_LAMBDA);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rbac::OpenFilter;
@@ -504,10 +680,11 @@ mod tests {
         let ids: Vec<_> = result.iter().map(|n| n.id).collect();
         assert!(ids.contains(&src.id), "source must be in path");
         assert!(ids.contains(&sink.id), "sink must be in path");
-        // Regression (#317): ref/call edges cost 0, so the λ threshold admits
-        // the entire zero-cost component. The route must lead the result —
-        // consumers truncate output, and a sink buried after thousands of
-        // context nodes is as bad as no sink at all.
+        // Regression (#317): the λ threshold admits far more than the route —
+        // here the source's whole fanout sits one hop away, inside the
+        // corridor. The route must lead the result: consumers truncate output,
+        // and a sink buried after thousands of context nodes is as bad as no
+        // sink at all.
         assert_eq!(ids[0], src.id, "route must start at source");
         assert_eq!(ids[1], sink.id, "direct route must place sink second");
     }
