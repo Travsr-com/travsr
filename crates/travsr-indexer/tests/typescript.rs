@@ -168,8 +168,9 @@ fn link_imports_emits_resolves_to_for_relative_import() {
 
     let edges = link_imports(&out.nodes, vname_path, "");
 
-    // Two candidates per relative import: .ts and .tsx
-    assert_eq!(edges.len(), 2, "expected one edge per extension candidate");
+    // #610: a TypeScript importer tries .ts, .tsx and .js — the last for
+    // `allowJs` interop, where a .ts file legitimately imports a .js module.
+    assert_eq!(edges.len(), 3, "expected one edge per extension candidate");
     assert!(
         edges.iter().all(|e| e.kind == EdgeKind::ResolvesTo),
         "all emitted edges must be ResolvesTo"
@@ -228,13 +229,68 @@ fn link_imports_skips_package_imports() {
 
     // 15 relative imports (./mcp, ./clientProxy, ./status, ./codelens, ./hover, ./tree,
     // ./repoFileTree, ./welcome, ./graph, ./installer, ./telemetry, ./commands,
-    // ./contextExplorer, ./mcpRegister, ./contextCodeAction) × 2 candidates each
-    // (.ts + .tsx probe) = 30 edges.  (contextProvider removed, 3 new panels added.)
+    // ./contextExplorer, ./mcpRegister, ./contextCodeAction) × 3 candidates each
+    // (#610: .ts + .tsx + .js probe) = 45 edges.
     assert_eq!(
         edges.len(),
-        30,
-        "15 relative imports × 2 extension candidates = 30 resolves-to edges"
+        45,
+        "15 relative imports × 3 extension candidates = 45 resolves-to edges"
     );
+}
+
+/// #610: a JavaScript importer must probe JavaScript extensions.
+///
+/// Only `.ts`/`.tsx` used to be tried, so `./animal` from a `.js` file produced
+/// candidates for `animal.ts` and `animal.tsx` — neither of which exists in a
+/// JS project. No JavaScript import resolved at all, whichever module syntax
+/// it used, which is why `get_blast_radius` on a JS module returned only the
+/// queried file.
+#[test]
+fn link_imports_probes_js_extensions_for_a_js_importer() {
+    use travsr_core::{NodeId, VName};
+
+    fn import_node(path: &str, spec: &str) -> travsr_core::Node {
+        travsr_analysis::emit::import_node("", path, spec)
+    }
+    fn file_id(path: &str) -> NodeId {
+        travsr_analysis::emit::file_node("", path).id
+    }
+    let _ = VName::new("", "", "", "", "");
+
+    let importer = "app/main.js";
+    let edges = link_imports(&[import_node(importer, "./animal")], importer, "");
+
+    assert_eq!(
+        edges.len(),
+        4,
+        "a .js importer probes js, jsx, mjs and cjs: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|e| e.dst == file_id("app/animal.js")),
+        "the .js candidate is the one that matters and was previously missing"
+    );
+    assert!(
+        !edges.iter().any(|e| e.dst == file_id("app/animal.ts")),
+        "a JS importer must not speculate about TypeScript targets"
+    );
+}
+
+/// A TypeScript importer keeps its existing candidates and gains `.js` for
+/// `allowJs` interop, where a `.ts` file legitimately imports a `.js` module.
+#[test]
+fn link_imports_keeps_ts_candidates_and_adds_js_interop() {
+    let importer = "app/main.ts";
+    let edges = link_imports(
+        &[travsr_analysis::emit::import_node("", importer, "./animal")],
+        importer,
+        "",
+    );
+    let dsts: Vec<travsr_core::NodeId> = edges.iter().map(|e| e.dst).collect();
+    for ext in ["ts", "tsx", "js"] {
+        let want = travsr_analysis::emit::file_node("", &format!("app/animal.{ext}")).id;
+        assert!(dsts.contains(&want), "missing .{ext} candidate");
+    }
+    assert_eq!(edges.len(), 3, "and nothing beyond those three");
 }
 
 #[test]
