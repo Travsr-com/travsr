@@ -158,17 +158,18 @@ pub fn pcst_path(
 
     // Dijkstra from source: cost = 1.0 / ppr_weight (lower = more traversable).
     // Determinism: pass `None` as the goal so the FULL local component settles.
-    // With an early-exit goal, zero-cost ref/call edges leave many nodes tied
-    // at cost 0 and WHICH of them settle before the sink varies with HashMap
-    // iteration order run-to-run. The component is capped at MAX_LOCAL_NODES
-    // (2000), so settling the full component is cheap.
+    // Cost depends only on edge kind, so every route of the same shape scores
+    // the same and ties are common (every `ref/call` hop costs exactly 1.0).
+    // With an early-exit goal, WHICH of the tied nodes settle before the sink
+    // varies with HashMap iteration order run-to-run. The component is capped
+    // at MAX_LOCAL_NODES (2000), so settling the full component is cheap.
     let costs = dijkstra(&graph, src_idx, None, |e| *e.weight());
 
     // Reconstruct the actual source→sink route. The route must LEAD the result:
     // downstream consumers truncate (token budget here, 4 KiB sanitizer at the
-    // MCP boundary), and ref/call edges cost 0 (ppr_weight 1.0) so the λ
-    // threshold can admit the source's whole zero-cost component — a sink
-    // appended after that blob would be cut off every time.
+    // MCP boundary), and the λ corridor still admits far more than the route —
+    // measured at ~37-43 nodes for a 3-to-5 node route on this repo's own graph
+    // (#527). A sink appended after that blob would be cut off every time.
     let Some((total_cost, route)) = astar(
         &graph,
         src_idx,
@@ -643,10 +644,11 @@ mod tests {
         let ids: Vec<_> = result.iter().map(|n| n.id).collect();
         assert!(ids.contains(&src.id), "source must be in path");
         assert!(ids.contains(&sink.id), "sink must be in path");
-        // Regression (#317): ref/call edges cost 0, so the λ threshold admits
-        // the entire zero-cost component. The route must lead the result —
-        // consumers truncate output, and a sink buried after thousands of
-        // context nodes is as bad as no sink at all.
+        // Regression (#317): the λ threshold admits far more than the route —
+        // here the source's whole fanout sits one hop away, inside the
+        // corridor. The route must lead the result: consumers truncate output,
+        // and a sink buried after thousands of context nodes is as bad as no
+        // sink at all.
         assert_eq!(ids[0], src.id, "route must start at source");
         assert_eq!(ids[1], sink.id, "direct route must place sink second");
     }
