@@ -221,22 +221,24 @@ pub async fn download_scip_binary(
     Ok(dest)
 }
 
-/// Downloads and installs a travsr-lang-* wrapper binary into ~/.travsr/bin/.
+/// Fetches a wrapper binary and its published `.sha256`, and returns the bytes
+/// only if they match.
 ///
-/// Downloads the binary and its .sha256 file in parallel, verifies integrity,
-/// then atomically renames into place. Returns the final install path.
-pub async fn download_and_install_wrapper(
+/// Split out of [`download_and_install_wrapper`] so the network and integrity
+/// half can be tested against a local fixture server (#410 T1). The install
+/// half needs `$HOME` and this half does not, and `base` is a parameter rather
+/// than a read of `TRAVSR_LANG_RELEASES_BASE` so tests need not mutate
+/// process-global environment that neighbouring tests also read.
+///
+/// A missing `.sha256` is a failure, not a skip: treating it as optional would
+/// mean an attacker who can delete one file downgrades every install to
+/// unverified.
+async fn fetch_and_verify_binary(
+    base: &str,
     version: &str,
     binary_name: &str,
     target: &str,
-) -> Result<PathBuf> {
-    if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
-        return Ok(travsr_bin_dir()?.join(binary_name));
-    }
-
-    let base =
-        std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
-
+) -> Result<Vec<u8>> {
     let bin_url = format!("{base}/download/{version}/{binary_name}-{target}");
     let sha_url = format!("{bin_url}.sha256");
 
@@ -276,6 +278,27 @@ pub async fn download_and_install_wrapper(
     if actual != expected {
         bail!("SHA256 mismatch for {binary_name}: expected {expected}, got {actual}");
     }
+
+    Ok(bin_bytes.to_vec())
+}
+
+/// Downloads and installs a travsr-lang-* wrapper binary into ~/.travsr/bin/.
+///
+/// Downloads the binary and its .sha256 file in parallel, verifies integrity,
+/// then atomically renames into place. Returns the final install path.
+pub async fn download_and_install_wrapper(
+    version: &str,
+    binary_name: &str,
+    target: &str,
+) -> Result<PathBuf> {
+    if std::env::var(SKIP_DOWNLOAD_ENV).is_ok() {
+        return Ok(travsr_bin_dir()?.join(binary_name));
+    }
+
+    let base =
+        std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
+
+    let bin_bytes = fetch_and_verify_binary(&base, version, binary_name, target).await?;
 
     // Atomic write: write to a temp path, then rename into place.
     let dest_dir = travsr_bin_dir()?;
@@ -1062,5 +1085,202 @@ mod extraction_tests {
 
         extract_zip(&bytes, &dest).unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
+    }
+}
+
+/// #410 T1 — the download half, against a local fixture server.
+///
+/// The extraction half is covered by `extraction_tests` above. What was left
+/// untested is everything between "a URL" and "verified bytes": status
+/// handling, the size guard, and whether integrity failures actually stop the
+/// install rather than merely logging.
+///
+/// `TRAVSR_LANG_RELEASES_BASE` exists precisely so these paths can be pointed
+/// somewhere local, but setting it here would be process-global and racy
+/// against tests that read it concurrently. [`fetch_and_verify_binary`] takes
+/// `base` as a parameter instead, so nothing here mutates the environment.
+#[cfg(test)]
+mod download_tests {
+    use super::{fetch_and_verify_binary, hex_encode_sha256, SIZE_LIMIT};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    struct Route {
+        path: String,
+        status: u16,
+        body: Vec<u8>,
+        /// Content-Length to advertise when it should differ from `body.len()`.
+        /// Lets the pre-download size guard be exercised without moving 100 MB
+        /// across a socket.
+        advertised_len: Option<u64>,
+    }
+
+    fn route(path: &str, status: u16, body: Vec<u8>) -> Route {
+        Route {
+            path: path.to_string(),
+            status,
+            body,
+            advertised_len: None,
+        }
+    }
+
+    /// Minimal HTTP/1.1 responder, hand-rolled rather than pulled in as a
+    /// dependency: the entire contract under test is status line,
+    /// Content-Length and body. Unknown paths are 404, which is what a real
+    /// release serves for an asset that was never published.
+    ///
+    /// Returns the base URL. The thread is detached and blocks on `accept`
+    /// until the process exits.
+    fn serve(routes: Vec<Route>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(peek) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(peek);
+
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+
+                // Drain headers so the client's write completes cleanly.
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) => break,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+
+                let matched = routes.iter().find(|r| r.path == path);
+                let (status, body, len) = match matched {
+                    Some(r) => (
+                        r.status,
+                        r.body.clone(),
+                        r.advertised_len.unwrap_or(r.body.len() as u64),
+                    ),
+                    None => (404, Vec::new(), 0),
+                };
+
+                let head = format!(
+                    "HTTP/1.1 {status} S\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    const VERSION: &str = "v1.2.3";
+    const BIN: &str = "travsr-lang-x";
+    const TARGET: &str = "aarch64-apple-darwin";
+
+    fn bin_path() -> String {
+        format!("/download/{VERSION}/{BIN}-{TARGET}")
+    }
+
+    fn sha_path() -> String {
+        format!("{}.sha256", bin_path())
+    }
+
+    /// `sha256sum` output shape: hash, two spaces, filename.
+    fn sha_line(body: &[u8]) -> Vec<u8> {
+        format!("{}  {BIN}-{TARGET}\n", hex_encode_sha256(body)).into_bytes()
+    }
+
+    async fn fetch(base: &str) -> anyhow::Result<Vec<u8>> {
+        fetch_and_verify_binary(base, VERSION, BIN, TARGET).await
+    }
+
+    #[tokio::test]
+    async fn a_binary_matching_its_published_sha256_is_returned() {
+        let body = b"#!/bin/sh\nexec real-tool \"$@\"\n".to_vec();
+        let base = serve(vec![
+            route(&bin_path(), 200, body.clone()),
+            route(&sha_path(), 200, sha_line(&body)),
+        ]);
+
+        assert_eq!(fetch(&base).await.unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn a_binary_swapped_after_publication_is_refused() {
+        // The published hash describes one payload; the server returns another.
+        // This is the whole point of shipping the .sha256 alongside.
+        let published = b"the tool that was signed for".to_vec();
+        let swapped = b"the tool that was served instead".to_vec();
+        let base = serve(vec![
+            route(&bin_path(), 200, swapped),
+            route(&sha_path(), 200, sha_line(&published)),
+        ]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        assert!(err.contains("SHA256 mismatch"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_sha256_fails_instead_of_installing_unverified() {
+        // Deleting one small file must not silently downgrade the install to
+        // unverified. The binary itself is served perfectly well here.
+        let body = b"plausible binary".to_vec();
+        let base = serve(vec![route(&bin_path(), 200, body)]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        assert!(
+            err.contains("SHA256 download failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_reports_the_url_it_tried() {
+        let body = b"orphan".to_vec();
+        let base = serve(vec![route(&sha_path(), 200, sha_line(&body))]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        assert!(err.contains("download failed"), "unexpected error: {err}");
+        assert!(
+            err.contains(&bin_path()),
+            "error should name the URL: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_binary_is_refused_before_its_body_is_read() {
+        // Advertise more than the cap while sending almost nothing: if the
+        // guard were moved to after the body read, this test would still pass
+        // but the process would have buffered the whole payload first. The
+        // small body is what proves the check fired on the header.
+        let body = b"x".to_vec();
+        let base = serve(vec![
+            Route {
+                path: bin_path(),
+                status: 200,
+                body: body.clone(),
+                advertised_len: Some(SIZE_LIMIT + 1),
+            },
+            route(&sha_path(), 200, sha_line(&body)),
+        ]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds 100 MB limit"),
+            "unexpected error: {err}"
+        );
     }
 }
