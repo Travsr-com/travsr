@@ -540,18 +540,23 @@ fn install_scip_github_binary(
         }
     };
 
-    // Fetch latest tag live; fall back to hardcoded version only on failure.
+    // #410 M2: an entry carrying a vendored hash is pinned, because the hash
+    // is only meaningful against one exact asset — resolving `releases/latest`
+    // would move the target out from under it on the next upstream release.
+    // Everything else keeps fetching the latest tag live.
     let repo = spec.repo.to_string();
-    let tag = match run_async(
-        async move { crate::install::fetch_latest_version_for_repo(&repo).await },
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "warning: could not fetch latest {} version ({e:#}), using {}",
-                spec.install_name, spec.version_fallback
-            );
-            spec.version_fallback.to_string()
+    let tag = if spec.sha256_fn.is_some() {
+        spec.version_fallback.to_string()
+    } else {
+        match run_async(async move { crate::install::fetch_latest_version_for_repo(&repo).await }) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not fetch latest {} version ({e:#}), using {}",
+                    spec.install_name, spec.version_fallback
+                );
+                spec.version_fallback.to_string()
+            }
         }
     };
 
@@ -574,9 +579,12 @@ fn install_scip_github_binary(
     let asset2 = asset_name.clone();
     let name2 = spec.install_name.to_string();
     let verify = spec.verify_sha256;
+    // Vendored hash for this exact (tag, target), when the upstream ships no
+    // sidecar. `None` leaves the sidecar / TLS-only path unchanged.
+    let expected = spec.sha256_fn.and_then(|f| f(&tag, target));
 
     match run_async(async move {
-        crate::install::download_scip_binary(&repo2, &tag2, &asset2, &name2, verify).await
+        crate::install::download_scip_binary(&repo2, &tag2, &asset2, &name2, verify, expected).await
     }) {
         Ok(path) => {
             println!(
@@ -610,17 +618,24 @@ fn install_zip_binary(
     entry: &travsr_plugin_host::phase_b::catalog::PhaseBEntry,
     spec: &ZipBinarySpec,
 ) -> Result<()> {
+    // #410 M2: same rule as the binary path — an entry carrying a vendored
+    // hash is pinned, because the hash only means anything against one exact
+    // asset. This was previously wired on the `GithubBinary` path only, which
+    // left the single `ZipBinary` entry (kotlin-language-server) reading
+    // `releases/latest` and never checking its hash at all.
     let repo = spec.repo.to_string();
-    let tag = match run_async(
-        async move { crate::install::fetch_latest_version_for_repo(&repo).await },
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "warning: could not fetch latest {} version ({e:#}), using {}",
-                spec.install_name, spec.version_fallback
-            );
-            spec.version_fallback.to_string()
+    let tag = if spec.sha256_fn.is_some() {
+        spec.version_fallback.to_string()
+    } else {
+        match run_async(async move { crate::install::fetch_latest_version_for_repo(&repo).await }) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not fetch latest {} version ({e:#}), using {}",
+                    spec.install_name, spec.version_fallback
+                );
+                spec.version_fallback.to_string()
+            }
         }
     };
 
@@ -631,9 +646,17 @@ fn install_zip_binary(
     let tag2 = tag.clone();
     let asset2 = asset_name.clone();
     let extract_dir = spec.extract_dir.to_string();
+    let expected = spec.sha256_fn.and_then(|f| f(&tag)).map(str::to_string);
 
     let extract_path = match run_async(async move {
-        crate::install::download_zip_and_extract(&repo2, &tag2, &asset2, &extract_dir).await
+        crate::install::download_zip_and_extract(
+            &repo2,
+            &tag2,
+            &asset2,
+            &extract_dir,
+            expected.as_deref(),
+        )
+        .await
     }) {
         Ok(p) => p,
         Err(e) => {

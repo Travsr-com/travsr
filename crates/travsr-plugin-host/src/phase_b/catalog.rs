@@ -37,6 +37,13 @@ pub struct ScipBinarySpec {
     pub version_fallback: &'static str,
     /// Whether the release page includes a `.sha256` sidecar file for integrity checking.
     pub verify_sha256: bool,
+    /// #410 M2: expected sha256 for `(tag, target)`, for upstreams that publish
+    /// no sidecar. `None` when the entry relies on a sidecar or on TLS alone.
+    ///
+    /// A vendored hash is only meaningful against a fixed asset, so an entry
+    /// that supplies one is also pinned to `version_fallback` rather than
+    /// resolving `releases/latest` — see `install_scip_github_binary`.
+    pub sha256_fn: Option<fn(tag: &str, target: &str) -> Option<&'static str>>,
 }
 
 /// Specifies a zip archive on GitHub Releases that must be extracted rather than
@@ -57,6 +64,9 @@ pub struct ZipBinarySpec {
     pub install_name: &'static str,
     /// Fallback version tag when the GitHub API is unreachable.
     pub version_fallback: &'static str,
+    /// #410 M2: expected sha256 of the zip for `tag`, for upstreams that
+    /// publish no sidecar. Pins the entry to `version_fallback` when present.
+    pub sha256_fn: Option<fn(tag: &str) -> Option<&'static str>>,
 }
 
 /// How to install the underlying SCIP tool once the travsr-lang wrapper is present.
@@ -86,6 +96,47 @@ pub fn scip_ruby_asset(_tag: &str, target: &str) -> Option<String> {
     match target {
         "aarch64-apple-darwin" => Some("scip-ruby-arm64-darwin".to_string()),
         "x86_64-unknown-linux-gnu" => Some("scip-ruby-x86_64-linux".to_string()),
+        _ => None,
+    }
+}
+
+/// #410 M2: vendored sha256 for pinned third-party assets whose upstreams
+/// publish no `.sha256` sidecar (kotlin-language-server, scip-ruby,
+/// scip-clang). scip-java is absent from this list on purpose — it does ship a
+/// sidecar, so it verifies through that instead.
+///
+/// Each value is the asset GitHub served for that exact tag, fetched over TLS
+/// on 2026-08-10. Pinned and checked, this detects an asset being replaced
+/// after the fact, which TLS alone does not. It does not attest that anyone
+/// reviewed the binary — a hash recorded this way is a fixity check, not a
+/// provenance one, and should not be read as the latter.
+pub fn kls_sha256(tag: &str) -> Option<&'static str> {
+    match tag {
+        "1.3.13" => Some("4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2"),
+        _ => None,
+    }
+}
+
+pub fn scip_ruby_sha256(tag: &str, target: &str) -> Option<&'static str> {
+    match (tag, target) {
+        ("scip-ruby-v0.4.7", "aarch64-apple-darwin") => {
+            Some("6a2bcda64ed385f0e99e92f9c5693296dc38325e4ed5ca91cd8e4b686ba14fb1")
+        }
+        ("scip-ruby-v0.4.7", "x86_64-unknown-linux-gnu") => {
+            Some("a068c7c3b2042b9eac563ce77ce35dcaca666b418530b1db9f932a3dbc7175dd")
+        }
+        _ => None,
+    }
+}
+
+pub fn scip_clang_sha256(tag: &str, target: &str) -> Option<&'static str> {
+    match (tag, target) {
+        ("v0.4.0", "aarch64-apple-darwin") => {
+            Some("ff042fbc8a029f09f4b69fc7692e290e21c52923593207ee52d4e7439473ec64")
+        }
+        ("v0.4.0", "x86_64-unknown-linux-gnu") => {
+            Some("06fd18c576f979a726c651594644ec4a35db4f471f2160b3f72eb89fa6001784")
+        }
         _ => None,
     }
 }
@@ -307,6 +358,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             install_name: "scip-java",
             version_fallback: "v0.12.3",
             verify_sha256: true,
+            sha256_fn: None,
         }),
         extensions: &[".java"],
         wrapper_version_fallback: "v0.1.0",
@@ -341,6 +393,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             binary_subpath: "server/bin/kotlin-language-server",
             install_name: "kotlin-language-server",
             version_fallback: "1.3.13",
+            sha256_fn: Some(kls_sha256),
         }),
         extensions: &[".kt", ".kts"],
         wrapper_version_fallback: "v0.1.0",
@@ -390,6 +443,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             install_name: "scip-ruby",
             version_fallback: "scip-ruby-v0.4.7",
             verify_sha256: false,
+            sha256_fn: Some(scip_ruby_sha256),
         }),
         extensions: &[".rb"],
         wrapper_version_fallback: "v0.1.0",
@@ -462,6 +516,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             install_name: "scip-clang",
             version_fallback: "v0.4.0",
             verify_sha256: false,
+            sha256_fn: Some(scip_clang_sha256),
         }),
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
         wrapper_version_fallback: "v0.1.0",
@@ -491,6 +546,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             install_name: "scip-clang",
             version_fallback: "v0.4.0",
             verify_sha256: false,
+            sha256_fn: Some(scip_clang_sha256),
         }),
         extensions: &[".c", ".h"],
         wrapper_version_fallback: "v0.1.0",
@@ -513,11 +569,12 @@ pub static CATALOG: &[PhaseBEntry] = &[
             repo: "Travsr-com/travsr-lang",
             asset_fn: swift_index_emitter_asset,
             install_name: "travsr-swift-index-emitter",
-            version_fallback: "v0.1.0",
-            verify_sha256: false,
+            version_fallback: "v0.3.0",
+            verify_sha256: true,
+            sha256_fn: None,
         }),
         extensions: &[".swift"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.3.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -537,11 +594,12 @@ pub static CATALOG: &[PhaseBEntry] = &[
             repo: "Travsr-com/travsr-lang",
             asset_fn: objc_index_emitter_asset,
             install_name: "travsr-lang-objectivec",
-            version_fallback: "v0.1.0",
-            verify_sha256: false,
+            version_fallback: "v0.3.0",
+            verify_sha256: true,
+            sha256_fn: None,
         }),
         extensions: &[".m", ".mm"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.3.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -568,11 +626,12 @@ pub static CATALOG: &[PhaseBEntry] = &[
             repo: "Travsr-com/travsr-lang",
             asset_fn: dart_scip_emitter_asset,
             install_name: "travsr-dart-index-emitter",
-            version_fallback: "v0.1.0",
-            verify_sha256: false,
+            version_fallback: "v0.3.0",
+            verify_sha256: true,
+            sha256_fn: None,
         }),
         extensions: &[".dart"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.3.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -582,4 +641,80 @@ pub static CATALOG: &[PhaseBEntry] = &[
 /// Look up a Phase B entry by canonical language string.
 pub fn lookup(language: &str) -> Option<&'static PhaseBEntry> {
     CATALOG.iter().find(|e| e.language == language)
+}
+
+#[cfg(test)]
+mod vendored_hash_tests {
+    use super::{kls_sha256, scip_clang_sha256, scip_ruby_sha256, ScipInstall, CATALOG};
+
+    /// The `GithubBinary` spec of an entry, if it has one. Kept local to the
+    /// tests rather than added to the production surface.
+    fn binary_spec(e: &super::PhaseBEntry) -> Option<&super::ScipBinarySpec> {
+        match &e.scip_install {
+            ScipInstall::GithubBinary(spec) => Some(spec),
+            _ => None,
+        }
+    }
+
+    /// #410 M2: a vendored hash is only meaningful against one exact asset, so
+    /// every entry carrying one must be pinned rather than resolving
+    /// `releases/latest`. `install_scip_github_binary` keys that decision off
+    /// `sha256_fn.is_some()`, so the invariant to hold here is that a hash is
+    /// only ever returned for the tag the entry actually pins to.
+    #[test]
+    fn a_vendored_hash_exists_only_for_the_pinned_tag() {
+        for e in CATALOG {
+            let Some(scip) = binary_spec(e) else { continue };
+            let Some(f) = scip.sha256_fn else { continue };
+            let pinned = scip.version_fallback;
+            for target in [
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-unknown-linux-gnu",
+            ] {
+                if let Some(h) = f(pinned, target) {
+                    assert_eq!(h.len(), 64, "{}: hash must be 64 hex chars", e.language);
+                    assert!(
+                        h.chars().all(|c| c.is_ascii_hexdigit()),
+                        "{}: non-hex in vendored hash",
+                        e.language
+                    );
+                }
+                assert!(
+                    f("some-other-tag", target).is_none(),
+                    "{}: a hash was returned for a tag the entry is not pinned to — \
+                     it would be checked against the wrong asset",
+                    e.language
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_vendored_hashes_cover_the_platforms_their_assets_ship_for() {
+        // scip-ruby and scip-clang ship darwin-arm64 and linux-x86_64 only;
+        // a missing hash there would fail the install rather than skip the check.
+        assert!(scip_ruby_sha256("scip-ruby-v0.4.7", "aarch64-apple-darwin").is_some());
+        assert!(scip_ruby_sha256("scip-ruby-v0.4.7", "x86_64-unknown-linux-gnu").is_some());
+        assert!(scip_clang_sha256("v0.4.0", "aarch64-apple-darwin").is_some());
+        assert!(scip_clang_sha256("v0.4.0", "x86_64-unknown-linux-gnu").is_some());
+        assert!(kls_sha256("1.3.13").is_some());
+    }
+
+    /// scip-java publishes a `.sha256` sidecar, so it verifies through that and
+    /// must NOT carry a vendored hash — one would pin it for no benefit and
+    /// make every upstream release a catalog bump.
+    #[test]
+    fn entries_with_a_sidecar_carry_no_vendored_hash() {
+        for e in CATALOG {
+            let Some(scip) = binary_spec(e) else { continue };
+            if scip.verify_sha256 {
+                assert!(
+                    scip.sha256_fn.is_none(),
+                    "{}: verifies via sidecar, so it must not also be pinned to a vendored hash",
+                    e.language
+                );
+            }
+        }
+    }
 }
