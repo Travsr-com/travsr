@@ -815,36 +815,28 @@ pub fn fsck_repo(
         ..travsr_core::GcReport::default()
     };
 
-    // Walk the disk (follow_links=false per §6.5 S4, matching the watcher).
-    let mut walked_paths = std::collections::HashSet::<String>::new();
-    for entry in ignore::WalkBuilder::new(repo_root)
-        .follow_links(false)
-        .build()
-        .flatten()
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    // Ghost detection stats each DB path directly rather than re-walking the disk.
+    // The DB side (`files`) tracks every indexed file, including hidden dirs and
+    // non-code files (.github/*, .mcp.json, *.yml) that carry a `file` node. A disk
+    // re-walk diverged from that set on two axes: `ignore::WalkBuilder` skips hidden
+    // entries by default, and it was additionally filtered by language extension.
+    // Either divergence flagged existing files as ghosts. Statting the DB paths is
+    // symmetric by construction — a ghost is any DB path whose file is absent on
+    // disk, with no walk config or filters to drift. `.exists()` matches the TOCTOU
+    // re-check inside `reconcile`, and `on_disk` feeds it so the report and the
+    // `--fix` deletion agree exactly.
+    let db_paths: std::collections::HashSet<String> =
+        store.get_all_file_hashes()?.into_keys().collect();
+    let mut on_disk = std::collections::HashSet::<String>::with_capacity(db_paths.len());
+    let mut ghosts: Vec<String> = Vec::new();
+    for path in &db_paths {
+        if repo_root.join(path).exists() {
+            on_disk.insert(path.clone());
+        } else {
+            ghosts.push(path.clone());
         }
-        let rel = path.strip_prefix(repo_root).unwrap_or(path);
-        if rel
-            .components()
-            .any(|c| watcher::SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip))
-        {
-            continue;
-        }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if travsr_core::Language::from_extension(ext).is_none() {
-            continue;
-        }
-        walked_paths.insert(rel.to_string_lossy().replace('\\', "/"));
     }
-
-    // Compute ghost set: in DB but absent on disk.
-    let db_hashes = store.get_all_file_hashes()?;
-    let db_paths: std::collections::HashSet<String> = db_hashes.into_keys().collect();
-    let ghosts: Vec<String> = db_paths.difference(&walked_paths).cloned().collect();
-    report.ghost_paths = ghosts.clone();
+    report.ghost_paths = ghosts;
 
     // Count orphan edges read-only so the default (no-`--fix`) report is honest
     // about them; `sweep_orphans` below only runs under `fix` (issue #580).
@@ -864,7 +856,7 @@ pub fn fsck_repo(
     };
 
     // reconcile enforces the circuit breaker, TOCTOU re-check, and batched deletes.
-    let mut fix_report = store.reconcile(&walked_paths, &policy, repo_root, &corpus)?;
+    let mut fix_report = store.reconcile(&on_disk, &policy, repo_root, &corpus)?;
 
     // Sweep any residual orphan edges (Tier-4 defect indicator).
     let orphans = store.sweep_orphans()?;
@@ -5705,6 +5697,60 @@ mod tests {
                 .unwrap(),
             0,
             "no orphan edges must remain after --fix"
+        );
+    }
+
+    /// Regression: a file tracked in the DB (a `.yml` under `.github/`, which
+    /// carries a `file` node) but present on disk must NOT be reported as a
+    /// ghost, and `--fix` must not delete its tracking row. Before the fix the
+    /// disk re-walk diverged from the DB `files` set on two axes — the
+    /// `ignore::WalkBuilder` default skips hidden dirs like `.github/`, and it
+    /// also filtered by `Language::from_extension` — so existing files such as
+    /// `.github/workflows/*.yml` and `.mcp.json` were flagged as ghosts.
+    #[test]
+    fn fsck_does_not_flag_existing_non_code_file_as_ghost() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { run() {} }").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        let yml_rel = ".github/workflows/ci.yml";
+        std::fs::write(tmp.path().join(yml_rel), "name: ci\non: [push]\n").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+
+        // Precondition: the .yml is tracked in the DB (has a `files` row).
+        assert!(
+            SqliteStore::open(&db_path)
+                .unwrap()
+                .get_all_file_hashes()
+                .unwrap()
+                .contains_key(yml_rel),
+            "precondition: init must track the non-code .yml file in `files`"
+        );
+
+        // Report mode: the existing .yml must NOT be flagged as a ghost.
+        let report = fsck_repo(tmp.path(), false, false).unwrap();
+        assert!(
+            !report.ghost_paths.iter().any(|p| p == yml_rel),
+            "existing non-code file wrongly reported as ghost: {:?}",
+            report.ghost_paths
+        );
+
+        // Fix mode must not delete the existing .yml's tracking row.
+        fsck_repo(tmp.path(), true, false).unwrap();
+        assert!(
+            SqliteStore::open(&db_path)
+                .unwrap()
+                .get_all_file_hashes()
+                .unwrap()
+                .contains_key(yml_rel),
+            "`--fix` deleted an existing non-code file's tracking row"
         );
     }
 
