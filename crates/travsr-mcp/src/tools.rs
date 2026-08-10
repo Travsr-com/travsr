@@ -7959,7 +7959,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     /// A node with an explicit kind, for repo-map region/edge tests.
     fn make_kind(path: &str, sig: &str, kind: &str) -> travsr_core::Node {
         use travsr_core::VName;
@@ -8207,7 +8206,6 @@ mod tests {
             &store,
             &crate::query::GraphQueryArgs {
                 query: "fn:seed".to_string(),
-                path: None,
                 depth: 2,
                 direction: crate::query::QueryDirection::Deps,
                 edge_mode: crate::query::QueryEdgeMode::All,
