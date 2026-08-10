@@ -21,7 +21,7 @@ pub mod sse;
 mod tools;
 
 // Re-exported for fuzz targets (fuzz/fuzz_targets/fuzz_mcp_parser.rs).
-pub use auth::fetch_signing_keys;
+pub use auth::{fetch_signing_keys, is_valid_tenant_id};
 pub use protocol::RpcRequest;
 pub use session::{session_id_log_hash, Session, SessionId, SessionStore};
 pub use sse::{router as sse_router, AppState};

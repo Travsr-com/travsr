@@ -70,7 +70,14 @@ pub enum AuthError {
 const TIMESTAMP_WINDOW: Duration = Duration::from_secs(60);
 
 /// Regex-free tenant_id validation: `^[a-z0-9-]{1,64}$`
-fn is_valid_tenant_id(s: &str) -> bool {
+/// Whether `s` is a well-formed tenant id: 1-64 chars of `[a-z0-9-]`.
+///
+/// #410 L2: public so tenant *discovery* can apply the same rule that token
+/// verification already applies. A directory whose name fails this check
+/// registers a tenant no bearer token can ever match, because this is the
+/// charset the token side enforces — the result is silent 401s with nothing
+/// to explain them. One definition, checked on both sides.
+pub fn is_valid_tenant_id(s: &str) -> bool {
     if s.is_empty() || s.len() > 64 {
         return false;
     }
