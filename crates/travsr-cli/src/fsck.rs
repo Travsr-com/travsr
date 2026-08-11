@@ -168,12 +168,19 @@ mod tests {
     /// root so the user can repair from there.
     #[test]
     fn fsck_fix_from_worktree_refuses_and_names_main() {
-        let Some((_tmp, main, wt)) = main_and_worktree() else {
+        let Some((_tmp, _main, wt)) = main_and_worktree() else {
             return;
         };
+        // The message embeds `find_git_root(&wt).display()` (the served main
+        // root). Compare against that exact value, not the test's own `main`
+        // PathBuf: on Windows git renders `--git-common-dir` with forward
+        // slashes (`C:/…/main`) while the native PathBuf uses backslashes
+        // (`C:\…\main`), so a `main.display()` substring check fails there even
+        // though the refusal is correct.
+        let served = find_git_root(&wt).unwrap();
         let err = resolve_fsck_root(&wt, true).unwrap_err().to_string();
         assert!(
-            err.contains(&main.display().to_string()),
+            err.contains(&served.display().to_string()),
             "refusal must name the served main root: {err}"
         );
         assert!(
