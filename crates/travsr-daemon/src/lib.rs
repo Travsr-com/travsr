@@ -842,6 +842,13 @@ pub fn fsck_repo(
     // about them; `sweep_orphans` below only runs under `fix` (issue #580).
     report.orphan_edges_detected = store.count_orphans()?;
 
+    // #650: self-referential `ref/call` edges are a false structural edge (the
+    // one failure mode the project's thesis rules out). Counted read-only here;
+    // swept under `--fix` below. New writes are guarded at the choke point
+    // (`write_scip_attributed_batch`), so a non-zero count here means a
+    // pre-guard DB that a reindex or `--fix` will clean.
+    report.self_ref_call_edges_detected = store.count_self_ref_call_edges()?;
+
     if !fix {
         return Ok(report);
     }
@@ -865,6 +872,16 @@ pub fn fsck_repo(
         tracing::warn!(
             orphans,
             "fsck: non-zero orphan edge count — write-path invariant violated"
+        );
+    }
+
+    // #650: sweep pre-guard self-referential `ref/call` edges (edge + sites).
+    let self_loops = store.sweep_self_ref_call_edges()?;
+    fix_report.self_ref_call_edges_swept = self_loops;
+    if self_loops > 0 {
+        tracing::warn!(
+            self_loops,
+            "fsck: swept self-referential ref/call edges — pre-guard DB or bypassed write choke point (#650)"
         );
     }
 
@@ -4951,6 +4968,7 @@ mod tests {
                 caller_path: path.to_string(),
                 caller_line: *line,
                 callee_id,
+                is_call: true,
             });
         }
 
@@ -5697,6 +5715,75 @@ mod tests {
                 .unwrap(),
             0,
             "no orphan edges must remain after --fix"
+        );
+    }
+
+    /// #650: `fsck` must detect self-referential (`src == dst`) `ref/call` edges
+    /// in report mode and sweep them — together with their occurrence sites —
+    /// under `--fix`, without disturbing legitimate edges. Covers DBs written
+    /// before the `write_scip_attributed_batch` guard existed.
+    #[test]
+    fn fsck_detects_and_sweeps_self_referential_ref_call_edges() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { run() {} }").unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(tmp.path()).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+
+        // Inject a self-referential ref/call edge on a REAL node (so it is not an
+        // orphan) plus its occurrence site, mirroring a pre-guard DB.
+        let self_id = {
+            let mut store = SqliteStore::open(&db_path).unwrap();
+            let n = Node::new(
+                VName::new("", "", "svc.ts", "typescript", "fn:selfcall"),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+            store
+                .put_edge(&Edge::new(n.id, n.id, EdgeKind::RefCall))
+                .unwrap();
+            store.record_edge_sites(&[(n.id, n.id, 1)]).unwrap();
+            n.id
+        };
+
+        // Report mode: detect, do not delete.
+        let report = fsck_repo(tmp.path(), false, false).unwrap();
+        assert_eq!(
+            report.self_ref_call_edges_detected, 1,
+            "report mode must count the injected self-loop"
+        );
+        assert_eq!(
+            SqliteStore::open(&db_path)
+                .unwrap()
+                .count_self_ref_call_edges()
+                .unwrap(),
+            1,
+            "report mode must not delete the self-loop"
+        );
+
+        // Fix mode: sweep edge + site.
+        let fixed = fsck_repo(tmp.path(), true, false).unwrap();
+        assert_eq!(
+            fixed.self_ref_call_edges_swept, 1,
+            "fix mode must sweep the injected self-loop"
+        );
+        let store = SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.count_self_ref_call_edges().unwrap(),
+            0,
+            "no self-referential ref/call edges may remain after --fix"
+        );
+        assert!(
+            store.reference_sites(self_id).unwrap().is_empty(),
+            "the self-loop's occurrence site must be swept with its edge"
         );
     }
 

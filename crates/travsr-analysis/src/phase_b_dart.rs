@@ -299,6 +299,9 @@ fn parse_emitter_output(
                         caller_path: path.to_string(),
                         caller_line: line as u32,
                         callee_id: dst_id,
+                        // The Dart emitter reports call references; treat as calls
+                        // so they create `ref/call` edges as before (#650).
+                        is_call: true,
                     });
                 } else {
                     edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));

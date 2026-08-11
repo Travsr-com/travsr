@@ -3492,6 +3492,10 @@ LIMIT 20",
             span_cache.insert(path, fetch_all_fn_spans(&tx, corpus, path)?);
         }
 
+        // #650: count `src == dst` refs dropped by the guard below, so the
+        // positional-collapse rate is observable rather than silent.
+        let mut self_loops_rejected: u64 = 0;
+
         for scip_ref in refs {
             // G2: find the innermost enclosing function/method span in memory.
             let occ_line = scip_ref.caller_line as i64;
@@ -3505,6 +3509,23 @@ LIMIT 20",
             };
 
             let callee_id = node_id_to_i64(scip_ref.callee_id);
+
+            // #650: reject self-referential `ref/call` edges. This is the single
+            // write choke point every language's ScipRef producer converges on
+            // (rust rust-analyzer LSIF, Dart native, SCIP-protobuf sidecars), and
+            // was the only edge-emission path in the pipeline missing the
+            // `src == dst` guard that the UnresolvedCall path (daemon: `u.src !=
+            // dst`) and the alias-remap paths already enforce. A self-loop arises
+            // from positional collapse — the occurrence line and the callee's
+            // definition line resolve to the *same* enclosing-function node — and
+            // carries zero reachability. Recursion is not represented as a
+            // self-edge anywhere in the graph (the tree-sitter path emits zero on
+            // the same corpus), so dropping these here keeps the semantic
+            // `ref/call` graph consistent with the structural one.
+            if caller_id == callee_id {
+                self_loops_rejected += 1;
+                continue;
+            }
 
             // E3 (W3a) — fail closed (Invariant #4): never write a `ref/call`
             // edge whose callee resolves to no node. The full node table is
@@ -3529,15 +3550,26 @@ LIMIT 20",
                 continue;
             }
 
-            tx.execute(
-                "INSERT INTO edges(src, dst, kind, provenance, confidence) \
-                 VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
-                 ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'scip'",
-                params![caller_id, callee_id],
-            )
-            .context("write_scip_attributed_batch: insert edge")?;
+            // #650: only genuine calls create a call-graph `ref/call` edge, so
+            // `get_callers` / blast-radius / PageRank stay a call graph and never
+            // gain a `src == dst` self-loop or a spurious non-call edge. Non-call
+            // references (type annotations, `self`/`Self`, path segments) still
+            // record their occurrence below so `find_references` enumerates every
+            // use site (issue #299). `is_call` defaults to true for call-scoped
+            // producers (native tree-sitter, bundled emitters), so their edges are
+            // unchanged.
+            if scip_ref.is_call {
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
+                     ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'scip'",
+                    params![caller_id, callee_id],
+                )
+                .context("write_scip_attributed_batch: insert edge")?;
+            }
 
-            // O4: record call-site line evidence.
+            // O4: record call-site line evidence. Written for every reference
+            // (call or not) so `find_references` covers non-call use sites too.
             tx.execute(
                 "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
                 params![caller_id, callee_id, occ_line],
@@ -3545,7 +3577,58 @@ LIMIT 20",
             .context("write_scip_attributed_batch: insert edge_site")?;
         }
 
+        if self_loops_rejected > 0 {
+            tracing::debug!(
+                self_loops_rejected,
+                total_refs = refs.len(),
+                "write_scip_attributed_batch: dropped self-referential ref/call edges (#650)"
+            );
+        }
+
         tx.commit().context("write_scip_attributed_batch: commit")
+    }
+
+    /// Count `ref/call` edges whose `src == dst` (#650). Zero in correct
+    /// operation once [`Self::write_scip_attributed_batch`] guards them at write
+    /// time; a non-zero count means the DB predates that guard (or a producer
+    /// bypassed the choke point), so `fsck` surfaces and `--fix` sweeps them.
+    pub fn count_self_ref_call_edges(&self) -> Result<u64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM edges WHERE kind = 'ref/call' AND src = dst",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .context("counting self-referential ref/call edges")
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Delete every self-referential (`src == dst`) `ref/call` edge and its
+    /// occurrence sites (#650). Returns the number of edges removed. Both the
+    /// edge and its `edge_sites` rows are dropped in one transaction so the
+    /// occurrence store cannot outlive the edge it described.
+    pub fn sweep_self_ref_call_edges(&mut self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("begin self-loop sweep transaction")?;
+            tx.execute(
+                "DELETE FROM edge_sites WHERE kind = 'ref/call' AND src = dst",
+                [],
+            )
+            .context("sweeping self-referential edge_sites")?;
+            let edges = tx
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'ref/call' AND src = dst",
+                    [],
+                )
+                .context("sweeping self-referential ref/call edges")?;
+            tx.commit().context("commit self-loop sweep")?;
+            Ok(edges as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Resolve rust-analyzer LSIF positional references (E3 W3b) into `ScipRef`s.
@@ -3617,6 +3700,7 @@ LIMIT 20",
                 caller_path: p.caller_path.clone(),
                 caller_line: p.caller_line,
                 callee_id: i64_to_node_id(callee_i64),
+                is_call: p.is_call,
             });
         }
         Ok(out)
@@ -9506,16 +9590,19 @@ mod tests {
                 caller_path: path.to_string(),
                 caller_line: 7,
                 callee_id: callee.id,
+                is_call: true,
             },
             travsr_core::ScipRef {
                 caller_path: path.to_string(),
                 caller_line: 15,
                 callee_id: callee.id,
+                is_call: true,
             },
             travsr_core::ScipRef {
                 caller_path: path.to_string(),
                 caller_line: 25,
                 callee_id: callee.id,
+                is_call: true,
             },
         ];
 
@@ -9553,6 +9640,290 @@ mod tests {
                 .iter()
                 .any(|(src, dst, _, _)| *src == file_id && *dst == callee.id),
             "line 25 ref must fall back to file node attribution"
+        );
+    }
+
+    // ── #650: self-referential ref/call guard at the write choke point ──────────
+
+    /// `write_scip_attributed_batch` is the single write path every language's
+    /// ScipRef producer converges on (rust rust-analyzer LSIF, Dart native,
+    /// SCIP-protobuf sidecars). It must drop `src == dst` `ref/call` edges for
+    /// all of them — the guard is language-agnostic by construction, so this
+    /// asserts the invariant across a representative language set to catch any
+    /// future per-language regression. Positional collapse produced 3,115 false
+    /// self-loops (17.7% of the semantic call graph) before this guard.
+    #[test]
+    fn attributed_batch_drops_self_referential_edges_all_languages() {
+        for lang in ["rust", "typescript", "python", "go", "dart", "java"] {
+            let corpus = "c";
+            let caller_path = "src/a";
+            let callee_path = "src/b";
+            let mut store = SqliteStore::open_in_memory().unwrap();
+
+            // `selfish` (lines 1–10): a body occurrence resolves back to itself.
+            let selfish = Node::new(
+                VName::new(corpus, "", caller_path, lang, "fn:selfish"),
+                "function",
+            )
+            .with_line(1)
+            .with_end_line(10);
+            // `user` (lines 20–30) genuinely calls `helper` in another file.
+            let user = Node::new(
+                VName::new(corpus, "", caller_path, lang, "fn:user"),
+                "function",
+            )
+            .with_line(20)
+            .with_end_line(30);
+            let helper = Node::new(
+                VName::new(corpus, "", callee_path, lang, "fn:helper"),
+                "function",
+            )
+            .with_line(1)
+            .with_end_line(5);
+
+            store
+                .write_scip_attributed_batch(
+                    corpus,
+                    &[selfish.clone(), user.clone(), helper.clone()],
+                    &[],
+                )
+                .unwrap();
+
+            let refs = vec![
+                // Occurrence at line 5 (inside `selfish`) attributed to `selfish`:
+                // positional collapse → self-loop, must be dropped.
+                travsr_core::ScipRef {
+                    caller_path: caller_path.to_string(),
+                    caller_line: 5,
+                    callee_id: selfish.id,
+                    is_call: true,
+                },
+                // Genuine recursion has the same shape and is also dropped:
+                // recursion is not represented as a self-edge anywhere in the graph.
+                travsr_core::ScipRef {
+                    caller_path: caller_path.to_string(),
+                    caller_line: 8,
+                    callee_id: selfish.id,
+                    is_call: true,
+                },
+                // Genuine cross-function call at line 25 (inside `user`) → `helper`.
+                travsr_core::ScipRef {
+                    caller_path: caller_path.to_string(),
+                    caller_line: 25,
+                    callee_id: helper.id,
+                    is_call: true,
+                },
+            ];
+            store
+                .write_scip_attributed_batch(corpus, &[], &refs)
+                .unwrap();
+
+            // Corpus-level invariant: zero self-referential ref/call edges.
+            assert_eq!(
+                store.count_self_ref_call_edges().unwrap(),
+                0,
+                "lang={lang}: a self-referential ref/call edge leaked"
+            );
+
+            let edges = store.all_edges().unwrap();
+            // The genuine cross-function edge survives.
+            assert!(
+                edges
+                    .iter()
+                    .any(|(s, d, k, _)| *s == user.id && *d == helper.id && k == "ref/call"),
+                "lang={lang}: genuine cross-function edge must survive the guard"
+            );
+            // No self ref/call edge of any kind exists.
+            assert!(
+                !edges.iter().any(|(s, d, k, _)| s == d && k == "ref/call"),
+                "lang={lang}: no self ref/call edge may exist"
+            );
+            // The dropped edge also left no occurrence site behind: `selfish` was
+            // the callee only of the two self-loops, so it has zero sites.
+            assert!(
+                store.reference_sites(selfish.id).unwrap().is_empty(),
+                "lang={lang}: a self-loop occurrence site leaked into edge_sites"
+            );
+        }
+    }
+
+    /// #650 clean split: a non-call reference (`is_call = false`) records a
+    /// `find_references` occurrence (`edge_sites`) but must NOT create a
+    /// call-graph `ref/call` edge — so `get_callers` / blast-radius stay
+    /// call-only while `find_references` still covers type / `self` / path use
+    /// sites. This is the invariant that keeps the WS-A cause fix from
+    /// regressing `find_references` on types.
+    #[test]
+    fn non_call_reference_records_occurrence_but_no_edge() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // caller fn `user` at a.rs:1–10; callee TYPE `Widget` at b.rs:1–3.
+        let user = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "fn:user"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let widget = Node::new(
+            VName::new(corpus, "", "b.rs", "rust", "struct:Widget"),
+            "struct",
+        )
+        .with_line(1)
+        .with_end_line(3);
+        store
+            .write_scip_attributed_batch(corpus, &[user.clone(), widget.clone()], &[])
+            .unwrap();
+
+        // A type-annotation reference to `Widget` inside `user` (line 5): the
+        // occurrence is real, but it is not a call.
+        let refs = vec![travsr_core::ScipRef {
+            caller_path: "a.rs".to_string(),
+            caller_line: 5,
+            callee_id: widget.id,
+            is_call: false,
+        }];
+        store
+            .write_scip_attributed_batch(corpus, &[], &refs)
+            .unwrap();
+
+        // No `ref/call` edge into Widget → get_callers stays call-only.
+        let edges = store.all_edges().unwrap();
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, d, k, _)| *d == widget.id && k == "ref/call"),
+            "a non-call reference must not create a ref/call edge"
+        );
+        // But the occurrence site IS recorded → find_references covers it.
+        let sites = store.reference_sites(widget.id).unwrap();
+        assert_eq!(
+            sites.len(),
+            1,
+            "non-call reference must record a find_references occurrence"
+        );
+        assert_eq!(sites[0].line, 5);
+    }
+
+    /// Reproduces issue #650's exact producer path: the rust-analyzer LSIF
+    /// positional resolver maps a callee's *definition line* to its enclosing
+    /// node, and `write_scip_attributed_batch` maps the *occurrence line* to its
+    /// enclosing node. When both land in the same function (an occurrence inside
+    /// the function whose def-line the callee resolves to), the two positional
+    /// lookups collapse to one node. The write guard must catch it.
+    #[test]
+    fn lsif_positional_collapse_produces_no_self_loop() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        // `f` spans lines 1–10 in a.rs; `g` spans 20–30; `h` spans 1–5 in b.rs.
+        let f = Node::new(VName::new(corpus, "", "a.rs", "rust", "fn:f"), "function")
+            .with_line(1)
+            .with_end_line(10);
+        let g = Node::new(VName::new(corpus, "", "a.rs", "rust", "fn:g"), "function")
+            .with_line(20)
+            .with_end_line(30);
+        let h = Node::new(VName::new(corpus, "", "b.rs", "rust", "fn:h"), "function")
+            .with_line(1)
+            .with_end_line(5);
+        store
+            .write_scip_attributed_batch(corpus, &[f.clone(), g.clone(), h.clone()], &[])
+            .unwrap();
+
+        let positional = vec![
+            // Occurrence at a.rs:5 (inside f) whose callee *definition* is a.rs:1
+            // (f's own def line, inside f's span) → callee resolves to f →
+            // positional collapse → self-loop candidate.
+            travsr_core::LsifPositionalRef {
+                caller_path: "a.rs".to_string(),
+                caller_line: 5,
+                callee_def_path: "a.rs".to_string(),
+                callee_def_line: 1,
+                is_call: true,
+            },
+            // Genuine call: occurrence at a.rs:25 (inside g) → callee def b.rs:1 (h).
+            travsr_core::LsifPositionalRef {
+                caller_path: "a.rs".to_string(),
+                caller_line: 25,
+                callee_def_path: "b.rs".to_string(),
+                callee_def_line: 1,
+                is_call: true,
+            },
+        ];
+
+        // Resolve callee def-lines → ScipRefs (the E3 W3b path), then write.
+        let refs = store
+            .resolve_lsif_positional_refs(corpus, &positional)
+            .unwrap();
+        assert_eq!(refs.len(), 2, "both positional refs must resolve a callee");
+        store
+            .write_scip_attributed_batch(corpus, &[], &refs)
+            .unwrap();
+
+        assert_eq!(
+            store.count_self_ref_call_edges().unwrap(),
+            0,
+            "positional collapse must not persist a self-loop"
+        );
+        let edges = store.all_edges().unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|(s, d, k, _)| *s == g.id && *d == h.id && k == "ref/call"),
+            "the genuine g → h call must survive"
+        );
+    }
+
+    /// `--fix` remediation for DBs written before the guard: `fsck` counts and
+    /// sweeps self-referential ref/call edges, leaving legitimate cross edges —
+    /// and their occurrence sites — intact. (A self-loop *site* can no longer be
+    /// created through any public write path: `record_edge_sites` and the guarded
+    /// `write_scip_attributed_batch` both refuse `src == dst`; the sweep's
+    /// `edge_sites` DELETE remains as defensive cleanup for pre-guard DBs, and
+    /// this test proves its `src == dst` scoping does not touch cross sites.)
+    #[test]
+    fn sweep_self_ref_call_edges_removes_edge_preserves_cross() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let f = Node::new(VName::new("c", "", "a.rs", "rust", "fn:f"), "function");
+        let g = Node::new(VName::new("c", "", "a.rs", "rust", "fn:g"), "function");
+        store.put_node(&f).unwrap();
+        store.put_node(&g).unwrap();
+
+        // A pre-guard self-loop edge, plus a legitimate cross edge and its site.
+        store
+            .put_edge(&Edge::new(f.id, f.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(g.id, f.id, EdgeKind::RefCall))
+            .unwrap();
+        store.record_edge_sites(&[(g.id, f.id, 5)]).unwrap();
+
+        assert_eq!(store.count_self_ref_call_edges().unwrap(), 1);
+        assert_eq!(
+            store.reference_sites(f.id).unwrap().len(),
+            1,
+            "cross occurrence site present before sweep"
+        );
+
+        assert_eq!(
+            store.sweep_self_ref_call_edges().unwrap(),
+            1,
+            "exactly one self edge swept"
+        );
+        assert_eq!(store.count_self_ref_call_edges().unwrap(), 0);
+
+        // The legitimate cross edge and its occurrence site are untouched.
+        assert!(
+            store
+                .all_edges()
+                .unwrap()
+                .iter()
+                .any(|(s, d, k, _)| *s == g.id && *d == f.id && k == "ref/call"),
+            "legitimate cross ref/call edge must be preserved"
+        );
+        assert_eq!(
+            store.reference_sites(f.id).unwrap().len(),
+            1,
+            "cross occurrence site must survive the self-loop sweep"
         );
     }
 

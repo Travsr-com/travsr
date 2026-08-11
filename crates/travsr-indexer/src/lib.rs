@@ -13,6 +13,7 @@ pub use travsr_analysis::phase_b_python;
 pub use travsr_analysis::phase_b_rust;
 pub use travsr_analysis::phase_b_typescript;
 
+pub mod callsite;
 pub mod ffi; // thin re-export wrapper → travsr_analysis::ffi
 mod ffi_resolver;
 mod hash;

@@ -312,6 +312,10 @@ pub fn ingest_g2(dump: &str, corpus: &str) -> anyhow::Result<LsifG2Output> {
                 caller_path: caller_path.clone(),
                 caller_line,
                 callee_id,
+                // Our bundled LSIF emitters (travsr-lsif-ts / -py) emit occurrence
+                // ranges only for call expressions and imports, so these are
+                // already call-scoped — flag as calls to preserve their edges.
+                is_call: true,
             });
         }
     }
@@ -336,6 +340,25 @@ fn make_relative(base: &str, abs_path: &str) -> String {
         rel.to_string()
     } else {
         abs_path.to_string()
+    }
+}
+
+/// Decode a `file://` URI from an LSIF dump into an OS filesystem path.
+///
+/// rust-analyzer emits `file:///C:/proj/src/main.rs` on Windows; naively
+/// stripping `file://` leaves `/C:/proj/src/main.rs`, whose leading slash before
+/// the drive letter is not a valid Windows path and fails to open — which would
+/// silently fail-open the #650 call-site source read (every ref treated as a
+/// call) on Windows. Drop that leading slash when it precedes a `X:` drive
+/// letter. Unix paths (`/home/..`) contain no such prefix and are returned
+/// unchanged, so this is a no-op off Windows.
+fn file_uri_to_path(uri: &str) -> String {
+    let s = uri.strip_prefix("file://").unwrap_or(uri);
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        s[1..].to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -480,6 +503,26 @@ mod tests {
         assert_eq!(make_relative("/repo", "/repo/src/foo.ts"), "src/foo.ts");
         assert_eq!(make_relative("/repo/", "/repo/src/foo.ts"), "src/foo.ts");
         assert_eq!(make_relative("", "/abs/path"), "/abs/path");
+    }
+
+    #[test]
+    fn file_uri_to_path_decodes_windows_and_unix() {
+        // Unix: leading slash is part of the path, kept as-is.
+        assert_eq!(
+            file_uri_to_path("file:///home/u/proj/src/a.rs"),
+            "/home/u/proj/src/a.rs"
+        );
+        // Windows: rust-analyzer's `file:///C:/..` must lose the slash before the
+        // drive letter so the path opens (#650 source read fails otherwise).
+        assert_eq!(
+            file_uri_to_path("file:///C:/proj/src/a.rs"),
+            "C:/proj/src/a.rs"
+        );
+        assert_eq!(file_uri_to_path("file:///d:/x/y.rs"), "d:/x/y.rs");
+        // No scheme prefix → returned unchanged (defensive).
+        assert_eq!(file_uri_to_path("/already/a/path"), "/already/a/path");
+        // A single leading slash that is NOT a drive letter is preserved.
+        assert_eq!(file_uri_to_path("file:///srv/app.rs"), "/srv/app.rs");
     }
 
     #[test]
@@ -778,6 +821,8 @@ pub fn ingest_rust_raw(dump: &str, corpus: &str) -> anyhow::Result<Vec<Edge>> {
 pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::LsifPositionalRef> {
     let mut doc_paths: HashMap<u64, String> = HashMap::new();
     let mut range_lines: HashMap<u64, u32> = HashMap::new();
+    // range id → 0-based UTF-16 start column (for the call-site filter, #650).
+    let mut range_cols: HashMap<u64, u32> = HashMap::new();
     // range id → resultSet id (the `next` edge).
     let mut next_edge: HashMap<u64, u64> = HashMap::new();
     // range id → document id (from `contains`).
@@ -803,7 +848,10 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
                         v.get("id").and_then(|i| i.as_u64()),
                         v.get("uri").and_then(|u| u.as_str()),
                     ) {
-                        let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+                        // #650: the resolved path is read from disk to classify
+                        // each occurrence as a call, so it must be a valid OS
+                        // path on Windows too (rust-analyzer emits `file:///C:/`).
+                        let path = file_uri_to_path(uri);
                         doc_paths.insert(id, path);
                     }
                 }
@@ -815,6 +863,13 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
                             .and_then(|l| l.as_u64()),
                     ) {
                         range_lines.insert(id, l as u32);
+                        if let Some(c) = v
+                            .get("start")
+                            .and_then(|s| s.get("character"))
+                            .and_then(|c| c.as_u64())
+                        {
+                            range_cols.insert(id, c as u32);
+                        }
                     }
                 }
                 _ => {}
@@ -876,6 +931,7 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
         .flat_map(|targets| targets.iter().map(|(_, rid)| *rid))
         .collect();
 
+    let mut src = crate::callsite::SourceLines::new();
     let mut out = Vec::new();
     for (&range_id, &caller_line0) in &range_lines {
         if def_range_ids.contains(&range_id) {
@@ -886,6 +942,20 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
         };
         let Some(caller_abs) = doc_paths.get(&doc) else {
             continue;
+        };
+        // #650: classify whether this occurrence is a call. rust-analyzer LSIF
+        // reports a reference for every use — `self`/`Self`, type refs, path
+        // segments — not just calls. Non-calls still record a `find_references`
+        // occurrence downstream, but must NOT create a call-graph `ref/call` edge
+        // (that is what collapses into `src == dst` self-loops and spurious
+        // non-call edges). Fail open (treat as a call) when the source line is
+        // unreadable — in production the file always exists.
+        let is_call = match range_cols.get(&range_id) {
+            Some(&col) => src
+                .line(std::path::Path::new(caller_abs), caller_line0 + 1)
+                .map(|t| crate::callsite::occurrence_is_call(t, col))
+                .unwrap_or(true),
+            None => true,
         };
         let Some(defres) = result_def.get(&rs) else {
             continue; // occurrence with no definition (e.g. a keyword range)
@@ -904,6 +974,7 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
                 caller_line: caller_line0 + 1,
                 callee_def_path: make_relative(repo_root, def_abs),
                 callee_def_line: def_line0 + 1,
+                is_call,
             });
         }
     }
@@ -1112,6 +1183,94 @@ mod rust_lsif_tests {
             "forward-referenced moniker must still produce an edge"
         );
     }
+
+    #[test]
+    fn positional_refs_flag_calls_and_non_call_occurrences() {
+        // #650 cause fix: rust-analyzer LSIF reports a reference occurrence for
+        // every use of a symbol. Every occurrence is still emitted (so
+        // `find_references` keeps non-call use sites), but each is tagged
+        // `is_call` — only calls become `ref/call` edges downstream. A type
+        // reference on the same symbol must be flagged non-call (it is what
+        // collapses into a `src == dst` self-loop when the callee def resolves to
+        // the enclosing fn, and is a spurious non-call edge off the diagonal).
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // Occurrences we will point the dump at:
+        //   line 1, col 11 → `Session` type reference  (is_call = false)
+        //   line 2, col 6  → `filter` method call       (is_call = true)
+        let main_rs = "fn run(s: Session) {\n    let x: Session = s;\n    s.filter();\n}\n";
+        std::fs::write(src_dir.join("main.rs"), main_rs).unwrap();
+        std::fs::write(
+            src_dir.join("types.rs"),
+            "struct Session;\n\nimpl Session {\n    fn filter(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        // Build portable file:// URIs. On Windows `dir.path()` uses `\` and a
+        // drive letter (`C:\..`); backslashes are invalid inside a JSON string
+        // (so serde would drop the document vertices, emptying the output) and
+        // the raw path is not URI-shaped. Normalize to forward slashes and the
+        // real rust-analyzer Windows shape `file:///C:/..` (a leading slash
+        // before the drive), which `file_uri_to_path` decodes to a readable OS
+        // path — exercising the Windows decode this test guards. On Unix the
+        // path already starts with `/`, so this yields the usual `file:///..`.
+        let root = dir.path().to_string_lossy().replace('\\', "/");
+        let uri_root = if root.starts_with('/') {
+            root.clone()
+        } else {
+            format!("/{root}")
+        };
+        let main_uri = format!("file://{uri_root}/src/main.rs");
+        let types_uri = format!("file://{uri_root}/src/types.rs");
+        // 10/11 are def ranges in types.rs; 20 is the call occurrence, 21 the
+        // type-reference occurrence, both in main.rs.
+        let dump = format!(
+            r#"
+{{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file://{uri_root}","positionEncoding":"utf-16","toolInfo":{{"name":"rust-analyzer","version":"0"}}}}
+{{"id":2,"type":"vertex","label":"document","uri":"{main_uri}"}}
+{{"id":3,"type":"vertex","label":"document","uri":"{types_uri}"}}
+{{"id":10,"type":"vertex","label":"range","start":{{"line":3,"character":7}},"end":{{"line":3,"character":13}}}}
+{{"id":11,"type":"vertex","label":"range","start":{{"line":0,"character":7}},"end":{{"line":0,"character":14}}}}
+{{"id":20,"type":"vertex","label":"range","start":{{"line":2,"character":6}},"end":{{"line":2,"character":12}}}}
+{{"id":21,"type":"vertex","label":"range","start":{{"line":1,"character":11}},"end":{{"line":1,"character":18}}}}
+{{"id":50,"type":"vertex","label":"resultSet"}}
+{{"id":51,"type":"vertex","label":"resultSet"}}
+{{"id":60,"type":"vertex","label":"definitionResult"}}
+{{"id":61,"type":"vertex","label":"definitionResult"}}
+{{"id":200,"type":"edge","label":"contains","outV":2,"inVs":[20,21]}}
+{{"id":201,"type":"edge","label":"contains","outV":3,"inVs":[10,11]}}
+{{"id":210,"type":"edge","label":"next","outV":20,"inV":50}}
+{{"id":211,"type":"edge","label":"next","outV":21,"inV":51}}
+{{"id":220,"type":"edge","label":"textDocument/definition","outV":50,"inV":60}}
+{{"id":221,"type":"edge","label":"textDocument/definition","outV":51,"inV":61}}
+{{"id":230,"type":"edge","label":"item","document":3,"property":"definitions","inVs":[10],"outV":60}}
+{{"id":231,"type":"edge","label":"item","document":3,"property":"definitions","inVs":[11],"outV":61}}
+"#
+        );
+
+        let out = ingest_rust_positional(&dump, &root);
+        // Both occurrences are emitted (find_references keeps the type use site).
+        assert_eq!(
+            out.len(),
+            2,
+            "both occurrences must be emitted; got {out:?}"
+        );
+        let call = out
+            .iter()
+            .find(|r| r.caller_line == 3)
+            .expect("the s.filter() call occurrence");
+        assert!(call.is_call, "the `s.filter()` occurrence must be a call");
+        assert_eq!(call.callee_def_path, "src/types.rs");
+        let type_ref = out
+            .iter()
+            .find(|r| r.caller_line == 2)
+            .expect("the `Session` type-reference occurrence");
+        assert!(
+            !type_ref.is_call,
+            "the `let x: Session` type reference must be flagged non-call"
+        );
+    }
 }
 
 // ── SCIP ingestion ────────────────────────────────────────────────────────────
@@ -1230,6 +1389,7 @@ pub fn ingest_scip_g2(
     bytes: &[u8],
     corpus: &str,
     language: &str,
+    repo_root: &std::path::Path,
 ) -> anyhow::Result<ScipIngestOutput> {
     use protobuf::Message as _;
 
@@ -1281,6 +1441,15 @@ pub fn ingest_scip_g2(
     }
 
     // Pass 2: reference occurrences → ScipRef records for G2 attribution.
+    //
+    // #650: general-purpose SCIP indexers (scip-go, scip-java, scip-clang, ...)
+    // emit an occurrence for every reference, not just calls. Classify each so
+    // non-calls still record a `find_references` occurrence but do not create a
+    // spurious `ref/call` edge (and, when the callee resolves to the enclosing
+    // fn, a `src == dst` self-loop). The `(`-rule is only sound for
+    // paren-required languages; others keep the prior edge-emitting behavior.
+    let classify_calls = crate::callsite::uses_call_parens(language);
+    let mut src = crate::callsite::SourceLines::new();
     for doc in &index.documents {
         let path = &doc.relative_path;
         for occ in &doc.occurrences {
@@ -1297,10 +1466,25 @@ pub fn ingest_scip_g2(
                     .copied()
                     .map(|l| (l.max(0) as u32).saturating_add(1))
                     .unwrap_or(1);
+                // Occurrence column is range[1] (0-based UTF-16). Fail open
+                // (treat as a call) when the language is paren-optional or the
+                // source line is unreadable.
+                let is_call = if classify_calls {
+                    match occ.range.get(1) {
+                        Some(&col) => src
+                            .line(&repo_root.join(path), caller_line)
+                            .map(|t| crate::callsite::occurrence_is_call(t, col.max(0) as u32))
+                            .unwrap_or(true),
+                        None => true,
+                    }
+                } else {
+                    true
+                };
                 out.refs.push(travsr_core::ScipRef {
                     caller_path: path.clone(),
                     caller_line,
                     callee_id,
+                    is_call,
                 });
             }
         }
@@ -1325,5 +1509,96 @@ fn scip_symbol_kind(symbol: &str) -> &'static str {
         "var"
     } else {
         "symbol"
+    }
+}
+
+// ── SCIP call-site filter tests (#650) ─────────────────────────────────────────
+
+#[cfg(test)]
+mod scip_g2_callsite_tests {
+    use super::*;
+
+    fn occ(line: i32, start: i32, end: i32, symbol: &str, roles: i32) -> scip::types::Occurrence {
+        scip::types::Occurrence {
+            range: vec![line, start, end],
+            symbol: symbol.to_string(),
+            symbol_roles: roles,
+            ..Default::default()
+        }
+    }
+
+    /// A tiny SCIP index over a real Go file with two definitions (`Svc`, `Do`)
+    /// and two references: a `Svc` type reference (NON-call) and an `s.Do()`
+    /// call. Returns `(index_bytes, repo_root_tempdir)`.
+    fn go_index_with_call_and_type_ref() -> (Vec<u8>, tempfile::TempDir) {
+        use protobuf::Message as _;
+        let dir = tempfile::tempdir().unwrap();
+        // Columns: line 3 `Svc` at col 11 (non-call), line 4 `Do` at col 6 (call).
+        let go = "package p\ntype Svc struct{}\nfunc (s Svc) Do() {}\nfunc run(s Svc) {\n    s.Do()\n}\n";
+        std::fs::write(dir.path().join("svc.go"), go).unwrap();
+
+        let doc = scip::types::Document {
+            relative_path: "svc.go".to_string(),
+            occurrences: vec![
+                occ(1, 5, 8, "Svc#", 1),    // def
+                occ(2, 13, 15, "Do().", 1), // def
+                occ(3, 11, 14, "Svc#", 0),  // type ref → non-call
+                occ(4, 6, 8, "Do().", 0),   // call
+            ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        (index.write_to_bytes().unwrap(), dir)
+    }
+
+    #[test]
+    fn paren_language_flags_only_calls() {
+        // Both occurrences are emitted (find_references keeps the type use site),
+        // but Go is paren-required so only the `s.Do()` occurrence is a call.
+        let (bytes, dir) = go_index_with_call_and_type_ref();
+        let out = ingest_scip_g2(&bytes, "corp", "go", dir.path()).unwrap();
+        assert_eq!(
+            out.refs.len(),
+            2,
+            "both occurrences emitted; got {:?}",
+            out.refs
+        );
+        let call = out
+            .refs
+            .iter()
+            .find(|r| r.caller_line == 5)
+            .expect("the s.Do() call on line 5");
+        assert!(call.is_call, "s.Do() must be a call");
+        let type_ref = out
+            .refs
+            .iter()
+            .find(|r| r.caller_line == 4)
+            .expect("the `Svc` type reference on line 4");
+        assert!(
+            !type_ref.is_call,
+            "the `Svc` type reference must be non-call"
+        );
+    }
+
+    #[test]
+    fn paren_optional_language_flags_everything_as_call() {
+        // Ruby allows paren-less calls (`obj.method`), so we must NOT apply the
+        // `(`-rule — every occurrence stays a call (recall over precision), which
+        // preserves the prior edge-emitting behavior for those languages.
+        let (bytes, dir) = go_index_with_call_and_type_ref();
+        let out = ingest_scip_g2(&bytes, "corp", "ruby", dir.path()).unwrap();
+        assert_eq!(
+            out.refs.len(),
+            2,
+            "both occurrences emitted; got {:?}",
+            out.refs
+        );
+        assert!(
+            out.refs.iter().all(|r| r.is_call),
+            "paren-optional languages leave every occurrence flagged as a call"
+        );
     }
 }

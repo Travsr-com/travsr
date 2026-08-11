@@ -551,6 +551,25 @@ pub struct ScipRef {
     pub caller_line: u32,
     /// `NodeId` of the called symbol (from `symbol_map` or `symbol_aliases`).
     pub callee_id: NodeId,
+    /// Whether this occurrence is an actual **call** (vs a non-call reference:
+    /// type annotation, `self`/`Self`, path segment, field access, bare read).
+    ///
+    /// Every occurrence — call or not — is recorded in `edge_sites` so
+    /// `find_references` enumerates all use sites. Only calls (`is_call == true`)
+    /// create a `ref/call` **edge**, keeping `get_callers` / blast-radius /
+    /// PageRank a genuine call graph and never a `src == dst` self-loop (#650).
+    ///
+    /// `#[serde(default)]` is `true`: producers whose occurrences are already
+    /// call-scoped by construction (native tree-sitter call-site queries, our
+    /// bundled emitters, older sidecars that predate this field) get the prior
+    /// edge-emitting behavior with no regression.
+    #[serde(default = "default_true")]
+    pub is_call: bool,
+}
+
+/// serde default for [`ScipRef::is_call`] / [`LsifPositionalRef::is_call`].
+fn default_true() -> bool {
+    true
 }
 
 /// A positional reference occurrence from a rust-analyzer LSIF dump (E3 W3b).
@@ -572,6 +591,11 @@ pub struct LsifPositionalRef {
     pub callee_def_path: String,
     /// 1-based source line of the callee's definition occurrence.
     pub callee_def_line: u32,
+    /// Whether this occurrence is an actual call (see [`ScipRef::is_call`]). The
+    /// store carries it through to the resolved `ScipRef` so non-call references
+    /// record a `find_references` occurrence without creating a call edge (#650).
+    #[serde(default = "default_true")]
+    pub is_call: bool,
 }
 
 /// A single reference occurrence returned by `find_references` (issue #299):
@@ -1119,6 +1143,13 @@ pub struct GcReport {
     pub orphan_edges_detected: u64,
     /// Number of orphan edges swept (should be 0 in normal operation).
     pub orphan_edges_swept: u64,
+    /// #650: self-referential (`src == dst`) `ref/call` edges detected in report
+    /// mode. Zero once the write-path guard is in effect; a non-zero count means
+    /// the DB predates the guard (or a producer bypassed the choke point).
+    pub self_ref_call_edges_detected: u64,
+    /// #650: self-referential `ref/call` edges swept under `--fix` (edge + its
+    /// occurrence sites). Should be 0 in normal operation.
+    pub self_ref_call_edges_swept: u64,
     /// Total node count at reconcile start.
     pub node_count: u64,
     /// Total edge count at reconcile start.
