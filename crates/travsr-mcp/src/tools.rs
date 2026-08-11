@@ -236,15 +236,95 @@ fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
     }
 }
 
-/// Append the Phase-B degraded note (when any) to a structural tool response.
-/// An empty body becomes the note alone: the note IS the answer then — it is
-/// exactly the empty-but-unreliable case #617 exists to flag.
-fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
-    match phase_b_degraded_note(store) {
-        Some(note) if body.is_empty() => note.to_string(),
-        Some(note) => format!("{body}\n{note}"),
-        None => body,
+/// #645 WS-B: the stdio server's launch directory — the caller's checkout.
+///
+/// Captured once when the stdio server starts (the IDE launches it in the
+/// workspace dir). The freshness markers only ever compare `phase_b_commit`
+/// vs `last_commit` — two store values, never the repository — so a read from
+/// a checkout at a *different* commit than the index (a linked worktree, or a
+/// HEAD move the daemon has not yet reconciled) answers with confident
+/// `path:line` for the wrong revision. Comparing this cwd's live HEAD to the
+/// index's `last_commit` is the only signal that surfaces it. Unset in the SSE
+/// server (a remote client has no local checkout) and in unit tests, where the
+/// head note correctly never fires.
+static LAUNCH_CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the stdio server's launch directory (§ `LAUNCH_CWD`). Idempotent:
+/// only the first call wins, matching the single server lifetime.
+pub fn set_launch_cwd(dir: PathBuf) {
+    let _ = LAUNCH_CWD.set(dir);
+}
+
+/// #645 WS-B: build the index/HEAD mismatch note. `head` is the caller's live
+/// `git rev-parse --short HEAD`; `stored` is the index's `last_commit`. Returns
+/// a note naming both, or `None` when they agree or either is unknown — never
+/// fabricate a mismatch for a git-less caller. Pure so both the MCP and CLI
+/// surfaces classify identically and it is trivially unit-testable.
+pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
+    if head.is_empty() || stored.is_empty() || head == stored {
+        return None;
     }
+    Some(format!(
+        "[note: index describes commit {stored} but your checkout is at {head}; \
+         results (including path:line) may not match your working tree. This is \
+         expected in a linked worktree; otherwise run `travsr init` or wait for \
+         the daemon to reconcile.]"
+    ))
+}
+
+/// The caller's short HEAD at `cwd`, or `None` when git is unavailable or `cwd`
+/// is not a repo. Uses `--short` to match the `--short`-stamped `last_commit`.
+fn git_short_head(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
+/// Append the read-path advisory notes (when any) to a structural tool
+/// response: the Phase-B degraded note (#617) and the index/HEAD mismatch note
+/// (#645 WS-B). Both are independent and may both appear. An empty body becomes
+/// the note(s) alone: the note IS the answer then — exactly the empty-but-
+/// unreliable case these notes exist to flag.
+///
+/// `head` is the caller's live short HEAD (or `None` when git-less); split out
+/// as a parameter so the composition is deterministically testable without the
+/// process-global `LAUNCH_CWD`.
+fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut out = body;
+    for note in [
+        phase_b_degraded_note(store).map(str::to_string),
+        head.and_then(|h| head_index_mismatch_note(h, &stored)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if out.is_empty() {
+            out = note;
+        } else {
+            out.push('\n');
+            out.push_str(&note);
+        }
+    }
+    out
+}
+
+/// Production entry: resolves the caller's HEAD from the captured launch cwd
+/// (§ `LAUNCH_CWD`) and appends the advisory notes. Fail-safe — no cwd or no git
+/// means no head note.
+fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    append_read_notes(store, body, head.as_deref())
 }
 
 /// Return all nodes that have an incoming edge to the given symbol, tagged
@@ -9969,6 +10049,91 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "0").unwrap();
         assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    // ── #645 WS-B: index/HEAD mismatch note ──────────────────────────────────
+
+    #[test]
+    fn head_index_mismatch_note_none_when_equal_or_unknown() {
+        assert!(head_index_mismatch_note("abc123", "abc123").is_none());
+        assert!(head_index_mismatch_note("", "abc123").is_none());
+        assert!(head_index_mismatch_note("abc123", "").is_none());
+    }
+
+    #[test]
+    fn head_index_mismatch_note_names_both_shas_on_drift() {
+        let note = head_index_mismatch_note("aaa111", "bbb222").expect("must flag mismatch");
+        assert!(
+            note.contains("aaa111"),
+            "must name the checkout HEAD: {note}"
+        );
+        assert!(
+            note.contains("bbb222"),
+            "must name the index commit: {note}"
+        );
+    }
+
+    #[test]
+    fn git_short_head_reads_repo_and_is_none_off_repo() {
+        // Off a repo (bare tempdir) there is no HEAD to read.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(git_short_head(empty.path()).is_none());
+    }
+
+    #[test]
+    fn append_read_notes_emits_head_note_only_on_drift() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Markers agree ⇒ no Phase-B note; isolate the head note.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+
+        // Caller's HEAD differs from the index ⇒ note appended to the body.
+        let out = append_read_notes(&store, "real result".to_string(), Some("chk1111"));
+        assert!(out.starts_with("real result"), "body preserved: {out}");
+        assert!(
+            out.contains("idx0000") && out.contains("chk1111"),
+            "got: {out}"
+        );
+
+        // Same commit ⇒ no head note.
+        assert_eq!(
+            append_read_notes(&store, "real result".to_string(), Some("idx0000")),
+            "real result"
+        );
+        // git-less caller ⇒ no head note.
+        assert_eq!(
+            append_read_notes(&store, "real result".to_string(), None),
+            "real result"
+        );
+    }
+
+    #[test]
+    fn append_read_notes_empty_body_becomes_head_note() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        // Empty body + mismatch: the note is the whole answer (no leading newline).
+        let out = append_read_notes(&store, String::new(), Some("chk1111"));
+        assert!(out.starts_with("[note:"), "note is the body: {out}");
+        assert!(
+            !out.contains("\n[note:"),
+            "no empty line before the note: {out}"
+        );
+    }
+
+    #[test]
+    fn append_read_notes_phase_b_and_head_notes_coexist() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD ⇒ Phase-B pending note fires...
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+        // ...and the caller is at yet another commit ⇒ head note also fires.
+        let out = append_read_notes(&store, "body".to_string(), Some("chk1111"));
+        assert!(
+            out.contains("call-graph index incomplete"),
+            "phase-b note: {out}"
+        );
+        assert!(out.contains("chk1111"), "head note: {out}");
     }
 
     /// get_callers must carry the note alongside real results when the marker
