@@ -1082,22 +1082,25 @@ impl ImportResolver for DartResolver {
 }
 
 // ── Ruby ───────────────────────────────────────────────────────────────────
-// Signature: `import:animal` (require_relative 'animal') or `import:foo/bar`.
+// Two signature forms, tagged by the keyword that produced them (#614):
+//   `import:animal` / `import:foo/bar`, from `require_relative`, importer-relative.
+//   `import:gem:json`, from `require`, load-path (gem/stdlib/in-repo lib).
 // Ruby's `require`/`require_relative` usually take a path without the `.rb`
 // extension; the indexer emits the import node but no ResolvesTo chain, so
 // resolve the bare require path against the file here.
 //
-// The require path is anchored to the importer's directory and matched
-// exactly, so `require_relative '../lib/foo'` in `app/src/main.rb` resolves
-// deterministically to `app/lib/foo.rb` and can never over-match a same-named
-// file under an unrelated root.
+// A `require_relative` path is anchored to the importer's directory and
+// matched exactly, so `require_relative '../lib/foo'` in `app/src/main.rb`
+// resolves deterministically to `app/lib/foo.rb` and can never over-match a
+// same-named file under an unrelated root. A `gem:`-tagged `require` always
+// resolves to nothing, since a load-path lookup is not available in the
+// graph.
 //
-// Limitation: `require 'json'` (a gem, load-path relative) and
-// `require_relative 'json'` both emit `import:json`; the analyzer does not
-// record which keyword produced the import, so a load-path `require` is
-// resolved as if importer-relative. This may miss a gem-style require whose
-// target lives outside the importer's subtree — an acceptable, deterministic
-// trade over silently matching every same-named file in the repo.
+// Known limitation (was previously the opposite bug, see #611/#613 history):
+// a load-path `require 'my_gem/parser'` that happens to point at an in-repo
+// `lib/my_gem/parser.rb` is now unresolved, since `gem:` requires never
+// resolve. This is deliberate, over-inclusion (resolving every same-stem
+// gem require) is traded for determinism (resolving none of them).
 
 struct RubyResolver;
 impl ImportResolver for RubyResolver {
@@ -1106,6 +1109,12 @@ impl ImportResolver for RubyResolver {
             Some(s) => s,
             None => return false,
         };
+        // #614: `require` (load-path: gem/stdlib/in-repo lib) is tagged
+        // `gem:` by the analyzer and resolves to no project file, only
+        // `require_relative`'s importer-relative form is resolved here.
+        if spec.starts_with("gem:") {
+            return false;
+        }
         // A require may already carry the extension (`require_relative 'foo.rb'`);
         // strip it so we don't build `foo.rb.rb`.
         let spec = spec.strip_suffix(".rb").unwrap_or(spec);
@@ -1229,6 +1238,32 @@ mod tests {
         // match, even though the bare stem is identical. This is the transitive
         // false-positive class the fixpoint would otherwise compound.
         assert!(!r.resolves_to("import:animal", "ruby/src/cat.rb", "pkg/other/animal.rb"));
+    }
+
+    #[test]
+    fn ruby_resolver_refuses_load_path_require() {
+        // #614: `require 'json'` (a gem/stdlib load-path require) is tagged
+        // `import:gem:json` by the analyzer and must never resolve, even when
+        // a same-stem `json.rb` sits right next to the importer. This is the
+        // exact false-positive from the issue.
+        let r = resolver_for_language("ruby");
+        assert!(!r.resolves_to("import:gem:json", "ruby/src/cat.rb", "ruby/src/json.rb"));
+        assert!(!r.resolves_to("import:gem:animal", "ruby/src/cat.rb", "ruby/src/animal.rb"));
+    }
+
+    #[test]
+    fn ruby_resolver_gem_early_return_is_load_bearing() {
+        // Mutation-test guard: `ruby_resolver_refuses_load_path_require`
+        // above passes even if the `gem:` early-return in `RubyResolver` is
+        // deleted, because the literal "gem:" text gets folded into the path
+        // segment by `resolve_relative_to_importer`, so it can never equal a
+        // realistic `target_path` and the assertion passes for the wrong
+        // reason. This test uses a `target_path` that contains the literal
+        // "gem:" text the join would produce, so it fails loudly (mismatched
+        // path) if the early-return is ever removed, proving the guard is
+        // exercised rather than vacuously true.
+        let r = resolver_for_language("ruby");
+        assert!(!r.resolves_to("import:gem:json", "ruby/src/cat.rb", "ruby/src/gem:json.rb"));
     }
 
     #[test]
