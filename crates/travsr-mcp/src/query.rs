@@ -617,10 +617,16 @@ fn node_entry(node: &travsr_core::Node, depth: u8) -> NodeEntry {
     }
 }
 
-fn is_semantic_edge(kind: &str) -> bool {
+fn is_semantic_edge(kind: &travsr_core::EdgeKind) -> bool {
+    use travsr_core::EdgeKind;
     matches!(
         kind,
-        "ref/call" | "ffi/call" | "overrides" | "is-implementation" | "ref/imports" | "resolves-to"
+        EdgeKind::RefCall
+            | EdgeKind::FFICall
+            | EdgeKind::Overrides
+            | EdgeKind::IsImplementation
+            | EdgeKind::RefImports
+            | EdgeKind::ResolvesTo
     )
 }
 
@@ -628,8 +634,8 @@ fn is_semantic_edge(kind: &str) -> bool {
 /// In caller traversal they are shown as orientation but never expanded —
 /// expanding one pulls in every sibling definition of the containing file
 /// (#517).
-fn is_containment_edge(kind: &str) -> bool {
-    kind == "defines/binding"
+fn is_containment_edge(kind: &travsr_core::EdgeKind) -> bool {
+    matches!(kind, travsr_core::EdgeKind::DefinesBinding)
 }
 
 /// Outgoing/incoming expansion for one node, mirroring `travsr graph`'s edge
@@ -642,20 +648,17 @@ fn is_containment_edge(kind: &str) -> bool {
 /// containment edge reached in `Callers`/`Both` direction (#517 DD-1): the
 /// node is still recorded and displayed, but the traversal does not walk
 /// further from it, so a file's other definitions never enter the BFS queue.
-/// `incoming` records which end of the stored edge `next_id` is (`true` means
-/// `next_id` is the source), so `Both` mode can reconstruct the true
-/// orientation instead of guessing it from the direction flag (#564).
-fn next_edges(
+pub fn next_edges(
     store: &SqliteStore,
     node_id: NodeId,
     direction: QueryDirection,
     edge_mode: QueryEdgeMode,
     is_seed: bool,
-) -> anyhow::Result<Vec<(String, NodeId, bool, bool)>> {
+) -> anyhow::Result<Vec<(travsr_core::EdgeKind, NodeId, bool, bool)>> {
     let mut out = Vec::new();
     if matches!(direction, QueryDirection::Deps | QueryDirection::Both) {
         for e in store.iter_edges_from(node_id)? {
-            out.push((e.kind.as_str().to_string(), e.dst, true, false));
+            out.push((e.kind, e.dst, true, false));
         }
     }
     if matches!(direction, QueryDirection::Callers | QueryDirection::Both) {
@@ -692,12 +695,12 @@ fn next_edges(
             }
         }
         if matches!(edge_mode, QueryEdgeMode::Semantic) {
-            let has_semantic = incoming.iter().any(|e| is_semantic_edge(e.kind.as_str()));
+            let has_semantic = incoming.iter().any(|e| is_semantic_edge(&e.kind));
             if has_semantic {
                 for e in &incoming {
-                    let s = e.kind.as_str();
-                    if is_semantic_edge(s) || s == "defines/binding" {
-                        out.push((s.to_string(), e.src, !is_containment_edge(s), true));
+                    let s = &e.kind;
+                    if is_semantic_edge(s) || matches!(s, travsr_core::EdgeKind::DefinesBinding) {
+                        out.push((*s, e.src, !is_containment_edge(s), true));
                     }
                 }
             } else {
@@ -706,21 +709,21 @@ fn next_edges(
                 // *language* lacks semantic data (and thus warrants the note) is
                 // judged from coverage in graph_query, not from this one node.
                 for e in &incoming {
-                    let s = e.kind.as_str();
-                    out.push((s.to_string(), e.src, !is_containment_edge(s), true));
+                    let s = &e.kind;
+                    out.push((*s, e.src, !is_containment_edge(s), true));
                 }
             }
         } else {
             for e in &incoming {
-                let s = e.kind.as_str();
-                out.push((s.to_string(), e.src, !is_containment_edge(s), true));
+                let s = &e.kind;
+                out.push((*s, e.src, !is_containment_edge(s), true));
             }
         }
     }
     // Multiple call sites (and the file-node definition splice) can yield the
     // same (kind, src, orientation) triple — collapse them for display.
     let mut seen = HashSet::new();
-    out.retain(|(kind, id, _, incoming)| seen.insert((kind.clone(), *id, *incoming)));
+    out.retain(|(kind, id, _, incoming)| seen.insert((*kind, *id, *incoming)));
     // #517 DD-1: non-containment edges (the answer) precede containment edges
     // (orientation) from the same parent. Stable sort preserves DB order
     // within each group, so output stays deterministic.
@@ -799,7 +802,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             // DEBT(travsr-75): iter_edges_from/to do not return provenance, so
             // BFS-traversed edges always show "tree-sitter" in JSON output even
             // when the DB row is "lsif". Only --all mode (all_edges) is correct.
-            edges_raw.push((src, dst, edge_kind.clone(), "tree-sitter".to_string()));
+            edges_raw.push((
+                src,
+                dst,
+                edge_kind.as_str().to_string(),
+                "tree-sitter".to_string(),
+            ));
 
             if !visited.contains(&next_id) {
                 if let Some(next_node) = store.get_node(next_id)? {
@@ -811,7 +819,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                 visited.insert(next_id);
                 tree.push(TreeStep {
                     parent: current_id.0,
-                    edge_kind,
+                    edge_kind: edge_kind.as_str().to_string(),
                     child: next_id.0,
                 });
                 queue.push_back((next_id, depth + 1, child_expand));

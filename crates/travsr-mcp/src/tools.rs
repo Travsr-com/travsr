@@ -6110,7 +6110,7 @@ fn get_graph_json_raw(
 
     // (NodeId, hop_distance)
     let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
+    let mut queue: VecDeque<(NodeId, u8, bool)> = VecDeque::new();
     let mut nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut edges_out: Vec<serde_json::Value> = Vec::new();
     let mut edge_seen: HashSet<(NodeId, NodeId, &'static str)> = HashSet::new();
@@ -6125,11 +6125,11 @@ fn get_graph_json_raw(
 
     for node in &seed_nodes {
         if visited.insert(node.id) {
-            queue.push_back((node.id, 0));
+            queue.push_back((node.id, 0, true));
         }
     }
 
-    while let Some((current_id, hop)) = queue.pop_front() {
+    while let Some((current_id, hop, expand)) = queue.pop_front() {
         let node = match store.get_node(current_id) {
             Ok(Some(n)) => n,
             _ => continue,
@@ -6189,7 +6189,7 @@ fn get_graph_json_raw(
             continue;
         }
 
-        if hop >= depth {
+        if hop >= depth || !expand {
             continue;
         }
 
@@ -6234,7 +6234,7 @@ fn get_graph_json_raw(
                                 }));
                             }
                             if visited.insert(target.id) {
-                                queue.push_back((target.id, hop + 1));
+                                queue.push_back((target.id, hop + 1, true));
                             }
                         }
                     }
@@ -6278,7 +6278,7 @@ fn get_graph_json_raw(
                                 }));
                             }
                             if visited.insert(source.id) {
-                                queue.push_back((source.id, hop + 1));
+                                queue.push_back((source.id, hop + 1, true));
                             }
                         }
                     }
@@ -6289,17 +6289,23 @@ fn get_graph_json_raw(
 
         // Normal traversal (symbol mode)
         if direction == "deps" || direction == "both" {
-            if let Ok(edges) = store.iter_edges_from(current_id) {
+            if let Ok(nexts) = crate::query::next_edges(
+                store,
+                current_id,
+                crate::query::QueryDirection::Deps,
+                crate::query::QueryEdgeMode::All,
+                hop == 0,
+            ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
                 // Collect (dst_id, kind_s) only for edges that produce JSON output.
                 let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for edge in &edges {
-                    let kind_s = edge_kind_str(&edge.kind);
-                    if edge_seen.insert((edge.src, edge.dst, kind_s)) {
-                        new_edges.push((edge.dst, kind_s));
+                for (kind, next_id, child_expand, _incoming) in &nexts {
+                    let kind_s = edge_kind_str(kind);
+                    if edge_seen.insert((current_id, *next_id, kind_s)) {
+                        new_edges.push((*next_id, kind_s));
                     }
-                    if visited.insert(edge.dst) {
-                        queue.push_back((edge.dst, hop + 1));
+                    if visited.insert(*next_id) {
+                        queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch dst nodes, then emit JSON edges in original order.
@@ -6323,16 +6329,22 @@ fn get_graph_json_raw(
         }
 
         if direction == "callers" || direction == "both" {
-            if let Ok(edges) = store.iter_edges_to(current_id) {
+            if let Ok(nexts) = crate::query::next_edges(
+                store,
+                current_id,
+                crate::query::QueryDirection::Callers,
+                crate::query::QueryEdgeMode::All,
+                hop == 0,
+            ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
                 let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for edge in &edges {
-                    let kind_s = edge_kind_str(&edge.kind);
-                    if edge_seen.insert((edge.src, edge.dst, kind_s)) {
-                        new_edges.push((edge.src, kind_s));
+                for (kind, next_id, child_expand, _incoming) in &nexts {
+                    let kind_s = edge_kind_str(kind);
+                    if edge_seen.insert((*next_id, current_id, kind_s)) {
+                        new_edges.push((*next_id, kind_s));
                     }
-                    if visited.insert(edge.src) {
-                        queue.push_back((edge.src, hop + 1));
+                    if visited.insert(*next_id) {
+                        queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch src nodes, then emit JSON edges in original order.
@@ -8358,6 +8370,189 @@ mod tests {
         assert!(
             raw.contains("Repo map"),
             "header must survive the reserve:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn get_graph_json_stops_at_containment_edges() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let file = Node::new(
+            VName::new("", "", "src/service.ts", "typescript", "file"),
+            "file",
+        );
+        let class = Node::new(
+            VName::new(
+                "test",
+                "",
+                "src/service.ts",
+                "typescript",
+                "class:PaymentService",
+            ),
+            "class",
+        );
+        let sibling = Node::new(
+            VName::new(
+                "test",
+                "",
+                "src/service.ts",
+                "typescript",
+                "class:UnrelatedHelper",
+            ),
+            "class",
+        );
+        let caller = Node::new(
+            VName::new(
+                "test",
+                "",
+                "src/controller.ts",
+                "typescript",
+                "fn:processPayment",
+            ),
+            "function",
+        );
+        let store = make_store(
+            &[file.clone(), class.clone(), sibling.clone(), caller.clone()],
+            &[
+                (file.id, class.id, EdgeKind::DefinesBinding),
+                (file.id, sibling.id, EdgeKind::DefinesBinding),
+                (caller.id, class.id, EdgeKind::RefCall),
+            ],
+        );
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "class:PaymentService",
+                direction: "callers",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nodes = v["nodes"].as_array().unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+
+        // Must show class, caller, and defining file
+        assert!(ids.contains(&"src/service.ts:class:PaymentService"));
+        assert!(ids.contains(&"src/controller.ts:fn:processPayment"));
+        assert!(ids.contains(&"src/service.ts")); // the defining file is returned for orientation
+
+        // Must NOT show the sibling (since traversal stops at the defining file containment edge)
+        assert!(!ids.contains(&"src/service.ts:class:UnrelatedHelper"));
+    }
+
+    #[test]
+    fn get_graph_json_and_graph_query_smoke_test() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let seed = Node::new(
+            VName::new("test", "", "src/seed.ts", "typescript", "fn:seed"),
+            "function",
+        );
+        let dep = Node::new(
+            VName::new("test", "", "src/dep.ts", "typescript", "fn:dep"),
+            "function",
+        );
+        let store = make_store(
+            &[seed.clone(), dep.clone()],
+            &[(seed.id, dep.id, EdgeKind::RefCall)],
+        );
+
+        // Run graph_query
+        let query_res = crate::query::graph_query(
+            &store,
+            &crate::query::GraphQueryArgs {
+                query: "fn:seed".to_string(),
+                depth: 2,
+                direction: crate::query::QueryDirection::Deps,
+                edge_mode: crate::query::QueryEdgeMode::All,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+
+        // Run get_graph_json
+        let json_raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "fn:seed",
+                direction: "deps",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
+
+        // Extract nodes and verify matching IDs
+        let json_val: serde_json::Value = serde_json::from_str(&json_raw).unwrap();
+        let mcp_nodes: std::collections::HashSet<String> = json_val["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap().to_string())
+            .collect();
+
+        let expected_mcp_node_ids: std::collections::HashSet<String> = query_res
+            .nodes
+            .iter()
+            .map(|n| {
+                if n.kind == "file" {
+                    n.path.clone()
+                } else {
+                    format!("{}:{}", n.path, n.signature)
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            mcp_nodes, expected_mcp_node_ids,
+            "Nodes must match conformantly"
+        );
+
+        // Edge comparison (orientation-independent set of undirected pairs of Node IDs):
+        let id_to_sig: std::collections::HashMap<u64, String> = query_res
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.signature.clone()))
+            .collect();
+        let mut cli_edge_sig_pairs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for e in &query_res.edges {
+            if let (Some(s_sig), Some(d_sig)) = (id_to_sig.get(&e.src), id_to_sig.get(&e.dst)) {
+                let mut pair = (s_sig.clone(), d_sig.clone());
+                if pair.0 > pair.1 {
+                    std::mem::swap(&mut pair.0, &mut pair.1);
+                }
+                cli_edge_sig_pairs.insert(pair);
+            }
+        }
+
+        let mcp_id_to_sig = |id: &str| -> String {
+            if let Some(pos) = id.find(':') {
+                id[pos + 1..].to_string()
+            } else {
+                "file".to_string()
+            }
+        };
+
+        let mut mcp_edge_sig_pairs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for e in json_val["edges"].as_array().unwrap() {
+            let src_id = e["source"].as_str().unwrap();
+            let dst_id = e["target"].as_str().unwrap();
+            let mut pair = (mcp_id_to_sig(src_id), mcp_id_to_sig(dst_id));
+            if pair.0 > pair.1 {
+                std::mem::swap(&mut pair.0, &mut pair.1);
+            }
+            mcp_edge_sig_pairs.insert(pair);
+        }
+
+        assert_eq!(
+            mcp_edge_sig_pairs, cli_edge_sig_pairs,
+            "Edges must match conformantly"
         );
     }
 }
