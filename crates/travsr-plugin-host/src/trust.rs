@@ -1,5 +1,9 @@
 //! Per-corpus trust gate (ADR-017 Rule 3).
-//! Phase B is spawned ONLY after an explicit trust grant in the global config.
+//! External (non-builtin) Phase B plugins are spawned ONLY after an explicit
+//! per-corpus trust grant in the global config (`travsr lang add <lang>
+//! --corpus <corpus>`). Builtin analyzers ship inside the travsr binary and
+//! run under Rule 4's first-party rules instead — they are not corpus-gated.
+//! Enforced in `PluginIndexer::invoke_phase_b_all` (#414).
 
 use std::collections::HashSet;
 
@@ -33,12 +37,14 @@ impl Default for TrustConfig {
 
 impl TrustConfig {
     /// Load trusted corpora from ~/.travsr/lang.toml (written by `travsr lang add --corpus`).
+    /// Override path via `TRAVSR_LANG_TOML` env var (for tests), mirroring
+    /// [`registered_languages_from_disk`] so both halves of the lang.toml gate
+    /// read the same file.
     pub fn from_disk() -> Self {
         let mut cfg = Self::new();
-        let Some(home) = dirs::home_dir() else {
+        let Some(path) = lang_toml_path() else {
             return cfg;
         };
-        let path = home.join(".travsr").join("lang.toml");
         let Ok(content) = std::fs::read_to_string(&path) else {
             return cfg;
         };
@@ -56,16 +62,20 @@ impl TrustConfig {
     }
 }
 
+/// The lang.toml path: `TRAVSR_LANG_TOML` override (for tests) or
+/// `~/.travsr/lang.toml`.
+fn lang_toml_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("TRAVSR_LANG_TOML") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    dirs::home_dir().map(|home| home.join(".travsr").join("lang.toml"))
+}
+
 /// Read the `registered` language list from ~/.travsr/lang.toml.
 /// Override path via `TRAVSR_LANG_TOML` env var (for tests).
 pub fn registered_languages_from_disk() -> Vec<String> {
-    let path = if let Ok(p) = std::env::var("TRAVSR_LANG_TOML") {
-        std::path::PathBuf::from(p)
-    } else {
-        let Some(home) = dirs::home_dir() else {
-            return vec![];
-        };
-        home.join(".travsr").join("lang.toml")
+    let Some(path) = lang_toml_path() else {
+        return vec![];
     };
     let Ok(content) = std::fs::read_to_string(&path) else {
         return vec![];

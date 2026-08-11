@@ -129,6 +129,12 @@ pub fn run() -> anyhow::Result<()> {
                     ["skipped_unregistered", lang] => eprintln!(
                         "warning: '{lang}' sources found but semantic indexing is not set up. Run `travsr lang install {lang}`"
                     ),
+                    // #414 (ADR-017 Rule 3): registered language, but this
+                    // repo's corpus has no per-corpus trust grant, so its
+                    // external tooling was not spawned.
+                    ["untrusted_corpus", lang] => eprintln!(
+                        "warning: '{lang}' is registered but this repository's corpus is not trusted for semantic indexing. Run `travsr lang add {lang} --corpus <your-corpus>` to trust it"
+                    ),
                     ["skipped_no_analyzer", lang] => eprintln!(
                         "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"
                     ),
