@@ -7050,6 +7050,50 @@ mod tests {
         );
     }
 
+    /// #614 regression: `require 'json'` (load-path, tagged `import:gem:json`
+    /// by the analyzer) must NOT resolve to a same-stem `json.rb` sibling,
+    /// unlike `require_relative 'json'` (`import:json`) which still does.
+    /// Before the fix both keywords emitted the same `import:json` signature
+    /// and RubyResolver could not tell them apart.
+    #[test]
+    fn blast_radius_phase2_ignores_ruby_gem_require() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let ruby = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("", "", path, "ruby", sig), kind)
+        };
+        let json_file = ruby("ruby/src/json.rb", "fn:json", "function");
+        let cat = ruby("ruby/src/cat.rb", "fn:cat", "function");
+        // `require 'json'` in cat.rb: load-path, must not resolve to json.rb.
+        let cat_gem_import = ruby("ruby/src/cat.rb", "import:gem:json", "import");
+        let dog = ruby("ruby/src/dog.rb", "fn:dog", "function");
+        // `require_relative 'json'` in dog.rb: importer-relative, must resolve.
+        let dog_relative_import = ruby("ruby/src/dog.rb", "import:json", "import");
+        let store = make_store(
+            &[
+                json_file.clone(),
+                cat.clone(),
+                cat_gem_import.clone(),
+                dog.clone(),
+                dog_relative_import.clone(),
+            ],
+            &[
+                (cat.id, cat_gem_import.id, EdgeKind::Depends),
+                (dog.id, dog_relative_import.id, EdgeKind::Depends),
+            ],
+        );
+        let result = get_blast_radius(&store, "ruby/src/json.rb", AnalysisMode::TreeSitter);
+        assert!(
+            !result.contains("ruby/src/cat.rb"),
+            "cat.rb's `require 'json'` is load-path (import:gem:json) and must NOT \
+             appear, got: {result}"
+        );
+        assert!(
+            result.contains("ruby/src/dog.rb"),
+            "dog.rb's `require_relative 'json'` (import:json) must still appear, \
+             got: {result}"
+        );
+    }
+
     /// #613 keystone. A Phase-2 language (Ruby, no ResolvesTo edge) must report
     /// blast radius *transitively*: main.rb requires cat, cat.rb requires animal.
     /// Editing animal.rb must reach cat.rb (one hop) AND main.rb (two hops).

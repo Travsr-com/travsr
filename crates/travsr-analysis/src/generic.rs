@@ -33,6 +33,11 @@ pub struct LanguageConfig {
     /// For regular nodes: `sig = "{prefix}:{captured_text}"`.
     /// Special prefix `"import"` → uses the full node text, strips the leading
     /// keyword (`import`, `use`, `require`, `using`) and trailing `;`.
+    /// A prefix of the form `"import:<scheme>"` (e.g. `"import:gem"`) behaves
+    /// identically but tags the signature with `<scheme>` so a language config
+    /// can distinguish two import forms captured under different tree-sitter
+    /// patterns (e.g. Ruby `require` vs `require_relative`, #614) without any
+    /// change to this parser's shared logic.
     pub capture_kinds: &'static [(&'static str, &'static str, &'static str)],
     /// AST node kinds that enclose their methods as a type/namespace, each
     /// paired with the signature prefix that container is itself captured
@@ -198,7 +203,7 @@ pub fn parse_with_config(
                         container_id,
                     )
                 }
-                (None, "import") => {
+                (None, prefix) if is_import_prefix(prefix) => {
                     // Use the full node text, strip leading keyword + trailing
                     // semicolons. N5: also strip surrounding quotes so Dart
                     // `import 'dart:core';` yields `import:dart:core` (the
@@ -213,14 +218,14 @@ pub fn parse_with_config(
                         .trim()
                         .trim_matches(|c| c == '\'' || c == '"')
                         .to_string();
-                    (format!("import:{cleaned}"), node_kind, file_id)
+                    (format!("{prefix}:{cleaned}"), node_kind, file_id)
                 }
                 (None, _) => (format!("{sig_prefix}:{text}"), node_kind, file_id),
             };
 
             let vname = VName::new(corpus, "", vname_path, lang_str, &sig);
             let mut node = Node::new(vname, node_kind).with_line(line);
-            if sig_prefix != "import" {
+            if !is_import_prefix(sig_prefix) {
                 node = node.with_end_line(end_line);
             }
             let edge_kind = if node_kind == "import" {
@@ -238,6 +243,14 @@ pub fn parse_with_config(
         edges,
         ffi_markers: vec![],
     })
+}
+
+/// `true` for the bare `"import"` prefix or a scheme-marked variant
+/// (`"import:<scheme>"`, e.g. Ruby's `"import:gem"`, #614). Both forms share
+/// the same node-text cleanup and both stay `end_line`-free, so every import
+/// capture is treated uniformly regardless of which scheme produced it.
+fn is_import_prefix(sig_prefix: &str) -> bool {
+    sig_prefix == "import" || sig_prefix.starts_with("import:")
 }
 
 /// Compute the 1-based end line for a definition's span (N2).
