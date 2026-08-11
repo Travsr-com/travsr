@@ -343,6 +343,25 @@ fn make_relative(base: &str, abs_path: &str) -> String {
     }
 }
 
+/// Decode a `file://` URI from an LSIF dump into an OS filesystem path.
+///
+/// rust-analyzer emits `file:///C:/proj/src/main.rs` on Windows; naively
+/// stripping `file://` leaves `/C:/proj/src/main.rs`, whose leading slash before
+/// the drive letter is not a valid Windows path and fails to open — which would
+/// silently fail-open the #650 call-site source read (every ref treated as a
+/// call) on Windows. Drop that leading slash when it precedes a `X:` drive
+/// letter. Unix paths (`/home/..`) contain no such prefix and are returned
+/// unchanged, so this is a no-op off Windows.
+fn file_uri_to_path(uri: &str) -> String {
+    let s = uri.strip_prefix("file://").unwrap_or(uri);
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        s[1..].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +503,26 @@ mod tests {
         assert_eq!(make_relative("/repo", "/repo/src/foo.ts"), "src/foo.ts");
         assert_eq!(make_relative("/repo/", "/repo/src/foo.ts"), "src/foo.ts");
         assert_eq!(make_relative("", "/abs/path"), "/abs/path");
+    }
+
+    #[test]
+    fn file_uri_to_path_decodes_windows_and_unix() {
+        // Unix: leading slash is part of the path, kept as-is.
+        assert_eq!(
+            file_uri_to_path("file:///home/u/proj/src/a.rs"),
+            "/home/u/proj/src/a.rs"
+        );
+        // Windows: rust-analyzer's `file:///C:/..` must lose the slash before the
+        // drive letter so the path opens (#650 source read fails otherwise).
+        assert_eq!(
+            file_uri_to_path("file:///C:/proj/src/a.rs"),
+            "C:/proj/src/a.rs"
+        );
+        assert_eq!(file_uri_to_path("file:///d:/x/y.rs"), "d:/x/y.rs");
+        // No scheme prefix → returned unchanged (defensive).
+        assert_eq!(file_uri_to_path("/already/a/path"), "/already/a/path");
+        // A single leading slash that is NOT a drive letter is preserved.
+        assert_eq!(file_uri_to_path("file:///srv/app.rs"), "/srv/app.rs");
     }
 
     #[test]
@@ -809,7 +848,10 @@ pub fn ingest_rust_positional(dump: &str, repo_root: &str) -> Vec<travsr_core::L
                         v.get("id").and_then(|i| i.as_u64()),
                         v.get("uri").and_then(|u| u.as_str()),
                     ) {
-                        let path = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+                        // #650: the resolved path is read from disk to classify
+                        // each occurrence as a call, so it must be a valid OS
+                        // path on Windows too (rust-analyzer emits `file:///C:/`).
+                        let path = file_uri_to_path(uri);
                         doc_paths.insert(id, path);
                     }
                 }
@@ -1165,14 +1207,27 @@ mod rust_lsif_tests {
         )
         .unwrap();
 
-        let root = dir.path().to_string_lossy().to_string();
-        let main_uri = format!("file://{}/src/main.rs", root);
-        let types_uri = format!("file://{}/src/types.rs", root);
+        // Build portable file:// URIs. On Windows `dir.path()` uses `\` and a
+        // drive letter (`C:\..`); backslashes are invalid inside a JSON string
+        // (so serde would drop the document vertices, emptying the output) and
+        // the raw path is not URI-shaped. Normalize to forward slashes and the
+        // real rust-analyzer Windows shape `file:///C:/..` (a leading slash
+        // before the drive), which `file_uri_to_path` decodes to a readable OS
+        // path — exercising the Windows decode this test guards. On Unix the
+        // path already starts with `/`, so this yields the usual `file:///..`.
+        let root = dir.path().to_string_lossy().replace('\\', "/");
+        let uri_root = if root.starts_with('/') {
+            root.clone()
+        } else {
+            format!("/{root}")
+        };
+        let main_uri = format!("file://{uri_root}/src/main.rs");
+        let types_uri = format!("file://{uri_root}/src/types.rs");
         // 10/11 are def ranges in types.rs; 20 is the call occurrence, 21 the
         // type-reference occurrence, both in main.rs.
         let dump = format!(
             r#"
-{{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file://{root}","positionEncoding":"utf-16","toolInfo":{{"name":"rust-analyzer","version":"0"}}}}
+{{"id":1,"type":"vertex","label":"metaData","version":"0.4.3","projectRoot":"file://{uri_root}","positionEncoding":"utf-16","toolInfo":{{"name":"rust-analyzer","version":"0"}}}}
 {{"id":2,"type":"vertex","label":"document","uri":"{main_uri}"}}
 {{"id":3,"type":"vertex","label":"document","uri":"{types_uri}"}}
 {{"id":10,"type":"vertex","label":"range","start":{{"line":3,"character":7}},"end":{{"line":3,"character":13}}}}
