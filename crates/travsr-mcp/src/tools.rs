@@ -289,6 +289,19 @@ fn git_short_head(cwd: &std::path::Path) -> Option<String> {
     (!head.is_empty()).then_some(head)
 }
 
+/// #645/#661: the live short HEAD of a *registered* repo, resolved from its db
+/// path (`<root>/.travsr/graph.db` → `<root>`). The global MCP server captures a
+/// single `LAUNCH_CWD` — the caller's one workspace — which is NOT each
+/// registered repo's checkout. The per-repo drift note must therefore read that
+/// repo's own HEAD: using `LAUNCH_CWD` in a multi-repo aggregate would compare
+/// one workspace's commit against every *other* repo's index and fire a spurious
+/// mismatch on repos that are perfectly fresh. `None` when git is unavailable or
+/// the db path has an unexpected shape — the note then correctly never fires.
+fn repo_head_from_registry_path(db_path: &std::path::Path) -> Option<String> {
+    let root = db_path.parent()?.parent()?;
+    git_short_head(root)
+}
+
 /// Append the read-path advisory notes (when any) to a structural tool
 /// response: the Phase-B degraded note (#617) and the index/HEAD mismatch note
 /// (#645 WS-B). Both are independent and may both appear. An empty body becomes
@@ -589,9 +602,13 @@ pub fn get_dependencies_global(
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        // #661 WS-D: per-repo HEAD note (mirrors get_callers_global's per-repo
-        // Phase-B note) — each store carries its own last_commit.
-        with_head_note(store, result)
+        // #661 WS-D: per-repo HEAD note — read *this* repo's own checkout, not
+        // the global LAUNCH_CWD (the caller's one workspace), so a fresh repo in
+        // the aggregate is never flagged against an unrelated commit.
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        append_head_note(store, result, head.as_deref())
     });
     // SEC-001: sanitize the fully-aggregated string once.
     sanitize_for_mcp(&raw)
@@ -609,8 +626,13 @@ pub fn get_callers_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
-        let result = with_phase_b_note(store, get_callers_raw(store, symbol));
+        // #617 + #645: per-repo notes — each store carries its own Phase B
+        // freshness, and the HEAD note reads *this* repo's own checkout (not the
+        // global LAUNCH_CWD, which is only the caller's one workspace).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(store, get_callers_raw(store, symbol), head.as_deref());
         if result.is_empty() || single {
             result
         } else {
@@ -990,8 +1012,12 @@ pub fn find_references_global(
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        // #661 WS-D: per-repo HEAD note (mirrors get_callers_global).
-        with_head_note(store, result)
+        // #661 WS-D: per-repo HEAD note — read *this* repo's own checkout, not
+        // the global LAUNCH_CWD (mirrors get_callers_global).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        append_head_note(store, result, head.as_deref())
     });
     wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
@@ -2222,8 +2248,16 @@ pub fn get_blast_radius_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
-        let result = with_phase_b_note(store, get_blast_radius_raw(store, file, mode));
+        // #617 + #645: per-repo notes — each store's own Phase B freshness, and
+        // the HEAD note against *this* repo's own checkout (not global LAUNCH_CWD).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(
+            store,
+            get_blast_radius_raw(store, file, mode),
+            head.as_deref(),
+        );
         if result.is_empty() || single {
             result
         } else {
@@ -3357,12 +3391,17 @@ pub fn get_execution_path_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
+        // #617 + #645: per-repo notes — each store's own Phase B freshness, and
+        // the HEAD note against *this* repo's own checkout (not global LAUNCH_CWD).
         // #620: diagnose empty outcomes only in single-repo mode; a repo that
         // simply doesn't contain the symbols must stay silent in an aggregate.
-        let result = with_phase_b_note(
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(
             store,
             get_execution_path_body(store, source, sink, filter, single),
+            head.as_deref(),
         );
         if result.is_empty() || single {
             result
@@ -5634,7 +5673,18 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
         }
     }
     let depth = (*depth).clamp(1, 4);
-    get_graph_json_raw(store, query, direction, depth, kind_filter, *token_budget)
+    // #645 WS-D: single-repo stdio server — the caller's checkout IS this repo,
+    // so the launch cwd's HEAD is the correct drift comparand.
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    get_graph_json_raw(
+        store,
+        query,
+        direction,
+        depth,
+        kind_filter,
+        *token_budget,
+        head.as_deref(),
+    )
 }
 
 // ── Repo-map LOD overview (P3 #319) ──────────────────────────────────────────
@@ -5975,6 +6025,11 @@ fn get_graph_json_raw(
     depth: u8,
     kind_filter: &str,
     token_budget: usize,
+    // #645/#661: the caller's live short HEAD for the index/HEAD drift signal.
+    // Injected (not read from LAUNCH_CWD here) so the global aggregator can pass
+    // *each* repo's own HEAD rather than the one workspace's — see
+    // `repo_head_from_registry_path`.
+    head: Option<&str>,
 ) -> String {
     use std::collections::{HashSet, VecDeque};
 
@@ -6325,8 +6380,7 @@ fn get_graph_json_raw(
     // incomplete (#617) and index/HEAD drift (#645) are independent and may both
     // apply. Carried as JSON `signals` array items (never appended as prose) so
     // the JSON body still parses; the global aggregator already merges `signals`.
-    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
-    let signals = read_note_signals(store, head.as_deref());
+    let signals = read_note_signals(store, head);
     if !signals.is_empty() {
         out["signals"] = serde_json::Value::Array(signals);
     }
@@ -6404,7 +6458,18 @@ pub fn get_graph_json_global(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = get_graph_json_raw(&store, query, direction, depth, kind_filter, 0);
+                // #645 WS-D: per-repo drift signal reads *this* repo's own HEAD,
+                // not the global LAUNCH_CWD (the caller's one workspace).
+                let head = repo_head_from_registry_path(db_path);
+                let raw = get_graph_json_raw(
+                    &store,
+                    query,
+                    direction,
+                    depth,
+                    kind_filter,
+                    0,
+                    head.as_deref(),
+                );
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -10147,6 +10212,48 @@ mod snippet_tests {
         // Off a repo (bare tempdir) there is no HEAD to read.
         let empty = tempfile::tempdir().unwrap();
         assert!(git_short_head(empty.path()).is_none());
+    }
+
+    /// #645/#661: in global mode the per-repo HEAD must come from that repo's own
+    /// root (`<root>/.travsr/graph.db` → `<root>`), NOT the process-global
+    /// LAUNCH_CWD — otherwise one workspace's commit is compared against every
+    /// other registered repo's index and fires a spurious mismatch. Pin that the
+    /// resolver reads the repo the db belongs to, and matches `git_short_head` of
+    /// that root exactly.
+    #[test]
+    fn repo_head_from_registry_path_reads_the_owning_repo_head() {
+        fn git(dir: &std::path::Path, args: &[&str]) -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !git(std::path::Path::new("."), &["--version"]) {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(git(root, &["init", "-q"]));
+        assert!(git(root, &["config", "user.email", "t@t.t"]));
+        assert!(git(root, &["config", "user.name", "t"]));
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "-qm", "init"]));
+
+        let db_path = root.join(".travsr").join("graph.db");
+        // Resolves from the db path's grandparent (the repo root) and equals a
+        // direct short-HEAD read of that root — the value LAUNCH_CWD would only
+        // coincidentally give when the caller happened to stand in this repo.
+        assert_eq!(
+            repo_head_from_registry_path(&db_path),
+            git_short_head(root),
+            "must read the repo the db belongs to, not the process cwd"
+        );
+        assert!(repo_head_from_registry_path(&db_path).is_some());
     }
 
     #[test]
