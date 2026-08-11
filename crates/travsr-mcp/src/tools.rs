@@ -39,7 +39,10 @@ pub fn get_dependencies(store: &SqliteStore, file: &str, transitive: bool, depth
         }
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
-    sanitize_for_mcp(&raw)
+    // #661 WS-D: carry the HEAD-mismatch note on the real dependency answer. The
+    // invalid-arg reject (above) and the arg-hint diagnostic are not path:line
+    // answers and return early without a note.
+    with_head_note(store, sanitize_for_mcp(&raw))
 }
 
 /// Diagnose an empty `get_dependencies` answer (#619).
@@ -327,6 +330,58 @@ fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
     append_read_notes(store, body, head.as_deref())
 }
 
+/// #661 WS-D: append the index/HEAD mismatch note (#645) **only** — no Phase-B
+/// note — to a deterministic `path:line` tool's response. `find_references`,
+/// `get_dependencies` and `get_graph_json` assert `path:line` but do not depend
+/// on Phase B, so they carry the head-drift signal without the Phase-B one.
+///
+/// `head` is split out as a parameter (the same injectable seam as
+/// [`append_read_notes`]) so the composition is deterministically testable
+/// without the process-global `LAUNCH_CWD`. Empty body ⇒ the note is the whole
+/// answer (the empty-but-unreliable case these notes exist to flag).
+fn append_head_note(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    match head.and_then(|h| head_index_mismatch_note(h, &stored)) {
+        Some(note) if body.is_empty() => note,
+        Some(note) => format!("{body}\n{note}"),
+        None => body,
+    }
+}
+
+/// Production entry for the head-only note: resolves the caller's HEAD from the
+/// captured launch cwd (§ `LAUNCH_CWD`) and appends the mismatch note. Fail-safe
+/// — no cwd or no git means no note.
+fn with_head_note(store: &SqliteStore, body: String) -> String {
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    append_head_note(store, body, head.as_deref())
+}
+
+/// #661 WS-D: the read-path advisory notes as JSON `signals` array items, for
+/// tools whose body is JSON for renderers (`get_graph_json`) — appending a
+/// `[note: …]` prose string would break `JSON.parse`. Returns the Phase-B note
+/// (#617) and the index/HEAD mismatch note (#645), each already carried in the
+/// `signals` array the global aggregator merges. `head` is injectable for the
+/// same testability reason as [`append_head_note`].
+fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json::Value> {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    [
+        phase_b_degraded_note(store).map(str::to_string),
+        head.and_then(|h| head_index_mismatch_note(h, &stored)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(serde_json::Value::String)
+    .collect()
+}
+
 /// Return all nodes that have an incoming edge to the given symbol, tagged
 /// by provenance so both semantic and structural callers are visible.
 ///
@@ -520,11 +575,12 @@ pub fn get_dependencies_global(
         let result = get_dependencies_raw(store, file);
         // #619: in single-repo mode, diagnose an empty answer exactly like the
         // stdio path. In multi-repo mode leave per-repo empties silent — a
-        // hint per non-matching repo would spam the aggregate.
+        // hint per non-matching repo would spam the aggregate. The arg-hint is
+        // a diagnostic, not a path:line answer, so it carries no HEAD note.
         if result.is_empty() && single {
             return dependency_arg_hint(store, file).unwrap_or(result);
         }
-        if result.is_empty() || single {
+        let result = if result.is_empty() || single {
             result
         } else {
             result
@@ -532,7 +588,10 @@ pub fn get_dependencies_global(
                 .map(|l| format!("[{repo_name}] {l}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        }
+        };
+        // #661 WS-D: per-repo HEAD note (mirrors get_callers_global's per-repo
+        // Phase-B note) — each store carries its own last_commit.
+        with_head_note(store, result)
     });
     // SEC-001: sanitize the fully-aggregated string once.
     sanitize_for_mcp(&raw)
@@ -737,10 +796,13 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     // SEC-001: sanitize before returning. Use the larger find-output limit (not
     // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
     // survive intact instead of being cut mid-line.
-    wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_references_raw(store, symbol, path),
-        FIND_OUTPUT_LIMIT,
-    ))
+    // #661 WS-D: append the HEAD-mismatch note *after* sanitize (so it is never
+    // truncated) but *before* wrap_envelope (so it stays inside <travsr-data>).
+    // The early returns above (validation reject, pending JSON) are not
+    // path:line answers and intentionally carry no note.
+    let body =
+        sanitize_mcp_body_with_limit(&find_references_raw(store, symbol, path), FIND_OUTPUT_LIMIT);
+    wrap_envelope(&with_head_note(store, body))
 }
 
 /// Raw (unsanitized) variant, shared by the global aggregator.
@@ -919,7 +981,7 @@ pub fn find_references_global(
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         let result = find_references_raw(store, symbol, path);
-        if result.is_empty() || single {
+        let result = if result.is_empty() || single {
             result
         } else {
             result
@@ -927,7 +989,9 @@ pub fn find_references_global(
                 .map(|l| format!("[{repo_name}] {l}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        }
+        };
+        // #661 WS-D: per-repo HEAD note (mirrors get_callers_global).
+        with_head_note(store, result)
     });
     wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
@@ -6256,10 +6320,15 @@ fn get_graph_json_raw(
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
     }
-    // #617: degraded-state signal — additive envelope field; first-party
-    // consumers read only `nodes`/`edges` and ignore extra keys.
-    if let Some(note) = phase_b_degraded_note(store) {
-        out["signals"] = serde_json::json!([note]);
+    // #617 + #661 WS-D: degraded-state signals — additive envelope field; first-
+    // party consumers read only `nodes`/`edges` and ignore extra keys. Phase-B
+    // incomplete (#617) and index/HEAD drift (#645) are independent and may both
+    // apply. Carried as JSON `signals` array items (never appended as prose) so
+    // the JSON body still parses; the global aggregator already merges `signals`.
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    let signals = read_note_signals(store, head.as_deref());
+    if !signals.is_empty() {
+        out["signals"] = serde_json::Value::Array(signals);
     }
     match serde_json::to_string(&out) {
         Ok(s) => s,
@@ -10134,6 +10203,84 @@ mod snippet_tests {
             "phase-b note: {out}"
         );
         assert!(out.contains("chk1111"), "head note: {out}");
+    }
+
+    // ── #661 WS-D: head-only note on the deterministic path:line tools ────────
+
+    #[test]
+    fn append_head_note_emits_head_note_only_on_drift() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD would fire the Phase-B note — append_head_note must
+        // NOT include it (these tools do not depend on Phase B).
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+
+        let out = append_head_note(&store, "real result".to_string(), Some("chk1111"));
+        assert!(out.starts_with("real result"), "body preserved: {out}");
+        assert!(
+            out.contains("idx0000") && out.contains("chk1111"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("call-graph index incomplete"),
+            "head-only wrapper must not carry the Phase-B note: {out}"
+        );
+
+        // Same commit ⇒ no note. git-less caller ⇒ no note.
+        assert_eq!(
+            append_head_note(&store, "real result".to_string(), Some("idx0000")),
+            "real result"
+        );
+        assert_eq!(
+            append_head_note(&store, "real result".to_string(), None),
+            "real result"
+        );
+    }
+
+    #[test]
+    fn append_head_note_empty_body_becomes_note() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        let out = append_head_note(&store, String::new(), Some("chk1111"));
+        assert!(out.starts_with("[note:"), "note is the body: {out}");
+        assert!(
+            !out.contains('\n'),
+            "no leading newline before the note: {out}"
+        );
+    }
+
+    #[test]
+    fn read_note_signals_carry_head_and_phase_b_as_json_array() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD ⇒ Phase-B signal; caller at another commit ⇒ head signal.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+
+        let signals = read_note_signals(&store, Some("chk1111"));
+        assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
+
+        // Embedding them in a graph-json envelope must still parse as JSON.
+        let out = serde_json::json!({ "nodes": [], "edges": [], "signals": signals });
+        let s = serde_json::to_string(&out).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("body must stay valid JSON");
+        let arr = parsed["signals"].as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|v| v.as_str().map(|t| t.contains("chk1111")).unwrap_or(false)),
+            "head signal present: {arr:?}"
+        );
+    }
+
+    #[test]
+    fn read_note_signals_empty_when_fresh_and_git_less() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
+        assert!(read_note_signals(&store, None).is_empty());
+        // Caller at the same commit ⇒ still no head signal.
+        assert!(read_note_signals(&store, Some("idx0000")).is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker
