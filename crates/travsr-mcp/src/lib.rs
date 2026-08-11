@@ -29,6 +29,9 @@ pub use sse::{router as sse_router, AppState};
 // which run the same occurrence-store read as the MCP tools against a locally
 // opened store. The rest of `tools` stays private (MCP-only surface).
 pub use tools::{find_pattern, find_references};
+// #645 WS-B: the CLI `status` surface reuses this exact classifier so the CLI
+// and MCP notes never disagree about an index/HEAD mismatch.
+pub use tools::head_index_mismatch_note;
 // #448: exported solely so `travsr-daemon` can assert its own `SKIP_DIRS` still
 // matches this copy. The dependency edge runs daemon → mcp, so the equality can
 // only be checked from that side; without it a future edit to the daemon's list
@@ -59,6 +62,12 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
     // which require `&mut Connection`). Read-only tools auto-reborrow `&mut`→`&`.
     let mut store = SqliteStore::open(db_path)
         .with_context(|| format!("opening graph database at {}", db_path.display()))?;
+    // #645 WS-B: record the caller's checkout (the IDE launches the stdio server
+    // in the workspace dir) so structural tools can flag an index built for a
+    // different commit than the live HEAD.
+    if let Ok(cwd) = std::env::current_dir() {
+        tools::set_launch_cwd(cwd);
+    }
     // Inject the embed KNN hook so get_context's semantic seed selection (Step 4)
     // works in standalone `travsr mcp --stdio` mode, not just daemon mode.
     inject_embed_hook(&mut store, db_path);
@@ -73,6 +82,10 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
 /// The registry is re-read on every tool call so repos added via `travsr init`
 /// after startup are picked up live without restarting the server.
 pub fn serve_stdio_global() -> anyhow::Result<()> {
+    // #645 WS-B: same checkout capture as `serve_stdio` (see there).
+    if let Ok(cwd) = std::env::current_dir() {
+        tools::set_launch_cwd(cwd);
+    }
     rerank::warm_background();
     server::run_global()
 }

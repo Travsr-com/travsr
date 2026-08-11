@@ -3372,6 +3372,45 @@ fn reconcile_head_drift(
             return false;
         }
     };
+
+    // #645 WS-A: reindex_files only visits paths in `paths`; a file the drift
+    // DELETED is absent from tracked_files_from_git, so nothing prunes its
+    // nodes and they survive as ghosts from the discarded commit. Reuse the
+    // §6.5 reconcile (the same prune `fsck --fix` uses) to remove
+    // db_file_paths − tracked. Run it regardless of `dirty`: deletions are
+    // orthogonal to the reindex delta. `walked` must match the stored VName
+    // key format exactly — relative to repo_root, forward slashes — or every
+    // tracked file reads as a ghost (Windows load-bearing; `paths` are
+    // absolute PathBufs, rebuilt here the same way reindex_files does).
+    let walked: std::collections::HashSet<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(repo_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
+    match s.reconcile(
+        &walked,
+        &travsr_core::SafetyPolicy::default(),
+        repo_root,
+        &corpus,
+    ) {
+        Ok(report) if report.aborted => tracing::warn!(
+            reason = report.abort_reason.as_deref().unwrap_or(""),
+            "head reconcile: ghost prune tripped the mass-delete circuit breaker — \
+             deleted nothing; run `travsr fsck --fix --force` to override"
+        ),
+        Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
+            pruned = report.ghost_paths.len(),
+            "head reconcile: pruned drift-deleted ghost files"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(err = %e, "head reconcile: ghost prune failed"),
+    }
+
     // Same guard as the ReindexCommit path: never claim freshness for a HEAD
     // whose reindex was skipped due to a signature-format mismatch.
     if s.get_signature_format_version().ok() == Some(SIGNATURE_FORMAT_VERSION) {
@@ -6628,6 +6667,128 @@ mod tests {
             s.get_meta("last_commit").unwrap().as_deref(),
             Some("f0f0f0f"),
             "marker must not claim freshness for a skipped reindex"
+        );
+    }
+
+    /// #645 WS-A: a file the drift DELETED (present in the graph, gone from the
+    /// tracked-at-HEAD set) must have its nodes pruned by the reconcile, not
+    /// left as a ghost from the discarded commit. This is the issue's exact
+    /// repro: index at C2 (which added `second.ts`), then `git reset --hard C1`
+    /// removes it and moves HEAD back.
+    #[test]
+    fn reconcile_head_drift_prunes_drift_deleted_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "export class B { go() {} }").unwrap();
+        let c1 = git_commit_all(tmp.path(), "c1");
+        std::fs::write(
+            tmp.path().join("second.ts"),
+            "export class Second { secondCommitSym() {} }",
+        )
+        .unwrap();
+        let c2 = git_commit_all(tmp.path(), "c2 adds second.ts");
+        assert_ne!(c1, c2);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        // Index the working tree as it stands at C2 (all three files present).
+        let paths: Vec<std::path::PathBuf> = ["a.ts", "b.ts", "second.ts"]
+            .iter()
+            .map(|f| tmp.path().join(f))
+            .collect();
+        reindex_files(&paths, tmp.path(), &mut store).unwrap();
+        store.set_meta("last_commit", &c2).unwrap();
+        assert!(
+            store
+                .get_all_file_hashes()
+                .unwrap()
+                .contains_key("second.ts"),
+            "second.ts must be in the graph before the drift"
+        );
+
+        // The drift: history moves back to C1, deleting second.ts from the tree.
+        StdCommand::new("git")
+            .args(["reset", "--hard", &c1])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+
+        let store = std::sync::Mutex::new(store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        assert!(reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get_meta("last_commit").unwrap().as_deref(),
+            Some(c1.as_str()),
+            "marker must advance to the reconciled HEAD"
+        );
+        let hashes = s.get_all_file_hashes().unwrap();
+        assert!(
+            !hashes.contains_key("second.ts"),
+            "drift-deleted second.ts must be pruned, not left as a ghost"
+        );
+        assert!(
+            hashes.contains_key("a.ts") && hashes.contains_key("b.ts"),
+            "surviving tracked files must be untouched: {:?}",
+            hashes.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// #645 WS-A: the reconcile's ghost prune reuses the §6.5 TOCTOU re-check —
+    /// a path in the graph but absent from the tracked set that is still present
+    /// on disk (an untracked working file) must NOT be deleted.
+    #[test]
+    fn reconcile_head_drift_prune_toctou_skips_present_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("tracked.ts"), "export class T { go() {} }").unwrap();
+        let c1 = git_commit_all(tmp.path(), "c1");
+        std::fs::write(tmp.path().join("another.ts"), "export class N { go() {} }").unwrap();
+        let c2 = git_commit_all(tmp.path(), "c2");
+        // On disk but never committed — tracked_files_from_git will not list it.
+        std::fs::write(
+            tmp.path().join("untracked.ts"),
+            "export class U { go() {} }",
+        )
+        .unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        let paths: Vec<std::path::PathBuf> = ["tracked.ts", "another.ts", "untracked.ts"]
+            .iter()
+            .map(|f| tmp.path().join(f))
+            .collect();
+        reindex_files(&paths, tmp.path(), &mut store).unwrap();
+        // Stale marker so reconcile actually runs (HEAD is c2).
+        store.set_meta("last_commit", &c1).unwrap();
+
+        let store = std::sync::Mutex::new(store);
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) = std::sync::mpsc::channel::<watcher::WatchEvent>();
+
+        assert!(reconcile_head_drift(tmp.path(), &store, &sched, &index_tx));
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get_meta("last_commit").unwrap().as_deref(),
+            Some(c2.as_str())
+        );
+        assert!(
+            s.get_all_file_hashes()
+                .unwrap()
+                .contains_key("untracked.ts"),
+            "an untracked file present on disk must survive the TOCTOU re-check"
         );
     }
 

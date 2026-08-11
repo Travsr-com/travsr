@@ -39,7 +39,10 @@ pub fn get_dependencies(store: &SqliteStore, file: &str, transitive: bool, depth
         }
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
-    sanitize_for_mcp(&raw)
+    // #661 WS-D: carry the HEAD-mismatch note on the real dependency answer. The
+    // invalid-arg reject (above) and the arg-hint diagnostic are not path:line
+    // answers and return early without a note.
+    with_head_note(store, sanitize_for_mcp(&raw))
 }
 
 /// Diagnose an empty `get_dependencies` answer (#619).
@@ -236,15 +239,160 @@ fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
     }
 }
 
-/// Append the Phase-B degraded note (when any) to a structural tool response.
-/// An empty body becomes the note alone: the note IS the answer then — it is
-/// exactly the empty-but-unreliable case #617 exists to flag.
+/// #645 WS-B: the stdio server's launch directory — the caller's checkout.
+///
+/// Captured once when the stdio server starts (the IDE launches it in the
+/// workspace dir). The freshness markers only ever compare `phase_b_commit`
+/// vs `last_commit` — two store values, never the repository — so a read from
+/// a checkout at a *different* commit than the index (a linked worktree, or a
+/// HEAD move the daemon has not yet reconciled) answers with confident
+/// `path:line` for the wrong revision. Comparing this cwd's live HEAD to the
+/// index's `last_commit` is the only signal that surfaces it. Unset in the SSE
+/// server (a remote client has no local checkout) and in unit tests, where the
+/// head note correctly never fires.
+static LAUNCH_CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the stdio server's launch directory (§ `LAUNCH_CWD`). Idempotent:
+/// only the first call wins, matching the single server lifetime.
+pub fn set_launch_cwd(dir: PathBuf) {
+    let _ = LAUNCH_CWD.set(dir);
+}
+
+/// #645 WS-B: build the index/HEAD mismatch note. `head` is the caller's live
+/// `git rev-parse --short HEAD`; `stored` is the index's `last_commit`. Returns
+/// a note naming both, or `None` when they agree or either is unknown — never
+/// fabricate a mismatch for a git-less caller. Pure so both the MCP and CLI
+/// surfaces classify identically and it is trivially unit-testable.
+pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
+    if head.is_empty() || stored.is_empty() || head == stored {
+        return None;
+    }
+    Some(format!(
+        "[note: index describes commit {stored} but your checkout is at {head}; \
+         results (including path:line) may not match your working tree. This is \
+         expected in a linked worktree; otherwise run `travsr init` or wait for \
+         the daemon to reconcile.]"
+    ))
+}
+
+/// The caller's short HEAD at `cwd`, or `None` when git is unavailable or `cwd`
+/// is not a repo. Uses `--short` to match the `--short`-stamped `last_commit`.
+fn git_short_head(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
+/// #645/#661: the live short HEAD of a *registered* repo, resolved from its db
+/// path (`<root>/.travsr/graph.db` → `<root>`). The global MCP server captures a
+/// single `LAUNCH_CWD` — the caller's one workspace — which is NOT each
+/// registered repo's checkout. The per-repo drift note must therefore read that
+/// repo's own HEAD: using `LAUNCH_CWD` in a multi-repo aggregate would compare
+/// one workspace's commit against every *other* repo's index and fire a spurious
+/// mismatch on repos that are perfectly fresh. `None` when git is unavailable or
+/// the db path has an unexpected shape — the note then correctly never fires.
+fn repo_head_from_registry_path(db_path: &std::path::Path) -> Option<String> {
+    let root = db_path.parent()?.parent()?;
+    git_short_head(root)
+}
+
+/// Append the read-path advisory notes (when any) to a structural tool
+/// response: the Phase-B degraded note (#617) and the index/HEAD mismatch note
+/// (#645 WS-B). Both are independent and may both appear. An empty body becomes
+/// the note(s) alone: the note IS the answer then — exactly the empty-but-
+/// unreliable case these notes exist to flag.
+///
+/// `head` is the caller's live short HEAD (or `None` when git-less); split out
+/// as a parameter so the composition is deterministically testable without the
+/// process-global `LAUNCH_CWD`.
+fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut out = body;
+    for note in [
+        phase_b_degraded_note(store).map(str::to_string),
+        head.and_then(|h| head_index_mismatch_note(h, &stored)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if out.is_empty() {
+            out = note;
+        } else {
+            out.push('\n');
+            out.push_str(&note);
+        }
+    }
+    out
+}
+
+/// Production entry: resolves the caller's HEAD from the captured launch cwd
+/// (§ `LAUNCH_CWD`) and appends the advisory notes. Fail-safe — no cwd or no git
+/// means no head note.
 fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
-    match phase_b_degraded_note(store) {
-        Some(note) if body.is_empty() => note.to_string(),
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    append_read_notes(store, body, head.as_deref())
+}
+
+/// #661 WS-D: append the index/HEAD mismatch note (#645) **only** — no Phase-B
+/// note — to a deterministic `path:line` tool's response. `find_references`,
+/// `get_dependencies` and `get_graph_json` assert `path:line` but do not depend
+/// on Phase B, so they carry the head-drift signal without the Phase-B one.
+///
+/// `head` is split out as a parameter (the same injectable seam as
+/// [`append_read_notes`]) so the composition is deterministically testable
+/// without the process-global `LAUNCH_CWD`. Empty body ⇒ the note is the whole
+/// answer (the empty-but-unreliable case these notes exist to flag).
+fn append_head_note(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    match head.and_then(|h| head_index_mismatch_note(h, &stored)) {
+        Some(note) if body.is_empty() => note,
         Some(note) => format!("{body}\n{note}"),
         None => body,
     }
+}
+
+/// Production entry for the head-only note: resolves the caller's HEAD from the
+/// captured launch cwd (§ `LAUNCH_CWD`) and appends the mismatch note. Fail-safe
+/// — no cwd or no git means no note.
+fn with_head_note(store: &SqliteStore, body: String) -> String {
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    append_head_note(store, body, head.as_deref())
+}
+
+/// #661 WS-D: the read-path advisory notes as JSON `signals` array items, for
+/// tools whose body is JSON for renderers (`get_graph_json`) — appending a
+/// `[note: …]` prose string would break `JSON.parse`. Returns the Phase-B note
+/// (#617) and the index/HEAD mismatch note (#645), each already carried in the
+/// `signals` array the global aggregator merges. `head` is injectable for the
+/// same testability reason as [`append_head_note`].
+fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json::Value> {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    [
+        phase_b_degraded_note(store).map(str::to_string),
+        head.and_then(|h| head_index_mismatch_note(h, &stored)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(serde_json::Value::String)
+    .collect()
 }
 
 /// Return all nodes that have an incoming edge to the given symbol, tagged
@@ -440,11 +588,12 @@ pub fn get_dependencies_global(
         let result = get_dependencies_raw(store, file);
         // #619: in single-repo mode, diagnose an empty answer exactly like the
         // stdio path. In multi-repo mode leave per-repo empties silent — a
-        // hint per non-matching repo would spam the aggregate.
+        // hint per non-matching repo would spam the aggregate. The arg-hint is
+        // a diagnostic, not a path:line answer, so it carries no HEAD note.
         if result.is_empty() && single {
             return dependency_arg_hint(store, file).unwrap_or(result);
         }
-        if result.is_empty() || single {
+        let result = if result.is_empty() || single {
             result
         } else {
             result
@@ -452,7 +601,14 @@ pub fn get_dependencies_global(
                 .map(|l| format!("[{repo_name}] {l}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        }
+        };
+        // #661 WS-D: per-repo HEAD note — read *this* repo's own checkout, not
+        // the global LAUNCH_CWD (the caller's one workspace), so a fresh repo in
+        // the aggregate is never flagged against an unrelated commit.
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        append_head_note(store, result, head.as_deref())
     });
     // SEC-001: sanitize the fully-aggregated string once.
     sanitize_for_mcp(&raw)
@@ -470,8 +626,13 @@ pub fn get_callers_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
-        let result = with_phase_b_note(store, get_callers_raw(store, symbol));
+        // #617 + #645: per-repo notes — each store carries its own Phase B
+        // freshness, and the HEAD note reads *this* repo's own checkout (not the
+        // global LAUNCH_CWD, which is only the caller's one workspace).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(store, get_callers_raw(store, symbol), head.as_deref());
         if result.is_empty() || single {
             result
         } else {
@@ -657,10 +818,13 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     // SEC-001: sanitize before returning. Use the larger find-output limit (not
     // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
     // survive intact instead of being cut mid-line.
-    wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_references_raw(store, symbol, path),
-        FIND_OUTPUT_LIMIT,
-    ))
+    // #661 WS-D: append the HEAD-mismatch note *after* sanitize (so it is never
+    // truncated) but *before* wrap_envelope (so it stays inside <travsr-data>).
+    // The early returns above (validation reject, pending JSON) are not
+    // path:line answers and intentionally carry no note.
+    let body =
+        sanitize_mcp_body_with_limit(&find_references_raw(store, symbol, path), FIND_OUTPUT_LIMIT);
+    wrap_envelope(&with_head_note(store, body))
 }
 
 /// Raw (unsanitized) variant, shared by the global aggregator.
@@ -839,7 +1003,7 @@ pub fn find_references_global(
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         let result = find_references_raw(store, symbol, path);
-        if result.is_empty() || single {
+        let result = if result.is_empty() || single {
             result
         } else {
             result
@@ -847,7 +1011,13 @@ pub fn find_references_global(
                 .map(|l| format!("[{repo_name}] {l}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        }
+        };
+        // #661 WS-D: per-repo HEAD note — read *this* repo's own checkout, not
+        // the global LAUNCH_CWD (mirrors get_callers_global).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        append_head_note(store, result, head.as_deref())
     });
     wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
@@ -2078,8 +2248,16 @@ pub fn get_blast_radius_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
-        let result = with_phase_b_note(store, get_blast_radius_raw(store, file, mode));
+        // #617 + #645: per-repo notes — each store's own Phase B freshness, and
+        // the HEAD note against *this* repo's own checkout (not global LAUNCH_CWD).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(
+            store,
+            get_blast_radius_raw(store, file, mode),
+            head.as_deref(),
+        );
         if result.is_empty() || single {
             result
         } else {
@@ -3213,12 +3391,17 @@ pub fn get_execution_path_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
+        // #617 + #645: per-repo notes — each store's own Phase B freshness, and
+        // the HEAD note against *this* repo's own checkout (not global LAUNCH_CWD).
         // #620: diagnose empty outcomes only in single-repo mode; a repo that
         // simply doesn't contain the symbols must stay silent in an aggregate.
-        let result = with_phase_b_note(
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(
             store,
             get_execution_path_body(store, source, sink, filter, single),
+            head.as_deref(),
         );
         if result.is_empty() || single {
             result
@@ -5490,7 +5673,18 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
         }
     }
     let depth = (*depth).clamp(1, 4);
-    get_graph_json_raw(store, query, direction, depth, kind_filter, *token_budget)
+    // #645 WS-D: single-repo stdio server — the caller's checkout IS this repo,
+    // so the launch cwd's HEAD is the correct drift comparand.
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    get_graph_json_raw(
+        store,
+        query,
+        direction,
+        depth,
+        kind_filter,
+        *token_budget,
+        head.as_deref(),
+    )
 }
 
 // ── Repo-map LOD overview (P3 #319) ──────────────────────────────────────────
@@ -5831,6 +6025,11 @@ fn get_graph_json_raw(
     depth: u8,
     kind_filter: &str,
     token_budget: usize,
+    // #645/#661: the caller's live short HEAD for the index/HEAD drift signal.
+    // Injected (not read from LAUNCH_CWD here) so the global aggregator can pass
+    // *each* repo's own HEAD rather than the one workspace's — see
+    // `repo_head_from_registry_path`.
+    head: Option<&str>,
 ) -> String {
     use std::collections::{HashSet, VecDeque};
 
@@ -6176,10 +6375,14 @@ fn get_graph_json_raw(
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
     }
-    // #617: degraded-state signal — additive envelope field; first-party
-    // consumers read only `nodes`/`edges` and ignore extra keys.
-    if let Some(note) = phase_b_degraded_note(store) {
-        out["signals"] = serde_json::json!([note]);
+    // #617 + #661 WS-D: degraded-state signals — additive envelope field; first-
+    // party consumers read only `nodes`/`edges` and ignore extra keys. Phase-B
+    // incomplete (#617) and index/HEAD drift (#645) are independent and may both
+    // apply. Carried as JSON `signals` array items (never appended as prose) so
+    // the JSON body still parses; the global aggregator already merges `signals`.
+    let signals = read_note_signals(store, head);
+    if !signals.is_empty() {
+        out["signals"] = serde_json::Value::Array(signals);
     }
     match serde_json::to_string(&out) {
         Ok(s) => s,
@@ -6255,7 +6458,18 @@ pub fn get_graph_json_global(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = get_graph_json_raw(&store, query, direction, depth, kind_filter, 0);
+                // #645 WS-D: per-repo drift signal reads *this* repo's own HEAD,
+                // not the global LAUNCH_CWD (the caller's one workspace).
+                let head = repo_head_from_registry_path(db_path);
+                let raw = get_graph_json_raw(
+                    &store,
+                    query,
+                    direction,
+                    depth,
+                    kind_filter,
+                    0,
+                    head.as_deref(),
+                );
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -9969,6 +10183,211 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "0").unwrap();
         assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    // ── #645 WS-B: index/HEAD mismatch note ──────────────────────────────────
+
+    #[test]
+    fn head_index_mismatch_note_none_when_equal_or_unknown() {
+        assert!(head_index_mismatch_note("abc123", "abc123").is_none());
+        assert!(head_index_mismatch_note("", "abc123").is_none());
+        assert!(head_index_mismatch_note("abc123", "").is_none());
+    }
+
+    #[test]
+    fn head_index_mismatch_note_names_both_shas_on_drift() {
+        let note = head_index_mismatch_note("aaa111", "bbb222").expect("must flag mismatch");
+        assert!(
+            note.contains("aaa111"),
+            "must name the checkout HEAD: {note}"
+        );
+        assert!(
+            note.contains("bbb222"),
+            "must name the index commit: {note}"
+        );
+    }
+
+    #[test]
+    fn git_short_head_reads_repo_and_is_none_off_repo() {
+        // Off a repo (bare tempdir) there is no HEAD to read.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(git_short_head(empty.path()).is_none());
+    }
+
+    /// #645/#661: in global mode the per-repo HEAD must come from that repo's own
+    /// root (`<root>/.travsr/graph.db` → `<root>`), NOT the process-global
+    /// LAUNCH_CWD — otherwise one workspace's commit is compared against every
+    /// other registered repo's index and fires a spurious mismatch. Pin that the
+    /// resolver reads the repo the db belongs to, and matches `git_short_head` of
+    /// that root exactly.
+    #[test]
+    fn repo_head_from_registry_path_reads_the_owning_repo_head() {
+        fn git(dir: &std::path::Path, args: &[&str]) -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !git(std::path::Path::new("."), &["--version"]) {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(git(root, &["init", "-q"]));
+        assert!(git(root, &["config", "user.email", "t@t.t"]));
+        assert!(git(root, &["config", "user.name", "t"]));
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "-qm", "init"]));
+
+        let db_path = root.join(".travsr").join("graph.db");
+        // Resolves from the db path's grandparent (the repo root) and equals a
+        // direct short-HEAD read of that root — the value LAUNCH_CWD would only
+        // coincidentally give when the caller happened to stand in this repo.
+        assert_eq!(
+            repo_head_from_registry_path(&db_path),
+            git_short_head(root),
+            "must read the repo the db belongs to, not the process cwd"
+        );
+        assert!(repo_head_from_registry_path(&db_path).is_some());
+    }
+
+    #[test]
+    fn append_read_notes_emits_head_note_only_on_drift() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Markers agree ⇒ no Phase-B note; isolate the head note.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+
+        // Caller's HEAD differs from the index ⇒ note appended to the body.
+        let out = append_read_notes(&store, "real result".to_string(), Some("chk1111"));
+        assert!(out.starts_with("real result"), "body preserved: {out}");
+        assert!(
+            out.contains("idx0000") && out.contains("chk1111"),
+            "got: {out}"
+        );
+
+        // Same commit ⇒ no head note.
+        assert_eq!(
+            append_read_notes(&store, "real result".to_string(), Some("idx0000")),
+            "real result"
+        );
+        // git-less caller ⇒ no head note.
+        assert_eq!(
+            append_read_notes(&store, "real result".to_string(), None),
+            "real result"
+        );
+    }
+
+    #[test]
+    fn append_read_notes_empty_body_becomes_head_note() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        // Empty body + mismatch: the note is the whole answer (no leading newline).
+        let out = append_read_notes(&store, String::new(), Some("chk1111"));
+        assert!(out.starts_with("[note:"), "note is the body: {out}");
+        assert!(
+            !out.contains("\n[note:"),
+            "no empty line before the note: {out}"
+        );
+    }
+
+    #[test]
+    fn append_read_notes_phase_b_and_head_notes_coexist() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD ⇒ Phase-B pending note fires...
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+        // ...and the caller is at yet another commit ⇒ head note also fires.
+        let out = append_read_notes(&store, "body".to_string(), Some("chk1111"));
+        assert!(
+            out.contains("call-graph index incomplete"),
+            "phase-b note: {out}"
+        );
+        assert!(out.contains("chk1111"), "head note: {out}");
+    }
+
+    // ── #661 WS-D: head-only note on the deterministic path:line tools ────────
+
+    #[test]
+    fn append_head_note_emits_head_note_only_on_drift() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD would fire the Phase-B note — append_head_note must
+        // NOT include it (these tools do not depend on Phase B).
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+
+        let out = append_head_note(&store, "real result".to_string(), Some("chk1111"));
+        assert!(out.starts_with("real result"), "body preserved: {out}");
+        assert!(
+            out.contains("idx0000") && out.contains("chk1111"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("call-graph index incomplete"),
+            "head-only wrapper must not carry the Phase-B note: {out}"
+        );
+
+        // Same commit ⇒ no note. git-less caller ⇒ no note.
+        assert_eq!(
+            append_head_note(&store, "real result".to_string(), Some("idx0000")),
+            "real result"
+        );
+        assert_eq!(
+            append_head_note(&store, "real result".to_string(), None),
+            "real result"
+        );
+    }
+
+    #[test]
+    fn append_head_note_empty_body_becomes_note() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        let out = append_head_note(&store, String::new(), Some("chk1111"));
+        assert!(out.starts_with("[note:"), "note is the body: {out}");
+        assert!(
+            !out.contains('\n'),
+            "no leading newline before the note: {out}"
+        );
+    }
+
+    #[test]
+    fn read_note_signals_carry_head_and_phase_b_as_json_array() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD ⇒ Phase-B signal; caller at another commit ⇒ head signal.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+
+        let signals = read_note_signals(&store, Some("chk1111"));
+        assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
+
+        // Embedding them in a graph-json envelope must still parse as JSON.
+        let out = serde_json::json!({ "nodes": [], "edges": [], "signals": signals });
+        let s = serde_json::to_string(&out).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("body must stay valid JSON");
+        let arr = parsed["signals"].as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|v| v.as_str().map(|t| t.contains("chk1111")).unwrap_or(false)),
+            "head signal present: {arr:?}"
+        );
+    }
+
+    #[test]
+    fn read_note_signals_empty_when_fresh_and_git_less() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
+        assert!(read_note_signals(&store, None).is_empty());
+        // Caller at the same commit ⇒ still no head signal.
+        assert!(read_note_signals(&store, Some("idx0000")).is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker
