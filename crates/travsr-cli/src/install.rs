@@ -143,64 +143,16 @@ pub async fn download_scip_binary(
         .build()
         .context("building HTTP client")?;
 
-    let bin_bytes = if verify_sha256 {
-        let sha_url = format!("{bin_url}.sha256");
-        let (bin_resp, sha_resp) =
-            tokio::try_join!(client.get(&bin_url).send(), client.get(&sha_url).send(),)
-                .context("sending download requests")?;
-
-        if !bin_resp.status().is_success() {
-            bail!("download failed ({}): {bin_url}", bin_resp.status());
-        }
-        if !sha_resp.status().is_success() {
-            bail!("SHA256 download failed ({}): {sha_url}", sha_resp.status());
-        }
-        if let Some(len) = bin_resp.content_length() {
-            if len > SCIP_SIZE_LIMIT {
-                bail!("binary exceeds size limit ({len} bytes)");
-            }
-        }
-        let bytes = bin_resp.bytes().await.context("reading binary body")?;
-        if bytes.len() as u64 > SCIP_SIZE_LIMIT {
-            bail!("binary exceeds size limit after download");
-        }
-        let sha_text = sha_resp.text().await.context("reading SHA256 body")?;
-        let expected = parse_sha256_line(&sha_text)?;
-        let actual = hex_encode_sha256(&bytes);
-        if actual != expected {
-            bail!("SHA256 mismatch for {asset_name}: expected {expected}, got {actual}");
-        }
-        bytes
-    } else {
-        let resp = client
-            .get(&bin_url)
-            .send()
-            .await
-            .context("sending download request")?;
-        if !resp.status().is_success() {
-            bail!("download failed ({}): {bin_url}", resp.status());
-        }
-        if let Some(len) = resp.content_length() {
-            if len > SCIP_SIZE_LIMIT {
-                bail!("binary exceeds size limit ({len} bytes)");
-            }
-        }
-        let bytes = resp.bytes().await.context("reading binary body")?;
-        if bytes.len() as u64 > SCIP_SIZE_LIMIT {
-            bail!("binary exceeds size limit after download");
-        }
-        if let Some(expected) = expected_sha256 {
-            let actual = hex_encode_sha256(&bytes);
-            if actual != expected {
-                bail!(
-                    "SHA256 mismatch for {asset_name} at {tag}: expected {expected}, got {actual}. \
-                     The pinned asset does not match the hash recorded in the catalog — it may have \
-                     been replaced upstream."
-                );
-            }
-        }
-        bytes
+    // Upstreams that publish a sidecar are verified against it; the rest are
+    // verified against the hash vendored at pin time. An entry with neither is
+    // the only unverified case, and the catalog test asserts none exist.
+    let integrity = match (verify_sha256, expected_sha256) {
+        (true, _) => Integrity::Sidecar,
+        (false, Some(pinned)) => Integrity::Vendored(pinned),
+        (false, None) => Integrity::Unverified,
     };
+    let label = format!("{asset_name} at {tag}");
+    let bin_bytes = fetch_verified(&client, &bin_url, &label, SCIP_SIZE_LIMIT, integrity).await?;
 
     let dest_dir = travsr_bin_dir()?;
     let dest = dest_dir.join(install_name);
@@ -221,6 +173,141 @@ pub async fn download_scip_binary(
     Ok(dest)
 }
 
+/// How a download proves it is the artefact that was published.
+enum Integrity<'a> {
+    /// Fetch `<url>.sha256` alongside the asset and compare. The publisher
+    /// controls both, so this catches a corrupted or swapped asset but not a
+    /// compromised origin.
+    Sidecar,
+    /// Compare against a hash vendored into the catalog when the version was
+    /// pinned (#410 M2). This is the anchor that survives a compromised
+    /// origin, because the expected value never travels with the download.
+    Vendored(&'a str),
+    /// Upstream publishes neither, and no pin is recorded.
+    Unverified,
+}
+
+/// Downloads `bin_url` and returns its bytes only if `integrity` is satisfied.
+///
+/// Single implementation for every download path in this file. It previously
+/// existed three times (wrapper sidecar, scip sidecar, scip vendored) at
+/// roughly 60% line-identical, which meant a guard could be fixed in one copy
+/// and left wrong in the others.
+///
+/// `bin_url` is a full URL rather than pieces, and nothing here reads the
+/// environment or `$HOME`, so tests point it at a local fixture server without
+/// mutating process-global state that neighbouring tests also read (#410 T1).
+///
+/// A missing `.sha256` under [`Integrity::Sidecar`] is a failure, not a skip:
+/// treating it as optional would let anyone who can delete one small file
+/// downgrade every install to unverified.
+async fn fetch_verified(
+    client: &reqwest::Client,
+    bin_url: &str,
+    label: &str,
+    size_limit: u64,
+    integrity: Integrity<'_>,
+) -> Result<Vec<u8>> {
+    // The sidecar is fetched concurrently with the asset, so the extra round
+    // trip costs nothing on the happy path.
+    let sha_url = format!("{bin_url}.sha256");
+    let (bin_resp, sha_resp) = match integrity {
+        Integrity::Sidecar => {
+            let (b, s) = tokio::try_join!(client.get(bin_url).send(), client.get(&sha_url).send())
+                .context("sending download requests")?;
+            (b, Some(s))
+        }
+        _ => {
+            let b = client
+                .get(bin_url)
+                .send()
+                .await
+                .context("sending download request")?;
+            (b, None)
+        }
+    };
+
+    if !bin_resp.status().is_success() {
+        bail!("download failed ({}): {bin_url}", bin_resp.status());
+    }
+    if let Some(s) = &sha_resp {
+        if !s.status().is_success() {
+            bail!("sha256 sidecar download failed ({}): {sha_url}", s.status());
+        }
+    }
+
+    // Reject oversized downloads on the advertised length, before the body is
+    // transferred.
+    if let Some(len) = bin_resp.content_length() {
+        if len > size_limit {
+            bail!("{label} exceeds the download size limit: {len} bytes > {size_limit}: {bin_url}");
+        }
+    }
+
+    let bin_bytes = bin_resp.bytes().await.context("reading binary body")?;
+    let got = bin_bytes.len() as u64;
+    if got > size_limit {
+        bail!("{label} exceeds the download size limit after download: {got} bytes > {size_limit}");
+    }
+
+    match integrity {
+        Integrity::Sidecar => {
+            let sha_text = sha_resp
+                .expect("sidecar response is present for Integrity::Sidecar")
+                .text()
+                .await
+                .context("reading SHA256 body")?;
+            let expected = parse_sha256_line(&sha_text)?;
+            let actual = hex_encode_sha256(&bin_bytes);
+            if actual != expected {
+                bail!("SHA256 mismatch for {label}: expected {expected}, got {actual}");
+            }
+        }
+        Integrity::Vendored(expected) => {
+            let actual = hex_encode_sha256(&bin_bytes);
+            if actual != expected {
+                bail!(
+                    "SHA256 mismatch for {label}: expected {expected}, got {actual}. \
+                     The pinned asset does not match the hash recorded in the catalog — it may \
+                     have been replaced upstream."
+                );
+            }
+        }
+        Integrity::Unverified => {}
+    }
+
+    Ok(bin_bytes.to_vec())
+}
+
+/// Fetches a wrapper binary and its published `.sha256`, and returns the bytes
+/// only if they match.
+///
+/// `base` is a parameter rather than a read of `TRAVSR_LANG_RELEASES_BASE` so
+/// the URL shape stays testable; the caller supplies the env-derived value.
+async fn fetch_and_verify_binary(
+    base: &str,
+    version: &str,
+    binary_name: &str,
+    target: &str,
+) -> Result<Vec<u8>> {
+    let bin_url = format!("{base}/download/{version}/{binary_name}-{target}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+
+    fetch_verified(
+        &client,
+        &bin_url,
+        binary_name,
+        SIZE_LIMIT,
+        Integrity::Sidecar,
+    )
+    .await
+}
+
 /// Downloads and installs a travsr-lang-* wrapper binary into ~/.travsr/bin/.
 ///
 /// Downloads the binary and its .sha256 file in parallel, verifies integrity,
@@ -237,45 +324,7 @@ pub async fn download_and_install_wrapper(
     let base =
         std::env::var(RELEASES_BASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASES_BASE.to_string());
 
-    let bin_url = format!("{base}/download/{version}/{binary_name}-{target}");
-    let sha_url = format!("{bin_url}.sha256");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
-
-    let (bin_resp, sha_resp) =
-        tokio::try_join!(client.get(&bin_url).send(), client.get(&sha_url).send(),)
-            .context("sending download requests")?;
-
-    if !bin_resp.status().is_success() {
-        bail!("download failed ({}): {bin_url}", bin_resp.status());
-    }
-    if !sha_resp.status().is_success() {
-        bail!("SHA256 download failed ({}): {sha_url}", sha_resp.status());
-    }
-
-    // Reject oversized binaries before downloading the full body.
-    if let Some(len) = bin_resp.content_length() {
-        if len > SIZE_LIMIT {
-            bail!("binary exceeds 100 MB limit ({len} bytes): {bin_url}");
-        }
-    }
-
-    let bin_bytes = bin_resp.bytes().await.context("reading binary body")?;
-    if bin_bytes.len() as u64 > SIZE_LIMIT {
-        bail!("binary exceeds 100 MB limit after download");
-    }
-    let sha_text = sha_resp.text().await.context("reading SHA256 body")?;
-
-    // Verify integrity.
-    let expected = parse_sha256_line(&sha_text)?;
-    let actual = hex_encode_sha256(&bin_bytes);
-    if actual != expected {
-        bail!("SHA256 mismatch for {binary_name}: expected {expected}, got {actual}");
-    }
+    let bin_bytes = fetch_and_verify_binary(&base, version, binary_name, target).await?;
 
     // Atomic write: write to a temp path, then rename into place.
     let dest_dir = travsr_bin_dir()?;
@@ -1062,5 +1111,297 @@ mod extraction_tests {
 
         extract_zip(&bytes, &dest).unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"binary");
+    }
+}
+
+/// #410 T1 — the download half, against a local fixture server.
+///
+/// The extraction half is covered by `extraction_tests` above. What was left
+/// untested is everything between "a URL" and "verified bytes": status
+/// handling, the size guard, and whether integrity failures actually stop the
+/// install rather than merely logging.
+///
+/// `TRAVSR_LANG_RELEASES_BASE` exists precisely so these paths can be pointed
+/// somewhere local, but setting it here would be process-global and racy
+/// against tests that read it concurrently. [`fetch_and_verify_binary`] takes
+/// `base` as a parameter instead, so nothing here mutates the environment.
+#[cfg(test)]
+mod download_tests {
+    use super::{
+        fetch_and_verify_binary, fetch_verified, hex_encode_sha256, Integrity, SIZE_LIMIT,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    struct Route {
+        path: String,
+        status: u16,
+        body: Vec<u8>,
+        /// Content-Length to advertise when it should differ from `body.len()`.
+        /// Lets the pre-download size guard be exercised without moving 100 MB
+        /// across a socket.
+        advertised_len: Option<u64>,
+    }
+
+    fn route(path: &str, status: u16, body: Vec<u8>) -> Route {
+        Route {
+            path: path.to_string(),
+            status,
+            body,
+            advertised_len: None,
+        }
+    }
+
+    /// Minimal HTTP/1.1 responder, hand-rolled rather than pulled in as a
+    /// dependency: the entire contract under test is status line,
+    /// Content-Length and body. Unknown paths are 404, which is what a real
+    /// release serves for an asset that was never published.
+    ///
+    /// Returns the base URL. The thread is detached and blocks on `accept`
+    /// until the process exits.
+    fn serve(routes: Vec<Route>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(peek) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(peek);
+
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+
+                // Drain headers so the client's write completes cleanly.
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) => break,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+
+                let matched = routes.iter().find(|r| r.path == path);
+                let (status, body, len) = match matched {
+                    Some(r) => (
+                        r.status,
+                        r.body.clone(),
+                        r.advertised_len.unwrap_or(r.body.len() as u64),
+                    ),
+                    None => (404, Vec::new(), 0),
+                };
+
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                    reason = if status == 200 { "OK" } else { "Not Found" }
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    const VERSION: &str = "v1.2.3";
+    const BIN: &str = "travsr-lang-x";
+    const TARGET: &str = "aarch64-apple-darwin";
+
+    fn bin_path() -> String {
+        format!("/download/{VERSION}/{BIN}-{TARGET}")
+    }
+
+    fn sha_path() -> String {
+        format!("{}.sha256", bin_path())
+    }
+
+    /// `sha256sum` output shape: hash, two spaces, filename.
+    fn sha_line(body: &[u8]) -> Vec<u8> {
+        format!("{}  {BIN}-{TARGET}\n", hex_encode_sha256(body)).into_bytes()
+    }
+
+    async fn fetch(base: &str) -> anyhow::Result<Vec<u8>> {
+        fetch_and_verify_binary(base, VERSION, BIN, TARGET).await
+    }
+
+    #[tokio::test]
+    async fn a_binary_matching_its_published_sha256_is_returned() {
+        let body = b"#!/bin/sh\nexec real-tool \"$@\"\n".to_vec();
+        let base = serve(vec![
+            route(&bin_path(), 200, body.clone()),
+            route(&sha_path(), 200, sha_line(&body)),
+        ]);
+
+        assert_eq!(fetch(&base).await.unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn a_binary_swapped_after_publication_is_refused() {
+        // The published hash describes one payload; the server returns another.
+        // This is the whole point of shipping the .sha256 alongside.
+        let published = b"the tool that was signed for".to_vec();
+        let swapped = b"the tool that was served instead".to_vec();
+        let base = serve(vec![
+            route(&bin_path(), 200, swapped),
+            route(&sha_path(), 200, sha_line(&published)),
+        ]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        assert!(err.contains("SHA256 mismatch"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_sha256_fails_instead_of_installing_unverified() {
+        // Deleting one small file must not silently downgrade the install to
+        // unverified. The binary itself is served perfectly well here.
+        let body = b"plausible binary".to_vec();
+        let base = serve(vec![route(&bin_path(), 200, body)]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("sha256 sidecar download failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_reports_the_url_it_tried() {
+        let body = b"orphan".to_vec();
+        let base = serve(vec![route(&sha_path(), 200, sha_line(&body))]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        // `starts_with`, not `contains`: the sidecar's failure message ends in
+        // the same words, and `sha_url` contains `bin_path()` because it is
+        // that URL plus `.sha256`, so a `contains` pair would pass on a
+        // sha-side error too.
+        assert!(
+            err.starts_with("download failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&bin_path()),
+            "error should name the URL: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_binary_is_refused_before_its_body_is_read() {
+        // Advertise more than the cap while sending one byte. The assertion
+        // names the advertised length, which only the pre-download bail
+        // reports — the post-download bail reports the received length, so it
+        // cannot satisfy this even though both messages share a prefix.
+        let body = b"x".to_vec();
+        let base = serve(vec![
+            Route {
+                path: bin_path(),
+                status: 200,
+                body: body.clone(),
+                advertised_len: Some(SIZE_LIMIT + 1),
+            },
+            route(&sha_path(), 200, sha_line(&body)),
+        ]);
+
+        let err = fetch(&base).await.unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("{} bytes > {SIZE_LIMIT}", SIZE_LIMIT + 1)),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── the vendored-hash path (#410 M2) ─────────────────────────────────────
+    //
+    // Four of the eight catalog entries publish no sidecar and are anchored
+    // only by a hash vendored at pin time. That is the control that survives a
+    // compromised origin, and it had no coverage at all: `download_scip_binary`
+    // builds its URL from a hardcoded github.com base, so the fixture server
+    // reaches it through `fetch_verified` directly.
+
+    const ASSET: &str = "scip-tool-linux";
+
+    fn vendored_url(base: &str) -> String {
+        format!("{base}/releases/download/v9/{ASSET}")
+    }
+
+    async fn fetch_pinned(base: &str, pinned: &str) -> anyhow::Result<Vec<u8>> {
+        let client = reqwest::Client::new();
+        fetch_verified(
+            &client,
+            &vendored_url(base),
+            ASSET,
+            SIZE_LIMIT,
+            Integrity::Vendored(pinned),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_asset_matching_its_pinned_catalog_hash_is_returned() {
+        let body = b"the pinned scip tool".to_vec();
+        let base = serve(vec![route(
+            &format!("/releases/download/v9/{ASSET}"),
+            200,
+            body.clone(),
+        )]);
+
+        let got = fetch_pinned(&base, &hex_encode_sha256(&body))
+            .await
+            .unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn an_asset_replaced_upstream_after_pinning_is_refused() {
+        // The catalog hash was recorded against one payload and upstream now
+        // serves another. Unlike the sidecar case there is nothing the origin
+        // can rewrite to make this pass, which is the point of vendoring it.
+        let pinned_at = b"what the catalog was pinned against".to_vec();
+        let served_now = b"what upstream serves today".to_vec();
+        let base = serve(vec![route(
+            &format!("/releases/download/v9/{ASSET}"),
+            200,
+            served_now,
+        )]);
+
+        let err = fetch_pinned(&base, &hex_encode_sha256(&pinned_at))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SHA256 mismatch"), "unexpected error: {err}");
+        assert!(
+            err.contains("recorded in the catalog"),
+            "the vendored path should say the pin is what failed: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_vendored_path_does_not_fetch_a_sidecar() {
+        // Only the asset route is served. If this path fetched `.sha256` the
+        // way the sidecar path does, the 404 would fail the download; it must
+        // not, because these upstreams publish no sidecar at all.
+        let body = b"no sidecar exists upstream".to_vec();
+        let base = serve(vec![route(
+            &format!("/releases/download/v9/{ASSET}"),
+            200,
+            body.clone(),
+        )]);
+
+        assert_eq!(
+            fetch_pinned(&base, &hex_encode_sha256(&body))
+                .await
+                .unwrap(),
+            body
+        );
     }
 }
