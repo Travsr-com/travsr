@@ -3550,15 +3550,26 @@ LIMIT 20",
                 continue;
             }
 
-            tx.execute(
-                "INSERT INTO edges(src, dst, kind, provenance, confidence) \
-                 VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
-                 ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'scip'",
-                params![caller_id, callee_id],
-            )
-            .context("write_scip_attributed_batch: insert edge")?;
+            // #650: only genuine calls create a call-graph `ref/call` edge, so
+            // `get_callers` / blast-radius / PageRank stay a call graph and never
+            // gain a `src == dst` self-loop or a spurious non-call edge. Non-call
+            // references (type annotations, `self`/`Self`, path segments) still
+            // record their occurrence below so `find_references` enumerates every
+            // use site (issue #299). `is_call` defaults to true for call-scoped
+            // producers (native tree-sitter, bundled emitters), so their edges are
+            // unchanged.
+            if scip_ref.is_call {
+                tx.execute(
+                    "INSERT INTO edges(src, dst, kind, provenance, confidence) \
+                     VALUES(?1, ?2, 'ref/call', 'scip', NULL) \
+                     ON CONFLICT(src, dst, kind) DO UPDATE SET provenance = 'scip'",
+                    params![caller_id, callee_id],
+                )
+                .context("write_scip_attributed_batch: insert edge")?;
+            }
 
-            // O4: record call-site line evidence.
+            // O4: record call-site line evidence. Written for every reference
+            // (call or not) so `find_references` covers non-call use sites too.
             tx.execute(
                 "INSERT OR IGNORE INTO edge_sites(src, dst, kind, line) VALUES(?1, ?2, 'ref/call', ?3)",
                 params![caller_id, callee_id, occ_line],
@@ -3689,6 +3700,7 @@ LIMIT 20",
                 caller_path: p.caller_path.clone(),
                 caller_line: p.caller_line,
                 callee_id: i64_to_node_id(callee_i64),
+                is_call: p.is_call,
             });
         }
         Ok(out)
@@ -9578,16 +9590,19 @@ mod tests {
                 caller_path: path.to_string(),
                 caller_line: 7,
                 callee_id: callee.id,
+                is_call: true,
             },
             travsr_core::ScipRef {
                 caller_path: path.to_string(),
                 caller_line: 15,
                 callee_id: callee.id,
+                is_call: true,
             },
             travsr_core::ScipRef {
                 caller_path: path.to_string(),
                 caller_line: 25,
                 callee_id: callee.id,
+                is_call: true,
             },
         ];
 
@@ -9681,6 +9696,7 @@ mod tests {
                     caller_path: caller_path.to_string(),
                     caller_line: 5,
                     callee_id: selfish.id,
+                    is_call: true,
                 },
                 // Genuine recursion has the same shape and is also dropped:
                 // recursion is not represented as a self-edge anywhere in the graph.
@@ -9688,12 +9704,14 @@ mod tests {
                     caller_path: caller_path.to_string(),
                     caller_line: 8,
                     callee_id: selfish.id,
+                    is_call: true,
                 },
                 // Genuine cross-function call at line 25 (inside `user`) → `helper`.
                 travsr_core::ScipRef {
                     caller_path: caller_path.to_string(),
                     caller_line: 25,
                     callee_id: helper.id,
+                    is_call: true,
                 },
             ];
             store
@@ -9727,6 +9745,63 @@ mod tests {
                 "lang={lang}: a self-loop occurrence site leaked into edge_sites"
             );
         }
+    }
+
+    /// #650 clean split: a non-call reference (`is_call = false`) records a
+    /// `find_references` occurrence (`edge_sites`) but must NOT create a
+    /// call-graph `ref/call` edge — so `get_callers` / blast-radius stay
+    /// call-only while `find_references` still covers type / `self` / path use
+    /// sites. This is the invariant that keeps the WS-A cause fix from
+    /// regressing `find_references` on types.
+    #[test]
+    fn non_call_reference_records_occurrence_but_no_edge() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // caller fn `user` at a.rs:1–10; callee TYPE `Widget` at b.rs:1–3.
+        let user = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "fn:user"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let widget = Node::new(
+            VName::new(corpus, "", "b.rs", "rust", "struct:Widget"),
+            "struct",
+        )
+        .with_line(1)
+        .with_end_line(3);
+        store
+            .write_scip_attributed_batch(corpus, &[user.clone(), widget.clone()], &[])
+            .unwrap();
+
+        // A type-annotation reference to `Widget` inside `user` (line 5): the
+        // occurrence is real, but it is not a call.
+        let refs = vec![travsr_core::ScipRef {
+            caller_path: "a.rs".to_string(),
+            caller_line: 5,
+            callee_id: widget.id,
+            is_call: false,
+        }];
+        store
+            .write_scip_attributed_batch(corpus, &[], &refs)
+            .unwrap();
+
+        // No `ref/call` edge into Widget → get_callers stays call-only.
+        let edges = store.all_edges().unwrap();
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, d, k, _)| *d == widget.id && k == "ref/call"),
+            "a non-call reference must not create a ref/call edge"
+        );
+        // But the occurrence site IS recorded → find_references covers it.
+        let sites = store.reference_sites(widget.id).unwrap();
+        assert_eq!(
+            sites.len(),
+            1,
+            "non-call reference must record a find_references occurrence"
+        );
+        assert_eq!(sites[0].line, 5);
     }
 
     /// Reproduces issue #650's exact producer path: the rust-analyzer LSIF
@@ -9763,6 +9838,7 @@ mod tests {
                 caller_line: 5,
                 callee_def_path: "a.rs".to_string(),
                 callee_def_line: 1,
+                is_call: true,
             },
             // Genuine call: occurrence at a.rs:25 (inside g) → callee def b.rs:1 (h).
             travsr_core::LsifPositionalRef {
@@ -9770,6 +9846,7 @@ mod tests {
                 caller_line: 25,
                 callee_def_path: "b.rs".to_string(),
                 callee_def_line: 1,
+                is_call: true,
             },
         ];
 

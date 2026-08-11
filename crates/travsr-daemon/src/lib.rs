@@ -4968,6 +4968,7 @@ mod tests {
                 caller_path: path.to_string(),
                 caller_line: *line,
                 callee_id,
+                is_call: true,
             });
         }
 
