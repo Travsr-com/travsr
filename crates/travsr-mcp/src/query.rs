@@ -96,6 +96,12 @@ pub struct TreeStep {
     pub parent: u64,
     pub edge_kind: String,
     pub child: u64,
+    /// `true` when the stored edge points `child -> parent` (the child is a
+    /// caller / container reached by walking an incoming edge), so the tree
+    /// renderer can draw the true orientation (#564). `serde(default)` keeps
+    /// payloads from daemons predating this field deserializable.
+    #[serde(default)]
+    pub incoming: bool,
 }
 
 /// Coverage / completeness metadata (#318 O5) — distinguishes "no callers"
@@ -813,6 +819,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     parent: current_id.0,
                     edge_kind,
                     child: next_id.0,
+                    incoming: edge_incoming,
                 });
                 queue.push_back((next_id, depth + 1, child_expand));
             }
@@ -1097,7 +1104,43 @@ mod tests {
                     .any(|e| e.kind == "ref/call" && e.src == class.id.0 && e.dst == caller.id.0),
                 "{direction:?}: reversed edge class -> caller reported"
             );
+            // The tree (default `--format tree` output) must carry the same
+            // orientation: the caller is reached over an incoming edge, so the
+            // step must be tagged `incoming` for the renderer to draw `←`.
+            let caller_step = payload
+                .tree
+                .iter()
+                .find(|t| t.parent == class.id.0 && t.child == caller.id.0)
+                .unwrap_or_else(|| panic!("{direction:?}: tree step to the caller missing"));
+            assert!(
+                caller_step.incoming,
+                "{direction:?}: caller tree step not tagged incoming — the \
+                 tree renderer would draw the in-edge as outgoing"
+            );
         }
+
+        // Deps mode reads only outgoing edges — its steps must not be tagged.
+        // Seeded from the caller, whose one outgoing edge is the call itself.
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "processPayment".to_string(),
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let call_step = payload
+            .tree
+            .iter()
+            .find(|t| t.parent == caller.id.0 && t.child == class.id.0)
+            .expect("Deps: tree step for the outgoing call missing");
+        assert!(
+            !call_step.incoming,
+            "Deps: outgoing call step wrongly tagged incoming"
+        );
     }
 
     // ── #517: containment edges terminal in caller traversal ──────────────────

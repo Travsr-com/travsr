@@ -164,12 +164,13 @@ fn render(mut payload: GraphPayload, format: Format, budget: usize) -> anyhow::R
 fn print_tree(payload: &GraphPayload) {
     let nodes_by_id: HashMap<u64, &NodeEntry> = payload.nodes.iter().map(|n| (n.id, n)).collect();
     // Children per parent, in BFS discovery order.
-    let mut children: HashMap<u64, Vec<(&str, u64)>> = HashMap::new();
+    let mut children: HashMap<u64, Vec<(&str, u64, bool)>> = HashMap::new();
     for step in &payload.tree {
-        children
-            .entry(step.parent)
-            .or_default()
-            .push((step.edge_kind.as_str(), step.child));
+        children.entry(step.parent).or_default().push((
+            step.edge_kind.as_str(),
+            step.child,
+            step.incoming,
+        ));
     }
     if let Some(seed) = &payload.seed {
         print_tree_level(seed.id, &nodes_by_id, &children, "");
@@ -179,20 +180,24 @@ fn print_tree(payload: &GraphPayload) {
 fn print_tree_level(
     node_id: u64,
     nodes_by_id: &HashMap<u64, &NodeEntry>,
-    children: &HashMap<u64, Vec<(&str, u64)>>,
+    children: &HashMap<u64, Vec<(&str, u64, bool)>>,
     prefix: &str,
 ) {
     let Some(kids) = children.get(&node_id) else {
         return;
     };
-    for (i, (edge_kind, child_id)) in kids.iter().enumerate() {
+    for (i, (edge_kind, child_id, incoming)) in kids.iter().enumerate() {
         let is_last = i == kids.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
         let extension = if is_last { "    " } else { "│   " };
 
         if let Some(child) = nodes_by_id.get(child_id) {
+            // #564: the arrow renders the stored edge orientation — `→` for an
+            // outgoing edge (parent → child), `←` for an incoming one (the
+            // child calls / contains the parent).
+            let arrow = if *incoming { "←" } else { "→" };
             println!(
-                "{prefix}{connector}{edge_kind} → {} ({})",
+                "{prefix}{connector}{edge_kind} {arrow} {} ({})",
                 child.label, child.kind
             );
             print_tree_level(
