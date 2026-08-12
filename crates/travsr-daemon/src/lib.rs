@@ -7316,7 +7316,20 @@ impl Daemon {
         // nothing. `RUST_LOG` still overrides in both directions.
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // JSON lines on disk. One line is one object, so every field is named
+        // and typed rather than recovered by guessing at column positions, and
+        // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
+        // `travsr daemon logs` renders it back into columns for people, and
+        // `--json` hands over the raw line for anything that would rather parse.
+        //
+        // `with_current_span` is on because the repo tag `--repo` filters by is
+        // a span field, not an event field, and would be absent otherwise.
+        // `with_span_list` is off: the full ancestry repeats the same few frames
+        // on every line for no added information.
         let file_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
             .with_writer(non_blocking)
             .with_ansi(false);
         let init_result = if foreground {

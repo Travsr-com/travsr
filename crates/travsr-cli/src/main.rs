@@ -291,6 +291,13 @@ enum DaemonAction {
         /// Show only lines newer than this age, for example 45s, 10m, 2h, 1d.
         #[arg(long)]
         since: Option<String>,
+        /// Print the stored JSON lines verbatim instead of rendering them, for
+        /// piping into jq or a log collector.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Render times in UTC, as stored, rather than in local time.
+        #[arg(long, default_value_t = false)]
+        utc: bool,
         /// Read the global log in ~/.travsr instead of this repo's, which is
         /// where `travsr mcp --global` writes.
         #[arg(long, default_value_t = false)]
@@ -448,9 +455,19 @@ fn init_tracing(
         // The file gets INFO so the log is worth reading, matching the daemon.
         // stderr keeps the caller's filter, which defaults to error: a stdio
         // MCP client should not have its terminal filled with our internals.
+        //
+        // The file is JSON lines; stderr stays human-readable. One line is one
+        // object, so every field is named and typed instead of being recovered
+        // by guessing at column positions — `jq`, Loki and Datadog all read it
+        // directly, and `travsr daemon logs` renders it back for people rather
+        // than making them read JSON. `with_current_span` is on because the
+        // repo tag that `--repo` filters by lives in a span, not in the event.
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(false)
                     .with_writer(writer)
                     .with_ansi(false)
                     .with_filter(tracing_subscriber::EnvFilter::new("info")),
@@ -722,6 +739,8 @@ async fn run(cli: Cli) -> Result<()> {
                     repo,
                     level,
                     since,
+                    json,
+                    utc,
                     global,
                 } => {
                     let dir = if global {
@@ -734,7 +753,14 @@ async fn run(cli: Cli) -> Result<()> {
                     };
                     let min_level = level.as_deref().map(parse_level).transpose()?;
                     let since = since.as_deref().map(parse_since).transpose()?;
-                    daemon_logs(&dir, follow, lines, LineFilter::new(repo, min_level, since))?;
+                    daemon_logs(
+                        &dir,
+                        follow,
+                        lines,
+                        LineFilter::new(repo, min_level, since),
+                        json,
+                        utc,
+                    )?;
                 }
                 DaemonAction::StopEmbed => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::StopEmbed) {
@@ -958,12 +984,16 @@ fn relay_daemon_startup(
     started: std::time::Instant,
 ) {
     let deadline = started + STARTUP_RELAY_TIMEOUT;
+    // The log on disk is JSON; a person waiting at a prompt is not going to read
+    // it. Render the same columns `travsr daemon logs` uses, minus the date
+    // separator, which is today by construction here.
+    let render = LogRenderer::new(false);
     eprintln!("[travsr] starting…");
 
     loop {
         if let Ok(lines) = relay.poll() {
             for line in lines {
-                eprintln!("[travsr] {line}");
+                eprintln!("[travsr] {}", render.one_line(&LogLine::parse(&line)));
             }
         }
 
@@ -1059,12 +1089,197 @@ fn parse_since(s: &str) -> anyhow::Result<chrono::Duration> {
 
 /// Whether a line starts a log entry, as opposed to continuing one.
 ///
-/// Entries begin with an RFC3339 timestamp. A panic backtrace frame or a
-/// wrapped message does not, and carries neither a level nor a timestamp of its
-/// own, so every filter has to recognise it rather than judge it.
+/// Only plain-text lines can continue: a JSON entry is one object per line with
+/// any newlines escaped inside it. Text entries begin with an RFC3339 timestamp;
+/// a panic backtrace frame does not, and carries neither a level nor a timestamp
+/// of its own, so every filter has to recognise it rather than judge it.
 fn is_entry_start(line: &str) -> bool {
     let b = line.as_bytes();
     b.len() >= 20 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T'
+}
+
+/// One line of the log.
+///
+/// The daemon writes JSON lines. Rotated files written before that change are
+/// still on disk and still worth reading, and a torn write is not JSON either,
+/// so anything that does not parse is carried through as opaque text rather
+/// than dropped. This is the only reason the text path still exists.
+enum LogLine {
+    Json(serde_json::Value),
+    Text(String),
+}
+
+impl LogLine {
+    fn parse(line: &str) -> Self {
+        // Cheap reject before handing bytes to the parser: every entry is an
+        // object, so a line that does not open with `{` cannot be one.
+        if line.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("timestamp").is_some() && v.get("level").is_some() {
+                    return Self::Json(v);
+                }
+            }
+        }
+        Self::Text(line.to_string())
+    }
+
+    /// RFC3339 timestamp, if the line has one.
+    fn timestamp(&self) -> Option<&str> {
+        match self {
+            Self::Json(v) => v.get("timestamp").and_then(|t| t.as_str()),
+            // Text entries start with the timestamp; `%Y-%m-%dT%H:%M:%S` is the
+            // first 19 bytes and the fraction runs to the `Z`.
+            Self::Text(s) => s.split_whitespace().next().filter(|t| is_entry_start(t)),
+        }
+    }
+
+    fn level(&self) -> Option<u8> {
+        match self {
+            Self::Json(v) => v.get("level").and_then(|l| l.as_str()).and_then(level_rank),
+            Self::Text(s) => s.split_whitespace().nth(1).and_then(level_rank),
+        }
+    }
+
+    /// Whether this line belongs to `repo`. JSON puts the tag in a named field,
+    /// on the event or on the span it happened inside, so no string matching is
+    /// needed; text lines fall back to matching the rendering.
+    fn is_for_repo(&self, repo: &str) -> bool {
+        match self {
+            Self::Json(v) => ["fields", "span"].iter().any(|k| {
+                v.get(k)
+                    .and_then(|o| o.get("repo"))
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|r| r == repo)
+            }),
+            Self::Text(s) => line_is_for_repo(s, repo),
+        }
+    }
+}
+
+/// Shorten a tracing target to the subsystem a reader cares about.
+///
+/// `travsr_plugin_host::registry` is 29 characters that say "plugin host". The
+/// module tail rarely disambiguates anything a message does not already say.
+fn short_target(target: &str) -> String {
+    target
+        .split("::")
+        .next()
+        .unwrap_or(target)
+        .trim_start_matches("travsr_")
+        .replace('_', "-")
+}
+
+/// Render a field value without JSON's quoting noise, quoting only when the
+/// value would otherwise look like two fields.
+fn render_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.contains(char::is_whitespace) {
+                format!("\"{s}\"")
+            } else {
+                s.clone()
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Turns log lines into columns, and announces the date when it changes.
+///
+/// The date is a separator rather than a prefix on every line: it changes once
+/// a day and costs 27 characters per entry to repeat, which is most of the room
+/// before the message on an 80-column terminal. Times are local, because the
+/// file is UTC and the reader's clock generally is not; the separator names the
+/// zone so the two are never confused.
+struct LogRenderer {
+    last_date: Option<String>,
+    utc: bool,
+}
+
+impl LogRenderer {
+    fn new(utc: bool) -> Self {
+        Self {
+            last_date: None,
+            utc,
+        }
+    }
+
+    /// Local (or UTC) date and time-of-day for an RFC3339 timestamp.
+    fn split_stamp(&self, ts: &str) -> Option<(String, String)> {
+        let parsed = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+        if self.utc {
+            let t = parsed.with_timezone(&chrono::Utc);
+            Some((
+                t.format("%Y-%m-%d UTC").to_string(),
+                t.format("%H:%M:%S").to_string(),
+            ))
+        } else {
+            let t = parsed.with_timezone(&chrono::Local);
+            Some((
+                t.format("%Y-%m-%d %Z").to_string(),
+                t.format("%H:%M:%S").to_string(),
+            ))
+        }
+    }
+
+    /// The lines to print for one log line: an optional date separator, then the
+    /// entry itself.
+    fn render(&mut self, line: &LogLine) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some((date, _)) = line.timestamp().and_then(|ts| self.split_stamp(ts)) {
+            if self.last_date.as_deref() != Some(date.as_str()) {
+                out.push(format!("── {date} ──"));
+                self.last_date = Some(date);
+            }
+        }
+        out.push(self.one_line(line));
+        out
+    }
+
+    /// One entry, without the date separator. The startup relay uses this: the
+    /// date is today by construction and the user is watching it happen.
+    fn one_line(&self, line: &LogLine) -> String {
+        if let LogLine::Json(v) = line {
+            if let Some((_, time)) = line.timestamp().and_then(|ts| self.split_stamp(ts)) {
+                return Self::columns(v, &time);
+            }
+        }
+        // Text: already human-readable, and reformatting it would mean parsing a
+        // format that no longer exists. Pass it through.
+        match line {
+            LogLine::Text(s) => s.clone(),
+            LogLine::Json(v) => v.to_string(),
+        }
+    }
+
+    fn columns(v: &serde_json::Value, time: &str) -> String {
+        let level = v.get("level").and_then(|l| l.as_str()).unwrap_or("?");
+        let target = v
+            .get("target")
+            .and_then(|t| t.as_str())
+            .map(short_target)
+            .unwrap_or_default();
+        let fields = v.get("fields").and_then(|f| f.as_object());
+        let message = fields
+            .and_then(|f| f.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        let rest: Vec<String> = fields
+            .map(|f| {
+                f.iter()
+                    .filter(|(k, _)| k.as_str() != "message")
+                    .map(|(k, val)| format!("{k}={}", render_value(val)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut line = format!("{time}  {level:<5}  {target:<11}  {message}");
+        if !rest.is_empty() {
+            line.push(' ');
+            line.push_str(&rest.join(" "));
+        }
+        line
+    }
 }
 
 /// Which log lines `travsr daemon logs` prints.
@@ -1097,33 +1312,41 @@ impl LineFilter {
     }
 
     /// Whether every active filter admits this line.
-    fn keep(&mut self, line: &str) -> bool {
-        if !is_entry_start(line) {
-            return self.last_kept;
+    fn keep(&mut self, line: &LogLine) -> bool {
+        // Only a text line can be a continuation, and only then does inheritance
+        // apply. Every JSON line is a complete entry.
+        if let LogLine::Text(s) = line {
+            if !is_entry_start(s) {
+                return self.last_kept;
+            }
         }
         let kept = self.admits(line);
         self.last_kept = kept;
         kept
     }
 
-    fn admits(&self, line: &str) -> bool {
+    fn admits(&self, line: &LogLine) -> bool {
         if let Some(repo) = &self.repo {
-            if !line_is_for_repo(line, repo) {
+            if !line.is_for_repo(repo) {
                 return false;
             }
         }
         if let Some(min) = self.min_level {
-            // The level is the second whitespace-separated token. A line whose
-            // level is unreadable is shown rather than hidden: dropping it would
-            // mean a format change silently emptying the output.
-            match line.split_whitespace().nth(1).and_then(level_rank) {
+            // A line whose level is unreadable is shown rather than hidden:
+            // dropping it would let a format change silently empty the output.
+            match line.level() {
                 Some(rank) if rank < min => return false,
                 _ => {}
             }
         }
         if let Some(cutoff) = &self.since {
-            if line.len() < cutoff.len() || &line[..cutoff.len()] < cutoff.as_str() {
-                return false;
+            // Timestamps are fixed-width RFC3339 UTC, so comparing the prefix as
+            // a string is already comparing instants. A line with no timestamp
+            // has no age to judge and is kept.
+            if let Some(ts) = line.timestamp() {
+                if ts.len() < cutoff.len() || &ts[..cutoff.len()] < cutoff.as_str() {
+                    return false;
+                }
             }
         }
         true
@@ -1140,9 +1363,12 @@ fn daemon_logs(
     follow: bool,
     lines: usize,
     mut filter: LineFilter,
+    raw: bool,
+    utc: bool,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
+    let mut render = LogRenderer::new(utc);
     let mut tail = travsr_daemon::logfile::LogTail::new(dir);
 
     if tail.path().is_none() {
@@ -1162,11 +1388,19 @@ fn daemon_logs(
     let backfill = tail.backfill(lines)?;
     let mut shown = 0usize;
     let mut scanned = 0usize;
-    for line in backfill.lines() {
+    for text in backfill.lines() {
         scanned += 1;
-        if filter.keep(line) {
-            shown += 1;
-            writeln!(out, "{line}")?;
+        let line = LogLine::parse(text);
+        if !filter.keep(&line) {
+            continue;
+        }
+        shown += 1;
+        if raw {
+            writeln!(out, "{text}")?;
+        } else {
+            for rendered in render.render(&line) {
+                writeln!(out, "{rendered}")?;
+            }
         }
     }
     out.flush()?;
@@ -1184,9 +1418,17 @@ fn daemon_logs(
     // Only lines from here on; the backfill above already covered history.
     tail.seek_to_end();
     loop {
-        for line in tail.poll()? {
-            if filter.keep(&line) {
-                writeln!(out, "{line}")?;
+        for text in tail.poll()? {
+            let line = LogLine::parse(&text);
+            if !filter.keep(&line) {
+                continue;
+            }
+            if raw {
+                writeln!(out, "{text}")?;
+            } else {
+                for rendered in render.render(&line) {
+                    writeln!(out, "{rendered}")?;
+                }
             }
         }
         // Flush every tick: a follower that buffers is indistinguishable from a
@@ -1454,43 +1696,152 @@ mod daemon_log_tests {
 
     // ── --level / --since ────────────────────────────────────────────────
 
-    use super::{is_entry_start, parse_level, parse_since, LineFilter};
+    use super::{is_entry_start, parse_level, parse_since, LineFilter, LogLine, LogRenderer};
 
-    fn entry(level: &str, msg: &str) -> String {
-        format!("2026-08-12T14:52:18.024693Z  {level} travsr_daemon: {msg}")
+    /// A JSON entry in the shape the daemon actually writes.
+    fn json_entry(level: &str, msg: &str) -> LogLine {
+        LogLine::parse(&format!(
+            r#"{{"timestamp":"2026-08-12T14:52:18.024693Z","level":"{level}","fields":{{"message":"{msg}"}},"target":"travsr_daemon"}}"#
+        ))
+    }
+
+    /// A pre-JSON entry, as still found in rotated files on disk.
+    fn text_entry(level: &str, msg: &str) -> LogLine {
+        LogLine::parse(&format!(
+            "2026-08-12T14:52:18.024693Z  {level} travsr_daemon: {msg}"
+        ))
     }
 
     #[test]
     fn level_filter_keeps_the_requested_severity_and_above() {
         let mut f = LineFilter::new(None, Some(parse_level("warn").unwrap()), None);
-        assert!(f.keep(&entry("ERROR", "boom")));
-        assert!(f.keep(&entry("WARN", "careful")));
-        assert!(!f.keep(&entry("INFO", "routine")));
-        assert!(!f.keep(&entry("DEBUG", "chatter")));
+        assert!(f.keep(&json_entry("ERROR", "boom")));
+        assert!(f.keep(&json_entry("WARN", "careful")));
+        assert!(!f.keep(&json_entry("INFO", "routine")));
+        assert!(!f.keep(&json_entry("DEBUG", "chatter")));
     }
 
-    /// The edge case any line-at-a-time filter gets wrong: a panic backtrace
-    /// carries no timestamp and no level, so judging it on its own merits keeps
-    /// the frames and drops the ERROR above them, or the reverse. Either way the
-    /// reader is left with half an entry.
+    /// Rotated files written before the format changed are still on disk and
+    /// still the only record of what happened then, so every filter has to work
+    /// on both shapes.
+    #[test]
+    fn the_filters_work_on_pre_json_lines_too() {
+        let mut f = LineFilter::new(None, Some(parse_level("warn").unwrap()), None);
+        assert!(f.keep(&text_entry("ERROR", "boom")));
+        assert!(!f.keep(&text_entry("INFO", "routine")));
+
+        let mut byrepo = LineFilter::new(Some("alpha".to_string()), None, None);
+        assert!(byrepo.keep(&LogLine::parse(
+            r#"2026-08-12T14:52:18.024693Z  INFO travsr_mcp: served repo="alpha""#
+        )));
+        assert!(!byrepo.keep(&LogLine::parse(
+            r#"2026-08-12T14:52:18.024693Z  INFO travsr_mcp: served repo="beta""#
+        )));
+    }
+
+    /// The repo tag lives in a named field now, on the event or on the span the
+    /// event happened inside, so the filter reads it instead of matching text.
+    #[test]
+    fn the_repo_filter_reads_the_json_field_on_event_or_span() {
+        let mut f = LineFilter::new(Some("alpha".to_string()), None, None);
+
+        assert!(f.keep(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"INFO","fields":{"message":"x","repo":"alpha"},"target":"travsr_daemon"}"#
+        )));
+        assert!(f.keep(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"INFO","fields":{"message":"served"},"target":"travsr_mcp","span":{"repo":"alpha","name":"tool_call"}}"#
+        )));
+        // The prefix trap a substring search falls into, now impossible.
+        assert!(!f.keep(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"INFO","fields":{"message":"x","repo":"alpha-staging"},"target":"travsr_daemon"}"#
+        )));
+        assert!(!f.keep(&json_entry("INFO", "no repo at all")));
+    }
+
+    /// Rendering: columns, local time, and the date announced once rather than
+    /// repeated on all 27 characters of every line.
+    #[test]
+    fn rendering_puts_the_date_on_a_separator_and_the_rest_in_columns() {
+        let mut r = LogRenderer::new(true); // UTC, so the assertion is stable.
+        let out = r.render(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"INFO","fields":{"message":"embed_text updated","written":130,"elapsed_ms":34},"target":"travsr_daemon"}"#,
+        ));
+        assert_eq!(out.len(), 2, "first entry of a day emits its separator");
+        assert_eq!(out[0], "── 2026-08-12 UTC ──");
+        // Fields after the message are alphabetical, not source order: a
+        // `serde_json` object is a sorted map. Deterministic either way, and
+        // consistent ordering is what matters when scanning a column of similar
+        // entries. Source order would mean enabling `preserve_order`, which
+        // changes key ordering for every JSON value in the workspace.
+        assert_eq!(
+            out[1],
+            "14:52:18  INFO   daemon       embed_text updated elapsed_ms=34 written=130"
+        );
+
+        // Same day: no second separator.
+        let again = r.render(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:53:00.000000Z","level":"WARN","fields":{"message":"careful"},"target":"travsr_plugin_host::registry"}"#,
+        ));
+        assert_eq!(again.len(), 1, "the date is announced once, not per line");
+        assert_eq!(
+            again[0], "14:53:00  WARN   plugin-host  careful",
+            "the target is shortened to the subsystem"
+        );
+
+        // A new day announces itself, which is what makes a rotation-spanning
+        // read legible.
+        let tomorrow = r.render(&LogLine::parse(
+            r#"{"timestamp":"2026-08-13T00:00:04.000000Z","level":"INFO","fields":{"message":"daemon starting"},"target":"travsr_daemon"}"#,
+        ));
+        assert_eq!(tomorrow.len(), 2);
+        assert_eq!(tomorrow[0], "── 2026-08-13 UTC ──");
+    }
+
+    /// A torn write is not JSON, and neither is a pre-JSON rotation. Neither may
+    /// be dropped: the log is the only record of whatever happened there.
+    #[test]
+    fn unparseable_and_legacy_lines_are_passed_through_not_dropped() {
+        let mut r = LogRenderer::new(true);
+        let torn = r.render(&LogLine::parse(r#"{"timestamp":"2026-08-12T14:52:1"#));
+        assert_eq!(
+            torn,
+            vec![r#"{"timestamp":"2026-08-12T14:52:1"#.to_string()]
+        );
+
+        let legacy = r.render(&LogLine::parse(
+            "2026-08-12T14:52:18.024693Z  INFO travsr_daemon: from before the change",
+        ));
+        assert!(
+            legacy.iter().any(|l| l.contains("from before the change")),
+            "a pre-JSON line stays readable: {legacy:?}"
+        );
+    }
+
+    /// The edge case any line-at-a-time filter gets wrong on the legacy format:
+    /// a panic backtrace carries no timestamp and no level, so judging it on its
+    /// own merits keeps the frames and drops the ERROR above them, or the
+    /// reverse. Either way the reader is left with half an entry. JSON cannot
+    /// produce this shape, but rotated files already on disk can.
     #[test]
     fn a_continuation_line_travels_with_the_entry_above_it() {
         let mut f = LineFilter::new(None, Some(parse_level("warn").unwrap()), None);
 
-        assert!(f.keep(&entry("ERROR", "phase B panicked")));
+        assert!(f.keep(&text_entry("ERROR", "phase B panicked")));
         assert!(
-            f.keep("    at crates/travsr-daemon/src/lib.rs:512"),
+            f.keep(&LogLine::parse(
+                "    at crates/travsr-daemon/src/lib.rs:512"
+            )),
             "a frame under a kept ERROR is part of that entry"
         );
         assert!(
-            f.keep("    note: run with RUST_BACKTRACE=full"),
+            f.keep(&LogLine::parse("    note: run with RUST_BACKTRACE=full")),
             "and so is the next frame"
         );
 
         // Now an entry the filter rejects: its continuations go with it.
-        assert!(!f.keep(&entry("INFO", "routine")));
+        assert!(!f.keep(&text_entry("INFO", "routine")));
         assert!(
-            !f.keep("    continuation of the routine line"),
+            !f.keep(&LogLine::parse("    continuation of the routine line")),
             "a frame under a dropped INFO must not survive its parent"
         );
     }
@@ -1499,19 +1850,25 @@ mod daemon_log_tests {
     fn an_unreadable_level_is_shown_rather_than_hidden() {
         // A format change must not silently empty the output.
         let mut f = LineFilter::new(None, Some(parse_level("error").unwrap()), None);
-        assert!(f.keep("2026-08-12T14:52:18.024693Z something-unparseable"));
+        assert!(f.keep(&LogLine::parse(
+            "2026-08-12T14:52:18.024693Z something-unparseable"
+        )));
     }
 
     #[test]
     fn since_drops_entries_older_than_the_cutoff() {
         let mut f = LineFilter::new(None, None, Some(chrono::Duration::hours(1)));
         // Fixed past date: comfortably older than one hour ago, whenever this runs.
-        assert!(!f.keep("2020-01-01T00:00:00.000000Z  INFO travsr_daemon: ancient"));
+        assert!(!f.keep(&LogLine::parse(
+            r#"{"timestamp":"2020-01-01T00:00:00.000000Z","level":"INFO","fields":{"message":"ancient"},"target":"travsr_daemon"}"#
+        )));
         // A line stamped now is inside the window.
         let now = chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.6fZ")
             .to_string();
-        assert!(f.keep(&format!("{now}  INFO travsr_daemon: fresh")));
+        assert!(f.keep(&LogLine::parse(&format!(
+            r#"{{"timestamp":"{now}","level":"INFO","fields":{{"message":"fresh"}},"target":"travsr_daemon"}}"#
+        ))));
     }
 
     #[test]
