@@ -217,7 +217,7 @@ fn phase_b_pending(store: &SqliteStore) -> bool {
 /// Mirrors `travsr status`'s freshness classification so the tools and the CLI
 /// never disagree about completeness. Returns the note to append, or `None`
 /// when Phase B is complete for the current commit.
-fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
+pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
     const PENDING: &str = "[note: call-graph index incomplete — Phase B has not caught up with the current commit; call edges may be missing and empty results are not authoritative. Run `travsr status` to check progress.]";
     const STALE: &str = "[note: call-graph edges degraded — a background re-index dropped call edges since the last Phase B run; empty results are not authoritative. Run `travsr init` to rebuild.]";
     let phase_b = store

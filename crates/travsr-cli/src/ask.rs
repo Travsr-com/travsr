@@ -143,6 +143,9 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     if !db_path.exists() {
         anyhow::bail!("not initialized — run `travsr init`");
     }
+    // Before either path: `ask` ranks over call edges, so an incomplete Phase B
+    // changes the answer, not just its completeness.
+    daemon_client::warn_if_call_graph_degraded(&db_path);
 
     let payload: AskPayload = match daemon_client::try_query(
         &repo_root,
