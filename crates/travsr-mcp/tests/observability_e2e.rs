@@ -452,19 +452,17 @@ fn x1_get_daemon_logs_redacts_bearer_token_and_home_path_in_real_response() {
     assert_eq!(payload["entries"].as_array().unwrap().len(), 1);
 }
 
-/// BUG reproduction (see report): `token=`/`secret=`/`password=`-shaped
-/// trailing fields are exactly what `split_message_and_fields` pulls OUT of
-/// the message into the structured `fields{}` map (this is what `tracing`'s
-/// own field formatting produces). Once split out, `build_log_entry` calls
-/// `sanitize_log_value` on the bare VALUE only ("abc123XYZ"), with the key
-/// name ("token") no longer present in that string. `redact_key_value_pairs`
-/// (sanitize.rs) can only recognize a sensitive field by matching a literal
-/// `name=value` substring, so it never fires on an isolated value. The
-/// SENSITIVE_KEY_NAMES catch-all X1 promises for "key=value secrets" is dead
-/// code for the exact shape `tracing` produces. This test is EXPECTED TO
-/// FAIL until that gap is fixed; do not delete it to make the suite green.
+/// Regression test (was a bug reproduction): `token=`/`secret=`/`password=`-
+/// shaped trailing fields are exactly what `split_message_and_fields` pulls
+/// OUT of the message into the structured `fields{}` map (this is what
+/// `tracing`'s own field formatting produces). Once split out, the bare VALUE
+/// ("abc123XYZ") no longer carries the key name ("token") for
+/// `redact_key_value_pairs`'s literal `name=value` match to find.
+/// `build_log_entry` now checks each field's own key against
+/// `sanitize::is_sensitive_key` directly and redacts by key, independent of
+/// the value's shape, closing that gap.
 #[test]
-fn bug_x1_key_value_secret_in_a_parsed_tracing_field_is_not_redacted() {
+fn x1_key_value_secret_in_a_parsed_tracing_field_is_redacted() {
     let tmp = tempfile::tempdir().unwrap();
     init_test_repo(tmp.path());
     let travsr_dir = tmp.path().join(".travsr");

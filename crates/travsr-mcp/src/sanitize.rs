@@ -167,6 +167,19 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Whether `key` (case-insensitive) is one of [`SENSITIVE_KEY_NAMES`].
+///
+/// Shared by [`redact_key_value_pairs`] (matches a literal `key=value`
+/// substring still embedded in a message) and `observability::build_log_entry`
+/// (checks a field's key once `split_message_and_fields` has already pulled
+/// it out of the message into a bare value, where the key name is no longer
+/// present in the value string for `redact_key_value_pairs` to match against).
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
+    SENSITIVE_KEY_NAMES
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+}
+
 /// Redact absolute home-directory paths and common credential shapes from `s`.
 /// Applied BEFORE truncation (see [`sanitize_log_value`]) so a token split by
 /// a byte cap can never survive as a recognizable partial.
@@ -378,9 +391,7 @@ fn redact_key_value_pairs(s: &str) -> String {
         let key = &s[key_start..eq];
         out.push_str(&s[i..=eq]);
         let value_start = eq + 1;
-        let sensitive = SENSITIVE_KEY_NAMES
-            .iter()
-            .any(|name| key.eq_ignore_ascii_case(name));
+        let sensitive = is_sensitive_key(key);
         if !sensitive {
             i = value_start;
             continue;
@@ -640,6 +651,17 @@ mod tests {
         assert!(validate_mcp_pattern_arg(&long).is_err());
         let exact = "a".repeat(MAX_ARG_BYTES);
         assert!(validate_mcp_pattern_arg(&exact).is_ok());
+    }
+
+    // ── #636: is_sensitive_key ─────────────────────────────────────────────
+
+    #[test]
+    fn is_sensitive_key_matches_case_insensitively() {
+        for name in ["token", "TOKEN", "Token", "password", "api_key"] {
+            assert!(is_sensitive_key(name), "{name} must be sensitive");
+        }
+        assert!(!is_sensitive_key("repo"));
+        assert!(!is_sensitive_key("reason"));
     }
 
     #[test]

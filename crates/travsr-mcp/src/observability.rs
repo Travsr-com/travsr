@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use travsr_store::SqliteStore;
 
 use crate::rerank;
-use crate::sanitize::{sanitize_log_value, validate_mcp_arg, wrap_envelope};
+use crate::sanitize::{is_sensitive_key, sanitize_log_value, validate_mcp_arg, wrap_envelope};
 use crate::tools::git_short_head;
 
 /// A resolved single-repo target for the observability tools' global-mode
@@ -661,15 +661,26 @@ fn tokenize_whitespace_quoted(s: &str) -> Vec<String> {
 /// value is redacted + capped via `sanitize_log_value` (X1/X2). Unparseable
 /// lines fall back to `{ts: null, level: "raw", ...}` and are always
 /// included regardless of the `level` filter (#636 plan step 5.3-5.4).
+///
+/// `split_message_and_fields` pulls trailing `key=value` tokens out of the
+/// message into `p.fields` before this runs, so a sensitive value like
+/// `token=abc123XYZ` arrives here as the bare value `"abc123XYZ"` with the
+/// key name ("token") no longer in that string. `redact_key_value_pairs`
+/// (sanitize.rs) can only recognize a sensitive field by matching a literal
+/// `key=value` substring, so it never fires on an already-split value. Each
+/// field's own key is checked directly against `is_sensitive_key` here,
+/// independent of the value's shape, to close that gap.
 fn build_log_entry(raw: &str) -> serde_json::Value {
     match parse_log_line(raw) {
         Some(p) => {
             let mut fields_obj = serde_json::Map::with_capacity(p.fields.len());
             for (k, v) in &p.fields {
-                fields_obj.insert(
-                    k.clone(),
-                    serde_json::json!(sanitize_log_value(v, MAX_FIELD_BYTES)),
-                );
+                let value = if is_sensitive_key(k) {
+                    "[redacted]".to_string()
+                } else {
+                    sanitize_log_value(v, MAX_FIELD_BYTES)
+                };
+                fields_obj.insert(k.clone(), serde_json::json!(value));
             }
             serde_json::json!({
                 "ts": p.ts,
@@ -1128,6 +1139,25 @@ mod tests {
         assert_eq!(entry["level"], "raw");
         assert_eq!(entry["ts"], serde_json::Value::Null);
         assert_eq!(entry["message"], "this is not a tracing log line");
+    }
+
+    /// X1 regression: `split_message_and_fields` pulls `token=abc123XYZ` OUT
+    /// of the message into `fields{"token": "abc123XYZ"}` before
+    /// `build_log_entry` ever calls `sanitize_log_value` on it, so the key
+    /// name is no longer present in the value for `redact_key_value_pairs`'s
+    /// literal `key=value` match to fire on. `build_log_entry` must redact by
+    /// the field's own key instead.
+    #[test]
+    fn build_log_entry_redacts_a_sensitive_field_by_key_not_value_shape() {
+        let entry = build_log_entry("2026-01-01T00:00:00Z ERROR mod: auth failed token=abc123XYZ");
+        assert_eq!(entry["fields"]["token"], "[redacted]", "got: {entry}");
+        assert!(!entry.to_string().contains("abc123XYZ"), "got: {entry}");
+    }
+
+    #[test]
+    fn build_log_entry_leaves_a_non_sensitive_field_untouched() {
+        let entry = build_log_entry("2026-01-01T00:00:00Z ERROR mod: request failed status=500");
+        assert_eq!(entry["fields"]["status"], "500", "got: {entry}");
     }
 
     #[test]
