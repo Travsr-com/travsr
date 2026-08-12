@@ -454,7 +454,7 @@ fn init_tracing(
                     .with_filter(env_filter),
             )
             .init();
-        return Some(guard);
+        Some(guard)
     }
 
     #[cfg(feature = "otlp")]
@@ -996,7 +996,8 @@ fn line_is_for_repo(line: &str, repo: &str) -> bool {
         line[i + needle.len()..]
             .chars()
             .next()
-            .is_none_or(|c| c.is_whitespace() || c == '}' || c == ',')
+            // `is_none_or` is stable since 1.82; MSRV here is 1.75.
+            .map_or(true, |c| c.is_whitespace() || c == '}' || c == ',')
     })
 }
 
@@ -1031,7 +1032,7 @@ fn daemon_logs(
 
     let backfill = tail.backfill(lines)?;
     for line in backfill.lines() {
-        if repo.is_none_or(|r| line_is_for_repo(line, r)) {
+        if repo.map_or(true, |r| line_is_for_repo(line, r)) {
             writeln!(out, "{line}")?;
         }
     }
@@ -1045,7 +1046,7 @@ fn daemon_logs(
     tail.seek_to_end();
     loop {
         for line in tail.poll()? {
-            if repo.is_none_or(|r| line_is_for_repo(&line, r)) {
+            if repo.map_or(true, |r| line_is_for_repo(&line, r)) {
                 writeln!(out, "{line}")?;
             }
         }

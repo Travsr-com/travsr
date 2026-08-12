@@ -109,7 +109,7 @@ pub fn prune(dir: &Path, budget: u64, max_files: usize) -> usize {
 
     let size_of = |p: &PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let mut total: u64 =
-        files.iter().map(size_of).sum::<u64>() + newest.as_ref().map(|p| size_of(p)).unwrap_or(0);
+        files.iter().map(size_of).sum::<u64>() + newest.as_ref().map(&size_of).unwrap_or(0);
 
     while total > budget && !files.is_empty() {
         let victim = files.remove(0);
