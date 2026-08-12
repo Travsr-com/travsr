@@ -7278,7 +7278,10 @@ impl Daemon {
             version = env!("CARGO_PKG_VERSION"),
             pid = std::process::id(),
             repo = %repo_root.display(),
-            foreground,
+            // No `foreground` field on purpose. A backgrounded daemon is a
+            // re-exec of `daemon start --foreground`, so the flag is true in the
+            // child either way: accurate for the process, and misleading to the
+            // person who ran the background command and is told they did not.
             pruned_logs = pruned,
             "daemon starting"
         );
