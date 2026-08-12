@@ -70,6 +70,15 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let names = query.capture_names();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // #479: a JUnit `@Test`/`@ParameterizedTest`/`@RepeatedTest`/`@TestFactory`
+    // annotation is a decisive test entry point (annotation, not name). A file
+    // under `/src/test/…` is additionally a `@test.scope` so its non-annotated
+    // members (helpers/fixtures) classify as `Support`.
+    let mut test_signals = crate::test_role::TestSignals::default();
+    if java_is_test_path(vname_path) {
+        test_signals.push_scope_span(0, tree.root_node().end_position().row);
+    }
+
     while let Some(m) = iter.next() {
         for cap in m.captures {
             let cap_name = &names[cap.index as usize];
@@ -167,6 +176,15 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .with_end_line(end_line);
                     let node_id = node.id;
                     push(&mut nodes, &mut edges, node, parent);
+                    // #479: `@Test`-family annotation ⇒ test entry point.
+                    if cap
+                        .node
+                        .parent()
+                        .is_some_and(|md| java_method_is_test_entry(md, &source))
+                    {
+                        let r = cap.node.start_position().row;
+                        test_signals.push_entry_span(r, r);
+                    }
                     if is_native {
                         if let Some(m) = FfiMarker::try_new(
                             node_id,
@@ -221,11 +239,56 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         }
     }
 
+    // #479: language-agnostic post-pass sets test_role from the collected signals.
+    crate::test_role::apply_test_roles(&test_signals, &mut nodes);
+
     Ok(ParseOutput {
         nodes,
         edges,
         ffi_markers,
     })
+}
+
+/// #479: true when a Java file lives under a `src/test/…` source root (Maven /
+/// Gradle layout). Separator-agnostic so Windows store paths match.
+fn java_is_test_path(vname_path: &str) -> bool {
+    let p = vname_path.replace('\\', "/");
+    p.contains("/src/test/") || p.starts_with("src/test/")
+}
+
+/// #479: true when a `method_declaration` carries a JUnit test annotation —
+/// `@Test`, `@ParameterizedTest`, `@RepeatedTest`, or `@TestFactory` — in its
+/// `modifiers`. Annotation-decisive: a production method merely named `testX`
+/// never matches (asymmetric-cost rule).
+fn java_method_is_test_entry(method_decl: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    // Annotations live inside the `modifiers` node (its kind, not a named field
+    // in every grammar revision). Scanning only that subtree avoids picking up
+    // annotations on locals inside the method body.
+    method_decl
+        .children(&mut method_decl.walk())
+        .find(|c| c.kind() == "modifiers")
+        .is_some_and(|modifiers| {
+            modifiers
+                .children(&mut modifiers.walk())
+                .any(|c| java_annotation_is_test(c, source))
+        })
+}
+
+/// True when `node` is a `marker_annotation`/`annotation` whose name is one of
+/// the JUnit test annotations.
+fn java_annotation_is_test(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if !matches!(node.kind(), "marker_annotation" | "annotation") {
+        return false;
+    }
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(|n| n.rsplit('.').next().unwrap_or(n))
+        .is_some_and(|n| {
+            matches!(
+                n,
+                "Test" | "ParameterizedTest" | "RepeatedTest" | "TestFactory"
+            )
+        })
 }
 
 /// Walk up from a method/constructor name identifier to the nearest enclosing

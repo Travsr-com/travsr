@@ -105,6 +105,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // #479: collect @test.entry/@test.scope line spans during the walk.
+    let mut test_signals = crate::test_role::TestSignals::default();
+
     // G2: walk up from the name identifier to the enclosing declaration item.
     // `impl.name` may need two hops (identifier → generic_type → impl_item),
     // so we walk up to 3 levels before falling back to the capture's own line.
@@ -174,6 +177,15 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     };
                     output.edges.push(emit::defines_edge(src_id, node.id));
                     output.nodes.push(node);
+                    // #479: a `#[test]`/`#[bench]`/`#[*::test]` fn is an entry point.
+                    if capture
+                        .node
+                        .parent()
+                        .is_some_and(|f| rust_fn_is_test_entry(f, source.as_slice()))
+                    {
+                        let r = capture.node.start_position().row;
+                        test_signals.push_entry_span(r, r);
+                    }
                 }
                 "struct.name" => {
                     let node = rust_struct_node(corpus, vname_path, text)
@@ -225,6 +237,16 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     };
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
+                    // #479: `#[cfg(test)] mod { … }` — the whole module is a scope,
+                    // so its members (helpers) classify as test support.
+                    if let Some(mod_item) = capture.node.parent() {
+                        if rust_mod_is_cfg_test(mod_item, source.as_slice()) {
+                            test_signals.push_scope_span(
+                                mod_item.start_position().row,
+                                mod_item.end_position().row,
+                            );
+                        }
+                    }
                 }
                 "const.name" => {
                     let node = rust_const_node(corpus, vname_path, text)
@@ -290,6 +312,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .edges
         .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
+    // #479: language-agnostic post-pass sets test_role from the collected signals.
+    crate::test_role::apply_test_roles(&test_signals, &mut output.nodes);
+
     // Collect FFI markers for cross-language edge resolution (RFC-005).
     let ffi_markers = collect_ffi_markers(corpus, vname_path, &source, &tree);
     output.ffi_markers = ffi_markers;
@@ -312,6 +337,73 @@ fn has_impl_or_trait_ancestor(node: tree_sitter::Node<'_>) -> bool {
         current = n.parent();
     }
     false
+}
+
+/// #479: the `#[…]` attributes attached to `item` — its immediately-preceding
+/// `attribute_item` siblings (skipping doc comments between them and the item).
+///
+/// In tree-sitter-rust an outer attribute is a *sibling* preceding its item, not
+/// a child, so this cannot be a nested tree-sitter query pattern; the association
+/// is done here in the collector. Each entry is `(path, args)` where `path` is
+/// the attribute path text (`"test"`, `"tokio::test"`, `"cfg"`) and `args` is the
+/// raw token-tree text if present (`"(test)"`).
+fn rust_preceding_attrs(
+    item: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut sib = item.prev_sibling();
+    while let Some(s) = sib {
+        match s.kind() {
+            "attribute_item" => {
+                if let Some(attr) = s.named_child(0).filter(|a| a.kind() == "attribute") {
+                    let path = attr
+                        .named_child(0)
+                        .and_then(|p| p.utf8_text(source).ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let args = attr
+                        .child_by_field_name("arguments")
+                        .and_then(|a| a.utf8_text(source).ok())
+                        .map(str::to_string);
+                    out.push((path, args));
+                }
+                sib = s.prev_sibling();
+            }
+            // Doc comments may sit between the attributes and the item.
+            "line_comment" | "block_comment" => sib = s.prev_sibling(),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// #479: true when `fn_item` carries a test-runner attribute — `#[test]`,
+/// `#[bench]`, or any `<path>::test` (`#[tokio::test]`, `#[async_std::test]`, …).
+/// Attribute-decisive: a production fn merely *named* `test_*` never matches.
+fn rust_fn_is_test_entry(fn_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    fn_item.kind() == "function_item"
+        && rust_preceding_attrs(fn_item, source)
+            .iter()
+            .any(|(path, _)| path == "test" || path == "bench" || path.ends_with("::test"))
+}
+
+/// #479: true when `mod_item` is gated by `#[cfg(test)]` (also matches
+/// `#[cfg(test, …)]`), so its whole body is a test scope. `#[cfg(feature = "test")]`
+/// is deliberately not matched — the `test` cfg token must stand alone.
+fn rust_mod_is_cfg_test(mod_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    mod_item.kind() == "mod_item"
+        && rust_preceding_attrs(mod_item, source)
+            .iter()
+            .any(|(path, args)| {
+                path == "cfg"
+                    && args.as_deref().is_some_and(|a| {
+                        a.trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .split(',')
+                            .any(|t| t.trim() == "test")
+                    })
+            })
 }
 
 /// Walk up the AST from `node` to find the nearest enclosing `impl_item`.
@@ -741,6 +833,54 @@ mod tests {
 
     fn fixture_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust/simple.rs")
+    }
+
+    #[test]
+    fn test_role_classifies_rust() {
+        use travsr_core::TestRole;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thing.rs");
+        std::fs::write(
+            &path,
+            b"pub fn calibrate() {}\n\
+              // production code with a test-ish name, must stay None:\n\
+              pub fn test_connection_pool() {}\n\
+              #[cfg(test)]\n\
+              mod tests {\n\
+              use super::*;\n\
+              fn helper() {}\n\
+              #[test]\n\
+              fn calibrate_works() { helper(); }\n\
+              #[tokio::test]\n\
+              async fn async_calibrate() {}\n\
+              }\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "thing.rs").unwrap();
+        let role = |sig: &str| {
+            out.nodes
+                .iter()
+                .find(|n| n.vname.signature == sig)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing node {sig}, have: {:?}",
+                        out.nodes
+                            .iter()
+                            .map(|n| &n.vname.signature)
+                            .collect::<Vec<_>>()
+                    )
+                })
+                .test_role
+        };
+        // #[test] / #[tokio::test] fns are entry points.
+        assert_eq!(role("fn:calibrate_works"), TestRole::EntryPoint);
+        assert_eq!(role("fn:async_calibrate"), TestRole::EntryPoint);
+        // helper inside #[cfg(test)] mod is support.
+        assert_eq!(role("fn:helper"), TestRole::Support);
+        // ordinary production code is None.
+        assert_eq!(role("fn:calibrate"), TestRole::None);
+        // adversarial: production fn with a test-ish name and no attribute → None.
+        assert_eq!(role("fn:test_connection_pool"), TestRole::None);
     }
 
     #[test]

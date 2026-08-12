@@ -22,6 +22,13 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (init_declaration "init" @init.name)
 (import_declaration)  @import
 (property_declaration name: (pattern bound_identifier: (simple_identifier) @var.name))
+(function_declaration
+  (modifiers (attribute (user_type (type_identifier) @_swa)))
+  name: (simple_identifier) @test.entry
+  (#eq? @_swa "Test"))
+(class_declaration
+  (inheritance_specifier inherits_from: (user_type (type_identifier) @_swc))
+  (#eq? @_swc "XCTestCase")) @test.scope
 "#,
     capture_kinds: &[
         // N4d: tree-sitter-swift folds all five type declarations into

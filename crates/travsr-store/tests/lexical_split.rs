@@ -2,7 +2,7 @@
 //! integration tests: write-path population, retraction on delete, and
 //! migration idempotency.
 
-use travsr_core::{Node, VName};
+use travsr_core::{Node, TestRole, VName};
 use travsr_store::{SqliteStore, Store as _};
 
 fn node(path: &str, sig: &str, kind: &str) -> Node {
@@ -42,7 +42,11 @@ fn put_node_sets_is_noise_false_for_src_function() {
 }
 
 #[test]
-fn put_node_sets_is_noise_true_for_test_path() {
+fn put_node_sets_is_noise_false_for_test_path_now_categorized() {
+    // #479 Phase 2: test-path nodes are no longer *hard noise*. The test-path
+    // patterns moved from `is_structural_noise` into `test_role_from_path`, so a
+    // `tests/` node is re-admitted to the seed/lexical set (`is_noise = false`)
+    // and instead categorized (`TestRole`) into the capped `tests` section.
     let mut store = open();
     let n = node(
         "crates/travsr-store/tests/fuzzy.rs",
@@ -50,7 +54,7 @@ fn put_node_sets_is_noise_true_for_test_path() {
         "function",
     );
     let id = store.put_node(&n).unwrap();
-    assert_eq!(store.is_noise_flag(id).unwrap(), Some(true));
+    assert_eq!(store.is_noise_flag(id).unwrap(), Some(false));
 }
 
 #[test]
@@ -148,25 +152,35 @@ fn v21_migration_is_idempotent_across_reopen() {
     assert_eq!(store3.fts_words_node_count().unwrap(), 1);
 }
 
-/// Pre-v21 rows (simulated: is_noise defaults to 0 via ALTER TABLE) must be
-/// correctly recomputed by `backfill_fts_words_if_needed`, not left at the
-/// column default.
+/// #479 Phase 2: a test-path node carrying an analysis-derived `TestRole` is
+/// stored un-excluded (`is_noise = false`) with its role persisted, and both
+/// values survive a reopen (which runs the `test_role` path backfill).
 #[test]
-fn backfill_recomputes_is_noise_for_preexisting_test_path_row() {
+fn test_path_node_is_categorized_not_excluded_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("graph.db");
 
     let test_node_id;
     {
         let mut store = SqliteStore::open(&db_path).unwrap();
-        let n = node("tests/some_test.rs", "fn:some_test", "function");
+        // As `travsr-analysis` would emit it: a `_test`-path node with the path
+        // fallback already applied.
+        let n = node("tests/some_test.rs", "fn:some_test", "function")
+            .with_test_role(TestRole::Support);
         test_node_id = store.put_node(&n).unwrap();
-        // First write already computes is_noise correctly (WS-3 write path).
-        assert_eq!(store.is_noise_flag(test_node_id).unwrap(), Some(true));
+        assert_eq!(store.is_noise_flag(test_node_id).unwrap(), Some(false));
+        assert_eq!(
+            store.test_role(test_node_id).unwrap(),
+            Some(TestRole::Support)
+        );
     }
-    // Reopening must not corrupt the already-correct value.
+    // Reopening (migrations + #479 backfill) must not corrupt the values.
     let store2 = SqliteStore::open(&db_path).unwrap();
-    assert_eq!(store2.is_noise_flag(test_node_id).unwrap(), Some(true));
+    assert_eq!(store2.is_noise_flag(test_node_id).unwrap(), Some(false));
+    assert_eq!(
+        store2.test_role(test_node_id).unwrap(),
+        Some(TestRole::Support)
+    );
 }
 
 #[test]
