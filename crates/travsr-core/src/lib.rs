@@ -497,8 +497,7 @@ impl EdgeKind {
 /// Index-time classification of a node as test code (issue #479).
 ///
 /// Derived from tree-sitter captures (`@test.entry` / `@test.scope`) during
-/// Phase A parsing, with an optional path-based fallback (`test_role_from_path`,
-/// Phase 2). It is **metadata, not identity**: two nodes are the same symbol
+/// Phase A parsing. It is **metadata, not identity**: two nodes are the same symbol
 /// regardless of `test_role`, so it is **not** part of the BLAKE3 VName id — it
 /// sits alongside `package`/`line`, exactly like `is_noise`.
 ///

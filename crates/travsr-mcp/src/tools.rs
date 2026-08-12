@@ -6701,7 +6701,7 @@ mod tests {
     // ── search_symbol / get_callers path:line tests ───────────────────────────
 
     #[test]
-    fn context_result_noise_drops_ci_packages_and_files_keeps_real_symbols() {
+    fn context_result_noise_drops_ci_packages_files_and_tests_keeps_real_symbols() {
         use travsr_core::{Node, VName};
         let node = |path: &str, kind: &str, sig: &str| {
             Node::new(VName::new("", "", path, "rust", sig), kind)
@@ -6719,9 +6719,8 @@ mod tests {
         )));
         // Dropped: bare file nodes.
         assert!(is_context_result_noise(&node("src/foo.rs", "file", "file")));
-        // #479 Phase 2: a test-directory symbol is NO LONGER dropped here — it is
-        // categorized into the capped `tests` section, not evicted.
-        assert!(!is_context_result_noise(&node(
+        // Dropped: everything is_noise_seed rejects (e.g. integration-test dir).
+        assert!(is_context_result_noise(&node(
             "tests/it.rs",
             "function",
             "fn:it_works"
@@ -9922,34 +9921,24 @@ mod snippet_tests {
         assert!(is_noise_seed(&n), "crate nodes must be excluded");
     }
 
-    // #479 Phase 2: test-directory paths are no longer *excluded* from the seed
-    // set — they are categorized (`TestRole`) and rendered in the capped `tests`
-    // section. `is_noise_seed` (a thin wrapper over `is_structural_noise`) keeps
-    // only genuine build/vendor/cache artefacts as hard noise.
     #[test]
-    fn is_noise_seed_allows_tests_path_now_categorized() {
+    fn is_noise_seed_excludes_tests_path() {
         let n = make_node_with_kind_and_path(
             "function",
             "crates/travsr-mcp/tests/conformance.rs",
             "fn:run_mcp",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: integration test files are categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "integration test files must be excluded");
     }
 
     #[test]
-    fn is_noise_seed_allows_benches_path_now_categorized() {
+    fn is_noise_seed_excludes_benches_path() {
         let n = make_node_with_kind_and_path(
             "function",
             "crates/travsr-retrieval/benches/retrieval.rs",
             "fn:bench_ppr_chain",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: benchmark files are categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "benchmark files must be excluded");
     }
 
     #[test]
@@ -10032,29 +10021,23 @@ mod snippet_tests {
     }
 
     #[test]
-    fn is_noise_seed_allows_root_fixtures_dir_now_categorized() {
+    fn is_noise_seed_excludes_root_fixtures_dir() {
         let n = make_node_with_kind_and_path(
             "class",
             "fixtures/ts-callers/service.ts",
             "class:PaymentService",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: root-level fixtures/ are categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "root-level fixtures/ must be excluded");
     }
 
     #[test]
-    fn is_noise_seed_allows_root_fuzz_corpus_now_categorized() {
+    fn is_noise_seed_excludes_root_fuzz_corpus() {
         let n = make_node_with_kind_and_path(
             "class",
             "fuzz/corpus/fuzz_treesitter_indexer/seed_class.ts",
             "class:PaymentService",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: root-level fuzz corpus is categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "root-level fuzz corpus must be excluded");
     }
 
     #[test]
@@ -10064,16 +10047,13 @@ mod snippet_tests {
     }
 
     #[test]
-    fn is_noise_seed_allows_go_test_files_now_categorized() {
+    fn is_noise_seed_excludes_go_test_files() {
         let n = make_node_with_kind_and_path(
             "function",
             "pkg/handler/handler_test.go",
             "fn:TestHandlerRPC",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: Go _test.go files are categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "Go _test.go files must be excluded");
     }
 
     #[test]
@@ -10097,68 +10077,56 @@ mod snippet_tests {
     }
 
     #[test]
-    fn is_noise_seed_allows_testdata_dir_now_categorized() {
+    fn is_noise_seed_excludes_testdata_dir() {
         let n = make_node_with_kind_and_path(
             "function",
             "pkg/parser/testdata/golden_output.go",
             "fn:some_func",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: testdata/ directories are categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "testdata/ directories must be excluded");
     }
 
     #[test]
-    fn is_noise_seed_allows_java_maven_test_src_now_categorized() {
+    fn is_noise_seed_excludes_java_maven_test_src() {
         let n = make_node_with_kind_and_path(
             "function",
             "src/test/java/com/example/ServiceTest.java",
             "fn:testChargeSuccess",
         );
         assert!(
-            !is_noise_seed(&n),
-            "#479: Java Maven src/test/java is categorized, not excluded"
+            is_noise_seed(&n),
+            "Java Maven src/test/java must be excluded"
         );
     }
 
     #[test]
-    fn is_noise_seed_allows_kotlin_test_src_now_categorized() {
+    fn is_noise_seed_excludes_kotlin_test_src() {
         let n = make_node_with_kind_and_path(
             "function",
             "src/test/kotlin/com/example/ServiceSpec.kt",
             "fn:charge_succeeds",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: Kotlin src/test/kotlin is categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "Kotlin src/test/kotlin must be excluded");
     }
 
     #[test]
-    fn is_noise_seed_allows_scala_test_src_now_categorized() {
+    fn is_noise_seed_excludes_scala_test_src() {
         let n = make_node_with_kind_and_path(
             "function",
             "src/test/scala/com/example/ServiceSuite.scala",
             "fn:chargeReturnsOk",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: Scala src/test/scala is categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "Scala src/test/scala must be excluded");
     }
 
     #[test]
-    fn is_noise_seed_allows_ruby_spec_dir_now_categorized() {
+    fn is_noise_seed_excludes_ruby_spec_dir() {
         let n = make_node_with_kind_and_path(
             "function",
             "spec/services/charge_spec.rb",
             "fn:charge_service",
         );
-        assert!(
-            !is_noise_seed(&n),
-            "#479: Ruby spec/ directory is categorized, not excluded"
-        );
+        assert!(is_noise_seed(&n), "Ruby spec/ directory must be excluded");
     }
 
     #[test]
@@ -10278,22 +10246,24 @@ mod snippet_tests {
 
         let (seeds, n_eligible, _, oracle) =
             embed_path_seeds(&store, "get_context", knn, &OpenFilter);
-        // pkg (kind=package/`pkg:`) and crate (kind=crate) stay hard noise and
-        // are filtered from both the seed list and the oracle.
+        // pkg (kind=package/`pkg:`), crate (kind=crate), and the tests/ node are
+        // all noise and filtered from both the seed list and the oracle.
         let seed_ids: Vec<_> = seeds.iter().map(|(n, _)| n.id).collect();
         assert!(!seed_ids.contains(&pkg_id), "pkg node must not be a seed");
         assert!(
             !seed_ids.contains(&crate_id),
             "crate node must not be a seed"
         );
-        // #479 Phase 2: the test-dir node is NO LONGER filtered — it is a valid
-        // seed and gets re-bucketed into the capped `tests` section at render.
         assert!(
-            seed_ids.contains(&impl_id) && seed_ids.contains(&test_id),
-            "src impl and test-dir node are both seeds now; got: {seeds:?}"
+            !seed_ids.contains(&test_id),
+            "test-dir node must not be a seed"
         );
-        assert_eq!(seeds.len(), 2, "impl + test-dir seeds expected");
-        assert_eq!(n_eligible, 2, "n_eligible should match non-noise seeds");
+        assert!(
+            seed_ids.contains(&impl_id),
+            "only the real src impl is a seed; got: {seeds:?}"
+        );
+        assert_eq!(seeds.len(), 1, "only the impl seed expected");
+        assert_eq!(n_eligible, 1, "n_eligible should match non-noise seeds");
         // The package/crate nodes must not be in the confidence-grounding oracle.
         assert!(
             !oracle.contains_key(&pkg_id),

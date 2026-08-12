@@ -547,8 +547,7 @@ impl Migration for V21LexicalSplit {
 /// derived roles are written by `travsr-analysis`/`travsr-store` on the next
 /// reindex of each file, so existing rows read back as `0` ([`TestRole::None`])
 /// until then — the `INTEGER NOT NULL DEFAULT 0` default and the serde default
-/// agree, so no read path ever sees a NULL. The Phase-2 path-based backfill
-/// (issue #479 §6) lives in `backfill_test_role_from_path_if_needed`, not here.
+/// agree, so no read path ever sees a NULL.
 struct V22TestRole;
 impl Migration for V22TestRole {
     fn version(&self) -> u32 {
@@ -782,9 +781,6 @@ impl SqliteStore {
                 .backfill_fts_words_if_needed()
                 .context("backfilling FTS word index (#478)")?;
             store
-                .backfill_test_role_from_path_if_needed()
-                .context("backfilling is_noise + test_role path fallback (#479)")?;
-            store
                 .backfill_vocab_if_needed()
                 .context("backfilling fts_vocab index (L2-A)")?;
             store
@@ -881,9 +877,6 @@ impl SqliteStore {
             store
                 .backfill_fts_words_if_needed()
                 .context("backfilling FTS word index in-memory (#478)")?;
-            store
-                .backfill_test_role_from_path_if_needed()
-                .context("backfilling is_noise + test_role path fallback in-memory (#479)")?;
             store
                 .backfill_vocab_if_needed()
                 .context("backfilling fts_vocab index in-memory (L2-A)")?;
@@ -4854,116 +4847,6 @@ impl SqliteStore {
         tracing::info!(
             indexed = nodes.len(),
             "#478: nodes_fts_words + is_noise backfill complete"
-        );
-        Ok(())
-    }
-
-    /// #479 Phase 2: one-shot recompute of `is_noise` + path-based `test_role`
-    /// for every existing row, run once after migrations and gated by a `meta`
-    /// flag so later opens skip it.
-    ///
-    /// The v22 `is_structural_noise` split (`travsr_core::noise`) moved the
-    /// test-path patterns out of the hard-noise set into
-    /// [`travsr_core::noise::test_role_from_path`]. Every pre-existing test-path
-    /// row therefore has a **stale** `is_noise = 1` (must flip to `0` so the node
-    /// is re-admitted to the lexical/PPR seed set) and `test_role = 0` (the path
-    /// fallback should classify it `Support` so the mcp buckets it into the
-    /// capped `tests` section instead of leaking it into `exact`/`semantic`).
-    /// Both are recomputed here in one pass.
-    ///
-    /// AST-derived roles (`test_role > 0`, written by `travsr-analysis` on
-    /// reindex) are authoritative and are **never** overwritten by the path
-    /// fallback — a `#[test]` fn stays `EntryPoint`.
-    fn backfill_test_role_from_path_if_needed(&mut self) -> AnyResult<()> {
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-            )
-            .context("ensuring meta table for #479 test_role backfill")?;
-        const FLAG: &str = "test_role_path_backfill_v1";
-        let already: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM meta WHERE key = ?1",
-                params![FLAG],
-                |r| r.get(0),
-            )
-            .context("reading #479 test_role backfill flag")?;
-        if already > 0 {
-            return Ok(());
-        }
-
-        let nodes: Vec<Node> = {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role \
-                     FROM nodes",
-                )
-                .context("preparing #479 test_role backfill query")?;
-            let collected = stmt
-                .query_map([], |row| {
-                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
-                    let vname = VName::new(
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    );
-                    let kind: String = row.get(6)?;
-                    let package: String = row.get(7)?;
-                    let line: Option<i64> = row.get(8)?;
-                    let end_line: Option<i64> = row.get(9)?;
-                    let test_role = TestRole::from_i64(row.get::<_, i64>(10)?);
-                    Ok(Node {
-                        id,
-                        vname,
-                        kind,
-                        package,
-                        line: line.and_then(|l| u32::try_from(l).ok()),
-                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
-                        test_role,
-                    })
-                })
-                .context("executing #479 test_role backfill query")?
-                .collect::<Result<_, _>>()
-                .context("collecting #479 test_role backfill rows")?;
-            collected
-        };
-
-        let tx = self
-            .conn
-            .transaction()
-            .context("starting #479 test_role backfill transaction")?;
-        for node in &nodes {
-            // Path fallback only for rows with no AST-derived role (Support-max).
-            let role = if node.test_role == TestRole::None {
-                travsr_core::noise::test_role_from_path(&node.vname.path)
-            } else {
-                node.test_role
-            };
-            tx.execute(
-                "UPDATE nodes SET is_noise = ?2, test_role = ?3 WHERE id = ?1",
-                params![
-                    node_id_to_i64(node.id),
-                    travsr_core::noise::is_structural_noise(node),
-                    role.as_i64(),
-                ],
-            )
-            .context("backfilling #479 is_noise + test_role")?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, '1')",
-            params![FLAG],
-        )
-        .context("recording #479 test_role backfill flag")?;
-        tx.commit()
-            .context("committing #479 test_role backfill transaction")?;
-
-        tracing::info!(
-            rows = nodes.len(),
-            "#479: is_noise + test_role path backfill complete"
         );
         Ok(())
     }

@@ -98,37 +98,24 @@ impl TestSignals {
     }
 }
 
-/// Set each node's `test_role`, preferring the AST captures and falling back to
-/// the path (#479 Phase 2).
+/// Set each node's `test_role` from the AST capture spans.
 ///
-/// Priority (asymmetric-cost, §2):
-/// 1. an `@test.entry` / `@test.scope` capture span containing the node's start
-///    `line` — the only source that can yield [`TestRole::EntryPoint`];
-/// 2. otherwise [`travsr_core::noise::test_role_from_path`] on the node's path —
-///    yields at most [`TestRole::Support`], covering test-directory declarations
-///    that emit no capture (and languages with no Phase-1 capture rule:
-///    C/C++/Dart/Obj-C).
+/// An `@test.entry` / `@test.scope` capture span containing the node's start
+/// `line` classifies it (entry wins over scope; see [`TestSignals::role_for_line`]).
+/// `@test.entry` is the only source that can yield [`TestRole::EntryPoint`].
 ///
 /// A node whose `test_role` a collector already set (Rust detects in the
-/// collector) is left untouched. Nodes without a `line` still get the path
-/// fallback (a test file's synthetic file node classifies as `Support`).
+/// collector) is left untouched.
 pub fn apply_test_roles(signals: &TestSignals, nodes: &mut [travsr_core::Node]) {
     for node in nodes.iter_mut() {
         if node.test_role != TestRole::None {
             continue; // already classified by a collector
         }
-        // 1. AST capture span (entry wins over scope; see `role_for_line`).
         if let Some(line) = node.line {
             let role = signals.role_for_line(line);
             if role != TestRole::None {
                 node.test_role = role;
-                continue;
             }
-        }
-        // 2. Path fallback (Support only).
-        let role = travsr_core::noise::test_role_from_path(&node.vname.path);
-        if role != TestRole::None {
-            node.test_role = role;
         }
     }
 }

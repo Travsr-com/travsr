@@ -294,8 +294,8 @@ const NO_RULE_YET: &[Language] = &[
     // Pending — #479 §0.2. These four have no decisive AST signal (idiomatic
     // detection is path-based: `_test.c`/`/test/`, `_test.dart`, GoogleTest
     // macros, ObjC XCTestCase whose superclass is on a *separate* @interface
-    // node than its @implementation methods). They are covered by the Phase-2
-    // `test_role_from_path` fallback instead of a Phase-1 capture rule.
+    // node than its @implementation methods), so they await a Phase-1 capture
+    // rule and are uncategorized until then.
     Language::Cpp,
     Language::C,
     Language::Dart,
