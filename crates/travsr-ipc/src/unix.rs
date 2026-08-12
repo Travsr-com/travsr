@@ -32,4 +32,17 @@ impl ControlTransport for UnixTransport {
         // drives the socket without needing ownership.
         crate::transport::send_request_line(&mut &self.stream, msg)
     }
+
+    fn send_fire_and_forget(&mut self, msg: &ControlMessage) -> anyhow::Result<()> {
+        // #407 L2: the git hook's budget, not the interactive one — tighten the
+        // socket timeout so a wedged daemon wakes the deadline check within the
+        // fire-and-forget window instead of after `connect`'s 500 ms.
+        self.stream
+            .set_write_timeout(Some(crate::transport::FIRE_AND_FORGET_DEADLINE))?;
+        crate::transport::write_line_before(
+            &mut &self.stream,
+            msg,
+            crate::transport::FIRE_AND_FORGET_DEADLINE,
+        )
+    }
 }
