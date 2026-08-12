@@ -121,7 +121,12 @@ fn handle_tool_call(
     };
     let args = &params["arguments"];
 
-    let _span = tracing::info_span!("mcp.tool_call", tool = tool_name).entered();
+    // The JSON-RPC id is already unique per in-flight request, so it is the
+    // correlation id — no separate one to generate, and it is the same value
+    // the client sees in the response. Every event emitted while serving this
+    // call inherits it, which is what makes "show me everything that happened
+    // for that one slow get_context" an answerable question.
+    let _span = tracing::info_span!("mcp.tool_call", tool = tool_name, req = %id).entered();
     let text = match tool_name {
         "get_dependencies" => {
             let file = args["file"].as_str().unwrap_or("");
@@ -728,7 +733,18 @@ fn handle_tool_call_global(
     let args = &params["arguments"];
     let repo_arg = args["repo"].as_str();
 
-    let _span = tracing::info_span!("mcp.tool_call", tool = tool_name, global = true).entered();
+    // `repo` is what makes a shared global log readable: one process serves
+    // every registered repo, so without it a line cannot be attributed. Carried
+    // on the span rather than added at each call site, so events emitted deeper
+    // in retrieval inherit it too.
+    let _span = tracing::info_span!(
+        "mcp.tool_call",
+        tool = tool_name,
+        req = %id,
+        repo = repo_arg.unwrap_or("*"),
+        global = true
+    )
+    .entered();
     let text = match tool_name {
         "get_dependencies" => {
             tools::get_dependencies_global(repos, args["file"].as_str().unwrap_or(""), repo_arg)

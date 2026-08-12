@@ -284,6 +284,10 @@ enum DaemonAction {
         /// serves several repos.
         #[arg(long)]
         repo: Option<String>,
+        /// Read the global log in ~/.travsr instead of this repo's, which is
+        /// where `travsr mcp --global` writes.
+        #[arg(long, default_value_t = false)]
+        global: bool,
     },
 }
 
@@ -345,9 +349,23 @@ async fn main() {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     let is_daemon = matches!(&cli.command, Command::Daemon { .. });
-    if !is_daemon {
-        init_tracing();
-    }
+    // Global stdio MCP serves every registered repo from one process, and its
+    // stdout is the protocol channel, so nothing can be printed there. Without
+    // a file it logged nowhere durable at all. Same rolling scheme as the
+    // daemon, in the global home next to registry.json, so `travsr daemon logs`
+    // can read it with the same reader.
+    let global_log_dir = match &cli.command {
+        Command::Mcp { global: true, .. } => {
+            dirs::home_dir().map(|h| travsr_daemon::logfile::log_dir(&h))
+        }
+        _ => None,
+    };
+    // Held for the process lifetime: dropping the guard closes the log.
+    let _log_guard = if is_daemon {
+        None
+    } else {
+        init_tracing(global_log_dir.as_deref())
+    };
 
     let result = run(cli).await;
 
@@ -378,7 +396,9 @@ async fn main() {
 ///
 /// Log redaction: file contents are never logged. Spans record only paths,
 /// counts, and numeric identifiers — never raw source text.
-fn init_tracing() {
+fn init_tracing(
+    file_dir: Option<&std::path::Path>,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     // Default to error-only for normal user operation — no internal tracing noise.
     // Set RUST_LOG=info or RUST_LOG=debug to see internals during development.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -386,10 +406,55 @@ fn init_tracing() {
 
     #[cfg(not(feature = "otlp"))]
     {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(env_filter)
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        // No file requested: stderr only, unchanged.
+        let Some(dir) = file_dir else {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(env_filter)
+                .init();
+            return None;
+        };
+
+        if std::fs::create_dir_all(dir).is_err() {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(env_filter)
+                .init();
+            return None;
+        }
+        travsr_daemon::logfile::prune(
+            dir,
+            travsr_daemon::logfile::LOG_BUDGET_BYTES,
+            travsr_daemon::logfile::MAX_LOG_FILES,
+        );
+        let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(travsr_daemon::logfile::BUFFERED_LINES)
+            .lossy(true)
+            .finish(tracing_appender::rolling::daily(
+                dir,
+                travsr_daemon::logfile::LOG_PREFIX,
+            ));
+
+        // The file gets INFO so the log is worth reading, matching the daemon.
+        // stderr keeps the caller's filter, which defaults to error: a stdio
+        // MCP client should not have its terminal filled with our internals.
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(env_filter),
+            )
             .init();
+        return Some(guard);
     }
 
     #[cfg(feature = "otlp")]
@@ -648,8 +713,17 @@ async fn run(cli: Cli) -> Result<()> {
                     follow,
                     lines,
                     repo,
+                    global,
                 } => {
-                    daemon_logs(&repo_root, follow, lines, repo.as_deref())?;
+                    let dir = if global {
+                        travsr_daemon::logfile::log_dir(
+                            &dirs::home_dir()
+                                .context("cannot determine home directory for --global")?,
+                        )
+                    } else {
+                        travsr_daemon::logfile::log_dir(&repo_root)
+                    };
+                    daemon_logs(&dir, follow, lines, repo.as_deref())?;
                 }
                 DaemonAction::StopEmbed => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::StopEmbed) {
@@ -917,15 +991,14 @@ fn line_is_for_repo(line: &str, repo: &str) -> bool {
 /// crash, which is when it is most wanted. Output carries no ANSI: these lines
 /// get piped into `grep` far more often than they get read directly.
 fn daemon_logs(
-    repo_root: &std::path::Path,
+    dir: &std::path::Path,
     follow: bool,
     lines: usize,
     repo: Option<&str>,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
-    let dir = travsr_daemon::logfile::log_dir(repo_root);
-    let mut tail = travsr_daemon::logfile::LogTail::new(&dir);
+    let mut tail = travsr_daemon::logfile::LogTail::new(dir);
 
     if tail.path().is_none() {
         // Name the directory, not a filename: the log is dated, so telling the
