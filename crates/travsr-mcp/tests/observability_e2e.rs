@@ -295,20 +295,18 @@ fn setup_two_repos_with_markers(
     (key_a, key_b, tmp_a, tmp_b)
 }
 
-/// BUG reproduction (see report), minimal form: a registry key is always the
+/// Regression test (was a bug reproduction): a registry key is always the
 /// absolute repo-root path (`travsr_store::registry::register` /
-/// `travsr-daemon/src/lib.rs`'s `registry_key = repo_root.to_string_lossy()`),
-/// and `validate_mcp_arg` unconditionally rejects any argument starting with
-/// `/` (SEC-002, `sanitize.rs`). `resolve_single_repo` runs that same
-/// validation before ever comparing `repo_arg` against the registry, so no
-/// real registry key can ever be supplied successfully. This is a
-/// pre-existing pattern shared with every other global-mode tool's `repo`
-/// argument (`collect_global`, `tools.rs`); #636 inherits it faithfully
-/// rather than introducing it, but it directly breaks the disambiguation
-/// flow #636's own schema documents ("supply `repo` when more than one is
-/// registered"). EXPECTED TO FAIL until fixed; do not delete to go green.
+/// `travsr-daemon/src/lib.rs`'s `registry_key = repo_root.to_string_lossy()`).
+/// `resolve_single_repo` now validates `repo_arg` with the narrower
+/// `validate_mcp_repo_key_arg` (byte-length cap + null-byte rejection only,
+/// see its doc comment in `sanitize.rs` for why that is safe here
+/// specifically) instead of the shared `validate_mcp_arg`, so a real,
+/// absolute registry key can match. This is #636-scoped only: every other
+/// global-mode tool's `repo` argument (`collect_global`, `tools.rs`) still
+/// has the wider systemic issue, filed separately.
 #[test]
-fn bug_ac5_explicit_repo_arg_never_matches_a_real_registry_key() {
+fn ac5c_explicit_repo_arg_matches_a_real_registry_key() {
     let fake_home = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     init_test_repo_env(tmp.path(), &[("HOME", &fake_home.path().to_string_lossy())]);
@@ -352,8 +350,8 @@ fn ac5b_get_daemon_logs_named_repo_never_returns_the_other_repos_marker() {
     let text = tool_text(&responses[1]);
     assert!(
         text.contains("MARKER_REPO_A_SECRET_LINE"),
-        "repo A's own logs must be visible (blocked by the same bug as \
-         bug_ac5_explicit_repo_arg_never_matches_a_real_registry_key): {text}"
+        "repo A's own logs must be visible when named by its real registry \
+         key (see ac5c_explicit_repo_arg_matches_a_real_registry_key): {text}"
     );
     assert!(
         !text.contains("MARKER_REPO_B_SECRET_LINE"),
@@ -576,16 +574,11 @@ fn ac4_get_graph_health_global_never_mutates_the_db_file_on_disk() {
     let before = std::fs::metadata(&db_path).unwrap();
 
     // `repo` is deliberately omitted: this registry has exactly one live
-    // entry, so `resolve_single_repo`'s sole-live-entry fallback applies.
-    // An explicit `repo=<registry key>` cannot be used here, see
-    // `bug_ac5_explicit_repo_arg_never_matches_a_real_registry_key`
-    // (filed separately): every registry key is an absolute path, and
-    // `validate_mcp_arg` unconditionally rejects any argument starting with
-    // `/`, so no global-mode tool's `repo` argument can ever match a real
-    // registry entry today. That bug is orthogonal to what this test proves
-    // (no mutation through the real `open_read_only` path), so it is worked
-    // around here via the omitted-repo fallback rather than blocking this
-    // test on it.
+    // entry, so `resolve_single_repo`'s sole-live-entry fallback applies. An
+    // explicit `repo=<registry key>` would work too now (see
+    // ac5c_explicit_repo_arg_matches_a_real_registry_key), but the omitted-
+    // repo fallback is the more direct path for what this test proves (no
+    // mutation through the real `open_read_only` path).
     let responses = run_mcp_global(
         fake_home.path(),
         &[

@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use travsr_store::SqliteStore;
 
 use crate::rerank;
-use crate::sanitize::{is_sensitive_key, sanitize_log_value, validate_mcp_arg, wrap_envelope};
+use crate::sanitize::{
+    is_sensitive_key, sanitize_log_value, validate_mcp_repo_key_arg, wrap_envelope,
+};
 use crate::tools::git_short_head;
 
 /// A resolved single-repo target for the observability tools' global-mode
@@ -38,13 +40,16 @@ const AMBIGUOUS_REPO_ERR: &str =
 /// Resolve `repo_arg` (or, when absent, the sole live registry entry) to a
 /// single [`RepoTarget`]. Never aggregates across repos, see the module doc.
 ///
-/// `repo_arg` is validated with [`validate_mcp_arg`] first (SEC-002).
+/// `repo_arg` is validated with [`validate_mcp_repo_key_arg`] first, NOT the
+/// shared `validate_mcp_arg`, because every registry key is an absolute
+/// path (see that validator's doc comment for why the relaxed guard set is
+/// safe specifically for this exact-match use).
 fn resolve_single_repo(
     repos: &HashMap<String, PathBuf>,
     repo_arg: Option<&str>,
 ) -> Result<RepoTarget, String> {
     if let Some(name) = repo_arg {
-        if let Err(reason) = validate_mcp_arg(name) {
+        if let Err(reason) = validate_mcp_repo_key_arg(name) {
             tracing::warn!("observability tool rejected invalid repo arg: {reason}");
             return Err(UNKNOWN_REPO_ERR.to_string());
         }

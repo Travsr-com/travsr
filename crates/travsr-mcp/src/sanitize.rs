@@ -473,6 +473,34 @@ pub fn validate_mcp_pattern_arg(arg: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Repo-key variant of [`validate_mcp_arg`] for the observability tools'
+/// global-mode `repo` argument (#636, `observability::resolve_single_repo`).
+///
+/// Every registry key is `repo_root.to_string_lossy()`, an absolute path
+/// (`travsr-daemon/src/lib.rs`, `travsr-store::registry`). `validate_mcp_arg`
+/// unconditionally rejects any argument starting with `/`, so a caller could
+/// never supply a real registry key, making the tools' documented
+/// disambiguation mechanism ("supply `repo` when more than one is
+/// registered") a dead end. This is safe to relax here specifically because
+/// `repo_arg` is used only for an exact `HashMap` key-equality comparison
+/// against locally-registered, trusted values (`resolve_single_repo`). It is
+/// never opened as a path, never concatenated, never interpolated into a
+/// query, unlike file/symbol args elsewhere in this crate. A traversal-shaped
+/// string simply fails to match any real key and falls through to
+/// `UNKNOWN_REPO_ERR`.
+///
+/// Keeps: byte-length cap, null-byte rejection.
+/// Drops: percent-encoding rejection, `../` / absolute-path rejection.
+pub fn validate_mcp_repo_key_arg(arg: &str) -> Result<(), &'static str> {
+    if arg.len() > MAX_ARG_BYTES {
+        return Err("argument exceeds maximum length");
+    }
+    if arg.contains('\0') {
+        return Err("null bytes not permitted in arguments");
+    }
+    Ok(())
+}
+
 fn validate_mcp_arg_with_limit(arg: &str, max_bytes: usize) -> Result<(), &'static str> {
     if arg.len() > max_bytes {
         return Err("argument exceeds maximum length");
@@ -662,6 +690,26 @@ mod tests {
         }
         assert!(!is_sensitive_key("repo"));
         assert!(!is_sensitive_key("reason"));
+    }
+
+    // ── #636: repo-key validator (observability tools' global `repo` arg) ────
+
+    #[test]
+    fn repo_key_arg_allows_absolute_paths_and_traversal_lookalikes() {
+        // Every registry key is an absolute repo-root path, and a caller must
+        // be able to pass one back verbatim to match it, unlike `validate_mcp_arg`.
+        assert!(validate_mcp_repo_key_arg("/home/alice/proj").is_ok());
+        assert!(validate_mcp_repo_key_arg("../../etc").is_ok());
+        assert!(validate_mcp_repo_key_arg("%2e%2e%2f").is_ok());
+    }
+
+    #[test]
+    fn repo_key_arg_still_rejects_null_byte_and_oversize() {
+        assert!(validate_mcp_repo_key_arg("foo\0bar").is_err());
+        let long = "a".repeat(MAX_ARG_BYTES + 1);
+        assert!(validate_mcp_repo_key_arg(&long).is_err());
+        let exact = "a".repeat(MAX_ARG_BYTES);
+        assert!(validate_mcp_repo_key_arg(&exact).is_ok());
     }
 
     #[test]
