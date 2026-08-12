@@ -84,6 +84,15 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path) -> SpawnOutc
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        // #572: with stdio configured the spawn passes bInheritHandles=TRUE,
+        // so every inheritable handle in this process — notably the write end
+        // of a pipe the shell attached to our stdout — leaks into the
+        // long-lived daemon even though ITS stdio is null. A pipeline like
+        // `travsr daemon start | tail` then never sees EOF until the daemon
+        // exits. Un-inherit our std handles first; later children that want
+        // inherited stdio still work because std duplicates the handle
+        // inheritably per spawn.
+        travsr_plugin_host::sandbox::windows::clear_stdio_handle_inheritance();
     }
     // #592: clear any breadcrumb from a previous failed start so we only observe
     // THIS start's outcome.
