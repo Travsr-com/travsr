@@ -310,6 +310,15 @@ fn handle_tool_call(
         }
         // #636: read-only observability tools.
         "get_index_status" => crate::observability::get_index_status(store),
+        "get_daemon_logs" => {
+            let tail = args["tail"]
+                .as_u64()
+                .or_else(|| args["tail"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(crate::observability::DEFAULT_TAIL as u64)
+                as usize;
+            let level = args["level"].as_str().unwrap_or("info");
+            crate::observability::get_daemon_logs(store, tail, level)
+        }
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -633,6 +642,19 @@ fn tools_list() -> serde_json::Value {
                     "required": [],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_daemon_logs",
+                "description": "Return recent daemon log entries (parsed, severity-filtered, and sanitized: home paths and credential-shaped substrings are best-effort redacted; do not assume logs are guaranteed secret-free). Read-only; never creates or writes any file. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tail": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Number of most-recent log lines to consider (default 50, max 500)." },
+                        "level": { "type": "string", "enum": ["error", "warn", "info", "debug"], "description": "Minimum severity to include (default 'info'); more severe levels are always included." }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -901,6 +923,15 @@ fn handle_tool_call_global(
         // each resolves to exactly one repo (`repo_arg`, or the sole live
         // registry entry) or returns an error payload naming `repos_list`.
         "get_index_status" => crate::observability::get_index_status_global(repos, repo_arg),
+        "get_daemon_logs" => {
+            let tail = args["tail"]
+                .as_u64()
+                .or_else(|| args["tail"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(crate::observability::DEFAULT_TAIL as u64)
+                as usize;
+            let level = args["level"].as_str().unwrap_or("info");
+            crate::observability::get_daemon_logs_global(repos, tail, level, repo_arg)
+        }
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
@@ -1134,6 +1165,20 @@ fn tools_list_global() -> serde_json::Value {
                     "required": [],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_daemon_logs",
+                "description": "Return recent daemon log entries for a single repo (parsed, severity-filtered, and sanitized: home paths and credential-shaped substrings are best-effort redacted; do not assume logs are guaranteed secret-free). Read-only; never creates or writes any file. Never aggregates across repos; supply `repo` when more than one is registered, or the call returns an ambiguity error. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tail": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Number of most-recent log lines to consider (default 50, max 500)." },
+                        "level": { "type": "string", "enum": ["error", "warn", "info", "debug"], "description": "Minimum severity to include (default 'info'); more severe levels are always included." },
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). REQUIRED when more than one repo is registered; this tool never aggregates across repos, and never reads more than one repo's logs per call." }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -1202,6 +1247,7 @@ mod tests {
         "get_snippets",
         // #636: read-only observability tools.
         "get_index_status",
+        "get_daemon_logs",
     ];
 
     /// Tools exposed only on the stdio (single-repo) server — never in the global

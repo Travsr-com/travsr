@@ -729,3 +729,18 @@ fn mcp_get_index_status_is_wrapped_and_not_an_error() {
     );
     assert_wrapped_text_response("get_index_status", &responses);
 }
+
+#[test]
+fn mcp_get_daemon_logs_is_wrapped_and_not_an_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_daemon_logs","arguments":{"tail":10}}}"#,
+        ],
+    );
+    assert_wrapped_text_response("get_daemon_logs", &responses);
+}
