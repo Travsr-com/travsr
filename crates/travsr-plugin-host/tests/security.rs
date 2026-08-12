@@ -6,7 +6,6 @@ use travsr_plugin_host::phase_b::catalog::{lookup, SandboxRequirement};
 use travsr_plugin_host::sandbox::policy::SandboxPolicy;
 #[cfg(target_os = "linux")]
 use travsr_plugin_host::sandbox::policy::SandboxUnavailable;
-use travsr_plugin_host::trust::TrustConfig;
 
 // 1. Egress allowed — Standard sandbox permits network (build tools need it)
 //
@@ -137,36 +136,147 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
     }
 }
 
-// 3. Trust gate — untrusted corpus refuses Phase B
+// 3. Trust gate — ADR-017 Rule 3, driven through the REAL spawn path (#414).
+//
+// These tests call `invoke_phase_b_all` (the production Phase B entry point)
+// against a lang.toml that registers an external language whose provider
+// binary is present on PATH, so the ONLY thing separating "spawned" from
+// "skipped" is the per-corpus trust grant. The earlier versions of these
+// tests only unit-tested `TrustConfig::is_trusted`, which production never
+// called — they passed while the gate was dead code.
+
+/// Serialises the trust-gate tests: they mutate process-global env
+/// (TRAVSR_LANG_TOML, PATH) which must not interleave.
+static TRUST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Drive `invoke_phase_b_all` for a registered external language ("go", fake
+/// `travsr-lang-go` on PATH) under the given `trusted_corpora` list, and
+/// return the outcome. Restores env before returning.
+fn run_phase_b_with_trust(
+    corpus: &str,
+    trusted_corpora: &[&str],
+) -> travsr_plugin_host::PhaseBOutcome {
+    use std::io::Write as _;
+
+    let _guard = TRUST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // lang.toml: "go" registered; trust list as given.
+    let cfg_dir = tempfile::tempdir().expect("cfg tempdir");
+    let lang_toml = cfg_dir.path().join("lang.toml");
+    let trusted = trusted_corpora
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        &lang_toml,
+        format!("registered = [\"go\"]\ntrusted_corpora = [{trusted}]\n"),
+    )
+    .expect("write lang.toml");
+
+    // Fake provider binary so the CatalogResolver surfaces "go" — without one
+    // the language never reaches the spawn loop and the gate would be
+    // untestable. The binary is a stub: if it is ever executed the handshake
+    // fails and the language lands in `crashed`, which is itself proof the
+    // spawn path was reached.
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    #[cfg(windows)]
+    let fake = bin_dir.path().join("travsr-lang-go.bat");
+    #[cfg(not(windows))]
+    let fake = bin_dir.path().join("travsr-lang-go");
+    {
+        let mut f = std::fs::File::create(&fake).expect("create fake provider");
+        #[cfg(windows)]
+        f.write_all(b"@echo off\r\nexit /b 0\r\n").expect("write");
+        #[cfg(not(windows))]
+        f.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake provider");
+    }
+
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<std::path::PathBuf> = vec![bin_dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&old_path));
+    let new_path = std::env::join_paths(paths).expect("join PATH");
+    let old_lang_toml = std::env::var_os("TRAVSR_LANG_TOML");
+    std::env::set_var("PATH", &new_path);
+    std::env::set_var("TRAVSR_LANG_TOML", &lang_toml);
+
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    std::fs::write(repo.path().join("main.go"), "package main\n").expect("write go file");
+
+    let indexer = travsr_plugin_host::PluginIndexer::new(corpus);
+    let inputs = travsr_plugin_host::PhaseBInputs {
+        repo_root: repo.path(),
+        present_languages: ["go".to_string()].into_iter().collect(),
+        indexable_paths: &[],
+    };
+    let (.., outcome) = indexer.invoke_phase_b_all(&inputs);
+
+    // Restore process env before any assertion can panic in the caller.
+    std::env::set_var("PATH", old_path);
+    match old_lang_toml {
+        Some(v) => std::env::set_var("TRAVSR_LANG_TOML", v),
+        None => std::env::remove_var("TRAVSR_LANG_TOML"),
+    }
+
+    outcome
+}
+
 #[test]
 fn trust_gate_blocks_untrusted_corpus() {
-    let trust = TrustConfig::new(); // empty — nothing trusted
-    assert!(
-        !trust.is_trusted("github.com/acme/my-repo"),
-        "empty TrustConfig should not trust any corpus"
+    // A trust grant exists — but for a DIFFERENT corpus. The gate must be
+    // per-corpus, not "any grant anywhere unlocks Phase B".
+    let outcome = run_phase_b_with_trust(
+        "github.com/acme/untrusted-repo",
+        &["github.com/acme/some-other-repo"],
+    );
+    assert_eq!(
+        outcome.skipped_untrusted_corpus,
+        vec!["go".to_string()],
+        "registered external language must be skipped before spawn when the \
+         corpus has no trust grant"
     );
     assert!(
-        !trust.is_trusted(""),
-        "empty corpus string should not be trusted"
+        outcome.ran.is_empty(),
+        "nothing may run for an untrusted corpus: {:?}",
+        outcome.ran
+    );
+    assert!(
+        outcome.crashed.is_empty(),
+        "no spawn may be attempted for an untrusted corpus (a crash entry \
+         means the sidecar was spawned): {:?}",
+        outcome.crashed
     );
 }
 
 #[test]
 fn trust_gate_allows_explicitly_trusted_corpus() {
-    let mut trust = TrustConfig::new();
-    trust.trust("github.com/acme/my-repo");
-
+    let outcome = run_phase_b_with_trust("github.com/acme/my-repo", &["github.com/acme/my-repo"]);
     assert!(
-        trust.is_trusted("github.com/acme/my-repo"),
-        "trusted corpus should be allowed"
+        outcome.skipped_untrusted_corpus.is_empty(),
+        "trusted corpus must pass the gate: {:?}",
+        outcome.skipped_untrusted_corpus
     );
+    // Past the gate, "go" must reach the spawn stage. The stub provider is not
+    // a real plugin, so the language lands in `ran`, `crashed`, or
+    // `version_mismatch` depending on how far the handshake gets — any of
+    // these proves the spawn path executed, which the old assertion-only test
+    // never did.
+    let reached_spawn = outcome.ran.iter().any(|l| l == "go")
+        || outcome.crashed.iter().any(|l| l == "go")
+        || outcome.version_mismatch.iter().any(|(l, ..)| l == "go");
     assert!(
-        !trust.is_trusted("github.com/acme/other-repo"),
-        "different corpus should not be trusted"
-    );
-    assert!(
-        !trust.is_trusted("github.com/acme/my-repo-suffix"),
-        "prefix match should not grant trust"
+        reached_spawn,
+        "trusted corpus must reach the spawn stage; outcome: ran={:?} crashed={:?} \
+         version_mismatch={:?} skipped_no_analyzer={:?}",
+        outcome.ran, outcome.crashed, outcome.version_mismatch, outcome.skipped_no_analyzer
     );
 }
 

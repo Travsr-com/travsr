@@ -357,6 +357,13 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
                     pal.dim("ℹ"),
                 );
             }
+            if !report.skipped_untrusted_corpus.is_empty() {
+                let langs = report.skipped_untrusted_corpus.join(", ");
+                println!(
+                    "  {} corpus not trusted for: {langs} — run `travsr lang add <lang> --corpus <your-corpus>` to enable",
+                    pal.dim("ℹ"),
+                );
+            }
             if !report.skipped_no_compdb.is_empty() {
                 let langs = report.skipped_no_compdb.join(", ");
                 println!(
