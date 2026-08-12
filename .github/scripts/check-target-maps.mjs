@@ -53,7 +53,9 @@ function readFileOrFail(absPath) {
  * Region: from the `  build:` job key to the next two-space-indented job
  * key. Sub-checks that the number of `- target:` matrix entries equals the
  * number of `artifact:` lines, so a future entry that omits `artifact:`
- * fails here instead of 404ing at release time.
+ * fails here instead of 404ing at release time, and that no two entries
+ * share the same `artifact:` value, so a duplicate fails here instead of
+ * silently overwriting a published binary.
  * // O(n) in file line count
  */
 function extractReleaseArtifacts(text) {
@@ -92,6 +94,16 @@ function extractReleaseArtifacts(text) {
     console.error(
       `ERROR: ${rel(RELEASE_YML)} build matrix has ${targetCount} "target:" entries ` +
         `but ${artifacts.length} "artifact:" entries. Every matrix entry must set both.`
+    );
+    process.exit(1);
+  }
+
+  const dupes = [...new Set(artifacts.filter((a, i) => artifacts.indexOf(a) !== i))];
+  if (dupes.length > 0) {
+    console.error(
+      `ERROR: ${rel(RELEASE_YML)} build matrix ships duplicate artifact name(s): ` +
+        `${dupes.join(", ")}. Two matrix entries would write the same asset, ` +
+        `so one silently overwrites the other's published binary.`
     );
     process.exit(1);
   }
@@ -211,7 +223,7 @@ for (const v of npmMissing) {
 
 if (failed) {
   console.error(
-    "\nFix: adding or removing a published platform requires editing all three of:\n" +
+    "\nFix: these three must agree on the published platform set:\n" +
       `  - ${rel(RELEASE_YML)} (build matrix, artifact:)\n` +
       `  - ${rel(INSTALLER_TS)} (TARGET_MAP)\n` +
       `  - ${rel(INSTALL_JS)} (TARGETS)`
