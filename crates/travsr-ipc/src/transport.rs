@@ -11,6 +11,16 @@ use crate::{ControlMessage, ControlResponse};
 /// `#[cfg]` appears outside the implementing modules.
 pub trait ControlTransport {
     fn send_request(&mut self, msg: &ControlMessage) -> anyhow::Result<ControlResponse>;
+
+    /// Send `msg` without reading a response (#407 L2).
+    ///
+    /// For fire-and-forget callers (the git post-commit hook) that must never
+    /// stall the user's workflow: the write is bounded by
+    /// [`FIRE_AND_FORGET_DEADLINE`] and no response is awaited — the daemon
+    /// processes the message after the caller has already exited. Keeping this
+    /// on the trait means the line-framing knowledge lives in one crate instead
+    /// of being hand-rolled at each fire-and-forget call site.
+    fn send_fire_and_forget(&mut self, msg: &ControlMessage) -> anyhow::Result<()>;
 }
 
 /// Overall ceiling on getting the request line out (#541).
@@ -25,6 +35,34 @@ pub const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 /// grace it always had — the change is that a would-block now retries within
 /// the window instead of failing the whole command on the first one.
 pub const READ_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Budget for a fire-and-forget send (#407 L2). Sized for the git post-commit
+/// hook, which must never make a commit feel slow: if the daemon cannot accept
+/// one line in this window, the hook gives up and the next commit (or a manual
+/// `travsr init`) catches the graph up instead.
+pub const FIRE_AND_FORGET_DEADLINE: Duration = Duration::from_millis(50);
+
+/// Ceiling on one response line (#407 L1). A buggy daemon streaming bytes with
+/// no terminating newline used to grow the client's buffer without limit; now
+/// the read fails at this cap instead of OOMing the CLI. 64 MiB sits
+/// comfortably above the largest real payload (`graph --all --format json`).
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// `msg` as its newline-terminated JSON wire line.
+fn encode_line(msg: &ControlMessage) -> anyhow::Result<String> {
+    let mut line = serde_json::to_string(msg)?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// Flush, treating a would-block as success: the bytes are already queued in
+/// the kernel by `write_all_before`, so "not yet" on flush is not a failure.
+fn flush_tolerant<S: Write>(stream: &mut S) -> anyhow::Result<()> {
+    stream.flush().or_else(|e| match e.kind() {
+        ErrorKind::WouldBlock | ErrorKind::Interrupted => Ok(()),
+        _ => Err(e.into()),
+    })
+}
 
 /// Send `msg` as one JSON line and read one JSON line back, retrying rather
 /// than surrendering on a would-block.
@@ -42,19 +80,21 @@ pub const READ_DEADLINE: Duration = Duration::from_secs(15);
 /// resumed from the offset the kernel accepted, which the old `writeln!` could
 /// not do: a timeout mid-line used to leave a truncated JSON message in the
 /// daemon's buffer.
+#[cfg_attr(windows, allow(dead_code))] // the Windows transport uses the bounded variant
 pub(crate) fn send_request_line<S: Read + Write>(
     stream: &mut S,
     msg: &ControlMessage,
 ) -> anyhow::Result<ControlResponse> {
-    let mut line = serde_json::to_string(msg)?;
-    line.push('\n');
+    let line = encode_line(msg)?;
+    request_on(stream, &line)
+}
+
+/// The wire exchange itself: write `line`, read one line back, parse. Split
+/// from [`send_request_line`] so the bounded-thread path (#407 M2) can run the
+/// same exchange from an owned closure.
+fn request_on<S: Read + Write>(stream: &mut S, line: &str) -> anyhow::Result<ControlResponse> {
     write_all_before(stream, line.as_bytes(), WRITE_DEADLINE)?;
-    stream.flush().or_else(|e| match e.kind() {
-        // A would-block on flush is the same "not yet" as one on write, and the
-        // bytes are already queued in the kernel by `write_all_before`.
-        ErrorKind::WouldBlock | ErrorKind::Interrupted => Ok(()),
-        _ => Err(e),
-    })?;
+    flush_tolerant(stream)?;
 
     let buf = read_line_before(stream, READ_DEADLINE)?;
     let trimmed = buf.trim();
@@ -63,6 +103,93 @@ pub(crate) fn send_request_line<S: Read + Write>(
         "daemon closed connection without a response"
     );
     Ok(serde_json::from_str::<ControlResponse>(trimmed)?)
+}
+
+/// Write `msg` as one line and return without reading a response (#407 L2).
+#[cfg_attr(windows, allow(dead_code))] // the Windows transport uses the bounded variant
+pub(crate) fn write_line_before<S: Write>(
+    stream: &mut S,
+    msg: &ControlMessage,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    let line = encode_line(msg)?;
+    write_all_before(stream, line.as_bytes(), deadline)?;
+    flush_tolerant(stream)
+}
+
+/// [`send_request_line`], but executed on a worker thread with a hard overall
+/// deadline (#407 M2).
+///
+/// The Windows named-pipe client uses blocking `File` I/O, which never returns
+/// [`ErrorKind::WouldBlock`] — so the in-line deadlines in `write_all_before` /
+/// `read_line_before` are never re-checked and a wedged daemon used to hang
+/// `travsr status` / `ask` / `daemon stop` forever. Running the exchange on a
+/// worker thread bounds it: on timeout the thread is abandoned, still parked on
+/// the blocked syscall, and exits with the (short-lived) CLI process. Takes the
+/// stream by value because the abandoned thread keeps it — which is also why
+/// the named-pipe transport is one request per connection, matching the
+/// daemon's one-response-per-connection protocol.
+#[cfg_attr(unix, allow(dead_code))] // only the Windows transport needs the bounding
+pub(crate) fn send_request_line_bounded<S>(
+    mut stream: S,
+    msg: &ControlMessage,
+) -> anyhow::Result<ControlResponse>
+where
+    S: Read + Write + Send + 'static,
+{
+    let line = encode_line(msg)?;
+    run_with_deadline(WRITE_DEADLINE + READ_DEADLINE, move || {
+        request_on(&mut stream, &line)
+    })
+}
+
+/// [`write_line_before`], on a worker thread with a hard deadline (#407 M2) —
+/// the fire-and-forget analogue of [`send_request_line_bounded`].
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn write_line_bounded<S>(
+    mut stream: S,
+    msg: &ControlMessage,
+    deadline: Duration,
+) -> anyhow::Result<()>
+where
+    S: Write + Send + 'static,
+{
+    let line = encode_line(msg)?;
+    run_with_deadline(deadline, move || {
+        write_all_before(&mut stream, line.as_bytes(), deadline)?;
+        flush_tolerant(&mut stream)
+    })
+}
+
+/// Run `work` on a named worker thread; give up after `deadline`.
+///
+/// An abandoned worker is deliberately leaked (it is parked on a blocking
+/// syscall that cannot be cancelled without unsafe FFI, which this crate
+/// forbids); it dies with the process, and every caller of this crate is a
+/// short-lived CLI invocation.
+#[cfg_attr(unix, allow(dead_code))]
+fn run_with_deadline<T: Send + 'static>(
+    deadline: Duration,
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("travsr-ipc-io".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => anyhow::bail!(
+            "timed out after {:?} talking to the daemon over the named pipe \
+             (it may be busy or wedged; `travsr daemon status` will say \
+             whether it is still running)",
+            deadline
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("the daemon I/O worker terminated unexpectedly")
+        }
+    }
 }
 
 /// `write_all`, but a would-block retries until `deadline` instead of failing.
@@ -128,6 +255,14 @@ fn read_line_before<S: Read>(stream: &mut S, deadline: Duration) -> anyhow::Resu
                     break;
                 }
                 out.extend_from_slice(&chunk[..n]);
+                // #407 L1: a daemon streaming bytes with no newline must fail
+                // the read, not OOM the client accumulating them forever.
+                anyhow::ensure!(
+                    out.len() <= MAX_RESPONSE_BYTES,
+                    "daemon response exceeded the {} MiB cap without a \
+                     terminating newline — the daemon is misbehaving",
+                    MAX_RESPONSE_BYTES / (1024 * 1024)
+                );
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -300,5 +435,48 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("closed the control connection"), "{err}");
+    }
+
+    /// A reader that streams bytes forever without ever emitting a newline —
+    /// the shape of the buggy daemon #407 L1 guards against.
+    struct EndlessStream;
+
+    impl Read for EndlessStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn a_response_with_no_newline_fails_at_the_cap_instead_of_growing_forever() {
+        // #407 L1: before the cap this accumulated until the process OOMed.
+        let err = read_line_before(&mut EndlessStream, Duration::from_secs(30))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeded"), "{err}");
+        assert!(err.contains("cap"), "{err}");
+    }
+
+    #[test]
+    fn fire_and_forget_writes_one_complete_line_and_reads_nothing() {
+        // #407 L2: the hook's fire-and-forget path shares the same framing as
+        // the request path — one newline-terminated JSON line — and never
+        // touches the read side.
+        let mut s = stream(0, 0, 3); // partial writes must still resume
+        s.read_stalls = usize::MAX; // any read attempt would hang the test
+        write_line_before(
+            &mut s,
+            &ControlMessage::ReindexCommit {
+                sha: "abc123".into(),
+            },
+            FIRE_AND_FORGET_DEADLINE,
+        )
+        .unwrap();
+        let sent = String::from_utf8(s.written.clone()).unwrap();
+        assert!(sent.ends_with('\n'), "message must be newline-terminated");
+        serde_json::from_str::<ControlMessage>(sent.trim())
+            .expect("the daemon must receive one complete, parseable message");
+        assert_eq!(s.reads.get(), 0, "fire-and-forget must never read");
     }
 }

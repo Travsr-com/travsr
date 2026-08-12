@@ -4007,6 +4007,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
