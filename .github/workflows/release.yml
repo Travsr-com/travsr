@@ -164,6 +164,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # artifact: must stay in lockstep with the installer target maps
+        # (#576); checked in CI by .github/scripts/check-target-maps.mjs.
         include:
           # musl = statically linked, runs on any Linux regardless of glibc version
           - target: x86_64-unknown-linux-musl

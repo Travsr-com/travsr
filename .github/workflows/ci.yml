@@ -162,6 +162,14 @@ jobs:
       - name: verify plugin source hashes (ADR-017 Rule 5)
         run: bash .github/scripts/check-plugin-hashes.sh
 
+  target-maps:
+    name: release/installer target maps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify release matrix and installer target maps agree (#576)
+        run: node .github/scripts/check-target-maps.mjs
+
   llm-dep-gate:
     name: TL1/TL2 — zero LLM/embedding deps in travsr-mcp
     runs-on: ubuntu-latest
