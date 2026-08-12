@@ -475,18 +475,24 @@ async fn run(cli: Cli) -> Result<()> {
                         // no daemon owns the lock — so we never fork a doomed
                         // ~700 MB process that pays full startup then dies.
                         let exe = std::env::current_exe().context("finding current exe")?;
+                        // #348: open the tail *before* spawning and park it at
+                        // the end. Today's log file usually already exists from
+                        // an earlier session, so a tail opened afterwards would
+                        // replay history as if it were this startup.
+                        let mut relay = travsr_daemon::logfile::LogTail::new(
+                            &travsr_daemon::logfile::log_dir(&repo_root),
+                        );
+                        relay.seek_to_end();
+                        let started = std::time::Instant::now();
+
                         match daemon_client::spawn_background_daemon(&repo_root, &exe) {
                             daemon_client::SpawnOutcome::AlreadyRunning => {
                                 eprintln!("travsr daemon is already running");
                                 return Ok(());
                             }
-                            daemon_client::SpawnOutcome::Started => {
-                                eprintln!("travsr daemon started in background");
-                            }
-                            daemon_client::SpawnOutcome::Starting => {
-                                eprintln!(
-                                    "travsr daemon starting in background (scanning file tree)"
-                                );
+                            daemon_client::SpawnOutcome::Started
+                            | daemon_client::SpawnOutcome::Starting => {
+                                relay_daemon_startup(&repo_root, relay, started);
                             }
                             daemon_client::SpawnOutcome::Failed => {
                                 match daemon_start_error(&repo_root) {
@@ -835,6 +841,67 @@ async fn run(cli: Cli) -> Result<()> {
 /// bind failure). `None` when the file is absent or empty. Lets `daemon
 /// start`/`status`/`restart` surface a background failure that would otherwise
 /// be silent (travsr #592).
+/// How long the parent waits for a spawned daemon to answer before giving up.
+///
+/// Covers a slow machine doing a first-run Phase A on a large tree. The daemon
+/// is not killed on expiry — it is still starting, and the message says so.
+const STARTUP_RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #348: relay the daemon's own log to the terminal until it can answer.
+///
+/// `travsr daemon start` used to print one line in under 10ms and return the
+/// shell prompt, which said nothing about whether the daemon connected, began
+/// indexing, or died. This blocks for as long as startup takes and shows what
+/// the daemon is actually doing.
+///
+/// Exits when the control socket answers, which is the point the daemon can
+/// serve MCP queries. Phase B may still be running; it is background by design
+/// and waiting for it would misrepresent readiness.
+///
+/// Startup *failures* are deliberately not diagnosed from this stream.
+/// `.travsr/daemon-start.err` already carries the reason (#592) and
+/// `daemon_start_error` already reports it; duplicating that here would give
+/// two sources for one answer that could disagree.
+///
+/// `started` is captured by the caller *before* spawning, because
+/// `spawn_background_daemon` itself waits on the child. Starting the clock here
+/// measured only the relay and reported "ready in 0.0s" for a startup that took
+/// most of a second.
+fn relay_daemon_startup(
+    repo_root: &std::path::Path,
+    mut relay: travsr_daemon::logfile::LogTail,
+    started: std::time::Instant,
+) {
+    let deadline = started + STARTUP_RELAY_TIMEOUT;
+    eprintln!("[travsr] starting…");
+
+    loop {
+        if let Ok(lines) = relay.poll() {
+            for line in lines {
+                eprintln!("[travsr] {line}");
+            }
+        }
+
+        // One attempt, no internal sleep: this loop already paces itself, and a
+        // nested delay would double the interval and blur the elapsed figure.
+        if daemon_is_running(repo_root, 1, 0) {
+            eprintln!("[travsr] ready in {:.1}s", started.elapsed().as_secs_f32());
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Not an error: the daemon may simply still be scanning. Say what
+            // is known rather than claiming a failure that may not have
+            // happened.
+            eprintln!(
+                "[travsr] still starting after {}s — follow it with `travsr daemon logs --follow`",
+                STARTUP_RELAY_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Whether a log line belongs to `repo`.
 ///
 /// The daemon tags repo-scoped work with a `repo` span field, which the
