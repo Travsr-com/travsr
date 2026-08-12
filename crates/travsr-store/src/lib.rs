@@ -2459,7 +2459,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line,
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role,
   (
     CASE
       WHEN signature = ?1 THEN 0
@@ -2515,6 +2515,11 @@ LIMIT 100",
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
                     let end_line: Option<i64> = row.get(9)?;
+                    // #479: carry the real test_role so `is_anchor_noise` (the only
+                    // reader of the `Node.test_role` field) can keep AST-detected
+                    // inline tests out of the anchor pool, not just the ones whose
+                    // name `is_test_symbol` recognises.
+                    let test_role: i64 = row.get(10)?;
                     Ok(Node {
                         id,
                         vname,
@@ -2522,7 +2527,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
-                        test_role: TestRole::None,
+                        test_role: TestRole::from_i64(test_role),
                     })
                 })
                 .context("executing search query")?;
@@ -5481,7 +5486,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line,
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role,
   (
     CASE
       WHEN signature = ?1 THEN 0
@@ -5537,6 +5542,9 @@ LIMIT 100",
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
                     let end_line: Option<i64> = row.get(9)?;
+                    // #479: carry the real test_role (parity with the unfiltered
+                    // `search_nodes_by_name`); the column is selected above.
+                    let test_role: i64 = row.get(10)?;
                     Ok(Node {
                         id,
                         vname,
@@ -5544,7 +5552,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
-                        test_role: TestRole::None,
+                        test_role: TestRole::from_i64(test_role),
                     })
                 })
                 .context("executing lang-filtered search query")?;

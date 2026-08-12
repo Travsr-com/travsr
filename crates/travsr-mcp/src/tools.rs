@@ -3743,16 +3743,14 @@ pub(crate) fn is_test_symbol(node: &CoreNode) -> bool {
 /// rejected candidate can still enter retrieval via the lexical/KNN seed paths
 /// (kept by [`is_noise_seed`]); it just cannot be an anchor.
 ///
-/// #479: the name-based [`is_test_symbol`] is the operative test gate here.
-/// `node.test_role` is checked too, but note it is best-effort on this path: the
-/// anchor candidates flow from [`SqliteStore::search_nodes_by_name`], which does
-/// not read the `test_role` column, so `node.test_role` is `None` for them and
-/// the middle term is currently dormant (kept so the check activates for free if
-/// that read path ever carries the column). The precise AST demotion of a
-/// descriptively-named inline test that `is_test_symbol` misses is instead done
-/// downstream by the display bucketer, which reads `store.test_role(id)` by id.
-/// So do not remove `is_test_symbol` on the assumption `test_role` covers the
-/// anchor pool: today it does not.
+/// #479: the AST-derived `test_role` is the precise test gate here. The anchor
+/// candidates flow from [`SqliteStore::search_nodes_by_name`], which carries the
+/// `test_role` column, so `node.test_role.is_test()` fires on this path and keeps
+/// a descriptively-named inline test (one whose name `is_test_symbol` does not
+/// recognise) out of the anchor pool, not just at display time. [`is_test_symbol`]
+/// stays as the name-based fallback for rows that predate the v22 reindex (their
+/// `test_role` reads back `None` until re-parsed). Keep both until v22 is
+/// guaranteed to have reparsed every corpus.
 pub(crate) fn is_anchor_noise(node: &CoreNode) -> bool {
     is_context_result_noise(node) || node.test_role.is_test() || is_test_symbol(node)
 }
