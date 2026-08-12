@@ -141,6 +141,273 @@ pub(crate) fn wrap_envelope(content: &str) -> String {
     }
 }
 
+// ── #636: home-path + secret redaction (observability tools) ──────────────────
+//
+// `get_daemon_logs` forwards real `tracing` log lines to the MCP client. Those
+// lines carry absolute filesystem paths (`repo=/home/alice/proj`) and, in
+// error/debug messages from third-party tooling, can carry credential-shaped
+// substrings. Neither `sanitize_for_mcp` nor `sanitize_mcp_body_with_limit`
+// strip either: they only handle prompt-injection framing (SEC-001). This is
+// a best-effort, pattern-based redaction pass: defence-in-depth, not a
+// guarantee that every possible secret shape is caught. Tool descriptions
+// must not claim logs are secret-free.
+
+/// Sensitive-value key names redacted by [`redact_key_value_pairs`] (case-insensitive).
+const SENSITIVE_KEY_NAMES: &[&str] = &[
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "api_key",
+];
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Redact absolute home-directory paths and common credential shapes from `s`.
+/// Applied BEFORE truncation (see [`sanitize_log_value`]) so a token split by
+/// a byte cap can never survive as a recognizable partial.
+pub(crate) fn redact_sensitive(s: &str) -> String {
+    let s = redact_home_paths(s);
+    let s = redact_bearer_tokens(&s);
+    let s = redact_prefixed_tokens(&s);
+    let s = redact_private_key_headers(&s);
+    redact_key_value_pairs(&s)
+}
+
+/// `sanitize_mcp_body_with_limit(&redact_sensitive(raw), limit)`: redact
+/// first, then apply the existing control-char strip / tag-escape / byte-cap
+/// pipeline. Always returns `<= limit` bytes.
+pub(crate) fn sanitize_log_value(raw: &str, limit: usize) -> String {
+    sanitize_mcp_body_with_limit(&redact_sensitive(raw), limit)
+}
+
+/// Replace the caller's real home directory, and any `/home/<user>/`,
+/// `/Users/<user>/`, or `<drive>:\Users\<user>\` shaped run, with `~/`.
+fn redact_home_paths(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if !home_str.is_empty() {
+            out = out.replace(home_str.as_ref(), "~");
+        }
+    }
+    out = redact_unix_home_run(&out, "/home/");
+    out = redact_unix_home_run(&out, "/Users/");
+    out = redact_windows_home_run(&out, ":\\Users\\");
+    redact_windows_home_run(&out, ":/Users/")
+}
+
+/// Replace `<prefix><username>/` with `~/`, left to right. `<username>` is
+/// the run of non-`/` bytes between `prefix` and the next `/`.
+fn redact_unix_home_run(s: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + prefix.len()..];
+        match after.find('/') {
+            Some(pos) => {
+                out.push_str("~/");
+                rest = &after[pos + 1..];
+            }
+            None => {
+                out.push('~');
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace `<drive-letter><prefix><username><sep>` with `~/`, where `prefix`
+/// is `:\Users\` or `:/Users/` and a single preceding ASCII drive-letter
+/// character (if present) is consumed too.
+fn redact_windows_home_run(s: &str, prefix: &str) -> String {
+    let sep = prefix.chars().last().unwrap_or('\\');
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        // Consume a single preceding ASCII drive-letter byte, if present.
+        // `idx` and `idx - 1` are both valid boundaries since a drive letter
+        // is always a single ASCII byte.
+        let prefix_start = if idx > 0 && rest.as_bytes()[idx - 1].is_ascii_alphabetic() {
+            idx - 1
+        } else {
+            idx
+        };
+        out.push_str(&rest[..prefix_start]);
+        let after = &rest[idx + prefix.len()..];
+        match after.find(sep) {
+            Some(pos) => {
+                out.push_str("~/");
+                rest = &after[pos + 1..];
+            }
+            None => {
+                out.push_str("~/");
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace `Bearer <token>` (case-insensitive) with `Bearer [redacted]`.
+fn redact_bearer_tokens(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut rest_lower: &str = &lower;
+    let mut rest: &str = s;
+    while let Some(idx) = rest_lower.find("bearer ") {
+        out.push_str(&rest[..idx]);
+        out.push_str("Bearer [redacted]");
+        let after = &rest[idx + "bearer ".len()..];
+        // Skip the token run (non-whitespace) that followed "Bearer ".
+        let token_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        rest = &after[token_end..];
+        rest_lower = &rest_lower[idx + "bearer ".len() + token_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Prefixes of common credential shapes: GitHub PATs, AWS access key IDs,
+/// Slack tokens, and OpenAI-style secret keys. Matched case-sensitively (all
+/// real-world prefixes are lowercase/mixed-case-fixed, not user-cased).
+const TOKEN_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "AKIA",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "xoxs-",
+    "xoxr-",
+    "sk-",
+];
+
+/// Replace any run starting with a [`TOKEN_PREFIXES`] entry (prefix included)
+/// up to the next non-token byte with `[redacted]`.
+///
+/// O(n * |TOKEN_PREFIXES|): each outer step re-scans the remaining slice for
+/// every prefix to find the leftmost match. `TOKEN_PREFIXES` is a small fixed
+/// constant and `s` is already bounded by `MAX_FIELD_BYTES`, so this stays cheap.
+fn redact_prefixed_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        // Leftmost match across all prefixes, skipping any that would land
+        // mid-identifier (the preceding byte, if any, is an ident byte).
+        let next = TOKEN_PREFIXES
+            .iter()
+            .filter_map(|prefix| {
+                rest.find(prefix).and_then(|idx| {
+                    let boundary_ok = idx == 0 || !is_ident_byte(rest.as_bytes()[idx - 1]);
+                    boundary_ok.then_some((idx, *prefix))
+                })
+            })
+            .min_by_key(|(idx, _)| *idx);
+
+        let Some((idx, prefix)) = next else {
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + prefix.len()..];
+        let token_body_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(after.len());
+        out.push_str("[redacted]");
+        rest = &after[token_body_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace a `-----BEGIN ... PRIVATE KEY-----` header span with `[redacted]`.
+/// Best-effort: only redacts the header line itself, not a multi-line key
+/// body (log lines are single-line by construction).
+fn redact_private_key_headers(s: &str) -> String {
+    const MARKER: &str = "-----BEGIN";
+    const SUFFIX: &str = "PRIVATE KEY-----";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(MARKER) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + MARKER.len()..];
+        match after.find(SUFFIX) {
+            Some(pos) => {
+                out.push_str("[redacted]");
+                rest = &after[pos + SUFFIX.len()..];
+            }
+            None => {
+                out.push_str(MARKER);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace the value of any `key|token|secret|password|passwd|authorization|
+/// api_key`-named `name=value` pair with `[redacted]`, keeping the name.
+/// Values may be a bare non-whitespace run or a double-quoted string.
+fn redact_key_value_pairs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let Some(rel_eq) = s[i..].find('=') else {
+            out.push_str(&s[i..]);
+            break;
+        };
+        let eq = i + rel_eq;
+        // Walk back over an ASCII identifier run to find the key name.
+        let mut key_start = eq;
+        while key_start > i && is_ident_byte(s.as_bytes()[key_start - 1]) {
+            key_start -= 1;
+        }
+        let key = &s[key_start..eq];
+        out.push_str(&s[i..=eq]);
+        let value_start = eq + 1;
+        let sensitive = SENSITIVE_KEY_NAMES
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name));
+        if !sensitive {
+            i = value_start;
+            continue;
+        }
+        if s[value_start..].starts_with('"') {
+            match s[value_start + 1..].find('"') {
+                Some(end_rel) => {
+                    out.push_str("\"[redacted]\"");
+                    i = value_start + 1 + end_rel + 1;
+                }
+                None => {
+                    out.push_str("\"[redacted]");
+                    i = s.len();
+                }
+            }
+        } else {
+            let value_end = s[value_start..]
+                .find(char::is_whitespace)
+                .map(|p| value_start + p)
+                .unwrap_or(s.len());
+            out.push_str("[redacted]");
+            i = value_end;
+        }
+    }
+    out
+}
+
 // ── SEC-002: input validator ──────────────────────────────────────────────────
 
 /// Validate an incoming MCP argument before it is forwarded to the store.
@@ -423,5 +690,94 @@ mod tests {
         assert!(validate_mcp_arg("my-repo").is_ok());
         assert!(validate_mcp_arg("github.com/acme/foo").is_ok());
         assert!(validate_mcp_arg("").is_ok()); // empty is valid — "nothing found"
+    }
+
+    // ── #636: redact_sensitive / sanitize_log_value ──────────────────────────
+
+    #[test]
+    fn redact_replaces_unix_home_path_with_tilde() {
+        let input = "repo=/home/rvishwakarma/learning/Travsr-com/travsr reason=\"ok\"";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("/home/"), "home path must be redacted: {out}");
+        assert!(out.contains("~/"), "redacted form must use ~/: {out}");
+    }
+
+    #[test]
+    fn redact_replaces_macos_home_path() {
+        let input = "cwd=/Users/alice/proj/main.rs";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("/Users/"), "got: {out}");
+        assert!(out.contains("~/"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_replaces_windows_home_path() {
+        let input = r"cwd=C:\Users\alice\proj";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("Users"), "got: {out}");
+        assert!(out.contains("~/"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_replaces_bearer_token() {
+        let input = "Authorization: Bearer abc.def.ghi more text";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("abc.def.ghi"), "got: {out}");
+        assert!(out.contains("Bearer [redacted]"), "got: {out}");
+        assert!(out.contains("more text"), "trailing text preserved: {out}");
+    }
+
+    #[test]
+    fn redact_key_value_pair_replaces_value_keeps_key() {
+        let out = redact_sensitive("token=abc123 next=field");
+        assert!(out.contains("token=[redacted]"), "got: {out}");
+        assert!(!out.contains("abc123"), "got: {out}");
+        assert!(
+            out.contains("next=field"),
+            "non-sensitive key untouched: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_github_pat_token() {
+        let out = redact_sensitive("token ghp_ABCDEFGHIJ0123456789 leaked");
+        assert!(!out.contains("ghp_ABCDEFGHIJ0123456789"), "got: {out}");
+        assert!(out.contains("[redacted]"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_aws_key_id() {
+        let out = redact_sensitive("key AKIAABCDEFGHIJKLMNOP end");
+        assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_private_key_header() {
+        let out = redact_sensitive("-----BEGIN RSA PRIVATE KEY----- rest of line");
+        assert!(!out.contains("PRIVATE KEY-----"), "got: {out}");
+        assert!(out.contains("[redacted]"), "got: {out}");
+    }
+
+    #[test]
+    fn sanitize_log_value_still_escapes_angle_brackets_and_strips_controls() {
+        let out = sanitize_log_value("<script>\x01bad\x01</script>", 4_096);
+        assert!(!out.contains("<script>"), "got: {out}");
+        assert!(out.contains("&lt;script&gt;"), "got: {out}");
+        assert!(!out.contains('\x01'), "got: {out}");
+    }
+
+    #[test]
+    fn sanitize_log_value_honors_limit_even_after_redaction_expansion() {
+        // "key=x" (5 bytes) redacts to "key=[redacted]" (15 bytes), an
+        // expansion. The final output must still respect the caller's limit.
+        let limit = 8;
+        let out = sanitize_log_value("key=x", limit);
+        assert!(out.len() <= limit, "got {} bytes: {out}", out.len());
+    }
+
+    #[test]
+    fn redact_does_not_touch_unrelated_text() {
+        let out = redact_sensitive("fn charge(amount: u64) -> Result<(), Error>");
+        assert_eq!(out, "fn charge(amount: u64) -> Result<(), Error>");
     }
 }
