@@ -523,6 +523,15 @@ fn grammar_for(lang: &Lang, _path: &str) -> tree_sitter::Language {
 
 // ── Declaration finder ────────────────────────────────────────────────────────
 
+/// Node kinds that count as a declaration to anchor a skeleton at.
+///
+/// A node whose recorded line lands on a kind absent from this list silently
+/// gets no `embed_text` at all, so a form that is *indexed* but not listed here
+/// is invisible to semantic retrieval. Each list therefore has to cover the
+/// declaration-only forms of a language, not just the defining ones: a Go
+/// package-level `const`, an ambient `declare function` in a `.d.ts`, a C
+/// prototype in a header. Those three were missing and cost 49 nodes on this
+/// repo alone.
 fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
     match lang {
         Lang::Rust => &[
@@ -538,6 +547,9 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
         ],
         Lang::TypeScript { .. } => &[
             "function_declaration",
+            // Ambient `declare function` — the only form a `.d.ts` binding
+            // surface has, so without it such a file embeds as nothing.
+            "function_signature",
             "method_definition",
             "class_declaration",
             "abstract_class_declaration",
@@ -550,6 +562,13 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
             "function_declaration",
             "method_declaration",
             "type_declaration",
+            // Package-level const/var. The `_spec` kinds carry grouped blocks
+            // (`var ( A = 1 \n B = 2 )`), where each member's recorded line is
+            // its own spec row rather than the declaration's.
+            "const_declaration",
+            "var_declaration",
+            "const_spec",
+            "var_spec",
         ],
         Lang::Java => &[
             "class_declaration",
@@ -566,7 +585,16 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
             "function_declaration",
             "secondary_constructor",
         ],
-        Lang::C => &["function_definition", "struct_specifier", "enum_specifier"],
+        Lang::C => &[
+            "function_definition",
+            // Header prototypes parse as a bare `declaration`. Broader than the
+            // other entries (a local `int x = 5;` is also a declaration), but a
+            // node recorded at that row previously got no text at all, so the
+            // trade is text-for-nothing, not text-for-worse-text.
+            "declaration",
+            "struct_specifier",
+            "enum_specifier",
+        ],
         Lang::Cpp => &[
             "function_definition",
             "class_specifier",
@@ -796,7 +824,10 @@ fn extract_typescript(
     let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
-        "function_declaration" | "method_definition" => {
+        // `function_signature` is the ambient `declare function` form. It
+        // carries the same `parameters` and `return_type` fields and simply has
+        // no `body`, so it shares this arm rather than getting a thinner one.
+        "function_declaration" | "function_signature" | "method_definition" => {
             if let Some(p) = decl.child_by_field_name("parameters") {
                 for i in 0..p.named_child_count() {
                     let Some(c) = p.named_child(i as u32) else {
@@ -1245,7 +1276,9 @@ fn extract_c(
     let mut comments = collect_doc_comments(decl, src, ck);
 
     match decl.kind() {
-        "function_definition" => {
+        // A header prototype is a `declaration` carrying the same `type` and
+        // `declarator` fields as a definition, minus the `body`.
+        "function_definition" | "declaration" => {
             // Return type is the `type` field
             if let Some(rt) = decl.child_by_field_name("type") {
                 return_type = Some(node_text(rt, src).to_string());
@@ -3281,5 +3314,99 @@ mod tests {
         );
         assert!(can_have_embed_text(&chunk));
         assert!(!can_have_embed_text(&md_file));
+    }
+
+    // ── declaration-only forms ───────────────────────────────────────────────
+    //
+    // Three shapes that are indexed as nodes but produced no embed_text,
+    // because `decl_kinds_for` listed only the *defining* form of each. Found
+    // by the `missed=` field added alongside these tests: 49 nodes reported
+    // fillable, parsed, and written back as nothing.
+
+    /// Helper: text produced for a single node in a single written file.
+    fn embed_text_for(rel: &str, src: &str, node: &Node) -> Vec<(travsr_core::NodeId, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, src).unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        embed_texts_for_file(dir.path(), &canon, rel, &[node], EmbedRichness::Compact)
+    }
+
+    /// Go package-level `const` and `var`. Both are indexed (22 such nodes on
+    /// this repo), and `decl_kinds_for(Go)` had neither declaration form.
+    #[test]
+    fn go_package_level_const_and_var_get_embed_text() {
+        let src = "package simple\n\nconst Version = \"1.0.0\"\n\nvar DefaultTimeout = 30\n";
+        let konst = make_node("simple.go", "var:Version", "go", "var", 3, 3);
+        let var = make_node("simple.go", "var:DefaultTimeout", "go", "var", 5, 5);
+
+        assert_eq!(
+            embed_text_for("simple.go", src, &konst).len(),
+            1,
+            "a package-level const is a declaration worth embedding"
+        );
+        assert_eq!(
+            embed_text_for("simple.go", src, &var).len(),
+            1,
+            "so is a package-level var"
+        );
+    }
+
+    /// Grouped `const (...)` / `var (...)` blocks, where each member's recorded
+    /// line is its own spec row rather than the declaration's. This is why the
+    /// `_spec` kinds are listed alongside the `_declaration` ones: matching on
+    /// the declaration alone would find nothing for members 2..n.
+    #[test]
+    fn go_grouped_const_block_members_each_get_embed_text() {
+        let src = "package k\n\nconst (\n\tAlpha = 1\n\tBeta  = 2\n)\n";
+        let alpha = make_node("k.go", "var:Alpha", "go", "var", 4, 4);
+        let beta = make_node("k.go", "var:Beta", "go", "var", 5, 5);
+
+        assert_eq!(embed_text_for("k.go", src, &alpha).len(), 1);
+        assert_eq!(
+            embed_text_for("k.go", src, &beta).len(),
+            1,
+            "the second member sits on its own spec row, not the declaration's"
+        );
+    }
+
+    /// Ambient declarations in a `.d.ts`: the only form a napi-rs or generated
+    /// binding surface has, so with these missing the whole file embedded as
+    /// nothing (25 such nodes on this repo). The signature carries real params
+    /// and a real return type, so the text has to reach them rather than settle
+    /// for name-and-path.
+    #[test]
+    fn typescript_ambient_declare_function_gets_embed_text() {
+        let src = "/** napi-rs generated binding */\nexport declare function greet(name: string): string;\n";
+        let node = make_node("addon.d.ts", "fn:greet", "typescript", "function", 2, 2);
+        let out = embed_text_for("addon.d.ts", src, &node);
+        assert_eq!(
+            out.len(),
+            1,
+            "`export declare function` is a declaration, not a definition"
+        );
+        assert_eq!(
+            out[0].1,
+            "function: fn:greet | module: addon.d.ts | params: name: string | returns: string"
+        );
+    }
+
+    /// A C prototype in a header. The definition lives in a `.c` file, but the
+    /// header is what other translation units see.
+    #[test]
+    fn c_header_prototype_gets_embed_text() {
+        let src = "int add(int a, int b);\n";
+        let node = make_node("helpers.h", "fn:add", "c", "function", 1, 1);
+        let out = embed_text_for("helpers.h", src, &node);
+        assert_eq!(
+            out.len(),
+            1,
+            "a header prototype is the only declaration of `add` in this file"
+        );
+        assert_eq!(
+            out[0].1,
+            "function: fn:add | module: helpers.h | params: int a, int b | returns: int"
+        );
     }
 }
