@@ -685,6 +685,40 @@ pub(super) fn make_inheritable(h: HANDLE) -> io::Result<()> {
     }
 }
 
+/// Clear `HANDLE_FLAG_INHERIT` on the calling process's std handles (#572).
+///
+/// A shell attaching a pipe to this process's stdout hands it an *inheritable*
+/// handle, and `std::process::Command` spawns with `bInheritHandles=TRUE`
+/// whenever stdio is configured — so every inheritable handle leaks into the
+/// child, even one whose stdio is explicitly null. For a long-lived detached
+/// child (the daemon), the leaked pipe write end means the shell-side reader
+/// never sees EOF and the pipeline hangs until the daemon exits.
+///
+/// Clearing the flag on our own std handles is safe for every later spawn:
+/// `Stdio::inherit` duplicates the current std handle into a fresh inheritable
+/// copy for the child (std `use_stdio_id`), and Rust-created handles are
+/// non-inheritable to begin with.
+///
+/// Best-effort by design: a missing std handle (detached process) or an exotic
+/// handle that rejects `SetHandleInformation` leaves things exactly as they
+/// were today, which must not fail the daemon spawn it protects.
+pub fn clear_stdio_handle_inheritance() {
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle has no preconditions; it returns null or
+        // INVALID_HANDLE_VALUE when no handle is available.
+        let h = unsafe { GetStdHandle(std_id) };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: `h` is a live std handle owned by this process; clearing the
+        // inherit flag only changes inheritance metadata, never the handle.
+        let _ = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+    }
+}
+
 /// Allocate and initialize an attribute list for `count` attributes.
 fn init_attr_list(count: u32) -> io::Result<AttrList> {
     let mut size: usize = 0;
