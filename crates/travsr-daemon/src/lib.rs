@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+pub mod logfile;
 mod phase_b_sched;
 mod query_cache;
 mod scip_unifier;
@@ -7219,13 +7220,38 @@ impl Daemon {
         let travsr_dir = repo_root.join(".travsr");
         std::fs::create_dir_all(&travsr_dir).context("creating .travsr")?;
 
-        let file_appender = tracing_appender::rolling::daily(&travsr_dir, "daemon.log");
-        // Must be held for the daemon's lifetime — dropping flushes and closes daemon.log.
-        let (non_blocking, _appender_guard) = tracing_appender::non_blocking(file_appender);
+        // #347/#348: drop old rotations before opening today's, so a long-lived
+        // install cannot grow `.travsr/` without bound. `rolling::daily` never
+        // deletes anything on its own.
+        let pruned = logfile::prune(
+            &travsr_dir,
+            logfile::LOG_BUDGET_BYTES,
+            logfile::MAX_LOG_FILES,
+        );
+
+        let file_appender = tracing_appender::rolling::daily(&travsr_dir, logfile::LOG_PREFIX);
+        // Must be held for the daemon's lifetime — dropping flushes and closes
+        // the log.
+        //
+        // The default buffer is 128,000 lines, which at INFO during a large
+        // Phase A is tens of megabytes of resident memory sitting in a channel.
+        // Bounded and lossy instead: under pressure the right thing to drop is
+        // log lines, never indexing throughput. `non_blocking` reports what it
+        // discarded, so the loss is visible rather than silent.
+        let (non_blocking, _appender_guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(logfile::BUFFERED_LINES)
+                .lossy(true)
+                .finish(file_appender);
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
+        // INFO, not WARN. At WARN the file held nothing a user would want: on
+        // this repo, four days of logs were 136 lines, every one of them the
+        // same repeated warning and not one lifecycle event. `travsr daemon
+        // logs` on top of that would have been a working feature showing
+        // nothing. `RUST_LOG` still overrides in both directions.
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
         let file_layer = tracing_subscriber::fmt::layer()
             .with_writer(non_blocking)
             .with_ansi(false);
@@ -7244,6 +7270,18 @@ impl Daemon {
         if let Err(e) = init_result {
             eprintln!("travsr daemon: could not init file logger: {e}");
         }
+
+        // First event in every session, so a rotated file is interpretable on
+        // its own: which build wrote it, which repo, which process.
+        tracing::info!(
+            event = "daemon.session.start",
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            repo = %repo_root.display(),
+            foreground,
+            pruned_logs = pruned,
+            "daemon starting"
+        );
 
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");
