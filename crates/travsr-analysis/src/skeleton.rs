@@ -3244,7 +3244,11 @@ mod tests {
             &[&fn_node],
             EmbedRichness::Compact,
         );
-        assert_eq!(with_fn.len(), 1, "what the predicate admits must be fillable");
+        assert_eq!(
+            with_fn.len(),
+            1,
+            "what the predicate admits must be fillable"
+        );
     }
 
     /// A blanket `kind = 'file'` exclusion is the tempting fix and it is wrong:
