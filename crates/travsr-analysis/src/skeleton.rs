@@ -550,6 +550,14 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
             // Ambient `declare function` — the only form a `.d.ts` binding
             // surface has, so without it such a file embeds as nothing.
             "function_signature",
+            // `const f = (a) => ...` and `const f = function (a) {...}`. The
+            // callable hangs off a declarator rather than being a declaration
+            // of its own, and this is the dominant function form in modern
+            // JS/TS — every `const Component = () => ...`. Without these two
+            // kinds none of them can be anchored, so none of them reach the
+            // vector index at all.
+            "lexical_declaration",
+            "variable_declaration",
             "method_definition",
             "class_declaration",
             "abstract_class_declaration",
@@ -851,6 +859,46 @@ fn extract_typescript(
             if let Some(body) = decl.child_by_field_name("body") {
                 collect_callees_dfs(body, src, "call_expression", &mut callees);
                 collect_body_comments_dfs(body, src, ck, &mut comments);
+            }
+        }
+        // `const f = (a) => ...`, `let f = async (a) => ...`,
+        // `var f = function (a) {...}`. The declaration itself carries no
+        // signature; the callable bound to the declarator does, so read the
+        // params and return type from there rather than settling for a
+        // name-and-path text.
+        "lexical_declaration" | "variable_declaration" => {
+            let callable = first_descendant_of_kind(decl, "arrow_function")
+                .or_else(|| first_descendant_of_kind(decl, "function_expression"))
+                .or_else(|| first_descendant_of_kind(decl, "function"));
+            if let Some(f) = callable {
+                // An arrow with one untyped parameter has no `parameters` list,
+                // just a bare `parameter`: `const f = a => a`.
+                if let Some(p) = f.child_by_field_name("parameters") {
+                    for i in 0..p.named_child_count() {
+                        let Some(c) = p.named_child(i as u32) else {
+                            continue;
+                        };
+                        if matches!(
+                            c.kind(),
+                            "required_parameter"
+                                | "optional_parameter"
+                                | "rest_pattern"
+                                | "assignment_pattern"
+                        ) {
+                            params.push(node_text(c, src).to_string());
+                        }
+                    }
+                } else if let Some(p) = f.child_by_field_name("parameter") {
+                    params.push(node_text(p, src).to_string());
+                }
+                if let Some(r) = f.child_by_field_name("return_type") {
+                    let raw = node_text(r, src);
+                    return_type = Some(raw.trim_start_matches(':').trim().to_string());
+                }
+                if let Some(body) = f.child_by_field_name("body") {
+                    collect_callees_dfs(body, src, "call_expression", &mut callees);
+                    collect_body_comments_dfs(body, src, ck, &mut comments);
+                }
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
@@ -3390,6 +3438,57 @@ mod tests {
             out[0].1,
             "function: fn:greet | module: addon.d.ts | params: name: string | returns: string"
         );
+    }
+
+    /// The dominant function form in modern JS/TS, and the one that was wholly
+    /// absent: an arrow bound to a `const`. The callable hangs off a declarator
+    /// rather than being a declaration, so `decl_kinds_for` matched nothing and
+    /// none of them reached the vector index. Found on this repo as 21 `.mjs`
+    /// bench helpers, but on a typical React or Node codebase this is most of
+    /// the functions in the project.
+    #[test]
+    fn typescript_arrow_bound_to_a_const_gets_embed_text_with_its_signature() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (
+                "typed arrow keeps params and return type",
+                "const median = (a: number[]): number => a[0];\n",
+                "function: fn:x | module: run.mjs | params: a: number[] | returns: number",
+            ),
+            (
+                "untyped JS arrow still yields its parameter names",
+                "const cOK = (min, got) => got >= min;\n",
+                "function: fn:x | module: run.mjs | params: min, got",
+            ),
+            (
+                // `t => t.trim()` has no parameter *list*, just a bare parameter.
+                "a single unparenthesised parameter is not skipped",
+                "const strip = t => t.trim();\n",
+                "function: fn:x | module: run.mjs | params: t | calls: trim",
+            ),
+            (
+                // The decl sits inside an `export_statement` wrapper.
+                "an exported arrow is reached through the export wrapper",
+                "export const hitOf = (p: string) => p.length;\n",
+                "function: fn:x | module: run.mjs | params: p: string",
+            ),
+            (
+                "async arrows report the Promise they return",
+                "const run = async (cmd: string): Promise<void> => {};\n",
+                "function: fn:x | module: run.mjs | params: cmd: string | returns: Promise<void>",
+            ),
+            (
+                "the older function-expression form works the same way",
+                "const f = function (a: number) { return a; };\n",
+                "function: fn:x | module: run.mjs | params: a: number",
+            ),
+        ];
+
+        for (why, src, want) in cases {
+            let node = make_node("run.mjs", "fn:x", "typescript", "function", 1, 1);
+            let out = embed_text_for("run.mjs", src, &node);
+            assert_eq!(out.len(), 1, "{why}: produced no text at all");
+            assert_eq!(out[0].1, want, "{why}");
+        }
     }
 
     /// A C prototype in a header. The definition lives in a `.c` file, but the
