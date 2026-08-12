@@ -692,3 +692,40 @@ fn mcp_get_context_path_traversal_arg_is_rejected() {
         "must not return RPC error for path traversal query"
     );
 }
+
+// ── #636: observability tools conformance ──────────────────────────────────
+
+fn assert_wrapped_text_response(tool: &str, responses: &[serde_json::Value]) {
+    assert_eq!(
+        responses.len(),
+        2,
+        "expected initialize + tool/call responses"
+    );
+    let resp = &responses[1];
+    assert!(
+        resp.get("error").is_none(),
+        "{tool} must not return an RPC error, got: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{tool} content.text must be a string, got: {resp}"));
+    assert!(
+        text.starts_with("<travsr-data>") && text.ends_with("</travsr-data>"),
+        "{tool} must be wrapped in the <travsr-data> envelope, got: {text}"
+    );
+}
+
+#[test]
+fn mcp_get_index_status_is_wrapped_and_not_an_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    init_test_repo(tmp.path());
+
+    let responses = run_mcp(
+        tmp.path(),
+        &[
+            INIT_MSG,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}"#,
+        ],
+    );
+    assert_wrapped_text_response("get_index_status", &responses);
+}

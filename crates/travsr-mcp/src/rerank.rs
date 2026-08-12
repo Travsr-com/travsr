@@ -144,6 +144,13 @@ pub(crate) fn manifest_weak_floor() -> Option<f32> {
     manifest().map(|m| m.weak_floor)
 }
 
+/// #636: whether a rerank model manifest (`model.toml`, with calibrated
+/// strong/weak floors) is present for the configured model. Used by
+/// `get_index_status`'s `semantic.calibrated` field.
+pub(crate) fn manifest_present() -> bool {
+    manifest().is_some()
+}
+
 /// Human-readable reranker state for `travsr status`. Honest in both contexts:
 /// answered by the warm daemon it reflects the loaded model; on the cold CLI
 /// fast-path (no daemon) it reflects on-disk presence, since that process never

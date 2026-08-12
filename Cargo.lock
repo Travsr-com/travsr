@@ -4036,6 +4036,7 @@ dependencies = [
  "blake3",
  "dashmap",
  "dirs",
+ "fs2",
  "getrandom 0.2.17",
  "hmac",
  "ignore",

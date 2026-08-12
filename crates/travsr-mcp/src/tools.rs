@@ -277,7 +277,10 @@ pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
 
 /// The caller's short HEAD at `cwd`, or `None` when git is unavailable or `cwd`
 /// is not a repo. Uses `--short` to match the `--short`-stamped `last_commit`.
-fn git_short_head(cwd: &std::path::Path) -> Option<String> {
+///
+/// `pub(crate)`: reused by `observability::index_status_payload` (#636) for
+/// `get_index_status`'s `head_commit` field.
+pub(crate) fn git_short_head(cwd: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
         .output()

@@ -308,6 +308,8 @@ fn handle_tool_call(
             let mode = tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto"));
             tools::get_snippets(store, symbols, token_budget, mode)
         }
+        // #636: read-only observability tools.
+        "get_index_status" => crate::observability::get_index_status(store),
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -621,6 +623,16 @@ fn tools_list() -> serde_json::Value {
                     "required": ["symbols"],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_index_status",
+                "description": "Return index freshness and completeness: schema version, indexed vs HEAD commit staleness, node/edge counts, Phase A/Phase B state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -885,6 +897,10 @@ fn handle_tool_call_global(
                 "repos_prune and repos_remove require a single-repo (stdio) session".into(),
             );
         }
+        // #636: read-only observability tools. Never aggregate across repos:
+        // each resolves to exactly one repo (`repo_arg`, or the sole live
+        // registry entry) or returns an error payload naming `repos_list`.
+        "get_index_status" => crate::observability::get_index_status_global(repos, repo_arg),
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
@@ -1106,6 +1122,18 @@ fn tools_list_global() -> serde_json::Value {
                     "required": ["symbols"],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_index_status",
+                "description": "Return index freshness and completeness for a single repo: schema version, indexed vs HEAD commit staleness, node/edge counts, Phase A/Phase B state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. Read-only. Never aggregates across repos; supply `repo` when more than one is registered, or the call returns an ambiguity error. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). REQUIRED when more than one repo is registered; this tool never aggregates across repos." }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -1172,6 +1200,8 @@ mod tests {
         "get_context",
         "get_graph_json",
         "get_snippets",
+        // #636: read-only observability tools.
+        "get_index_status",
     ];
 
     /// Tools exposed only on the stdio (single-repo) server — never in the global
