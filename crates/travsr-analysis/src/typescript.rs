@@ -109,6 +109,16 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
 
+    // #479: TypeScript test entry points are BDD callbacks (`it(...)`,
+    // `test(...)`) for which Travsr emits no node (§9, out of scope for v1), so
+    // there is no `EntryPoint`. Instead a test *file* (`*.test.ts`, `*.spec.ts`,
+    // `__tests__/…`) is one whole `@test.scope`: every declaration in it is
+    // `Support`. The path gate is what keeps a production `testHelper` unmarked.
+    let mut test_signals = crate::test_role::TestSignals::default();
+    if ts_is_test_path(vname_path) {
+        test_signals.push_scope_span(0, tree.root_node().end_position().row);
+    }
+
     // G2: one hop from the name identifier to its declaration node gives the full span.
     // Works for class_declaration, function_declaration, function_signature, method_definition.
     let decl_end_line = |node: tree_sitter::Node<'_>| -> u32 {
@@ -259,7 +269,22 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         } // for &capture in m.captures
     }
 
+    // #479: language-agnostic post-pass sets test_role from the collected signals.
+    crate::test_role::apply_test_roles(&test_signals, &mut output.nodes);
+
     Ok(output)
+}
+
+/// #479: true when a TypeScript/JavaScript file is a test file by path — a
+/// `*.test.*` / `*.spec.*` basename, or anything under a `__tests__/` directory
+/// (Jest/Vitest conventions). Separator-agnostic so Windows store paths match.
+fn ts_is_test_path(vname_path: &str) -> bool {
+    let p = vname_path.replace('\\', "/");
+    let base = p.rsplit('/').next().unwrap_or(p.as_str());
+    base.contains(".test.")
+        || base.contains(".spec.")
+        || p.contains("/__tests__/")
+        || p.starts_with("__tests__/")
 }
 
 /// Collect `NapiCall` FFI markers from a TypeScript file (RFC-005 §3, plan 171f).

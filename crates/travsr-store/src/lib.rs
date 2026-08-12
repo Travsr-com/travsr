@@ -90,7 +90,7 @@ impl EmbedReadiness {
 use anyhow::{Context, Result as AnyResult};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use travsr_core::{
-    DirtySet, Edge, EdgeKind, GcReport, Node, NodeId, ReplaceReport, SafetyPolicy, VName,
+    DirtySet, Edge, EdgeKind, GcReport, Node, NodeId, ReplaceReport, SafetyPolicy, TestRole, VName,
 };
 use travsr_error::StoreError;
 
@@ -540,6 +540,27 @@ impl Migration for V21LexicalSplit {
     }
 }
 
+/// #479: `nodes.test_role` index-time test classification column.
+///
+/// Column-only DDL on the same `ALTER TABLE … in up()` template as
+/// [`V21LexicalSplit`]'s `is_noise` (Migration::up has DDL access only). AST-
+/// derived roles are written by `travsr-analysis`/`travsr-store` on the next
+/// reindex of each file, so existing rows read back as `0` ([`TestRole::None`])
+/// until then — the `INTEGER NOT NULL DEFAULT 0` default and the serde default
+/// agree, so no read path ever sees a NULL.
+struct V22TestRole;
+impl Migration for V22TestRole {
+    fn version(&self) -> u32 {
+        22
+    }
+    fn up(&self, store: &mut dyn StoreMigratable) -> anyhow::Result<()> {
+        if !store.column_exists("nodes", "test_role")? {
+            store.exec_ddl("ALTER TABLE nodes ADD COLUMN test_role INTEGER NOT NULL DEFAULT 0")?;
+        }
+        Ok(())
+    }
+}
+
 /// Build the ordered migration runner for the SQLite backend.
 /// Register new SQLite migrations here; version order is enforced by the runner.
 fn sqlite_migration_runner() -> MigrationRunner {
@@ -564,6 +585,7 @@ fn sqlite_migration_runner() -> MigrationRunner {
     r.register(V19NodesSignatureIdx);
     r.register(V20PurgeOrphanEdgeSites);
     r.register(V21LexicalSplit);
+    r.register(V22TestRole);
     r
 }
 
@@ -1283,6 +1305,28 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// #479: the `nodes.test_role` classification computed by `travsr-analysis`
+    /// at index time (AST captures), read back by the mcp `Tests`-bucketer. `None`
+    /// (the [`Option`], i.e. absent id) is distinct from `TestRole::None` (the
+    /// row exists but is not test code). Mirrors [`Self::is_noise_flag`]: the
+    /// bucketer reads it by id rather than relying on `Node.test_role`, which the
+    /// generic read paths default to `None` (only the write path carries it).
+    pub fn test_role(&self, id: NodeId) -> Result<Option<TestRole>, StoreError> {
+        (|| -> AnyResult<Option<TestRole>> {
+            let v: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT test_role FROM nodes WHERE id = ?1",
+                    params![node_id_to_i64(id)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("reading test_role")?;
+            Ok(v.map(TestRole::from_i64))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// #478: word-segmented `(sig_words, path_words)` currently indexed for `id`
     /// (`nodes_fts_words_map`). `None` when absent. Test/diagnostic accessor.
     pub fn fts_words_entry(&self, id: NodeId) -> Result<Option<(String, String)>, StoreError> {
@@ -1574,8 +1618,8 @@ impl SqliteStore {
                     for node in &file.nodes {
                         tx.execute(
                             "INSERT INTO nodes_stage(id,corpus,root,path,language,\
-                             signature,kind,package,line,end_line,is_noise) \
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                             signature,kind,package,line,end_line,is_noise,test_role) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                             params![
                                 node_id_to_i64(node.id),
                                 node.vname.corpus,
@@ -1588,6 +1632,7 @@ impl SqliteStore {
                                 node.line.map(|l| l as i64),
                                 node.end_line.map(|l| l as i64),
                                 travsr_core::noise::is_structural_noise(node),
+                                node.test_role.as_i64(),
                             ],
                         )
                         .context("staging: inserting node")?;
@@ -1674,13 +1719,14 @@ impl SqliteStore {
                     for node in &file.nodes {
                         let id_i64 = node_id_to_i64(node.id);
                         tx.execute(
-                            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise) \
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                            "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise,test_role) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
                              ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                                package = excluded.package, \
                                line = COALESCE(excluded.line, nodes.line), \
                                end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                               is_noise = excluded.is_noise",
+                               is_noise = excluded.is_noise, \
+                               test_role = excluded.test_role",
                             params![
                                 id_i64,
                                 node.vname.corpus,
@@ -1693,6 +1739,7 @@ impl SqliteStore {
                                 node.line.map(|l| l as i64),
                                 node.end_line.map(|l| l as i64),
                                 travsr_core::noise::is_structural_noise(node),
+                                node.test_role.as_i64(),
                             ],
                         )
                         .context("inserting node in batch")?;
@@ -2083,13 +2130,14 @@ impl SqliteStore {
                 let id_i64 = node_id_to_i64(node.id);
                 new_ids.insert(id_i64);
                 tx.execute(
-                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                    "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise, test_role) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                      ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                      package = excluded.package, \
                      line = COALESCE(excluded.line, nodes.line), \
                      end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                     is_noise = excluded.is_noise",
+                     is_noise = excluded.is_noise, \
+                     test_role = excluded.test_role",
                     params![
                         id_i64,
                         node.vname.corpus,
@@ -2102,6 +2150,7 @@ impl SqliteStore {
                         node.line.map(|l| l as i64),
                         node.end_line.map(|l| l as i64),
                         travsr_core::noise::is_structural_noise(node),
+                        node.test_role.as_i64(),
                     ],
                 )
                 .context("inserting node in reindex_replace")?;
@@ -2410,7 +2459,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line,
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role,
   (
     CASE
       WHEN signature = ?1 THEN 0
@@ -2466,6 +2515,11 @@ LIMIT 100",
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
                     let end_line: Option<i64> = row.get(9)?;
+                    // #479: carry the real test_role so `is_anchor_noise` (the only
+                    // reader of the `Node.test_role` field) can keep AST-detected
+                    // inline tests out of the anchor pool, not just the ones whose
+                    // name `is_test_symbol` recognises.
+                    let test_role: i64 = row.get(10)?;
                     Ok(Node {
                         id,
                         vname,
@@ -2473,6 +2527,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::from_i64(test_role),
                     })
                 })
                 .context("executing search query")?;
@@ -2570,6 +2625,7 @@ LIMIT 20",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     })
                 })
                 .context("executing lookup_nodes_exact query")?;
@@ -2613,6 +2669,7 @@ LIMIT 20",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     })
                 })
                 .context("executing all_nodes query")?;
@@ -2656,6 +2713,7 @@ LIMIT 20",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     })
                 })
                 .context("executing nodes_by_kind query")?;
@@ -3187,6 +3245,7 @@ LIMIT 20",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     })
                 })
                 .context("executing nodes_missing_embed_text query")?;
@@ -3350,6 +3409,10 @@ LIMIT 20",
             .conn
             .transaction()
             .context("write_phase_b_batch: begin")?;
+        // #479: Phase B nodes carry no `test_role` (it is Phase-A/AST-derived), so
+        // this INSERT deliberately omits the column — a fresh Phase-B-only node
+        // takes the schema default (`None`) and the ON CONFLICT leaves any
+        // existing Phase-A role intact rather than clobbering it to `None`.
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
             tx.execute(
@@ -3452,6 +3515,8 @@ LIMIT 20",
             .transaction()
             .context("write_scip_attributed_batch: begin")?;
 
+        // #479: see write_phase_b_batch — this Phase-B INSERT omits `test_role`
+        // on purpose so it never clobbers a Phase-A role to `None`.
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
             tx.execute(
@@ -4501,7 +4566,7 @@ impl SqliteStore {
                    id INTEGER, corpus TEXT, root TEXT, path TEXT, \
                    language TEXT, signature TEXT, kind TEXT, \
                    package TEXT, line INTEGER, end_line INTEGER, \
-                   is_noise INTEGER \
+                   is_noise INTEGER, test_role INTEGER \
                  ); \
                  CREATE INDEX IF NOT EXISTS nodes_stage_id ON nodes_stage(id); \
                  CREATE TEMP TABLE IF NOT EXISTS edges_stage( \
@@ -4547,16 +4612,17 @@ impl SqliteStore {
 
             let nodes_written = tx
                 .execute(
-                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise) \
+                    "INSERT INTO nodes(id,corpus,root,path,language,signature,kind,package,line,end_line,is_noise,test_role) \
                        SELECT id,corpus,root,path,language,signature,kind,package, \
-                              MAX(line),MAX(end_line),MAX(is_noise) \
+                              MAX(line),MAX(end_line),MAX(is_noise),MAX(test_role) \
                        FROM nodes_stage GROUP BY id \
                        ON CONFLICT(id) DO UPDATE SET \
                          kind     = excluded.kind, \
                          package  = excluded.package, \
                          line     = COALESCE(excluded.line,     nodes.line), \
                          end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                         is_noise = excluded.is_noise",
+                         is_noise = excluded.is_noise, \
+                         test_role = excluded.test_role",
                     [],
                 )
                 .context("inserting nodes from staging")?;
@@ -4673,6 +4739,7 @@ impl SqliteStore {
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     })
                 })
                 .context("executing FTS backfill query")?
@@ -4755,6 +4822,7 @@ impl SqliteStore {
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     })
                 })
                 .context("executing FTS word backfill query")?
@@ -5319,6 +5387,7 @@ impl SqliteStore {
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     },
                     bm25 as f32,
                 ))
@@ -5391,6 +5460,7 @@ impl SqliteStore {
                     package,
                     line: line.and_then(|l| u32::try_from(l).ok()),
                     end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    test_role: TestRole::None,
                 })
             })
             .context("executing FTS5 query")?;
@@ -5416,7 +5486,7 @@ impl SqliteStore {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line,
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role,
   (
     CASE
       WHEN signature = ?1 THEN 0
@@ -5472,6 +5542,9 @@ LIMIT 100",
                     let package: String = row.get(7)?;
                     let line: Option<i64> = row.get(8)?;
                     let end_line: Option<i64> = row.get(9)?;
+                    // #479: carry the real test_role (parity with the unfiltered
+                    // `search_nodes_by_name`); the column is selected above.
+                    let test_role: i64 = row.get(10)?;
                     Ok(Node {
                         id,
                         vname,
@@ -5479,6 +5552,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::from_i64(test_role),
                     })
                 })
                 .context("executing lang-filtered search query")?;
@@ -5544,6 +5618,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     },
                     bm25 as f32,
                 ))
@@ -5604,6 +5679,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     },
                     bm25 as f32,
                 ))
@@ -5658,6 +5734,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     },
                     bm25 as f32,
                 ))
@@ -5803,6 +5880,7 @@ LIMIT 100",
                     package,
                     line: line.and_then(|l| u32::try_from(l).ok()),
                     end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                    test_role: TestRole::None,
                 })
             })
             .context("executing lang-filtered FTS5 query")?;
@@ -6283,6 +6361,7 @@ LIMIT 100",
                         package,
                         line: line.and_then(|l| u32::try_from(l).ok()),
                         end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::None,
                     })
                 })
                 .context("executing doc_nodes_missing_embed_text query")?;
@@ -6454,13 +6533,14 @@ impl Store for SqliteStore {
                 .transaction()
                 .context("starting put_node transaction")?;
             tx.execute(
-                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise, test_role) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
                  end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                 is_noise = excluded.is_noise",
+                 is_noise = excluded.is_noise, \
+                 test_role = excluded.test_role",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -6473,6 +6553,7 @@ impl Store for SqliteStore {
                     node.line.map(|l| l as i64),
                     node.end_line.map(|l| l as i64),
                     travsr_core::noise::is_structural_noise(node),
+                    node.test_role.as_i64(),
                 ],
             )
             .context("inserting node")?;
@@ -6532,6 +6613,7 @@ impl Store for SqliteStore {
                             package,
                             line: line.and_then(|l| u32::try_from(l).ok()),
                             end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                            test_role: TestRole::None,
                         })
                     },
                 )
@@ -6717,6 +6799,7 @@ impl Store for SqliteStore {
                             package,
                             line: line.and_then(|l| u32::try_from(l).ok()),
                             end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                            test_role: TestRole::None,
                         })
                     })
                     .context("executing get_nodes query")?;

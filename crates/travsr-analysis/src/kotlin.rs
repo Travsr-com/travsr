@@ -16,6 +16,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (function_declaration name: (identifier) @fn.name)
 (type_alias (identifier) @typealias.name)
 (import) @import
+(function_declaration
+  (modifiers (annotation (user_type (identifier) @_ka)))
+  name: (identifier) @test.entry
+  (#eq? @_ka "Test"))
 "#,
     capture_kinds: &[
         ("class.name", "class", "class"),

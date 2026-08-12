@@ -20,6 +20,13 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (method_declaration name: (identifier) @fn.name)
 (constructor_declaration name: (identifier) @fn.name)
 (using_directive) @import
+(class_declaration
+  (attribute_list (attribute name: (identifier) @_ca))
+  (#any-of? @_ca "TestFixture" "TestClass")) @test.scope
+(method_declaration
+  (attribute_list (attribute name: (identifier) @_ma))
+  name: (identifier) @test.entry
+  (#any-of? @_ma "Test" "Fact" "Theory" "TestMethod"))
 "#,
     capture_kinds: &[
         ("class.name", "class", "class"),

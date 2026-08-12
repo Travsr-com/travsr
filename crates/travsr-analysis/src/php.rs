@@ -18,6 +18,13 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (function_definition name: (name) @fn.name)
 (method_declaration name: (name) @fn.name)
 (namespace_use_clause) @import
+(class_declaration
+  (base_clause (name) @_pb)
+  (#eq? @_pb "TestCase")) @test.scope
+(method_declaration
+  attributes: (attribute_list (attribute_group (attribute (name) @_pa)))
+  name: (name) @test.entry
+  (#eq? @_pa "Test"))
 "#,
     capture_kinds: &[
         ("class.name", "class", "class"),

@@ -172,14 +172,21 @@ export class ContextExplorerPanel {
         }
 
         // RFC-022 §14: when the backend groups by match-source (flag-on), keep the
-        // Exact → Semantic → Relevant section order and sort by score *within* a
-        // section — a flat score-sort would shuffle the sections together. Flag-off
-        // (no matchSource) keeps the original flat score-sort.
+        // Exact → Semantic → Docs → Tests → Relevant section order and sort by
+        // score *within* a section — a flat score-sort would shuffle the sections
+        // together. Order mirrors the backend trust_rank (seed.rs). Flag-off (no
+        // matchSource) keeps the original flat score-sort.
         if (result.nodes.some((n) => n.matchSource)) {
-          const rank: Record<string, number> = { exact: 0, semantic: 1, relevant: 2 };
+          const rank: Record<string, number> = {
+            exact: 0,
+            semantic: 1,
+            docs: 2,
+            tests: 3,
+            relevant: 4,
+          };
           result.nodes.sort(
             (a, b) =>
-              (rank[a.matchSource ?? "relevant"] ?? 3) - (rank[b.matchSource ?? "relevant"] ?? 3) ||
+              (rank[a.matchSource ?? "relevant"] ?? 5) - (rank[b.matchSource ?? "relevant"] ?? 5) ||
               (b.score ?? 0) - (a.score ?? 0)
           );
         } else {
@@ -546,6 +553,8 @@ pre.raw-fallback{
   <div class="items">
     <div class="it"><span class="ms-tag">Exact</span><span class="why">literal symbol / FTS name match</span></div>
     <div class="it"><span class="ms-tag">Semantic</span><span class="why">cross-encoder ranked by relevance</span></div>
+    <div class="it"><span class="ms-tag">Docs</span><span class="why">documentation prose (verify against code)</span></div>
+    <div class="it"><span class="ms-tag">Tests</span><span class="why">test entry points &amp; fixtures</span></div>
     <div class="it"><span class="ms-tag">Relevant</span><span class="why">graph-adjacent context (see via)</span></div>
     <div class="it"><span class="via caller">caller</span><span class="why">calls a seed</span></div>
     <div class="it"><span class="via dependency">dependency</span><span class="why">imported / used by a seed</span></div>
@@ -626,6 +635,8 @@ function viaClass(via){
 function sectionHead(ms){
   const label = ms==='exact' ? 'Exact · literal / FTS match'
     : ms==='semantic' ? 'Semantic · cross-encoder ranked'
+    : ms==='docs' ? 'Docs · documentation prose (verify against code)'
+    : ms==='tests' ? 'Tests · test entry points & fixtures'
     : 'Relevant · graph-adjacent context';
   return \`<div class="section-head" role="heading" aria-level="3">\${label}</div>\`;
 }

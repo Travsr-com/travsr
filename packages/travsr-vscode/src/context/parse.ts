@@ -23,8 +23,12 @@ export interface ContextHeader {
   confidence: string;
 }
 
-/** RFC-022 §14 match-source bucket a node is grouped under (flag-on only). */
-export type MatchSource = "exact" | "semantic" | "relevant";
+/**
+ * RFC-022 §14 match-source bucket a node is grouped under (flag-on only).
+ * `docs` (#376) and `tests` (#479) are non-code lanes rendered below the
+ * implementation sections.
+ */
+export type MatchSource = "exact" | "semantic" | "docs" | "tests" | "relevant";
 
 export interface ContextNode {
   sig: string;
@@ -81,7 +85,9 @@ const FOOTER_RE_SIMPLE = /^\[(\d+)\s+nodes?,\s*~(\d+)\s+tokens[^\]]*\]$/;
 const NOTE_RE = /^\[note:\s*.+\]$/;
 // RFC-022 §14 match-source section header: "## exact — literal symbol / FTS …".
 // Consumed (not emitted); stamps matchSource on the node rows that follow it.
-const SECTION_RE = /^##\s+(exact|semantic|relevant)\b/;
+// Includes the docs (#376) and tests (#479) lanes so their rows are bucketed
+// under the right section instead of inheriting the preceding one.
+const SECTION_RE = /^##\s+(exact|semantic|docs|tests|relevant)\b/;
 
 function parseHeader(line1: string, line2: string): ContextHeader | null {
   const m1 = FRESHNESS_RE.exec(line1.trim());

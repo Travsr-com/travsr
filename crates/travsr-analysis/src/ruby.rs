@@ -23,6 +23,14 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
   method: (identifier) @require.kw
   arguments: (argument_list (string (string_content) @import.gem))
   (#eq? @require.kw "require"))
+(class
+  superclass: (superclass (scope_resolution name: (constant) @_rs))
+  (#any-of? @_rs "Test" "TestCase")) @test.scope
+(class
+  superclass: (superclass (scope_resolution name: (constant) @_rs2))
+  body: (body_statement (method name: (identifier) @test.entry))
+  (#any-of? @_rs2 "Test" "TestCase")
+  (#match? @test.entry "^test"))
 "#,
     capture_kinds: &[
         ("class.name", "class", "class"),

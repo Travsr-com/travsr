@@ -31,6 +31,16 @@ struct Row {
     score: String,
 }
 
+/// The match-source lanes the grouped human table renders, in backend
+/// `trust_rank` order (seed.rs `MatchSource`): exact -> semantic -> docs ->
+/// tests -> relevant. Every lane the backend can stamp on a row MUST appear
+/// here: the per-tag filter in `run` drops any row whose `match_source` matches
+/// no listed tag, so a missing lane is silently dropped from the table (the #479
+/// bug: `tests` was absent, so 24 test rows including the top-scored node
+/// vanished; the JSON `rows` still carried them). `docs` renders from
+/// `payload.docs`, not from `rows`.
+const SECTION_TAGS: [&str; 5] = ["exact", "semantic", "docs", "tests", "relevant"];
+
 fn to_row(r: &query::AskRow) -> Row {
     Row {
         kind: r.kind.clone(),
@@ -198,12 +208,12 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     let n = payload.rows.len();
     // RFC-022 §14: when match-source grouping is on (rows carry `match_source`)
     // and the result is large enough (N>4) that section headers pay for themselves,
-    // print one table per Exact → Semantic → Relevant section. Otherwise a single
-    // flat table (unchanged default). This never reorders the JSON `rows` (that
-    // path returned above); it only regroups the human table.
+    // print one table per Exact → Semantic → Docs → Tests → Relevant section.
+    // Otherwise a single flat table (unchanged default). This never reorders the
+    // JSON `rows` (that path returned above); it only regroups the human table.
     let grouped = n > 4 && payload.rows.iter().any(|r| r.match_source.is_some());
     if grouped {
-        for tag in ["exact", "semantic", "docs", "relevant"] {
+        for tag in SECTION_TAGS {
             // #376 §4.1 section order: exact → semantic → docs → relevant. Docs
             // sit above `relevant` because design intent beats graph-adjacent
             // filler, and below the code sections so code leads whenever it has
@@ -221,10 +231,17 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
                 continue;
             }
             section.sort_by(|a, b| b.score.total_cmp(&a.score));
+            // #479: cap the tests lane in the human table the same way
+            // `get_context`'s `assemble_context_body` does (TESTS_CAP = 3) so a
+            // test lane never dominates the summary. The JSON `rows` keep every row.
+            if tag == "tests" {
+                section.truncate(3);
+            }
             let rows: Vec<Row> = section.iter().map(|r| to_row(r)).collect();
             let header = match tag {
                 "exact" => "── exact — literal symbol / FTS match (not reranked) ──",
                 "semantic" => "── semantic — cross-encoder ranked ──",
+                "tests" => "── tests — test entry points & fixtures ──",
                 _ => "── relevant — graph-adjacent context ──",
             };
             println!("{header}");
@@ -341,6 +358,29 @@ mod docs_note_tests {
         assert!(
             travsr_config::effective_bool("docs.enabled", Some(&env.repo())).unwrap_or(true),
             "repo config must drive the note"
+        );
+    }
+
+    /// #479 regression: every match-source lane the backend can stamp on a row
+    /// must be rendered by the grouped table. The backend stamps `tests` (and
+    /// `docs`, #376) alongside `exact`/`semantic`/`relevant`; the grouped renderer
+    /// filters rows per `SECTION_TAGS`, so a lane missing from that list is
+    /// silently dropped from the human table (the #479 bug dropped 24 `tests`
+    /// rows, including the top-scored node, while the JSON path still carried
+    /// them). Pin the full lane set so a future edit cannot re-introduce the drop.
+    #[test]
+    fn section_tags_cover_every_backend_match_source_lane() {
+        for lane in ["exact", "semantic", "docs", "tests", "relevant"] {
+            assert!(
+                super::SECTION_TAGS.contains(&lane),
+                "match-source lane {lane:?} missing from SECTION_TAGS -> its rows would be silently dropped from the ask table"
+            );
+        }
+        // And the order matches the backend trust_rank so sections read
+        // most-trusted first.
+        assert_eq!(
+            super::SECTION_TAGS,
+            ["exact", "semantic", "docs", "tests", "relevant"]
         );
     }
 }

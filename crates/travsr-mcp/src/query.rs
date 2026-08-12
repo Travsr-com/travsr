@@ -514,6 +514,19 @@ pub fn ask_query_with_filter(
     } else {
         HashMap::new()
     };
+    // #479: index-time test nodes bucket as the "tests" match source regardless
+    // of seed provenance, so the CLI groups them into the capped tests section
+    // instead of letting a `#[test]` fn lead the exact/semantic group. Read by id
+    // (the store column) since `Node.test_role` defaults to `None` on read paths.
+    let test_node_ids: std::collections::HashSet<NodeId> = if emit_match_source {
+        selected
+            .iter()
+            .filter(|n| matches!(store.test_role(n.id), Ok(Some(r)) if r.is_test()))
+            .map(|n| n.id)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let rows = selected
         .into_iter()
         .map(|n| {
@@ -528,6 +541,9 @@ pub fn ask_query_with_filter(
                     seed_set.confidence,
                 ),
                 match_source: emit_match_source.then(|| {
+                    if test_node_ids.contains(&n.id) {
+                        return crate::seed::MatchSource::Tests.label().to_string();
+                    }
                     let is_exact = matches!(
                         strongest_source.get(&n.id),
                         Some(crate::seed::SeedSource::Exact)
@@ -956,6 +972,7 @@ mod tests {
             package: String::new(),
             line: None,
             end_line: None,
+            test_role: travsr_core::TestRole::None,
         }
     }
 

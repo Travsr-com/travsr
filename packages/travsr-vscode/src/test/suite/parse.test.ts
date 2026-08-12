@@ -97,11 +97,13 @@ fn:knapsack (function) — crates/travsr-retrieval/src/knapsack.rs:53 [score: 0.
 fn:solve (function) — crates/travsr-retrieval/src/knapsack.rs:71 [score: 0.90]
 ## semantic — cross-encoder ranked
 fn:token_budget (function) — crates/travsr-retrieval/src/budget.rs:12 [score: 0.55]
+## tests — test entry points & fixtures
+fn:token_budget_keeps_prefix (function) — crates/travsr-retrieval/src/knapsack.rs:210 [score: 0.40]
 ## relevant — graph-adjacent context
 fn:seeded_store (function) — crates/travsr-mcp/src/query.rs:682 [via: dependency of fn:token_budget] [score: 0.00]
 method:SqliteStore.open (method) — crates/travsr-store/src/lib.rs:744 [via: caller of fn:knapsack] [score: 0.00]
 
-[5 nodes, ~150 tokens]
+[6 nodes, ~150 tokens]
 `;
 
 const MALFORMED_FIXTURE = `not a valid get_context response at all`;
@@ -212,14 +214,21 @@ suite("context/parse: parseContextResult", () => {
     const p = r as ParsedContext;
 
     // Section headers are consumed, not emitted as nodes.
-    assert.strictEqual(p.nodes.length, 5, "five nodes, no header rows");
-    assert.strictEqual(p.footer.nodes, 5);
+    assert.strictEqual(p.nodes.length, 6, "six nodes, no header rows");
+    assert.strictEqual(p.footer.nodes, 6);
 
     // matchSource stamped per node from the preceding section header.
     const bySource = (s: string) => p.nodes.filter((n) => n.matchSource === s);
     assert.strictEqual(bySource("exact").length, 2);
     assert.strictEqual(bySource("semantic").length, 1);
+    assert.strictEqual(bySource("tests").length, 1);
     assert.strictEqual(bySource("relevant").length, 2);
+
+    // #479: the tests-lane row is bucketed under `tests` (not inherited as
+    // `semantic`), and its via is hoisted into the header like other seeds.
+    const testRow = p.nodes.find((n) => n.sig === "fn:token_budget_keeps_prefix");
+    assert.strictEqual(testRow?.matchSource, "tests");
+    assert.strictEqual(testRow?.via, undefined, "hoisted tests row carries no via");
 
     // Exact/Semantic seed lines: via hoisted into the header → undefined on the row.
     const knapsack = p.nodes.find((n) => n.sig === "fn:knapsack");

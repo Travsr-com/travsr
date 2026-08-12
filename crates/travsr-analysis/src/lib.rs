@@ -18,6 +18,7 @@ pub mod ffi;
 pub mod generic;
 pub mod skeleton;
 pub mod snippet;
+pub mod test_role;
 
 // ── Phase A parsers — high-complexity (hand-crafted, FFI/LSIF aware) ─────────
 pub mod go;
