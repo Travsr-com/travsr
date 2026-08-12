@@ -518,8 +518,9 @@ pub enum TestRole {
     /// `func TestX` with a `*testing.T` param, etc. The thing a runner invokes.
     EntryPoint,
     /// Support code that lives inside a test unit — a helper fn or fixture inside
-    /// a `#[cfg(test)] mod`, a method of a `TestCase` subclass, a file under
-    /// `/src/test/…` (Phase-2 path fallback), etc.
+    /// a `#[cfg(test)] mod`, a method of a `TestCase` subclass, etc. Detected from
+    /// AST `@test.scope` captures only (the path-based fallback was Phase 2, which
+    /// regressed the k8s bench and was reverted).
     Support,
 }
 
@@ -582,7 +583,7 @@ pub struct Node {
     pub end_line: Option<u32>,
     /// Index-time test classification (issue #479). Defaults to
     /// [`TestRole::None`]; set by the `travsr-analysis` post-pass from
-    /// tree-sitter captures (and, in Phase 2, the path fallback). Stored in
+    /// tree-sitter `@test.entry` / `@test.scope` captures. Stored in
     /// `nodes.test_role` (v22); **not** part of the BLAKE3 id.
     ///
     /// `#[serde(default)]` keeps old plugin-protocol payloads (out-of-process
