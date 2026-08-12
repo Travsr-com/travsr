@@ -692,7 +692,11 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
                 .into_iter()
                 .filter(|n| {
                     // Exclude non-definition nodes: `file` container nodes and
-                    // `import`/`use` nodes (kind == "import").
+                    // `import`/`use` nodes (kind == "import"). An import node
+                    // shares the imported symbol's simple name, so without this
+                    // guard `refs find_pattern` reads as "ambiguous — 2 defs"
+                    // (the real `fn:` plus `use:...::find_pattern`), and pinning
+                    // the import node yields an empty, misleading "0 references".
                     n.kind != "file"
                         && n.kind != "import"
                         && (n.vname.signature == symbol
@@ -707,7 +711,13 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
     }
 
     // Tier 3 (#449): dotted static/member access like `ClassC.shared` or
-    // `Type.method`.
+    // `Type.method`. Stored signatures qualify the member (`swift::ClassC.shared`,
+    // `method:ClassC.shared`, `scip:...ClassC#shared.`) but never equal the
+    // dotted query, and `simple_name` reduces them to the bare member, so both
+    // tiers above miss. Split at the last `.`, search the member, and keep
+    // candidates whose signature carries the container qualifier; fall back to
+    // a bare-member match only when it is unique AND genuinely unqualified
+    // (never a match with some OTHER, unrelated container).
     if candidates.is_empty() {
         if let Some((container, member)) = symbol.rsplit_once('.') {
             if !container.is_empty() && !member.is_empty() {
@@ -8817,9 +8827,11 @@ fn get_snippets_body(
 
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
-    // search_nodes_by_name (O(N) LIKE) is never called — every tier uses the
-    // V19NodesSignatureIdx exact-match index (O(log N)) or direct primary-key
-    // lookup (O(1)).
+    // search_nodes_by_name (O(N) LIKE) is generally avoided for exact-match
+    // tiers (Tiers 0-2), which use the V19NodesSignatureIdx exact-match index
+    // (O(log N)) or direct primary-key lookup (O(1)). However, the bare-signature
+    // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
+    // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
     for tok in &tokens {
         match tok {
