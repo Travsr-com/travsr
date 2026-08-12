@@ -28,6 +28,7 @@ mod synonym;
 
 use anyhow::{Context as _, Result};
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -751,6 +752,13 @@ async fn run(cli: Cli) -> Result<()> {
                     } else {
                         travsr_daemon::logfile::log_dir(&repo_root)
                     };
+                    // Non-global logs belong to exactly one repo, so the
+                    // renderer can leave its name and paths implicit.
+                    let renderer_repo = if global {
+                        None
+                    } else {
+                        Some(repo_root.clone())
+                    };
                     let min_level = level.as_deref().map(parse_level).transpose()?;
                     let since = since.as_deref().map(parse_since).transpose()?;
                     daemon_logs(
@@ -760,6 +768,7 @@ async fn run(cli: Cli) -> Result<()> {
                         LineFilter::new(repo, min_level, since),
                         json,
                         utc,
+                        renderer_repo,
                     )?;
                 }
                 DaemonAction::StopEmbed => {
@@ -1255,6 +1264,14 @@ fn render_value(v: &serde_json::Value) -> String {
 struct LogRenderer {
     last_date: Option<String>,
     utc: bool,
+    /// Repo the log belongs to, when it serves exactly one.
+    ///
+    /// Used to drop what the reader already knows. Every repo-scoped line
+    /// carries `repo=/Users/me/work/travsr`, which is thirty-odd characters of a
+    /// fact established by the directory the command was run in, repeated on
+    /// every line. `--global` leaves this unset, because there the repo is the
+    /// one thing that distinguishes one line from the next.
+    repo: Option<PathBuf>,
 }
 
 impl LogRenderer {
@@ -1262,7 +1279,15 @@ impl LogRenderer {
         Self {
             last_date: None,
             utc,
+            repo: None,
         }
+    }
+
+    /// Treat this log as belonging to a single repo, whose name and paths can
+    /// therefore be left implicit.
+    fn for_repo(mut self, repo: PathBuf) -> Self {
+        self.repo = Some(repo);
+        self
     }
 
     /// Local (or UTC) date and time-of-day for an RFC3339 timestamp.
@@ -1302,7 +1327,7 @@ impl LogRenderer {
     fn one_line(&self, line: &LogLine) -> String {
         if let LogLine::Json(v) = line {
             if let Some((_, time)) = line.timestamp().and_then(|ts| self.split_stamp(ts)) {
-                return Self::columns(v, &time);
+                return self.columns(v, &time);
             }
         }
         // Text: already human-readable, and reformatting it would mean parsing a
@@ -1313,8 +1338,16 @@ impl LogRenderer {
         }
     }
 
-    fn columns(v: &serde_json::Value, time: &str) -> String {
-        let level = v.get("level").and_then(|l| l.as_str()).unwrap_or("?");
+    fn columns(&self, v: &serde_json::Value, time: &str) -> String {
+        // INFO is left blank. It is the level of nine lines in ten, so printing
+        // it is four characters of "nothing unusual happened" per line, and it
+        // buries the two lines that do say something. WARN and ERROR keep their
+        // label and now stand out from a column of blanks. `--json` still
+        // carries the level on every entry for anything that filters on it.
+        let level = match v.get("level").and_then(|l| l.as_str()) {
+            Some("INFO") | None => "",
+            Some(other) => other,
+        };
         let target = v
             .get("target")
             .and_then(|t| t.as_str())
@@ -1329,7 +1362,8 @@ impl LogRenderer {
             .map(|f| {
                 f.iter()
                     .filter(|(k, _)| k.as_str() != "message")
-                    .map(|(k, val)| format!("{k}={}", render_value(val)))
+                    .filter(|(k, val)| !self.is_redundant(k, val))
+                    .map(|(k, val)| format!("{k}={}", self.shorten(val)))
                     .collect()
             })
             .unwrap_or_default();
@@ -1340,6 +1374,32 @@ impl LogRenderer {
             line.push_str(&rest.join(" "));
         }
         line
+    }
+
+    /// Whether a field says something the reader established by running the
+    /// command where they ran it.
+    fn is_redundant(&self, key: &str, value: &serde_json::Value) -> bool {
+        let Some(repo) = &self.repo else {
+            return false;
+        };
+        key == "repo" && value.as_str().is_some_and(|v| Path::new(v) == repo)
+    }
+
+    /// Render a value, with paths inside the repo shortened to what varies.
+    ///
+    /// `sock=/Users/me/work/travsr/.travsr/daemon-1c0d66a3.sock` is seventy
+    /// characters to say which socket, of which only the last component differs
+    /// between two of them.
+    fn shorten(&self, value: &serde_json::Value) -> String {
+        if let (Some(repo), Some(s)) = (&self.repo, value.as_str()) {
+            if let Ok(rel) = Path::new(s).strip_prefix(repo) {
+                let shown = rel.to_string_lossy();
+                if !shown.is_empty() {
+                    return shown.into_owned();
+                }
+            }
+        }
+        render_value(value)
     }
 }
 
@@ -1426,10 +1486,14 @@ fn daemon_logs(
     mut filter: LineFilter,
     raw: bool,
     utc: bool,
+    repo: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
-    let mut render = LogRenderer::new(utc);
+    let mut render = match repo {
+        Some(r) => LogRenderer::new(utc).for_repo(r),
+        None => LogRenderer::new(utc),
+    };
     let mut tail = travsr_daemon::logfile::LogTail::new(dir);
 
     if tail.path().is_none() {
@@ -1834,9 +1898,12 @@ mod daemon_log_tests {
         // consistent ordering is what matters when scanning a column of similar
         // entries. Source order would mean enabling `preserve_order`, which
         // changes key ordering for every JSON value in the workspace.
+        // INFO renders as a blank label: it is the level of nine lines in ten,
+        // so printing it says "nothing unusual" over and over and buries the
+        // lines that do say something.
         assert_eq!(
             out[1],
-            "14:52:18  INFO   daemon       embed_text updated elapsed_ms=34 written=130"
+            "14:52:18         daemon       embed_text updated elapsed_ms=34 written=130"
         );
 
         // Same day: no second separator.
@@ -1905,6 +1972,57 @@ mod daemon_log_tests {
             v.get("unparsed").is_none(),
             "a native line must not be tagged as recovered"
         );
+    }
+
+    /// What the reader already knows is not worth a column. Every repo-scoped
+    /// line carried `repo=/Users/me/work/travsr`, thirty-odd characters of a
+    /// fact established by the directory the command ran in, and `sock=` spelled
+    /// out an absolute path where only the last component differs.
+    #[test]
+    fn a_single_repo_log_drops_the_repo_it_obviously_belongs_to() {
+        let repo = std::path::PathBuf::from("/w/travsr");
+        let mut r = LogRenderer::new(true).for_repo(repo);
+
+        let out = r.render(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"INFO","fields":{"message":"control socket bound","repo":"/w/travsr","sock":"/w/travsr/.travsr/daemon-1c0d66a3.sock","transport":"unix"},"target":"travsr_daemon"}"#,
+        ));
+        let line = out.last().unwrap();
+        assert!(
+            !line.contains("repo="),
+            "the repo the reader is standing in is not news: {line}"
+        );
+        assert!(
+            line.contains("sock=.travsr/daemon-1c0d66a3.sock"),
+            "a path under the repo shortens to what varies: {line}"
+        );
+        assert!(line.contains("transport=unix"), "other fields survive");
+    }
+
+    /// In `--global` the repo is the one thing that tells two lines apart, so it
+    /// has to stay.
+    #[test]
+    fn a_global_log_keeps_the_repo_field() {
+        let mut r = LogRenderer::new(true);
+        let out = r.render(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"INFO","fields":{"message":"served","repo":"/w/travsr"},"target":"travsr_mcp"}"#,
+        ));
+        assert!(out.last().unwrap().contains("repo=/w/travsr"));
+    }
+
+    /// Only the repo's *own* paths are shortened. A path elsewhere on disk is
+    /// still the whole answer to where it is.
+    #[test]
+    fn a_path_outside_the_repo_is_left_whole() {
+        let mut r = LogRenderer::new(true).for_repo(std::path::PathBuf::from("/w/travsr"));
+        let out = r.render(&LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"WARN","fields":{"message":"tool missing","path":"/opt/homebrew/bin/rust-analyzer"},"target":"travsr_indexer"}"#,
+        ));
+        let line = out.last().unwrap();
+        assert!(
+            line.contains("path=/opt/homebrew/bin/rust-analyzer"),
+            "{line}"
+        );
+        assert!(line.contains("WARN"), "a warning keeps its label: {line}");
     }
 
     /// A torn write is not JSON, and neither is a pre-JSON rotation. Neither may

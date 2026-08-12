@@ -4745,10 +4745,18 @@ impl SqliteStore {
             return Ok(());
         }
 
-        tracing::info!(
-            missing = backfill_counts(node_count, words_map_count).0,
-            stale = backfill_counts(node_count, words_map_count).1,
-            "#478: backfilling nodes_fts_words + is_noise for unindexed nodes"
+        // DEBUG, not INFO. The gate above is a count comparison, which is
+        // deliberately conservative: stale map rows left by a delete make the
+        // counts differ forever, so this pass runs on every startup and indexes
+        // nothing. It cannot be gated on `missing == 0` instead — with stale
+        // rows present that figure can read zero while nodes really are
+        // unindexed, and the `NOT IN` query below is the only reliable answer.
+        // So the pass stays, and only its *outcome* is announced.
+        let (missing, stale) = backfill_counts(node_count, words_map_count);
+        tracing::debug!(
+            missing,
+            stale,
+            "#478: checking nodes_fts_words + is_noise for unindexed nodes"
         );
 
         let nodes: Vec<Node> = {
@@ -4806,10 +4814,15 @@ impl SqliteStore {
         tx.commit()
             .context("committing FTS word backfill transaction")?;
 
-        tracing::info!(
-            indexed = nodes.len(),
-            "#478: nodes_fts_words + is_noise backfill complete"
-        );
+        // Only a pass that did something is worth a line in the log.
+        if nodes.is_empty() {
+            tracing::debug!("#478: nodes_fts_words + is_noise already complete");
+        } else {
+            tracing::info!(
+                indexed = nodes.len(),
+                "#478: nodes_fts_words + is_noise backfill complete"
+            );
+        }
         Ok(())
     }
 
