@@ -6,6 +6,36 @@
 //! `restart` told users to "see .travsr/daemon.log" — a path that has never
 //! existed. #347 and #348 were both specified against that same absent path.
 //!
+//! ## `event` keys
+//!
+//! The file is JSON lines, and a machine reading it needs something stable to
+//! select on. `fields.message` is prose: rewording it for clarity silently
+//! breaks every query and dashboard built on it, which is not a property a
+//! contract should have. So each lifecycle and outcome event carries an `event`
+//! key, dotted and lowercase, and *that* is the thing to match:
+//!
+//! ```text
+//! jq 'select(.fields.event == "phase_b.complete")'   # stable
+//! jq 'select(.fields.message == "background phase B refresh complete")'   # not
+//! ```
+//!
+//! The keys, which are the part callers may rely on:
+//!
+//! ```text
+//! daemon.session.start     daemon.ready          daemon.socket.bound
+//! daemon.session.stop      head.drift.detected   head.reconcile.pruned
+//! head.reconcile.complete  phase_b.start         phase_b.indexed
+//! phase_b.complete         kcore.updated         embed.text.updated
+//! embed.text.fts_backfill  store.fts_words.backfill
+//! lsif.spawn               lsif.complete         adr017.fuzz_target.missing
+//! ```
+//!
+//! Deliberately not every log site. A key is a promise to keep it spelled the
+//! same way, so it is worth adding where something *happened* that a reader
+//! would count, alert on, or chart, and not worth adding to the running
+//! commentary in between. When adding a lifecycle event, add its key here too:
+//! this list is the only place the set is visible at once.
+//!
 //! Rotation is the reason a reader cannot simply hold an open descriptor. At
 //! midnight the appender moves to a new file and the old one stops growing;
 //! a naive `tail -f` keeps polling a file nothing will ever write to again and

@@ -676,9 +676,20 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     let missed = fillable.saturating_sub(written);
     let elapsed_ms = started.elapsed().as_millis();
     if missed > 0 {
-        tracing::info!(written, missed, elapsed_ms, "embed_text updated");
+        tracing::info!(
+            event = "embed.text.updated",
+            written,
+            missed,
+            elapsed_ms,
+            "embed_text updated"
+        );
     } else {
-        tracing::info!(written, elapsed_ms, "embed_text updated");
+        tracing::info!(
+            event = "embed.text.updated",
+            written,
+            elapsed_ms,
+            "embed_text updated"
+        );
     }
 }
 
@@ -794,7 +805,11 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
     // before the `embed_text`-in-FTS change landed. Idempotent (meta-gated), so it
     // is a cheap no-op after the first run and preserves the always-fresh invariant.
     match store.backfill_fts_embed_text() {
-        Ok(n) if n > 0 => tracing::info!(nodes = n, "backfilled embed_text into FTS content"),
+        Ok(n) if n > 0 => tracing::info!(
+            event = "embed.text.fts_backfill",
+            nodes = n,
+            "backfilled embed_text into FTS content"
+        ),
         Ok(_) => {}
         Err(e) => tracing::warn!("embed-text FTS backfill failed: {e}"),
     }
@@ -2335,6 +2350,7 @@ fn write_phase_b_results(
     }
     if pb_node_count > 0 || pb_edge_count > 0 {
         tracing::info!(
+            event = "phase_b.indexed",
             nodes = pb_node_count,
             structural_edges = pb_edge_count,
             "phase B indexing complete"
@@ -2883,7 +2899,11 @@ fn run_background_phase_b_inner(
         (corpus, last)
     };
 
-    tracing::info!(commit=%target_sha, "background phase B refresh starting");
+    tracing::info!(
+        event = "phase_b.start",
+        commit = %target_sha,
+        "background phase B refresh starting"
+    );
 
     // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
     // Collect edges into a Vec first; write them under the store lock below.
@@ -2985,6 +3005,7 @@ fn run_background_phase_b_inner(
 
     tracing::info!(
         commit = %target_sha,
+        event = "phase_b.complete",
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
         crashed = report.crashed.len(),
@@ -3004,7 +3025,10 @@ fn run_background_phase_b_inner(
                 if let Err(e) = s.write_shell_numbers(&pairs) {
                     tracing::warn!("kcore: failed to update shell numbers after phase B: {e}");
                 } else {
-                    tracing::info!("kcore: shell numbers updated after phase B");
+                    tracing::info!(
+                        event = "kcore.updated",
+                        "kcore: shell numbers updated after phase B"
+                    );
                 }
             }
             Err(e) => tracing::warn!("kcore: computation failed after phase B: {e}"),
@@ -3426,6 +3450,7 @@ fn reconcile_head_drift(
         return false;
     }
     tracing::info!(
+        event = "head.drift.detected",
         stored = %stored,
         head = %head,
         "last_commit does not match live HEAD (history moved during daemon downtime) — reconciling"
@@ -3480,6 +3505,7 @@ fn reconcile_head_drift(
              deleted nothing; run `travsr fsck --fix --force` to override"
         ),
         Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
+            event = "head.reconcile.pruned",
             pruned = report.ghost_paths.len(),
             "head reconcile: pruned drift-deleted ghost files"
         ),
@@ -3497,7 +3523,12 @@ fn reconcile_head_drift(
     // Phase A is now aligned with HEAD; the RefCall edge set is not. Arm the
     // debounced whole-project Phase B rebuild, same as the hook path.
     phase_b_scheduler.mark_dirty();
-    tracing::info!(head = %head, files = paths.len(), "head reconcile complete — Phase B rebuild armed");
+    tracing::info!(
+        event = "head.reconcile.complete",
+        head = %head,
+        files = paths.len(),
+        "head reconcile complete — Phase B rebuild armed"
+    );
     true
 }
 
@@ -7587,15 +7618,29 @@ impl Daemon {
         let embed_phase2_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
-        tracing::info!(repo = %repo_root.display(), "travsr daemon started");
+        tracing::info!(
+            event = "daemon.ready",
+            repo = %repo_root.display(),
+            "travsr daemon started"
+        );
         #[cfg(unix)]
-        tracing::info!(transport = "unix", sock = %sock_path.display(), "control socket bound");
+        tracing::info!(
+            event = "daemon.socket.bound",
+            transport = "unix",
+            sock = %sock_path.display(),
+            "control socket bound"
+        );
 
         // Windows Named Pipe setup — resolved address for use in the accept task.
         #[cfg(windows)]
         let pipe_name = travsr_ipc::ControlAddr::for_repo(&repo_root).pipe_name();
         #[cfg(windows)]
-        tracing::info!(transport = "named_pipe", pipe = %pipe_name, "control pipe bound");
+        tracing::info!(
+            event = "daemon.socket.bound",
+            transport = "named_pipe",
+            pipe = %pipe_name,
+            "control pipe bound"
+        );
 
         let repo_root_arc = Arc::new(repo_root.clone());
         // Notify used for socket-initiated shutdown signal.
@@ -8020,7 +8065,7 @@ impl Daemon {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
         drop(lock_file);
-        tracing::info!("travsr daemon stopped");
+        tracing::info!(event = "daemon.session.stop", "travsr daemon stopped");
         Ok(())
     }
 }

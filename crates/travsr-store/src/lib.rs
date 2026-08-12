@@ -4819,6 +4819,7 @@ impl SqliteStore {
             tracing::debug!("#478: nodes_fts_words + is_noise already complete");
         } else {
             tracing::info!(
+                event = "store.fts_words.backfill",
                 indexed = nodes.len(),
                 "#478: nodes_fts_words + is_noise backfill complete"
             );
