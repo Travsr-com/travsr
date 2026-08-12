@@ -837,7 +837,9 @@ fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> s
         .map(|p| serde_json::json!(sanitize_log_value(p, MAX_FIELD_BYTES)))
         .collect();
     let parity_ok = report.lexical_index_parity_issue.is_none();
-    let healthy = report.orphan_edges_detected == 0 && ghost_count == 0 && parity_ok;
+    let self_ref_count = report.self_ref_call_edges_detected;
+    let healthy =
+        report.orphan_edges_detected == 0 && ghost_count == 0 && parity_ok && self_ref_count == 0;
 
     let mut payload = serde_json::json!({
         "repo": repo,
@@ -846,6 +848,7 @@ fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> s
         "edge_count": report.edge_count,
         "ghost_paths": { "count": ghost_count, "sample": sample },
         "orphan_edges": report.orphan_edges_detected,
+        "self_ref_call_edges": self_ref_count,
         "lexical_index_parity": {
             "ok": parity_ok,
             "detail": report
@@ -856,13 +859,16 @@ fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> s
     });
 
     if !healthy {
-        // Priority matches the daemon's own fsck wording: ghosts/orphans are
+        // Priority matches the daemon's own fsck wording (fsck.rs): ghosts,
+        // orphan edges, and self-referential ref/call edges (#650) are all
         // fixed by `--fix`; a lexical-index parity gap needs a full re-index.
-        let recommendation = if ghost_count > 0 || report.orphan_edges_detected > 0 {
-            "run `travsr fsck --fix` to clean up ghost paths / orphan edges"
-        } else {
-            "run `travsr init` to rebuild the lexical index"
-        };
+        let recommendation =
+            if ghost_count > 0 || report.orphan_edges_detected > 0 || self_ref_count > 0 {
+                "run `travsr fsck --fix` to clean up ghost paths / orphan edges / \
+             self-referential ref/call edges (#650)"
+            } else {
+                "run `travsr init` to rebuild the lexical index"
+            };
         payload["recommendation"] = serde_json::json!(recommendation);
     }
     payload
@@ -1308,6 +1314,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("travsr fsck --fix"));
+    }
+
+    /// AC4 gap: `healthy` must be `false` whenever ANY check fails, including
+    /// self-referential ref/call edges (`report.self_ref_call_edges_detected`),
+    /// which `travsr fsck` already treats as a reportable defect (fsck.rs).
+    /// A DB with nothing else wrong but a self-ref edge must not report
+    /// `healthy: true`.
+    #[test]
+    fn graph_health_detects_self_ref_call_edge_and_reports_unhealthy() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        use travsr_store::Store as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node = Node::new(
+            VName::new("corpus", "main", "src/a.ts", "typescript", "fn:a"),
+            "function",
+        );
+        let id = store.put_node(&node).unwrap();
+        store
+            .put_edge(&Edge::new(id, id, EdgeKind::RefCall))
+            .unwrap();
+
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["healthy"], false, "got: {payload}");
+        assert_eq!(payload["self_ref_call_edges"], 1, "got: {payload}");
+        assert!(
+            payload["recommendation"]
+                .as_str()
+                .unwrap()
+                .contains("fsck --fix"),
+            "got: {payload}"
+        );
     }
 
     #[test]
