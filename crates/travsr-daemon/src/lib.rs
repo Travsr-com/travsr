@@ -784,15 +784,8 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
         .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("cannot derive repo_root from db_path"))?;
     // Use the PER-REPO configured model, not the global active.
-    // If this repo has not been configured via `travsr embed init`, skip silently.
-    let active_id = match travsr_plugin_host::repo_backend_id(repo_root) {
-        Some(id) => id,
-        None => return Ok(false),
-    };
-    let backend = match travsr_plugin_host::lookup_embed_backend(&active_id) {
-        Some(b) => b,
-        None => return Ok(false),
-    };
+    let configured = travsr_plugin_host::repo_backend_id(repo_root)
+        .and_then(|id| travsr_plugin_host::lookup_embed_backend(&id).map(|b| (id, b)));
 
     let mut store = travsr_store::SqliteStore::open(db_path)
         .context("opening store for embed_text regeneration")?;
@@ -805,6 +798,22 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
         Ok(_) => {}
         Err(e) => tracing::warn!("embed-text FTS backfill failed: {e}"),
     }
+
+    // No model configured for this repo. Only the *tier* decision below needs
+    // one; generating the text does not, and returning here made this a silent
+    // no-op on every path that goes through it. `travsr embed reindex` printed
+    // "Preparing embed text for ..." and prepared nothing, and `travsr init`
+    // left the same gap. The daemon's own reindex path never had it: it calls
+    // `update_embed_texts` unconditionally with the same `Compact` fallback, so
+    // the two disagreed about whether this work needs a model at all.
+    //
+    // Text with no model still earns its keep: RFC-022 D1 widens FTS content
+    // with `embed_text`, so it feeds lexical retrieval whether or not a vector
+    // ever gets built from it.
+    let Some((active_id, backend)) = configured else {
+        update_embed_texts(&mut store, repo_root, EmbedRichness::Compact);
+        return Ok(false);
+    };
 
     let stored_id = store.get_meta("embed_text_model_id").ok().flatten();
     if stored_id.as_deref() == Some(active_id.as_str()) {
@@ -3264,7 +3273,9 @@ pub fn reindex_files(
         }
 
         // Populate embed_text for newly-indexed nodes (commit-hook path).
-        // Only runs when a model is configured for this repo.
+        // Runs whether or not a model is configured: `richness_from_meta` falls
+        // back to `Compact`, and the text feeds FTS content as well as any
+        // vector built from it later.
         let richness = richness_from_meta(repo_root);
         update_embed_texts(store, repo_root, richness);
     }
@@ -6334,6 +6345,64 @@ mod tests {
         maybe_spawn_embed(tmp.path(), &store, &flag);
         // No spawn attempted; flag must stay false
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// The silent no-op. With no `.travsr/embed.toml`, this returned before
+    /// touching the store, so `travsr embed reindex` printed "Preparing embed
+    /// text for ..." and prepared nothing, and `travsr init` had the same gap.
+    /// Only the model-*tier* decision needs a configured model; generating the
+    /// text does not, which is why the daemon's own reindex path had always run
+    /// it unconditionally. The two paths disagreed.
+    #[test]
+    fn embed_text_is_generated_with_no_model_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn handler(a: u32) -> u32 { a }\n",
+        )
+        .unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let node = {
+            let mut store = setup_embed_store(tmp.path());
+            let node = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.rs", "rust", "fn:handler"),
+                "function",
+            )
+            .with_line(1)
+            .with_end_line(1);
+            store.put_node(&node).unwrap();
+            assert!(
+                !store.nodes_missing_embed_text().unwrap().is_empty(),
+                "precondition: the node starts with no embed_text"
+            );
+            node
+        };
+
+        assert!(
+            travsr_plugin_host::repo_backend_id(tmp.path()).is_none(),
+            "precondition: this repo has no embed model configured"
+        );
+
+        let regenerated = regenerate_embed_texts_if_stale(&db_path).unwrap();
+        assert!(
+            !regenerated,
+            "no model means no tier change, so nothing was *re*generated"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let text = store
+            .get_nodes_embed_text(&[node.id])
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|(_, t)| t);
+        assert_eq!(
+            text.as_deref(),
+            Some("function: fn:handler | module: src/lib.rs | params: a: u32 | returns: u32"),
+            "the text is generated at the Compact fallback, not skipped"
+        );
     }
 
     /// #526: hook injection must prefer a repo's own `.travsr/embed.toml`
