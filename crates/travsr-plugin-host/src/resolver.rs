@@ -211,6 +211,42 @@ impl CatalogResolver {
 
             tracing::debug!(lang, program = %program, "CatalogResolver: binary found");
 
+            // #573: since #502 the PATHEXT-aware probe can resolve a provider
+            // that exists only as an npm `.cmd` shim. The AppContainer spawn
+            // runs PE images only (`CreateProcessW`, no `cmd.exe /c`), so a
+            // shim handed to it fails and the language reports as crashed.
+            // Resolve the shim to the packaged native binary npm installs next
+            // to it; when there is none, skip the provider with an actionable
+            // hint instead of spawning a guaranteed failure.
+            let program = match resolve_npm_cmd_shim(
+                std::path::Path::new(&program),
+                catalog_entry.npm_package,
+            ) {
+                ShimResolution::NotAShim => program,
+                ShimResolution::Exe(exe) => {
+                    tracing::info!(
+                        lang,
+                        shim = %program,
+                        exe = %exe.display(),
+                        "Phase B catalog: npm shim resolved to its packaged native binary (#573)"
+                    );
+                    exe.to_string_lossy().into_owned()
+                }
+                ShimResolution::Unresolvable => {
+                    tracing::warn!(
+                        lang,
+                        "Phase B catalog: provider '{}' for '{}' is installed as an npm \
+                         shim ('{}'), which the Windows sandbox cannot execute — install \
+                         the native binary via `travsr lang install {}`",
+                        binary_name,
+                        lang,
+                        program,
+                        lang
+                    );
+                    continue;
+                }
+            };
+
             // Determine sandbox policy.
             let policy = match catalog_entry.sandbox {
                 SandboxRequirement::Standard => SandboxPolicy::Standard,
@@ -386,6 +422,106 @@ fn which_binary(name: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+// ── npm .cmd shim resolution (#573) ──────────────────────────────────────────
+
+/// How a resolved provider path relates to the Windows npm-shim problem (#573).
+#[derive(Debug)]
+enum ShimResolution {
+    /// Not a `.cmd`/`.bat` shim — spawnable as-is.
+    NotAShim,
+    /// The shim's packaged native binary, spawnable by the AppContainer.
+    Exe(std::path::PathBuf),
+    /// A shim with no packaged native binary next to it. `CreateProcessW`
+    /// cannot execute batch scripts, so handing this to the sandbox spawn is a
+    /// guaranteed crash — the caller should skip it with an actionable hint.
+    Unresolvable,
+}
+
+/// Resolve an npm `.cmd`/`.bat` shim to the real native binary it wraps.
+///
+/// Two strategies, mirroring the vscode extension's `resolveNpmShimExe`
+/// (installer.ts #486), which does the same for travsr's own npm package:
+///
+/// 1. npm's cmd-shim embeds its target as a `%~dp0`- or `%dp0%`-relative
+///    quoted path. When that target is an existing PE image, spawn it
+///    directly.
+/// 2. House packaging convention: the native binary ships at
+///    `<shim dir>/node_modules/<npm package>/bin/<binary>.exe`.
+///
+/// Deliberately does NOT fall back to running JS entry points via `node.exe`:
+/// a provider whose only artifact is a script has no PE for the AppContainer
+/// to execute, and speculatively spawning node inside the sandbox is exactly
+/// the kind of silent behavior change ADR-017 gates. Those providers surface
+/// the actionable skip instead.
+fn resolve_npm_cmd_shim(program: &std::path::Path, npm_package: Option<&str>) -> ShimResolution {
+    let is_shim = program
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if !is_shim {
+        return ShimResolution::NotAShim;
+    }
+    let Some(dir) = program.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return ShimResolution::Unresolvable;
+    };
+
+    // Strategy 1: the target path embedded in the shim script itself.
+    if let Ok(text) = std::fs::read_to_string(program) {
+        for token in ["%~dp0", "%dp0%"] {
+            if let Some(exe) = embedded_shim_target(&text, token, dir) {
+                return ShimResolution::Exe(exe);
+            }
+        }
+    }
+
+    // Strategy 2: the packaging convention for travsr npm packages.
+    if let (Some(pkg), Some(stem)) = (npm_package, program.file_stem()) {
+        let mut candidate = dir.join("node_modules");
+        for seg in pkg.split('/') {
+            candidate.push(seg);
+        }
+        candidate.push("bin");
+        let mut name = stem.to_os_string();
+        name.push(".exe");
+        candidate.push(name);
+        if candidate.is_file() {
+            return ShimResolution::Exe(candidate);
+        }
+    }
+
+    ShimResolution::Unresolvable
+}
+
+/// Extract the first existing PE image referenced in `text` as a quoted
+/// `<token>`-relative path (npm cmd-shims quote their targets, so the path
+/// runs from the token to the closing quote or end of line).
+fn embedded_shim_target(
+    text: &str,
+    token: &str,
+    dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let mut search_from = 0;
+    while let Some(pos) = text[search_from..].find(token) {
+        let rel_start = search_from + pos + token.len();
+        let rest = &text[rel_start..];
+        let rel_end = rest.find(['"', '\r', '\n']).unwrap_or(rest.len());
+        let rel = rest[..rel_end].trim_start_matches(['\\', '/']);
+        if !rel.is_empty() {
+            let candidate = dir.join(rel);
+            let is_pe = candidate
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe") || e.eq_ignore_ascii_case("com"));
+            if is_pe && candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        search_from = rel_start + rel_end.max(1);
+        if search_from >= text.len() {
+            break;
+        }
+    }
+    None
+}
+
 // ── lang.toml approval reader ─────────────────────────────────────────────────
 //
 // We need the PSE approval fields (permitted_hosts, approved_by, reason,
@@ -550,5 +686,101 @@ mod tests {
     fn which_binary_returns_none_for_nonexistent() {
         let result = which_binary("__travsr_nonexistent_binary_xyz__");
         assert!(result.is_none());
+    }
+
+    // ── npm .cmd shim resolution (#573) ──────────────────────────────────────
+    // Pure path/text logic — runs on every platform even though only the
+    // Windows PATHEXT probe can produce a .cmd hit in production.
+
+    #[test]
+    fn non_shim_paths_pass_through_untouched() {
+        for name in ["travsr-lang-go.exe", "travsr-lang-go", "scip-go.EXE"] {
+            let p = std::path::Path::new(name);
+            assert!(
+                matches!(
+                    resolve_npm_cmd_shim(p, Some("@travsr-plugin/go")),
+                    ShimResolution::NotAShim
+                ),
+                "{name} is not a shim"
+            );
+        }
+    }
+
+    #[test]
+    fn shim_with_embedded_dp0_exe_target_resolves_to_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_rel = std::path::Path::new("node_modules")
+            .join("@travsr-plugin")
+            .join("go")
+            .join("bin")
+            .join("real-provider.exe");
+        let target = dir.path().join(&target_rel);
+        std::fs::create_dir_all(target.parent().unwrap()).expect("mk target dir");
+        std::fs::write(&target, b"MZ").expect("write target");
+
+        // The two generations of npm's cmd-shim template.
+        for token in ["%~dp0", "%dp0%"] {
+            let shim = dir.path().join("travsr-lang-go.cmd");
+            std::fs::write(
+                &shim,
+                format!(
+                    "@ECHO off\r\nSETLOCAL\r\n\"{token}\\{}\"   %*\r\n",
+                    target_rel.display()
+                ),
+            )
+            .expect("write shim");
+            match resolve_npm_cmd_shim(&shim, None) {
+                ShimResolution::Exe(exe) => assert_eq!(exe, target, "token {token}"),
+                other => panic!("token {token}: expected Exe, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn shim_ignores_non_pe_targets_like_node_scripts() {
+        // A JS-only provider: the shim points node at a script. There is no PE
+        // to spawn, so this must be Unresolvable — never "run node.exe" (see
+        // resolve_npm_cmd_shim docs) and never the raw shim.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("cli.js");
+        std::fs::write(&script, b"//").expect("write script");
+        let shim = dir.path().join("travsr-lang-go.cmd");
+        std::fs::write(&shim, "@ECHO off\r\nnode \"%~dp0\\cli.js\" %*\r\n").expect("write shim");
+        assert!(matches!(
+            resolve_npm_cmd_shim(&shim, None),
+            ShimResolution::Unresolvable
+        ));
+    }
+
+    #[test]
+    fn unparseable_shim_falls_back_to_the_packaging_convention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir
+            .path()
+            .join("node_modules")
+            .join("@travsr-plugin")
+            .join("go")
+            .join("bin")
+            .join("travsr-lang-go.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).expect("mk bin dir");
+        std::fs::write(&exe, b"MZ").expect("write exe");
+        let shim = dir.path().join("travsr-lang-go.cmd");
+        std::fs::write(&shim, "@ECHO off\r\nrem no dp0 reference here\r\n").expect("write shim");
+
+        match resolve_npm_cmd_shim(&shim, Some("@travsr-plugin/go")) {
+            ShimResolution::Exe(found) => assert_eq!(found, exe),
+            other => panic!("expected the conventional sibling exe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shim_with_no_native_binary_is_unresolvable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("travsr-lang-go.bat");
+        std::fs::write(&shim, "@ECHO off\r\n").expect("write shim");
+        assert!(matches!(
+            resolve_npm_cmd_shim(&shim, Some("@travsr-plugin/go")),
+            ShimResolution::Unresolvable
+        ));
     }
 }

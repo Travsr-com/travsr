@@ -149,15 +149,77 @@ fn sandbox_unavailable_returns_err_not_fallback_command() {
 /// (TRAVSR_LANG_TOML, PATH) which must not interleave.
 static TRUST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// How the fake `travsr-lang-go` provider is laid out on the temp PATH dir.
+enum ProviderLayout {
+    /// A directly spawnable stub: `.exe` on Windows (any bytes — a spawn
+    /// failure still lands in `crashed`, proving the spawn path ran), an
+    /// executable shell script elsewhere.
+    NativeStub,
+    /// Windows npm layout: only a `.cmd` shim, no PE anywhere (#573).
+    #[cfg(windows)]
+    CmdShimOnly,
+    /// Windows npm layout: a `.cmd` shim whose packaged native binary sits at
+    /// the conventional `node_modules/<pkg>/bin/<name>.exe` (#573).
+    #[cfg(windows)]
+    CmdShimWithPackagedExe,
+}
+
+/// Materialise `layout` inside `bin_dir`.
+fn write_fake_provider(bin_dir: &std::path::Path, layout: &ProviderLayout) {
+    use std::io::Write as _;
+    match layout {
+        ProviderLayout::NativeStub => {
+            #[cfg(windows)]
+            let fake = bin_dir.join("travsr-lang-go.exe");
+            #[cfg(not(windows))]
+            let fake = bin_dir.join("travsr-lang-go");
+            let mut f = std::fs::File::create(&fake).expect("create fake provider");
+            #[cfg(windows)]
+            f.write_all(b"MZ not a real PE").expect("write");
+            #[cfg(not(windows))]
+            f.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod fake provider");
+            }
+        }
+        #[cfg(windows)]
+        ProviderLayout::CmdShimOnly => {
+            std::fs::write(
+                bin_dir.join("travsr-lang-go.cmd"),
+                "@ECHO off\r\nnode \"%~dp0\\cli.js\" %*\r\n",
+            )
+            .expect("write shim");
+        }
+        #[cfg(windows)]
+        ProviderLayout::CmdShimWithPackagedExe => {
+            std::fs::write(
+                bin_dir.join("travsr-lang-go.cmd"),
+                "@ECHO off\r\nrem opaque shim body\r\n",
+            )
+            .expect("write shim");
+            let exe = bin_dir
+                .join("node_modules")
+                .join("@travsr-plugin")
+                .join("go")
+                .join("bin")
+                .join("travsr-lang-go.exe");
+            std::fs::create_dir_all(exe.parent().unwrap()).expect("mk packaged bin dir");
+            std::fs::write(&exe, b"MZ not a real PE").expect("write packaged exe");
+        }
+    }
+}
+
 /// Drive `invoke_phase_b_all` for a registered external language ("go", fake
-/// `travsr-lang-go` on PATH) under the given `trusted_corpora` list, and
-/// return the outcome. Restores env before returning.
-fn run_phase_b_with_trust(
+/// `travsr-lang-go` on PATH per `layout`) under the given `trusted_corpora`
+/// list, and return the outcome. Restores env before returning.
+fn run_phase_b_with_provider(
     corpus: &str,
     trusted_corpora: &[&str],
+    layout: ProviderLayout,
 ) -> travsr_plugin_host::PhaseBOutcome {
-    use std::io::Write as _;
-
     let _guard = TRUST_ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -177,28 +239,12 @@ fn run_phase_b_with_trust(
     .expect("write lang.toml");
 
     // Fake provider binary so the CatalogResolver surfaces "go" — without one
-    // the language never reaches the spawn loop and the gate would be
-    // untestable. The binary is a stub: if it is ever executed the handshake
-    // fails and the language lands in `crashed`, which is itself proof the
-    // spawn path was reached.
+    // the language never reaches the spawn loop and the gates would be
+    // untestable. The stub is never a working plugin: if it is ever spawned
+    // the handshake fails and the language lands in `crashed`, which is
+    // itself proof the spawn path was reached.
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
-    #[cfg(windows)]
-    let fake = bin_dir.path().join("travsr-lang-go.bat");
-    #[cfg(not(windows))]
-    let fake = bin_dir.path().join("travsr-lang-go");
-    {
-        let mut f = std::fs::File::create(&fake).expect("create fake provider");
-        #[cfg(windows)]
-        f.write_all(b"@echo off\r\nexit /b 0\r\n").expect("write");
-        #[cfg(not(windows))]
-        f.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake provider");
-    }
+    write_fake_provider(bin_dir.path(), &layout);
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<std::path::PathBuf> = vec![bin_dir.path().to_path_buf()];
@@ -233,9 +279,10 @@ fn run_phase_b_with_trust(
 fn trust_gate_blocks_untrusted_corpus() {
     // A trust grant exists — but for a DIFFERENT corpus. The gate must be
     // per-corpus, not "any grant anywhere unlocks Phase B".
-    let outcome = run_phase_b_with_trust(
+    let outcome = run_phase_b_with_provider(
         "github.com/acme/untrusted-repo",
         &["github.com/acme/some-other-repo"],
+        ProviderLayout::NativeStub,
     );
     assert_eq!(
         outcome.skipped_untrusted_corpus,
@@ -258,7 +305,11 @@ fn trust_gate_blocks_untrusted_corpus() {
 
 #[test]
 fn trust_gate_allows_explicitly_trusted_corpus() {
-    let outcome = run_phase_b_with_trust("github.com/acme/my-repo", &["github.com/acme/my-repo"]);
+    let outcome = run_phase_b_with_provider(
+        "github.com/acme/my-repo",
+        &["github.com/acme/my-repo"],
+        ProviderLayout::NativeStub,
+    );
     assert!(
         outcome.skipped_untrusted_corpus.is_empty(),
         "trusted corpus must pass the gate: {:?}",
@@ -277,6 +328,61 @@ fn trust_gate_allows_explicitly_trusted_corpus() {
         "trusted corpus must reach the spawn stage; outcome: ran={:?} crashed={:?} \
          version_mismatch={:?} skipped_no_analyzer={:?}",
         outcome.ran, outcome.crashed, outcome.version_mismatch, outcome.skipped_no_analyzer
+    );
+}
+
+// 3b. npm .cmd shims — the AppContainer spawn runs PE images only (#573).
+
+/// A provider installed only as an npm `.cmd` shim must be skipped at
+/// resolution (with the actionable hint logged by the resolver — the
+/// classification itself is unit-tested in resolver.rs) and never handed to
+/// the sandbox spawn, where it used to surface as a bare CreateProcessW crash
+/// recorded against the language.
+#[cfg(windows)]
+#[test]
+fn cmd_shim_only_provider_is_skipped_not_crashed() {
+    let outcome = run_phase_b_with_provider(
+        "github.com/acme/my-repo",
+        &["github.com/acme/my-repo"], // trusted, so the shim is the only gate
+        ProviderLayout::CmdShimOnly,
+    );
+    assert!(
+        outcome.crashed.is_empty(),
+        "a .cmd-only provider must never reach the spawn (a crash entry means \
+         the doomed shim was spawned): {:?}",
+        outcome.crashed
+    );
+    assert!(outcome.ran.is_empty(), "nothing can run: {:?}", outcome.ran);
+    assert!(
+        outcome.version_mismatch.is_empty(),
+        "no handshake can happen: {:?}",
+        outcome.version_mismatch
+    );
+}
+
+/// When npm's packaged native binary ships next to the shim
+/// (`node_modules/<pkg>/bin/<name>.exe`, the travsr packaging convention),
+/// the resolver must adopt it and the language must reach the spawn stage.
+#[cfg(windows)]
+#[test]
+fn cmd_shim_with_packaged_exe_reaches_spawn() {
+    let outcome = run_phase_b_with_provider(
+        "github.com/acme/my-repo",
+        &["github.com/acme/my-repo"],
+        ProviderLayout::CmdShimWithPackagedExe,
+    );
+    let reached_spawn = outcome.ran.iter().any(|l| l == "go")
+        || outcome.crashed.iter().any(|l| l == "go")
+        || outcome.version_mismatch.iter().any(|(l, ..)| l == "go");
+    assert!(
+        reached_spawn,
+        "the packaged exe behind the shim must be spawned; outcome: ran={:?} crashed={:?} \
+         version_mismatch={:?} skipped_no_analyzer={:?}",
+        outcome.ran, outcome.crashed, outcome.version_mismatch, outcome.skipped_no_analyzer
+    );
+    assert!(
+        !outcome.skipped_no_analyzer.iter().any(|l| l == "go"),
+        "must not be reported as analyzer-less when the packaged exe exists: {outcome:?}"
     );
 }
 
