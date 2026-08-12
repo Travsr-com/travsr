@@ -287,6 +287,37 @@ pub fn skeleton_for_node(node: &Node, repo_root: &Path) -> Option<AstSkeleton> {
     Some(extract_skeleton(decl, &src, node, &lang))
 }
 
+/// Can [`embed_texts_for_file`] ever return text for this node?
+///
+/// Mirrors that function's own filters, and lives next to it so the two cannot
+/// drift. Callers group thousands of nodes by file and pay a file read plus a
+/// tree-sitter parse per group, so a node that is structurally incapable of
+/// producing text must be dropped *before* grouping — otherwise its file is
+/// read and parsed to produce nothing, on every pass, forever. `embed_progress`
+/// in travsr-store carries the same guard for the same reason (#391, #376 W1).
+///
+/// Deliberately conservative: it rejects only the always-unfillable classes.
+/// A node it admits can still yield nothing (grammar-less language, unreadable
+/// file, no declaration found at the recorded row) — those are misses to fix at
+/// the source, not classes to exclude.
+pub fn can_have_embed_text(node: &Node) -> bool {
+    // Markdown: only doc-chunks carry prose. The plain `.md` file node
+    // deliberately gets none, to stay out of the vector index (#376 §3.1).
+    if node.vname.language == "markdown" {
+        return node.kind == "doc-chunk";
+    }
+    // Data formats have no grammar; only the file node gets path-based text.
+    if travsr_core::Language::from_str(node.vname.language.as_str())
+        .is_some_and(|l| l.is_data_format())
+    {
+        return node.kind == "file";
+    }
+    // Code: the skeleton is extracted at a declaration row, so a node with no
+    // recorded line has nothing to anchor to. This is what every code-language
+    // `file` node looks like.
+    node.line.is_some()
+}
+
 /// Batch form of [`skeleton_for_node`]: parse a source file **once** and build
 /// the `embed_text` for every node located in it, at the given richness.
 ///
@@ -3174,5 +3205,77 @@ mod tests {
             "only file node emits text; package node skipped"
         );
         assert_eq!(result[0].1, "toml Cargo.toml");
+    }
+
+    // ── can_have_embed_text ──────────────────────────────────────────────────
+
+    /// The class that made the daemon re-read and tree-sitter-parse 476 files
+    /// per tick to write nothing: a code-language `file` node has no line to
+    /// anchor a skeleton at, so the parse always skips it. The predicate and
+    /// the parse have to agree in both directions — reject too much and real
+    /// text is lost, reject too little and the wasted pass comes back.
+    #[test]
+    fn can_have_embed_text_agrees_with_the_parse_on_code_file_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn handler() {}\n").unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        // A `file` node exactly as indexed: no line.
+        let file_node = Node::new(VName::new("corpus", "", "a.rs", "rust", "file"), "file");
+        let fn_node = make_node("a.rs", "fn:handler", "rust", "function", 1, 1);
+
+        assert!(!can_have_embed_text(&file_node));
+        assert!(can_have_embed_text(&fn_node));
+
+        let only_file = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            "a.rs",
+            &[&file_node],
+            EmbedRichness::Compact,
+        );
+        assert!(
+            only_file.is_empty(),
+            "the parse declines this node, so grouping it in only buys a wasted read + parse"
+        );
+        let with_fn = embed_texts_for_file(
+            dir.path(),
+            &canon,
+            "a.rs",
+            &[&fn_node],
+            EmbedRichness::Compact,
+        );
+        assert_eq!(with_fn.len(), 1, "what the predicate admits must be fillable");
+    }
+
+    /// A blanket `kind = 'file'` exclusion is the tempting fix and it is wrong:
+    /// data-format file nodes are the one file kind that does get text.
+    #[test]
+    fn can_have_embed_text_admits_data_format_file_nodes() {
+        let toml_file = Node::new(
+            VName::new("corpus", "", "Cargo.toml", "toml", "file"),
+            "file",
+        );
+        assert!(can_have_embed_text(&toml_file));
+        let toml_pkg = make_node("Cargo.toml", "pkg:serde@1", "toml", "package", 1, 1);
+        assert!(
+            !can_have_embed_text(&toml_pkg),
+            "package nodes are filled by the pathless pass, not by the parse"
+        );
+    }
+
+    /// Markdown prose lives on doc-chunks; the `.md` file node is kept out of
+    /// the vector index deliberately (#376 §3.1).
+    #[test]
+    fn can_have_embed_text_markdown_only_doc_chunks() {
+        let chunk = Node::new(
+            VName::new("corpus", "", "README.md", "markdown", "doc:intro"),
+            "doc-chunk",
+        );
+        let md_file = Node::new(
+            VName::new("corpus", "", "README.md", "markdown", "file"),
+            "file",
+        );
+        assert!(can_have_embed_text(&chunk));
+        assert!(!can_have_embed_text(&md_file));
     }
 }

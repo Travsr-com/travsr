@@ -529,11 +529,6 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     if nodes.is_empty() {
         return;
     }
-    tracing::info!(
-        count = nodes.len(),
-        ?richness,
-        "regenerating embed_text (parse-once-per-file, parallel)"
-    );
 
     // Canonicalize the repo root once (skeleton_for_node did it per node).
     let canon_root = repo_root
@@ -548,19 +543,49 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     // Package/external nodes have path="" — collect separately for direct text gen.
     let mut pathless: Vec<&travsr_core::Node> = Vec::new();
     for node in &nodes {
-        if !node.vname.path.is_empty() {
-            by_file
-                .entry(node.vname.path.as_str())
-                .or_default()
-                .push(node);
-        } else {
-            pathless.push(node);
+        if node.vname.path.is_empty() {
+            // Only `package` nodes have a signature to derive text from; `crate`
+            // and `go-pkg` do not, and admitting them here left them queried on
+            // every pass with nothing to write.
+            if node.kind == "package" {
+                pathless.push(node);
+            }
+            continue;
         }
+        // Drop the structurally unfillable before grouping, not inside the
+        // parse: a `file` node cannot produce text, but keeping it here is what
+        // pulled its whole file into the read-and-parse set to yield nothing.
+        if !travsr_analysis::skeleton::can_have_embed_text(node) {
+            continue;
+        }
+        by_file
+            .entry(node.vname.path.as_str())
+            .or_default()
+            .push(node);
     }
     let files: Vec<(&str, Vec<&travsr_core::Node>)> = by_file.into_iter().collect();
-    // NB: do NOT early-return when `files` is empty — pathless package nodes
-    // (path="") are handled below and would otherwise be stranded without
-    // embed_text whenever they are the only nodes missing it.
+    // Gate on `fillable`, never on `files.is_empty()`: pathless package nodes
+    // (path="") are handled below, and keying the return off `files` alone would
+    // strand them without embed_text whenever they are the only nodes missing it.
+    let fillable = files.iter().map(|(_, ns)| ns.len()).sum::<usize>() + pathless.len();
+    if fillable == 0 {
+        // Every node the query returned is unfillable. Running the pass anyway
+        // is what made the log read `count=1009` five times in 90 seconds while
+        // writing nothing, re-reading 5.9 MB across 476 files each time.
+        tracing::debug!(
+            unfillable = nodes.len(),
+            "embed_text: nothing fillable this pass, skipping parse"
+        );
+        return;
+    }
+    tracing::info!(
+        count = fillable,
+        unfillable = nodes.len().saturating_sub(fillable),
+        files = files.len(),
+        ?richness,
+        "regenerating embed_text (parse-once-per-file, parallel)"
+    );
+    let started = std::time::Instant::now();
 
     // Parse + build text in parallel across files (tree-sitter parsing is CPU-bound,
     // so this scales with cores — the reason a single-threaded regen only used 1 CPU).
@@ -598,24 +623,39 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     };
 
     // Generate embed text for pathless package nodes (pkg:foo@v1 → "foo v1").
+    // `pathless` holds only `package` nodes — gated where it is built, so the
+    // `fillable` count above cannot claim a node this loop then skips.
     let mut pairs = pairs;
     for node in &pathless {
-        if node.kind == "package" {
-            let text = node
-                .vname
-                .signature
-                .trim_start_matches("pkg:")
-                .replace(['@', '/', ':'], " ");
-            pairs.push((node.id, text));
-        }
+        let text = node
+            .vname
+            .signature
+            .trim_start_matches("pkg:")
+            .replace(['@', '/', ':'], " ");
+        pairs.push((node.id, text));
     }
 
     // Write path is single-threaded SQLite; batch to keep transactions small.
+    let mut written = 0usize;
     for chunk in pairs.chunks(500) {
-        if let Err(e) = store.write_embed_texts_batch(chunk) {
-            tracing::warn!("update_embed_texts: batch write failed: {e}");
+        match store.write_embed_texts_batch(chunk) {
+            Ok(()) => written += chunk.len(),
+            Err(e) => tracing::warn!("update_embed_texts: batch write failed: {e}"),
         }
     }
+
+    // `written` is the field that makes a stalled pass legible. A pass that
+    // reports the same `count` on every tick and `written=0` is doing the work
+    // twice for nothing; without this the repetition looked like progress.
+    // `saturating_sub` because this is a log line: `written` cannot exceed
+    // `fillable`, but a subtraction that can render as nonsense has no place in
+    // the one output we are asking a reader to trust (cf. `missing=-299`).
+    tracing::info!(
+        written,
+        missed = fillable.saturating_sub(written),
+        elapsed_ms = started.elapsed().as_millis(),
+        "embed_text regeneration complete"
+    );
 }
 
 /// Populate `embed_text` for doc-chunk nodes that have none (#376 W1).
