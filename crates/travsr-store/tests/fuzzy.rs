@@ -453,7 +453,7 @@ fn issue393_filtered_lang_scopes_and_fuses() {
     put(&mut store, &ts);
 
     let rust_only = store
-        .search_nodes_fuzzy_filtered("workflow", Some("rust"))
+        .search_nodes_fuzzy_filtered("workflow", Some("rust"), false)
         .unwrap();
     assert!(!rust_only.is_empty(), "lang-filtered query must resolve");
     assert!(
@@ -1133,4 +1133,46 @@ fn pa_c4_l2a_expand_query_only_returns_vocabulary_grounded_tokens() {
         r.is_empty(),
         "PA C4: L2-A must return empty for token absent from vocabulary"
     );
+}
+
+#[test]
+fn test_exact_only_filters_pure_substring() {
+    let mut store = open();
+    // 1. exact match
+    let n1 = node("src/ClassD.rs", "struct:ClassD", "struct");
+    // 2. word boundary match (prefix/suffix on signature)
+    let n2 = node("src/ClassD.rs", "fn:ClassD::method", "function");
+    // 3. pure substring match on signature (ELSE 40)
+    let n3 = node(
+        "src/ClassDConfig.rs",
+        "struct:ClassDConfigurationManager",
+        "struct",
+    );
+    // 4. pure substring match on path (ELSE 40)
+    let n4 = node("src/ClassD.rs", "fn:unrelated_func", "function");
+
+    put(&mut store, &n1);
+    put(&mut store, &n2);
+    put(&mut store, &n3);
+    put(&mut store, &n4);
+
+    // With exact_only = false (default), all of them should match ClassD
+    let results_all = store
+        .search_nodes_fuzzy_filtered("ClassD", None, false)
+        .unwrap();
+    assert_eq!(results_all.len(), 4);
+
+    // With exact_only = true, only n1 and n2 should match
+    let results_exact = store
+        .search_nodes_fuzzy_filtered("ClassD", None, true)
+        .unwrap();
+    assert_eq!(results_exact.len(), 2);
+    let sigs: std::collections::HashSet<String> = results_exact
+        .iter()
+        .map(|n| n.vname.signature.clone())
+        .collect();
+    assert!(sigs.contains("struct:ClassD"));
+    assert!(sigs.contains("fn:ClassD::method"));
+    assert!(!sigs.contains("struct:ClassDConfigurationManager"));
+    assert!(!sigs.contains("fn:unrelated_func"));
 }

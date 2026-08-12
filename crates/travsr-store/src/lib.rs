@@ -2488,7 +2488,7 @@ impl SqliteStore {
   (
     CASE
       WHEN signature = ?1 THEN 0
-      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 THEN 10
+      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 OR signature LIKE '%:' || ?1 || ':%' THEN 10
       WHEN signature LIKE ?1 || '%' THEN 20
       WHEN path = ?1 THEN 5
       WHEN path LIKE '%/' || ?1 THEN 15
@@ -2544,6 +2544,98 @@ LIMIT 100",
                     // reader of the `Node.test_role` field) can keep AST-detected
                     // inline tests out of the anchor pool, not just the ones whose
                     // name `is_test_symbol` recognises.
+                    let test_role: i64 = row.get(10)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::from_i64(test_role),
+                    })
+                })
+                .context("executing search query")?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding search row")?);
+            }
+            tracing::debug!(nodes_returned = out.len());
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Search nodes by name exact/prefix/word-boundary only, filtering out pure substring matches.
+    pub fn search_nodes_by_name_exact(&self, name: &str) -> Result<Vec<Node>, StoreError> {
+        let _span =
+            tracing::debug_span!("store.search_nodes_by_name_exact", query = name).entered();
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role,
+  (
+    CASE
+      WHEN signature = ?1 THEN 0
+      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 OR signature LIKE '%:' || ?1 || ':%' THEN 10
+      WHEN signature LIKE ?1 || '%' THEN 20
+      WHEN path = ?1 THEN 5
+      WHEN path LIKE '%/' || ?1 THEN 15
+      ELSE 40
+    END
+    + CASE WHEN path LIKE '%_test.go' OR path LIKE '%test/%'
+           OR path LIKE '%.test.%' OR path LIKE '%_test.%'
+           OR path LIKE 'tests/%' OR path LIKE '%/tests/%' THEN 25 ELSE 0 END
+    + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
+           OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
+    + CASE WHEN path LIKE '%zz_generated%' OR path LIKE '%.pb.go'
+           OR path LIKE '%_pb2.py' OR path LIKE '%.pb.cc' OR path LIKE '%.pb.h'
+           OR path LIKE '%.generated.%' OR path LIKE '%.g.dart'
+           OR path LIKE '%mock%' OR path LIKE '%fake%' THEN 20 ELSE 0 END
+    + (LENGTH(path) / 32)
+    + CASE kind
+        WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
+        WHEN 'class'       THEN 2 WHEN 'interface'   THEN 2 WHEN 'struct'      THEN 2
+        WHEN 'enum'        THEN 2 WHEN 'trait'       THEN 2 WHEN 'union'       THEN 2
+        WHEN 'constant'    THEN 3 WHEN 'static'      THEN 3
+        WHEN 'impl'        THEN 4 WHEN 'type'        THEN 4 WHEN 'module'      THEN 4
+        WHEN 'field'       THEN 6 WHEN 'var'         THEN 6 WHEN 'variable'    THEN 6
+        WHEN 'property'    THEN 6
+        WHEN 'import'      THEN 8 WHEN 'file-module' THEN 8 WHEN 'crate'       THEN 8
+        WHEN 'go-pkg'      THEN 10
+        ELSE 4
+      END
+  ) AS rank
+FROM nodes
+WHERE (signature = ?1
+   OR signature LIKE ?1 || ':%'
+   OR signature LIKE '%:' || ?1
+   OR signature LIKE '%:' || ?1 || ':%'
+   OR signature LIKE ?1 || '%'
+   OR path = ?1
+   OR path LIKE '%/' || ?1)
+  AND kind != 'doc-chunk'
+ORDER BY rank ASC, id ASC
+LIMIT 100",
+                )
+                .context("preparing search query")?;
+
+            let rows = stmt
+                .query_map(params![name], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
                     let test_role: i64 = row.get(10)?;
                     Ok(Node {
                         id,
@@ -5050,20 +5142,42 @@ impl SqliteStore {
         query: &str,
         lang_filter: Option<&str>,
         include_embed: bool,
+        exact_only: bool,
     ) -> Result<Vec<FusedHit>, StoreError> {
         let _span = tracing::debug_span!(
             "store.fused_search_scored",
             query,
             lang = lang_filter.unwrap_or(""),
-            include_embed
+            include_embed,
+            exact_only
         )
         .entered();
 
-        // Stage 1 (Leg A) — exact substring, ranked best-first.
-        let stage1_nodes = match lang_filter {
-            Some(l) => self.search_nodes_by_name_with_lang(query, l)?,
-            None => self.search_nodes_by_name(query)?,
+        // Stage 1 (Leg A) — exact/word-boundary/prefix, ranked best-first.
+        let stage1_nodes = if exact_only {
+            match lang_filter {
+                Some(l) => self.search_nodes_by_name_with_lang_exact(query, l)?,
+                None => self.search_nodes_by_name_exact(query)?,
+            }
+        } else {
+            match lang_filter {
+                Some(l) => self.search_nodes_by_name_with_lang(query, l)?,
+                None => self.search_nodes_by_name(query)?,
+            }
         };
+
+        if exact_only {
+            return Ok(Self::synthetic_desc_scores(stage1_nodes)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, (node, natural))| FusedHit {
+                    node,
+                    natural,
+                    bm25_natural: None,
+                    exact_rank: Some(rank),
+                })
+                .collect());
+        }
 
         // G1 — confident-exact fast path: the top row is an exact signature match
         // (SQL rank 0). Return Stage 1 only, so crisp symbol lookups stay precise
@@ -5456,7 +5570,7 @@ impl SqliteStore {
     /// first-nonempty short-circuit. `include_embed = true` (the `ask` path).
     pub fn search_nodes_fuzzy(&self, query: &str) -> Result<Vec<Node>, StoreError> {
         Ok(self
-            .fused_search_scored(query, None, true)?
+            .fused_search_scored(query, None, true, false)?
             .into_iter()
             .map(|hit| hit.node)
             .collect())
@@ -5525,7 +5639,7 @@ impl SqliteStore {
   (
     CASE
       WHEN signature = ?1 THEN 0
-      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 THEN 10
+      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 OR signature LIKE '%:' || ?1 || ':%' THEN 10
       WHEN signature LIKE ?1 || '%' THEN 20
       WHEN path = ?1 THEN 5
       WHEN path LIKE '%/' || ?1 THEN 15
@@ -5591,6 +5705,104 @@ LIMIT 100",
                     })
                 })
                 .context("executing lang-filtered search query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding search row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Language-scoped variant of [`search_nodes_by_name_exact`].
+    fn search_nodes_by_name_with_lang_exact(
+        &self,
+        name: &str,
+        lang: &str,
+    ) -> Result<Vec<Node>, StoreError> {
+        let _span = tracing::debug_span!(
+            "store.search_nodes_by_name_with_lang_exact",
+            query = name,
+            lang
+        )
+        .entered();
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, end_line, test_role,
+  (
+    CASE
+      WHEN signature = ?1 THEN 0
+      WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 OR signature LIKE '%:' || ?1 || ':%' THEN 10
+      WHEN signature LIKE ?1 || '%' THEN 20
+      WHEN path = ?1 THEN 5
+      WHEN path LIKE '%/' || ?1 THEN 15
+      ELSE 40
+    END
+    + CASE WHEN path LIKE '%_test.go' OR path LIKE '%test/%'
+           OR path LIKE '%.test.%' OR path LIKE '%_test.%'
+           OR path LIKE 'tests/%' OR path LIKE '%/tests/%' THEN 25 ELSE 0 END
+    + CASE WHEN path LIKE 'third_party/%' OR path LIKE 'vendor/%'
+           OR path LIKE '%/node_modules/%' THEN 50 ELSE 0 END
+    + CASE WHEN path LIKE '%zz_generated%' OR path LIKE '%.pb.go'
+           OR path LIKE '%_pb2.py' OR path LIKE '%.pb.cc' OR path LIKE '%.pb.h'
+           OR path LIKE '%.generated.%' OR path LIKE '%.g.dart'
+           OR path LIKE '%mock%' OR path LIKE '%fake%' THEN 20 ELSE 0 END
+    + (LENGTH(path) / 32)
+    + CASE kind
+        WHEN 'method'      THEN 0 WHEN 'function'    THEN 0 WHEN 'constructor' THEN 0
+        WHEN 'class'       THEN 2 WHEN 'interface'   THEN 2 WHEN 'struct'      THEN 2
+        WHEN 'enum'        THEN 2 WHEN 'trait'       THEN 2 WHEN 'union'       THEN 2
+        WHEN 'constant'    THEN 3 WHEN 'static'      THEN 3
+        WHEN 'impl'        THEN 4 WHEN 'type'        THEN 4 WHEN 'module'      THEN 4
+        WHEN 'field'       THEN 6 WHEN 'var'         THEN 6 WHEN 'variable'    THEN 6
+        WHEN 'property'    THEN 6
+        WHEN 'import'      THEN 8 WHEN 'file-module' THEN 8 WHEN 'crate'       THEN 8
+        WHEN 'go-pkg'      THEN 10
+        ELSE 4
+      END
+  ) AS rank
+FROM nodes
+WHERE (signature = ?1
+   OR signature LIKE ?1 || ':%'
+   OR signature LIKE '%:' || ?1
+   OR signature LIKE '%:' || ?1 || ':%'
+   OR signature LIKE ?1 || '%'
+   OR path = ?1
+   OR path LIKE '%/' || ?1)
+  AND kind != 'doc-chunk'
+  AND language = ?2
+ORDER BY rank ASC, id ASC
+LIMIT 100",
+                )
+                .context("preparing lang-filtered exact search query")?;
+            let rows = stmt
+                .query_map(params![name, lang], |row| {
+                    let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                    let vname = VName::new(
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    );
+                    let kind: String = row.get(6)?;
+                    let package: String = row.get(7)?;
+                    let line: Option<i64> = row.get(8)?;
+                    let end_line: Option<i64> = row.get(9)?;
+                    let test_role: i64 = row.get(10)?;
+                    Ok(Node {
+                        id,
+                        vname,
+                        kind,
+                        package,
+                        line: line.and_then(|l| u32::try_from(l).ok()),
+                        end_line: end_line.and_then(|l| u32::try_from(l).ok()),
+                        test_role: TestRole::from_i64(test_role),
+                    })
+                })
+                .context("executing lang-filtered exact search query")?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding search row")?);
@@ -5796,7 +6008,7 @@ LIMIT 100",
     /// (`travsr-mcp`'s lexical loop) that reads `bm25_natural`/`exact_rank` to
     /// fix the boundary-evidence bug by topology rather than by a discount.
     pub fn search_nodes_fuzzy_scored(&self, query: &str) -> Result<Vec<FusedHit>, StoreError> {
-        self.fused_search_scored(query, None, false)
+        self.fused_search_scored(query, None, false, false)
     }
 
     /// Returns the number of nodes whose indexed word set contains `token`
@@ -5936,12 +6148,13 @@ LIMIT 100",
         &self,
         query: &str,
         lang_filter: Option<&str>,
+        exact_only: bool,
     ) -> Result<Vec<Node>, StoreError> {
         // #393: thin wrapper over the fused core. `lang_filter = None` behaves
         // identically to [`search_nodes_fuzzy`]; `Some(l)` scopes every stage to
         // language `l`. `include_embed = true` (the `search_symbol` path).
         Ok(self
-            .fused_search_scored(query, lang_filter, true)?
+            .fused_search_scored(query, lang_filter, true, exact_only)?
             .into_iter()
             .map(|hit| hit.node)
             .collect())

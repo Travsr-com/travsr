@@ -641,6 +641,7 @@ fn dispatch_tool_call(
                     repos,
                     args["name"].as_str().unwrap_or(""),
                     repo_arg,
+                    args["exact"].as_bool().unwrap_or(false),
                 ),
                 "get_repo_map" => tools::get_repo_map_global(repos, repo_arg),
                 // TODO(RFC-008 / #197): replace OpenFilter with per-session RbacFilter
