@@ -29,25 +29,42 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("objectivec", "fuzz_objc_parser.rs"), // TODO(#345): create this fuzz target
 ];
 
+/// Emitted at most once per process, like [`SANDBOX_PROBED`] below.
+static FUZZ_CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process
 /// does not yet have a cargo-fuzz target. The language is still registered —
 /// refusing to index would be worse than the missing fuzz coverage. Track the gap.
-fn check_fuzz_target(language: &str) {
-    let expected = FUZZ_TARGETS
-        .iter()
-        .find(|(lang, _)| *lang == language)
-        .map(|(_, f)| *f);
-    let Some(filename) = expected else { return };
-    let path = std::path::Path::new("fuzz/fuzz_targets").join(filename);
-    if !path.exists() {
-        tracing::warn!(
-            lang = language,
-            missing = %path.display(),
-            "ADR-017 Rule 4: in-process grammar '{}' has no fuzz target at {} \
-             — add a cargo-fuzz target to satisfy the eligibility requirement",
-            language, path.display()
-        );
-    }
+///
+/// One aggregated line rather than one per language. This used to warn per
+/// language per `PluginIndexer` creation, and since the indexer is recreated
+/// per file, a single daemon start produced dozens of near-identical lines —
+/// on a fresh repo the last 20 lines of the log were nothing else, which made
+/// `travsr daemon logs` useless for the case it exists to serve. The
+/// information is identical; only the repetition is gone.
+fn check_fuzz_targets_once() {
+    FUZZ_CHECKED.get_or_init(|| {
+        let missing: Vec<&str> = FUZZ_TARGETS
+            .iter()
+            .filter(|(_, filename)| {
+                !std::path::Path::new("fuzz/fuzz_targets")
+                    .join(filename)
+                    .exists()
+            })
+            .map(|(lang, _)| *lang)
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                event = "adr017.fuzz_target.missing",
+                count = missing.len(),
+                langs = %missing.join(","),
+                "ADR-017 Rule 4: {} in-process grammar(s) have no fuzz target under \
+                 fuzz/fuzz_targets — add cargo-fuzz targets to satisfy the eligibility \
+                 requirement",
+                missing.len()
+            );
+        }
+    });
 }
 
 /// Cached probe: log sandbox availability once per process lifetime.
@@ -109,7 +126,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
     macro_rules! register {
         ($plugin:expr, $lang:expr, $exts:expr, $phase_b:expr) => {{
             // ADR-017 Rule 4: warn if no fuzz target for this in-process grammar.
-            check_fuzz_target($lang);
+            check_fuzz_targets_once();
             let hs = HandshakeResponse {
                 protocol_version: PROTOCOL_VERSION,
                 plugin_version: version.clone(),
@@ -150,7 +167,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         &crate::plugins::dart::CONFIG,
         &crate::plugins::objc::CONFIG,
     ] {
-        check_fuzz_target(config.language.as_str());
+        check_fuzz_targets_once();
         register_generic(dispatcher, &version, config);
     }
 }

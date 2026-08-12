@@ -271,6 +271,20 @@ enum DaemonAction {
     StopEmbed,
     /// Resume background embed reindexing paused by `stop-embed`.
     ResumeEmbed,
+    /// Print daemon log entries. Reads the file directly, so it works after a
+    /// crash and does not need a running daemon.
+    Logs {
+        /// Stream new lines as they are written, following rotation.
+        #[arg(long, short = 'f', default_value_t = false)]
+        follow: bool,
+        /// Lines to show from the end of the log. 0 prints the whole file.
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+        /// Show only lines tagged with this repo. Useful against a log that
+        /// serves several repos.
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -480,7 +494,7 @@ async fn run(cli: Cli) -> Result<()> {
                                         eprintln!("travsr daemon failed to start: {r}")
                                     }
                                     None => eprintln!(
-                                        "travsr daemon failed to start (see .travsr/daemon.log)"
+                                        "travsr daemon failed to start — see `travsr daemon logs`"
                                     ),
                                 }
                                 return Ok(());
@@ -618,11 +632,18 @@ async fn run(cli: Cli) -> Result<()> {
                         {
                             Some(r) => eprintln!("travsr daemon failed to restart: {r}"),
                             None => eprintln!(
-                                "travsr daemon failed to restart (see .travsr/daemon.log)"
+                                "travsr daemon failed to restart — see `travsr daemon logs`"
                             ),
                         },
                         _ => eprintln!("travsr daemon restarted in background"),
                     }
+                }
+                DaemonAction::Logs {
+                    follow,
+                    lines,
+                    repo,
+                } => {
+                    daemon_logs(&repo_root, follow, lines, repo.as_deref())?;
                 }
                 DaemonAction::StopEmbed => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::StopEmbed) {
@@ -814,6 +835,72 @@ async fn run(cli: Cli) -> Result<()> {
 /// bind failure). `None` when the file is absent or empty. Lets `daemon
 /// start`/`status`/`restart` surface a background failure that would otherwise
 /// be silent (travsr #592).
+/// Whether a log line belongs to `repo`.
+///
+/// The daemon tags repo-scoped work with a `repo` span field, which the
+/// formatter renders as `repo="<name>"`. Matching on that rendering rather
+/// than parsing the line keeps this independent of the rest of the format.
+fn line_is_for_repo(line: &str, repo: &str) -> bool {
+    line.contains(&format!("repo=\"{repo}\"")) || line.contains(&format!("repo={repo}"))
+}
+
+/// `travsr daemon logs` — print, and optionally follow, the daemon log.
+///
+/// Reads the file rather than asking the daemon, so it still works after a
+/// crash, which is when it is most wanted. Output carries no ANSI: these lines
+/// get piped into `grep` far more often than they get read directly.
+fn daemon_logs(
+    repo_root: &std::path::Path,
+    follow: bool,
+    lines: usize,
+    repo: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let dir = travsr_daemon::logfile::log_dir(repo_root);
+    let mut tail = travsr_daemon::logfile::LogTail::new(&dir);
+
+    if tail.path().is_none() {
+        // Name the directory, not a filename: the log is dated, so telling the
+        // user to look for `daemon.log` would send them after a file that is
+        // never created.
+        eprintln!(
+            "no daemon log in {} yet — run `travsr daemon start`",
+            dir.display()
+        );
+        return Ok(());
+    }
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let backfill = tail.backfill(lines)?;
+    for line in backfill.lines() {
+        if repo.is_none_or(|r| line_is_for_repo(line, r)) {
+            writeln!(out, "{line}")?;
+        }
+    }
+    out.flush()?;
+
+    if !follow {
+        return Ok(());
+    }
+
+    // Only lines from here on; the backfill above already covered history.
+    tail.seek_to_end();
+    loop {
+        for line in tail.poll()? {
+            if repo.is_none_or(|r| line_is_for_repo(&line, r)) {
+                writeln!(out, "{line}")?;
+            }
+        }
+        // Flush every tick: a follower that buffers is indistinguishable from a
+        // daemon that has stopped logging.
+        out.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
 fn daemon_start_error(repo_root: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(repo_root.join(".travsr").join("daemon-start.err"))
         .ok()
