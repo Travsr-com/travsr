@@ -2216,8 +2216,29 @@ fn strip_comment_marker(s: &str) -> String {
 /// Walk `prev_named_sibling()` from `decl` to collect adjacent doc-comment nodes.
 /// Stops at the first non-comment named sibling. Results are reversed to source order.
 fn collect_doc_comments(decl: TsNode<'_>, src: &[u8], comment_kinds: &[&str]) -> Vec<String> {
+    // Climb out of same-line wrappers first. `export function f() {}` parses as
+    // an `export_statement` containing the `function_declaration`, so the
+    // declaration has no previous sibling at all and the comment is a sibling of
+    // the wrapper. Collecting from the declaration therefore found nothing, and
+    // every *exported* TypeScript symbol lost its doc comment while Go and C
+    // kept theirs.
+    //
+    // Guarded twice so this cannot wander into an enclosing block: only while
+    // the node has no previous sibling of its own, and only into a parent that
+    // begins on the same line.
+    let mut anchor = decl;
+    for _ in 0..3 {
+        if anchor.prev_named_sibling().is_some() {
+            break;
+        }
+        match anchor.parent() {
+            Some(p) if p.start_position().row == anchor.start_position().row => anchor = p,
+            _ => break,
+        }
+    }
+
     let mut docs: Vec<String> = Vec::new();
-    let mut cursor = decl.prev_named_sibling();
+    let mut cursor = anchor.prev_named_sibling();
     while let Some(sib) = cursor {
         if comment_kinds.contains(&sib.kind()) {
             let stripped = strip_comment_marker(node_text(sib, src));
@@ -3436,7 +3457,66 @@ mod tests {
         );
         assert_eq!(
             out[0].1,
-            "function: fn:greet | module: addon.d.ts | params: name: string | returns: string"
+            "function: fn:greet | module: addon.d.ts | params: name: string | returns: string \
+             | doc: napi-rs generated binding"
+        );
+    }
+
+    /// Doc comments on *exported* declarations were dropped for every
+    /// TypeScript symbol, while Go and C kept theirs. `export function f() {}`
+    /// wraps the declaration in an `export_statement`, so the declaration has no
+    /// previous sibling and the comment is a sibling of the wrapper.
+    ///
+    /// This is the highest-value text a symbol has, and `export` is how nearly
+    /// every symbol in a TypeScript codebase is declared.
+    #[test]
+    fn typescript_exported_declarations_keep_their_doc_comment() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (
+                "exported function",
+                "/** Greets someone by name. */\nexport function greet(name: string): string { return name; }\n",
+                "function: fn:greet | module: a.ts | params: name: string | returns: string | doc: Greets someone by name.",
+            ),
+            (
+                "exported arrow",
+                "/** Median of a list. */\nexport const median = (a: number[]): number => a[0];\n",
+                "function: fn:median | module: a.ts | params: a: number[] | returns: number | doc: Median of a list.",
+            ),
+            (
+                "line comments stack in order",
+                "// first line\n// second line\nexport function f(): void {}\n",
+                "function: fn:f | module: a.ts | returns: void | doc: first line second line",
+            ),
+        ];
+        for (why, src, want) in cases {
+            let line = src.lines().count() as u32;
+            let sig = if src.contains("median") {
+                "fn:median"
+            } else if src.contains("greet") {
+                "fn:greet"
+            } else {
+                "fn:f"
+            };
+            let node = make_node("a.ts", sig, "typescript", "function", line, line);
+            let out = embed_text_for("a.ts", src, &node);
+            assert_eq!(out.len(), 1, "{why}: no text at all");
+            assert_eq!(out[0].1, want, "{why}");
+        }
+    }
+
+    /// The climb out of a wrapper must not reach past it. A function whose
+    /// preceding sibling is another statement has no doc comment, and must not
+    /// inherit a comment attached to whatever encloses it.
+    #[test]
+    fn the_doc_comment_climb_does_not_borrow_from_an_enclosing_scope() {
+        let src = "/** Outer doc. */\nexport function outer(): void {\n  const x = 1;\n  function inner(): void {}\n}\n";
+        let node = make_node("a.ts", "fn:inner", "typescript", "function", 4, 4);
+        let out = embed_text_for("a.ts", src, &node);
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out[0].1.contains("doc:"),
+            "inner has no doc comment of its own and must not take outer's: {}",
+            out[0].1
         );
     }
 
