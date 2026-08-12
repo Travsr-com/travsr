@@ -982,7 +982,22 @@ fn relay_daemon_startup(
 /// formatter renders as `repo="<name>"`. Matching on that rendering rather
 /// than parsing the line keeps this independent of the rest of the format.
 fn line_is_for_repo(line: &str, repo: &str) -> bool {
-    line.contains(&format!("repo=\"{repo}\"")) || line.contains(&format!("repo={repo}"))
+    // Quoted rendering (string-valued fields): the closing quote is its own
+    // terminator, so a plain match is exact.
+    if line.contains(&format!("repo=\"{repo}\"")) {
+        return true;
+    }
+    // Unquoted rendering (Display-valued fields, e.g. the daemon's own
+    // `repo=/path/to/repo`): the value runs to the next separator, so the match
+    // has to end at one. Without this, `--repo alpha` silently also selects
+    // every line belonging to `alpha-staging`.
+    let needle = format!("repo={repo}");
+    line.match_indices(&needle).any(|(i, _)| {
+        line[i + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == '}' || c == ',')
+    })
 }
 
 /// `travsr daemon logs` — print, and optionally follow, the daemon log.
@@ -1249,6 +1264,51 @@ mod tests {
             daemon_lock_pid(dir.path()),
             None,
             "a corrupt lock file must not panic or yield a bogus pid"
+        );
+    }
+}
+
+#[cfg(test)]
+mod daemon_log_tests {
+    use super::line_is_for_repo;
+
+    /// The tag is a span field, so the formatter renders it quoted. Matching on
+    /// the rendering keeps the filter independent of the rest of the line.
+    #[test]
+    fn a_tagged_line_matches_its_own_repo_only() {
+        let line =
+            r#"INFO mcp.tool_call{tool="search_symbol" req=42 repo="alpha" global=true}: served"#;
+        assert!(line_is_for_repo(line, "alpha"));
+        assert!(!line_is_for_repo(line, "beta"));
+    }
+
+    #[test]
+    fn an_untagged_line_belongs_to_no_repo() {
+        // Process-wide lines — session start, reranker fetch — carry no repo,
+        // and must not be attributed to whichever one the user asked about.
+        let line = "INFO travsr_mcp::rerank: reranker model absent — auto-fetching";
+        assert!(!line_is_for_repo(line, "alpha"));
+    }
+
+    #[test]
+    fn a_repo_name_that_is_a_prefix_of_another_does_not_match_it() {
+        // "alpha" must not select lines belonging to "alpha-staging", which a
+        // bare substring search on the name alone would do.
+        let line = r#"INFO mcp.tool_call{repo="alpha-staging"}: served"#;
+        assert!(line_is_for_repo(line, "alpha-staging"));
+        assert!(!line_is_for_repo(line, "alpha"));
+    }
+
+    #[test]
+    fn the_unquoted_rendering_is_prefix_safe_too() {
+        // Display-valued fields render unquoted: the daemon's own session line
+        // is `repo=/path/to/repo`. A bare `contains` on that form matches any
+        // longer name that starts with the one asked for.
+        let line = "INFO daemon starting event=\"daemon.session.start\" repo=alpha-staging";
+        assert!(line_is_for_repo(line, "alpha-staging"));
+        assert!(
+            !line_is_for_repo(line, "alpha"),
+            "alpha must not select alpha-staging"
         );
     }
 }
