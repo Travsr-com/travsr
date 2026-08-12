@@ -52,6 +52,64 @@ pub fn log_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".travsr")
 }
 
+/// Byte offset where the `lines`-th line from the end of `file` begins, or 0
+/// when the file holds fewer than that many lines.
+fn line_start_from_end(file: &mut File, len: u64, lines: usize) -> std::io::Result<u64> {
+    let mut pos = len;
+    let mut seen = 0usize;
+    let mut chunk = vec![0u8; BACKFILL_CHUNK];
+    while pos > 0 {
+        let take = std::cmp::min(BACKFILL_CHUNK as u64, pos) as usize;
+        pos -= take as u64;
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(&mut chunk[..take])?;
+        for i in (0..take).rev() {
+            if chunk[i] == b'\n' {
+                // The trailing newline of the final line does not begin one.
+                if pos + i as u64 + 1 == len {
+                    continue;
+                }
+                seen += 1;
+                if seen == lines {
+                    return Ok(pos + i as u64 + 1);
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// Append the last `lines` complete lines of `path` to `out` (`0` for all).
+///
+/// Decodes lossily on purpose. `read_to_string` fails the entire read on one
+/// invalid UTF-8 byte, so a single torn write — the daemon being killed
+/// mid-line is the ordinary way to get one — made `travsr daemon logs` refuse
+/// to show any of the log, at exactly the moment someone wanted to read it.
+/// A replacement character in one line costs nothing by comparison.
+///
+/// Always leaves `out` newline-terminated, so concatenating one file's tail
+/// onto another cannot glue two entries into a single line.
+fn append_file_tail(path: &Path, lines: usize, out: &mut String) -> std::io::Result<()> {
+    let mut file = File::open(path)?;
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        return Ok(());
+    }
+    let start = if lines == 0 {
+        0
+    } else {
+        line_start_from_end(&mut file, len, lines)?
+    };
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(LOG_BUDGET_BYTES).read_to_end(&mut bytes)?;
+    out.push_str(&String::from_utf8_lossy(&bytes));
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(())
+}
+
 /// Every rotated log file in `dir`, oldest first.
 ///
 /// `tracing-appender` suffixes with an ISO date, which sorts lexicographically
@@ -184,58 +242,48 @@ impl LogTail {
         }
     }
 
-    /// The last `lines` complete lines already in the log.
+    /// The last `lines` complete lines already in the log, across rotations.
     ///
-    /// Scans backwards from the end so cost is proportional to the tail read,
-    /// not to file size — a long-lived daemon's log is read at the same speed
-    /// whether it is 4 KB or 400 MB. `lines == 0` returns the whole file.
+    /// Rotation means "the last 200 lines" is rarely 200 lines of one file: at
+    /// 00:01 today's file holds a handful and the rest of the answer sits in
+    /// yesterday's. Reading only the newest file returns short without saying
+    /// so, which reads as "the daemon logged almost nothing" when the truth is
+    /// "you are looking at one file out of seven". So older files are walked,
+    /// newest first, until the request is satisfied or history runs out.
+    ///
+    /// Each file is scanned backwards, so cost is proportional to the tail read
+    /// rather than to file size: a 400 MB log tails as fast as a 4 KB one.
+    /// `lines == 0` returns the whole retained history, oldest first, which
+    /// [`prune`] already bounds to [`LOG_BUDGET_BYTES`].
     pub fn backfill(&self, lines: usize) -> std::io::Result<String> {
-        let Some(path) = &self.path else {
-            return Ok(String::new());
-        };
-        let mut file = File::open(path)?;
-        let len = file.seek(SeekFrom::End(0))?;
-        if len == 0 {
+        let files = log_files(&self.dir);
+        if files.is_empty() {
             return Ok(String::new());
         }
 
         if lines == 0 {
-            file.seek(SeekFrom::Start(0))?;
             let mut all = String::new();
-            file.take(LOG_BUDGET_BYTES).read_to_string(&mut all)?;
+            for path in &files {
+                append_file_tail(path, 0, &mut all)?;
+            }
             return Ok(all);
         }
 
-        // Walk backwards a chunk at a time until enough newlines are behind us.
-        let mut pos = len;
-        let mut seen = 0usize;
-        let mut start = 0u64;
-        let mut chunk = vec![0u8; BACKFILL_CHUNK];
-        while pos > 0 {
-            let take = std::cmp::min(BACKFILL_CHUNK as u64, pos) as usize;
-            pos -= take as u64;
-            file.seek(SeekFrom::Start(pos))?;
-            file.read_exact(&mut chunk[..take])?;
-            for i in (0..take).rev() {
-                if chunk[i] == b'\n' {
-                    // The trailing newline of the final line does not begin one.
-                    if pos + i as u64 + 1 == len {
-                        continue;
-                    }
-                    seen += 1;
-                    if seen == lines {
-                        start = pos + i as u64 + 1;
-                        pos = 0;
-                        break;
-                    }
-                }
+        // Newest first, each older file supplying only what the newer ones
+        // could not.
+        let mut chunks: Vec<String> = Vec::new();
+        let mut needed = lines;
+        for path in files.iter().rev() {
+            if needed == 0 {
+                break;
             }
+            let mut text = String::new();
+            append_file_tail(path, needed, &mut text)?;
+            needed = needed.saturating_sub(text.lines().count());
+            chunks.push(text);
         }
-
-        file.seek(SeekFrom::Start(start))?;
-        let mut out = String::new();
-        file.take(LOG_BUDGET_BYTES).read_to_string(&mut out)?;
-        Ok(out)
+        chunks.reverse();
+        Ok(chunks.concat())
     }
 
     /// Complete lines written since the previous call.
@@ -382,6 +430,66 @@ mod tests {
 
         // More lines requested than exist: return everything, not an error.
         assert_eq!(tail.backfill(10_000).unwrap().lines().count(), 200);
+    }
+
+    /// The rotation gap: shortly after midnight the newest file holds a handful
+    /// of lines and the rest of the answer is in yesterday's. Reading only the
+    /// newest file returned short without saying so, which reads as "the daemon
+    /// logged almost nothing".
+    #[test]
+    fn backfill_spans_rotated_files_instead_of_stopping_at_the_newest() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "daemon.log.2026-08-10", "a1\na2\na3\na4\n");
+        write(d.path(), "daemon.log.2026-08-11", "b1\nb2\n");
+        write(d.path(), "daemon.log.2026-08-12", "c1\n");
+        let tail = LogTail::new(d.path());
+
+        // 1 from today, 2 from yesterday, 1 from the day before: chronological.
+        assert_eq!(tail.backfill(4).unwrap(), "a4\nb1\nb2\nc1\n");
+        // Satisfied entirely by the newest file: older ones are never opened.
+        assert_eq!(tail.backfill(1).unwrap(), "c1\n");
+        // The whole retained history, oldest first.
+        assert_eq!(
+            tail.backfill(0).unwrap(),
+            "a1\na2\na3\na4\nb1\nb2\nc1\n",
+            "`--lines 0` means the whole log, not the whole newest file"
+        );
+        // More than exists across every file: everything, not an error.
+        assert_eq!(tail.backfill(10_000).unwrap().lines().count(), 7);
+    }
+
+    /// A rotated file whose last write was torn leaves no trailing newline.
+    /// Concatenating the next file straight onto it would glue two entries into
+    /// one line, which silently corrupts whatever the reader greps for.
+    #[test]
+    fn backfill_does_not_glue_entries_across_a_file_missing_its_newline() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "daemon.log.2026-08-11",
+            "first\nsecond-no-newline",
+        );
+        write(d.path(), "daemon.log.2026-08-12", "third\n");
+        let tail = LogTail::new(d.path());
+
+        let out = tail.backfill(0).unwrap();
+        assert_eq!(out, "first\nsecond-no-newline\nthird\n");
+        assert_eq!(out.lines().count(), 3, "three entries stay three lines");
+    }
+
+    /// One invalid byte used to fail the whole read, so a daemon killed
+    /// mid-line made `travsr daemon logs` refuse to print any of the log.
+    #[test]
+    fn backfill_survives_a_non_utf8_byte_instead_of_failing_the_read() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("daemon.log.2026-08-12");
+        std::fs::write(&p, b"good line\ntorn \xFF line\nlast line\n").unwrap();
+        let tail = LogTail::new(d.path());
+
+        let out = tail.backfill(0).unwrap();
+        assert_eq!(out.lines().count(), 3, "no line is lost to one bad byte");
+        assert!(out.starts_with("good line\n"));
+        assert!(out.ends_with("last line\n"));
     }
 
     #[test]

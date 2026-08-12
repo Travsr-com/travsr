@@ -513,6 +513,15 @@ fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -
     exclude
 }
 
+/// File count above which an embed pass announces itself before starting.
+///
+/// An incremental pass touches the handful of files a commit changed and lands
+/// in tens of milliseconds, so announcing it only doubles the most frequent
+/// line in the log. A first pass on a large repo runs for minutes, where a
+/// silent log is indistinguishable from a hung daemon. The threshold sits well
+/// above any incremental pass and well below a whole-repo one.
+const ANNOUNCE_PASS_ABOVE_FILES: usize = 200;
+
 /// Compute and persist `embed_text` for all nodes where it is currently NULL.
 ///
 /// `richness` controls how much context is packed per node — derived from the
@@ -578,13 +587,22 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
         );
         return;
     }
-    tracing::info!(
-        count = fillable,
-        unfillable = nodes.len().saturating_sub(fillable),
-        files = files.len(),
-        ?richness,
-        "regenerating embed_text (parse-once-per-file, parallel)"
-    );
+    // Announce the pass only when it is big enough that silence would read as a
+    // hang. A start line for the common case doubles the volume of the most
+    // frequent line in the log, which is the failure this PR exists to fix; but
+    // the first pass on a large repo runs for minutes, and a log that says
+    // nothing for minutes is its own bug. `unfillable` rides along here rather
+    // than on the routine line: it is a property of the index that barely moves
+    // between passes, so repeating it every tick is noise.
+    if files.len() > ANNOUNCE_PASS_ABOVE_FILES {
+        tracing::info!(
+            count = fillable,
+            unfillable = nodes.len().saturating_sub(fillable),
+            files = files.len(),
+            ?richness,
+            "regenerating embed_text (parse-once-per-file, parallel)"
+        );
+    }
     let started = std::time::Instant::now();
 
     // Parse + build text in parallel across files (tree-sitter parsing is CPU-bound,
@@ -647,15 +665,21 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     // `written` is the field that makes a stalled pass legible. A pass that
     // reports the same `count` on every tick and `written=0` is doing the work
     // twice for nothing; without this the repetition looked like progress.
-    // `saturating_sub` because this is a log line: `written` cannot exceed
-    // `fillable`, but a subtraction that can render as nonsense has no place in
-    // the one output we are asking a reader to trust (cf. `missing=-299`).
-    tracing::info!(
-        written,
-        missed = fillable.saturating_sub(written),
-        elapsed_ms = started.elapsed().as_millis(),
-        "embed_text regeneration complete"
-    );
+    // One line for the pass, carrying only what changed between passes.
+    // `missed` is the field that makes a stall legible: a pass that writes
+    // nothing while reporting work to do is doing it twice for nothing, and
+    // without this the repetition read as progress. It is omitted when zero so
+    // the healthy line stays short. `saturating_sub` because `written` cannot
+    // exceed `fillable`, but a subtraction that can render as nonsense has no
+    // place in the one output we are asking a reader to trust (cf.
+    // `missing=-299`).
+    let missed = fillable.saturating_sub(written);
+    let elapsed_ms = started.elapsed().as_millis();
+    if missed > 0 {
+        tracing::info!(written, missed, elapsed_ms, "embed_text updated");
+    } else {
+        tracing::info!(written, elapsed_ms, "embed_text updated");
+    }
 }
 
 /// Populate `embed_text` for doc-chunk nodes that have none (#376 W1).

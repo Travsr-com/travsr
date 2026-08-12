@@ -277,13 +277,20 @@ enum DaemonAction {
         /// Stream new lines as they are written, following rotation.
         #[arg(long, short = 'f', default_value_t = false)]
         follow: bool,
-        /// Lines to show from the end of the log. 0 prints the whole file.
+        /// Lines to show from the end of the log, spanning rotated files.
+        /// 0 prints the whole retained history.
         #[arg(long, default_value_t = 50)]
         lines: usize,
         /// Show only lines tagged with this repo. Useful against a log that
         /// serves several repos.
         #[arg(long)]
         repo: Option<String>,
+        /// Show only this severity and above: trace, debug, info, warn, error.
+        #[arg(long)]
+        level: Option<String>,
+        /// Show only lines newer than this age, for example 45s, 10m, 2h, 1d.
+        #[arg(long)]
+        since: Option<String>,
         /// Read the global log in ~/.travsr instead of this repo's, which is
         /// where `travsr mcp --global` writes.
         #[arg(long, default_value_t = false)]
@@ -713,6 +720,8 @@ async fn run(cli: Cli) -> Result<()> {
                     follow,
                     lines,
                     repo,
+                    level,
+                    since,
                     global,
                 } => {
                     let dir = if global {
@@ -723,7 +732,9 @@ async fn run(cli: Cli) -> Result<()> {
                     } else {
                         travsr_daemon::logfile::log_dir(&repo_root)
                     };
-                    daemon_logs(&dir, follow, lines, repo.as_deref())?;
+                    let min_level = level.as_deref().map(parse_level).transpose()?;
+                    let since = since.as_deref().map(parse_since).transpose()?;
+                    daemon_logs(&dir, follow, lines, LineFilter::new(repo, min_level, since))?;
                 }
                 DaemonAction::StopEmbed => {
                     match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::StopEmbed) {
@@ -1001,6 +1012,124 @@ fn line_is_for_repo(line: &str, repo: &str) -> bool {
     })
 }
 
+/// Severity rank, ordered so `>=` reads as "at least this severe".
+fn level_rank(name: &str) -> Option<u8> {
+    match name {
+        "TRACE" => Some(0),
+        "DEBUG" => Some(1),
+        "INFO" => Some(2),
+        "WARN" => Some(3),
+        "ERROR" => Some(4),
+        _ => None,
+    }
+}
+
+/// Parse a `--level` argument.
+fn parse_level(s: &str) -> anyhow::Result<u8> {
+    level_rank(&s.to_ascii_uppercase()).with_context(|| {
+        format!("unknown log level `{s}` (expected trace, debug, info, warn or error)")
+    })
+}
+
+/// Parse a `--since` argument: `45s`, `10m`, `2h`, `1d`.
+///
+/// A duration rather than a clock time on purpose. Log timestamps are UTC and
+/// the reader's clock is not, so "since 14:20" invites a five-and-a-half hour
+/// mistake that "since 10m" cannot make.
+fn parse_since(s: &str) -> anyhow::Result<chrono::Duration> {
+    let unit = s
+        .chars()
+        .last()
+        .with_context(|| "`--since` needs a value, for example `10m`")?;
+    let digits = &s[..s.len() - unit.len_utf8()];
+    let n: i64 = digits.parse().map_err(|_| {
+        anyhow::anyhow!("`--since {s}`: expected a number followed by s, m, h or d")
+    })?;
+    if n < 0 {
+        anyhow::bail!("`--since {s}`: a duration cannot be negative");
+    }
+    match unit.to_ascii_lowercase() {
+        's' => Ok(chrono::Duration::seconds(n)),
+        'm' => Ok(chrono::Duration::minutes(n)),
+        'h' => Ok(chrono::Duration::hours(n)),
+        'd' => Ok(chrono::Duration::days(n)),
+        _ => anyhow::bail!("`--since {s}`: unknown unit `{unit}` (expected s, m, h or d)"),
+    }
+}
+
+/// Whether a line starts a log entry, as opposed to continuing one.
+///
+/// Entries begin with an RFC3339 timestamp. A panic backtrace frame or a
+/// wrapped message does not, and carries neither a level nor a timestamp of its
+/// own, so every filter has to recognise it rather than judge it.
+fn is_entry_start(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() >= 20 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T'
+}
+
+/// Which log lines `travsr daemon logs` prints.
+///
+/// Stateful because of continuation lines: judging a backtrace frame on its own
+/// merits would strip it from the entry it belongs to, leaving an error message
+/// whose cause was filtered out from underneath it. Each continuation inherits
+/// the decision made for the entry above it.
+struct LineFilter {
+    repo: Option<String>,
+    min_level: Option<u8>,
+    /// Cutoff as an RFC3339 prefix. Log timestamps are fixed-width UTC, so a
+    /// string comparison is already a chronological one — no parsing per line.
+    since: Option<String>,
+    last_kept: bool,
+}
+
+impl LineFilter {
+    fn new(repo: Option<String>, min_level: Option<u8>, since: Option<chrono::Duration>) -> Self {
+        Self {
+            repo,
+            min_level,
+            since: since.map(|d| {
+                (chrono::Utc::now() - d)
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string()
+            }),
+            last_kept: true,
+        }
+    }
+
+    /// Whether every active filter admits this line.
+    fn keep(&mut self, line: &str) -> bool {
+        if !is_entry_start(line) {
+            return self.last_kept;
+        }
+        let kept = self.admits(line);
+        self.last_kept = kept;
+        kept
+    }
+
+    fn admits(&self, line: &str) -> bool {
+        if let Some(repo) = &self.repo {
+            if !line_is_for_repo(line, repo) {
+                return false;
+            }
+        }
+        if let Some(min) = self.min_level {
+            // The level is the second whitespace-separated token. A line whose
+            // level is unreadable is shown rather than hidden: dropping it would
+            // mean a format change silently emptying the output.
+            match line.split_whitespace().nth(1).and_then(level_rank) {
+                Some(rank) if rank < min => return false,
+                _ => {}
+            }
+        }
+        if let Some(cutoff) = &self.since {
+            if line.len() < cutoff.len() || &line[..cutoff.len()] < cutoff.as_str() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// `travsr daemon logs` — print, and optionally follow, the daemon log.
 ///
 /// Reads the file rather than asking the daemon, so it still works after a
@@ -1010,7 +1139,7 @@ fn daemon_logs(
     dir: &std::path::Path,
     follow: bool,
     lines: usize,
-    repo: Option<&str>,
+    mut filter: LineFilter,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
@@ -1031,12 +1160,22 @@ fn daemon_logs(
     let mut out = stdout.lock();
 
     let backfill = tail.backfill(lines)?;
+    let mut shown = 0usize;
+    let mut scanned = 0usize;
     for line in backfill.lines() {
-        if repo.map_or(true, |r| line_is_for_repo(line, r)) {
+        scanned += 1;
+        if filter.keep(line) {
+            shown += 1;
             writeln!(out, "{line}")?;
         }
     }
     out.flush()?;
+
+    // A filter that matched nothing looks exactly like a daemon that logged
+    // nothing. Say which it was, on stderr so it never reaches a pipe.
+    if shown == 0 && scanned > 0 {
+        eprintln!("no matching lines in the last {scanned} log line(s) — widen the filters");
+    }
 
     if !follow {
         return Ok(());
@@ -1046,7 +1185,7 @@ fn daemon_logs(
     tail.seek_to_end();
     loop {
         for line in tail.poll()? {
-            if repo.map_or(true, |r| line_is_for_repo(&line, r)) {
+            if filter.keep(&line) {
                 writeln!(out, "{line}")?;
             }
         }
@@ -1311,5 +1450,91 @@ mod daemon_log_tests {
             !line_is_for_repo(line, "alpha"),
             "alpha must not select alpha-staging"
         );
+    }
+
+    // ── --level / --since ────────────────────────────────────────────────
+
+    use super::{is_entry_start, parse_level, parse_since, LineFilter};
+
+    fn entry(level: &str, msg: &str) -> String {
+        format!("2026-08-12T14:52:18.024693Z  {level} travsr_daemon: {msg}")
+    }
+
+    #[test]
+    fn level_filter_keeps_the_requested_severity_and_above() {
+        let mut f = LineFilter::new(None, Some(parse_level("warn").unwrap()), None);
+        assert!(f.keep(&entry("ERROR", "boom")));
+        assert!(f.keep(&entry("WARN", "careful")));
+        assert!(!f.keep(&entry("INFO", "routine")));
+        assert!(!f.keep(&entry("DEBUG", "chatter")));
+    }
+
+    /// The edge case any line-at-a-time filter gets wrong: a panic backtrace
+    /// carries no timestamp and no level, so judging it on its own merits keeps
+    /// the frames and drops the ERROR above them, or the reverse. Either way the
+    /// reader is left with half an entry.
+    #[test]
+    fn a_continuation_line_travels_with_the_entry_above_it() {
+        let mut f = LineFilter::new(None, Some(parse_level("warn").unwrap()), None);
+
+        assert!(f.keep(&entry("ERROR", "phase B panicked")));
+        assert!(
+            f.keep("    at crates/travsr-daemon/src/lib.rs:512"),
+            "a frame under a kept ERROR is part of that entry"
+        );
+        assert!(
+            f.keep("    note: run with RUST_BACKTRACE=full"),
+            "and so is the next frame"
+        );
+
+        // Now an entry the filter rejects: its continuations go with it.
+        assert!(!f.keep(&entry("INFO", "routine")));
+        assert!(
+            !f.keep("    continuation of the routine line"),
+            "a frame under a dropped INFO must not survive its parent"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_level_is_shown_rather_than_hidden() {
+        // A format change must not silently empty the output.
+        let mut f = LineFilter::new(None, Some(parse_level("error").unwrap()), None);
+        assert!(f.keep("2026-08-12T14:52:18.024693Z something-unparseable"));
+    }
+
+    #[test]
+    fn since_drops_entries_older_than_the_cutoff() {
+        let mut f = LineFilter::new(None, None, Some(chrono::Duration::hours(1)));
+        // Fixed past date: comfortably older than one hour ago, whenever this runs.
+        assert!(!f.keep("2020-01-01T00:00:00.000000Z  INFO travsr_daemon: ancient"));
+        // A line stamped now is inside the window.
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
+        assert!(f.keep(&format!("{now}  INFO travsr_daemon: fresh")));
+    }
+
+    #[test]
+    fn entry_starts_are_told_apart_from_continuations() {
+        assert!(is_entry_start(
+            "2026-08-12T14:52:18.024693Z  INFO travsr_daemon: x"
+        ));
+        assert!(!is_entry_start("    at src/lib.rs:512"));
+        assert!(!is_entry_start(""));
+        assert!(!is_entry_start("short"));
+    }
+
+    #[test]
+    fn bad_level_and_duration_arguments_are_rejected_with_a_usable_message() {
+        let e = parse_level("loud").unwrap_err().to_string();
+        assert!(e.contains("trace, debug, info, warn or error"), "{e}");
+
+        for bad in ["10x", "abc", "m", ""] {
+            assert!(parse_since(bad).is_err(), "`{bad}` must not parse");
+        }
+        assert_eq!(parse_since("10m").unwrap(), chrono::Duration::minutes(10));
+        assert_eq!(parse_since("2h").unwrap(), chrono::Duration::hours(2));
+        assert_eq!(parse_since("45s").unwrap(), chrono::Duration::seconds(45));
+        assert_eq!(parse_since("1d").unwrap(), chrono::Duration::days(1));
     }
 }
