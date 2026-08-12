@@ -1140,6 +1140,47 @@ impl LogLine {
         }
     }
 
+    /// This line as a JSON object, whatever it started as.
+    ///
+    /// `--json` exists to be piped into `jq` or a log collector, so the stream
+    /// has to be uniformly valid: one line that is not an object kills the
+    /// consumer on the spot, and it does not matter that the other 16 lines were
+    /// fine. Rotated files written before the format changed are most of the
+    /// history for a week after it, so this is the normal case rather than an
+    /// exotic one.
+    ///
+    /// Such lines are wrapped rather than dropped, tagged `unparsed` so a
+    /// consumer can tell them apart, and given whatever timestamp, level and
+    /// target can be recovered from the old rendering so they stay queryable
+    /// instead of opaque.
+    fn to_json_line(&self) -> String {
+        match self {
+            Self::Json(v) => v.to_string(),
+            Self::Text(s) => {
+                let mut obj = serde_json::Map::new();
+                let mut message: &str = s;
+                if is_entry_start(s) {
+                    let mut tok = s.split_whitespace();
+                    if let Some(ts) = tok.next() {
+                        obj.insert("timestamp".into(), ts.into());
+                    }
+                    if let Some(level) = tok.next().filter(|l| level_rank(l).is_some()) {
+                        obj.insert("level".into(), level.into());
+                    }
+                    if let Some(target) = tok.next() {
+                        obj.insert("target".into(), target.trim_end_matches(':').into());
+                    }
+                    message = legacy_message(s);
+                }
+                let mut fields = serde_json::Map::new();
+                fields.insert("message".into(), message.into());
+                obj.insert("fields".into(), serde_json::Value::Object(fields));
+                obj.insert("unparsed".into(), true.into());
+                serde_json::Value::Object(obj).to_string()
+            }
+        }
+    }
+
     /// Whether this line belongs to `repo`. JSON puts the tag in a named field,
     /// on the event or on the span it happened inside, so no string matching is
     /// needed; text lines fall back to matching the rendering.
@@ -1154,6 +1195,26 @@ impl LogLine {
             Self::Text(s) => line_is_for_repo(s, repo),
         }
     }
+}
+
+/// The message of a pre-JSON log line: everything after the fixed
+/// `<timestamp> <LEVEL> <target>:` prefix.
+///
+/// Scans past exactly three whitespace-separated tokens rather than splitting on
+/// `": "`, because messages contain that too (`#478: backfilling ...`) and would
+/// otherwise be cut in half.
+fn legacy_message(line: &str) -> &str {
+    let b = line.as_bytes();
+    let mut i = 0;
+    for _ in 0..3 {
+        while i < b.len() && b[i] == b' ' {
+            i += 1;
+        }
+        while i < b.len() && b[i] != b' ' {
+            i += 1;
+        }
+    }
+    line[i..].trim_start()
 }
 
 /// Shorten a tracing target to the subsystem a reader cares about.
@@ -1396,7 +1457,7 @@ fn daemon_logs(
         }
         shown += 1;
         if raw {
-            writeln!(out, "{text}")?;
+            writeln!(out, "{}", line.to_json_line())?;
         } else {
             for rendered in render.render(&line) {
                 writeln!(out, "{rendered}")?;
@@ -1424,7 +1485,7 @@ fn daemon_logs(
                 continue;
             }
             if raw {
-                writeln!(out, "{text}")?;
+                writeln!(out, "{}", line.to_json_line())?;
             } else {
                 for rendered in render.render(&line) {
                     writeln!(out, "{rendered}")?;
@@ -1795,6 +1856,55 @@ mod daemon_log_tests {
         ));
         assert_eq!(tomorrow.len(), 2);
         assert_eq!(tomorrow[0], "── 2026-08-13 UTC ──");
+    }
+
+    /// `--json` is for piping into jq or a collector, so every line it emits has
+    /// to be an object. It was not: on this repo 142 of 158 lines were pre-JSON
+    /// rotations, and `jq` died on the first one with
+    /// `parse error: Invalid numeric literal at line 1, column 14`, which makes
+    /// the flag useless for the only thing it exists for.
+    #[test]
+    fn the_json_stream_stays_valid_json_even_where_the_log_is_not() {
+        let legacy = LogLine::parse(
+            "2026-08-12T13:31:02.217447Z  WARN travsr_plugin_host::registry: #478: rule 4 tripped",
+        );
+        let wrapped: serde_json::Value = serde_json::from_str(&legacy.to_json_line())
+            .expect("a pre-JSON line must still come out as an object");
+
+        assert_eq!(wrapped["timestamp"], "2026-08-12T13:31:02.217447Z");
+        assert_eq!(wrapped["level"], "WARN");
+        assert_eq!(
+            wrapped["target"], "travsr_plugin_host::registry",
+            "the trailing colon is not part of the target"
+        );
+        assert_eq!(
+            wrapped["fields"]["message"], "#478: rule 4 tripped",
+            "a message containing ': ' must not be cut at it"
+        );
+        assert_eq!(
+            wrapped["unparsed"], true,
+            "a consumer has to be able to tell recovered lines from native ones"
+        );
+
+        // A continuation frame has no prefix to recover; it still has to be an
+        // object rather than raw text.
+        let frame = LogLine::parse("    at crates/travsr-daemon/src/lib.rs:512");
+        let v: serde_json::Value = serde_json::from_str(&frame.to_json_line()).unwrap();
+        assert_eq!(
+            v["fields"]["message"], "    at crates/travsr-daemon/src/lib.rs:512",
+            "with no prefix to strip, the whole line is the message"
+        );
+
+        // Native lines pass through unchanged in content.
+        let native = LogLine::parse(
+            r#"{"timestamp":"2026-08-12T14:52:18.024693Z","level":"INFO","fields":{"message":"x"},"target":"travsr_daemon"}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&native.to_json_line()).unwrap();
+        assert_eq!(v["fields"]["message"], "x");
+        assert!(
+            v.get("unparsed").is_none(),
+            "a native line must not be tagged as recovered"
+        );
     }
 
     /// A torn write is not JSON, and neither is a pre-JSON rotation. Neither may
