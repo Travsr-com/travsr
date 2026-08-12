@@ -797,6 +797,95 @@ pub fn get_daemon_logs_global(
     ))
 }
 
+// ── get_graph_health ────────────────────────────────────────────────────────
+
+/// Build the `get_graph_health` JSON payload from a read-only integrity scan.
+/// O(F) where F = tracked file count (`SqliteStore::integrity_report` stats
+/// one path per tracked file), slower than the other observability tools;
+/// documented on the tool description (#636 plan risk 3).
+fn graph_health_payload(store: &SqliteStore, repo_label: &str, root: &Path) -> serde_json::Value {
+    let repo = sanitize_log_value(repo_label, 256);
+    let report = match store.integrity_report(root) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("get_graph_health: integrity_report failed: {e}");
+            return serde_json::json!({ "repo": repo, "error": "integrity check failed" });
+        }
+    };
+
+    let ghost_count = report.ghost_paths.len();
+    let sample: Vec<serde_json::Value> = report
+        .ghost_paths
+        .iter()
+        .take(20)
+        .map(|p| serde_json::json!(sanitize_log_value(p, MAX_FIELD_BYTES)))
+        .collect();
+    let parity_ok = report.lexical_index_parity_issue.is_none();
+    let healthy = report.orphan_edges_detected == 0 && ghost_count == 0 && parity_ok;
+
+    let mut payload = serde_json::json!({
+        "repo": repo,
+        "healthy": healthy,
+        "node_count": report.node_count,
+        "edge_count": report.edge_count,
+        "ghost_paths": { "count": ghost_count, "sample": sample },
+        "orphan_edges": report.orphan_edges_detected,
+        "lexical_index_parity": {
+            "ok": parity_ok,
+            "detail": report
+                .lexical_index_parity_issue
+                .as_deref()
+                .map(|d| sanitize_log_value(d, MAX_FIELD_BYTES)),
+        },
+    });
+
+    if !healthy {
+        // Priority matches the daemon's own fsck wording: ghosts/orphans are
+        // fixed by `--fix`; a lexical-index parity gap needs a full re-index.
+        let recommendation = if ghost_count > 0 || report.orphan_edges_detected > 0 {
+            "run `travsr fsck --fix` to clean up ghost paths / orphan edges"
+        } else {
+            "run `travsr init` to rebuild the lexical index"
+        };
+        payload["recommendation"] = serde_json::json!(recommendation);
+    }
+    payload
+}
+
+/// Graph integrity report for the caller's own repo (stdio server).
+/// Strictly read-only, see [`travsr_store::SqliteStore::integrity_report`].
+pub fn get_graph_health(store: &SqliteStore) -> String {
+    let label = stdio_repo_label(store);
+    let payload = match stdio_repo_root(store) {
+        Some(root) => graph_health_payload(store, &label, &root),
+        None => serde_json::json!({
+            "repo": sanitize_log_value(&label, 256),
+            "error": "repo root unknown, index metadata missing",
+        }),
+    };
+    json_response(&payload)
+}
+
+/// Global-mode variant: resolves `repo_arg` (or the sole live repo), opens it
+/// read-only, and runs the same integrity scan.
+pub fn get_graph_health_global(repos: &HashMap<String, PathBuf>, repo_arg: Option<&str>) -> String {
+    let target = match resolve_single_repo(repos, repo_arg) {
+        Ok(t) => t,
+        Err(reason) => return json_response(&error_payload(&reason)),
+    };
+    let store = match SqliteStore::open_read_only(&target.db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "get_graph_health_global failed to open {}: {e}",
+                target.db_path.display()
+            );
+            return json_response(&error_payload("failed to open repo database"));
+        }
+    };
+    json_response(&graph_health_payload(&store, &target.name, &target.root))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1151,5 +1240,75 @@ mod tests {
         let out_omitted = get_daemon_logs_global(&repos, 10, "info", None);
         assert!(!out_omitted.contains("MARKER_A"));
         assert!(!out_omitted.contains("MARKER_B"));
+    }
+
+    // ── get_graph_health ──────────────────────────────────────────────────
+
+    #[test]
+    fn graph_health_clean_store_is_healthy_with_no_recommendation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["healthy"], true);
+        assert!(payload.get("recommendation").is_none());
+    }
+
+    #[test]
+    fn graph_health_detects_ghost_and_recommends_fsck() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node = Node::new(
+            VName::new("corpus", "main", "src/deleted.ts", "typescript", "fn:a"),
+            "function",
+        );
+        store.put_node(&node).unwrap();
+        store.put_file_hash("src/deleted.ts", "deadbeef").unwrap();
+
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["healthy"], false);
+        assert_eq!(payload["ghost_paths"]["count"], 1);
+        assert!(payload["recommendation"]
+            .as_str()
+            .unwrap()
+            .contains("travsr fsck --fix"));
+    }
+
+    #[test]
+    fn graph_health_samples_at_most_twenty_ghosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for i in 0..25 {
+            store
+                .put_file_hash(&format!("src/ghost{i}.ts"), "deadbeef")
+                .unwrap();
+        }
+        let payload = graph_health_payload(&store, "repo", tmp.path());
+        assert_eq!(payload["ghost_paths"]["count"], 25);
+        assert_eq!(
+            payload["ghost_paths"]["sample"].as_array().unwrap().len(),
+            20
+        );
+    }
+
+    #[test]
+    fn graph_health_never_mutates_the_store() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node = Node::new(
+            VName::new("corpus", "main", "src/a.ts", "typescript", "fn:a"),
+            "function",
+        );
+        store.put_node(&node).unwrap();
+        let nodes_before = store.node_count().unwrap();
+        let hashes_before = store.get_all_file_hashes().unwrap().len();
+
+        let _ = graph_health_payload(&store, "repo", tmp.path());
+
+        assert_eq!(store.node_count().unwrap(), nodes_before);
+        assert_eq!(store.get_all_file_hashes().unwrap().len(), hashes_before);
     }
 }

@@ -319,6 +319,7 @@ fn handle_tool_call(
             let level = args["level"].as_str().unwrap_or("info");
             crate::observability::get_daemon_logs(store, tail, level)
         }
+        "get_graph_health" => crate::observability::get_graph_health(store),
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -655,6 +656,16 @@ fn tools_list() -> serde_json::Value {
                     "required": [],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_graph_health",
+                "description": "Return a read-only graph integrity report: ghost paths (indexed but deleted on disk), orphan edges, and lexical-index parity. Never mutates; this is the report half of `travsr fsck`, not `--fix`. O(tracked file count); slower than most tools. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -932,6 +943,7 @@ fn handle_tool_call_global(
             let level = args["level"].as_str().unwrap_or("info");
             crate::observability::get_daemon_logs_global(repos, tail, level, repo_arg)
         }
+        "get_graph_health" => crate::observability::get_graph_health_global(repos, repo_arg),
         other => return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}")),
     };
 
@@ -1179,6 +1191,18 @@ fn tools_list_global() -> serde_json::Value {
                     "required": [],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_graph_health",
+                "description": "Return a read-only graph integrity report for a single repo: ghost paths (indexed but deleted on disk), orphan edges, and lexical-index parity. Never mutates; this is the report half of `travsr fsck`, not `--fix`. O(tracked file count); slower than most tools. Never aggregates across repos; supply `repo` when more than one is registered, or the call returns an ambiguity error. Returns JSON.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string", "description": "Repo name (run repos_list to discover). REQUIRED when more than one repo is registered; this tool never aggregates across repos." }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -1248,6 +1272,7 @@ mod tests {
         // #636: read-only observability tools.
         "get_index_status",
         "get_daemon_logs",
+        "get_graph_health",
     ];
 
     /// Tools exposed only on the stdio (single-repo) server — never in the global
@@ -1404,6 +1429,71 @@ mod tests {
                     "tool '{tool_name}' must have '{required_field}' in required"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn observability_tools_have_no_required_fields() {
+        for list in [tools_list(), tools_list_global()] {
+            let tools = list["tools"].as_array().unwrap();
+            for name in ["get_index_status", "get_daemon_logs", "get_graph_health"] {
+                let tool = tools
+                    .iter()
+                    .find(|t| t["name"].as_str() == Some(name))
+                    .unwrap_or_else(|| panic!("tool '{name}' not found"));
+                let required = tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("tool '{name}' must have a required array"));
+                assert!(
+                    required.is_empty(),
+                    "tool '{name}' must have no required fields"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_daemon_logs_schema_has_tail_bounds_and_level_enum() {
+        for list in [tools_list(), tools_list_global()] {
+            let tools = list["tools"].as_array().unwrap();
+            let tool = tools
+                .iter()
+                .find(|t| t["name"].as_str() == Some("get_daemon_logs"))
+                .expect("get_daemon_logs must be present");
+            let props = &tool["inputSchema"]["properties"];
+            assert_eq!(props["tail"]["minimum"].as_i64(), Some(1));
+            assert_eq!(props["tail"]["maximum"].as_i64(), Some(500));
+            let levels: Vec<&str> = props["level"]["enum"]
+                .as_array()
+                .expect("level must have an enum")
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(levels, vec!["error", "warn", "info", "debug"]);
+        }
+    }
+
+    #[test]
+    fn observability_tools_expose_repo_only_in_global_mode() {
+        let stdio_tools = tools_list()["tools"].as_array().unwrap().clone();
+        let global_tools = tools_list_global()["tools"].as_array().unwrap().clone();
+        for name in ["get_index_status", "get_daemon_logs", "get_graph_health"] {
+            let stdio_tool = stdio_tools
+                .iter()
+                .find(|t| t["name"].as_str() == Some(name))
+                .unwrap();
+            assert!(
+                stdio_tool["inputSchema"]["properties"]["repo"].is_null(),
+                "stdio '{name}' must not expose 'repo'"
+            );
+            let global_tool = global_tools
+                .iter()
+                .find(|t| t["name"].as_str() == Some(name))
+                .unwrap();
+            assert!(
+                global_tool["inputSchema"]["properties"]["repo"].is_object(),
+                "global '{name}' must expose 'repo'"
+            );
         }
     }
 

@@ -6,6 +6,10 @@ All notable changes to Travsr are documented here.
 
 ## Unreleased
 
+### Added
+
+- **Read-only MCP observability tools (#636): `get_index_status`, `get_daemon_logs`, `get_graph_health`.** `get_index_status` reports schema version, indexed-vs-HEAD staleness, node/edge counts, Phase A/Phase B state (including per-language failed/unavailable/done), and semantic (embeddings/rerank) readiness. `get_daemon_logs` returns recent daemon log entries, parsed and severity-filtered, with home paths and credential-shaped substrings best-effort redacted. `get_graph_health` returns the report-only half of `travsr fsck`: ghost paths, orphan edges, and lexical-index parity, never mutating. All three are strictly read-only, never write `.travsr/daemon.lock`, and never aggregate across repos in global mode (supply `repo` when more than one repo is registered).
+
 ### Fixed
 
 - **Ruby `require` vs `require_relative` false-positive blast radius (#614).** The Ruby analyzer now records which keyword produced an import, emitting `import:gem:<spec>` for a load-path `require` (gem/stdlib/in-repo lib) and `import:<spec>` for an importer-relative `require_relative`, instead of both collapsing to the same signature. `RubyResolver` only resolves the `require_relative` form, so a gem/stdlib `require 'json'` no longer false-matches an unrelated local `json.rb`. Existing indexes need a re-index to clear stale Ruby gem-require false positives.
