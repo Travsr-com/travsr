@@ -1,5 +1,6 @@
 import * as assert from "assert";
 import { buildSynonymsHtml, buildReposHtml, buildStatsHtml, buildLanguagesHtml } from "../../webviews";
+import { highlightJson } from "../../webviews";
 import type { Diagnostic, LangCount, LangInfo, LogEntry, StatsView } from "../../webviews";
 
 suite("VSCODE-247: buildSynonymsHtml", () => {
@@ -235,5 +236,45 @@ suite("codicon syntax never reaches webview HTML", () => {
         `${name} leaks codicon syntax into HTML: ${hit?.[0]} — drop it, a webview cannot render it`,
       );
     }
+  });
+});
+
+suite("JSON view", () => {
+  // The first version ran chained regexes over the text, and a pass for numbers
+  // matched the digits inside an already-marked timestamp string, nesting the
+  // spans. Walking the parsed value cannot do that, and this pins it.
+  test("tokens are not nested inside one another", () => {
+    const line = JSON.stringify({
+      timestamp: "2026-08-13T21:12:16.186214Z",
+      level: "INFO",
+      fields: { message: "semantic indexing complete", nodes: 89, ok: true },
+    });
+    const html = highlightJson(line);
+    assert.ok(
+      !/class="j-[a-z]"[^>]*>[^<]*<span/.test(html),
+      `a token was rendered inside another token: ${html}`
+    );
+  });
+
+  test("each kind of value gets its own class, and strings keep their digits", () => {
+    const html = highlightJson(JSON.stringify({ n: 89, s: "2026-08-13", b: true, z: null }));
+    assert.ok(html.includes('class="j-n">89'), "number");
+    assert.ok(html.includes('class="j-s">&quot;2026-08-13&quot;'), "the date stays one string");
+    assert.ok(html.includes('class="j-b">true'), "boolean");
+    assert.ok(html.includes('class="j-b">null'), "null");
+  });
+
+  test("a line that is not JSON is shown as itself", () => {
+    // Rotations written before the log became JSON are still on disk.
+    const legacy = "2026-08-12T13:31:02Z  WARN travsr_daemon: something happened";
+    const html = highlightJson(legacy);
+    assert.ok(html.includes("j-raw"), "should fall back rather than throw");
+    assert.ok(html.includes("something happened"), "and must not lose the line");
+  });
+
+  test("markup in a value cannot escape into the page", () => {
+    const html = highlightJson(JSON.stringify({ msg: "<img src=x onerror=alert(1)>" }));
+    assert.ok(!html.includes("<img"), `unescaped markup reached the output: ${html}`);
+    assert.ok(html.includes("&lt;img"), "the value should still be readable, escaped");
   });
 });

@@ -48,6 +48,7 @@ export function webviewShell(title: string, body: string, script: string): strin
     --green: #86df86; --green-deep: #17340e; --gold: #fcd053;
     --orange: #fb923c; --orange-deep: #4f2000;
     --error: #ef4444;
+    --blue: #7dd3fc;
   }
   @media (prefers-color-scheme: light) {
     :root {
@@ -57,6 +58,7 @@ export function webviewShell(title: string, body: string, script: string): strin
       --green: #429429; --green-deep: #dbf6db; --gold: #d89a02;
       --orange: #b35500; --orange-deep: #fff7ed;
       --error: #b91c1c;
+      --blue: #0369a1;
     }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -211,10 +213,22 @@ export function webviewShell(title: string, body: string, script: string): strin
   .tog { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   .tog input { margin: 0; }
 
-  /* JSON view: the stored line verbatim, for copying or piping. */
+  /* JSON view: the stored line verbatim, coloured so it can be read, and still
+     selectable so it can be copied. Wraps rather than scrolling sideways: a
+     log line is long and a horizontal scrollbar per row is unusable. */
+  .jsonline { display: none; }
+  .log.json-mode .log-line { display: block; padding: 3px 0; }
   .log.json-mode .log-line > span { display: none; }
-  .log.json-mode .log-line::before { content: attr(data-json); white-space: pre-wrap;
-    word-break: break-all; color: var(--fg-muted); }
+  .log.json-mode .jsonline { display: block; white-space: pre; overflow-x: auto;
+    line-height: 1.5; }
+  .log.json-mode .log-line { padding: 8px 0; }
+  .log.json-mode .log-line + .log-line { border-top: 1px solid var(--border); }
+  .j-k { color: var(--blue); }
+  .j-s { color: var(--green); }
+  .j-n { color: var(--gold); }
+  .j-b { color: var(--orange); }
+  .j-p { color: var(--fg-subtle); }
+  .j-raw { color: var(--fg-muted); }
   :focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
   .badge.dim { background: var(--bg-elev); color: var(--fg-subtle); }
   .consent { margin-top: 6px; }
@@ -400,6 +414,57 @@ function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({com
   return webviewShell("Travsr Repos", body, script);
 }
 
+/**
+ * Pretty-print one stored log line the way a JSON viewer does: indented, one
+ * field per line, each kind of value its own colour.
+ *
+ * Raw JSON in a panel is a wall. Every line is the same width and the same
+ * weight, so the eye has nothing to land on and the format buys nothing over
+ * the column view.
+ *
+ * Built by walking the parsed value rather than running regexes over the text.
+ * Chained replacements cannot work here: a pass for numbers matches the digits
+ * inside an already-marked timestamp string, and the spans nest. Walking the
+ * value knows what each token is.
+ *
+ * A line that does not parse is shown as itself, escaped. Rotations from before
+ * the log was JSON are still on disk.
+ */
+export function highlightJson(line: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return `<span class="j-raw">${esc(line)}</span>`;
+  }
+  return renderJsonValue(parsed, 0);
+}
+
+function renderJsonValue(v: unknown, depth: number): string {
+  const pad = (n: number): string => "  ".repeat(n);
+  if (v === null) return `<span class="j-b">null</span>`;
+  if (typeof v === "boolean") return `<span class="j-b">${v}</span>`;
+  if (typeof v === "number") return `<span class="j-n">${v}</span>`;
+  if (typeof v === "string") return `<span class="j-s">"${esc(v)}"</span>`;
+  if (Array.isArray(v)) {
+    if (v.length === 0) return `<span class="j-p">[]</span>`;
+    const items = v
+      .map((x) => `${pad(depth + 1)}${renderJsonValue(x, depth + 1)}`)
+      .join(`<span class="j-p">,</span>\n`);
+    return `<span class="j-p">[</span>\n${items}\n${pad(depth)}<span class="j-p">]</span>`;
+  }
+  const entries = Object.entries(v as Record<string, unknown>);
+  if (entries.length === 0) return `<span class="j-p">{}</span>`;
+  const rows = entries
+    .map(
+      ([k, val]) =>
+        `${pad(depth + 1)}<span class="j-k">"${esc(k)}"</span><span class="j-p">:</span> ` +
+        renderJsonValue(val, depth + 1)
+    )
+    .join(`<span class="j-p">,</span>\n`);
+  return `<span class="j-p">{</span>\n${rows}\n${pad(depth)}<span class="j-p">}</span>`;
+}
+
 /** One thing that is wrong, phrased for the person who has to fix it. */
 export interface Diagnostic {
   severity: "error" | "warn";
@@ -536,7 +601,8 @@ export function buildStatsHtml(
             `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
             `<span class="mono muted tg">${esc(e.target)}</span>` +
             `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
-            `<span class="mono muted detail" data-raw="${esc(e.detail)}">${esc(e.detail)}</span></div>`
+            `<span class="mono muted detail" data-raw="${esc(e.detail)}">${esc(e.detail)}</span>` +
+            `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`
         )
         .join("\n")
     : `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
