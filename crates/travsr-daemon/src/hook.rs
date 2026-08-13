@@ -69,7 +69,7 @@ fn hook_body(hook: &str, bin: &str) -> String {
 # installed by travsr — do not edit this line
 {guard}_travsr={exe}
 [ -x "$_travsr" ] || _travsr="travsr"
-exec "$_travsr" hook-run --from-hook
+exec "$_travsr" hook-run --from-hook --event {hook}
 "#,
         guard = branch_checkout_guard_sh(hook),
         exe = sh_quote(bin),
@@ -87,7 +87,7 @@ if [ -x "$_dir/{hook}.travsr-pre.bak" ]; then
 fi
 {guard}_travsr={exe}
 [ -x "$_travsr" ] || _travsr="travsr"
-exec "$_travsr" hook-run --from-hook
+exec "$_travsr" hook-run --from-hook --event {hook}
 "#,
         guard = branch_checkout_guard_sh(hook),
         exe = sh_quote(bin),
@@ -108,7 +108,7 @@ fn branch_checkout_guard_cmd(hook: &str) -> &'static str {
 #[cfg(windows)]
 fn cmd_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n{guard}{exe} hook-run --from-hook\r\n",
+        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
         guard = branch_checkout_guard_cmd(hook),
         exe = cmd_quote(bin),
     )
@@ -118,7 +118,7 @@ fn cmd_hook_body(hook: &str, bin: &str) -> String {
 #[cfg(windows)]
 fn cmd_chain_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0{hook}.travsr-pre.bak.cmd\" call \"%~dp0{hook}.travsr-pre.bak.cmd\" %*\r\n{guard}{exe} hook-run --from-hook\r\n",
+        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0{hook}.travsr-pre.bak.cmd\" call \"%~dp0{hook}.travsr-pre.bak.cmd\" %*\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
         guard = branch_checkout_guard_cmd(hook),
         exe = cmd_quote(bin),
     )
@@ -610,6 +610,29 @@ mod tests {
             HOOKS.contains(&"post-merge") && HOOKS.contains(&"post-checkout"),
             "the merge and checkout events are the ones #655 M2 is about"
         );
+    }
+
+    /// Each hook has to say which event fired, because the right file set
+    /// differs by event and the hook is the only place that knows.
+    ///
+    /// A commit is described exactly by `git diff-tree HEAD`. A branch checkout
+    /// and a multi-commit fast-forward are not: the new tip's own diff says
+    /// nothing about the other files that differ between the two trees.
+    /// Measured on a fast-forward carrying two commits, reindexing the tip delta
+    /// alone reached 4 nodes where the tree holds 6, and the file from the
+    /// non-tip commit was absent from the graph.
+    #[test]
+    fn each_hook_tells_the_cli_which_event_fired() {
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+
+        for hook in HOOKS {
+            let body = std::fs::read_to_string(tmp.path().join(".git/hooks").join(hook)).unwrap();
+            assert!(
+                body.contains(&format!("--event {hook}")),
+                "{hook} must pass its own name through, got:\n{body}"
+            );
+        }
     }
 
     #[test]
