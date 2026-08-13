@@ -55,7 +55,8 @@ function readFileOrFail(absPath) {
  * number of `artifact:` lines, so a future entry that omits `artifact:`
  * fails here instead of 404ing at release time, and that no two entries
  * share the same `artifact:` value, so a duplicate fails here instead of
- * silently overwriting a published binary.
+ * making actions/upload-artifact@v4 reject the second upload and fail the
+ * release build.
  * // O(n) in file line count
  */
 function extractReleaseArtifacts(text) {
@@ -102,8 +103,9 @@ function extractReleaseArtifacts(text) {
   if (dupes.length > 0) {
     console.error(
       `ERROR: ${rel(RELEASE_YML)} build matrix ships duplicate artifact name(s): ` +
-        `${dupes.join(", ")}. Two matrix entries would write the same asset, ` +
-        `so one silently overwrites the other's published binary.`
+        `${dupes.join(", ")}. Two matrix entries writing the same artifact name ` +
+        `make actions/upload-artifact@v4 reject the second upload, so the release ` +
+        `build fails and nothing publishes.`
     );
     process.exit(1);
   }
