@@ -48,7 +48,7 @@ impl Plugin for TypeScriptPlugin {
         match travsr_indexer::typescript_parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(out) => parse_output_to_response(out),
             Err(e) => {
-                tracing::warn!("ts parse {}: {e}", req.path.display());
+                tracing::warn!(event = "file.parse_failed", lang = "typescript", path = %req.path.display(), err = %e, "parse error, skipping");
                 ParseResponse::default()
             }
         }

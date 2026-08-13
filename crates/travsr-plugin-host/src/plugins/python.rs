@@ -27,7 +27,7 @@ impl Plugin for PythonPlugin {
                 parse_output_to_response(out)
             }
             Err(e) => {
-                tracing::warn!("python parse {}: {e}", req.path.display());
+                tracing::warn!(event = "file.parse_failed", lang = "python", path = %req.path.display(), err = %e, "parse error, skipping");
                 ParseResponse::default()
             }
         }

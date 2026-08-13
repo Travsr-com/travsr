@@ -218,7 +218,7 @@ fn index_paths_parallel(
                     let new_hash = match hash_file(abs_path) {
                         Ok(h) => h,
                         Err(e) => {
-                            tracing::warn!(path=%abs_path.display(), err=%e, "hash failed, skipping");
+                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "hash failed, skipping");
                             continue;
                         }
                     };
@@ -252,7 +252,7 @@ fn index_paths_parallel(
                     let out = match parsed {
                         Ok(o) => o,
                         Err(e) => {
-                            tracing::warn!(path=%abs_path.display(), err=%e, "parse error, skipping");
+                            tracing::warn!(event = "file.parse_failed", path = %abs_path.display(), err = %e, "parse error, skipping");
                             continue;
                         }
                     };
@@ -3176,7 +3176,7 @@ pub fn reindex_files(
                 continue;
             }
             Err(err) => {
-                tracing::warn!("skipping {}: {err}", abs_path.display());
+                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "hash failed, skipping");
                 continue;
             }
         };
@@ -3203,7 +3203,7 @@ pub fn reindex_files(
         let out = match parsed {
             Ok(o) => o,
             Err(err) => {
-                tracing::warn!("parse error for {}: {err}", abs_path.display());
+                tracing::warn!(event = "file.parse_failed", path = %abs_path.display(), err = %err, "parse error, skipping");
                 continue; // keep old graph intact
             }
         };
