@@ -934,13 +934,23 @@ pub fn fsck_repo(
     }
 
     // `reconcile` takes the on-disk set (walked_paths), not the ghost set.
-    // Recompute it here rather than threading it out of `integrity_report`,
-    // which is report-only and has no reason to expose it.
+    // Derive it as `db_paths \ report.ghost_paths` instead of re-statting
+    // every path a second time (#636 review): the removed code built both
+    // sets in a single `.exists()` pass specifically so the report and the
+    // `--fix` deletion agree exactly ("`.exists()` matches the TOCTOU
+    // re-check inside `reconcile`, and `on_disk` feeds it so the report and
+    // the `--fix` deletion agree exactly"). A second independent stat pass
+    // can disagree with `report.ghost_paths` if a file appears or
+    // disappears in between; deriving from the report's own ghost set can't.
+    // `reconcile`'s own TOCTOU re-check is still the safety net against a
+    // file changing between this point and the actual delete.
     let db_paths: std::collections::HashSet<String> =
         store.get_all_file_hashes()?.into_keys().collect();
+    let ghost_set: std::collections::HashSet<&str> =
+        report.ghost_paths.iter().map(String::as_str).collect();
     let on_disk: std::collections::HashSet<String> = db_paths
         .into_iter()
-        .filter(|path| repo_root.join(path).exists())
+        .filter(|path| !ghost_set.contains(path.as_str()))
         .collect();
 
     let policy = if force {
