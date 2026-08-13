@@ -2353,7 +2353,7 @@ fn write_phase_b_results(
             event = "phase_b.indexed",
             nodes = pb_node_count,
             structural_edges = pb_edge_count,
-            "phase B indexing complete"
+            "semantic indexing complete"
         );
     }
     // H3: stamp phase_b_warnings in the meta table so `travsr status` can surface
@@ -2902,7 +2902,7 @@ fn run_background_phase_b_inner(
     tracing::info!(
         event = "phase_b.start",
         commit = %target_sha,
-        "background phase B refresh starting"
+        "semantic call and reference indexing starting"
     );
 
     // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
@@ -3010,7 +3010,7 @@ fn run_background_phase_b_inner(
         lsif_edges = lsif_edges.len(),
         crashed = report.crashed.len(),
         outcome = ?outcome,
-        "background phase B refresh complete"
+        "semantic call and reference indexing complete"
     );
 
     // Re-run k-core while the lock is still held: Phase B edges change the
@@ -3025,10 +3025,7 @@ fn run_background_phase_b_inner(
                 if let Err(e) = s.write_shell_numbers(&pairs) {
                     tracing::warn!("kcore: failed to update shell numbers after phase B: {e}");
                 } else {
-                    tracing::info!(
-                        event = "kcore.updated",
-                        "kcore: shell numbers updated after phase B"
-                    );
+                    tracing::info!(event = "kcore.updated", "graph centrality updated");
                 }
             }
             Err(e) => tracing::warn!("kcore: computation failed after phase B: {e}"),

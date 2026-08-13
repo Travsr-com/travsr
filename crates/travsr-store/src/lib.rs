@@ -4663,7 +4663,7 @@ impl SqliteStore {
         tracing::info!(
             missing = backfill_counts(node_count, map_count).0,
             stale = backfill_counts(node_count, map_count).1,
-            "RFC-012 L1: backfilling FTS index for unindexed nodes"
+            "building the text search index for new symbols"
         );
 
         // Fetch unindexed nodes into a Vec first so the statement is dropped
@@ -4716,7 +4716,7 @@ impl SqliteStore {
         }
         tx.commit().context("committing FTS backfill transaction")?;
 
-        tracing::info!(indexed = nodes.len(), "RFC-012 L1: FTS backfill complete");
+        tracing::info!(indexed = nodes.len(), "text search index updated");
         Ok(())
     }
 
@@ -4753,11 +4753,7 @@ impl SqliteStore {
         // unindexed, and the `NOT IN` query below is the only reliable answer.
         // So the pass stays, and only its *outcome* is announced.
         let (missing, stale) = backfill_counts(node_count, words_map_count);
-        tracing::debug!(
-            missing,
-            stale,
-            "#478: checking nodes_fts_words + is_noise for unindexed nodes"
-        );
+        tracing::debug!(missing, stale, "checking the word index for new symbols");
 
         let nodes: Vec<Node> = {
             let mut stmt = self
@@ -4816,12 +4812,12 @@ impl SqliteStore {
 
         // Only a pass that did something is worth a line in the log.
         if nodes.is_empty() {
-            tracing::debug!("#478: nodes_fts_words + is_noise already complete");
+            tracing::debug!("word index already current");
         } else {
             tracing::info!(
                 event = "store.fts_words.backfill",
                 indexed = nodes.len(),
-                "#478: nodes_fts_words + is_noise backfill complete"
+                "word index updated"
             );
         }
         Ok(())
@@ -6022,10 +6018,7 @@ LIMIT 100",
         tx.commit()
             .context("committing vocab backfill transaction")?;
 
-        tracing::info!(
-            nodes = token_strings.len(),
-            "RFC-012 L2-A: fts_vocab backfill complete"
-        );
+        tracing::info!(nodes = token_strings.len(), "search vocabulary updated");
         Ok(())
     }
 
@@ -6169,7 +6162,7 @@ LIMIT 100",
             }
         }
         tx.commit()?;
-        tracing::info!("RFC-012 A2 F1: seeded fts_synonyms from static defaults");
+        tracing::info!("loaded default search synonyms");
         Ok(())
     }
 

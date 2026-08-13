@@ -262,7 +262,7 @@ impl PluginIndexer {
 
         let providable = resolver.providable_languages();
         tracing::debug!(
-            "Phase B: resolver surfaced {} language(s): {:?}",
+            "semantic analysis available for {} language(s): {:?}",
             providable.len(),
             providable
         );
@@ -325,7 +325,7 @@ impl PluginIndexer {
             if !inputs.present_languages.is_empty()
                 && !inputs.present_languages.contains(lang.as_str())
             {
-                tracing::debug!(lang = %lang, "Phase B skipped — language absent from repo");
+                tracing::debug!(lang = %lang, "semantic analysis skipped, language not present in this repo");
                 outcome.skipped_not_in_repo.push(lang.clone());
                 continue;
             }
@@ -336,7 +336,7 @@ impl PluginIndexer {
             let is_builtin =
                 crate::phase_b::catalog::lookup(lang.as_str()).is_some_and(|e| e.builtin);
             if !is_builtin && !registered.contains(lang.as_str()) {
-                tracing::debug!(lang = %lang, "Phase B skipped — not registered in lang.toml");
+                tracing::debug!(lang = %lang, "semantic analysis skipped, no tool registered for this language");
                 outcome.skipped_unregistered.push(lang.clone());
                 continue;
             }

@@ -27,8 +27,16 @@
 //! head.reconcile.complete  phase_b.start         phase_b.indexed
 //! phase_b.complete         kcore.updated         embed.text.updated
 //! embed.text.fts_backfill  store.fts_words.backfill
-//! lsif.spawn               lsif.complete         adr017.fuzz_target.missing
+//! lsif.spawn               lsif.complete         fuzz_target.missing
 //! ```
+//!
+//! The keys keep the codebase's own vocabulary (`phase_b`, `lsif`, `kcore`)
+//! because they are identifiers, matched exactly by whatever reads them, and a
+//! machine gains nothing from a friendlier spelling. The *messages* beside them
+//! are written for people, so they say "semantic call and reference indexing"
+//! where the key says `phase_b`. Renaming a key is a breaking change for every
+//! query built on it; rewording a message is not, which is the whole reason the
+//! keys exist.
 //!
 //! Deliberately not every log site. A key is a promise to keep it spelled the
 //! same way, so it is worth adding where something *happened* that a reader

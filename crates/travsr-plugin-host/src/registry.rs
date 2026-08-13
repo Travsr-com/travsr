@@ -54,13 +54,17 @@ fn check_fuzz_targets_once() {
             .map(|(lang, _)| *lang)
             .collect();
         if !missing.is_empty() {
-            tracing::warn!(
-                event = "adr017.fuzz_target.missing",
+            // The eligibility rule this enforces is ADR-017 Rule 4. The rule
+            // reference belongs here rather than in the message: the log is read
+            // by people running travsr, and "ADR-017 Rule 4" tells them nothing
+            // they can act on. DEBUG for the same reason. Nothing about a
+            // missing fuzz target affects the indexing they are waiting on, and
+            // at WARN this was the single most repeated line in the file.
+            tracing::debug!(
+                event = "fuzz_target.missing",
                 count = missing.len(),
                 langs = %missing.join(","),
-                "ADR-017 Rule 4: {} in-process grammar(s) have no fuzz target under \
-                 fuzz/fuzz_targets — add cargo-fuzz targets to satisfy the eligibility \
-                 requirement",
+                "{} language grammar(s) are parsed in-process without a fuzz target",
                 missing.len()
             );
         }
@@ -86,12 +90,13 @@ pub fn probe_sandbox() {
                 .status()
                 .is_ok();
             if available {
-                tracing::info!("sandbox: bubblewrap available — Phase B sidecar spawn enabled");
+                tracing::info!(
+                    "sandbox available (bubblewrap), semantic analysis can run isolated"
+                );
             } else {
                 tracing::warn!(
-                    "sandbox: bubblewrap (bwrap) not found on PATH — \
-                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
-                     Install with: sudo apt-get install bubblewrap"
+                    "no sandbox found (bubblewrap), so semantic analysis that needs isolation \
+                     is disabled. Install it with: sudo apt-get install bubblewrap"
                 );
             }
         }
@@ -99,18 +104,20 @@ pub fn probe_sandbox() {
         {
             let available = std::path::Path::new("/usr/bin/sandbox-exec").exists();
             if available {
-                tracing::info!("sandbox: sandbox-exec available — Phase B sidecar spawn enabled");
+                tracing::info!(
+                    "sandbox available (sandbox-exec), semantic analysis can run isolated"
+                );
             } else {
                 tracing::warn!(
-                    "sandbox: sandbox-exec not found — \
-                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+                    "no sandbox found (sandbox-exec), so semantic analysis that needs isolation \
+                     is disabled"
                 );
             }
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         tracing::warn!(
-            "sandbox: no sandbox implementation for this platform — \
-             Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+            "no sandbox implementation for this platform, so semantic analysis that needs \
+             isolation is disabled"
         );
     });
 }
