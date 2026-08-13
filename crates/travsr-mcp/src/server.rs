@@ -127,6 +127,7 @@ fn handle_tool_call(
     // call inherits it, which is what makes "show me everything that happened
     // for that one slow get_context" an answerable question.
     let _span = tracing::info_span!("mcp.tool_call", tool = tool_name, req = %id).entered();
+    let started = std::time::Instant::now();
     let text = match tool_name {
         "get_dependencies" => {
             let file = args["file"].as_str().unwrap_or("");
@@ -315,7 +316,9 @@ fn handle_tool_call(
     // tool_calls_total=1 is a log-based counter field for tracing subscribers.
     // TODO(travsr-060): replace with otel Counter metric for proper OTLP aggregation.
     tracing::info!(
+        event = "mcp.tool_call.served",
         tool = tool_name,
+        elapsed_ms = started.elapsed().as_millis(),
         tool_calls_total = 1u64,
         "mcp.tool_call complete"
     );

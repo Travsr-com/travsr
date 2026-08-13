@@ -91,7 +91,14 @@ pub fn run(
 
     // Callers and blast radius ride ref/call edges, so an incomplete Phase B
     // turns "nothing found" into a wrong answer rather than a small one.
-    daemon_client::warn_if_call_graph_degraded(&db_path);
+    //
+    // `deps` does not: it rides Phase A import and `defines` edges, which are
+    // complete whether or not Phase B has run. Warning there told the user their
+    // complete answer might be missing something, which is both wrong and the
+    // fastest way to teach someone to ignore the warning that matters.
+    if !matches!(direction, Direction::Deps) {
+        daemon_client::warn_if_call_graph_degraded(&db_path);
+    }
 
     // Daemon route first (#318 O1), direct read-only open as fallback.
     let payload: GraphPayload =

@@ -8356,6 +8356,7 @@ fn handle_control_message(
             // "work?" and "work ?" share the same cache entry and produce
             // identical embedding vectors. Only applied to NL tools ("ask");
             // symbol-name tools ("graph") are left as-is.
+            let started = std::time::Instant::now();
             let args = normalize_nl_query_args(&tool, args);
             // R5 (#342): use the dedicated read-only connection so this lock
             // does not block the indexer worker from acquiring the write store.
@@ -8404,6 +8405,13 @@ fn handle_control_message(
             if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
+                    tracing::info!(
+                        event = "query.served",
+                        tool = %tool,
+                        cached = true,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "query served"
+                    );
                     return (ControlResponse::query_result(cached), false);
                 }
             }
@@ -8420,9 +8428,31 @@ fn handle_control_message(
                             value.clone(),
                         );
                     }
+                    // The line that makes "which query was slow" answerable.
+                    // Without it a successful query logged nothing at all, so
+                    // the `req` correlation id had nothing on the happy path to
+                    // bind to and per-request timing did not exist. `cached`
+                    // distinguishes the two costs, which is usually the first
+                    // thing worth knowing about a slow one.
+                    tracing::info!(
+                        event = "query.served",
+                        tool = %tool,
+                        cached = false,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "query served"
+                    );
                     (ControlResponse::query_result(value), false)
                 }
-                Err(e) => (ControlResponse::err(format!("query failed: {e:#}")), false),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "query.failed",
+                        tool = %tool,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %e,
+                        "query failed"
+                    );
+                    (ControlResponse::err(format!("query failed: {e:#}")), false)
+                }
             }
         }
         Err(e) => (ControlResponse::err(format!("parse error: {e}")), false),

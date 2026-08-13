@@ -623,6 +623,11 @@ fn decl_kinds_for(lang: &Lang) -> &'static [&'static str] {
         Lang::Swift => &[
             "function_declaration",
             "init_declaration",
+            // `let handler = { (a: Int) -> Int in ... }`: a closure bound to a
+            // name. Without this the node is indexed and gets no text at all,
+            // which is exactly where TypeScript arrows were before they were
+            // anchored.
+            "property_declaration",
             "class_declaration", // covers struct/enum/actor/extension too (declaration_kind field)
             "protocol_declaration",
         ],
@@ -1085,6 +1090,38 @@ fn extract_go(
                     collect_callees_dfs(c, src, "call_expression", &mut callees);
                     collect_body_comments_dfs(c, src, ck, &mut comments);
                     break;
+                }
+            }
+        }
+        // `var handler = func(a int) int { ... }`, and the `const`/`var` forms
+        // generally. The declaration carries only a name; the signature lives on
+        // the function value bound to it, so without descending into the literal
+        // the text is `var: var:handler | module: m.go` and nothing more. Same
+        // shape as a TypeScript arrow bound to a `const`, handled the same way.
+        //
+        // A plain `var x = 3` has no literal to find and keeps the name-only
+        // text, which is all there is to say about it.
+        "var_declaration" | "var_spec" | "const_declaration" | "const_spec" => {
+            if let Some(f) = first_descendant_of_kind(decl, "func_literal") {
+                if let Some(p) = f.child_by_field_name("parameters") {
+                    for i in 0..p.named_child_count() {
+                        let Some(c) = p.named_child(i as u32) else {
+                            continue;
+                        };
+                        if matches!(
+                            c.kind(),
+                            "parameter_declaration" | "variadic_parameter_declaration"
+                        ) {
+                            params.push(node_text(c, src).to_string());
+                        }
+                    }
+                }
+                if let Some(r) = f.child_by_field_name("result") {
+                    return_type = Some(node_text(r, src).to_string());
+                }
+                if let Some(b) = f.child_by_field_name("body") {
+                    collect_callees_dfs(b, src, "call_expression", &mut callees);
+                    collect_body_comments_dfs(b, src, ck, &mut comments);
                 }
             }
         }
@@ -1584,6 +1621,45 @@ fn extract_swift(
             }
             if let Some(body) = named_child_of_kind(decl, "code_block") {
                 collect_body_comments_dfs(body, src, ck, &mut comments);
+            }
+        }
+        // `let handler = { (a: Int) -> Int in ... }`: the property carries only a
+        // name, and the signature is on the closure bound to it. Read from the
+        // grammar rather than assumed: the closure is a `lambda_literal`, whose
+        // `lambda_function_type` holds `lambda_function_type_parameters` of
+        // `lambda_parameter`, and the return type after them.
+        //
+        // A property with no closure (`let n = 3`, a stored property) finds no
+        // literal and keeps its name-only text, which is all it has.
+        "property_declaration" => {
+            if let Some(lambda) = first_descendant_of_kind(decl, "lambda_literal") {
+                if let Some(ty) = first_descendant_of_kind(lambda, "lambda_function_type") {
+                    if let Some(ps) =
+                        first_descendant_of_kind(ty, "lambda_function_type_parameters")
+                    {
+                        for i in 0..ps.named_child_count() {
+                            let Some(c) = ps.named_child(i as u32) else {
+                                continue;
+                            };
+                            if c.kind() == "lambda_parameter" {
+                                params.push(node_text(c, src).to_string());
+                            }
+                        }
+                    }
+                    // The return type is the type sitting after the parameter
+                    // list inside the function type, so take the last type-ish
+                    // child that is not the parameter list itself.
+                    for i in (0..ty.named_child_count()).rev() {
+                        let Some(c) = ty.named_child(i as u32) else {
+                            continue;
+                        };
+                        if c.kind() != "lambda_function_type_parameters" {
+                            return_type = Some(node_text(c, src).to_string());
+                            break;
+                        }
+                    }
+                }
+                collect_body_comments_dfs(lambda, src, ck, &mut comments);
             }
         }
         "init_declaration" => {
@@ -3587,5 +3663,60 @@ mod tests {
             out[0].1,
             "function: fn:add | module: helpers.h | params: int a, int b | returns: int"
         );
+    }
+    /// A function value bound to a name, in the languages where the node is
+    /// indexed. TypeScript arrows were fixed first; the same shape exists in Go
+    /// and Swift, and both were left behind. Swift got no text at all, which is
+    /// exactly where TS arrows were: indexed, and absent from the vector index.
+    ///
+    /// Node names read from the grammar rather than assumed. Go nests the value
+    /// as `var_spec -> expression_list -> func_literal`; Swift as
+    /// `property_declaration -> lambda_literal -> lambda_function_type`.
+    #[test]
+    fn a_function_value_bound_to_a_name_carries_its_signature() {
+        let cases: Vec<(&str, &str, &str, &str, u32, &str)> = vec![
+            (
+                "go: func literal bound to a package-level var",
+                "go",
+                "m.go",
+                "package m\n\nvar handler = func(a int) int { return a }\n",
+                3,
+                "function: fn:x | module: m.go | params: a int | returns: int",
+            ),
+            (
+                "swift: closure bound to a let",
+                "swift",
+                "m.swift",
+                "let handler = { (a: Int) -> Int in a }\n",
+                1,
+                "function: fn:x | module: m.swift | params: a: Int | returns: Int",
+            ),
+        ];
+        for (why, lang, path, src, line, want) in cases {
+            let node = make_node(path, "fn:x", lang, "function", line, line);
+            let out = embed_text_for(path, src, &node);
+            assert_eq!(out.len(), 1, "{why}: produced no text");
+            assert_eq!(out[0].1, want, "{why}");
+        }
+    }
+
+    /// A binding with no function value keeps its name-only text. The descent
+    /// must not invent a signature for `var n = 3`, and must not regress it to
+    /// nothing by failing to find a literal that was never there.
+    #[test]
+    fn a_plain_value_binding_is_left_as_a_name() {
+        for (lang, path, src, line) in [
+            ("go", "m.go", "package m\n\nvar n = 3\n", 3u32),
+            ("swift", "m.swift", "let n = 3\n", 1u32),
+        ] {
+            let node = make_node(path, "fn:x", lang, "function", line, line);
+            let out = embed_text_for(path, src, &node);
+            assert_eq!(out.len(), 1, "{lang}: a plain binding still gets its name");
+            assert!(
+                !out[0].1.contains("params:") && !out[0].1.contains("returns:"),
+                "{lang}: nothing to read a signature from, so none should appear: {}",
+                out[0].1
+            );
+        }
     }
 }

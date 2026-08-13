@@ -282,8 +282,10 @@ enum DaemonAction {
         /// 0 prints the whole retained history.
         #[arg(long, default_value_t = 50)]
         lines: usize,
-        /// Show only lines tagged with this repo. Useful against a log that
-        /// serves several repos.
+        /// Show only lines tagged with this repo, for a log that serves several
+        /// of them. Matches the repo tag as written: `--global` logs tag by
+        /// name, while this repo's own log tags by full path, so a bare
+        /// basename will not match here.
         #[arg(long)]
         repo: Option<String>,
         /// Show only this severity and above: trace, debug, info, warn, error.
