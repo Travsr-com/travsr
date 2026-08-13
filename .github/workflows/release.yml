@@ -135,6 +135,7 @@ jobs:
             "MSRV (rust 1.75)"
             "cargo-deny"
             "plugin-hashes.lock"
+            "release/installer target maps"
             "TL1/TL2 — zero LLM/embedding deps in travsr-mcp"
             "Phase 2 correctness suite"
             "Bench p95 < 50 ms"
