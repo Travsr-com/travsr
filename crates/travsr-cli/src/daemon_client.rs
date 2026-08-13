@@ -35,17 +35,19 @@ pub(crate) enum SpawnOutcome {
 /// open→write window). Because the OS releases an flock when its holder dies,
 /// "held" inherently means "a live process holds it" — no PID-liveness check
 /// needed. If we can take the lock, no daemon holds it and we release immediately.
+///
+/// Opens read-only and NEVER creates the file: an absent lock means no daemon
+/// can possibly hold it, so `false` is the answer without writing anything.
+/// The previous `.create(true)` made this liveness probe create the very file
+/// it was probing, so every non-interactive `travsr init` (CI, pipes,
+/// scripts) left a stale zero-byte `.travsr/daemon.lock` behind, a file the
+/// singleton protocol treats as meaningful, dropped there by something that
+/// only wanted to read it (#636 round-2 review).
 pub(crate) fn daemon_lock_held(repo_root: &Path) -> bool {
     use fs2::FileExt as _;
     let lock_path = repo_root.join(".travsr").join("daemon.lock");
-    // NB: no `.truncate(true)` — never clobber a running daemon's PID content.
-    #[allow(clippy::suspicious_open_options)]
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    else {
-        return false; // .travsr missing / unopenable → no daemon possible
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(&lock_path) else {
+        return false; // absent / .travsr missing / unopenable → no daemon possible
     };
     match file.try_lock_exclusive() {
         Ok(()) => {
@@ -235,6 +237,51 @@ mod lock_tests {
         // With .travsr present but nobody holding the flock → still not held.
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
         assert!(!daemon_lock_held(tmp.path()));
+    }
+
+    /// #636 round-2 review: a liveness probe must not create the file it
+    /// probes. The old `.create(true)` open left a zero-byte
+    /// `.travsr/daemon.lock` behind on every non-interactive `travsr init`.
+    #[test]
+    fn probing_never_creates_the_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr).unwrap();
+
+        assert!(!daemon_lock_held(tmp.path()));
+        assert!(
+            !travsr.join("daemon.lock").exists(),
+            "probing must not create .travsr/daemon.lock"
+        );
+    }
+
+    /// The singleton semantics the probe exists for are unchanged: an
+    /// exclusively locked, already-present lock file still reads as held.
+    #[test]
+    fn lock_held_for_an_existing_exclusively_locked_file() {
+        use fs2::FileExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr).unwrap();
+        std::fs::write(travsr.join("daemon.lock"), b"12345").unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(travsr.join("daemon.lock"))
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        assert!(daemon_lock_held(tmp.path()));
+
+        fs2::FileExt::unlock(&held).unwrap();
+        drop(held);
+        assert!(!daemon_lock_held(tmp.path()));
+        // Still there, still holding the daemon's PID: the probe never
+        // truncated or clobbered it.
+        assert_eq!(
+            std::fs::read_to_string(travsr.join("daemon.lock")).unwrap(),
+            "12345"
+        );
     }
 
     #[test]
