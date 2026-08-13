@@ -64,15 +64,9 @@ fn detect_dart_sdk() -> Option<PathBuf> {
     // (Without this the emitter falls back to a broken auto-detect → empty Dart
     // Phase B, reintroducing the #299 E1 failure.)
     if let Some(dart) = first_dart {
-        if let Ok(out) = std::process::Command::new(&dart)
-            .arg("--print-sdk-path")
-            .output()
-        {
-            if out.status.success() {
-                let sdk = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-                if !sdk.as_os_str().is_empty() && is_sdk_root(&sdk) {
-                    return Some(sdk);
-                }
+        if let Some(sdk) = sdk_root_via_dart(&dart) {
+            if is_sdk_root(&sdk) {
+                return Some(sdk);
             }
         }
     }
@@ -81,6 +75,35 @@ fn detect_dart_sdk() -> Option<PathBuf> {
          Set DART_SDK to the SDK root (the directory containing lib/_internal) to enable it."
     );
     None
+}
+
+/// Ask the `dart` tool where its SDK lives, for the version-manager-shim case.
+///
+/// There is no `dart` flag that prints the SDK path (the old `--print-sdk-path`
+/// was invalid and this fallback silently no-opped — U6a). Instead we run a
+/// one-line program that prints `Platform.resolvedExecutable`'s SDK root
+/// (`<sdk>/bin/dart` → `<sdk>`). This resolves correctly even through an asdf /
+/// mise / volta shim, because the shim `exec`s the real binary so
+/// `resolvedExecutable` is the true `<sdk>/bin/dart`, not the shim script.
+///
+/// Returns `None` on any failure (spawn error, non-zero exit, empty output) so
+/// a broken shim degrades to the "SDK not found" warning in [`detect_dart_sdk`]
+/// rather than handing the emitter an invalid path.
+fn sdk_root_via_dart(dart: &Path) -> Option<PathBuf> {
+    let scratch = tempfile::tempdir().ok()?;
+    let prog = scratch.path().join("travsr_sdk_probe.dart");
+    std::fs::write(
+        &prog,
+        "import 'dart:io';\n\
+         void main() => print(File(Platform.resolvedExecutable).parent.parent.path);\n",
+    )
+    .ok()?;
+    let out = std::process::Command::new(dart).arg(&prog).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 fn emitter_path() -> Option<PathBuf> {
@@ -488,5 +511,27 @@ mod tests {
 
         let got = unresolved_dep_packages(r);
         assert_eq!(got, vec!["pkgs/shelf".to_string()]);
+    }
+
+    #[test]
+    fn sdk_root_via_dart_resolves_installed_sdk() {
+        // U6a: the shim fallback must run a program the installed Dart accepts
+        // (unlike the old invalid `--print-sdk-path`) and resolve a real SDK
+        // root — never silently no-op. Gated on a real `dart` being on PATH so
+        // CI images without Dart skip rather than fail.
+        let dart_name = format!("dart{}", std::env::consts::EXE_SUFFIX);
+        let Some(dart) = std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(&dart_name))
+                .find(|c| c.exists())
+        }) else {
+            eprintln!("skipping sdk_root_via_dart: no `dart` on PATH");
+            return;
+        };
+        let sdk = sdk_root_via_dart(&dart).expect("dart probe should resolve an SDK root");
+        assert!(
+            sdk.join("lib/_internal/allowed_experiments.json").is_file(),
+            "resolved path {sdk:?} is not a Dart SDK root"
+        );
     }
 }
