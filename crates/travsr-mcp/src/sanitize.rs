@@ -214,39 +214,52 @@ fn redact_home_paths(s: &str) -> String {
     redact_windows_home_run(&out, ":/Users/")
 }
 
-/// End of the username run starting at `after`: the first byte that isn't a
-/// plausible username character (POSIX portable filename charset, `[A-Za-z0-9._-]`),
-/// or `after.len()` when the whole remainder is username-shaped.
+/// Byte offset of the end of the username run starting at `after`: the first
+/// character that isn't a plausible username character (any Unicode
+/// alphanumeric, plus `_`, `-`, `.`), or `after.len()` when the whole
+/// remainder is username-shaped. The returned offset is always a char
+/// boundary (`str::find` with a char predicate reports char starts).
 ///
-/// Used when no path separator follows the username, i.e. the home path is
-/// the last path-ish token in the string: only the username itself should be
-/// consumed, everything after it is unrelated message text and must survive
-/// (#636 review: consuming to end-of-string here silently dropped the rest
-/// of the log message, e.g. `"cannot stat /home/bob, retrying"` became
-/// `"cannot stat ~"`, losing `", retrying"`).
+/// This bounds the username in EVERY case, whether or not a path separator
+/// follows it: only the username itself is consumed, everything after it is
+/// unrelated message text and must survive (#636 review: consuming to the
+/// next separator, or to end-of-string, silently dropped the rest of the log
+/// message, e.g. `"cannot stat /home/bob, retrying"` became `"cannot stat ~"`
+/// and `"index /home/bob failed, see /var/log/travsr.log"` became the
+/// actively misleading `"index ~/var/log/travsr.log"`).
+///
+/// Unicode alphanumeric, not `is_ascii_alphanumeric`: a non-ASCII username
+/// otherwise ended the run at its first non-ASCII byte and leaked its tail
+/// (#636 round-2 review: `"stat /home/böb failed"` -> `"stat ~öb failed"`).
 fn username_run_end(after: &str) -> usize {
     after
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
         .unwrap_or(after.len())
 }
 
-/// Replace `<prefix><username>/` with `~/`, left to right. `<username>` is
-/// the run of non-`/` bytes between `prefix` and the next `/`.
+/// Replace `<prefix><username>` with `~` (and a trailing `/`, when the
+/// username is directly followed by one) left to right. `<username>` is the
+/// run bounded by [`username_run_end`], never the span up to the next `/`
+/// anywhere in the remainder.
+///
+/// Single code path on purpose: the separator-present and separator-absent
+/// cases differ only in whether the separator itself is consumed, and
+/// splitting them into two branches is exactly how the unbounded scan
+/// survived in the "some other path follows on this line" branch (#636
+/// round-2 review).
 fn redact_unix_home_run(s: &str, prefix: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(idx) = rest.find(prefix) {
         out.push_str(&rest[..idx]);
         let after = &rest[idx + prefix.len()..];
-        match after.find('/') {
-            Some(pos) => {
-                out.push_str("~/");
-                rest = &after[pos + 1..];
-            }
-            None => {
-                out.push('~');
-                rest = &after[username_run_end(after)..];
-            }
+        let end = username_run_end(after);
+        if after[end..].starts_with('/') {
+            out.push_str("~/");
+            rest = &after[end + '/'.len_utf8()..];
+        } else {
+            out.push('~');
+            rest = &after[end..];
         }
     }
     out.push_str(rest);
@@ -256,6 +269,12 @@ fn redact_unix_home_run(s: &str, prefix: &str) -> String {
 /// Replace `<drive-letter><prefix><username><sep>` with `~/`, where `prefix`
 /// is `:\Users\` or `:/Users/` and a single preceding ASCII drive-letter
 /// character (if present) is consumed too.
+///
+/// Same bounding as [`redact_unix_home_run`]: the username run ends at
+/// [`username_run_end`], not at the next `sep` anywhere later in the string.
+/// Unlike the Unix helper both cases emit `~/` (the trailing separator is
+/// part of the replacement here, so a bare `C:\Users\bob` reads `~/`), which
+/// is pre-existing behaviour and deliberately preserved.
 fn redact_windows_home_run(s: &str, prefix: &str) -> String {
     let sep = prefix.chars().last().unwrap_or('\\');
     let mut out = String::with_capacity(s.len());
@@ -270,17 +289,14 @@ fn redact_windows_home_run(s: &str, prefix: &str) -> String {
             idx
         };
         out.push_str(&rest[..prefix_start]);
+        out.push_str("~/");
         let after = &rest[idx + prefix.len()..];
-        match after.find(sep) {
-            Some(pos) => {
-                out.push_str("~/");
-                rest = &after[pos + 1..];
-            }
-            None => {
-                out.push_str("~/");
-                rest = &after[username_run_end(after)..];
-            }
-        }
+        let end = username_run_end(after);
+        rest = if after[end..].starts_with(sep) {
+            &after[end + sep.len_utf8()..]
+        } else {
+            &after[end..]
+        };
     }
     out.push_str(rest);
     out
@@ -911,5 +927,46 @@ mod tests {
     fn redact_does_not_touch_unrelated_text() {
         let out = redact_sensitive("fn charge(amount: u64) -> Result<(), Error>");
         assert_eq!(out, "fn charge(amount: u64) -> Result<(), Error>");
+    }
+
+    /// #636 round-2 review: the branch that fires when another path appears
+    /// later on the line scanned to the next `/` anywhere in the remainder,
+    /// so everything between the home path and that slash was swallowed as if
+    /// it were part of the username. The first case is the worst: it dropped
+    /// "failed, see" and rewrote the line to read as though the path itself
+    /// were `~/var/log/travsr.log`.
+    #[test]
+    fn redact_home_path_bounds_username_when_another_path_follows_on_the_line() {
+        let out = redact_sensitive("index /home/bob failed, see /var/log/travsr.log");
+        assert!(out.contains("failed, see"), "got: {out}");
+        assert!(out.contains("/var/log/travsr.log"), "got: {out}");
+        assert!(!out.contains("/home/bob"), "got: {out}");
+
+        let out = redact_sensitive("reindex /Users/alice aborted; retry with --force /tmp/x");
+        assert!(out.contains("aborted; retry with --force"), "got: {out}");
+        assert!(!out.contains("alice"), "got: {out}");
+    }
+
+    /// The same unbounded scan resumed past the *second* home path, so that
+    /// username went out unredacted (#636 round-2 review).
+    #[test]
+    fn redact_home_path_redacts_a_second_username_later_on_the_line() {
+        let out = redact_sensitive("copy /home/bob to /home/carol/dest");
+        assert!(out.contains(" to "), "got: {out}");
+        assert!(!out.contains("carol"), "got: {out}");
+
+        let out = redact_sensitive(r"copy C:\Users\bob to C:\Users\carol\dest");
+        assert!(out.contains(" to "), "got: {out}");
+        assert!(!out.contains("carol"), "got: {out}");
+    }
+
+    /// #636 round-2 review: `username_run_end` accepted only ASCII, so a
+    /// non-ASCII username ended its run at the first non-ASCII byte and
+    /// leaked the tail (`/home/böb` -> `~öb`).
+    #[test]
+    fn redact_home_path_handles_non_ascii_username() {
+        let out = redact_sensitive("stat /home/b\u{f6}b failed");
+        assert!(!out.contains("\u{f6}b"), "got: {out}");
+        assert!(out.contains(" failed"), "got: {out}");
     }
 }
