@@ -1368,6 +1368,59 @@ mod tests {
         let _ = fs2::FileExt::unlock(&restart);
     }
 
+    /// The most direct evidentiary case for "the probe takes no lock at all"
+    /// (#636 round-2 review). Unlike the two tests above, which hold a
+    /// single exclusive lock for the whole test and prove it survives many
+    /// probes, this test never has any holder at all: a fresh exclusive
+    /// `try_lock_exclusive`/`unlock` cycle races directly against concurrent
+    /// `daemon_running` probes running on their own threads. If `daemon_running`
+    /// took so much as a shared lock, some fraction of these fresh exclusive
+    /// acquisitions would see `WouldBlock`. It never does, because
+    /// `daemon_running` only reads the PID out of the file and never calls
+    /// `try_lock*` at all. Deterministic: the probing threads are stopped by
+    /// a flag once the fixed number of lock attempts on the main thread
+    /// completes, no sleeps or timing assumptions.
+    #[test]
+    fn daemon_running_never_blocks_a_fresh_exclusive_try_lock_with_no_holder() {
+        let (tmp, lock) = repo_with_lock_pid(&std::process::id().to_string());
+        let root = tmp.path().to_path_buf();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let root = root.clone();
+                let stop = &stop;
+                s.spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = daemon_running(&root);
+                    }
+                });
+            }
+
+            for _ in 0..2_000 {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock)
+                    .unwrap();
+                if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+                    failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    let _ = fs2::FileExt::unlock(&file);
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert_eq!(
+            failures.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a fresh exclusive try_lock must never fail while the probe runs concurrently: \
+             daemon_running holds no lock of any kind"
+        );
+    }
+
     // ── get_index_status payload ──────────────────────────────────────────
 
     #[test]
