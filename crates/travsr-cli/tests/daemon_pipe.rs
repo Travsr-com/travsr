@@ -12,7 +12,7 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Generous per-stage ceiling: a tiny-repo init plus daemon spawn completes in
 /// seconds; only the #572 leak makes EOF wait for the daemon's exit.
@@ -107,7 +107,55 @@ fn daemon_status(repo: &Path) -> String {
     s
 }
 
+/// Poll `daemon status` until it reports the daemon running, up to `deadline`.
+///
+/// `daemon start` confirms the spawn for only ~5 s and then legitimately
+/// returns with the daemon still "starting": the child holds the repo lock
+/// but has not bound its control pipe yet (store open, embed sidecar loading
+/// its model, initial watcher scan — or a concurrent reindex holding the
+/// embed lock). Status only flips to "running [" once the pipe binds, so a
+/// single immediate snapshot races startup and fails on any slow machine.
+fn wait_for_daemon_running(repo: &Path, deadline: Duration) -> String {
+    let cutoff = Instant::now() + deadline;
+    loop {
+        let out = daemon_status(repo);
+        if out.contains("running [") {
+            return out;
+        }
+        assert!(
+            Instant::now() < cutoff,
+            "daemon must be running after the piped start completed, but it never \
+             reported so within {deadline:?}; last status:\n{out}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// True iff a live daemon holds this repo's `.travsr/daemon.lock` flock —
+/// the same race-free singleton probe the CLI uses. The OS drops the flock
+/// when its holder dies, so "held" inherently means a live process.
+fn repo_daemon_alive(repo: &Path) -> bool {
+    use fs2::FileExt as _;
+    // NB: no `.truncate(true)` — never clobber a running daemon's PID content.
+    #[allow(clippy::suspicious_open_options)]
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(repo.join(".travsr").join("daemon.lock"))
+    else {
+        return false; // no .travsr → no daemon possible
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// Wait until every daemon spawned from the test binary has actually exited.
+/// Returns `true` once no process runs this binary anymore.
 ///
 /// `daemon stop` is acknowledged before the process is gone, and a daemon
 /// that outlives its (deleted) temp repo can linger past any status poll —
@@ -116,18 +164,77 @@ fn daemon_status(repo: &Path) -> String {
 /// access, so an append-open succeeding is proof no process is running this
 /// binary anymore. Best-effort: gives up after `deadline` (a developer's own
 /// daemon running the same debug binary would legitimately hold it).
-fn wait_for_daemon_exit(deadline: Duration) {
-    let cutoff = std::time::Instant::now() + deadline;
-    while std::time::Instant::now() < cutoff {
+fn wait_for_daemon_exit(deadline: Duration) -> bool {
+    let cutoff = Instant::now() + deadline;
+    while Instant::now() < cutoff {
         if std::fs::OpenOptions::new()
             .append(true)
             .open(travsr_exe())
             .is_ok()
         {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    false
+}
+
+/// Stop this repo's daemon and only return once it is actually gone.
+///
+/// One fire-and-forget `daemon stop` is not enough: sent while the daemon is
+/// still starting (repo lock held, control pipe not bound yet) the stop used
+/// to come back as "not running" and was silently lost — the daemon then
+/// outlived the deleted temp repo forever, serving stale answers and keeping
+/// `target\debug\travsr.exe` locked. The CLI now waits out that window
+/// itself, but the test's cleanup must not depend on the code under test:
+/// retry the stop for as long as a daemon holds this repo's lock, and
+/// force-kill daemons of this binary as a last resort so one wedged stop
+/// path cannot poison every later `cargo` relink on the machine.
+fn stop_daemon_and_wait(repo: &Path) {
+    let cutoff = Instant::now() + STAGE_DEADLINE;
+    loop {
+        let _ = Command::new(travsr_exe())
+            .args(["daemon", "stop"])
+            .current_dir(repo)
+            .status();
+        if !repo_daemon_alive(repo) {
+            // This repo's daemon released its lock; give the process (and any
+            // unrelated sibling daemon a developer may run off this binary —
+            // hence best-effort) time to release the executable image too.
+            wait_for_daemon_exit(Duration::from_secs(30));
+            return;
+        }
+        if Instant::now() >= cutoff {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    kill_daemons_of_this_binary();
+    wait_for_daemon_exit(Duration::from_secs(10));
+}
+
+/// Last resort: force-kill every `daemon start --foreground` process running
+/// THIS test build's travsr executable. Only reached after a daemon held the
+/// repo lock through the whole [`STAGE_DEADLINE`] of stop retries, i.e. the
+/// stop path itself is wedged. (This may also take down a developer's own
+/// daemon started from the same debug binary; at this point that beats
+/// leaking a daemon that locks the binary and serves a deleted temp repo.)
+fn kill_daemons_of_this_binary() {
+    let exe = travsr_exe();
+    let name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "travsr.exe".to_string());
+    let exe = exe.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='{name}'\" | \
+         Where-Object {{ $_.ExecutablePath -eq '{exe}' -and \
+                         $_.CommandLine -match 'daemon start --foreground' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status();
 }
 
 /// Stops the repo's daemon on drop, so a mid-test panic never strands a
@@ -135,11 +242,7 @@ fn wait_for_daemon_exit(deadline: Duration) {
 struct DaemonGuard(PathBuf);
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let _ = Command::new(travsr_exe())
-            .args(["daemon", "stop"])
-            .current_dir(&self.0)
-            .status();
-        wait_for_daemon_exit(Duration::from_secs(30));
+        stop_daemon_and_wait(&self.0);
     }
 }
 
@@ -156,22 +259,18 @@ fn piped_daemon_start_reaches_eof_while_daemon_keeps_running() {
     // Force the explicit `daemon start` spawn path: stop whatever init
     // started and wait for it to actually exit (not merely acknowledge the
     // stop), or the start below sees the repo lock still held and reports
-    // AlreadyRunning without ever spawning.
-    let _ = Command::new(travsr_exe())
-        .args(["daemon", "stop"])
-        .current_dir(repo.path())
-        .status();
-    wait_for_daemon_exit(Duration::from_secs(60));
+    // AlreadyRunning without ever spawning. This stop can race init's daemon
+    // still being mid-startup, so it must retry rather than fire once.
+    stop_daemon_and_wait(repo.path());
 
     // The issue's exact repro: `travsr daemon start | <reader>` must complete
     // promptly...
     let (status, output) = run_piped_expecting_prompt_eof(repo.path(), &["daemon", "start"]);
     assert!(status.success(), "travsr daemon start failed:\n{output}");
 
-    // ...while the daemon it spawned keeps running.
-    let status_out = daemon_status(repo.path());
-    assert!(
-        status_out.contains("running ["),
-        "daemon must still be running after the piped start completed:\n{status_out}"
-    );
+    // ...while the daemon it spawned keeps running. Poll rather than assert a
+    // single snapshot: on a slow startup the CLI's spawn-confirmation window
+    // expires with the control pipe still unbound, and status only reports
+    // "running [" once the pipe binds.
+    wait_for_daemon_running(repo.path(), STAGE_DEADLINE);
 }
