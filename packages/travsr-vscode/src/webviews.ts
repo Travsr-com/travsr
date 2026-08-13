@@ -119,13 +119,31 @@ export function webviewShell(title: string, body: string, script: string): strin
     vertical-align: top; font-size: 12px; }
   .activity td:first-child { white-space: nowrap; width: 1%; }
   .activity .detail { font-size: 11px; }
+  .activity .when { font-variant-numeric: tabular-nums; white-space: nowrap; width: 1%; }
+  .activity .what { color: var(--fg); }
+  /* A dot per family, so a run of one kind of work is findable without reading
+     any of it. Same hues the log gives each subsystem. */
+  .activity td.fam { width: 1%; padding-right: 0; }
+  .fam-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--fg-subtle); vertical-align: middle; }
+  .activity tr[data-fam="daemon"] .fam-dot { background: var(--green); }
+  .activity tr[data-fam="git"]    .fam-dot { background: #a78bfa; }
+  .activity tr[data-fam="index"]  .fam-dot { background: var(--orange); }
+  .activity tr[data-fam="search"] .fam-dot { background: var(--gold); }
+  .activity tr[data-fam="query"]  .fam-dot { background: #7dd3fc; }
+  /* How many times in a row, as a pill rather than loose text. */
+  .run { font-size: 10px; font-variant-numeric: tabular-nums; color: var(--fg-muted);
+    border: 1px solid var(--border); border-radius: 8px; padding: 0 5px; margin-left: 5px; }
   /* Whole row tinted, not just the label: a warning should read as one thing. */
   tr.lvl-WARN td { color: var(--gold); }
   tr.lvl-ERROR td { color: var(--error); }
+  /* After the family rules on purpose: equal specificity, so severity wins. */
+  .activity tr.lvl-WARN  .fam-dot { background: var(--gold); }
+  .activity tr.lvl-ERROR .fam-dot { background: var(--error); }
 
   /* Daemon log: fixed height so the panel stays scannable, scrolls on both axes
      so a long line never widens the page. */
-  .log { max-height: 340px; overflow: auto; background: var(--bg-elev);
+  .log { max-height: 520px; overflow: auto; background: var(--bg-elev);
     border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
   .log-line { display: flex; gap: 8px; align-items: baseline; padding: 2px 0;
     font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
@@ -169,6 +187,17 @@ export function webviewShell(title: string, body: string, script: string): strin
     margin-left: auto; }
   .count.filtered { color: var(--gold); }
   mark { background: var(--gold); color: var(--bg); border-radius: 2px; padding: 0 1px; }
+
+  /* Activity beside the log rather than above it. Activity is eight rows and the
+     log is two hundred, so stacked left most of the panel empty next to a short
+     table. Side by side they balance and the log gets the height back. Collapses
+     to one column on a narrow panel: the log line has five columns and squeezing
+     them is worse than scrolling. */
+  .split { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 1.9fr);
+    gap: 22px; align-items: start; margin-top: 26px; }
+  .split > section { min-width: 0; }
+  .split h2 { margin-top: 0; }
+  @media (max-width: 880px) { .split { grid-template-columns: 1fr; gap: 26px; } }
 
   /* Health banner: the answer to "is something wrong", before any detail. */
   .banner { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
@@ -229,6 +258,11 @@ export function webviewShell(title: string, body: string, script: string): strin
     padding-left: 10px; border-left: 2px solid var(--border); }
   .log.json-mode .log-line.open { display: block; }
   .log.json-mode .log-line.open > span:not(.jsonline) { display: inline; }
+
+  /* A file the log is complaining about, made openable. Underlined on hover only,
+     so a wall of log lines does not read as a wall of links. */
+  .ref { color: var(--blue); cursor: pointer; }
+  .ref:hover { text-decoration: underline; }
 
   .j-k { color: var(--blue); }
   .j-s { color: var(--green); }
@@ -472,6 +506,41 @@ function renderJsonValue(v: unknown, depth: number): string {
   return `<span class="j-p">{</span>\n${rows}\n${pad(depth)}<span class="j-p">}</span>`;
 }
 
+/**
+ * Whether a log field value is a source file worth opening.
+ *
+ * Deliberately narrow. The log carries plenty of paths that lead nowhere useful:
+ * the repo root on every repo-scoped line, a unix socket, a model directory, a
+ * cargo registry path from a dependency. Making those clickable would be a
+ * cursor that changes shape and then does nothing.
+ *
+ * What is worth it is the handful of warnings that name a file because that file
+ * is the problem: hash failed, parse error, delete failed. Those carry a
+ * `path` or `file` field pointing at a real source file, so the test is the
+ * field name plus a plausible extension.
+ */
+export function looksLikeSourceRef(key: string, value: string): boolean {
+  if (key !== "path" && key !== "file") return false;
+  if (value.endsWith("/") || value.includes("://")) return false;
+  return /\.[A-Za-z0-9]{1,8}$/.test(value);
+}
+
+/** Split `k=v k=v` back into pairs so the openable ones can be marked up. */
+export function renderDetail(detail: string): string {
+  if (!detail) return "";
+  return detail
+    .split(" ")
+    .map((tok) => {
+      const eq = tok.indexOf("=");
+      if (eq <= 0) return esc(tok);
+      const k = tok.slice(0, eq);
+      const v = tok.slice(eq + 1);
+      if (!looksLikeSourceRef(k, v)) return esc(tok);
+      return `${esc(k)}=<span class="ref" data-path="${esc(v)}" title="Open this file">${esc(v)}</span>`;
+    })
+    .join(" ");
+}
+
 /** One thing that is wrong, phrased for the person who has to fix it. */
 export interface Diagnostic {
   severity: "error" | "warn";
@@ -527,6 +596,38 @@ const EVENT_LABELS: Record<string, string> = {
   "query.failed": "Query failed",
 };
 
+
+/**
+ * Which part of the system an activity row is about.
+ *
+ * The hues are the same ones the log gives each subsystem, and each family maps
+ * to the subsystem that actually emits it, so a colour means one thing across
+ * the whole panel: an orange dot on the left and an orange `indexer` target on
+ * the right are the same thing happening.
+ *
+ * Severity still wins. A family is grouping, not signal, so a warning row
+ * overrides its family colour.
+ */
+const EVENT_FAMILY: Record<string, string> = {
+  "daemon.session.start": "daemon",
+  "daemon.ready": "daemon",
+  "daemon.socket.bound": "daemon",
+  "daemon.session.stop": "daemon",
+  "head.drift.detected": "git",
+  "head.reconcile.complete": "git",
+  "head.reconcile.pruned": "git",
+  "phase_b.start": "index",
+  "phase_b.indexed": "index",
+  "phase_b.complete": "index",
+  "kcore.updated": "index",
+  "lsif.spawn": "index",
+  "lsif.complete": "index",
+  "embed.text.updated": "search",
+  "embed.text.fts_backfill": "search",
+  "store.fts_words.backfill": "search",
+  "query.failed": "query",
+};
+
 /** Stats for the dashboard card. Fields are pre-formatted strings. */
 export interface StatsView {
   nodes: string;
@@ -572,13 +673,14 @@ export function buildStatsHtml(
     ? activity
         .map(
           ({ entry: e, count }) =>
-            `<tr class="lvl-${esc(e.level)}">
-<td class="mono muted">${esc(e.time)}</td>
-<td>${esc(EVENT_LABELS[e.event as string])}${count > 1 ? ` <span class="muted">&times;${count}</span>` : ""}</td>
-<td class="mono muted detail">${esc(e.detail)}</td></tr>`
+            `<tr class="lvl-${esc(e.level)}" data-fam="${esc(EVENT_FAMILY[e.event as string] ?? "other")}">
+<td class="fam"><span class="fam-dot"></span></td>
+<td class="mono muted when">${esc(e.time)}</td>
+<td class="what">${esc(EVENT_LABELS[e.event as string])}${count > 1 ? ` <span class="run">&times;${count}</span>` : ""}</td>
+<td class="mono muted detail">${renderDetail(e.detail)}</td></tr>`
         )
         .join("\n")
-    : `<tr><td colspan="3" class="empty">No lifecycle events yet. Start the daemon to see activity.</td></tr>`;
+    : `<tr><td colspan="4" class="empty">No lifecycle events yet. Start the daemon to see activity.</td></tr>`;
 
   // Severity threshold, the same semantics `travsr daemon logs --level` uses:
   // warn means warn and above, not warn alone.
@@ -609,7 +711,7 @@ export function buildStatsHtml(
             `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
             `<span class="mono muted tg">${esc(e.target)}</span>` +
             `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
-            `<span class="mono muted detail" data-raw="${esc(e.detail)}">${esc(e.detail)}</span>` +
+            `<span class="mono muted detail" data-raw="${esc(e.detail)}">${renderDetail(e.detail)}</span>` +
             `<span class="jsonline mono">${highlightJson(e.raw)}</span></div>`
         )
         .join("\n")
@@ -663,13 +765,17 @@ export function buildStatsHtml(
 ${health}
 ${diagCards}
 
-<h2 style="margin-top:28px">Recent activity</h2>
+<div class="split">
+<section class="col-activity">
+<h2>Recent activity</h2>
 <p class="sub">Lifecycle events from the daemon, newest first.</p>
 <table class="activity"><tbody>
 ${activityRows}
 </tbody></table>
+</section>
 
-<h2 style="margin-top:28px">Daemon log</h2>
+<section class="col-log">
+<h2>Daemon log</h2>
 <div class="log-bar">
   <input id="logSearch" type="search" placeholder="Filter lines\u2026" oninput="filterLog()"
          aria-label="Filter log lines">
@@ -701,9 +807,11 @@ ${activityRows}
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
   <label class="tog"><input type="checkbox" id="logFollow" onchange="toggleFollow(this)"> Follow</label>
 </div>
-<div class="log" id="logBox" onclick="toggleRow(event)">
+<div class="log" id="logBox" onclick="onLogClick(event)">
 <div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>
 ${logRows}
+</div>
+</section>
 </div>`;
 
   const script = `
@@ -745,6 +853,18 @@ function toggleFollow(cb) {
   if (cb.checked) followTimer = setInterval(function () {
     vscode.postMessage({ command: 'refresh' });
   }, 3000);
+}
+
+function onLogClick(ev) {
+  // A ref wins over the row toggle: clicking the filename should open the file,
+  // not expand the JSON underneath it.
+  var ref = ev.target.closest('.ref');
+  if (ref) {
+    ev.stopPropagation();
+    vscode.postMessage({ command: 'openFile', path: ref.getAttribute('data-path') });
+    return;
+  }
+  toggleRow(ev);
 }
 
 function toggleRow(ev) {

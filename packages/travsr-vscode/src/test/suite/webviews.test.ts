@@ -1,6 +1,13 @@
 import * as assert from "assert";
-import { buildSynonymsHtml, buildReposHtml, buildStatsHtml, buildLanguagesHtml } from "../../webviews";
-import { highlightJson } from "../../webviews";
+import {
+  buildSynonymsHtml,
+  buildReposHtml,
+  buildStatsHtml,
+  buildLanguagesHtml,
+  highlightJson,
+  looksLikeSourceRef,
+  renderDetail,
+} from "../../webviews";
 import type { Diagnostic, LangCount, LangInfo, LogEntry, StatsView } from "../../webviews";
 
 // Shared fixtures. Values are arbitrary: they exist to drive each builder
@@ -262,7 +269,11 @@ suite("JSON view", () => {
   test("each kind of value gets its own class, and strings keep their digits", () => {
     const html = highlightJson(JSON.stringify({ n: 89, s: "2026-08-13", b: true, z: null }));
     assert.ok(html.includes('class="j-n">89'), "number");
-    assert.ok(html.includes('class="j-s">&quot;2026-08-13&quot;'), "the date stays one string");
+    // The quotes here are delimiters the highlighter writes itself, not user
+    // data, so they stay literal. What matters is that the date is one string
+    // token and did not shred into number spans; escaping of actual values is
+    // pinned by the payload test below.
+    assert.ok(html.includes('class="j-s">"2026-08-13"<'), "the date stays one string");
     assert.ok(html.includes('class="j-b">true'), "boolean");
     assert.ok(html.includes('class="j-b">null'), "null");
   });
@@ -308,5 +319,128 @@ suite("every panel renders", () => {
       assert.ok(html.includes("<body>"), `${name} produced no document`);
       assert.ok(html.length > 1000, `${name} produced a suspiciously short document`);
     }
+  });
+});
+
+suite("clickable file references", () => {
+  // The log carries plenty of paths that lead nowhere: the repo root on every
+  // repo-scoped line, a unix socket, a model directory. Linking those is a
+  // cursor that changes shape and then does nothing, so only a `path` or `file`
+  // field pointing at something with an extension is offered.
+  test("only real source refs are offered", () => {
+    const yes: Array<[string, string]> = [
+      ["path", "src/generated/proto.ts"],
+      ["path", "/Users/me/app/src/legacy.py"],
+      ["file", "crates/travsr-daemon/src/lib.rs"],
+    ];
+    const no: Array<[string, string]> = [
+      ["repo", "/Users/me/work/travsr"],
+      ["sock", "/tmp/daemon-abc.sock"],
+      ["model_dir", "/Users/me/.travsr/models/rerank"],
+      ["path", "/Users/me/some/dir/"],
+      ["commit", "b2a0013"],
+    ];
+    for (const [k, v] of yes) {
+      assert.ok(looksLikeSourceRef(k, v), `${k}=${v} should be openable`);
+    }
+    for (const [k, v] of no) {
+      assert.ok(!looksLikeSourceRef(k, v), `${k}=${v} should not be offered`);
+    }
+  });
+
+  test("only the ref is marked up, and values stay escaped", () => {
+    const html = renderDetail('path=src/legacy.py err="<b>SyntaxError</b>" repo=/Users/me/app');
+    assert.ok(html.includes('data-path="src/legacy.py"'), "the source file is openable");
+    assert.ok(!html.includes('data-path="/Users/me/app"'), "the repo root is not");
+    assert.ok(!html.includes("<b>"), `error text must stay escaped: ${html}`);
+  });
+});
+
+suite("activity feed colouring", () => {
+  const evt = (event: string, level: string, detail: string): LogEntry => ({
+    time: "10:00:01",
+    level,
+    target: "travsr_daemon",
+    message: event,
+    event,
+    detail,
+    iso: "2026-08-14T10:00:01Z",
+    raw: "{}",
+  });
+  const STATS = {
+    nodes: "4,102",
+    edges: "9,881",
+    schemaVersion: "22",
+    dbSize: "12 MB",
+    lastIndexed: "just now",
+  };
+  /** Families on the rows only. The CSS carries the same attribute. */
+  const rowFamilies = (html: string): string[] =>
+    [...html.matchAll(/<tr class="lvl-[A-Z]+" data-fam="([a-z]+)"/g)].map((m) => m[1]);
+
+  test("each lifecycle event lands in the family that emits it", () => {
+    const html = buildStatsHtml(STATS, [
+      evt("daemon.session.start", "INFO", "version=0.7.0"),
+      evt("head.drift.detected", "INFO", "from=b2a0013"),
+      evt("phase_b.start", "INFO", "langs=4"),
+      evt("embed.text.updated", "INFO", "written=18"),
+      evt("kcore.updated", "INFO", ""),
+      evt("query.failed", "ERROR", 'err="no such symbol"'),
+    ]);
+    // Newest first, so the feed reads back to front.
+    assert.deepStrictEqual(rowFamilies(html), [
+      "query",
+      "index",
+      "search",
+      "index",
+      "git",
+      "daemon",
+    ]);
+  });
+
+  test("an event with no family still renders, rather than dropping out", () => {
+    // Only labelled events reach the feed, so this pins the fallback for a
+    // label added without a matching family.
+    const html = buildStatsHtml(STATS, [evt("lsif.spawn", "INFO", "lang=rust")]);
+    const fams = rowFamilies(html);
+    assert.strictEqual(fams.length, 1, `one row expected, got ${fams.length}`);
+    assert.ok(fams[0].length > 0, "the row carries some family");
+  });
+
+  test("severity beats family, and comes after it so the cascade agrees", () => {
+    const html = buildStatsHtml(STATS, [evt("phase_b.complete", "ERROR", "")]);
+    const family = html.indexOf('.activity tr[data-fam="query"]');
+    const severity = html.indexOf(".activity tr.lvl-ERROR .fam-dot");
+    assert.ok(family > 0 && severity > 0, "both rules are present");
+    // Equal specificity (0,2,1), so only source order decides the winner.
+    assert.ok(
+      severity > family,
+      "severity must be declared after family or a failing row keeps its family colour"
+    );
+  });
+
+  test("a run of one event collapses into a count, not repeated rows", () => {
+    const html = buildStatsHtml(STATS, [
+      evt("embed.text.updated", "INFO", "written=18"),
+      evt("embed.text.updated", "INFO", "written=4"),
+      evt("embed.text.updated", "INFO", "written=2"),
+    ]);
+    assert.strictEqual(rowFamilies(html).length, 1, "three ticks are one row");
+    assert.ok(html.includes('<span class="run">&times;3</span>'), "and it says three");
+  });
+
+  test("family hues are defined for both themes", () => {
+    const html = buildStatsHtml(STATS, [evt("phase_b.start", "INFO", "")]);
+    for (const token of ["--green", "--orange", "--gold"]) {
+      const defined = (html.match(new RegExp(`${token}:`, "g")) ?? []).length;
+      assert.ok(defined >= 2, `${token} must be defined in light and dark, saw ${defined}`);
+    }
+  });
+
+  test("a path in an activity detail is openable too", () => {
+    const html = buildStatsHtml(STATS, [
+      evt("phase_b.complete", "WARN", 'path=src/legacy.py err="parse error"'),
+    ]);
+    assert.ok(html.includes('data-path="src/legacy.py"'), "the file is offered");
   });
 });

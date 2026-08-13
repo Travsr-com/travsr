@@ -610,6 +610,7 @@ type PanelMessage =
   | { command: "detectLangs" }
   | { command: "reloadAvailable" }
   | { command: "initRepo" }
+  | { command: "openFile"; path: string }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -761,7 +762,21 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     return buildStatsHtml(stats, log, diags);
   };
 
-  const handle = async (_msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
+  const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
+    if (msg.command === "openFile") {
+      // The log writes absolute paths in some places and repo-relative in
+      // others, so resolve against the repo root and let an absolute path win.
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const target = root ? path.resolve(root, msg.path) : msg.path;
+      try {
+        const doc = await vscode.workspace.openTextDocument(target);
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch {
+        // The file the log complained about may be the file that is gone.
+        void vscode.window.showWarningMessage(`Travsr: cannot open ${msg.path}`);
+      }
+      return;
+    }
     await refresh();
   };
 
