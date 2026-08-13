@@ -969,4 +969,118 @@ mod tests {
         assert!(!out.contains("\u{f6}b"), "got: {out}");
         assert!(out.contains(" failed"), "got: {out}");
     }
+
+    /// Exact outputs for the shapes a daemon log line actually takes around a
+    /// home path (#636 round-2 review follow-up). `assert_eq` on the whole
+    /// string, not `contains`: both defects the review found were *dropped*
+    /// message text, which a `contains` assertion on the surviving half
+    /// cannot see. Every case here is byte-for-byte what the redactor must
+    /// produce, so an over-consuming username run fails loudly.
+    #[test]
+    fn redact_home_paths_produces_exact_output_for_log_shaped_lines() {
+        for (input, want) in [
+            // Ritik's three round-2 cases, pinned exactly rather than by
+            // substring.
+            (
+                "index /home/bob failed, see /var/log/travsr.log",
+                "index ~ failed, see /var/log/travsr.log",
+            ),
+            ("copy /home/bob to /home/carol/dest", "copy ~ to ~/dest"),
+            (
+                "reindex /Users/alice aborted; retry with --force /tmp/x",
+                "reindex ~ aborted; retry with --force /tmp/x",
+            ),
+            // Three home paths on one line: every one of them is bounded.
+            ("repeat /home/a /home/b /home/c", "repeat ~ ~ ~"),
+            // Punctuation immediately after the username must survive.
+            ("comma /home/bob, retrying", "comma ~, retrying"),
+            ("paren (/home/bob) done", "paren (~) done"),
+            ("quoted \"/home/bob/x\" done", "quoted \"~/x\" done"),
+            // Degenerate separators: no panic, no swallowed remainder.
+            ("lone /home/", "lone ~"),
+            ("double /home//x", "double ~/x"),
+            ("users end /Users/", "users end ~"),
+            // Non-ASCII usernames, precomposed: the whole run is consumed.
+            ("cjk /home/\u{5317}\u{4EAC} failed", "cjk ~ failed"),
+            (
+                "rtl /home/\u{0645}\u{062D}\u{0645}\u{062F} failed",
+                "rtl ~ failed",
+            ),
+            // Windows: both usernames go, the text between them stays.
+            (
+                r"copy C:\Users\bob to C:\Users\carol\dest",
+                "copy ~/ to ~/dest",
+            ),
+            (r"win nosep C:\Users\bob suffix", "win nosep ~/ suffix"),
+        ] {
+            assert_eq!(redact_sensitive(input), want, "input: {input:?}");
+        }
+    }
+
+    /// Property: for a home path followed by arbitrary message text, the
+    /// username never survives and the message text after it always does.
+    ///
+    /// Deterministic LCG rather than `proptest` (no new dependency, and a
+    /// fixed seed keeps CI failures reproducible). The two alphabets are
+    /// disjoint on purpose, so "the username does not appear in the output"
+    /// cannot be satisfied accidentally by the tail, and the tail alphabet
+    /// excludes `=`, `:` and `/` so no other redactor in `redact_sensitive`
+    /// (key=value, bearer, prefixed-token) can rewrite it.
+    #[test]
+    fn prop_redact_home_paths_consumes_the_username_and_keeps_the_tail() {
+        const USER: &[char] = &['a', 'b', 'x', 'y', 'z', '0', '9', '_', '-', '.'];
+        const TAIL: &[char] = &[' ', ',', ';', ')', '!', '?', 'Q', 'W', 'R', 'T'];
+        let mut state: u64 = 0x5DEE_CE66_D1CE_4B9D;
+        let mut next = |n: usize| -> usize {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % n
+        };
+
+        for prefix in ["/home/", "/Users/"] {
+            for _ in 0..500 {
+                // Username: always starts with a letter (a leading '.' or '-'
+                // is not a plausible account name and would make the expected
+                // output ambiguous), 1..=8 chars from USER.
+                let mut user = String::from(USER[next(5)]);
+                for _ in 0..next(8) {
+                    user.push(USER[next(USER.len())]);
+                }
+                // Tail: always starts with a non-username character, so the
+                // username run provably ends where we say it does.
+                let mut tail = String::from(TAIL[next(6)]);
+                for _ in 0..next(12) {
+                    tail.push(TAIL[next(TAIL.len())]);
+                }
+
+                let line = format!("op {prefix}{user}{tail}");
+                let out = redact_sensitive(&line);
+                assert_eq!(out, format!("op ~{tail}"), "input: {line:?}");
+                assert!(!out.contains(&user), "username leaked: {out:?}");
+                assert!(out.ends_with(&tail), "tail dropped: {out:?}");
+
+                // The same line with an unrelated path further along: this is
+                // the branch the round-2 review found, where the username run
+                // was scanned to that later `/` and everything in between was
+                // swallowed.
+                let line = format!("op {prefix}{user}{tail} /var/log/travsr.log");
+                let out = redact_sensitive(&line);
+                assert_eq!(
+                    out,
+                    format!("op ~{tail} /var/log/travsr.log"),
+                    "input: {line:?}"
+                );
+
+                // Same username, now a real path: only the separator is
+                // consumed with it, the rest of the path survives.
+                let line = format!("op {prefix}{user}/pkg/mod.rs");
+                assert_eq!(
+                    redact_sensitive(&line),
+                    "op ~/pkg/mod.rs".to_string(),
+                    "input: {line:?}"
+                );
+            }
+        }
+    }
 }

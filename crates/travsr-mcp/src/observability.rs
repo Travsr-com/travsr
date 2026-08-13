@@ -1602,6 +1602,110 @@ mod tests {
         assert_eq!(payload["phase_b"]["languages"][0]["state"], "running");
     }
 
+    /// The compile-commands rung of `phase_b_availability`'s ladder, which
+    /// only fires when the repo root is known. Deterministic on any machine:
+    /// the compdb check sits *above* the resolver, so whether `scip-clang`
+    /// happens to be installed cannot change either half of this test.
+    #[test]
+    fn phase_b_unavailable_names_compile_commands_json_only_when_the_root_lacks_one() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lang_toml = tempfile::tempdir().unwrap();
+        let lang_toml_path = lang_toml.path().join("lang.toml");
+        // Registered, so the ladder gets past the registration rung and
+        // reaches the compdb one.
+        std::fs::write(&lang_toml_path, "registered = [\"c\"]\n").unwrap();
+        std::env::set_var("TRAVSR_LANG_TOML", &lang_toml_path);
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("corpus", "main", "src/a.c", "c", "fn:a"),
+                "function",
+            ))
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let detail_of = |payload: &serde_json::Value| -> String {
+            payload["phase_b"]["languages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["language"] == "c")
+                .map(|l| l["detail"].as_str().unwrap_or_default().to_string())
+                .unwrap_or_default()
+        };
+
+        // No compile_commands.json at the root: scip-clang can never run, so
+        // this is unavailable with the reason `travsr status` would give.
+        let payload = index_status_payload(&store, "repo", Some(root.path()));
+        let langs = payload["phase_b"]["languages"].as_array().unwrap();
+        let c = langs.iter().find(|l| l["language"] == "c").unwrap();
+        assert_eq!(c["state"], "unavailable", "got: {payload}");
+        assert!(
+            detail_of(&payload).contains("compile_commands.json"),
+            "got: {payload}"
+        );
+
+        // With one present, the compdb rung must not fire: whatever the
+        // resolver then decides, the reason can no longer be the compdb.
+        std::fs::write(root.path().join("compile_commands.json"), "[]").unwrap();
+        let payload = index_status_payload(&store, "repo", Some(root.path()));
+        assert!(
+            !detail_of(&payload).contains("compile_commands.json"),
+            "compdb rung must not fire when the file exists: {payload}"
+        );
+
+        std::env::remove_var("TRAVSR_LANG_TOML");
+    }
+
+    /// The probe is documented for polling agents, so the "never participates
+    /// in the singleton protocol" property has to hold under concurrency, not
+    /// just in a sequential loop: many threads probing at once while a real
+    /// holder keeps the lock must leave that holder undisturbed, and none of
+    /// them may block on it.
+    #[test]
+    fn daemon_running_is_safe_under_concurrent_polling() {
+        let (tmp, lock) = repo_with_lock_pid(&std::process::id().to_string());
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&holder).expect("test must hold the exclusive lock");
+
+        let root = tmp.path().to_path_buf();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let root = root.clone();
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        assert!(daemon_running(&root), "live PID must read as running");
+                    }
+                });
+            }
+        });
+
+        // The holder still holds it, and a daemon start after the storm can
+        // still take it: no probe queued for or stole the lock.
+        let _ = fs2::FileExt::unlock(&holder);
+        let restart = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&restart).is_ok(),
+            "a daemon start after concurrent probes must still take the lock"
+        );
+        let _ = fs2::FileExt::unlock(&restart);
+    }
+
     /// #636 round-2 review harness: the only realistic-graph check available.
     /// Skipped by default. Point `TRAVSR_REAL_GRAPH_DB` at a **copy** of a
     /// real `.travsr/graph.db` (never the live one: this opens it read-only,
