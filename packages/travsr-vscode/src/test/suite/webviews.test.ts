@@ -1,6 +1,6 @@
 import * as assert from "assert";
 import { buildSynonymsHtml, buildReposHtml, buildStatsHtml, buildLanguagesHtml } from "../../webviews";
-import type { LangCount, LangInfo } from "../../webviews";
+import type { LangCount, LangInfo, LogEntry, StatsView } from "../../webviews";
 
 suite("VSCODE-247: buildSynonymsHtml", () => {
   test("groups aliases by term and renders chips + staged multi-add row", () => {
@@ -163,27 +163,63 @@ suite("codicon syntax never reaches webview HTML", () => {
   // never carry it in the first place.
   const CODICON = /\$\([a-z-]+\)/;
 
-  test("no panel builder emits a codicon", () => {
-    const panels: Array<[string, string]> = [
-      ["synonyms", buildSynonymsHtml([{ term: "auth", alias: "login" }])],
-      ["repos", buildReposHtml([{ name: "demo", path: "/tmp/demo/.travsr/graph.db", exists: true }])],
-      [
-        "stats",
-        buildStatsHtml({
-          nodes: "5310",
-          edges: "9147",
-          schemaVersion: "22",
-          dbSize: "18.2 MB",
-          lastIndexed: "1h ago",
-        }),
-      ],
-      ["languages", buildLanguagesHtml([], [])],
-    ];
-    for (const [name, html] of panels) {
+  // Field values are arbitrary. Nothing here asserts on them: they exist only
+  // to drive each builder down a branch. What matters is that every branch that
+  // emits markup is rendered at least once, since a codicon added to a row the
+  // fixtures never build is a codicon this test cannot see.
+  const LANG: LangInfo = {
+    language: "rust",
+    package: "@travsr-plugin/rust",
+    sandbox: "Standard",
+    installed: true,
+    registered: true,
+    builtin: false,
+    needsApproval: false,
+    scipInstallType: "GithubBinary",
+    installHint: "travsr lang install rust",
+    underlyingToolHint: "",
+    elevatedHosts: [],
+  };
+
+  const STATS: StatsView = {
+    nodes: "1",
+    edges: "1",
+    schemaVersion: "1",
+    dbSize: "1 B",
+    lastIndexed: "just now",
+  };
+
+  // One labelled event, one repeat of it (the collapse path), one warning, and
+  // one line that is not an event at all, so every branch of the panel renders.
+  const LOG: LogEntry[] = [
+    { time: "01:00:00", level: "INFO", target: "daemon", message: "started", event: "daemon.ready", detail: "pid=1" },
+    { time: "01:00:01", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=1" },
+    { time: "01:00:02", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=2" },
+    { time: "01:00:03", level: "WARN", target: "plugin-host", message: "analyzer missing", detail: "lang=go" },
+    { time: "", level: "", target: "", message: "a line from before the log became JSON", detail: "" },
+  ];
+
+  const panels = (): Array<[string, string]> => [
+    // Populated and empty are separate code paths in several builders, so both
+    // are rendered rather than whichever one the fixture happened to hit.
+    ["synonyms, populated", buildSynonymsHtml([{ term: "auth", alias: "login" }])],
+    ["synonyms, empty", buildSynonymsHtml([])],
+    ["repos, populated", buildReposHtml([{ name: "demo", path: "/tmp/demo/.travsr/graph.db", exists: true }])],
+    ["repos, with a stale row", buildReposHtml([{ name: "gone", path: "/tmp/gone/.travsr/graph.db", exists: false }])],
+    ["repos, empty", buildReposHtml([])],
+    ["stats, no log", buildStatsHtml(STATS)],
+    ["stats, with a log", buildStatsHtml(STATS, LOG)],
+    ["languages, indexed and available", buildLanguagesHtml([{ language: "rust", count: 1 }], [LANG])],
+    ["languages, available but not indexed", buildLanguagesHtml([], [LANG])],
+    ["languages, empty", buildLanguagesHtml([], [])],
+  ];
+
+  test("no panel builder emits a codicon, on any branch", () => {
+    for (const [name, html] of panels()) {
       const hit = html.match(CODICON);
       assert.ok(
         hit === null,
-        `${name} panel leaks codicon syntax into HTML: ${hit?.[0]} — drop it, a webview cannot render it`,
+        `${name} leaks codicon syntax into HTML: ${hit?.[0]} — drop it, a webview cannot render it`,
       );
     }
   });

@@ -111,6 +111,32 @@ export function webviewShell(title: string, body: string, script: string): strin
     letter-spacing: 0.05em; margin: 0 0 8px; }
   .lang-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     background: var(--green); margin-right: 6px; }
+  /* Recent activity: one row per lifecycle event. */
+  .activity { width: 100%; border-collapse: collapse; }
+  .activity td { padding: 5px 8px; border-bottom: 1px solid var(--border);
+    vertical-align: top; font-size: 12px; }
+  .activity td:first-child { white-space: nowrap; width: 1%; }
+  .activity .detail { font-size: 11px; }
+  /* Whole row tinted, not just the label: a warning should read as one thing. */
+  tr.lvl-WARN td { color: var(--gold); }
+  tr.lvl-ERROR td { color: var(--error); }
+
+  /* Daemon log: fixed height so the panel stays scannable, scrolls on both axes
+     so a long line never widens the page. */
+  .log { max-height: 340px; overflow: auto; background: var(--bg-elev);
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+  .log-line { display: flex; gap: 8px; align-items: baseline; padding: 2px 0;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    font-size: 11.5px; white-space: pre; }
+  .log-line .t { flex: 0 0 auto; }
+  .log-line .lv { flex: 0 0 44px; font-weight: 600; }
+  .log-line .tg { flex: 0 0 88px; }
+  .log-line .msg { flex: 1 1 auto; color: var(--fg); }
+  .log-line .detail { flex: 0 0 auto; }
+  /* Only level and message take the colour; time and target stay muted so the
+     tint marks the line without shouting the whole row. */
+  .lvl-WARN .lv, .lvl-WARN .msg { color: var(--gold); }
+  .lvl-ERROR .lv, .lvl-ERROR .msg { color: var(--error); }
   .badge.dim { background: var(--bg-elev); color: var(--fg-subtle); }
   .consent { margin-top: 6px; }
   .consent summary { cursor: pointer; font-size: 12px; color: var(--gold); }
@@ -295,6 +321,46 @@ function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({com
   return webviewShell("Travsr Repos", body, script);
 }
 
+/** One daemon log line, as the stats panel renders it. */
+export interface LogEntry {
+  time: string;
+  level: string;
+  target: string;
+  message: string;
+  /** Stable machine key, present on lifecycle events only. */
+  event?: string;
+  /** Remaining structured fields, already flattened to `k=v`. */
+  detail: string;
+}
+
+/**
+ * Human labels for the stable event keys the daemon emits.
+ *
+ * Keyed on `event`, never on the message, which is the point of the keys: a
+ * message can be reworded for clarity without breaking anything built on it.
+ * An event with no entry here is simply not lifecycle, so it does not belong in
+ * the activity feed.
+ */
+const EVENT_LABELS: Record<string, string> = {
+  "daemon.session.start": "Daemon started",
+  "daemon.ready": "Daemon ready",
+  "daemon.socket.bound": "Control socket bound",
+  "daemon.session.stop": "Daemon stopped",
+  "head.drift.detected": "HEAD moved, reconciling",
+  "head.reconcile.complete": "Reindexed after HEAD moved",
+  "head.reconcile.pruned": "Pruned deleted files",
+  "phase_b.start": "Semantic indexing started",
+  "phase_b.indexed": "Semantic indexing complete",
+  "phase_b.complete": "Semantic refresh complete",
+  "kcore.updated": "Graph centrality updated",
+  "embed.text.updated": "Embedding text updated",
+  "embed.text.fts_backfill": "Search index backfilled",
+  "store.fts_words.backfill": "Word index updated",
+  "lsif.spawn": "Analyzer started",
+  "lsif.complete": "Analyzer finished",
+  "query.failed": "Query failed",
+};
+
 /** Stats for the dashboard card. Fields are pre-formatted strings. */
 export interface StatsView {
   nodes: string;
@@ -304,10 +370,61 @@ export interface StatsView {
   lastIndexed: string;
 }
 
-/** Graph stats dashboard: a row of metric cards. */
-export function buildStatsHtml(stats: StatsView): string {
+/** Graph stats dashboard: metric cards, recent activity, and the log tail. */
+export function buildStatsHtml(stats: StatsView, log: LogEntry[] = []): string {
   const card = (k: string, v: string): string =>
     `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+
+  // The feed is lifecycle, not traffic. `query.served` fires on every query and
+  // would bury a Phase B failure under a hundred cache hits, so only events with
+  // a label reach it; everything else stays in the stream below.
+  const labelled = log.filter(
+    (e) => e.event !== undefined && EVENT_LABELS[e.event] !== undefined
+  );
+
+  // Collapse consecutive runs of the same event. The embed tick fires on every
+  // reindex, so without this four `embed.text.updated` rows push a Phase B
+  // failure off the bottom of an eight-row feed. Runs are collapsed rather than
+  // deduplicated outright, so a repeated failure still reads as repeated.
+  const runs: Array<{ entry: LogEntry; count: number }> = [];
+  for (const e of labelled) {
+    const last = runs[runs.length - 1];
+    if (last && last.entry.event === e.event) {
+      last.entry = e; // keep the newest of the run
+      last.count += 1;
+    } else {
+      runs.push({ entry: e, count: 1 });
+    }
+  }
+  const activity = runs.slice(-8).reverse();
+
+  const activityRows = activity.length
+    ? activity
+        .map(
+          ({ entry: e, count }) =>
+            `<tr class="lvl-${esc(e.level)}">
+<td class="mono muted">${esc(e.time)}</td>
+<td>${esc(EVENT_LABELS[e.event as string])}${count > 1 ? ` <span class="muted">&times;${count}</span>` : ""}</td>
+<td class="mono muted detail">${esc(e.detail)}</td></tr>`
+        )
+        .join("\n")
+    : `<tr><td colspan="3" class="empty">No lifecycle events yet. Start the daemon to see activity.</td></tr>`;
+
+  const logRows = log.length
+    ? log
+        .slice(-200)
+        .reverse()
+        .map(
+          (e) =>
+            `<div class="log-line lvl-${esc(e.level)}"><span class="mono muted t">${esc(e.time)}</span>` +
+            `<span class="lv">${esc(e.level)}</span>` +
+            `<span class="mono muted tg">${esc(e.target)}</span>` +
+            `<span class="msg">${esc(e.message)}</span>` +
+            `<span class="mono muted detail">${esc(e.detail)}</span></div>`
+        )
+        .join("\n")
+    : `<div class="empty">No daemon log yet.</div>`;
+
   const body = `
 <h2>Graph stats</h2>
 <p class="sub">Live metrics for the indexed graph.</p>
@@ -320,7 +437,20 @@ export function buildStatsHtml(stats: StatsView): string {
 </div>
 <div class="toolbar" style="margin-top:16px">
   <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
+</div>
+
+<h2 style="margin-top:28px">Recent activity</h2>
+<p class="sub">Lifecycle events from the daemon, newest first.</p>
+<table class="activity"><tbody>
+${activityRows}
+</tbody></table>
+
+<h2 style="margin-top:28px">Daemon log</h2>
+<p class="sub">Last ${log.length} lines, newest first.</p>
+<div class="log">
+${logRows}
 </div>`;
+
   const script = `function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }`;
   return webviewShell("Travsr Stats", body, script);
 }

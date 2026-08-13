@@ -30,6 +30,7 @@ import {
   type LangCount,
   type LangInfo,
 } from "./webviews";
+import type { LogEntry } from "./webviews";
 
 // ── Pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -190,6 +191,104 @@ export function timeAgo(ms: number): string {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
   return `${Math.floor(hrs / 24)}d ago`;
+}
+
+/**
+ * Read the tail of the daemon log.
+ *
+ * `daemon.log.<UTC-DATE>` is JSON lines, one object per line. Only the last
+ * `maxBytes` are read, by seeking rather than by loading the file and slicing:
+ * the log is capped at 50 MB across rotations and the newest file is never
+ * pruned even when it alone exceeds that, so reading it whole to show 200 lines
+ * is a bounded-looking call that is not bounded.
+ *
+ * The first line of the window is dropped when the window did not start at byte
+ * zero, because a seek lands mid-line.
+ */
+export function readDaemonLogTail(repoRoot: string, maxLines = 200): LogEntry[] {
+  const dir = path.join(repoRoot, ".travsr");
+  let newest: string;
+  try {
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith("daemon.log"))
+      .sort(); // ISO date suffix sorts chronologically
+    if (files.length === 0) return [];
+    newest = path.join(dir, files[files.length - 1]);
+  } catch {
+    return [];
+  }
+
+  // Generous enough that maxLines is the binding limit, not the byte window.
+  const MAX_BYTES = 512 * 1024;
+  let text: string;
+  try {
+    const size = fs.statSync(newest).size;
+    const start = Math.max(0, size - MAX_BYTES);
+    const len = size - start;
+    const fd = fs.openSync(newest, "r");
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      text = buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (start > 0) text = text.slice(text.indexOf("\n") + 1);
+  } catch {
+    return [];
+  }
+
+  return text
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .slice(-maxLines)
+    .map(parseLogLine);
+}
+
+/**
+ * One log line as the panel needs it.
+ *
+ * Rotated files written before the log became JSON are still on disk and are
+ * still the only record of what happened then, so a line that does not parse is
+ * carried through as its own text rather than dropped.
+ */
+export function parseLogLine(line: string): LogEntry {
+  try {
+    const e = JSON.parse(line) as {
+      timestamp?: string;
+      level?: string;
+      target?: string;
+      fields?: Record<string, unknown>;
+    };
+    if (typeof e.timestamp === "string" && typeof e.level === "string") {
+      const fields = e.fields ?? {};
+      // `repo` is dropped for the same reason the CLI renderer drops it: the
+      // panel belongs to one repo and the reader opened it from inside that
+      // repo, so restating the path on every line is spent width.
+      const { message, event, repo: _repo, ...rest } = fields as Record<string, unknown>;
+      return {
+        // 24-hour, fixed width. `toLocaleTimeString` defaults to 12-hour with a
+        // meridiem in most locales, which is wider and does not sort by eye.
+        time: new Date(e.timestamp).toTimeString().slice(0, 8),
+        level: e.level,
+        target: shortTarget(e.target ?? ""),
+        message: typeof message === "string" ? message : "",
+        event: typeof event === "string" ? event : undefined,
+        detail: Object.entries(rest)
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join(" "),
+      };
+    }
+  } catch {
+    // fall through
+  }
+  return { time: "", level: "", target: "", message: line, detail: "" };
+}
+
+/** `travsr_plugin_host::registry` is 29 characters that say "plugin host". */
+function shortTarget(target: string): string {
+  return target.split("::")[0].replace(/^travsr_/, "").replace(/_/g, "-");
 }
 
 /** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
@@ -649,8 +748,14 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
  * travsr.showGraphStats — read-only metrics dashboard webview.
  */
 export function registerShowGraphStats(client: McpClient): vscode.Disposable {
-  const render = async (): Promise<string> =>
-    buildStatsHtml(buildStatsView(await client.callTool("get_graph_stats")));
+  const render = async (): Promise<string> => {
+    const stats = buildStatsView(await client.callTool("get_graph_stats"));
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    // Read straight from the log file rather than asking the daemon: it works
+    // after a crash, which is when the panel is worth opening.
+    const log = root ? readDaemonLogTail(root) : [];
+    return buildStatsHtml(stats, log);
+  };
 
   const handle = async (_msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
     await refresh();
