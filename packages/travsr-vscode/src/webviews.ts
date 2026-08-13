@@ -218,7 +218,11 @@ export function webviewShell(title: string, body: string, script: string): strin
      log line is long and a horizontal scrollbar per row is unusable. */
   .jsonline { display: none; }
   .log.json-mode .log-line { display: block; padding: 3px 0; }
-  .log.json-mode .log-line > span { display: none; }
+  /* :not(.jsonline) rather than a separate override. An element selector makes
+     the child-span rule more specific than the .jsonline rule, so the two fought
+     and the hide won, leaving the JSON view blank. One rule cannot fight
+     itself. (No backticks in here: this stylesheet is a template literal.) */
+  .log.json-mode .log-line > span:not(.jsonline) { display: none; }
   .log.json-mode .jsonline { display: block; white-space: pre; overflow-x: auto;
     line-height: 1.5; }
   .log.json-mode .log-line { padding: 8px 0; }
