@@ -793,9 +793,13 @@ fn daemon_logs_payload(
     let min_level = normalize_min_level(level);
 
     let Some(root) = root else {
+        // Empty array, not null: `source` is an array in every other branch
+        // and a client parsing this field should not have to handle two
+        // types for a response that is already `returned: 0` (#636 round-2
+        // review).
         return serde_json::json!({
             "repo": repo,
-            "source": serde_json::Value::Null,
+            "source": [],
             "daemon_running": false,
             "returned": 0,
             "truncated": false,
@@ -830,19 +834,19 @@ fn daemon_logs_payload(
     raw_newest_first.truncate(tail);
     origins.truncate(tail);
 
-    // Distinct files actually contributing to the (possibly truncated)
-    // response, newest-first.
+    // Distinct files that each contributed at least one *surviving* entry,
+    // newest-first. Accumulated inside the filter loop rather than from
+    // `origins` up front (#636 round-2 review): `origins` is only bounded by
+    // `tail`, so a file whose every line is afterwards dropped by the level
+    // filter or cut off by `MAX_TOTAL_BYTES` was still named as a source of
+    // a response it contributes nothing to. `contains` is a linear scan over
+    // an at-most-`candidates.len()` vector (one entry per rotated log file),
+    // so the loop stays O(lines * files) with files in the low single digits.
     let mut source: Vec<String> = Vec::new();
-    for f in &origins {
-        if !source.contains(f) {
-            source.push(f.clone());
-        }
-    }
-
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(raw_newest_first.len());
     let mut total_bytes = 0usize;
     let mut byte_truncated = false;
-    for raw in &raw_newest_first {
+    for (raw, origin) in raw_newest_first.iter().zip(origins.iter()) {
         let entry = build_log_entry(raw);
         let passes = match entry["level"].as_str() {
             Some("raw") => true,
@@ -859,6 +863,9 @@ fn daemon_logs_payload(
         }
         total_bytes += entry_bytes;
         entries.push(entry);
+        if !source.contains(origin) {
+            source.push(origin.clone());
+        }
     }
 
     serde_json::json!({
@@ -1423,12 +1430,130 @@ mod tests {
         assert_eq!(payload["returned"], 2, "got: {payload}");
     }
 
-    /// `source: null` is reserved for "repo root itself unknown" (distinct
-    /// from a known root with zero log files, which reads `source: []`).
+    /// #636 round-2 review: `source` used to be `null` on the unknown-root
+    /// path and an array everywhere else, so a client had to parse two types
+    /// for one field. It is an empty array there now, and this test pins the
+    /// type as stable across every branch.
     #[test]
-    fn daemon_logs_source_is_null_when_repo_root_unknown() {
+    fn daemon_logs_source_is_an_empty_array_when_repo_root_unknown() {
         let payload = daemon_logs_payload("repo", None, 10, "info");
-        assert_eq!(payload["source"], serde_json::Value::Null, "got: {payload}");
+        assert_eq!(payload["source"], serde_json::json!([]), "got: {payload}");
+    }
+
+    /// #636 round-2 review: `source` was built from `origins` *before* the
+    /// level filter ran, so it named files whose every line was then dropped.
+    #[test]
+    fn daemon_logs_source_omits_a_file_whose_lines_are_all_filtered_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        std::fs::write(
+            travsr_dir.join("daemon.log.2026-01-02"),
+            "2026-01-02T00:00:00Z ERROR mod: newest boom\n",
+        )
+        .unwrap();
+        // Every line here is below the requested level, so this file
+        // contributes nothing to the response.
+        std::fs::write(
+            travsr_dir.join("daemon.log.2026-01-01"),
+            "2026-01-01T00:00:00Z DEBUG mod: older chatter\n\
+             2026-01-01T00:00:01Z DEBUG mod: older chatter 2\n",
+        )
+        .unwrap();
+
+        let payload = daemon_logs_payload("repo", Some(tmp.path()), 50, "error");
+        let names: Vec<&str> = payload["source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["daemon.log.2026-01-02"], "got: {payload}");
+        assert_eq!(payload["returned"], 1, "got: {payload}");
+    }
+
+    /// The same invariant for the other drop path: entries cut off by
+    /// `MAX_TOTAL_BYTES` never name their file as a source.
+    #[test]
+    fn daemon_logs_source_omits_a_file_that_only_contributed_past_the_byte_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        // The newest file alone overflows MAX_TOTAL_BYTES (each message is
+        // capped at MAX_FIELD_BYTES, so ~600 serialized bytes per entry and
+        // ~55 entries reach the cap), while staying under `tail` lines so the
+        // older file is still read and still present in `origins`. The byte
+        // cut-off must break the loop before any of its lines is pushed.
+        let big = "x".repeat(2_000);
+        let mut newest = String::new();
+        for i in 0..80 {
+            newest.push_str(&format!("2026-01-02T00:{i:02}:00Z INFO mod: {big}\n"));
+        }
+        std::fs::write(travsr_dir.join("daemon.log.2026-01-02"), newest).unwrap();
+        std::fs::write(
+            travsr_dir.join("daemon.log.2026-01-01"),
+            "2026-01-01T00:00:00Z INFO mod: older\n",
+        )
+        .unwrap();
+
+        let payload = daemon_logs_payload("repo", Some(tmp.path()), 100, "info");
+        let names: Vec<&str> = payload["source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(payload["truncated"], true, "got: {names:?}");
+        assert!(
+            !names.contains(&"daemon.log.2026-01-01"),
+            "byte-capped file must not be named: {names:?}"
+        );
+    }
+
+    /// `source` is an array in every branch, `source.len() <=
+    /// candidates.len()`, and `entries.is_empty()` implies `source.is_empty()`.
+    #[test]
+    fn daemon_logs_source_invariants_hold_in_every_branch() {
+        // Unknown root.
+        let unknown = daemon_logs_payload("repo", None, 10, "info");
+        assert!(unknown["source"].is_array(), "got: {unknown}");
+        assert!(unknown["source"].as_array().unwrap().is_empty());
+
+        // Known root, empty .travsr (no log files at all).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let empty = daemon_logs_payload("repo", Some(tmp.path()), 10, "info");
+        assert!(empty["source"].is_array(), "got: {empty}");
+        assert!(
+            empty["source"].as_array().unwrap().is_empty(),
+            "got: {empty}"
+        );
+        assert_eq!(empty["returned"], 0, "got: {empty}");
+
+        // Known root with log files, but every line filtered out: entries
+        // empty implies source empty.
+        std::fs::write(
+            tmp.path().join(".travsr").join("daemon.log.2026-01-01"),
+            "2026-01-01T00:00:00Z DEBUG mod: chatter\n",
+        )
+        .unwrap();
+        let filtered = daemon_logs_payload("repo", Some(tmp.path()), 10, "error");
+        assert_eq!(filtered["returned"], 0, "got: {filtered}");
+        assert!(
+            filtered["source"].as_array().unwrap().is_empty(),
+            "entries empty must imply source empty: {filtered}"
+        );
+
+        // Populated and surviving: source is a non-empty array bounded by the
+        // number of candidate files (1 here).
+        std::fs::write(
+            tmp.path().join(".travsr").join("daemon.log.2026-01-01"),
+            "2026-01-01T00:00:00Z ERROR mod: boom\n",
+        )
+        .unwrap();
+        let populated = daemon_logs_payload("repo", Some(tmp.path()), 10, "error");
+        let names = populated["source"].as_array().unwrap();
+        assert_eq!(names.len(), 1, "got: {populated}");
     }
 
     #[test]
