@@ -10537,7 +10537,27 @@ mod snippet_tests {
     fn git_short_head_reads_repo_and_is_none_off_repo() {
         // Off a repo (bare tempdir) there is no HEAD to read.
         let empty = tempfile::tempdir().unwrap();
-        assert!(git_short_head(empty.path()).is_none());
+        // Prevent git from walking up and finding parent repos (e.g. in CI or user home).
+        let mut ceiling_paths = Vec::new();
+        let mut current = Some(empty.path());
+        while let Some(p) = current {
+            let p_str = p.to_string_lossy().to_string();
+            ceiling_paths.push(p_str.clone());
+            ceiling_paths.push(p_str.replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("C:", "c:"));
+            ceiling_paths.push(p_str.replace("c:", "C:"));
+            ceiling_paths.push(p_str.replace("C:", "c:").replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("c:", "C:").replace("\\", "/"));
+            current = p.parent();
+        }
+        #[cfg(windows)]
+        let delim = ";";
+        #[cfg(not(windows))]
+        let delim = ":";
+        std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
+        let res = git_short_head(empty.path());
+        std::env::remove_var("GIT_CEILING_DIRECTORIES");
+        assert!(res.is_none());
     }
 
     /// #645/#661: in global mode the per-repo HEAD must come from that repo's own
@@ -12672,7 +12692,26 @@ mod snippet_tests {
         ]
         .into();
 
+        // Prevent git from walking up and finding parent repos from bad_root
+        let mut ceiling_paths = Vec::new();
+        let mut current = Some(bad_root.as_path());
+        while let Some(p) = current {
+            let p_str = p.to_string_lossy().to_string();
+            ceiling_paths.push(p_str.clone());
+            ceiling_paths.push(p_str.replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("C:", "c:"));
+            ceiling_paths.push(p_str.replace("c:", "C:"));
+            ceiling_paths.push(p_str.replace("C:", "c:").replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("c:", "C:").replace("\\", "/"));
+            current = p.parent();
+        }
+        #[cfg(windows)]
+        let delim = ";";
+        #[cfg(not(windows))]
+        let delim = ":";
+        std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
         let out = find_pattern_global(&repos, "alpha", None, None, false);
+        std::env::remove_var("GIT_CEILING_DIRECTORIES");
         assert!(
             out.contains("[repo_bad] pattern error"),
             "the failing repo's error must be attributed to it, not silently dropped: {out}"
