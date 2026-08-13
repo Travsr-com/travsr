@@ -257,7 +257,10 @@ fn cmd_list(json: bool) -> Result<()> {
                 && !tool_on_path
                 && !entry.install_hint.is_empty()
             {
-                format!(" (Phase A only — Phase B needs: {})", entry.install_hint)
+                format!(
+                    " (parsing only, semantic analysis needs: {})",
+                    entry.install_hint
+                )
             } else {
                 String::new()
             };
@@ -730,7 +733,7 @@ fn cmd_detect() -> Result<()> {
         let status = if registered && fully_ready {
             "\u{2713} already active"
         } else if registered {
-            "registered (SCIP tool missing)"
+            "registered (analyzer binary missing)"
         } else {
             "not installed"
         };
@@ -787,7 +790,7 @@ fn cmd_detect() -> Result<()> {
         match cmd_install(lang, false, false, None, false, false) {
             Ok(InstallStatus::FullyReady) => {}
             Ok(InstallStatus::WrapperOnly) => {
-                println!("  \u{26A0} {lang}: wrapper installed but SCIP tool missing")
+                println!("  \u{26A0} {lang}: wrapper installed but the analyzer binary is missing")
             }
             Err(e) => eprintln!("  error: {e:#}"),
         }
@@ -926,7 +929,7 @@ fn cmd_remove(language: &str) -> Result<()> {
     let mut config = load_config().unwrap_or_default();
     if config.unregister(language) {
         save_config(&config)?;
-        println!("\u{2713} '{language}' Phase B unregistered.");
+        println!("\u{2713} '{language}' semantic analysis unregistered.");
     } else {
         println!("'{language}' was not registered.");
     }

@@ -33,7 +33,7 @@ fn phase_b_state(payload: &StatusPayload) -> &'static str {
     match payload.phase_b_commit.as_deref() {
         Some(pb) if !pb.is_empty() && Some(pb) == payload.last_commit.as_deref() => {
             if payload.phase_b_dirty {
-                "stale (needs Phase B refresh)"
+                "stale (run travsr init to refresh)"
             } else {
                 "complete"
             }
@@ -90,7 +90,7 @@ pub fn run() -> anyhow::Result<()> {
         format!(" | rerank: {}", payload.rerank)
     };
     println!(
-        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {} | phase_b: {}{}",
+        "nodes: {} | edges: {} | schema: v{} | journal: {} | last_commit: {} | semantic: {}{}",
         payload.nodes,
         payload.edges,
         payload.schema,
@@ -127,7 +127,7 @@ pub fn run() -> anyhow::Result<()> {
     let fts = payload.fts_nodes;
     if fts > 0 && fts != payload.nodes {
         eprintln!(
-            "warning: FTS index has {fts} rows but graph has {} nodes — run `travsr init` to rebuild",
+            "warning: text search index has {fts} rows but the graph has {} nodes — run `travsr init` to rebuild",
             payload.nodes
         );
     }
@@ -140,7 +140,7 @@ pub fn run() -> anyhow::Result<()> {
                 let parts: Vec<&str> = warn.splitn(2, ':').collect();
                 match parts.as_slice() {
                     ["crashed", lang] => eprintln!(
-                        "warning: phase B analyzer for '{lang}' crashed — re-run `travsr init --semantic` to retry"
+                        "warning: semantic analyzer for '{lang}' crashed — re-run `travsr init --semantic` to retry"
                     ),
                     ["version_mismatch", rest] => {
                         let v: Vec<&str> = rest.splitn(3, ':').collect();
@@ -171,7 +171,7 @@ pub fn run() -> anyhow::Result<()> {
                     // tree-sitter node — their references attribute to an orphaned
                     // duplicate node instead. `rate` is missed/attempted.
                     ["scip_unification_misses", rate] => eprintln!(
-                        "warning: {rate} SCIP definitions did not unify onto their tree-sitter nodes — some references may resolve to a duplicate node. Re-run `travsr init --semantic` if it persists."
+                        "warning: {rate} semantic definitions did not match their parsed symbol — some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
                     ),
                     _ => {}
                 }
@@ -226,7 +226,7 @@ mod tests {
         // old logic said `complete`, but the file's `ref/call` edges are gone.
         assert_eq!(
             phase_b_state(&payload("abc", "abc", true)),
-            "stale (needs Phase B refresh)"
+            "stale (run travsr init to refresh)"
         );
     }
 
