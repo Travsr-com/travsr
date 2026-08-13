@@ -252,7 +252,7 @@ impl ProgressReporter {
             }
             InitProgress::PhaseBDeferred => {
                 format!(
-                    "  {} structural index ready — semantic edges indexing in background   {}",
+                    "  {} structural index ready — semantic edges build on your next commit   {}",
                     pal.green("●"),
                     pal.dim(&elapsed)
                 )
@@ -339,9 +339,11 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
 
     match &stats.phase_b_report {
         None => {
-            // Phase B deferred — daemon auto-started by init, indexing in background.
+            // Phase B is deferred, not running yet: it is commit-gated (runs on
+            // the next `git commit` via the hook), so "indexing now" would be
+            // untrue — and in non-interactive runs no daemon was even started.
             println!(
-                "  {} semantic call-edge indexing in background — run `travsr daemon status` to check progress",
+                "  {} semantic call edges build on your next `git commit` — or run `travsr init --semantic` to build them now",
                 pal.dim("ℹ"),
             );
         }

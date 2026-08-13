@@ -1460,6 +1460,8 @@ pub fn init_repo_with_progress(
             );
             let (report, alias_map) =
                 write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            // WS-2: flag Dart packages indexed without resolved dependencies.
+            record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
             // E1: edges resolved by native leaf-name heuristics are tree-sitter,
             // not compiler-derived — write them separately with truthful
             // provenance instead of folding them into the SCIP batch as 'lsif'.
@@ -2181,6 +2183,23 @@ fn resolve_unresolved_calls(
 /// (#318 O3, [`run_background_phase_b`]) writes results through the exact same
 /// unification + attribution path as a full init — there is one and only one
 /// place that decides how Phase B nodes/edges/refs land in the store.
+/// WS-2 (Dart production readiness): record whether Dart Phase B ran with
+/// resolved dependencies, so `travsr status` and `find_references` never report
+/// the resulting partial index as a confident zero. Mirrors `rust_lsif_degraded`.
+///
+/// Empty meta = resolved (or no Dart in the repo). A comma-separated package
+/// list = Dart packages missing `.dart_tool/package_config.json` — the user can
+/// restore cross-package references by running `dart pub get` there. We never
+/// run it ourselves (local-first: it mutates the tree and needs the network).
+fn record_dart_resolution_state(store: &mut SqliteStore, repo_root: &Path, dart_present: bool) {
+    let unresolved = if dart_present {
+        travsr_analysis::phase_b_dart::unresolved_dep_packages(repo_root)
+    } else {
+        Vec::new()
+    };
+    let _ = store.set_meta("dart_deps_unresolved", &unresolved.join(","));
+}
+
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2820,6 +2839,8 @@ fn run_background_phase_b_inner(
     // P6 (#329): single walk yields both present_languages and indexable_paths
     // so Phase B runners skip their own directory walks.
     let (present_languages, indexable_paths) = collect_present_languages_and_paths(repo_root);
+    // WS-2: captured before `present_languages` is moved into PhaseBInputs below.
+    let dart_present = present_languages.contains("dart");
     // R1: reset per-Phase-B skip latch before the run (same as init_repo_with_progress).
     travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
@@ -2870,6 +2891,8 @@ fn run_background_phase_b_inner(
 
     let (report, alias_map) =
         write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    // WS-2: flag Dart packages indexed without resolved dependencies.
+    record_dart_resolution_state(&mut s, repo_root, dart_present);
     // E1: native leaf-name resolved edges are tree-sitter-heuristic — truthful
     // provenance, not the SCIP batch's 'lsif'.
     if let Err(e) = s.write_phase_b_batch(&[], &resolved, "tree-sitter") {

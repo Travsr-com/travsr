@@ -223,6 +223,71 @@ pub fn extract_native_phase_b(
     parse_emitter_output(&output_path, corpus)
 }
 
+/// Dart packages under `root` whose dependencies are not resolved.
+///
+/// `package:analyzer` needs `<pkg>/.dart_tool/package_config.json` (produced by
+/// `dart pub get`) to resolve `package:` imports. Without it it silently
+/// degrades to file-URI / SDK-only resolution: intra-package references still
+/// resolve, but cross-package references are dropped. A fresh clone never
+/// carries `package_config.json` (`.dart_tool/` is gitignored by Dart
+/// convention), so this is the common case — and the resulting partial index
+/// must never be reported as a confident zero.
+///
+/// We never run `dart pub get` ourselves: it mutates the user's tree and needs
+/// the network (local-first). This only *detects* the degraded state so the
+/// daemon can record it and `travsr status` / `find_references` can be honest.
+///
+/// Returns package directories (relative to `root`, `.` for the root package)
+/// that have a `pubspec.yaml` but no resolved `package_config.json`, sorted and
+/// capped. Empty when every Dart package is resolved (or none exist).
+pub fn unresolved_dep_packages(root: &Path) -> Vec<String> {
+    const MAX_REPORTED: usize = 20;
+    let mut out = Vec::new();
+    collect_unresolved(root, root, 0, &mut out);
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_REPORTED);
+    out
+}
+
+fn collect_unresolved(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    const MAX_DEPTH: usize = 12;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if dir.join("pubspec.yaml").is_file()
+        && !dir.join(".dart_tool").join("package_config.json").is_file()
+    {
+        let rel = dir.strip_prefix(root).unwrap_or(dir);
+        // Forward slashes so the label is identical on Windows and Unix.
+        let label = if rel.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            rel.to_string_lossy().replace('\\', "/")
+        };
+        out.push(label);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // `file_type()` does not follow symlinks, so a symlinked directory is
+        // is_dir() == false here — that both skips it and avoids symlink loops.
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Hidden (.git, .dart_tool), build outputs, and vendored JS deps are
+        // never Dart package roots and can be large.
+        if name.starts_with('.') || name == "build" || name == "node_modules" {
+            continue;
+        }
+        collect_unresolved(root, &entry.path(), depth + 1, out);
+    }
+}
+
 fn parse_emitter_output(
     json_path: &Path,
     corpus: &str,
@@ -398,5 +463,30 @@ mod tests {
         let f = tempfile::NamedTempFile::new().unwrap();
         let (nodes, edges, refs) = parse_emitter_output(f.path(), "c").unwrap();
         assert!(nodes.is_empty() && edges.is_empty() && refs.is_empty());
+    }
+
+    #[test]
+    fn unresolved_dep_packages_flags_only_unresolved_packages() {
+        // WS-2: a monorepo mirroring dart-lang/shelf — a resolved root package,
+        // one nested package missing package_config.json (fresh clone), and a
+        // non-package directory. Only the unresolved nested package is flagged.
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+
+        // Root package: resolved (has .dart_tool/package_config.json).
+        std::fs::write(r.join("pubspec.yaml"), "name: app\n").unwrap();
+        std::fs::create_dir_all(r.join(".dart_tool")).unwrap();
+        std::fs::write(r.join(".dart_tool/package_config.json"), "{}").unwrap();
+
+        // Nested package: unresolved (no .dart_tool).
+        let shelf = r.join("pkgs/shelf");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join("pubspec.yaml"), "name: shelf\n").unwrap();
+
+        // A plain source dir with no pubspec: never a package.
+        std::fs::create_dir_all(r.join("lib/src")).unwrap();
+
+        let got = unresolved_dep_packages(r);
+        assert_eq!(got, vec!["pkgs/shelf".to_string()]);
     }
 }

@@ -954,6 +954,25 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                 target.vname.path
             );
         }
+        // WS-3 (C3): a Dart index built without resolved dependencies drops
+        // every cross-package reference, so "no recorded uses" would be a
+        // confident zero the index cannot support even when the file itself was
+        // analysed. Soften it, mirroring the partial-coverage case above.
+        if target.vname.language == "dart"
+            && store
+                .get_meta("dart_deps_unresolved")
+                .ok()
+                .flatten()
+                .is_some_and(|v| !v.is_empty())
+        {
+            return format!(
+                "{header}\n0 recorded reference(s) — not a definitive zero. This \
+                 repo's Dart dependencies are not resolved (no \
+                 `.dart_tool/package_config.json`), so cross-package references \
+                 are not indexed. Run `dart pub get` and re-run `travsr init`, or \
+                 use `find_pattern` for a textual search."
+            );
+        }
         // Coverage is effectively complete for this language and this symbol has
         // neither occurrence rows nor ref/call edges: a genuine zero. (If the
         // same name is also defined elsewhere, bare calls to it are left
@@ -4043,8 +4062,8 @@ fn format_node_line(
 /// (vs a per-row badge) and disambiguates the Exact section's non-rerank score.
 fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
     match ms {
-        crate::seed::MatchSource::Exact => "## exact — literal symbol / FTS match (not reranked)",
-        crate::seed::MatchSource::Semantic => "## semantic — cross-encoder ranked",
+        crate::seed::MatchSource::Exact => "## exact matches — literal symbol / text (not relevance-ranked)",
+        crate::seed::MatchSource::Semantic => "## related — ranked by relevance",
         // #376 Phase 2 (§4.1): no raw cosine printed in this section — see
         // build_docs_section's doc comment for why (doc cosines and code
         // cosines are not commensurable; a printed number invites exactly the

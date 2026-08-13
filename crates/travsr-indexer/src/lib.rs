@@ -76,6 +76,12 @@ pub fn go_parse(
 /// Native Phase B for Dart: calls travsr-dart-index-emitter directly.
 /// Bypasses the travsr-lang-dart sidecar to avoid a Dart AOT SIGABRT that
 /// occurs when the emitter is a nested subprocess of the sandboxed sidecar.
+///
+/// "Native" here means "run as a direct child of the daemon" — NOT the catalog's
+/// `native_phase_b` flag, which is `false` for Dart (catalog.rs). That flag marks
+/// the in-process LSIF path (Rust/TS/JS/Python); Dart instead runs a first-party
+/// SCIP emitter (an external Dart AOT binary) whose output goes through the
+/// shared SCIP-unifier path, same as Kotlin/Swift/Obj-C.
 pub fn phase_b_native_dart(
     corpus: &str,
     root: &std::path::Path,
