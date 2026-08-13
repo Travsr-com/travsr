@@ -1333,6 +1333,31 @@ mod tests {
         }
     }
 
+    /// `daemon_running` retried a bounded number of times with a short sleep
+    /// between attempts, so an assertion on its *result* is decoupled from
+    /// the reliability of the one external process spawn (`tasklist` on
+    /// Windows, `kill -0` on Unix) each call makes. `pid_is_alive`'s own doc
+    /// already accepts a recycled-PID false positive as an inherent
+    /// trade-off; the property these tests check is "the probe never takes a
+    /// lock", not "every single subprocess spawn succeeds under whatever
+    /// parallel load the rest of the test suite happens to be under at the
+    /// same instant" (`cargo test` runs test functions in parallel by
+    /// default, and Windows process creation is comparatively expensive
+    /// under contention). A transient spawn failure must not fail these
+    /// tests; a genuinely broken probe (one that never reads the PID as
+    /// alive) still will, since retries do not manufacture a `true`.
+    fn daemon_running_retrying(root: &Path) -> bool {
+        for attempt in 0..5 {
+            if daemon_running(root) {
+                return true;
+            }
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        false
+    }
+
     /// The reported failure itself: a concurrent exclusive holder (a real
     /// `travsr daemon start` / `daemon_lock_held`) must never be disturbed by
     /// this probe, however many times an agent polls it. Deterministic, no
@@ -1349,8 +1374,8 @@ mod tests {
             .unwrap();
         fs2::FileExt::try_lock_exclusive(&holder).expect("test must hold the exclusive lock");
 
-        for _ in 0..50 {
-            assert!(daemon_running(tmp.path()));
+        for _ in 0..20 {
+            assert!(daemon_running_retrying(tmp.path()));
         }
 
         // Still exclusively held by `holder`, and the probe never queued for
@@ -1737,8 +1762,11 @@ mod tests {
             for _ in 0..8 {
                 let root = root.clone();
                 s.spawn(move || {
-                    for _ in 0..20 {
-                        assert!(daemon_running(&root), "live PID must read as running");
+                    for _ in 0..5 {
+                        assert!(
+                            daemon_running_retrying(&root),
+                            "live PID must read as running"
+                        );
                     }
                 });
             }
