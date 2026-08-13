@@ -192,12 +192,12 @@ suite("codicon syntax never reaches webview HTML", () => {
   // One labelled event, one repeat of it (the collapse path), one warning, and
   // one line that is not an event at all, so every branch of the panel renders.
   const LOG: LogEntry[] = [
-    { time: "01:00:00", level: "INFO", target: "daemon", message: "started", event: "daemon.ready", detail: "pid=1" },
-    { time: "01:00:01", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=1" },
-    { time: "01:00:02", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=2" },
-    { time: "01:00:03", level: "WARN", target: "plugin-host", message: "analyzer missing", detail: "lang=go" },
-    { time: "01:00:04", level: "ERROR", target: "indexer", message: "lsif failed", detail: "code=1" },
-    { time: "", level: "", target: "", message: "a line from before the log became JSON", detail: "" },
+    { time: "01:00:00", level: "INFO", target: "daemon", message: "started", event: "daemon.ready", detail: "pid=1", iso: "2026-08-14T01:00:00Z", raw: "{}" },
+    { time: "01:00:01", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=1", iso: "2026-08-14T01:00:01Z", raw: "{}" },
+    { time: "01:00:02", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=2", iso: "2026-08-14T01:00:02Z", raw: "{}" },
+    { time: "01:00:03", level: "WARN", target: "plugin-host", message: "analyzer missing", detail: "lang=go", iso: "2026-08-14T01:00:03Z", raw: "{}" },
+    { time: "01:00:04", level: "ERROR", target: "indexer", message: "lsif failed", detail: "code=1", iso: "2026-08-14T01:00:04Z", raw: "{}" },
+    { time: "", level: "", target: "", message: "a line from before the log became JSON", detail: "", iso: "", raw: "{}" },
   ];
 
   const panels = (): Array<[string, string]> => [

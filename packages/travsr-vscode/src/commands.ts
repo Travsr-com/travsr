@@ -205,7 +205,7 @@ export function timeAgo(ms: number): string {
  * The first line of the window is dropped when the window did not start at byte
  * zero, because a seek lands mid-line.
  */
-export function readDaemonLogTail(repoRoot: string, maxLines = 200): LogEntry[] {
+export function readDaemonLogTail(repoRoot: string, maxLines = 500): LogEntry[] {
   const dir = path.join(repoRoot, ".travsr");
   let newest: string;
   try {
@@ -278,12 +278,14 @@ export function parseLogLine(line: string): LogEntry {
         detail: Object.entries(rest)
           .map(([k, v]) => `${k}=${String(v)}`)
           .join(" "),
+        iso: e.timestamp,
+        raw: line,
       };
     }
   } catch {
     // fall through
   }
-  return { time: "", level: "", target: "", message: line, detail: "" };
+  return { time: "", level: "", target: "", message: line, detail: "", iso: "", raw: line };
 }
 
 /** `travsr_plugin_host::registry` is 29 characters that say "plugin host". */

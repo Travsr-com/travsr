@@ -143,7 +143,7 @@ export function webviewShell(title: string, body: string, script: string): strin
   .pill { flex: 0 0 auto; min-width: 42px; text-align: center; font-size: 9.5px;
     font-weight: 700; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 3px;
     border: 1px solid transparent; text-transform: uppercase; }
-  .p-INFO  { color: var(--fg-subtle); border-color: var(--border); }
+  .p-INFO  { color: var(--green); border-color: var(--green); background: var(--green-deep); }
   .p-DEBUG, .p-TRACE { color: var(--fg-subtle); border-color: var(--border); opacity: .7; }
   .p-WARN  { color: var(--gold);  border-color: var(--gold);  background: var(--orange-deep); }
   .p-ERROR { color: var(--error); border-color: var(--error); }
@@ -167,6 +167,28 @@ export function webviewShell(title: string, body: string, script: string): strin
     margin-left: auto; }
   .count.filtered { color: var(--gold); }
   mark { background: var(--gold); color: var(--bg); border-radius: 2px; padding: 0 1px; }
+
+  /* Subsystem tint. A categorical axis, separate from severity, so a run of
+     indexer lines is findable by eye without reading any of them. Kept low
+     saturation: severity is the signal, this is only grouping. */
+  .log-line[data-tg="daemon"]      .tg { color: var(--green); opacity: .75; }
+  .log-line[data-tg="store"]       .tg { color: var(--gold);  opacity: .7; }
+  .log-line[data-tg="indexer"]     .tg { color: var(--orange); opacity: .8; }
+  .log-line[data-tg="plugin-host"] .tg { color: #a78bfa; opacity: .85; }
+  .log-line[data-tg="mcp"]         .tg { color: #7dd3fc; opacity: .85; }
+
+  /* Second toolbar row: the modes that mirror the CLI flags. */
+  .log-bar.modes { margin: -2px 0 8px; font-size: 11px; color: var(--fg-subtle); }
+  .sel { display: inline-flex; align-items: center; gap: 4px; }
+  .sel select { background: var(--bg-input); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 4px; font-size: 11px; font-family: inherit; }
+  .tog { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .tog input { margin: 0; }
+
+  /* JSON view: the stored line verbatim, for copying or piping. */
+  .log.json-mode .log-line > span { display: none; }
+  .log.json-mode .log-line::before { content: attr(data-json); white-space: pre-wrap;
+    word-break: break-all; color: var(--fg-muted); }
   :focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
   .badge.dim { background: var(--bg-elev); color: var(--fg-subtle); }
   .consent { margin-top: 6px; }
@@ -362,6 +384,10 @@ export interface LogEntry {
   event?: string;
   /** Remaining structured fields, already flattened to `k=v`. */
   detail: string;
+  /** Raw RFC3339 stamp, so the panel can retime to UTC without a round trip. */
+  iso: string;
+  /** The stored line verbatim, for the JSON view. */
+  raw: string;
 }
 
 /**
@@ -463,8 +489,9 @@ export function buildStatsHtml(stats: StatsView, log: LogEntry[] = []): string {
         .reverse()
         .map(
           (e) =>
-            `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}">` +
-            `<span class="mono muted t">${esc(e.time)}</span>` +
+            `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}"` +
+            ` data-iso="${esc(e.iso)}" data-json="${esc(e.raw)}" data-tg="${esc(e.target)}">` +
+            `<span class="mono muted t" data-local="${esc(e.time)}">${esc(e.time)}</span>` +
             `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
             `<span class="mono muted tg">${esc(e.target)}</span>` +
             `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
@@ -505,6 +532,26 @@ ${activityRows}
   </div>
   <span class="count" id="logCount">${log.length} lines</span>
 </div>
+<div class="log-bar modes">
+  <label class="sel">Lines
+    <select id="logLines" onchange="filterLog()">
+      <option value="100">100</option>
+      <option value="200" selected>200</option>
+      <option value="500">500</option>
+    </select>
+  </label>
+  <label class="sel">Since
+    <select id="logSince" onchange="filterLog()">
+      <option value="0" selected>All</option>
+      <option value="5">5m</option>
+      <option value="60">1h</option>
+      <option value="1440">24h</option>
+    </select>
+  </label>
+  <label class="tog"><input type="checkbox" id="logUtc" onchange="filterLog()"> UTC</label>
+  <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
+  <label class="tog"><input type="checkbox" id="logFollow" onchange="toggleFollow(this)"> Follow</label>
+</div>
 <div class="log" id="logBox">
 <div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>
 ${logRows}
@@ -541,17 +588,48 @@ function mark(el, q) {
   el.appendChild(document.createTextNode(raw.slice(i)));
 }
 
+var followTimer = null;
+function toggleFollow(cb) {
+  if (followTimer) { clearInterval(followTimer); followTimer = null; }
+  // Re-reads the file on a timer, which is what --follow does. 3s is slower
+  // than a tail and fast enough for a panel you glance at.
+  if (cb.checked) followTimer = setInterval(function () {
+    vscode.postMessage({ command: 'refresh' });
+  }, 3000);
+}
+
 function filterLog() {
   var box = document.getElementById('logBox');
   if (!box) return;
   var q = (document.getElementById('logSearch').value || '').toLowerCase();
+  var maxLines = Number(document.getElementById('logLines').value);
+  var sinceMin = Number(document.getElementById('logSince').value);
+  var utc = document.getElementById('logUtc').checked;
+  var asJson = document.getElementById('logJson').checked;
+  var cutoff = sinceMin ? Date.now() - sinceMin * 60000 : 0;
+  box.classList.toggle('json-mode', asJson);
+
   var lines = box.querySelectorAll('.log-line');
   var shown = 0;
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
+
+    // Retime from the stored stamp rather than re-reading the file: the raw
+    // value is on the row, so local and UTC are the same data rendered twice.
+    var iso = line.getAttribute('data-iso');
+    var tEl = line.querySelector('.t');
+    if (iso && tEl) {
+      var d = new Date(iso);
+      tEl.textContent = utc
+        ? d.toISOString().slice(11, 19)
+        : (tEl.getAttribute('data-local') || '');
+    }
+
     var okLevel = Number(line.getAttribute('data-rank')) >= minRank;
+    var okAge = !cutoff || (iso && new Date(iso).getTime() >= cutoff);
+    var okCount = shown < maxLines;
     var okText = !q || line.textContent.toLowerCase().indexOf(q) !== -1;
-    var vis = okLevel && okText;
+    var vis = okLevel && okAge && okText && okCount;
     line.style.display = vis ? '' : 'none';
     if (vis) {
       shown++;
