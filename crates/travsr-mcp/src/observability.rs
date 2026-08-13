@@ -150,41 +150,71 @@ fn working_tree_dirty(root: &Path) -> Option<bool> {
     Some(!out.stdout.is_empty())
 }
 
+/// Whether a process with the given PID is currently alive.
+///
+/// Mirrors `travsr_cli::pid_is_alive` (travsr-cli/src/main.rs), duplicated
+/// rather than imported because travsr-mcp cannot depend on travsr-cli
+/// (cli -> daemon -> mcp, so the reverse edge is a cycle). `kill -0` on Unix
+/// and `tasklist` on Windows, no signal sent, no `unsafe`, no new dependency.
+///
+/// Trade-off, same as the CLI helper's: a recycled PID reads as alive. The
+/// window is the same one `daemon_is_running`'s own lock-file fallback
+/// accepts, and it fails in the safe direction for a read-only status probe
+/// (reports "daemon up" one poll too long, never disturbs the singleton).
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        // tasklist CSV output quotes the PID as a field only when the
+        // process exists; the localized "no tasks" INFO line never does.
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// `true` iff a live daemon currently holds `<root>/.travsr/daemon.lock`.
 ///
-/// Deliberately NOT `daemon_client::daemon_lock_held` (travsr-cli): that
-/// helper opens the lock file with `.create(true)`, which would create
-/// `.travsr/daemon.lock` as a side effect, unacceptable for a read-only MCP
-/// tool. This variant opens the file only if it already exists and returns
-/// `false` (not "unknown") when it is absent, matching the CLI helper's
-/// semantics for every case that does not require creating the file.
+/// Reads the PID out of the lock file and checks liveness. It takes NO lock,
+/// shared or exclusive, and never creates the file: this tool observes the
+/// singleton protocol, it must never participate in it (#636 round-2 review).
+/// A shared probe lock still conflicts with the exclusive acquire every real
+/// holder uses (the daemon in travsr-daemon/src/lib.rs, `daemon_lock_held` in
+/// travsr-cli/src/daemon_client.rs), so while this probe held one, a
+/// concurrent `travsr daemon start` got EWOULDBLOCK and reported "another
+/// travsr daemon is already running" against no daemon at all, and
+/// `spawn_background_daemon` returned `AlreadyRunning` so `travsr init`
+/// declined to start one. The inverse held too: `daemon_lock_held` saw the
+/// probe's own lock and reported a daemon that did not exist. The doc on
+/// `get_index_status` invites an agent to poll in a loop, which is exactly
+/// what widens that window.
 ///
-/// Probes with `try_lock_shared`, not `try_lock_exclusive`: the daemon only
-/// ever holds the lock exclusively, so a shared lock answers "is anyone
-/// holding this exclusively" without itself conflicting with another
-/// `get_index_status`/`get_daemon_logs` call's shared probe running at the
-/// same instant (#636 review: `job_in_flight` calls this on every
-/// `get_index_status`, and an agent polling in a loop is the intended usage,
-/// so concurrent probes are the expected case, not an edge case).
+/// Same shape as `daemon_is_running`'s lock-file fallback (travsr-cli
+/// main.rs): absent, empty, or unparsable content is `false`, never
+/// "unknown", matching the previous behaviour for every non-lock case.
 fn daemon_running(root: &Path) -> bool {
     let lock_path = root.join(".travsr").join("daemon.lock");
-    let Ok(file) = std::fs::OpenOptions::new().read(true).open(&lock_path) else {
-        return false; // absent / unopenable → no daemon possible
-    };
-    // Fully-qualified, not `file.try_lock_shared()`: on a toolchain new
-    // enough to have std's own (much later-stabilized) file-locking API,
-    // method resolution would silently prefer std's inherent method over
-    // this crate's `fs2` dependency, which is a real risk here since the
-    // workspace MSRV (1.75, `rust-toolchain.toml`) predates that std API.
-    // The explicit path guarantees `fs2` regardless of toolchain, matching
-    // `unlock` below.
-    match fs2::FileExt::try_lock_shared(&file) {
-        Ok(()) => {
-            let _ = fs2::FileExt::unlock(&file);
-            false
-        }
-        Err(_) => true,
-    }
+    std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(pid_is_alive)
+        .unwrap_or(false)
 }
 
 /// Serialize `payload` and wrap it in the `<travsr-data>` envelope. No output
@@ -1147,6 +1177,98 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
         assert!(!daemon_running(tmp.path()));
         assert!(!tmp.path().join(".travsr").join("daemon.lock").exists());
+    }
+
+    /// Write `pid` into a fresh temp repo's `.travsr/daemon.lock`, returning
+    /// the temp dir (kept alive by the caller) and the lock path.
+    fn repo_with_lock_pid(pid: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        let lock = travsr_dir.join("daemon.lock");
+        std::fs::write(&lock, pid).unwrap();
+        (tmp, lock)
+    }
+
+    /// #636 round-2 review: the probe must answer from the lock file's PID and
+    /// never touch the flock. Holding the lock exclusively (what a real daemon
+    /// start does) while the PID inside is dead must read as "not running";
+    /// the old `try_lock_shared` implementation reported `true` here purely
+    /// because someone else held the lock.
+    #[test]
+    fn daemon_running_ignores_the_flock_and_uses_the_pid() {
+        // 4294967294 is u32::MAX - 1: above every platform's pid_max, so it
+        // cannot be a live process.
+        let (tmp, lock) = repo_with_lock_pid("4294967294");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).expect("test must hold the exclusive lock");
+
+        assert!(
+            !daemon_running(tmp.path()),
+            "an exclusively locked file with a dead PID is not a running daemon"
+        );
+
+        let _ = fs2::FileExt::unlock(&held);
+    }
+
+    /// The converse: a live PID with nobody holding the lock at all (the
+    /// daemon writes its PID before/independently of any observer) must read
+    /// as running. The old implementation reported `false` here because it
+    /// could take the shared lock.
+    #[test]
+    fn daemon_running_true_for_a_live_pid_without_any_lock() {
+        let (tmp, _lock) = repo_with_lock_pid(&std::process::id().to_string());
+        assert!(daemon_running(tmp.path()));
+    }
+
+    #[test]
+    fn daemon_running_false_on_empty_or_garbage_lock_file() {
+        for content in ["", "abc", "-1", "   ", "12 34"] {
+            let (tmp, _lock) = repo_with_lock_pid(content);
+            assert!(
+                !daemon_running(tmp.path()),
+                "unparsable lock content {content:?} must read false, not panic"
+            );
+        }
+    }
+
+    /// The reported failure itself: a concurrent exclusive holder (a real
+    /// `travsr daemon start` / `daemon_lock_held`) must never be disturbed by
+    /// this probe, however many times an agent polls it. Deterministic, no
+    /// timing: the exclusive lock is taken first and re-verified after the
+    /// polls, on a second handle, so a probe that took any lock would show up
+    /// as a failed re-acquire.
+    #[test]
+    fn daemon_running_never_disturbs_a_concurrent_exclusive_holder() {
+        let (tmp, lock) = repo_with_lock_pid(&std::process::id().to_string());
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&holder).expect("test must hold the exclusive lock");
+
+        for _ in 0..50 {
+            assert!(daemon_running(tmp.path()));
+        }
+
+        // Still exclusively held by `holder`, and the probe never queued for
+        // it: dropping and re-acquiring must succeed immediately.
+        let _ = fs2::FileExt::unlock(&holder);
+        let restart = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&restart).is_ok(),
+            "a daemon start after the probes must still be able to take the lock"
+        );
+        let _ = fs2::FileExt::unlock(&restart);
     }
 
     // ── get_index_status payload ──────────────────────────────────────────
