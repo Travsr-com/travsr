@@ -45,6 +45,8 @@ pub fn response_to_output(resp: ParseResponse) -> ParseOutput {
                 )
             })
             .collect(),
+        // Sandboxed Phase B plugins never emit Cargo workspace markers.
+        workspace_dep_markers: Vec::new(),
     }
 }
 

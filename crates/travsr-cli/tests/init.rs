@@ -211,6 +211,36 @@ fn hook_run_from_hook_reindexes_changed_file() {
     );
 }
 
+/// Item C (dogfooding): `travsr init` must install a post-commit hook that
+/// `exec`s the SAME binary that ran init (an absolute path), never bare
+/// `travsr`. On a dogfooding box a bare hook resolves to the npm-global wrapper
+/// (often stale) and reindexes a fresh daemon's graph with old behavior.
+#[test]
+fn init_hook_pins_installing_binary_not_bare_travsr() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(tmp.path().join("svc.ts"), "export function foo() {}").unwrap();
+    git(tmp.path(), &["add", "svc.ts"]);
+    git(tmp.path(), &["commit", "-q", "-m", "initial"]);
+
+    travsr_init(tmp.path()).success();
+
+    let hook = tmp.path().join(".git/hooks/post-commit");
+    let body = std::fs::read_to_string(&hook).expect("post-commit hook must be installed");
+
+    let bin = assert_cmd::cargo::cargo_bin("travsr");
+    let bin = bin.to_str().unwrap();
+    assert!(
+        body.contains(bin),
+        "hook must embed the installing binary's absolute path ({bin}), got:\n{body}"
+    );
+    assert!(body.contains("hook-run --from-hook"));
+    assert!(
+        !body.contains("exec travsr hook-run"),
+        "hook must not invoke bare `travsr`, got:\n{body}"
+    );
+}
+
 /// BUG-1 regression: `git diff-tree HEAD` on a merge commit returns nothing
 /// without `--first-parent`. This test creates a branch, modifies a file, and
 /// merges back — the resulting merge commit's hook-run must still reindex the
