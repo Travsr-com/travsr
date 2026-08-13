@@ -196,6 +196,7 @@ suite("codicon syntax never reaches webview HTML", () => {
     { time: "01:00:01", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=1" },
     { time: "01:00:02", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=2" },
     { time: "01:00:03", level: "WARN", target: "plugin-host", message: "analyzer missing", detail: "lang=go" },
+    { time: "01:00:04", level: "ERROR", target: "indexer", message: "lsif failed", detail: "code=1" },
     { time: "", level: "", target: "", message: "a line from before the log became JSON", detail: "" },
   ];
 

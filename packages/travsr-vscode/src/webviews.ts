@@ -133,10 +133,41 @@ export function webviewShell(title: string, body: string, script: string): strin
   .log-line .tg { flex: 0 0 88px; }
   .log-line .msg { flex: 1 1 auto; color: var(--fg); }
   .log-line .detail { flex: 0 0 auto; }
-  /* Only level and message take the colour; time and target stay muted so the
-     tint marks the line without shouting the whole row. */
-  .lvl-WARN .lv, .lvl-WARN .msg { color: var(--gold); }
-  .lvl-ERROR .lv, .lvl-ERROR .msg { color: var(--error); }
+  /* Only the message takes the colour; time and target stay muted so the tint
+     marks the line without shouting the whole row. The pill carries severity as
+     shape as well as hue, so it still reads without colour vision. */
+  .lvl-WARN .msg { color: var(--gold); }
+  .lvl-ERROR .msg { color: var(--error); }
+  .log-line:hover { background: var(--bg-input); border-radius: 3px; }
+
+  .pill { flex: 0 0 auto; min-width: 42px; text-align: center; font-size: 9.5px;
+    font-weight: 700; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 3px;
+    border: 1px solid transparent; text-transform: uppercase; }
+  .p-INFO  { color: var(--fg-subtle); border-color: var(--border); }
+  .p-DEBUG, .p-TRACE { color: var(--fg-subtle); border-color: var(--border); opacity: .7; }
+  .p-WARN  { color: var(--gold);  border-color: var(--gold);  background: var(--orange-deep); }
+  .p-ERROR { color: var(--error); border-color: var(--error); }
+
+  /* Toolbar: search on the left, severity threshold in the middle, count on the
+     right, so the eye lands on the control it needs without hunting. */
+  .log-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 0 0 8px; }
+  .log-bar input[type=search] { flex: 1 1 220px; min-width: 160px; padding: 4px 8px;
+    background: var(--bg-input); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 5px; font-size: 12px; font-family: inherit; }
+  .log-bar input[type=search]::placeholder { color: var(--fg-subtle); }
+  .chips { display: flex; gap: 4px; }
+  .chip-btn { cursor: pointer; padding: 3px 9px; font-size: 11px; border-radius: 5px;
+    background: var(--bg-elev); color: var(--fg-muted);
+    border: 1px solid var(--border); font-family: inherit; }
+  .chip-btn:hover { color: var(--fg); }
+  .chip-btn.on { background: var(--green-deep); color: var(--green); border-color: var(--green); }
+  .chip-n { opacity: .65; font-variant-numeric: tabular-nums; }
+  .count { font-size: 11px; color: var(--fg-subtle); font-variant-numeric: tabular-nums;
+    margin-left: auto; }
+  .count.filtered { color: var(--gold); }
+  mark { background: var(--gold); color: var(--bg); border-radius: 2px; padding: 0 1px; }
+  :focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
   .badge.dim { background: var(--bg-elev); color: var(--fg-subtle); }
   .consent { margin-top: 6px; }
   .consent summary { cursor: pointer; font-size: 12px; color: var(--gold); }
@@ -410,20 +441,37 @@ export function buildStatsHtml(stats: StatsView, log: LogEntry[] = []): string {
         .join("\n")
     : `<tr><td colspan="3" class="empty">No lifecycle events yet. Start the daemon to see activity.</td></tr>`;
 
+  // Severity threshold, the same semantics `travsr daemon logs --level` uses:
+  // warn means warn and above, not warn alone.
+  const RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
+  const rankOf = (lvl: string): number => RANK[lvl] ?? 2;
+  const counts = { all: log.length, info: 0, warn: 0, error: 0 };
+  for (const e of log) {
+    const r = rankOf(e.level);
+    if (r >= 2) counts.info += 1;
+    if (r >= 3) counts.warn += 1;
+    if (r >= 4) counts.error += 1;
+  }
+
+  const chip = (id: string, label: string, n: number): string =>
+    `<button class="chip-btn" data-level="${id}" onclick="setLevel('${id}',this)">` +
+    `${esc(label)} <span class="chip-n">${n}</span></button>`;
+
   const logRows = log.length
     ? log
         .slice(-200)
         .reverse()
         .map(
           (e) =>
-            `<div class="log-line lvl-${esc(e.level)}"><span class="mono muted t">${esc(e.time)}</span>` +
-            `<span class="lv">${esc(e.level)}</span>` +
+            `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}">` +
+            `<span class="mono muted t">${esc(e.time)}</span>` +
+            `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
             `<span class="mono muted tg">${esc(e.target)}</span>` +
-            `<span class="msg">${esc(e.message)}</span>` +
-            `<span class="mono muted detail">${esc(e.detail)}</span></div>`
+            `<span class="msg" data-raw="${esc(e.message)}">${esc(e.message)}</span>` +
+            `<span class="mono muted detail" data-raw="${esc(e.detail)}">${esc(e.detail)}</span></div>`
         )
         .join("\n")
-    : `<div class="empty">No daemon log yet.</div>`;
+    : `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
 
   const body = `
 <h2>Graph stats</h2>
@@ -446,12 +494,87 @@ ${activityRows}
 </tbody></table>
 
 <h2 style="margin-top:28px">Daemon log</h2>
-<p class="sub">Last ${log.length} lines, newest first.</p>
-<div class="log">
+<div class="log-bar">
+  <input id="logSearch" type="search" placeholder="Filter lines\u2026" oninput="filterLog()"
+         aria-label="Filter log lines">
+  <div class="chips" role="group" aria-label="Minimum severity">
+    ${chip("all", "All", counts.all)}
+    ${chip("info", "Info+", counts.info)}
+    ${chip("warn", "Warn+", counts.warn)}
+    ${chip("error", "Error", counts.error)}
+  </div>
+  <span class="count" id="logCount">${log.length} lines</span>
+</div>
+<div class="log" id="logBox">
+<div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>
 ${logRows}
 </div>`;
 
-  const script = `function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }`;
+  const script = `
+function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({command:'refresh'}); }
+
+var minRank = 0;
+function setLevel(id, btn) {
+  minRank = { all: 0, info: 2, warn: 3, error: 4 }[id];
+  var all = document.querySelectorAll('.chip-btn');
+  for (var i = 0; i < all.length; i++) all[i].classList.remove('on');
+  btn.classList.add('on');
+  filterLog();
+}
+
+// Rebuilt from text nodes rather than innerHTML. The query is user input and
+// this runs on every keystroke, so there is no point at which it could be
+// parsed as markup.
+function mark(el, q) {
+  if (!el) return;
+  var raw = el.getAttribute('data-raw') || '';
+  el.textContent = '';
+  if (!q) { el.textContent = raw; return; }
+  var lower = raw.toLowerCase(), i = 0, at;
+  while ((at = lower.indexOf(q, i)) !== -1) {
+    if (at > i) el.appendChild(document.createTextNode(raw.slice(i, at)));
+    var m = document.createElement('mark');
+    m.textContent = raw.slice(at, at + q.length);
+    el.appendChild(m);
+    i = at + q.length;
+  }
+  el.appendChild(document.createTextNode(raw.slice(i)));
+}
+
+function filterLog() {
+  var box = document.getElementById('logBox');
+  if (!box) return;
+  var q = (document.getElementById('logSearch').value || '').toLowerCase();
+  var lines = box.querySelectorAll('.log-line');
+  var shown = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    var okLevel = Number(line.getAttribute('data-rank')) >= minRank;
+    var okText = !q || line.textContent.toLowerCase().indexOf(q) !== -1;
+    var vis = okLevel && okText;
+    line.style.display = vis ? '' : 'none';
+    if (vis) {
+      shown++;
+      mark(line.querySelector('.msg'), q);
+      mark(line.querySelector('.detail'), q);
+    }
+  }
+  var total = lines.length;
+  var label = document.getElementById('logCount');
+  // Say when a filter is hiding something. A short list with no explanation
+  // reads as "the daemon logged almost nothing".
+  label.textContent = shown === total ? total + ' lines' : shown + ' of ' + total + ' lines';
+  label.classList.toggle('filtered', shown !== total);
+
+  var empty = document.getElementById('logEmpty');
+  if (empty) empty.style.display = shown === 0 && total > 0 ? '' : 'none';
+}
+
+(function () {
+  var first = document.querySelector('.chip-btn');
+  if (first) first.classList.add('on');
+})();
+`;
   return webviewShell("Travsr Stats", body, script);
 }
 
