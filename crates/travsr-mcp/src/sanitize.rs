@@ -214,6 +214,22 @@ fn redact_home_paths(s: &str) -> String {
     redact_windows_home_run(&out, ":/Users/")
 }
 
+/// End of the username run starting at `after`: the first byte that isn't a
+/// plausible username character (POSIX portable filename charset, `[A-Za-z0-9._-]`),
+/// or `after.len()` when the whole remainder is username-shaped.
+///
+/// Used when no path separator follows the username, i.e. the home path is
+/// the last path-ish token in the string: only the username itself should be
+/// consumed, everything after it is unrelated message text and must survive
+/// (#636 review: consuming to end-of-string here silently dropped the rest
+/// of the log message, e.g. `"cannot stat /home/bob, retrying"` became
+/// `"cannot stat ~"`, losing `", retrying"`).
+fn username_run_end(after: &str) -> usize {
+    after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .unwrap_or(after.len())
+}
+
 /// Replace `<prefix><username>/` with `~/`, left to right. `<username>` is
 /// the run of non-`/` bytes between `prefix` and the next `/`.
 fn redact_unix_home_run(s: &str, prefix: &str) -> String {
@@ -229,7 +245,7 @@ fn redact_unix_home_run(s: &str, prefix: &str) -> String {
             }
             None => {
                 out.push('~');
-                rest = "";
+                rest = &after[username_run_end(after)..];
             }
         }
     }
@@ -262,7 +278,7 @@ fn redact_windows_home_run(s: &str, prefix: &str) -> String {
             }
             None => {
                 out.push_str("~/");
-                rest = "";
+                rest = &after[username_run_end(after)..];
             }
         }
     }
@@ -308,6 +324,28 @@ const TOKEN_PREFIXES: &[&str] = &[
     "sk-",
 ];
 
+/// Find the leftmost occurrence of `prefix` in `s` whose preceding byte (if
+/// any) is not an identifier byte, skipping past any occurrence that fails
+/// that boundary check to look for a later one, rather than giving up on
+/// `prefix` entirely after its first occurrence (#636 review: a real token
+/// later in the string must still be found when an earlier lookalike
+/// substring merely happens to share the prefix mid-identifier, e.g. `sk-`
+/// inside `risk-free` must not shadow a real `sk-...` token that follows).
+fn find_boundary_ok(s: &str, prefix: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find(prefix) {
+        let idx = search_from + rel;
+        let boundary_ok = idx == 0 || !is_ident_byte(s.as_bytes()[idx - 1]);
+        if boundary_ok {
+            return Some(idx);
+        }
+        // `prefix` is pure ASCII, so `idx` is a char boundary and `idx + 1`
+        // always is too (an ASCII byte is exactly one char wide).
+        search_from = idx + 1;
+    }
+    None
+}
+
 /// Replace any run starting with a [`TOKEN_PREFIXES`] entry (prefix included)
 /// up to the next non-token byte with `[redacted]`.
 ///
@@ -322,12 +360,7 @@ fn redact_prefixed_tokens(s: &str) -> String {
         // mid-identifier (the preceding byte, if any, is an ident byte).
         let next = TOKEN_PREFIXES
             .iter()
-            .filter_map(|prefix| {
-                rest.find(prefix).and_then(|idx| {
-                    let boundary_ok = idx == 0 || !is_ident_byte(rest.as_bytes()[idx - 1]);
-                    boundary_ok.then_some((idx, *prefix))
-                })
-            })
+            .filter_map(|prefix| find_boundary_ok(rest, prefix).map(|idx| (idx, *prefix)))
             .min_by_key(|(idx, _)| *idx);
 
         let Some((idx, prefix)) = next else {
@@ -826,6 +859,35 @@ mod tests {
         let out = redact_sensitive("-----BEGIN RSA PRIVATE KEY----- rest of line");
         assert!(!out.contains("PRIVATE KEY-----"), "got: {out}");
         assert!(out.contains("[redacted]"), "got: {out}");
+    }
+
+    /// #636 review: a lookalike substring earlier in the string (`sk-` inside
+    /// `risk-free`, mid-identifier, boundary-rejected) previously caused the
+    /// whole `sk-` prefix to be dropped for the rest of this pass, so a real
+    /// token later in the same string went out unredacted.
+    #[test]
+    fn redact_prefixed_token_found_after_an_earlier_boundary_rejected_lookalike() {
+        let out = redact_sensitive("risk-free sk-abc123secret");
+        assert!(!out.contains("sk-abc123secret"), "got: {out}");
+        assert!(out.contains("[redacted]"), "got: {out}");
+    }
+
+    /// #636 review: when no path separator follows the redacted username (the
+    /// home path is the last path-ish token in the string), only the username
+    /// must be consumed. The previous code cleared the rest of the string,
+    /// silently dropping any trailing message text.
+    #[test]
+    fn redact_home_path_without_trailing_slash_keeps_rest_of_message() {
+        let out = redact_sensitive("ERROR mod: cannot stat /home/bob, retrying");
+        assert!(out.contains("retrying"), "got: {out}");
+        assert!(!out.contains("/home/bob"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_windows_home_path_without_trailing_sep_keeps_rest_of_message() {
+        let out = redact_sensitive(r"cannot stat C:\Users\bob, retrying");
+        assert!(out.contains("retrying"), "got: {out}");
+        assert!(!out.contains("Users"), "got: {out}");
     }
 
     #[test]
