@@ -815,23 +815,26 @@ fn packageref_attrs(e: &quick_xml::events::BytesStart) -> (Option<String>, Optio
             .to_string();
         match key {
             "Include" => include = Some(val),
-            "Version" => version = Some(val),
+            // `VersionOverride` is how a project pins a version under Central
+            // Package Management; either form makes the reference self-versioned.
+            "Version" | "VersionOverride" => version = Some(val),
             _ => {}
         }
     }
     (include, version)
 }
 
-/// Parse a `.csproj` (MSBuild XML) for `<PackageReference Include="X" Version="Y" />`
-/// entries, including the child-element form
-/// `<PackageReference Include="X"><Version>Y</Version></PackageReference>`.
-fn parse_csproj(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let mut reader = Reader::from_str(&text);
+/// Collect every `<PackageReference>` in a `.csproj` (MSBuild XML) as
+/// `(name, explicit_version)`, covering both the self-closing
+/// `<PackageReference Include="X" Version="Y" />` and the child-element
+/// `<PackageReference Include="X"><Version>Y</Version></PackageReference>` forms.
+/// `explicit_version` is `None` for a Central Package Management reference whose
+/// version lives in `Directory.Packages.props` (resolved by the caller).
+fn collect_csproj_package_refs(text: &str) -> Vec<(String, Option<String>)> {
+    let mut reader = Reader::from_str(text);
     reader.config_mut().trim_text(true);
 
+    let mut refs: Vec<(String, Option<String>)> = Vec::new();
     let mut include: Option<String> = None;
     let mut version: Option<String> = None;
     let mut in_pkgref = false;
@@ -844,8 +847,7 @@ fn parse_csproj(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
                 if xml_local_name(e.name()) == "PackageReference" {
                     let (inc, ver) = packageref_attrs(&e);
                     if let Some(name) = inc {
-                        let ver = ver.unwrap_or_else(|| "*".to_string());
-                        emit_package(file_id, "nuget.org", "xml", &name, &ver, out);
+                        refs.push((name, ver));
                     }
                 }
             }
@@ -872,8 +874,7 @@ fn parse_csproj(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
             Ok(Event::End(e)) => {
                 if xml_local_name(e.name()) == "PackageReference" && in_pkgref {
                     if let Some(name) = include.take() {
-                        let ver = version.take().unwrap_or_else(|| "*".to_string());
-                        emit_package(file_id, "nuget.org", "xml", &name, &ver, out);
+                        refs.push((name, version.take()));
                     }
                     in_pkgref = false;
                     current_tag.clear();
@@ -884,6 +885,87 @@ fn parse_csproj(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
+    }
+    refs
+}
+
+/// Nearest `Directory.Packages.props` at or above `start_dir`, MSBuild's
+/// Central Package Management (CPM) lookup: walk up until the file is found,
+/// stopping at the repo root (a directory containing `.git`) or the filesystem
+/// root. Returns `None` when the project is not under CPM.
+fn find_directory_packages_props(start_dir: &Path) -> Option<PathBuf> {
+    let mut dir = start_dir;
+    loop {
+        let candidate = dir.join("Directory.Packages.props");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.join(".git").exists() {
+            return None; // repo boundary: do not escape into ancestors
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Central package versions from a `Directory.Packages.props`: the
+/// `<PackageVersion Include="X" Version="Y" />` entries that a CPM project's
+/// versionless `<PackageReference>`s inherit. Conditions are ignored
+/// (best-effort — the last definition of a name wins).
+fn parse_central_package_versions(props_path: &Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(props_path) else {
+        return map;
+    };
+    let mut reader = Reader::from_str(&text);
+    reader.config_mut().trim_text(true);
+    loop {
+        let (name, attrs) = match reader.read_event() {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
+                (xml_local_name(e.name()), packageref_attrs(&e))
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => continue,
+        };
+        // `packageref_attrs` reads `Include` + `Version`, the same shape a
+        // `<PackageVersion>` uses.
+        if name == "PackageVersion" {
+            if let (Some(pkg), Some(ver)) = attrs {
+                map.insert(pkg, ver);
+            }
+        }
+    }
+    map
+}
+
+/// Parse a `.csproj` (MSBuild XML) for `<PackageReference>` dependencies.
+/// A reference that carries its own `Version`/`VersionOverride` is emitted as
+/// written; a versionless reference (Central Package Management) has its version
+/// resolved from the nearest `Directory.Packages.props`, falling back to `*`
+/// when the project is not under CPM or the name is absent there.
+///
+/// CAVEAT: the central version is read at parse time. Editing only
+/// `Directory.Packages.props` (a bare version bump) will not re-resolve the
+/// `.csproj` edges until that project is itself reindexed — the same
+/// manifest-only-edit limitation the C1 cross-link documents.
+fn parse_csproj(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let refs = collect_csproj_package_refs(&text);
+    // Only pay the CPM lookup when a reference actually needs it.
+    let central = if refs.iter().any(|(_, v)| v.is_none()) {
+        path.parent()
+            .and_then(find_directory_packages_props)
+            .map(|p| parse_central_package_versions(&p))
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    for (name, ver) in refs {
+        let ver = ver
+            .or_else(|| central.get(&name).cloned())
+            .unwrap_or_else(|| "*".to_string());
+        emit_package(file_id, "nuget.org", "xml", &name, &ver, out);
     }
 }
 
@@ -1492,6 +1574,74 @@ require github.com/single/dep v1.2.3
         assert!(s.contains(&"pkg:Serilog@3.1.1"), "child <Version> form");
         assert!(out.nodes[1..].iter().all(|n| n.vname.corpus == "nuget.org"));
         assert_eq!(out.nodes[0].vname.language, "xml");
+    }
+
+    #[test]
+    fn csproj_central_package_management_resolves_from_props() {
+        // Central Package Management: the project references packages without a
+        // version; the versions live in a `Directory.Packages.props` at the repo
+        // root. A `VersionOverride` on a reference still wins locally.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "").unwrap(); // repo boundary marker
+        std::fs::write(
+            dir.path().join("Directory.Packages.props"),
+            r#"<Project>
+  <ItemGroup>
+    <PackageVersion Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageVersion Include="Serilog" Version="3.1.1" />
+  </ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+        let proj_dir = dir.path().join("src");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let csproj = proj_dir.join("App.csproj");
+        std::fs::write(
+            &csproj,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" />
+    <PackageReference Include="Serilog" VersionOverride="4.0.0" />
+    <PackageReference Include="Unlisted.Pkg" />
+  </ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+
+        let out = parse("github.com/a/b", &csproj, "src/App.csproj").unwrap();
+        let s = sigs(&out);
+        assert!(
+            s.contains(&"pkg:Newtonsoft.Json@13.0.3"),
+            "versionless ref resolves from Directory.Packages.props"
+        );
+        assert!(
+            s.contains(&"pkg:Serilog@4.0.0"),
+            "VersionOverride wins over the central version"
+        );
+        assert!(
+            s.contains(&"pkg:Unlisted.Pkg@*"),
+            "a name absent from the props file falls back to *"
+        );
+    }
+
+    #[test]
+    fn csproj_versionless_without_cpm_falls_back_to_star() {
+        // No Directory.Packages.props anywhere: a versionless reference keeps the
+        // pre-CPM behavior and degrades to `*`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "").unwrap();
+        let csproj = dir.path().join("App.csproj");
+        std::fs::write(
+            &csproj,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" />
+  </ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+        let out = parse("github.com/a/b", &csproj, "App.csproj").unwrap();
+        assert!(sigs(&out).contains(&"pkg:Newtonsoft.Json@*"));
     }
 
     #[test]
