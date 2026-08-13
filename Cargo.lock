@@ -4060,6 +4060,7 @@ dependencies = [
  "travsr-rerank",
  "travsr-retrieval",
  "travsr-store",
+ "unicode-segmentation",
  "uuid",
 ]
 

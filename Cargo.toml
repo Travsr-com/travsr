@@ -113,6 +113,11 @@ base64           = "0.22"
 tokio-util       = { version = "0.7", features = ["rt"] }
 tokio-stream     = "0.1"
 fs2              = "0.4"
+# Already resolved transitively (liquid-lib, tokenizers' spm_precompiled) at
+# 1.13.3, so a direct dependency here introduces no new external code into
+# the build graph (#636 round-2 review: grapheme-cluster-aware username
+# bounding in travsr-mcp's home-path redactor).
+unicode-segmentation = "1"
 # SIGINT/Ctrl-C handler for graceful foreground reindex cancel (WS3).
 ctrlc            = "3"
 tracing-appender = "0.2"

@@ -15,6 +15,8 @@
 //! registry lookups without sanitization. `validate_mcp_arg` rejects `../`,
 //! absolute paths, oversized inputs, and null bytes before any store query runs.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 /// Maximum byte length of a sanitized MCP output item (per item, not per call).
 const MAX_OUTPUT_BYTES: usize = 4_096;
 
@@ -214,11 +216,18 @@ fn redact_home_paths(s: &str) -> String {
     redact_windows_home_run(&out, ":/Users/")
 }
 
+/// Whether `c`, the base (leading) character of a grapheme cluster, marks
+/// that cluster as username material: any Unicode alphanumeric, plus `_`,
+/// `-`, `.`.
+fn is_username_material_base(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
 /// Byte offset of the end of the username run starting at `after`: the first
-/// character that isn't a plausible username character (any Unicode
-/// alphanumeric, plus `_`, `-`, `.`), or `after.len()` when the whole
+/// grapheme cluster whose base character isn't plausible username material
+/// (see [`is_username_material_base`]), or `after.len()` when the whole
 /// remainder is username-shaped. The returned offset is always a char
-/// boundary (`str::find` with a char predicate reports char starts).
+/// boundary (grapheme cluster boundaries are always char boundaries).
 ///
 /// This bounds the username in EVERY case, whether or not a path separator
 /// follows it: only the username itself is consumed, everything after it is
@@ -228,13 +237,52 @@ fn redact_home_paths(s: &str) -> String {
 /// and `"index /home/bob failed, see /var/log/travsr.log"` became the
 /// actively misleading `"index ~/var/log/travsr.log"`).
 ///
-/// Unicode alphanumeric, not `is_ascii_alphanumeric`: a non-ASCII username
-/// otherwise ended the run at its first non-ASCII byte and leaked its tail
-/// (#636 round-2 review: `"stat /home/böb failed"` -> `"stat ~öb failed"`).
+/// Grapheme-cluster aware, not a per-`char` scan (#636 round-2 review,
+/// second half): `char::is_alphanumeric` is false for many combining marks
+/// (e.g. U+0308 COMBINING DIAERESIS) and for ZWJ, so a per-char scan ends the
+/// run in the middle of a base-character-plus-mark pair and leaks the rest
+/// of the username as if it were message text (`"stat /home/bo\u{308}b
+/// failed"` -> `"stat ~\u{308}b failed"`). This matters in practice, not just
+/// in theory: macOS APFS/HFS+ store filenames in NFD (decomposed) form by
+/// default, and CI runs `macos-latest`, so a real `/Users/böb` home
+/// directory on that runner arrives at this redactor already decomposed,
+/// in exactly the leaking spelling. Walking grapheme clusters (via
+/// `unicode-segmentation`, already resolved transitively in this workspace)
+/// keeps a combining mark bound to the base character it modifies, so the
+/// run can never end mid-cluster.
+///
+/// Fails CLOSED, not open, on a cluster with no alphanumeric base at all
+/// (#636 round-2 review: an all-emoji username has run length zero under
+/// (a) alone, which used to mean "nothing to redact", emitting the whole
+/// username verbatim). When the computed run is zero-length and the next
+/// character is neither `/` nor whitespace, this falls back to consuming up
+/// to the next `/` or whitespace boundary instead of stopping immediately,
+/// so an unrecognized-but-clearly-a-username run is still redacted.
 fn username_run_end(after: &str) -> usize {
-    after
-        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
-        .unwrap_or(after.len())
+    let mut end = 0usize;
+    for (idx, grapheme) in after.grapheme_indices(true) {
+        let base_is_username = grapheme
+            .chars()
+            .next()
+            .is_some_and(is_username_material_base);
+        if !base_is_username {
+            end = idx;
+            break;
+        }
+        end = idx + grapheme.len();
+    }
+
+    if end == 0 {
+        if let Some(next_char) = after.chars().next() {
+            if next_char != '/' && !next_char.is_whitespace() {
+                end = after
+                    .find(|c: char| c == '/' || c.is_whitespace())
+                    .unwrap_or(after.len());
+            }
+        }
+    }
+
+    end
 }
 
 /// Replace `<prefix><username>` with `~` (and a trailing `/`, when the
@@ -246,7 +294,8 @@ fn username_run_end(after: &str) -> usize {
 /// cases differ only in whether the separator itself is consumed, and
 /// splitting them into two branches is exactly how the unbounded scan
 /// survived in the "some other path follows on this line" branch (#636
-/// round-2 review).
+/// round-2 review). The non-ASCII/NFD leak that same review found lives in
+/// [`username_run_end`] itself, this helper only consumes whatever it reports.
 fn redact_unix_home_run(s: &str, prefix: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -271,10 +320,12 @@ fn redact_unix_home_run(s: &str, prefix: &str) -> String {
 /// character (if present) is consumed too.
 ///
 /// Same bounding as [`redact_unix_home_run`]: the username run ends at
-/// [`username_run_end`], not at the next `sep` anywhere later in the string.
-/// Unlike the Unix helper both cases emit `~/` (the trailing separator is
-/// part of the replacement here, so a bare `C:\Users\bob` reads `~/`), which
-/// is pre-existing behaviour and deliberately preserved.
+/// [`username_run_end`], not at the next `sep` anywhere later in the string,
+/// and shares that function's grapheme-cluster-aware, NFD-safe bounding
+/// (#636 round-2 review). Unlike the Unix helper both cases emit `~/` (the
+/// trailing separator is part of the replacement here, so a bare
+/// `C:\Users\bob` reads `~/`), which is pre-existing behaviour and
+/// deliberately preserved.
 fn redact_windows_home_run(s: &str, prefix: &str) -> String {
     let sep = prefix.chars().last().unwrap_or('\\');
     let mut out = String::with_capacity(s.len());
@@ -968,6 +1019,93 @@ mod tests {
         let out = redact_sensitive("stat /home/b\u{f6}b failed");
         assert!(!out.contains("\u{f6}b"), "got: {out}");
         assert!(out.contains(" failed"), "got: {out}");
+    }
+
+    /// #636 round-2 review, second half: `char::is_alphanumeric` is false for
+    /// U+0308 COMBINING DIAERESIS (and for combining marks generally), so a
+    /// per-char scan ended the username run mid-cluster and leaked the tail.
+    /// This is the NFD spelling of "böb" (base `o` + U+0308), exactly what
+    /// macOS APFS/HFS+ hands back for a real `/Users/böb` home directory,
+    /// since CI runs `macos-latest`. Every assertion here is `assert_eq!` on
+    /// the whole string: the failure mode is dropped/leaked text, which a
+    /// `contains` check on the surviving half cannot see. Each case is run
+    /// against both the failing pre-fix predicate's shape (documented in the
+    /// comment) and the fixed one, so this test would have failed before the
+    /// grapheme-aware rewrite.
+    #[test]
+    fn redact_home_path_handles_combining_marks_zwj_and_emoji_without_leaking() {
+        for (input, want) in [
+            // NFD "böb": base `o` + U+0308 COMBINING DIAERESIS. Pre-fix:
+            // "stat ~\u{308}b failed" (leaked "\u{308}b").
+            ("stat /home/bo\u{308}b failed", "stat ~ failed"),
+            // Same NFD username with a real path after it: only the
+            // separator is consumed with the username, the rest of the path
+            // (and the combining mark) must not leak either.
+            (
+                "index /home/bo\u{308}b/pkg/mod.rs failed",
+                "index ~/pkg/mod.rs failed",
+            ),
+            // Windows helper shares `username_run_end`: must be fixed too.
+            (
+                "copy C:\\Users\\bo\u{308}b to C:\\Users\\carol\\dest",
+                "copy ~/ to ~/dest",
+            ),
+            // ZWJ (U+200D): also not `is_alphanumeric`, also must bind to
+            // its neighbours rather than ending the run.
+            ("stat /home/a\u{200D}b failed", "stat ~ failed"),
+            // All-emoji username: the grapheme run is zero-length (no
+            // alphanumeric base at all), so the fail-closed fallback must
+            // consume up to the next whitespace/`/` instead of emitting the
+            // username verbatim (fail OPEN). Pre-fix this leaked the whole
+            // username unredacted.
+            ("stat /home/\u{1F600}\u{1F601} failed", "stat ~ failed"),
+        ] {
+            assert_eq!(redact_sensitive(input), want, "input: {input:?}");
+        }
+
+        // NFC control: the precomposed spelling of the same username ("böb",
+        // single codepoint U+00F6) already passed before this fix, and must
+        // keep passing, so NFC and NFD spellings of the same name behave the
+        // same way.
+        assert_eq!(
+            redact_sensitive("stat /home/b\u{f6}b failed"),
+            "stat ~ failed"
+        );
+        assert_eq!(
+            redact_sensitive("copy C:\\Users\\b\u{f6}b to C:\\Users\\carol\\dest"),
+            "copy ~/ to ~/dest"
+        );
+    }
+
+    /// #636 round-2 review: guard against the *other* failure direction. A
+    /// non-ASCII character that is not part of the username (a standalone
+    /// combining mark starting the trailing message text, or a symbol glued
+    /// directly onto the username with no separator) must not be swallowed
+    /// into the redacted run. A simpler dependency-free predicate ("every
+    /// non-ASCII char is username material") was considered and rejected
+    /// specifically because it fails the glued case below by dropping
+    /// message text, the very defect Ritik's review raised.
+    #[test]
+    fn redact_home_path_does_not_over_consume_non_username_non_ascii_text() {
+        // A combining mark starting the message text, after a space: the
+        // run already ended at the space, so this must survive untouched.
+        assert_eq!(
+            redact_sensitive("stat /home/bob \u{0301}message failed"),
+            "stat ~ \u{0301}message failed"
+        );
+        // A non-ASCII symbol as its own token, after a space.
+        assert_eq!(
+            redact_sensitive("index /home/bob \u{2192} done"),
+            "index ~ \u{2192} done"
+        );
+        // Glued directly onto the username with no separator at all: the
+        // arrow is its own grapheme cluster with a non-alphanumeric base, so
+        // the run stops right before it. Must not become "index ~", which
+        // would silently drop "\u{2192}done".
+        assert_eq!(
+            redact_sensitive("index /home/bob\u{2192}done"),
+            "index ~\u{2192}done"
+        );
     }
 
     /// Exact outputs for the shapes a daemon log line actually takes around a

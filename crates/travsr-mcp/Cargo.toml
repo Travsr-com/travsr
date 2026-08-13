@@ -38,6 +38,7 @@ base64 = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 ignore = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [features]
 default = []
