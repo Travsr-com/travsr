@@ -725,6 +725,21 @@ async fn run(cli: Cli) -> Result<()> {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     let exe = std::env::current_exe().context("finding current exe")?;
+                    // Relay the new daemon's startup, exactly as `daemon start`
+                    // does. #348 is about a command that detaches in under 10ms
+                    // and tells you nothing, and restart detaches the same way:
+                    // it printed one line and returned the prompt whether the
+                    // replacement came up or died. Restart is also the command
+                    // you run right after a rebuild, which is precisely when
+                    // "did the new one actually start" is the question.
+                    //
+                    // Seek to the end before spawning so the relay shows this
+                    // session's lines rather than replaying the old daemon's.
+                    let mut relay = travsr_daemon::logfile::LogTail::new(
+                        &travsr_daemon::logfile::log_dir(&repo_root),
+                    );
+                    relay.seek_to_end();
+                    let started = std::time::Instant::now();
                     match daemon_client::spawn_background_daemon(&repo_root, &exe) {
                         daemon_client::SpawnOutcome::Failed => match daemon_start_error(&repo_root)
                         {
@@ -733,7 +748,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 "travsr daemon failed to restart — see `travsr daemon logs`"
                             ),
                         },
-                        _ => eprintln!("travsr daemon restarted in background"),
+                        _ => relay_daemon_startup(&repo_root, relay, started),
                     }
                 }
                 DaemonAction::Logs {
@@ -998,7 +1013,11 @@ fn relay_daemon_startup(
     // The log on disk is JSON; a person waiting at a prompt is not going to read
     // it. Render the same columns `travsr daemon logs` uses, minus the date
     // separator, which is today by construction here.
-    let render = LogRenderer::new(false);
+    //
+    // Scoped to the repo for the same reason `daemon logs` is: the reader just
+    // typed the command in this directory, so `repo=/long/path/to/it` on every
+    // line is thirty characters spent restating that.
+    let render = LogRenderer::new(false).for_repo(repo_root.to_path_buf());
     eprintln!("[travsr] starting…");
 
     loop {
