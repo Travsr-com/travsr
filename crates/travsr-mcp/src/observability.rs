@@ -18,7 +18,7 @@ use crate::rerank;
 use crate::sanitize::{
     is_sensitive_key, sanitize_log_value, validate_mcp_repo_key_arg, wrap_envelope,
 };
-use crate::tools::{git_short_head, phase_b_capable_languages};
+use crate::tools::git_short_head;
 
 /// A resolved single-repo target for the observability tools' global-mode
 /// variants: registry key, repo root (derived from the db path), and db path.
@@ -335,6 +335,72 @@ fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'static str, Str
     out
 }
 
+/// Whether each Phase-B-catalog language can produce Phase B edges *for this
+/// repo on this machine*: `None` = available, `Some(detail)` = unavailable,
+/// with the reason. The key set is exactly `PHASE_B_CATALOG`, so it doubles
+/// as the "is this language Phase-B-capable at all" membership test.
+///
+/// Catalog membership alone is the wrong predicate (#636 round-2 review): a
+/// language with sources in the repo but no analyzer installed emits no
+/// ref/call edges and never will, so classifying it by "has edges yet" leaves
+/// it permanently non-terminal. What actually decides it is the skip ladder
+/// `travsr_plugin_host::indexer` runs, and this mirrors that ladder in the
+/// same order rather than inventing a second one:
+///   1. builtin (bundled in the travsr binary) -> always available
+///   2. non-builtin not registered in lang.toml -> `skipped_unregistered`
+///   3. scip-clang-based with no `compile_commands.json` at the repo root ->
+///      `skipped_no_compdb` (only checked when the root is known)
+///   4. resolver cannot resolve the analyzer -> `skipped_no_analyzer`
+///
+/// The detail strings reuse the exact wording `decode_phase_b_warnings`
+/// produces for those same classes, so this tool and `travsr status` never
+/// disagree about why a language is degraded.
+///
+/// Everything here is read-only: `registered_languages_from_disk` reads
+/// `lang.toml` (honouring `TRAVSR_LANG_TOML`) and `CatalogResolver::new`
+/// reads it plus probes `PATH`. Nothing is written, nothing is downloaded.
+/// The resolver is built once per payload, not once per language.
+fn phase_b_availability(root: Option<&Path>) -> HashMap<&'static str, Option<String>> {
+    use travsr_plugin_host::resolver::PluginResolver as _;
+
+    let registered = travsr_plugin_host::trust::registered_languages_from_disk();
+    let resolver = travsr_plugin_host::resolver::CatalogResolver::new();
+    let has_compdb = root.map(|r| r.join("compile_commands.json").exists());
+
+    let mut out = HashMap::with_capacity(travsr_plugin_host::PHASE_B_CATALOG.len());
+    for entry in travsr_plugin_host::PHASE_B_CATALOG {
+        let lang = entry.language;
+        let detail = if entry.builtin {
+            None
+        } else if !registered.iter().any(|r| r == lang) {
+            Some(format!(
+                "'{lang}' sources found but semantic indexing is not set up. \
+                 Run `travsr lang install {lang}`"
+            ))
+        } else if entry.command == "scip-clang" && has_compdb == Some(false) {
+            Some(format!(
+                "'{lang}' semantic indexing needs a compile_commands.json at the \
+                 repo root. Generate one (e.g. `bear -- make`, or CMake's \
+                 CMAKE_EXPORT_COMPILE_COMMANDS) to enable it"
+            ))
+        } else if lang == "dart" {
+            // The indexer queues dart straight after the registration check
+            // (its emitter runs in-process, never through the resolver), so
+            // registration is the whole test for it.
+            None
+        } else if resolver.resolve(lang).is_none() {
+            Some(format!(
+                "'{lang}' is registered but its analyzer binary is missing. \
+                 Run `travsr lang install {lang}`"
+            ))
+        } else {
+            None
+        };
+        out.insert(lang, detail);
+    }
+    out
+}
+
 // ── get_index_status ────────────────────────────────────────────────────────
 
 /// Semantic (embeddings + rerank) section of `get_index_status`'s payload.
@@ -468,26 +534,52 @@ fn index_status_payload(
     // yaml, ...) that have no Phase B analyzer and so can never reach a Phase
     // B terminal state. Filter to Phase-B-capable languages first, otherwise
     // those languages are permanently misreported as "running".
-    let capable = phase_b_capable_languages();
+    //
+    // Capability comes from the plugin host's own `PHASE_B_CATALOG` (the
+    // key set of `phase_b_availability`), not from `tools::LANG_CATALOG`'s
+    // hand-maintained copy: that copy is missing `objectivec`, which is a
+    // real Phase B language, so it was excluded from `phase_b.languages`
+    // entirely. It is now reported like any other catalog language.
+    let availability = phase_b_availability(root);
     let languages = store.language_distribution().unwrap_or_default();
     let languages: Vec<(String, u64)> = languages
         .into_iter()
-        .filter(|(lang, _)| capable.contains(lang.as_str()))
+        .filter(|(lang, _)| availability.contains_key(lang.as_str()))
         .collect();
     let mut lang_entries = Vec::with_capacity(languages.len());
     let mut lang_states: Vec<&'static str> = Vec::with_capacity(languages.len());
     for (lang, _count) in &languages {
+        // Ordered so that every language lands on a state it can actually
+        // leave (#636 round-2 review: twelve capable languages had nodes in
+        // the real graph but only four had ref/call edges, and the other
+        // eight fell through to "running" forever, dragging the aggregate
+        // with them, so an agent polling for readiness never got an answer).
         let (state, detail) = if let Some((cls, msg)) = decoded_warnings.get(lang) {
+            // 1. A recorded warning still wins: it is what actually happened
+            //    on the last run, more specific than any static prediction.
             (*cls, Some(msg.clone()))
         } else if store.has_refcall_edges_for_language(lang) {
+            // 2. Edges exist: Phase B produced output for this language.
             ("done", None)
-        } else {
-            let pending = phase_b_commit.is_none() || phase_b_commit != last_commit;
-            if pending {
-                ("pending", None)
-            } else {
+        } else if let Some(Some(reason)) = availability.get(lang.as_str()) {
+            // 3. No analyzer installed/registered for this repo: it emits no
+            //    ref/call edges and never will. Unavailable, not running.
+            ("unavailable", Some(reason.clone()))
+        } else if phase_b_commit.is_none() || phase_b_commit != last_commit {
+            // 4. Phase B has not completed at the indexed commit. "running"
+            //    now means a job is genuinely in flight (a live daemon with
+            //    work to do); otherwise the work is merely queued.
+            if job_in_flight {
                 ("running", None)
+            } else {
+                ("pending", None)
             }
+        } else {
+            // 5. Analyzer installed, Phase B complete at this commit, no
+            //    warning, no edges: the pass ran and legitimately found
+            //    nothing to link (e.g. a single leaf file with no calls).
+            //    That is a finished state, not a perpetually running one.
+            ("done", None)
         };
         lang_states.push(state);
         let mut entry = serde_json::json!({ "language": lang, "state": state });
@@ -1039,6 +1131,11 @@ pub fn get_graph_health_global(repos: &HashMap<String, PathBuf>, repo_arg: Optio
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate process-global env vars; the default test
+    /// harness runs test fns on parallel threads and `set_var`/`remove_var`
+    /// are process-wide (same pattern as `rerank::tests`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn git(args: &[&str], cwd: &Path) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -1348,8 +1445,12 @@ mod tests {
     /// Phase B analyzer (markdown, toml, json, ...). Those must never appear
     /// in `phase_b.languages`, they can never reach a terminal state and
     /// would otherwise be permanently misreported as "running".
+    ///
+    /// Also pins termination (#636 round-2 review: the original version of
+    /// this test only asserted markdown's absence, so it stayed green while
+    /// the aggregate was stuck in "running" forever).
     #[test]
-    fn index_status_excludes_non_phase_b_capable_languages_from_phase_b_languages() {
+    fn index_status_excludes_non_capable_languages_and_reaches_done() {
         use travsr_core::{Node, VName};
         use travsr_store::Store as _;
         let mut store = SqliteStore::open_in_memory().unwrap();
@@ -1365,7 +1466,16 @@ mod tests {
                     "function"
                 },
             );
-            store.put_node(&node).unwrap();
+            let id = store.put_node(&node).unwrap();
+            if lang == "rust" {
+                store
+                    .put_edge(&travsr_core::Edge::new(
+                        id,
+                        id,
+                        travsr_core::EdgeKind::RefCall,
+                    ))
+                    .ok();
+            }
         }
 
         let payload = index_status_payload(&store, "repo", None);
@@ -1374,11 +1484,168 @@ mod tests {
             !langs.iter().any(|l| l["language"] == "markdown"),
             "markdown must never appear in phase_b.languages: {payload}"
         );
-        // rust has no refcall edges and phase_b_commit == last_commit (no
-        // decoded warning either), so with markdown excluded it is the only
-        // capable language and its own state (not markdown's) drives the mix.
+        // rust (builtin, with ref/call edges) is the only capable language
+        // present, so the aggregate must be the literal "done".
         assert_eq!(langs.len(), 1, "got: {payload}");
         assert_eq!(langs[0]["language"], "rust");
+        assert_eq!(payload["phase_b"]["state"], "done", "got: {payload}");
+        assert!(
+            !langs.iter().any(|l| l["state"] == "running"),
+            "no language may sit in \"running\" here: {payload}"
+        );
+    }
+
+    /// Termination invariant (#636 round-2 review): with no warnings and
+    /// Phase B complete at the indexed commit, every capable language present
+    /// must land on a state it can leave, and the aggregate with it. Both
+    /// halves of the mix are covered: a builtin analyzer that produced no
+    /// edges, and a non-builtin one that is not installed at all.
+    ///
+    /// `TRAVSR_LANG_TOML` points at an empty registry so the result does not
+    /// depend on which analyzers the developer running the suite happens to
+    /// have installed.
+    #[test]
+    fn index_status_phase_b_always_reaches_a_terminal_state() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lang_toml = tempfile::tempdir().unwrap();
+        let lang_toml_path = lang_toml.path().join("lang.toml");
+        std::fs::write(&lang_toml_path, "registered = []\n").unwrap();
+        std::env::set_var("TRAVSR_LANG_TOML", &lang_toml_path);
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+        // rust: builtin, always available, but no ref/call edges here.
+        // ruby: non-builtin and unregistered, so no analyzer can ever run.
+        for (lang, sig) in [("rust", "fn:a"), ("ruby", "fn:b")] {
+            let node = Node::new(
+                VName::new("corpus", "main", format!("src/f.{lang}"), lang, sig),
+                "function",
+            );
+            store.put_node(&node).unwrap();
+        }
+
+        let payload = index_status_payload(&store, "repo", None);
+        std::env::remove_var("TRAVSR_LANG_TOML");
+
+        let langs = payload["phase_b"]["languages"].as_array().unwrap();
+        for entry in langs {
+            let state = entry["state"].as_str().unwrap();
+            assert!(
+                matches!(state, "done" | "failed" | "unavailable"),
+                "{} must be terminal, got {state:?}: {payload}",
+                entry["language"]
+            );
+        }
+        let aggregate = payload["phase_b"]["state"].as_str().unwrap();
+        assert!(
+            !matches!(aggregate, "running" | "pending"),
+            "aggregate must be terminal, got {aggregate:?}: {payload}"
+        );
+
+        // A language with sources but no analyzer is unavailable, never
+        // running, and says how to fix it.
+        let ruby = langs.iter().find(|l| l["language"] == "ruby").unwrap();
+        assert_eq!(ruby["state"], "unavailable", "got: {payload}");
+        assert!(
+            ruby["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("travsr lang install"),
+            "got: {payload}"
+        );
+        // Installed analyzer, Phase B complete at this commit, no warning and
+        // no edges: the pass ran and found nothing to link.
+        let rust = langs.iter().find(|l| l["language"] == "rust").unwrap();
+        assert_eq!(rust["state"], "done", "got: {payload}");
+        assert_eq!(payload["phase_b"]["state"], "partial", "got: {payload}");
+
+        // Determinism: the payload is a pure function of the store + env.
+        let again = index_status_payload(&store, "repo", None);
+        assert_eq!(
+            payload["phase_b"], again["phase_b"],
+            "two consecutive calls must produce identical phase_b payloads"
+        );
+    }
+
+    /// "running" stays reachable, but only when a job is genuinely in flight:
+    /// Phase B is behind the indexed commit AND a live daemon is holding the
+    /// lock. Without the daemon the same store reads "pending".
+    #[test]
+    fn index_status_phase_b_running_only_while_a_job_is_in_flight() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "old999").unwrap();
+        let node = Node::new(
+            VName::new("corpus", "main", "src/f.rust", "rust", "fn:a"),
+            "function",
+        );
+        store.put_node(&node).unwrap();
+
+        // No daemon: the work is queued, not running.
+        let (idle, _lock) = repo_with_lock_pid("4294967294");
+        let payload = index_status_payload(&store, "repo", Some(idle.path()));
+        assert_eq!(payload["phase_b"]["job_in_flight"], false, "got: {payload}");
+        assert_eq!(payload["phase_b"]["languages"][0]["state"], "pending");
+
+        // Live daemon (this test process stands in for it) plus a commit
+        // mismatch: a job is in flight.
+        let (live, _lock) = repo_with_lock_pid(&std::process::id().to_string());
+        let payload = index_status_payload(&store, "repo", Some(live.path()));
+        assert_eq!(payload["phase_b"]["job_in_flight"], true, "got: {payload}");
+        assert_eq!(payload["phase_b"]["languages"][0]["state"], "running");
+    }
+
+    /// #636 round-2 review harness: the only realistic-graph check available.
+    /// Skipped by default. Point `TRAVSR_REAL_GRAPH_DB` at a **copy** of a
+    /// real `.travsr/graph.db` (never the live one: this opens it read-only,
+    /// but SQLite still touches the `-shm`/`-wal` siblings) and run
+    ///
+    ///   cargo test -p travsr-mcp -- --ignored real_graph --nocapture
+    ///
+    /// It pins the property the review is about: Phase B always terminates,
+    /// on a graph with many languages present and analyzers installed for
+    /// only a few of them.
+    #[test]
+    #[ignore = "needs TRAVSR_REAL_GRAPH_DB pointing at a copy of a real graph.db"]
+    fn real_graph_index_status_phase_b_reaches_a_terminal_state() {
+        let Ok(path) = std::env::var("TRAVSR_REAL_GRAPH_DB") else {
+            eprintln!("TRAVSR_REAL_GRAPH_DB unset, skipping real-graph harness");
+            return;
+        };
+        let store = SqliteStore::open_read_only(Path::new(&path))
+            .expect("TRAVSR_REAL_GRAPH_DB must point at a readable graph.db copy");
+
+        let meta = |k: &str| store.get_meta(k).ok().flatten().unwrap_or_default();
+        println!("last_commit      = {:?}", meta("last_commit"));
+        println!("phase_b_commit   = {:?}", meta("phase_b_commit"));
+        println!("phase_b_warnings = {:?}", meta("phase_b_warnings"));
+
+        let payload = index_status_payload(&store, "travsr", None);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload["phase_b"]).unwrap_or_default()
+        );
+
+        let state = payload["phase_b"]["state"].as_str().unwrap_or_default();
+        assert!(
+            matches!(state, "done" | "partial" | "failed"),
+            "phase_b.state must be terminal, got {state:?}"
+        );
+        for entry in payload["phase_b"]["languages"].as_array().unwrap() {
+            let lang_state = entry["state"].as_str().unwrap_or_default();
+            assert!(
+                !matches!(lang_state, "running" | "pending"),
+                "{} is stuck in {lang_state:?}",
+                entry["language"]
+            );
+        }
     }
 
     /// #636 review: `is_stale` must never collapse "unknown" to "not stale".
