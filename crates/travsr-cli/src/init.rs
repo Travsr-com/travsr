@@ -58,10 +58,20 @@ pub fn run(
     // piped contexts, or integration tests (where it would race the DB lock).
     use crate::daemon_client::SpawnOutcome;
     use std::io::IsTerminal as _;
+    // TRAVSR_NO_AUTOSTART is an explicit, unambiguous escape hatch for tests
+    // that assert on `.travsr/daemon.lock` (its absence, its content): it
+    // skips both the spawn attempt below AND the non-interactive
+    // `daemon_lock_held` probe, since that probe's `.create(true)` open
+    // creates the lock file as a side effect even when no daemon is running,
+    // which a liveness-only check should not do. Does not depend on how
+    // stdio was redirected, unlike `is_terminal()` alone.
+    let autostart_disabled = std::env::var("TRAVSR_NO_AUTOSTART").as_deref() == Ok("1");
     // Whether a daemon is (or is coming) up after init. This decides the Phase B
     // summary wording: a running daemon auto-arms Phase B on startup and indexes
     // semantic call edges in the background, so "commit-gated" would be wrong.
-    let daemon_running = if std::io::stdout().is_terminal() {
+    let daemon_running = if autostart_disabled {
+        false
+    } else if std::io::stdout().is_terminal() {
         // Race-free: spawns only if no daemon holds the lock, so a re-`init` over
         // an already-running daemon never forks a doomed child.
         let exe = std::env::current_exe().context("finding current exe path")?;

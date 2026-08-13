@@ -53,7 +53,12 @@ fn init_test_repo_env(tmp: &Path, env: &[(&str, &str)]) {
     cmd.arg("init")
         .current_dir(tmp)
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // `is_terminal()` on a null stdout should already prevent this, but
+        // this suite asserts on `.travsr/daemon.lock`'s absence/content
+        // (edge_daemon_logs_and_index_status_never_create_daemon_lock), so
+        // make the guarantee explicit rather than inferred.
+        .env("TRAVSR_NO_AUTOSTART", "1");
     for (k, v) in env {
         cmd.env(k, v);
     }
