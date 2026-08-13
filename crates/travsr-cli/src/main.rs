@@ -153,6 +153,9 @@ enum Command {
     Graph {
         /// Symbol or file name to start from. Mutually exclusive with --all.
         query: Option<String>,
+        /// Exact path of the definition file to resolve ambiguity.
+        #[arg(long)]
+        path: Option<String>,
         /// Dump the entire indexed repository graph.
         #[arg(long)]
         all: bool,
@@ -735,6 +738,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => pattern::run(&pattern, scope, fixed, format)?,
         Command::Graph {
             query,
+            path,
             all,
             depth,
             direction,
@@ -745,9 +749,16 @@ async fn run(cli: Cli) -> Result<()> {
         } => match (all, query.as_deref()) {
             (true, Some(_)) => anyhow::bail!("--all and a query are mutually exclusive"),
             (true, None) => graph::run_all(format, budget)?,
-            (false, Some(q)) => {
-                graph::run(q, depth, direction, format, edges, include_noise, budget)?
-            }
+            (false, Some(q)) => graph::run(
+                q,
+                path,
+                depth,
+                direction,
+                format,
+                edges,
+                include_noise,
+                budget,
+            )?,
             (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
         },
         Command::HookRun { from_hook, paths } => {

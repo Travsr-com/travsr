@@ -662,7 +662,7 @@ const MAX_REFERENCE_SITES: usize = 500;
 const FIND_OUTPUT_LIMIT: usize = 512_000;
 
 /// Resolution outcome for a `find_references` symbol argument.
-enum RefTarget {
+pub(crate) enum RefTarget {
     /// Exactly one definition — enumerate its references.
     Unique(CoreNode),
     /// Multiple definitions and no disambiguating `path` — return the list so the
@@ -678,7 +678,11 @@ enum RefTarget {
 /// first (handles full headers like `fn:charge` from `get_context`), then an
 /// exact simple-name match over the FTS candidates. An optional `path` suffix
 /// pins overloaded names to one file.
-fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&str>) -> RefTarget {
+pub(crate) fn resolve_reference_targets(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> RefTarget {
     // Tier 1: exact signature (+ optional path pin).
     let mut candidates = store.lookup_nodes_exact(symbol, path).unwrap_or_else(|e| {
         tracing::warn!("find_references lookup_nodes_exact '{symbol}': {e}");
@@ -8505,6 +8509,7 @@ mod tests {
             &store,
             &crate::query::GraphQueryArgs {
                 query: "fn:seed".to_string(),
+                path: None,
                 depth: 2,
                 direction: crate::query::QueryDirection::Deps,
                 edge_mode: crate::query::QueryEdgeMode::All,

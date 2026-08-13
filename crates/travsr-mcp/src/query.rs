@@ -57,11 +57,15 @@ pub enum QueryEdgeMode {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GraphQueryArgs {
     pub query: String,
+    pub path: Option<String>,
     pub depth: u8,
     pub direction: QueryDirection,
     pub edge_mode: QueryEdgeMode,
     pub include_noise: bool,
 }
+
+/// The maximum number of ambiguous candidate definitions to display to the user.
+pub const AMBIGUOUS_DISPLAY_LIMIT: usize = 20;
 
 /// One graph node, with everything the CLI renderers need.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +79,7 @@ pub struct NodeEntry {
     pub label: String,
     /// Estimated token cost (same formula as `travsr ask` / `get_context`).
     pub tokens: usize,
+    pub line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +123,9 @@ pub struct GraphPayload {
     pub tree: Vec<TreeStep>,
     pub coverage: Option<Coverage>,
     pub last_commit: Option<String>,
+    /// Ambiguous candidates, if the query resolves to multiple definitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<NodeEntry>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -630,6 +638,7 @@ fn node_entry(node: &travsr_core::Node, depth: u8) -> NodeEntry {
         depth,
         label: display_label(node).to_string(),
         tokens: token_cost(node),
+        line: node.line,
     }
 }
 
@@ -760,19 +769,39 @@ fn coverage_for(store: &SqliteStore, language: &str) -> Coverage {
 /// `payload.seed == None` means no symbol matched. Nodes are emitted in BFS
 /// discovery order; `tree` holds the spanning-tree expansion steps.
 pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result<GraphPayload> {
-    let matches = store.search_nodes_by_name(&args.query)?;
-    let Some(seed) = matches
-        .iter()
-        .find(|n| n.kind == "file")
-        .or_else(|| matches.first())
-    else {
+    let mut candidates: Option<Vec<NodeEntry>> = None;
+    let seed =
+        match crate::tools::resolve_reference_targets(store, &args.query, args.path.as_deref()) {
+            crate::tools::RefTarget::Unique(n) => Some(n),
+            crate::tools::RefTarget::Ambiguous(list) => {
+                let candidates_entries: Vec<NodeEntry> =
+                    list.iter().map(|n| node_entry(n, 0)).collect();
+                candidates = Some(candidates_entries);
+                None
+            }
+            crate::tools::RefTarget::None => {
+                if args.path.is_none() {
+                    let matches = store.search_nodes_by_name(&args.query)?;
+                    matches
+                        .iter()
+                        .find(|n| n.kind == "file")
+                        .or_else(|| matches.first())
+                        .cloned()
+                } else {
+                    None
+                }
+            }
+        };
+
+    let Some(seed) = seed else {
         return Ok(GraphPayload {
             seed: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             tree: Vec::new(),
             coverage: None,
-            last_commit: None,
+            last_commit: store.get_meta("last_commit").ok().flatten(),
+            candidates,
         });
     };
 
@@ -854,6 +883,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
         tree,
         coverage: Some(coverage),
         last_commit: store.get_meta("last_commit")?,
+        candidates,
     })
 }
 
@@ -884,6 +914,7 @@ pub fn graph_all_payload(store: &SqliteStore) -> anyhow::Result<GraphPayload> {
         tree: Vec::new(),
         coverage: None,
         last_commit: store.get_meta("last_commit")?,
+        candidates: None,
     })
 }
 
@@ -1009,6 +1040,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "PaymentService".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Callers,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1035,6 +1067,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "DoesNotExist".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Both,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1053,6 +1086,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "PaymentService".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Both,
                 edge_mode: QueryEdgeMode::All,
@@ -1079,6 +1113,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "PaymentService".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Both,
                 edge_mode: QueryEdgeMode::All,
@@ -1098,6 +1133,7 @@ mod tests {
         let (store, _, class, caller) = seeded_store();
         let args = |direction| GraphQueryArgs {
             query: "PaymentService".to_string(),
+            path: None,
             depth: 3,
             direction,
             edge_mode: QueryEdgeMode::Semantic,
@@ -1161,6 +1197,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "PaymentService".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Callers,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1182,6 +1219,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "PaymentService".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Callers,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1218,6 +1256,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "PaymentService".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Callers,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1243,6 +1282,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "service.ts".to_string(),
+                path: None,
                 depth: 2,
                 direction: QueryDirection::Callers,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1266,6 +1306,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "service.ts".to_string(),
+                path: None,
                 depth: 2,
                 direction: QueryDirection::Deps,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1284,6 +1325,7 @@ mod tests {
             &store,
             &GraphQueryArgs {
                 query: "PaymentService".to_string(),
+                path: None,
                 depth: 3,
                 direction: QueryDirection::Callers,
                 edge_mode: QueryEdgeMode::Semantic,
@@ -1530,5 +1572,198 @@ mod tests {
             "total {} exceeded budget {DEFAULT_TOKEN_BUDGET}",
             payload.total_tokens
         );
+    }
+
+    // ── Ambiguity resolution tests (issue #565 / RFC-002) ──────────────────
+
+    #[test]
+    fn test_graph_query_unique_candidate() {
+        let (store, _, _, _) = seeded_store();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "class:PaymentService".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+
+        assert!(payload.seed.is_some());
+        assert_eq!(
+            payload.seed.as_ref().unwrap().signature,
+            "class:PaymentService"
+        );
+        assert!(payload.candidates.is_none());
+        assert!(!payload.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_graph_query_ambiguous_symbol() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node_a = Node {
+            id: travsr_core::NodeId(101),
+            vname: VName {
+                signature: "fn:overloaded".to_string(),
+                corpus: "test".to_string(),
+                root: String::new(),
+                path: "src/file_a.rs".to_string(),
+                language: "rust".to_string(),
+            },
+            kind: "function".to_string(),
+            package: String::new(),
+            line: Some(57),
+            end_line: Some(80),
+            test_role: travsr_core::TestRole::None,
+        };
+        let node_b = Node {
+            id: travsr_core::NodeId(102),
+            vname: VName {
+                signature: "fn:overloaded".to_string(),
+                corpus: "test".to_string(),
+                root: String::new(),
+                path: "src/file_b.rs".to_string(),
+                language: "rust".to_string(),
+            },
+            kind: "function".to_string(),
+            package: String::new(),
+            line: Some(43),
+            end_line: Some(70),
+            test_role: travsr_core::TestRole::None,
+        };
+        store.put_node(&node_a).unwrap();
+        store.put_node(&node_b).unwrap();
+
+        // 1. Without path hint: remains ambiguous, seed is None, candidates is Some(2)
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "fn:overloaded".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+
+        assert!(payload.seed.is_none());
+        assert!(payload.nodes.is_empty());
+        assert_eq!(payload.candidates.as_ref().unwrap().len(), 2);
+
+        // 2. Exact path hint resolves uniquely: seed is Some, candidates is None
+        let payload_unique = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "fn:overloaded".to_string(),
+                path: Some("file_a.rs".to_string()),
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(payload_unique.seed.is_some());
+        assert_eq!(payload_unique.seed.as_ref().unwrap().path, "src/file_a.rs");
+        assert!(payload_unique.candidates.is_none());
+
+        // 3. Invalid path hint: resolves to 0 candidates, seed is None, candidates is None
+        let payload_invalid = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "fn:overloaded".to_string(),
+                path: Some("nonexistent.rs".to_string()),
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(payload_invalid.seed.is_none());
+        assert!(payload_invalid.candidates.is_none());
+    }
+
+    #[test]
+    fn test_graph_query_still_ambiguous_path() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node_a = Node {
+            id: travsr_core::NodeId(101),
+            vname: VName {
+                signature: "fn:overloaded".to_string(),
+                corpus: "test".to_string(),
+                root: String::new(),
+                path: "src/subdir1/file.rs".to_string(),
+                language: "rust".to_string(),
+            },
+            kind: "function".to_string(),
+            package: String::new(),
+            line: Some(57),
+            end_line: Some(80),
+            test_role: travsr_core::TestRole::None,
+        };
+        let node_b = Node {
+            id: travsr_core::NodeId(102),
+            vname: VName {
+                signature: "fn:overloaded".to_string(),
+                corpus: "test".to_string(),
+                root: String::new(),
+                path: "src/subdir2/file.rs".to_string(),
+                language: "rust".to_string(),
+            },
+            kind: "function".to_string(),
+            package: String::new(),
+            line: Some(43),
+            end_line: Some(70),
+            test_role: travsr_core::TestRole::None,
+        };
+        store.put_node(&node_a).unwrap();
+        store.put_node(&node_b).unwrap();
+
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "fn:overloaded".to_string(),
+                path: Some("file.rs".to_string()),
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+
+        assert!(payload.seed.is_none());
+        assert_eq!(payload.candidates.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_graph_query_legacy_recall_fallback() {
+        let (store, _, _, _) = seeded_store();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "Payment".to_string(),
+                path: None,
+                depth: 3,
+                direction: QueryDirection::Deps,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+
+        let seed = payload
+            .seed
+            .as_ref()
+            .expect("seed must match via recall fallback");
+        assert!(seed.signature == "class:PaymentService" || seed.signature == "fn:processPayment");
     }
 }

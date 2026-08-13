@@ -29,6 +29,8 @@ pub use sse::{router as sse_router, AppState};
 // which run the same occurrence-store read as the MCP tools against a locally
 // opened store. The rest of `tools` stays private (MCP-only surface).
 pub use tools::{find_pattern, find_references};
+// Re-exported for the `travsr graph` CLI subcommand.
+pub use query::AMBIGUOUS_DISPLAY_LIMIT;
 // #645 WS-B: the CLI `status` surface reuses this exact classifier so the CLI
 // and MCP notes never disagree about an index/HEAD mismatch.
 pub use tools::head_index_mismatch_note;
