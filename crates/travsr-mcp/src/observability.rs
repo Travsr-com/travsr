@@ -1361,6 +1361,16 @@ mod tests {
     /// start does) while the PID inside is dead must read as "not running";
     /// the old `try_lock_shared` implementation reported `true` here purely
     /// because someone else held the lock.
+    ///
+    /// Unix only, and the reason is a genuine platform semantic difference,
+    /// not a test-environment quirk: POSIX `flock` is advisory, so a plain
+    /// read of the locked file still succeeds and the PID inside is
+    /// observable. Windows `LockFileEx` is mandatory, so the same read fails
+    /// outright while the lock is held and the PID is *not* observable at
+    /// all, which makes "ignore the lock, use the PID" impossible to honour
+    /// there. See `daemon_running`'s doc comment and the Windows counterpart
+    /// test below.
+    #[cfg(unix)]
     #[test]
     fn daemon_running_ignores_the_flock_and_uses_the_pid() {
         // 4294967294 is u32::MAX - 1: above every platform's pid_max, so it
@@ -1379,6 +1389,52 @@ mod tests {
         );
 
         let _ = fs2::FileExt::unlock(&held);
+    }
+
+    /// Windows counterpart to the test above, pinning the documented
+    /// divergence rather than pretending the platforms agree.
+    ///
+    /// `LockFileEx` is a mandatory whole-file lock, so while it is held the
+    /// PID inside is unreadable and this probe answers from the lock's
+    /// existence instead: held implies a live holder, because Windows (like
+    /// POSIX) releases a lock when its owning process dies. The stale-PID
+    /// case the Unix test constructs is therefore unrepresentable on
+    /// Windows: a real holder is by definition alive, whatever bytes happen
+    /// to be in the file.
+    ///
+    /// Known trade-off, deliberately accepted and matching the
+    /// recycled-PID one already documented on `pid_is_alive`: a *brief*
+    /// exclusive lock taken by something that is not the daemon (the CLI's
+    /// own `daemon_lock_held` probe does exactly this) reads as "daemon
+    /// running" for the duration of that probe. It fails in the safe
+    /// direction for a read-only status tool, and it never disturbs the
+    /// singleton protocol, which is the property the review actually asked
+    /// for.
+    #[cfg(windows)]
+    #[test]
+    fn daemon_running_reports_running_while_the_lock_is_mandatorily_held() {
+        let (tmp, lock) = repo_with_lock_pid("4294967294");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).expect("test must hold the exclusive lock");
+
+        assert!(
+            daemon_running(tmp.path()),
+            "a mandatorily locked file means a live holder, so this reads as running"
+        );
+
+        // Once released, the PID becomes readable again and the ordinary
+        // dead-PID answer returns, proving the branch above is driven by the
+        // lock and not by something sticky.
+        let _ = fs2::FileExt::unlock(&held);
+        drop(held);
+        assert!(
+            !daemon_running(tmp.path()),
+            "with the lock released the dead PID inside must read as not running"
+        );
     }
 
     /// The converse: a live PID with nobody holding the lock at all (the
