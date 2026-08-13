@@ -3742,8 +3742,17 @@ pub(crate) fn is_test_symbol(node: &CoreNode) -> bool {
 /// build/cache/test-dir paths) plus in-src test symbols ([`is_test_symbol`]). A
 /// rejected candidate can still enter retrieval via the lexical/KNN seed paths
 /// (kept by [`is_noise_seed`]); it just cannot be an anchor.
+///
+/// #479: the AST-derived `test_role` is the precise test gate here. The anchor
+/// candidates flow from [`SqliteStore::search_nodes_by_name`], which carries the
+/// `test_role` column, so `node.test_role.is_test()` fires on this path and keeps
+/// a descriptively-named inline test (one whose name `is_test_symbol` does not
+/// recognise) out of the anchor pool, not just at display time. [`is_test_symbol`]
+/// stays as the name-based fallback for rows that predate the v22 reindex (their
+/// `test_role` reads back `None` until re-parsed). Keep both until v22 is
+/// guaranteed to have reparsed every corpus.
 pub(crate) fn is_anchor_noise(node: &CoreNode) -> bool {
-    is_context_result_noise(node) || is_test_symbol(node)
+    is_context_result_noise(node) || node.test_role.is_test() || is_test_symbol(node)
 }
 
 /// Derive PPR seeds from symbol-level KNN results with score-based selection.
@@ -4043,6 +4052,9 @@ fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
         crate::seed::MatchSource::Docs => {
             "## docs (documentation prose: claims about the code, verify behaviour against the code itself)"
         }
+        // #479: test entry points & fixtures, capped and placed below the
+        // implementation/design sections so a `#[test]` fn never leads.
+        crate::seed::MatchSource::Tests => "## tests — test entry points & fixtures",
         crate::seed::MatchSource::Relevant => "## relevant — graph-adjacent context",
     }
 }
@@ -4086,7 +4098,19 @@ fn assemble_context_body(
     });
     let mut out: Vec<String> = Vec::with_capacity(entries.len() + 3);
     let mut cur: Option<crate::seed::MatchSource> = None;
+    // #479: cap the tests section small and omit it when empty. Entries are
+    // already sorted by trust_rank then descending score, so the retained tests
+    // are the highest-scoring ones; the section header is only emitted if at
+    // least one test survives the cap.
+    const TESTS_CAP: usize = 3;
+    let mut tests_shown = 0usize;
     for (ms, _score, line) in entries {
+        if ms == crate::seed::MatchSource::Tests {
+            if tests_shown >= TESTS_CAP {
+                continue;
+            }
+            tests_shown += 1;
+        }
         if cur != Some(ms) {
             out.push(match_source_header(ms).to_string());
             cur = Some(ms);
@@ -5005,6 +5029,18 @@ fn get_context_body(
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
+    // #479: index-time test classification for the selected set. A node with
+    // `test_role != None` buckets as `MatchSource::Tests` regardless of its seed
+    // provenance, so a `#[test]` fn that is also an exact/semantic seed renders
+    // in the capped `tests` section, not at the top of `exact`/`semantic`. Read
+    // by id (the store column) rather than `Node.test_role`, which the read
+    // paths default to `None`.
+    let test_node_ids: std::collections::HashSet<NodeId> = selected
+        .iter()
+        .filter(|n| matches!(store.test_role(n.id), Ok(Some(r)) if r.is_test()))
+        .map(|n| n.id)
+        .collect();
+
     // RFC-022 §14: match-source grouping of the (already-selected) node set.
     // Display-only — `selected`/knapsack are untouched; this only decides how the
     // rendered lines are ordered/headed. Gated behind the flag; and collapsed to a
@@ -5015,7 +5051,12 @@ fn get_context_body(
             seed_source_map.get(&id),
             Some(crate::seed::SeedSource::Exact)
         );
-        let ms = crate::seed::match_source(primary_seed_ids.contains(&id), is_exact);
+        // #479: test classification overrides seed-provenance bucketing.
+        let ms = if test_node_ids.contains(&id) {
+            crate::seed::MatchSource::Tests
+        } else {
+            crate::seed::match_source(primary_seed_ids.contains(&id), is_exact)
+        };
         (ms, display_score_map.get(&id).copied().unwrap_or(0.0))
     };
 
@@ -10208,16 +10249,32 @@ mod snippet_tests {
 
         let (seeds, n_eligible, _, oracle) =
             embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        // pkg (kind=package/`pkg:`), crate (kind=crate), and the tests/ node are
+        // all noise and filtered from both the seed list and the oracle.
+        let seed_ids: Vec<_> = seeds.iter().map(|(n, _)| n.id).collect();
+        assert!(!seed_ids.contains(&pkg_id), "pkg node must not be a seed");
         assert!(
-            seeds.iter().all(|(node, _)| node.id == impl_id),
-            "only the src impl node should be a seed; got: {seeds:?}"
+            !seed_ids.contains(&crate_id),
+            "crate node must not be a seed"
         );
-        assert_eq!(seeds.len(), 1, "exactly one seed expected");
+        assert!(
+            !seed_ids.contains(&test_id),
+            "test-dir node must not be a seed"
+        );
+        assert!(
+            seed_ids.contains(&impl_id),
+            "only the real src impl is a seed; got: {seeds:?}"
+        );
+        assert_eq!(seeds.len(), 1, "only the impl seed expected");
         assert_eq!(n_eligible, 1, "n_eligible should match non-noise seeds");
-        // The package node must not be in the confidence-grounding oracle.
+        // The package/crate nodes must not be in the confidence-grounding oracle.
         assert!(
             !oracle.contains_key(&pkg_id),
             "pkg node must be excluded from the cosine oracle"
+        );
+        assert!(
+            !oracle.contains_key(&crate_id),
+            "crate node must be excluded from the cosine oracle"
         );
         assert!(
             oracle.contains_key(&impl_id),

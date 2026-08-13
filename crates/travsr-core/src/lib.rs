@@ -258,6 +258,36 @@ impl Language {
     }
 }
 
+/// Canonical list of every [`Language`] variant.
+///
+/// `Language` is `#[non_exhaustive]`, so the compiler cannot enforce that a
+/// downstream `for lang in ALL_LANGUAGES` sees every variant. Keep this slice in
+/// sync with the enum — the test-role coverage gate (issue #479 §7.2) and any
+/// future per-language matrix iterate it, so adding a variant here is the
+/// forcing function that makes those gates flag the new language.
+pub const ALL_LANGUAGES: &[Language] = &[
+    Language::TypeScript,
+    Language::Rust,
+    Language::Python,
+    Language::Go,
+    Language::Java,
+    Language::Kotlin,
+    Language::Ruby,
+    Language::CSharp,
+    Language::Php,
+    Language::Scala,
+    Language::Cpp,
+    Language::C,
+    Language::Swift,
+    Language::Dart,
+    Language::ObjectiveC,
+    Language::Json,
+    Language::Yaml,
+    Language::Toml,
+    Language::Xml,
+    Language::Markdown,
+];
+
 /// Kythe-style globally unique identifier for a code entity.
 ///
 /// VNames are stable across repos, languages, and time — they form the
@@ -464,6 +494,65 @@ impl EdgeKind {
     }
 }
 
+/// Index-time classification of a node as test code (issue #479).
+///
+/// Derived from tree-sitter captures (`@test.entry` / `@test.scope`) during
+/// Phase A parsing. It is **metadata, not identity**: two nodes are the same symbol
+/// regardless of `test_role`, so it is **not** part of the BLAKE3 VName id — it
+/// sits alongside `package`/`line`, exactly like `is_noise`.
+///
+/// Retrieval uses it to bucket test declarations into a capped `tests` section
+/// below the implementation sections, instead of letting a `#[test]` fn take the
+/// top slot of the `exact`/`semantic` groups (the #479 defect).
+///
+/// The asymmetric-cost rule (a false positive removes a real answer from the
+/// section the host reads first) is enforced upstream in the tree-sitter query
+/// predicates, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRole {
+    /// Not test code (production code, or a test-ish name with no corroboration).
+    #[default]
+    None,
+    /// A test entry point — a `#[test]` fn, a `@Test`-annotated method, a
+    /// `func TestX` with a `*testing.T` param, etc. The thing a runner invokes.
+    EntryPoint,
+    /// Support code that lives inside a test unit — a helper fn or fixture inside
+    /// a `#[cfg(test)] mod`, a method of a `TestCase` subclass, etc. Detected from
+    /// AST `@test.scope` captures only (the path-based fallback was Phase 2, which
+    /// regressed the k8s bench and was reverted).
+    Support,
+}
+
+impl TestRole {
+    /// Stable integer representation for the `nodes.test_role` column (v22).
+    ///
+    /// `None = 0` so the `INTEGER NOT NULL DEFAULT 0` column and the serde
+    /// default agree — un-reindexed rows read back as [`TestRole::None`].
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::None => 0,
+            Self::EntryPoint => 1,
+            Self::Support => 2,
+        }
+    }
+
+    /// Parse from the stored integer. Unknown values fail closed to `None`
+    /// (a forward-compatible store row never mislabels code as a test).
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            1 => Self::EntryPoint,
+            2 => Self::Support,
+            _ => Self::None,
+        }
+    }
+
+    /// True for any node classified as test code (entry point or support).
+    pub fn is_test(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// A node in the code graph.
 ///
 /// `PartialEq` compares all fields including `package`. Use `node.id == other.id`
@@ -492,6 +581,16 @@ pub struct Node {
     /// Used by G2 span attribution to find the enclosing function for a SCIP
     /// reference occurrence. `None` until migration v13 backfills the column.
     pub end_line: Option<u32>,
+    /// Index-time test classification (issue #479). Defaults to
+    /// [`TestRole::None`]; set by the `travsr-analysis` post-pass from
+    /// tree-sitter `@test.entry` / `@test.scope` captures. Stored in
+    /// `nodes.test_role` (v22); **not** part of the BLAKE3 id.
+    ///
+    /// `#[serde(default)]` keeps old plugin-protocol payloads (out-of-process
+    /// sidecars, RFC-013 plugins) valid — a missing field deserializes to
+    /// `None`, the default-safe value.
+    #[serde(default)]
+    pub test_role: TestRole,
 }
 
 impl Node {
@@ -509,6 +608,7 @@ impl Node {
             package: String::new(),
             line: None,
             end_line: None,
+            test_role: TestRole::None,
         }
     }
 
@@ -534,6 +634,15 @@ impl Node {
     /// Set the `end_line` field (1-based, inclusive) and return `self` (builder pattern).
     pub fn with_end_line(mut self, end_line: u32) -> Self {
         self.end_line = Some(end_line);
+        self
+    }
+
+    /// Set the `test_role` field and return `self` (builder pattern).
+    ///
+    /// Used by the `travsr-analysis` post-pass so the ~10 `emit.rs` constructors
+    /// stay one-liners and only test declarations pay the extra call (issue #479).
+    pub fn with_test_role(mut self, test_role: TestRole) -> Self {
+        self.test_role = test_role;
         self
     }
 }

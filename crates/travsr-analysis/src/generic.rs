@@ -140,9 +140,24 @@ pub fn parse_with_config(
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(query, tree.root_node(), source.as_slice());
 
+    // #479: `@test.entry`/`@test.scope` line-span signals collected during the
+    // walk, then applied to `nodes` in a single post-pass keyed off each node's
+    // own start line.
+    let mut test_signals = crate::test_role::TestSignals::default();
+
     while let Some(m) = iter.next() {
         for cap in m.captures {
             let cap_name = *capture_names.get(cap.index as usize).unwrap_or(&"");
+
+            // #479: route test captures to the signal collector; they are not in
+            // `capture_kinds` so they never emit a node.
+            if test_signals.route_capture(
+                cap_name,
+                cap.node.start_position().row,
+                cap.node.end_position().row,
+            ) {
+                continue;
+            }
 
             let Some(&(_, node_kind, sig_prefix)) = config
                 .capture_kinds
@@ -237,6 +252,10 @@ pub fn parse_with_config(
             nodes.push(node);
         }
     }
+
+    // #479: single language-agnostic post-pass sets test_role from the collected
+    // signals (no-op when the file has no test captures).
+    crate::test_role::apply_test_roles(&test_signals, &mut nodes);
 
     Ok(ParseOutput {
         nodes,

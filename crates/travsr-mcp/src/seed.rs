@@ -538,6 +538,12 @@ pub(crate) enum MatchSource {
     /// lane (§4). Never a member of the code seed set — it does not go
     /// through `match_source()` below, only through `doc_lane_seeds()`.
     Docs,
+    /// #479: a node classified as test code at index time (`nodes.test_role !=
+    /// None`). Overrides whatever seed-provenance bucket the node would have had,
+    /// so a `#[test]` fn that is also an exact/semantic seed still renders in the
+    /// capped `tests` section below the implementation sections, never at the top
+    /// of `exact`/`semantic`.
+    Tests,
     Relevant,
 }
 
@@ -550,20 +556,25 @@ impl MatchSource {
             MatchSource::Exact => "exact",
             MatchSource::Semantic => "semantic",
             MatchSource::Docs => "docs",
+            MatchSource::Tests => "tests",
             MatchSource::Relevant => "relevant",
         }
     }
 
-    /// Section order: certainties → strong candidates → design intent →
+    /// Section order: certainties → strong candidates → design intent → tests →
     /// context (plan §4.1). Docs sits below code sections so code always
     /// leads when it has an answer, and above Relevant because graph-adjacent
-    /// filler is less informative than a floored, on-topic doc section.
+    /// filler is less informative than a floored, on-topic doc section. Tests
+    /// sits below all of those (#479): a test entry point is never the answer to
+    /// "what does X do", so it renders after implementation and design intent but
+    /// above unfocused Relevant filler.
     pub(crate) fn trust_rank(self) -> u8 {
         match self {
             MatchSource::Exact => 0,
             MatchSource::Semantic => 1,
             MatchSource::Docs => 2,
-            MatchSource::Relevant => 3,
+            MatchSource::Tests => 3,
+            MatchSource::Relevant => 4,
         }
     }
 }

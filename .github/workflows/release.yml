@@ -135,6 +135,7 @@ jobs:
             "MSRV (rust 1.75)"
             "cargo-deny"
             "plugin-hashes.lock"
+            "release/installer target maps"
             "TL1/TL2 — zero LLM/embedding deps in travsr-mcp"
             "Phase 2 correctness suite"
             "Bench p95 < 50 ms"
@@ -164,6 +165,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # artifact: must stay in lockstep with the installer target maps
+        # (#576); checked in CI by .github/scripts/check-target-maps.mjs.
         include:
           # musl = statically linked, runs on any Linux regardless of glibc version
           - target: x86_64-unknown-linux-musl
