@@ -45,6 +45,28 @@ pub use registry::probe_sandbox;
 pub use sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 pub use transport::{InProcess, PluginHealth, Sidecar, Transport};
 
+/// Native Windows process-liveness probe (`OpenProcess` +
+/// `GetExitCodeProcess`, no signal sent), for callers outside this crate
+/// that need it and cannot themselves hold `unsafe` (`travsr-mcp` is
+/// `#![forbid(unsafe_code)]`).
+///
+/// Delegates to [`sandbox::windows::pid_alive`], the same probe
+/// `embed_catalog::pid_alive` already uses for the daemon shutdown grace
+/// poll; `unsafe` stays confined to `sandbox/windows/ffi.rs` per ADR-017
+/// Amendment A2 Invariant 1, this is a safe wrapper only.
+///
+/// #636 round-2 review: `travsr-mcp`'s `observability::pid_is_alive`
+/// previously shelled out to `tasklist` on every call, which measurably
+/// failed under the process-spawn contention a full `cargo test --workspace`
+/// run puts on Windows CI (`CreateProcess` is comparatively expensive under
+/// load there). A syscall has no such failure mode. Unix's `kill -0` stays a
+/// subprocess call in every caller, unchanged: it was never the source of
+/// that flakiness and doesn't need this treatment.
+#[cfg(target_os = "windows")]
+pub fn windows_pid_is_alive(pid: u32) -> bool {
+    sandbox::windows::pid_alive(pid)
+}
+
 /// Formal plugin state — reported at startup and queryable by the daemon.
 /// ADR-017 Rule 2: `Disabled` means no subprocess runs, not "degraded mode".
 #[derive(Debug, Clone, PartialEq, Eq)]

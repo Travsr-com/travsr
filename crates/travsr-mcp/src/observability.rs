@@ -152,10 +152,23 @@ fn working_tree_dirty(root: &Path) -> Option<bool> {
 
 /// Whether a process with the given PID is currently alive.
 ///
-/// Mirrors `travsr_cli::pid_is_alive` (travsr-cli/src/main.rs), duplicated
-/// rather than imported because travsr-mcp cannot depend on travsr-cli
-/// (cli -> daemon -> mcp, so the reverse edge is a cycle). `kill -0` on Unix
-/// and `tasklist` on Windows, no signal sent, no `unsafe`, no new dependency.
+/// On Unix, this is `kill -0`, mirroring `travsr_cli::pid_is_alive`
+/// (travsr-cli/src/main.rs), duplicated rather than imported because
+/// travsr-mcp cannot depend on travsr-cli (cli -> daemon -> mcp, so the
+/// reverse edge is a cycle). No signal sent.
+///
+/// On Windows, this calls `travsr_plugin_host::windows_pid_is_alive`, a
+/// native `OpenProcess` + `GetExitCodeProcess` syscall, not a subprocess
+/// spawn. travsr-mcp already depends on travsr-plugin-host
+/// (`repo_backend_id`, `derive_phase1_threshold_for_status`,
+/// `PHASE_B_CATALOG`) and is itself `#![forbid(unsafe_code)]`, so it cannot
+/// hold the `unsafe` this needs directly; that crate's own ADR-017 confines
+/// it to `sandbox/windows/ffi.rs` and exposes a safe wrapper. This used to
+/// shell out to `tasklist` here too, which measurably failed under the
+/// process-spawn contention a full `cargo test --workspace` run puts on
+/// Windows CI (#636 round-2 review): `CreateProcess` is comparatively
+/// expensive under load there, and a plain syscall has no equivalent
+/// failure mode.
 ///
 /// Trade-off, same as the CLI helper's: a recycled PID reads as alive. The
 /// window is the same one `daemon_is_running`'s own lock-file fallback
@@ -174,13 +187,7 @@ fn pid_is_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        // tasklist CSV output quotes the PID as a field only when the
-        // process exists; the localized "no tasks" INFO line never does.
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
-            .unwrap_or(false)
+        travsr_plugin_host::windows_pid_is_alive(pid)
     }
     #[cfg(not(any(unix, windows)))]
     {
