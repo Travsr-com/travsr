@@ -213,20 +213,23 @@ export function webviewShell(title: string, body: string, script: string): strin
   .tog { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   .tog input { margin: 0; }
 
-  /* JSON view: the stored line verbatim, coloured so it can be read, and still
-     selectable so it can be copied. Wraps rather than scrolling sideways: a
-     log line is long and a horizontal scrollbar per row is unusable. */
+  /* JSON mode makes each row expandable rather than replacing the list with a
+     wall of objects. The column line is already the summary, so collapsed costs
+     nothing and 200 entries stay scannable; the stored line is one click away.
+     (No backticks in this stylesheet: it is a template literal.) */
+  .caret { display: none; flex: 0 0 10px; color: var(--fg-subtle); user-select: none; }
+  .caret::before { content: "\u25B8"; }
+  .log.json-mode .caret { display: inline-block; }
+  .log.json-mode .log-line { cursor: pointer; padding: 3px 0; }
+  .log.json-mode .log-line.open .caret::before { content: "\u25BE"; }
+  .log.json-mode .log-line.open { background: var(--bg-input); border-radius: 3px; }
   .jsonline { display: none; }
-  .log.json-mode .log-line { display: block; padding: 3px 0; }
-  /* :not(.jsonline) rather than a separate override. An element selector makes
-     the child-span rule more specific than the .jsonline rule, so the two fought
-     and the hide won, leaving the JSON view blank. One rule cannot fight
-     itself. (No backticks in here: this stylesheet is a template literal.) */
-  .log.json-mode .log-line > span:not(.jsonline) { display: none; }
-  .log.json-mode .jsonline { display: block; white-space: pre; overflow-x: auto;
-    line-height: 1.5; }
-  .log.json-mode .log-line { padding: 8px 0; }
-  .log.json-mode .log-line + .log-line { border-top: 1px solid var(--border); }
+  .log.json-mode .log-line.open .jsonline { display: block; white-space: pre;
+    overflow-x: auto; line-height: 1.5; margin: 6px 0 4px 18px;
+    padding-left: 10px; border-left: 2px solid var(--border); }
+  .log.json-mode .log-line.open { display: block; }
+  .log.json-mode .log-line.open > span:not(.jsonline) { display: inline; }
+
   .j-k { color: var(--blue); }
   .j-s { color: var(--green); }
   .j-n { color: var(--gold); }
@@ -601,6 +604,7 @@ export function buildStatsHtml(
           (e) =>
             `<div class="log-line lvl-${esc(e.level)}" data-rank="${rankOf(e.level)}"` +
             ` data-iso="${esc(e.iso)}" data-json="${esc(e.raw)}" data-tg="${esc(e.target)}">` +
+            `<span class="caret" aria-hidden="true"></span>` +
             `<span class="mono muted t" data-local="${esc(e.time)}">${esc(e.time)}</span>` +
             `<span class="pill p-${esc(e.level)}">${esc(e.level || "\u2014")}</span>` +
             `<span class="mono muted tg">${esc(e.target)}</span>` +
@@ -697,7 +701,7 @@ ${activityRows}
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
   <label class="tog"><input type="checkbox" id="logFollow" onchange="toggleFollow(this)"> Follow</label>
 </div>
-<div class="log" id="logBox">
+<div class="log" id="logBox" onclick="toggleRow(event)">
 <div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>
 ${logRows}
 </div>`;
@@ -741,6 +745,13 @@ function toggleFollow(cb) {
   if (cb.checked) followTimer = setInterval(function () {
     vscode.postMessage({ command: 'refresh' });
   }, 3000);
+}
+
+function toggleRow(ev) {
+  var box = document.getElementById('logBox');
+  if (!box || !box.classList.contains('json-mode')) return;
+  var row = ev.target.closest('.log-line');
+  if (row) row.classList.toggle('open');
 }
 
 function filterLog() {

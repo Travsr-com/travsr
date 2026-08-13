@@ -3,6 +3,47 @@ import { buildSynonymsHtml, buildReposHtml, buildStatsHtml, buildLanguagesHtml }
 import { highlightJson } from "../../webviews";
 import type { Diagnostic, LangCount, LangInfo, LogEntry, StatsView } from "../../webviews";
 
+// Shared fixtures. Values are arbitrary: they exist to drive each builder
+// down a branch, and nothing asserts on them.
+const STATS: StatsView = {
+  nodes: "1",
+  edges: "1",
+  schemaVersion: "1",
+  dbSize: "1 B",
+  lastIndexed: "just now",
+};
+const LANG: LangInfo = {
+  language: "rust",
+  package: "@travsr-plugin/rust",
+  sandbox: "Standard",
+  installed: true,
+  registered: true,
+  builtin: false,
+  needsApproval: false,
+  scipInstallType: "GithubBinary",
+  installHint: "travsr lang install rust",
+  underlyingToolHint: "",
+  elevatedHosts: [],
+};
+const LOG: LogEntry[] = [
+  { time: "01:00:00", level: "INFO", target: "daemon", message: "started", event: "daemon.ready", detail: "pid=1", iso: "2026-08-14T01:00:00Z", raw: "{}" },
+  { time: "01:00:01", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=1", iso: "2026-08-14T01:00:01Z", raw: "{}" },
+  { time: "01:00:02", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=2", iso: "2026-08-14T01:00:02Z", raw: "{}" },
+  { time: "01:00:03", level: "WARN", target: "plugin-host", message: "analyzer missing", detail: "lang=go", iso: "2026-08-14T01:00:03Z", raw: "{}" },
+  { time: "01:00:04", level: "ERROR", target: "indexer", message: "lsif failed", detail: "code=1", iso: "2026-08-14T01:00:04Z", raw: "{}" },
+  { time: "", level: "", target: "", message: "a line from before the log became JSON", detail: "", iso: "", raw: "{}" },
+];
+const DIAGS: Diagnostic[] = [
+  {
+    severity: "error",
+    title: "semantic analyzer for 'kotlin' crashed",
+    hint: "semantic analyzer for 'kotlin' crashed, re-run to retry",
+    command: "travsr init --semantic",
+  },
+  // No command: the card must render without an action row.
+  { severity: "warn", title: "index looks stale", hint: "HEAD moved since the last index" },
+];
+
 suite("VSCODE-247: buildSynonymsHtml", () => {
   test("groups aliases by term and renders chips + staged multi-add row", () => {
     const html = buildSynonymsHtml([
@@ -168,49 +209,11 @@ suite("codicon syntax never reaches webview HTML", () => {
   // to drive each builder down a branch. What matters is that every branch that
   // emits markup is rendered at least once, since a codicon added to a row the
   // fixtures never build is a codicon this test cannot see.
-  const LANG: LangInfo = {
-    language: "rust",
-    package: "@travsr-plugin/rust",
-    sandbox: "Standard",
-    installed: true,
-    registered: true,
-    builtin: false,
-    needsApproval: false,
-    scipInstallType: "GithubBinary",
-    installHint: "travsr lang install rust",
-    underlyingToolHint: "",
-    elevatedHosts: [],
-  };
 
-  const STATS: StatsView = {
-    nodes: "1",
-    edges: "1",
-    schemaVersion: "1",
-    dbSize: "1 B",
-    lastIndexed: "just now",
-  };
 
   // One labelled event, one repeat of it (the collapse path), one warning, and
   // one line that is not an event at all, so every branch of the panel renders.
-  const LOG: LogEntry[] = [
-    { time: "01:00:00", level: "INFO", target: "daemon", message: "started", event: "daemon.ready", detail: "pid=1", iso: "2026-08-14T01:00:00Z", raw: "{}" },
-    { time: "01:00:01", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=1", iso: "2026-08-14T01:00:01Z", raw: "{}" },
-    { time: "01:00:02", level: "INFO", target: "daemon", message: "indexed", event: "phase_b.indexed", detail: "nodes=2", iso: "2026-08-14T01:00:02Z", raw: "{}" },
-    { time: "01:00:03", level: "WARN", target: "plugin-host", message: "analyzer missing", detail: "lang=go", iso: "2026-08-14T01:00:03Z", raw: "{}" },
-    { time: "01:00:04", level: "ERROR", target: "indexer", message: "lsif failed", detail: "code=1", iso: "2026-08-14T01:00:04Z", raw: "{}" },
-    { time: "", level: "", target: "", message: "a line from before the log became JSON", detail: "", iso: "", raw: "{}" },
-  ];
 
-  const DIAGS: Diagnostic[] = [
-    {
-      severity: "error",
-      title: "semantic analyzer for 'kotlin' crashed",
-      hint: "semantic analyzer for 'kotlin' crashed, re-run to retry",
-      command: "travsr init --semantic",
-    },
-    // No command: the card must render without an action row.
-    { severity: "warn", title: "index looks stale", hint: "HEAD moved since the last index" },
-  ];
 
   const panels = (): Array<[string, string]> => [
     // Populated and empty are separate code paths in several builders, so both
@@ -276,5 +279,34 @@ suite("JSON view", () => {
     const html = highlightJson(JSON.stringify({ msg: "<img src=x onerror=alert(1)>" }));
     assert.ok(!html.includes("<img"), `unescaped markup reached the output: ${html}`);
     assert.ok(html.includes("&lt;img"), "the value should still be readable, escaped");
+  });
+});
+
+suite("every panel renders", () => {
+  // The cheapest test here, and the one that would have caught the worst bug so
+  // far. A stray backtick in a CSS comment closed the stylesheet template early,
+  // the rest parsed as JavaScript, and webviewShell threw at render time: the
+  // panel came back blank. It was valid TypeScript, so the typecheck passed and
+  // nothing else noticed until it was installed and opened.
+  //
+  // Asserting only that each builder returns markup is enough to catch that
+  // whole class, because the failure is a throw rather than a wrong string.
+  test("no builder throws, and each returns a document", () => {
+    const cases: Array<[string, () => string]> = [
+      ["stats, offline", () => buildStatsHtml(STATS)],
+      ["stats, all clear", () => buildStatsHtml(STATS, LOG)],
+      ["stats, with diagnostics", () => buildStatsHtml(STATS, LOG, DIAGS)],
+      ["synonyms", () => buildSynonymsHtml([{ term: "auth", alias: "login" }])],
+      ["repos", () => buildReposHtml([{ name: "demo", path: "/tmp/d", exists: true }])],
+      ["languages", () => buildLanguagesHtml([{ language: "rust", count: 1 }], [])],
+    ];
+    for (const [name, build] of cases) {
+      let html = "";
+      assert.doesNotThrow(() => {
+        html = build();
+      }, `${name} threw while rendering`);
+      assert.ok(html.includes("<body>"), `${name} produced no document`);
+      assert.ok(html.length > 1000, `${name} produced a suspiciously short document`);
+    }
   });
 });
