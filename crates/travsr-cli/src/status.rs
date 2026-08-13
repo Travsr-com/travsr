@@ -191,6 +191,19 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // WS-2: warn when Dart Phase B ran without resolved dependencies, so a
+    // partial cross-package index is never mistaken for a complete one.
+    if let Some(pkgs) = payload.dart_deps_unresolved.as_deref() {
+        if !pkgs.is_empty() {
+            eprintln!(
+                "warning: Dart cross-package references are incomplete — these \
+                 package(s) were indexed without resolved dependencies: {pkgs}. \
+                 Run `dart pub get` in each to enable cross-package references \
+                 (intra-package references are unaffected)."
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -212,6 +225,7 @@ mod tests {
             rust_lsif_degraded: None,
             rerank: String::new(),
             phase_b_dirty: dirty,
+            dart_deps_unresolved: None,
         }
     }
 
