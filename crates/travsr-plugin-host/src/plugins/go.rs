@@ -15,7 +15,7 @@ impl Plugin for GoPlugin {
         match travsr_indexer::go_parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(out) => parse_output_to_response(out),
             Err(e) => {
-                tracing::warn!(event = "file.parse_failed", lang = "go", path = %req.path.display(), err = %e, "parse error, skipping");
+                tracing::warn!("go parse {}: {e}", req.path.display());
                 ParseResponse::default()
             }
         }

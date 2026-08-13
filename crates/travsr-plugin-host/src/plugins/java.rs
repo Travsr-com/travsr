@@ -25,7 +25,7 @@ impl Plugin for JavaPlugin {
         match travsr_analysis::java::parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(out) => parse_output_to_response(out),
             Err(e) => {
-                tracing::warn!(event = "file.parse_failed", lang = "java", path = %req.path.display(), err = %e, "parse error, skipping");
+                tracing::warn!("java parse {}: {e}", req.path.display());
                 ParseResponse::default()
             }
         }

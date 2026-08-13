@@ -18,7 +18,7 @@ impl Plugin for RustPlugin {
         match travsr_indexer::rust_parse(&req.corpus, &req.path, &req.vname_path) {
             Ok(out) => parse_output_to_response(out),
             Err(e) => {
-                tracing::warn!(event = "file.parse_failed", lang = "rust", path = %req.path.display(), err = %e, "parse error, skipping");
+                tracing::warn!("rust parse {}: {e}", req.path.display());
                 ParseResponse::default()
             }
         }
