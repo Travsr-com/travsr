@@ -81,7 +81,7 @@ function extractReleaseArtifacts(text) {
   const artifacts = [];
   for (const l of stripped) {
     const m = l.match(/^\s*artifact:\s*(\S+)\s*$/);
-    if (m) artifacts.push(m[1]);
+    if (m) artifacts.push(m[1].replace(/^["']|["']$/g, ""));
   }
 
   if (artifacts.length === 0) {
