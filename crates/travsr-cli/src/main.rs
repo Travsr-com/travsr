@@ -508,7 +508,7 @@ async fn run(cli: Cli) -> Result<()> {
 
                     // M2/L1: if the daemon is not running, tell the user clearly
                     // and exit 0 — it's not an error to stop something already stopped.
-                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown) {
+                    match send_shutdown_waiting_for_startup(&repo_root) {
                         Ok(_) => match pid_before {
                             Some(pid) if !wait_for_exit(pid, STOP_EXIT_TIMEOUT) => {
                                 anyhow::bail!(
@@ -533,13 +533,7 @@ async fn run(cli: Cli) -> Result<()> {
                             Some(_) => eprintln!("travsr daemon stopped"),
                         },
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("No such file")
-                                || msg.contains("Connection refused")
-                                || msg.contains("os error 2")
-                                || msg.contains("os error 111")
-                                || msg.contains("os error 61")
-                            {
+                            if transport_absent(&e) {
                                 eprintln!("travsr daemon is not running");
                             } else if let Some(pid) = pid_before.filter(|p| pid_is_alive(*p)) {
                                 // #541: the original report. The transport now
@@ -575,20 +569,17 @@ async fn run(cli: Cli) -> Result<()> {
                             }
                         }
                         Err(_) => {
-                            // Socket not ready yet — check lock file PID.
-                            // On a large repo the watcher initial scan can take
-                            // 10-30 s; the daemon is alive but hasn't bound its
-                            // socket yet.
-                            let lock_path = repo_root.join(".travsr/daemon.lock");
-                            let starting = std::fs::read_to_string(&lock_path)
-                                .ok()
-                                .and_then(|s| s.trim().parse::<u32>().ok())
-                                .map(pid_is_alive)
-                                .unwrap_or(false);
-                            if starting {
-                                println!(
-                                    "daemon: starting (scanning file tree — socket not ready yet)"
-                                );
+                            // Socket not ready yet — the daemon may be alive but
+                            // still starting (store open, embed sidecar model
+                            // load, initial watcher scan; tens of seconds). The
+                            // liveness authority for that window is the repo-lock
+                            // flock, NOT the lock-file PID: on Windows the
+                            // daemon's exclusive flock makes the PID read fail
+                            // with a lock violation for its entire lifetime, so
+                            // the old PID fallback reported "not running" against
+                            // a live, still-starting daemon.
+                            if daemon_client::daemon_lock_held(&repo_root) {
+                                println!("daemon: starting (control socket not ready yet)");
                             } else {
                                 match daemon_start_error(&repo_root) {
                                     Some(r) => {
@@ -632,13 +623,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 .unwrap_or_else(|| "embed auto-reindex paused".into())
                         ),
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("No such file")
-                                || msg.contains("Connection refused")
-                                || msg.contains("os error 2")
-                                || msg.contains("os error 111")
-                                || msg.contains("os error 61")
-                            {
+                            if transport_absent(&e) {
                                 eprintln!("travsr daemon is not running");
                             } else {
                                 return Err(e);
@@ -655,13 +640,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 .unwrap_or_else(|| "embed auto-reindex resumed".into())
                         ),
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("No such file")
-                                || msg.contains("Connection refused")
-                                || msg.contains("os error 2")
-                                || msg.contains("os error 111")
-                                || msg.contains("os error 61")
-                            {
+                            if transport_absent(&e) {
                                 eprintln!("travsr daemon is not running");
                             } else {
                                 return Err(e);
@@ -865,6 +844,69 @@ fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
 /// that has to flush a store, short enough to stay scriptable.
 const STOP_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long `daemon stop` waits for a still-starting daemon (repo lock held,
+/// control transport not bound yet) to become reachable before giving up on
+/// delivering the stop. The pre-bind stretch covers the store open, the embed
+/// sidecar loading its model, and the initial watcher scan — tens of seconds
+/// on big repos or with large embedding models.
+const STOP_DELIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// True when a control-transport error means nothing is listening on the
+/// repo's socket/pipe: the endpoint does not exist ("No such file" /
+/// "os error 2"), or a stale Unix socket has no daemon accepting behind it
+/// ("Connection refused" — os error 111 on Linux, 61 on macOS).
+fn transport_absent(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("No such file")
+        || msg.contains("Connection refused")
+        || msg.contains("os error 2")
+        || msg.contains("os error 111")
+        || msg.contains("os error 61")
+}
+
+/// Send `Shutdown`, waiting out the daemon's startup window if needed.
+///
+/// Between taking `daemon.lock` and binding its control transport the daemon
+/// spends its longest startup stretch (store open, embed sidecar model load,
+/// initial watcher scan), and a connect in that window fails exactly like "no
+/// daemon at all". Treating it that way silently loses the stop: the CLI
+/// reports "not running", the daemon finishes starting, and it keeps running
+/// (and serving) a repo its owner believes is stopped. While the repo lock is
+/// held by a live daemon, keep retrying until the transport binds, the daemon
+/// exits on its own (lock released — the caller then sees the usual "not
+/// running" transport error), or [`STOP_DELIVER_TIMEOUT`] fires.
+fn send_shutdown_waiting_for_startup(
+    repo_root: &std::path::Path,
+) -> anyhow::Result<travsr_ipc::ControlResponse> {
+    let cutoff = std::time::Instant::now() + STOP_DELIVER_TIMEOUT;
+    let mut announced = false;
+    loop {
+        let err = match send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Shutdown) {
+            Ok(resp) => return Ok(resp),
+            Err(e) => e,
+        };
+        if !transport_absent(&err) || !daemon_client::daemon_lock_held(repo_root) {
+            return Err(err);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < cutoff,
+            "travsr daemon is still starting (repo lock held, control transport not \
+             bound within {}s) and the stop request was NOT delivered.\n  \
+             Wait for `travsr daemon status` to report it running, then retry \
+             `travsr daemon stop`.",
+            STOP_DELIVER_TIMEOUT.as_secs()
+        );
+        if !announced {
+            eprintln!(
+                "travsr daemon is starting (control transport not bound yet); \
+                 waiting to deliver the stop..."
+            );
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 /// Check whether a process with the given PID is currently alive.
 /// Uses `kill -0` on Unix and `tasklist` on Windows (no signal sent).
 fn pid_is_alive(pid: u32) -> bool {
@@ -913,10 +955,10 @@ fn send_daemon_command(
 
 /// Retry pinging the daemon transport up to `attempts` times with `delay_ms` between tries.
 ///
-/// Also checks the lock file PID so that a daemon that is alive but still
-/// doing its initial file-tree scan (socket not bound yet) is not mistaken
-/// for "not running" — which would cause a second daemon to be spawned and
-/// crash immediately with "another daemon already running".
+/// Also checks the repo-lock flock so that a daemon that is alive but still
+/// starting (socket not bound yet) is not mistaken for "not running" — which
+/// would cause a second daemon to be spawned and crash immediately with
+/// "another daemon already running".
 pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
@@ -926,13 +968,12 @@ pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, dela
             return true;
         }
     }
-    // Socket not ready — fall back to lock-file PID check.
-    let lock_path = repo_root.join(".travsr/daemon.lock");
-    std::fs::read_to_string(&lock_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .map(pid_is_alive)
-        .unwrap_or(false)
+    // Socket not ready — fall back to the repo-lock flock, the race-free
+    // liveness authority. Not the lock-file PID: on Windows the daemon's
+    // exclusive flock makes that read fail with a lock violation for as long
+    // as the daemon lives, which reported a live-but-still-starting daemon
+    // as absent (the exact case this fallback exists for).
+    daemon_client::daemon_lock_held(repo_root)
 }
 
 #[cfg(test)]
@@ -1004,6 +1045,30 @@ mod tests {
             !wait_for_exit(std::process::id(), std::time::Duration::from_millis(150)),
             "a process that is still running must not be reported as exited"
         );
+    }
+
+    /// `daemon stop`/`status` must treat only "nothing is listening" errors as
+    /// "not running"; anything else (busy pipe, wedged daemon, timeout) has to
+    /// surface, or a live daemon gets reported as absent.
+    #[test]
+    fn transport_absent_classifies_no_listener_errors() {
+        for msg in [
+            // Windows: pipe path does not exist.
+            r"daemon not running (\\.\pipe\travsr-abc): The system cannot \
+              find the file specified. (os error 2)",
+            // Unix: socket file missing / stale socket with no acceptor.
+            "No such file or directory (os error 2)",
+            "Connection refused (os error 111)",
+            "Connection refused (os error 61)",
+        ] {
+            assert!(transport_absent(&anyhow::anyhow!(msg)), "{msg}");
+        }
+        for msg in [
+            "daemon is busy (\\\\.\\pipe\\travsr-abc had no free pipe instance for 2s)",
+            "control response exceeded deadline",
+        ] {
+            assert!(!transport_absent(&anyhow::anyhow!(msg)), "{msg}");
+        }
     }
 
     /// The PID has to be read before the stop request, since a clean shutdown
