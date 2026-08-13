@@ -215,13 +215,75 @@ fn pid_is_alive(pid: u32) -> bool {
 /// Same shape as `daemon_is_running`'s lock-file fallback (travsr-cli
 /// main.rs): absent, empty, or unparsable content is `false`, never
 /// "unknown", matching the previous behaviour for every non-lock case.
+///
+/// Windows-specific: `fs2`'s `try_lock_exclusive` calls `LockFileEx` over the
+/// entire file (`travsr-mcp` does not vendor `fs2` for production code, but
+/// every real holder of this lock does), and unlike POSIX `flock` (purely
+/// advisory, never affects a plain `read()` from another descriptor), a
+/// Windows exclusive `LockFileEx` range is mandatory: a plain read from
+/// *any other handle* that overlaps the locked range fails with
+/// `ERROR_LOCK_VIOLATION`, for as long as the lock is held. Since a real
+/// daemon holds this file's whole-file exclusive lock for its entire
+/// lifetime, a naive read-only probe on Windows would fail every single
+/// time a daemon is actually running, the exact case it exists to report
+/// `true` for, an inversion far worse than an occasional miss. Retrying
+/// does not help: the condition does not clear until the daemon exits.
+/// `read_lock_file_content` below turns that specific failure into positive
+/// evidence instead: only a live exclusive holder produces it, and this
+/// probe never becomes one itself, so this still adds no lock of our own.
 fn daemon_running(root: &Path) -> bool {
     let lock_path = root.join(".travsr").join("daemon.lock");
-    std::fs::read_to_string(&lock_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .map(pid_is_alive)
-        .unwrap_or(false)
+    match read_lock_file_content(&lock_path) {
+        LockFileRead::Content(s) => s
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .map(pid_is_alive)
+            .unwrap_or(false),
+        LockFileRead::ExclusivelyHeld => true,
+        LockFileRead::Absent => false,
+    }
+}
+
+/// Outcome of a plain (never-locking) read attempt on `.travsr/daemon.lock`.
+enum LockFileRead {
+    /// Read succeeded; here is what was in it (parsed by the caller).
+    Content(String),
+    /// The read failed specifically because another handle holds a Windows
+    /// mandatory exclusive lock over the range being read (see
+    /// [`daemon_running`]'s doc comment). Unix's advisory `flock` has no
+    /// equivalent failure mode, so nothing ever constructs this variant on
+    /// non-Windows targets; the `allow` reflects exactly that, not a
+    /// genuinely dead variant.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ExclusivelyHeld,
+    /// Absent, unreadable for any other reason, or (non-Windows) any error
+    /// at all: the previous, pre-#636-round-2 behaviour for every case that
+    /// is not specifically a Windows lock-contention read failure.
+    Absent,
+}
+
+fn read_lock_file_content(lock_path: &Path) -> LockFileRead {
+    match std::fs::read_to_string(lock_path) {
+        Ok(s) => LockFileRead::Content(s),
+        Err(e) => {
+            #[cfg(windows)]
+            {
+                // ERROR_LOCK_VIOLATION (33) is `LockFileEx`'s own documented
+                // failure code for this exact case (`fs2`'s Windows backend
+                // constructs this same code for its own contended-lock
+                // error). ERROR_SHARING_VIOLATION (32) is included too:
+                // both are plausible depending on exactly where in the
+                // open+read path the OS enforces the conflict, and neither
+                // occurs for a merely absent or otherwise-unreadable file.
+                if matches!(e.raw_os_error(), Some(32) | Some(33)) {
+                    return LockFileRead::ExclusivelyHeld;
+                }
+            }
+            let _ = &e;
+            LockFileRead::Absent
+        }
+    }
 }
 
 /// Serialize `payload` and wrap it in the `<travsr-data>` envelope. No output
@@ -1340,19 +1402,18 @@ mod tests {
         }
     }
 
-    /// `daemon_running` retried a bounded number of times with a short sleep
-    /// between attempts, so an assertion on its *result* is decoupled from
-    /// the reliability of the one external process spawn (`tasklist` on
-    /// Windows, `kill -0` on Unix) each call makes. `pid_is_alive`'s own doc
-    /// already accepts a recycled-PID false positive as an inherent
-    /// trade-off; the property these tests check is "the probe never takes a
-    /// lock", not "every single subprocess spawn succeeds under whatever
-    /// parallel load the rest of the test suite happens to be under at the
-    /// same instant" (`cargo test` runs test functions in parallel by
-    /// default, and Windows process creation is comparatively expensive
-    /// under contention). A transient spawn failure must not fail these
-    /// tests; a genuinely broken probe (one that never reads the PID as
-    /// alive) still will, since retries do not manufacture a `true`.
+    /// Small bounded retry around `daemon_running`, kept as defensive margin
+    /// against transient environment noise (a slow CI runner scheduling this
+    /// thread late, for instance), not as the fix for anything specific: the
+    /// real Windows failure these two tests originally hit was not transient
+    /// at all (see `daemon_running`'s own doc comment for the actual cause,
+    /// a mandatory-lock read failure that persists for as long as the
+    /// exclusive holder is held, which a retry with a short sleep cannot
+    /// wait out). That is now handled at the read layer inside
+    /// `daemon_running` itself, so these tests should pass on the first
+    /// attempt in the normal case; this wrapper just means a stray
+    /// scheduling hiccup does not fail the test outright. A genuinely broken
+    /// probe still fails, since retries do not manufacture a `true`.
     fn daemon_running_retrying(root: &Path) -> bool {
         for attempt in 0..5 {
             if daemon_running(root) {
