@@ -150,3 +150,41 @@ suite("VSCODE-247: buildStatsHtml", () => {
     assert.ok(html.includes("doRefresh"));
   });
 });
+
+suite("codicon syntax never reaches webview HTML", () => {
+  // `$(icon-name)` is VS Code's codicon syntax. It renders in the status bar,
+  // in QuickPick labels and on tree items, and NOT in a webview, where it is
+  // shown to the user verbatim: the Graph stats panel read
+  // "$(graph) Graph stats" as a literal heading.
+  //
+  // The hazard is easy to reintroduce, because the same label string is often
+  // right for a QuickPick and wrong for a panel built from it. `commands.ts`
+  // already strips the prefix for exactly this reason. This asserts the panels
+  // never carry it in the first place.
+  const CODICON = /\$\([a-z-]+\)/;
+
+  test("no panel builder emits a codicon", () => {
+    const panels: Array<[string, string]> = [
+      ["synonyms", buildSynonymsHtml([{ term: "auth", alias: "login" }])],
+      ["repos", buildReposHtml([{ name: "demo", path: "/tmp/demo/.travsr/graph.db", exists: true }])],
+      [
+        "stats",
+        buildStatsHtml({
+          nodes: "5310",
+          edges: "9147",
+          schemaVersion: "22",
+          dbSize: "18.2 MB",
+          lastIndexed: "1h ago",
+        }),
+      ],
+      ["languages", buildLanguagesHtml([], [])],
+    ];
+    for (const [name, html] of panels) {
+      const hit = html.match(CODICON);
+      assert.ok(
+        hit === null,
+        `${name} panel leaks codicon syntax into HTML: ${hit?.[0]} — drop it, a webview cannot render it`,
+      );
+    }
+  });
+});

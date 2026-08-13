@@ -201,7 +201,7 @@ export function buildSynonymsHtml(pairs: SynonymPair[]): string {
     .join("\n");
 
   const body = `
-<h2>$(symbol-keyword) Synonyms</h2>
+<h2>Synonyms</h2>
 <p class="sub">Query terms expanded during search. ${pairs.length} pair(s).</p>
 <div class="addrow">
   <div style="display:flex;flex-direction:column;gap:6px;flex:1;min-width:200px">
@@ -278,7 +278,7 @@ export function buildReposHtml(rows: RepoRow[]): string {
     .join("\n");
 
   const body = `
-<h2>$(repo) Registered repos</h2>
+<h2>Registered repos</h2>
 <p class="sub">${rows.length} repo(s) in ~/.travsr/registry.json · ${staleCount} stale.</p>
 <div class="toolbar">
   <button class="btn ${staleCount > 0 ? "primary" : ""}" id="pruneBtn" onclick="prune(this)">Prune stale (${staleCount})</button>
@@ -309,7 +309,7 @@ export function buildStatsHtml(stats: StatsView): string {
   const card = (k: string, v: string): string =>
     `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
   const body = `
-<h2>$(graph) Graph stats</h2>
+<h2>Graph stats</h2>
 <p class="sub">Live metrics for the indexed graph.</p>
 <div class="cards">
   ${card("Nodes", stats.nodes)}
@@ -473,7 +473,7 @@ function removeLang(btn, lang) {
   vscode.postMessage({command:'removeLang', language:lang});
 }
 function detectLangs(btn) {
-  setLoading(btn, true, '$(search) Detect & install');
+  setLoading(btn, true, 'Detect &amp; install');
   vscode.postMessage({command:'detectLangs'});
 }
 function doRefresh(btn) { setLoading(btn, true, 'Refresh'); vscode.postMessage({command:'refresh'}); }
