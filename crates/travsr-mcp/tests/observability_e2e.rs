@@ -168,6 +168,14 @@ fn registry_key_for(fake_home: &Path, repo_dir: &Path) -> String {
         .expect("registry.json must exist after travsr init");
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let repos = json["repos"].as_object().expect("repos object");
+    // Registration canonicalizes the repo root before using it as the
+    // registry key (travsr-daemon/src/lib.rs), which on Windows resolves an
+    // 8.3 short-name alias (e.g. RUNNER~1) to its long form and prepends the
+    // `\\?\` extended-length prefix. Canonicalize here too so the comparison
+    // matches what was actually stored, not the tempdir's raw short-name path.
+    let repo_dir = repo_dir
+        .canonicalize()
+        .unwrap_or_else(|_| repo_dir.to_path_buf());
     let repo_dir_str = repo_dir.to_string_lossy();
     repos
         .iter()
