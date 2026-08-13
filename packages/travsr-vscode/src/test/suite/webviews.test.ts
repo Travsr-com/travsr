@@ -1,6 +1,6 @@
 import * as assert from "assert";
 import { buildSynonymsHtml, buildReposHtml, buildStatsHtml, buildLanguagesHtml } from "../../webviews";
-import type { LangCount, LangInfo, LogEntry, StatsView } from "../../webviews";
+import type { Diagnostic, LangCount, LangInfo, LogEntry, StatsView } from "../../webviews";
 
 suite("VSCODE-247: buildSynonymsHtml", () => {
   test("groups aliases by term and renders chips + staged multi-add row", () => {
@@ -200,6 +200,17 @@ suite("codicon syntax never reaches webview HTML", () => {
     { time: "", level: "", target: "", message: "a line from before the log became JSON", detail: "", iso: "", raw: "{}" },
   ];
 
+  const DIAGS: Diagnostic[] = [
+    {
+      severity: "error",
+      title: "semantic analyzer for 'kotlin' crashed",
+      hint: "semantic analyzer for 'kotlin' crashed, re-run to retry",
+      command: "travsr init --semantic",
+    },
+    // No command: the card must render without an action row.
+    { severity: "warn", title: "index looks stale", hint: "HEAD moved since the last index" },
+  ];
+
   const panels = (): Array<[string, string]> => [
     // Populated and empty are separate code paths in several builders, so both
     // are rendered rather than whichever one the fixture happened to hit.
@@ -208,8 +219,9 @@ suite("codicon syntax never reaches webview HTML", () => {
     ["repos, populated", buildReposHtml([{ name: "demo", path: "/tmp/demo/.travsr/graph.db", exists: true }])],
     ["repos, with a stale row", buildReposHtml([{ name: "gone", path: "/tmp/gone/.travsr/graph.db", exists: false }])],
     ["repos, empty", buildReposHtml([])],
-    ["stats, no log", buildStatsHtml(STATS)],
-    ["stats, with a log", buildStatsHtml(STATS, LOG)],
+    ["stats, offline", buildStatsHtml(STATS)],
+    ["stats, all clear", buildStatsHtml(STATS, LOG)],
+    ["stats, with diagnostics", buildStatsHtml(STATS, LOG, DIAGS)],
     ["languages, indexed and available", buildLanguagesHtml([{ language: "rust", count: 1 }], [LANG])],
     ["languages, available but not indexed", buildLanguagesHtml([], [LANG])],
     ["languages, empty", buildLanguagesHtml([], [])],

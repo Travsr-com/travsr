@@ -30,7 +30,7 @@ import {
   type LangCount,
   type LangInfo,
 } from "./webviews";
-import type { LogEntry } from "./webviews";
+import type { Diagnostic, LogEntry } from "./webviews";
 
 // ── Pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -756,7 +756,9 @@ export function registerShowGraphStats(client: McpClient): vscode.Disposable {
     // Read straight from the log file rather than asking the daemon: it works
     // after a crash, which is when the panel is worth opening.
     const log = root ? readDaemonLogTail(root) : [];
-    return buildStatsHtml(stats, log);
+    const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+    const diags = root ? await readDiagnostics(bin, root) : [];
+    return buildStatsHtml(stats, log, diags);
   };
 
   const handle = async (_msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
@@ -859,6 +861,41 @@ export function registerShowExecutionPath(
     const panel = GraphPanel.show(client, context);
     panel.renderPath(data, `${source} → ${sink}`);
   });
+}
+
+/**
+ * What is wrong with this repo's index, as `travsr status` reports it.
+ *
+ * The CLI already phrases every one of these for a person and names the command
+ * that fixes it, so this parses that rather than reimplementing the mapping in
+ * TypeScript and letting the two drift.
+ *
+ * These are all repo-scoped: an analyzer that crashed, a language with no tool
+ * registered, an approval that was never given. None of them belong to a file,
+ * which is why they are cards here rather than entries in the Problems panel,
+ * which wants a file to attach to.
+ */
+export async function readDiagnostics(binary: string, cwd: string): Promise<Diagnostic[]> {
+  const out = await spawnLangCommand(binary, ["status"], cwd);
+  const found: Diagnostic[] = [];
+  for (const line of out.split("\n")) {
+    const m = /^\s*warning:\s*(.+)$/.exec(line);
+    if (!m) continue;
+    const text = m[1].trim();
+    // The CLI writes the fix in backticks. Lift it out so it can be copied
+    // without the reader having to pick it out of the sentence.
+    const cmd = /`([^`]+)`/.exec(text);
+    const severity: Diagnostic["severity"] = /crashed|failed|not usable/i.test(text)
+      ? "error"
+      : "warn";
+    found.push({
+      severity,
+      title: text.replace(/\s*[-—.]?\s*(re-?run|run)\s+`[^`]+`.*$/i, "").trim(),
+      hint: text,
+      command: cmd ? cmd[1] : undefined,
+    });
+  }
+  return found;
 }
 
 /** Spawn a travsr CLI command and return its combined stdout+stderr. */

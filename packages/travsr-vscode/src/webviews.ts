@@ -168,6 +168,32 @@ export function webviewShell(title: string, body: string, script: string): strin
   .count.filtered { color: var(--gold); }
   mark { background: var(--gold); color: var(--bg); border-radius: 2px; padding: 0 1px; }
 
+  /* Health banner: the answer to "is something wrong", before any detail. */
+  .banner { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; border-radius: 6px; margin: 14px 0 0; font-size: 12px;
+    border: 1px solid transparent; }
+  .banner strong { font-size: 12px; }
+  .banner span { color: var(--fg-muted); }
+  .banner.good { background: var(--green-deep); border-color: var(--green); color: var(--green); }
+  .banner.bad  { background: var(--orange-deep); border-color: var(--orange); color: var(--orange); }
+  .banner.idle { background: var(--bg-elev); border-color: var(--border); color: var(--fg-muted); }
+
+  /* One card per problem: what broke, what it costs, what to run. */
+  .diags { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+  .diag { padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg-elev); border-left-width: 3px; }
+  .diag.error { border-left-color: var(--error); }
+  .diag.warn  { border-left-color: var(--gold); }
+  .diag-t { font-size: 12px; font-weight: 600; margin-bottom: 3px; }
+  .diag.error .diag-t { color: var(--error); }
+  .diag.warn  .diag-t { color: var(--gold); }
+  .diag-h { font-size: 11.5px; color: var(--fg-muted); line-height: 1.5; }
+  .diag-a { margin-top: 7px; }
+  .diag-cmd { display: inline-block; padding: 3px 7px; border-radius: 4px;
+    background: var(--bg-input); border: 1px solid var(--border); color: var(--fg);
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11px;
+    user-select: all; }
+
   /* Subsystem tint. A categorical axis, separate from severity, so a run of
      indexer lines is findable by eye without reading any of them. Kept low
      saturation: severity is the signal, this is only grouping. */
@@ -374,6 +400,17 @@ function doRefresh(btn){ setLoading(btn,true,'Refresh'); vscode.postMessage({com
   return webviewShell("Travsr Repos", body, script);
 }
 
+/** One thing that is wrong, phrased for the person who has to fix it. */
+export interface Diagnostic {
+  severity: "error" | "warn";
+  /** What is wrong, in a few words. */
+  title: string;
+  /** What it costs, and how to fix it. */
+  hint: string;
+  /** A command to run, pulled out of the hint so it can be copied. */
+  command?: string;
+}
+
 /** One daemon log line, as the stats panel renders it. */
 export interface LogEntry {
   time: string;
@@ -428,7 +465,11 @@ export interface StatsView {
 }
 
 /** Graph stats dashboard: metric cards, recent activity, and the log tail. */
-export function buildStatsHtml(stats: StatsView, log: LogEntry[] = []): string {
+export function buildStatsHtml(
+  stats: StatsView,
+  log: LogEntry[] = [],
+  diags: Diagnostic[] = []
+): string {
   const card = (k: string, v: string): string =>
     `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
 
@@ -500,6 +541,37 @@ export function buildStatsHtml(stats: StatsView, log: LogEntry[] = []): string {
         .join("\n")
     : `<div class="empty">No daemon log yet. Run <span class="mono">travsr daemon start</span>.</div>`;
 
+  // Health reads before anything else, because "is something wrong" is the
+  // question the panel is opened with. All clear is its own state, not an empty
+  // list: nothing found and nothing checked look identical otherwise.
+  const errs = diags.filter((d) => d.severity === "error").length;
+  const warns = diags.length - errs;
+  const health = diags.length
+    ? `<div class="banner bad">
+<strong>${errs ? `${errs} error${errs > 1 ? "s" : ""}` : ""}${errs && warns ? " &middot; " : ""}${warns ? `${warns} warning${warns > 1 ? "s" : ""}` : ""}</strong>
+<span>affecting what the graph can answer</span></div>`
+    : log.length
+      ? `<div class="banner good"><strong>All clear</strong><span>no analyzer or index problems reported</span></div>`
+      : `<div class="banner idle"><strong>Daemon not running</strong>
+<span>start it to keep the graph fresh: <span class="mono">travsr daemon start</span></span></div>`;
+
+  const diagCards = diags.length
+    ? `<div class="diags">` +
+      diags
+        .map(
+          (d) =>
+            `<div class="diag ${d.severity}">` +
+            `<div class="diag-t">${d.severity === "error" ? "&#10007;" : "&#9888;"} ${esc(d.title)}</div>` +
+            `<div class="diag-h">${esc(d.hint)}</div>` +
+            (d.command
+              ? `<div class="diag-a"><code class="diag-cmd">${esc(d.command)}</code></div>`
+              : "") +
+            `</div>`
+        )
+        .join("\n") +
+      `</div>`
+    : "";
+
   const body = `
 <h2>Graph stats</h2>
 <p class="sub">Live metrics for the indexed graph.</p>
@@ -513,6 +585,9 @@ export function buildStatsHtml(stats: StatsView, log: LogEntry[] = []): string {
 <div class="toolbar" style="margin-top:16px">
   <button class="btn" id="refreshBtn" onclick="doRefresh(this)">Refresh</button>
 </div>
+
+${health}
+${diagCards}
 
 <h2 style="margin-top:28px">Recent activity</h2>
 <p class="sub">Lifecycle events from the daemon, newest first.</p>
