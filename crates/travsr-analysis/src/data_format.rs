@@ -23,7 +23,7 @@
 //!
 //! Malformed-input policy: parse errors degrade to Level 1 (file node only)
 //! with a debug-level warning — never panic on user config files.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -242,6 +242,92 @@ fn cargo_dep_version(spec: &toml::Value) -> &str {
     }
 }
 
+/// Extract `[workspace.dependencies]` from an already-parsed `Cargo.toml` as
+/// `(name, version)` pairs. Shared by [`parse_cargo_toml`] (the root's own
+/// Provider markers) and [`workspace_provider_markers_for_member`] (the daemon's
+/// incremental enrichment) so both derive versions through one code path.
+fn workspace_dep_providers(doc: &toml::Value) -> Vec<(String, String)> {
+    let Some(ws_deps) = doc
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.as_table())
+    else {
+        return Vec::new();
+    };
+    ws_deps
+        .iter()
+        .map(|(name, spec)| (name.clone(), cargo_dep_version(spec).to_string()))
+        .collect()
+}
+
+/// Load the `[workspace.dependencies]` a member `Cargo.toml` inherits, as
+/// `Provider` markers, by walking up to its workspace root.
+///
+/// A member reindexed *alone* (an incremental commit that does not touch the
+/// root) has `Consumer` markers for its `{ workspace = true }` entries but no
+/// matching `Provider` in the batch, so the indexer's `resolve_workspace_deps`
+/// would degrade the edge to the `@workspace` sentinel. This walks from
+/// `member_cargo` up to the nearest ancestor `Cargo.toml` that declares a
+/// `[workspace]` table (bounded by `repo_root`), reads its
+/// `[workspace.dependencies]`, and returns them as `Provider` markers so the
+/// resolver can supply the real versions.
+///
+/// Returns empty when no ancestor workspace root exists on disk (a detached
+/// member) or on read/parse failure — the caller then keeps the `@workspace`
+/// sentinel as the last resort.
+pub fn workspace_provider_markers_for_member(
+    member_cargo: &Path,
+    repo_root: &Path,
+) -> Vec<WorkspaceDepMarker> {
+    let Some(root) = find_workspace_root(member_cargo, repo_root) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&root) else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        tracing::debug!("data_format: malformed workspace root Cargo.toml at {root:?}");
+        return Vec::new();
+    };
+    workspace_dep_providers(&doc)
+        .into_iter()
+        .map(|(name, version)| WorkspaceDepMarker::Provider { name, version })
+        .collect()
+}
+
+/// Walk up from `member_cargo` to the nearest *ancestor* `Cargo.toml` that
+/// declares a `[workspace]` table, bounded by `repo_root` so the search never
+/// escapes the repository. The member file itself is skipped: a self-contained
+/// root (`[workspace]` + `{ workspace = true }` in one file) already resolves
+/// in-batch and never reaches this path.
+fn find_workspace_root(member_cargo: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let repo_root = repo_root.canonicalize().ok();
+    let mut dir = member_cargo.parent()?.to_path_buf();
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate != member_cargo && candidate.is_file() {
+            if let Ok(text) = std::fs::read_to_string(&candidate) {
+                if let Ok(doc) = text.parse::<toml::Value>() {
+                    if doc.get("workspace").is_some() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        // Stop once we have inspected the repo root directory.
+        if let Some(ref rr) = repo_root {
+            if dir.canonicalize().ok().as_deref() == Some(rr.as_path()) {
+                break;
+            }
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    None
+}
+
 /// A member spec that inherits from the workspace: `{ workspace = true }`.
 fn is_workspace_inherited(spec: &toml::Value) -> bool {
     matches!(spec, toml::Value::Table(t)
@@ -260,26 +346,16 @@ fn parse_cargo_toml(_corpus: &str, path: &Path, file_id: NodeId, out: &mut Parse
     // A1: a workspace root declares its dependency versions under
     // `[workspace.dependencies]`. Emit versioned edges for the root itself and
     // record Provider markers so member `{ workspace = true }` entries resolve.
-    if let Some(ws_deps) = doc
-        .get("workspace")
-        .and_then(|w| w.get("dependencies"))
-        .and_then(|d| d.as_table())
-    {
-        for (name, spec) in ws_deps {
-            let ver = cargo_dep_version(spec);
-            let pkg_node = cargo_package_node(name, ver);
-            out.edges.push(Edge::new(
-                file_id,
-                pkg_node.id,
-                EdgeKind::ExternalDependency,
-            ));
-            out.nodes.push(pkg_node);
-            out.workspace_dep_markers
-                .push(WorkspaceDepMarker::Provider {
-                    name: name.clone(),
-                    version: ver.to_string(),
-                });
-        }
+    for (name, ver) in workspace_dep_providers(&doc) {
+        let pkg_node = cargo_package_node(&name, &ver);
+        out.edges.push(Edge::new(
+            file_id,
+            pkg_node.id,
+            EdgeKind::ExternalDependency,
+        ));
+        out.nodes.push(pkg_node);
+        out.workspace_dep_markers
+            .push(WorkspaceDepMarker::Provider { name, version: ver });
     }
 
     for section in &["dependencies", "dev-dependencies", "build-dependencies"] {
@@ -971,6 +1047,53 @@ tempfile = "3"
         let out = parse("github.com/a/b", f.path(), "Cargo.toml").unwrap();
         assert_eq!(out.nodes.len(), 1);
         assert_eq!(out.edges.len(), 0);
+    }
+
+    /// A2 follow-up: the member-only enrichment helper walks up to the workspace
+    /// root and returns its `[workspace.dependencies]` as `Provider` markers.
+    #[test]
+    fn workspace_provider_markers_walk_up_to_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n\n\
+             [workspace.dependencies]\nserde = \"1.0.200\"\n",
+        )
+        .unwrap();
+        let member_dir = tmp.path().join("crates/member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member = member_dir.join("Cargo.toml");
+        std::fs::write(
+            &member,
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { workspace = true }\n",
+        )
+        .unwrap();
+
+        let markers = workspace_provider_markers_for_member(&member, tmp.path());
+        assert!(
+            markers.iter().any(|m| matches!(
+                m,
+                WorkspaceDepMarker::Provider { name, version }
+                    if name == "serde" && version == "1.0.200"
+            )),
+            "must find serde=1.0.200 from the workspace root"
+        );
+    }
+
+    /// A detached member with no ancestor workspace root yields nothing, so the
+    /// caller keeps the `@workspace` sentinel as the last resort.
+    #[test]
+    fn workspace_provider_markers_detached_member_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &member,
+            "[package]\nname = \"o\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { workspace = true }\n",
+        )
+        .unwrap();
+        assert!(workspace_provider_markers_for_member(&member, tmp.path()).is_empty());
     }
 
     #[test]
