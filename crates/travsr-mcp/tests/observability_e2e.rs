@@ -320,7 +320,7 @@ fn ac5c_explicit_repo_arg_matches_a_real_registry_key() {
     init_test_repo_env(tmp.path(), &[("HOME", &fake_home.path().to_string_lossy())]);
     let key = registry_key_for(fake_home.path(), tmp.path());
     assert!(
-        key.starts_with('/'),
+        Path::new(&key).is_absolute(),
         "sanity: registry keys are absolute paths on this platform, got: {key}"
     );
 
