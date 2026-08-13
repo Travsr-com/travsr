@@ -757,9 +757,22 @@ impl Indexer {
                 &self.doc_excludes,
             )
             .map_err(map_err)?,
-            // Other future languages (#[non_exhaustive]) are silently skipped
-            // until their parsers ship.
-            _ => ParseOutput::default(),
+            // A name-recognized manifest whose extension is unmapped or absent
+            // (`go.mod`, `*.csproj`) still routes to the data-format parser, which
+            // dispatches by filename. Other future languages (#[non_exhaustive])
+            // are silently skipped until their parsers ship.
+            _ => {
+                let file_name = Path::new(vname_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if travsr_core::is_manifest_file(file_name) {
+                    travsr_analysis::data_format::parse(&self.corpus, abs_path, vname_path)
+                        .map_err(map_err)?
+                } else {
+                    ParseOutput::default()
+                }
+            }
         };
 
         // Collect per-language FFI call-site markers (RFC-005 §3).
@@ -806,5 +819,44 @@ impl Indexer {
             );
         }
         edges
+    }
+
+    /// Resolve Cargo workspace-inherited dependency versions (A2) from markers
+    /// accumulated across the batch. A member's `{ workspace = true }` entry
+    /// (`Consumer`) is matched against the workspace root's
+    /// `[workspace.dependencies]` (`Provider`) so its edge targets the versioned
+    /// `pkg:name@version` node — the very node the root emits, since both build
+    /// it through [`cargo_package_node`]. Unresolved consumers (the root is not
+    /// in this batch, e.g. a single-file incremental reindex) fall back to
+    /// `@workspace` so the edge is never dangling.
+    ///
+    /// Returns nodes *and* edges: the target node is re-emitted for an idempotent
+    /// upsert so it exists even when the root is written in a separate pass.
+    pub fn resolve_workspace_deps(
+        &self,
+        markers: &[travsr_analysis::data_format::WorkspaceDepMarker],
+    ) -> (Vec<Node>, Vec<Edge>) {
+        use travsr_analysis::data_format::{cargo_package_node, WorkspaceDepMarker};
+        let mut versions: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for m in markers {
+            if let WorkspaceDepMarker::Provider { name, version } = m {
+                versions.insert(name.as_str(), version.as_str());
+            }
+        }
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for m in markers {
+            if let WorkspaceDepMarker::Consumer { member_file, name } = m {
+                let ver = versions.get(name.as_str()).copied().unwrap_or("workspace");
+                let node = cargo_package_node(name, ver);
+                edges.push(Edge::new(
+                    *member_file,
+                    node.id,
+                    EdgeKind::ExternalDependency,
+                ));
+                nodes.push(node);
+            }
+        }
+        (nodes, edges)
     }
 }

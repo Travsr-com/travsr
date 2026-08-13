@@ -138,6 +138,8 @@ pub enum InitProgress {
 struct ParseResult {
     file_graph: FileGraph,
     ffi_markers: Vec<FfiMarker>,
+    /// Cargo workspace dependency markers (A2), resolved in the repo-level pass.
+    workspace_dep_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker>,
     /// `true` when the file was skipped (unchanged hash) — graph is empty.
     unchanged: bool,
 }
@@ -231,6 +233,7 @@ fn index_paths_parallel(
                                 edges: vec![],
                             },
                             ffi_markers: vec![],
+                            workspace_dep_markers: vec![],
                             unchanged: true,
                         }));
                         continue;
@@ -284,6 +287,7 @@ fn index_paths_parallel(
                             edges,
                         },
                         ffi_markers: out.ffi_markers,
+                        workspace_dep_markers: out.workspace_dep_markers,
                         unchanged: false,
                     }));
                 }
@@ -297,6 +301,7 @@ fn index_paths_parallel(
         let mut files_skipped_unchanged: u64 = 0;
         let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+        let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
 
         for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
@@ -313,6 +318,7 @@ fn index_paths_parallel(
             }
 
             all_ffi_markers.extend(pr.ffi_markers);
+            all_ws_markers.extend(pr.workspace_dep_markers);
             batch.push(pr.file_graph);
 
             if batch.len() >= BATCH_SIZE {
@@ -347,6 +353,27 @@ fn index_paths_parallel(
                     tracing::warn!(err=%e, "ffi edge write error");
                 }
                 counts.edges_upserted += 1;
+            }
+        }
+
+        // Repo-level Cargo workspace dependency resolution (A2): resolve member
+        // `{ workspace = true }` entries against the root's
+        // `[workspace.dependencies]` versions. Runs once the whole batch is
+        // parsed so the root and all members are visible together.
+        if !all_ws_markers.is_empty() {
+            let indexer = PluginIndexer::new(corpus);
+            let (nodes, edges) = indexer.resolve_workspace_deps(&all_ws_markers);
+            for node in &nodes {
+                match store.put_node(node) {
+                    Ok(_) => counts.nodes_upserted += 1,
+                    Err(e) => tracing::warn!(err=%e, "workspace dep node write error"),
+                }
+            }
+            for edge in &edges {
+                match store.put_edge(edge) {
+                    Ok(_) => counts.edges_upserted += 1,
+                    Err(e) => tracing::warn!(err=%e, "workspace dep edge write error"),
+                }
             }
         }
 
@@ -1174,6 +1201,12 @@ pub fn init_repo_with_progress(
         if let Some(lang) = Language::from_extension(ext) {
             present_languages.insert(lang.as_str().to_string());
             indexable_paths.push(p);
+        } else if travsr_core::is_manifest_file(
+            p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        ) {
+            // Name-recognized manifest (go.mod, *.csproj): index it even though
+            // its extension is unmapped. No Phase B language to record.
+            indexable_paths.push(p);
         }
     }
     reclassify_objc_headers(&mut present_languages, &indexable_paths);
@@ -1218,6 +1251,11 @@ pub fn init_repo_with_progress(
                 if let Some(lang) = Language::from_extension(ext) {
                     present_languages.insert(lang.as_str().to_string());
                     indexable_paths.push(p);
+                } else if travsr_core::is_manifest_file(
+                    p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                ) {
+                    // Name-recognized manifest (go.mod, *.csproj): unmapped ext.
+                    indexable_paths.push(p);
                 }
             }
             reclassify_objc_headers(&mut present_languages, &indexable_paths);
@@ -1253,10 +1291,7 @@ pub fn init_repo_with_progress(
                     .any(|skip| c.as_os_str() == *skip)
             })
         })
-        .filter(|e| {
-            Language::from_extension(e.path().extension().and_then(|x| x.to_str()).unwrap_or(""))
-                .is_some()
-        })
+        .filter(|e| travsr_core::is_indexable_path(e.path()))
         .count() as u64;
     let files_skipped_ignored =
         source_files_without_ignore.saturating_sub(indexable_paths.len() as u64);
@@ -2200,6 +2235,80 @@ fn record_dart_resolution_state(store: &mut SqliteStore, repo_root: &Path, dart_
     let _ = store.set_meta("dart_deps_unresolved", &unresolved.join(","));
 }
 
+/// C1: cross-link a language's own dependency node (`crate:serde`, kind
+/// `crate`) to the manifest-derived package node (`pkg:serde@ver`, kind
+/// `package`) when their bare names match, using the existing `ResolvesTo` edge
+/// so bare-name graph queries and traversal see the manifest data alongside the
+/// module graph. Package lookup is scoped to the `crates.io` registry so a
+/// same-named npm/pypi package can never link to a Rust crate. The
+/// `(kind, prefix, corpus)` shape generalises to other ecosystems as their
+/// symbol nodes gain stable dependency names.
+///
+/// Idempotent: `put_edge` dedupes on `(src, dst, kind)`, so re-running on every
+/// Phase B write never accumulates duplicates. Returns the edge count.
+fn cross_link_manifest_deps(store: &mut SqliteStore) -> usize {
+    use std::collections::HashMap;
+
+    let pkg_nodes = match store.nodes_by_kind("package") {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("C1 cross-link: package node scan failed: {e}");
+            return 0;
+        }
+    };
+    let mut pkg_by_name: HashMap<String, Vec<travsr_core::NodeId>> = HashMap::new();
+    for n in &pkg_nodes {
+        if n.vname.corpus != "crates.io" {
+            continue;
+        }
+        if let Some(rest) = n.vname.signature.strip_prefix("pkg:") {
+            let name = rest.rsplit_once('@').map(|(nm, _)| nm).unwrap_or(rest);
+            if !name.is_empty() {
+                pkg_by_name.entry(name.to_string()).or_default().push(n.id);
+            }
+        }
+    }
+    if pkg_by_name.is_empty() {
+        return 0;
+    }
+
+    let crate_nodes = match store.nodes_by_kind("crate") {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("C1 cross-link: crate node scan failed: {e}");
+            return 0;
+        }
+    };
+    let mut linked = 0usize;
+    for n in &crate_nodes {
+        let Some(name) = n.vname.signature.strip_prefix("crate:") else {
+            continue;
+        };
+        if let Some(pkg_ids) = pkg_by_name.get(name) {
+            for &pkg_id in pkg_ids {
+                if n.id == pkg_id {
+                    continue;
+                }
+                match store.put_edge(&travsr_core::Edge::new(
+                    n.id,
+                    pkg_id,
+                    travsr_core::EdgeKind::ResolvesTo,
+                )) {
+                    Ok(_) => linked += 1,
+                    Err(e) => tracing::warn!("C1 cross-link edge write error: {e}"),
+                }
+            }
+        }
+    }
+    if linked > 0 {
+        tracing::info!(
+            count = linked,
+            "C1: cross-linked crate <-> manifest package nodes"
+        );
+    }
+    linked
+}
+
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2285,6 +2394,13 @@ fn write_phase_b_results(
             "phase B indexing complete"
         );
     }
+
+    // C1: now that the module graph's `crate:*` nodes are written, cross-link
+    // them to the manifest-derived `pkg:*` package nodes by name so a bare-name
+    // query (`graph serde`) surfaces the manifest dependency alongside the
+    // language's own crate node.
+    cross_link_manifest_deps(store);
+
     // H3: stamp phase_b_warnings in the meta table so `travsr status` can surface
     // actionable issues without the user having to re-read init output.
     let mut warnings: Vec<String> = Vec::new();
@@ -2412,6 +2528,11 @@ fn collect_present_languages_and_paths(
             if !lang.is_phase_a_only() {
                 langs.insert(lang.as_str().to_string());
             }
+            paths.push(p);
+        } else if travsr_core::is_manifest_file(
+            p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        ) {
+            // Name-recognized manifest (go.mod, *.csproj): Phase A only.
             paths.push(p);
         }
     }
@@ -3056,6 +3177,7 @@ pub fn reindex_files(
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.
     let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+    let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
     let mut any_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
@@ -3166,6 +3288,8 @@ pub fn reindex_files(
                 any_changed = true;
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
+                // Collect Cargo workspace dep markers for the A2 repo-level pass.
+                all_ws_markers.extend(out.workspace_dep_markers);
             }
             Err(e) => tracing::warn!(path = %vname_path, err = %e, "reindex_replace failed"),
         }
@@ -3182,6 +3306,24 @@ pub fn reindex_files(
         for edge in &ffi_edges {
             if let Err(err) = store.put_edge(edge) {
                 tracing::warn!("ffi edge write error: {err}");
+            }
+        }
+    }
+
+    // Cargo workspace dependency resolution (A2) — same single-pass rationale as
+    // FFI above. A member `{ workspace = true }` entry re-indexed alongside its
+    // workspace root gets the root's version; re-indexed alone it falls back to
+    // the `@workspace` sentinel (no dangling edge).
+    if !all_ws_markers.is_empty() {
+        let (nodes, edges) = indexer.resolve_workspace_deps(&all_ws_markers);
+        for node in &nodes {
+            if let Err(err) = store.put_node(node) {
+                tracing::warn!("workspace dep node write error: {err}");
+            }
+        }
+        for edge in &edges {
+            if let Err(err) = store.put_edge(edge) {
+                tracing::warn!("workspace dep edge write error: {err}");
             }
         }
     }
