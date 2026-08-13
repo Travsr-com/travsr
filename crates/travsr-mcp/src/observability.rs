@@ -18,7 +18,7 @@ use crate::rerank;
 use crate::sanitize::{
     is_sensitive_key, sanitize_log_value, validate_mcp_repo_key_arg, wrap_envelope,
 };
-use crate::tools::git_short_head;
+use crate::tools::{git_short_head, phase_b_capable_languages};
 
 /// A resolved single-repo target for the observability tools' global-mode
 /// variants: registry key, repo root (derived from the db path), and db path.
@@ -158,13 +158,27 @@ fn working_tree_dirty(root: &Path) -> Option<bool> {
 /// tool. This variant opens the file only if it already exists and returns
 /// `false` (not "unknown") when it is absent, matching the CLI helper's
 /// semantics for every case that does not require creating the file.
+///
+/// Probes with `try_lock_shared`, not `try_lock_exclusive`: the daemon only
+/// ever holds the lock exclusively, so a shared lock answers "is anyone
+/// holding this exclusively" without itself conflicting with another
+/// `get_index_status`/`get_daemon_logs` call's shared probe running at the
+/// same instant (#636 review: `job_in_flight` calls this on every
+/// `get_index_status`, and an agent polling in a loop is the intended usage,
+/// so concurrent probes are the expected case, not an edge case).
 fn daemon_running(root: &Path) -> bool {
-    use fs2::FileExt as _;
     let lock_path = root.join(".travsr").join("daemon.lock");
     let Ok(file) = std::fs::OpenOptions::new().read(true).open(&lock_path) else {
         return false; // absent / unopenable → no daemon possible
     };
-    match file.try_lock_exclusive() {
+    // Fully-qualified, not `file.try_lock_shared()`: on a toolchain new
+    // enough to have std's own (much later-stabilized) file-locking API,
+    // method resolution would silently prefer std's inherent method over
+    // this crate's `fs2` dependency, which is a real risk here since the
+    // workspace MSRV (1.75, `rust-toolchain.toml`) predates that std API.
+    // The explicit path guarantees `fs2` regardless of toolchain, matching
+    // `unlock` below.
+    match fs2::FileExt::try_lock_shared(&file) {
         Ok(()) => {
             let _ = fs2::FileExt::unlock(&file);
             false
@@ -300,9 +314,15 @@ fn semantic_block(store: &SqliteStore, root: Option<&Path>) -> serde_json::Value
     let has_embed_db = store.has_embed_db();
 
     let embeddings = match (&model_and_root, has_embed_db) {
-        (None, false) => "disabled",
-        (Some(_), false) => "error",
-        (None, true) => "building",
+        // No active backend configured (`.travsr/embed.toml` absent or has no
+        // `active` key): nothing is embedding and nothing will, regardless of
+        // whether a leftover `embed.db` is on disk from a prior backend.
+        (None, _) => "disabled",
+        // A backend is configured but `embed.db` doesn't exist yet: the
+        // ordinary state between `travsr embed init` and the daemon's first
+        // embed tick, not a failure (`SqliteStore::embed_progress`'s doc: returns
+        // "(total, 0, phase1_total, 0) when embed.db does not yet exist").
+        (Some(_), false) => "building",
         (Some((model_id, r)), true) => {
             let db_path = r.join(".travsr").join("graph.db");
             let threshold =
@@ -321,10 +341,19 @@ fn semantic_block(store: &SqliteStore, root: Option<&Path>) -> serde_json::Value
     };
 
     let rerank_installed = matches!(rerank::rerank_status(), "installed" | "ready");
+    // `calibrated` sits beside `model` (the embedding model id), so it must
+    // describe embedding calibration, not the reranker. `travsr embed
+    // calibrate` (`calibrate_semantic_floors`, travsr-cli/src/embed.rs) is
+    // the thing that produces it, writing `embed_cos_lo`/`embed_cos_hi` into
+    // this store's meta; `rerank::manifest_present()` answers an unrelated
+    // question (is the cross-encoder's model.toml on disk) and was wrongly
+    // reused here (#636 review).
+    let calibrated = store.get_meta("embed_cos_lo").ok().flatten().is_some()
+        && store.get_meta("embed_cos_hi").ok().flatten().is_some();
     serde_json::json!({
         "embeddings": embeddings,
         "model": model_and_root.map(|(m, _)| m),
-        "calibrated": rerank::manifest_present(),
+        "calibrated": calibrated,
         "rerank": if rerank_installed { "installed" } else { "absent" },
     })
 }
@@ -353,17 +382,35 @@ fn index_status_payload(
         (Some(r), Some(indexed)) => commits_behind(r, indexed),
         _ => None,
     };
-    let is_stale = behind_by.is_some_and(|n| n > 0);
+    // Tri-state: `None` means unknown (git unavailable, no commit indexed
+    // yet, or the indexed commit no longer resolves), never collapsed to
+    // "not stale" (`commits_behind`'s doc comment requires this). When
+    // `behind_by` can't answer it (indexed commit rebased away/gc'd, or the
+    // checkout moved backwards past it so `indexed..HEAD` counts zero even
+    // though the two commits differ), fall back to a direct commit-identity
+    // comparison instead of fabricating a verdict.
+    let commits_known_and_differ = match (last_commit.as_deref(), head_commit.as_deref()) {
+        (Some(a), Some(b)) => Some(a != b),
+        _ => None,
+    };
+    let is_stale: Option<bool> = match behind_by {
+        Some(n) if n > 0 => Some(true),
+        Some(_) => commits_known_and_differ.or(Some(false)),
+        None => commits_known_and_differ,
+    };
     let dirty = root.and_then(working_tree_dirty);
 
     let node_count = store.node_count().unwrap_or(0);
     let edge_count = store.edge_count().unwrap_or(0);
 
-    // Phase A: the Tree-sitter structural pass.
+    // Phase A: the Tree-sitter structural pass. `last_commit` is only ever
+    // written after a Phase A pass completes (daemon/CLI init flows), so its
+    // presence alone is evidence of "done" regardless of `node_count`: a repo
+    // of only unsupported/binary files legitimately indexes to zero nodes,
+    // and reporting "failed" there would tell an agent the structural pass
+    // broke when it in fact completed normally (#636 review).
     let phase_a_state = if last_commit.is_none() {
         "pending"
-    } else if node_count == 0 {
-        "failed"
     } else {
         "done"
     };
@@ -386,7 +433,17 @@ fn index_status_payload(
     let daemon_up = root.is_some_and(daemon_running);
     let job_in_flight = daemon_up && phase_b_commit != last_commit;
 
+    // #636 review: `language_distribution()` returns every distinct language
+    // present in `nodes`, including non-code languages (markdown, toml, json,
+    // yaml, ...) that have no Phase B analyzer and so can never reach a Phase
+    // B terminal state. Filter to Phase-B-capable languages first, otherwise
+    // those languages are permanently misreported as "running".
+    let capable = phase_b_capable_languages();
     let languages = store.language_distribution().unwrap_or_default();
+    let languages: Vec<(String, u64)> = languages
+        .into_iter()
+        .filter(|(lang, _)| capable.contains(lang.as_str()))
+        .collect();
     let mut lang_entries = Vec::with_capacity(languages.len());
     let mut lang_states: Vec<&'static str> = Vec::with_capacity(languages.len());
     for (lang, _count) in &languages {
@@ -547,12 +604,29 @@ fn list_daemon_log_files(travsr_dir: &Path) -> Vec<String> {
 /// newest-first. A partial first line from the byte-window cut is dropped
 /// (best-effort: the line is presumed present in full in an even-older read
 /// that this bounded window intentionally does not perform).
+///
+/// Seeks to the window rather than reading the whole file first (#636
+/// review): the active `daemon.log.<DATE>` is rotated only daily
+/// (`tracing_appender::rolling::daily`, no size cap), so it can grow well
+/// past `PER_FILE_READ_BYTES` over one busy day, and loading it in full just
+/// to discard everything but the tail defeats the point of a bounded window.
 fn read_tail_lines_newest_first(path: &Path) -> Vec<String> {
-    let Ok(data) = std::fs::read(path) else {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    let start = data.len().saturating_sub(PER_FILE_READ_BYTES);
-    let text = String::from_utf8_lossy(&data[start..]);
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let start = len.saturating_sub(PER_FILE_READ_BYTES as u64);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut data = Vec::with_capacity((len - start) as usize);
+    if file.read_to_end(&mut data).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&data);
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     if start > 0 && !lines.is_empty() {
         lines.remove(0); // possibly truncated mid-line by the window cut
@@ -735,21 +809,35 @@ fn daemon_logs_payload(
 
     // Over-collect by one so we can distinguish "exactly tail lines exist"
     // from "more exist" without a second pass (drives the `truncated` flag).
+    // `origins` tracks which candidate file each line in `raw_newest_first`
+    // came from, so `source` can name every file the response actually draws
+    // from (#636 review: when the newest file is short, e.g. right after a
+    // midnight rotation, entries can be drawn from more than one file, and a
+    // single latched `source` named only the first one, silently mislabeling
+    // the rest).
     let want = tail.saturating_add(1);
     let mut raw_newest_first: Vec<String> = Vec::with_capacity(want.min(4096));
-    let mut source: Option<String> = None;
+    let mut origins: Vec<String> = Vec::with_capacity(want.min(4096));
     for file_name in &candidates {
         if raw_newest_first.len() >= want {
             break;
         }
         let chunk = read_tail_lines_newest_first(&travsr_dir.join(file_name));
-        if !chunk.is_empty() && source.is_none() {
-            source = Some(file_name.clone());
-        }
+        origins.extend(std::iter::repeat(file_name.clone()).take(chunk.len()));
         raw_newest_first.extend(chunk);
     }
     let tail_truncated = raw_newest_first.len() > tail;
     raw_newest_first.truncate(tail);
+    origins.truncate(tail);
+
+    // Distinct files actually contributing to the (possibly truncated)
+    // response, newest-first.
+    let mut source: Vec<String> = Vec::new();
+    for f in &origins {
+        if !source.contains(f) {
+            source.push(f.clone());
+        }
+    }
 
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(raw_newest_first.len());
     let mut total_bytes = 0usize;
@@ -1126,6 +1214,100 @@ mod tests {
         assert_eq!(state_of("typescript"), "done");
     }
 
+    /// #636 review (blocker): `language_distribution()` returns every distinct
+    /// language present in `nodes`, including non-code languages with no
+    /// Phase B analyzer (markdown, toml, json, ...). Those must never appear
+    /// in `phase_b.languages`, they can never reach a terminal state and
+    /// would otherwise be permanently misreported as "running".
+    #[test]
+    fn index_status_excludes_non_phase_b_capable_languages_from_phase_b_languages() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store as _;
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        store.set_meta("phase_b_commit", "abc123").unwrap();
+
+        for (lang, sig) in [("markdown", "doc:a"), ("rust", "fn:b")] {
+            let node = Node::new(
+                VName::new("corpus", "main", format!("f.{lang}"), lang, sig),
+                if lang == "markdown" {
+                    "doc"
+                } else {
+                    "function"
+                },
+            );
+            store.put_node(&node).unwrap();
+        }
+
+        let payload = index_status_payload(&store, "repo", None);
+        let langs = payload["phase_b"]["languages"].as_array().unwrap();
+        assert!(
+            !langs.iter().any(|l| l["language"] == "markdown"),
+            "markdown must never appear in phase_b.languages: {payload}"
+        );
+        // rust has no refcall edges and phase_b_commit == last_commit (no
+        // decoded warning either), so with markdown excluded it is the only
+        // capable language and its own state (not markdown's) drives the mix.
+        assert_eq!(langs.len(), 1, "got: {payload}");
+        assert_eq!(langs[0]["language"], "rust");
+    }
+
+    /// #636 review: `is_stale` must never collapse "unknown" to "not stale".
+    /// When the indexed commit no longer resolves (rebased away / gc'd) but
+    /// `head_commit` is known and differs from it, `is_stale` must be `true`,
+    /// not fabricated `false` just because `git rev-list --count` failed.
+    #[test]
+    fn index_status_is_stale_true_when_indexed_commit_unresolvable_but_commits_differ() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "deadbeef").unwrap(); // never resolves
+
+        let payload = index_status_payload(&store, "repo", Some(tmp.path()));
+        assert_eq!(payload["staleness"]["behind_by"], serde_json::Value::Null);
+        assert_eq!(payload["staleness"]["is_stale"], true, "got: {payload}");
+    }
+
+    /// #636 review: when git itself is unavailable (no `root`), staleness is
+    /// genuinely unknown and must serialize as `null`, not `false`.
+    #[test]
+    fn index_status_is_stale_null_when_root_unknown() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["staleness"]["is_stale"], serde_json::Value::Null);
+    }
+
+    /// #636 review: `calibrated` must reflect this repo's embedding
+    /// calibration (`embed_cos_lo`/`embed_cos_hi` meta, written by `travsr
+    /// embed calibrate`), not the unrelated reranker manifest.
+    #[test]
+    fn index_status_calibrated_reflects_embed_cos_meta_not_rerank_manifest() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(
+            payload["semantic"]["calibrated"], false,
+            "no embed_cos meta yet: {payload}"
+        );
+
+        store.set_meta("embed_cos_lo", "0.1").unwrap();
+        store.set_meta("embed_cos_hi", "0.9").unwrap();
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["semantic"]["calibrated"], true, "got: {payload}");
+    }
+
+    /// #636 review: a repo that ran Phase A to completion (evidenced by
+    /// `last_commit` being set) and legitimately found nothing to index
+    /// (e.g. only unsupported/binary files) must report `done`, not `failed`.
+    #[test]
+    fn index_status_phase_a_done_not_failed_when_no_nodes_indexed() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "abc123").unwrap();
+        let payload = index_status_payload(&store, "repo", None);
+        assert_eq!(payload["counts"]["nodes"], 0);
+        assert_eq!(payload["phase_a"]["state"], "done", "got: {payload}");
+    }
+
     // ── get_daemon_logs parsing / caps ────────────────────────────────────
 
     #[test]
@@ -1206,6 +1388,47 @@ mod tests {
         assert!(entries[0]["message"].as_str().unwrap().contains("line 9"));
         assert!(entries[1]["message"].as_str().unwrap().contains("line 8"));
         assert!(entries[2]["message"].as_str().unwrap().contains("line 7"));
+    }
+
+    /// #636 review: when the newest file is short (e.g. right after a
+    /// midnight rotation) and the response has to draw lines from an older
+    /// file too, `source` must name every file actually read, not just the
+    /// first one, otherwise entries are silently mislabeled.
+    #[test]
+    fn daemon_logs_source_lists_every_file_actually_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        // Newest file has only 1 line; the request needs more, so the reader
+        // must fall through to the older file too.
+        std::fs::write(
+            travsr_dir.join("daemon.log.2026-01-02"),
+            "2026-01-02T00:00:00Z INFO mod: newest\n",
+        )
+        .unwrap();
+        std::fs::write(
+            travsr_dir.join("daemon.log.2026-01-01"),
+            "2026-01-01T00:00:00Z INFO mod: older\n",
+        )
+        .unwrap();
+
+        let payload = daemon_logs_payload("repo", Some(tmp.path()), 5, "info");
+        let source = payload["source"].as_array().unwrap();
+        let names: Vec<&str> = source.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["daemon.log.2026-01-02", "daemon.log.2026-01-01"],
+            "got: {payload}"
+        );
+        assert_eq!(payload["returned"], 2, "got: {payload}");
+    }
+
+    /// `source: null` is reserved for "repo root itself unknown" (distinct
+    /// from a known root with zero log files, which reads `source: []`).
+    #[test]
+    fn daemon_logs_source_is_null_when_repo_root_unknown() {
+        let payload = daemon_logs_payload("repo", None, 10, "info");
+        assert_eq!(payload["source"], serde_json::Value::Null, "got: {payload}");
     }
 
     #[test]

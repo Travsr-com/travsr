@@ -1939,6 +1939,16 @@ static LANG_CATALOG: &[LangMeta] = &[
     },
 ];
 
+/// Language names that have a Phase B (semantic) analyzer registered in
+/// [`LANG_CATALOG`]. Used by `observability::index_status_payload` (#636) to
+/// filter `SqliteStore::language_distribution()` down to Phase-B-capable
+/// languages before classifying per-language state, since the node table
+/// also carries non-code languages (markdown, toml, json, yaml, ...) that
+/// have no analyzer and can never reach a Phase B terminal state.
+pub(crate) fn phase_b_capable_languages() -> std::collections::HashSet<&'static str> {
+    LANG_CATALOG.iter().map(|m| m.language).collect()
+}
+
 /// Return the set of files transitively affected if the given file changes.
 ///
 /// Uses reverse BFS over `DefinesBinding` and `RefCall` edges: starting from

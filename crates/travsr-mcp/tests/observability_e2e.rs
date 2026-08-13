@@ -826,7 +826,11 @@ fn edge_empty_log_dir_returns_empty_entries_gracefully() {
     );
     assert_eq!(payload["returned"], 0, "got: {payload}");
     assert_eq!(payload["truncated"], false, "got: {payload}");
-    assert_eq!(payload["source"], serde_json::Value::Null, "got: {payload}");
+    // `source` is a list of files actually read (#636 review), so a known
+    // repo root with zero daemon.log* files reads none: `[]`, not `null`.
+    // `null` is reserved for "repo root itself unknown"
+    // (`observability::tests::daemon_logs_source_is_null_when_repo_root_unknown`).
+    assert_eq!(payload["source"], serde_json::json!([]), "got: {payload}");
     assert_eq!(payload["daemon_running"], false, "got: {payload}");
 }
 
