@@ -251,13 +251,26 @@ fn is_username_material_base(c: char) -> bool {
 /// keeps a combining mark bound to the base character it modifies, so the
 /// run can never end mid-cluster.
 ///
-/// Fails CLOSED, not open, on a cluster with no alphanumeric base at all
-/// (#636 round-2 review: an all-emoji username has run length zero under
-/// (a) alone, which used to mean "nothing to redact", emitting the whole
-/// username verbatim). When the computed run is zero-length and the next
-/// character is neither `/` nor whitespace, this falls back to consuming up
-/// to the next `/` or whitespace boundary instead of stopping immediately,
-/// so an unrecognized-but-clearly-a-username run is still redacted.
+/// Fails CLOSED, not open, whenever the computed run is zero-length: an
+/// all-emoji username has no alphanumeric base character at all, so the
+/// grapheme-aware scan above alone reports zero, which used to mean "nothing
+/// to redact" and emit the whole username verbatim. This fallback fires on
+/// ANY zero-length run, not only on an exotic (e.g. all-emoji) username. When
+/// the next character after the prefix is neither `/` nor whitespace, it
+/// consumes up to the next `/` or whitespace boundary instead of stopping
+/// immediately, so a zero-length run with plain punctuation directly abutting
+/// the prefix (where there is in fact no username at all, e.g. a bare
+/// `/home/` followed by a comma or a parenthesis) takes this same path and
+/// that one adjacent token is consumed along with the redaction.
+///
+/// This is a deliberate fail-closed-over-fail-open choice (#636 round-2
+/// review): on ambiguous input, the redactor prefers to consume one extra
+/// adjacent token rather than risk emitting a real username verbatim. The
+/// two outcomes are not symmetric. A leaked real username is a privacy and
+/// security defect; a dropped adjacent token in an unusual bare-`/home/` log
+/// shape is a readability nit. The fallback is bounded to a single token, up
+/// to the next `/` or whitespace, never the old unbounded scan to the next
+/// separator anywhere later in the string.
 fn username_run_end(after: &str) -> usize {
     let mut end = 0usize;
     for (idx, grapheme) in after.grapheme_indices(true) {
@@ -1105,6 +1118,34 @@ mod tests {
         assert_eq!(
             redact_sensitive("index /home/bob\u{2192}done"),
             "index ~\u{2192}done"
+        );
+    }
+
+    /// Pins the residual fallback behaviour in [`username_run_end`] (#636
+    /// round-2 review follow-up): plain punctuation directly abutting a bare `/home/`
+    /// (no username at all, so the grapheme-aware run is zero-length) takes
+    /// the same fail-closed path built for an all-emoji username, and
+    /// consumes that one adjacent token along with the redaction.
+    ///
+    /// This is INTENTIONAL and reviewed, not a latent bug: fixing these two
+    /// cases to stop leaves the fallback unable to tell "zero-length because
+    /// there is no username" apart from "zero-length because the username is
+    /// all-emoji", and the all-emoji case must still be redacted or a real
+    /// username leaks verbatim, which is a privacy defect. A dropped adjacent
+    /// token in this unusual bare-`/home/` shape is a readability nit by
+    /// comparison, and the fallback only ever consumes a single token (up to
+    /// the next `/` or whitespace), never the old unbounded scan. Do not
+    /// change this behaviour to make these two inputs "pass" without also
+    /// reintroducing the all-emoji leak; see the doc comment on
+    /// [`username_run_end`] for the full tradeoff. `assert_eq!` on the whole
+    /// string, never `contains`, since the point being pinned is exactly
+    /// which bytes are dropped.
+    #[test]
+    fn redact_home_path_fallback_consumes_an_adjacent_non_username_token() {
+        assert_eq!(redact_sensitive("see /home/, retrying"), "see ~ retrying");
+        assert_eq!(
+            redact_sensitive("path /home/(unknown) failed"),
+            "path ~ failed"
         );
     }
 
