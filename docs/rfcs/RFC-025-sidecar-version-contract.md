@@ -263,13 +263,14 @@ sidecars:
 | Sidecar below floor (Point A) | **Hard refuse** with named remedy. This is the #701 case: the fix is to refuse *before* the cryptic downstream error, not to tolerate it. |
 | `protocol_version` mismatch | Hard refuse (same as below-floor); wire-incompatible sidecar never does real work. |
 | `--version` / handshake unparseable **and a floor is declared** | `installed_version` → `None` → `sidecar.version.unreadable` (WARN). Treated conservatively: cannot prove compliance → **refuse**. |
-| `--version` / handshake unparseable **and no `min_version` declared** (effectively `0.0.0`) | `sidecar.version.unreadable` (WARN) for visibility, but **allow** - the floor is trivially met, so an unreadable version cannot violate it. |
+| `--version` / handshake unparseable **and no `min_version` declared** (effectively `0.0.0`) | **Allow** - the floor is trivially met, so an unreadable version cannot violate it. Logged at **DEBUG** (`sidecar.version.checked`, disposition `unreadable_no_floor`), not WARN: a warning that fires forever on a permitted state trains readers to ignore warnings, and today every Phase B entry is in exactly this state. |
+| `--version` probe **exceeds its deadline** (`VERSION_PROBE_TIMEOUT`, 3s) **and a floor is declared** | Watchdog kills the probe; `sidecar.version.probe_timeout` (WARN, transition-only by name) → `ProbeTimeout` → **degrade to usable**. A timeout is a transient/infra condition (a slow first exec, e.g. macOS Gatekeeper verifying a freshly-downloaded binary), not proof the binary is old, and the real work downstream is already bounded by its own per-call watchdog. Kept distinct from `unreadable` so the timeout case is explicit rather than inherited. |
 | Offline at install (Point B advisory) | Silent; the install command never fails on a failed latest-fetch. |
 | Offline at resolve/spawn (Point A) | Unaffected - Point A is 100% offline; the floor is enforced from local `--version` / handshake with no network. |
 | Cache cold/stale (health line `latest`) | `latest` column omitted; installed-vs-required (the correctness axis) still shown. |
 | Daemon wants "latest" | Reads cache only; **never fetches**. If cache is cold, `sidecar.version.stale` simply does not fire. |
 
-Degradation is always toward **refuse-with-remedy** on the required axis and **silent** on the advisory axis. There is no path where drift produces a cryptic error the user cannot act on.
+Degradation is toward **refuse-with-remedy** on the required axis when age is *proven* (below-floor, or unreadable with a floor), **degrade-to-usable** when the version is merely *undetermined by a transient probe timeout* (the downstream operation stays watchdog-bounded regardless), and **silent** on the advisory axis. There is no path where drift produces a cryptic error the user cannot act on, and no path where a slow one-off `--version` exec turns a freshly-installed sidecar into a hard refusal.
 
 ---
 
@@ -325,13 +326,45 @@ Net: the RFC holds on all three phases; the only correction reality forced was t
 2. **Point A is hard and offline; Point B is soft, install-time, and cached.** The floor never touches the network; the advisory never fails a command. Reindex and daemon spawns are network-free.
 3. **`min_version` bumps in the same commit that relies on the behavior.** Enforced by honesty test (a); the #376/#701 gap (behavior shipped, floor not raised) is the anti-pattern this rule forbids.
 4. **Embed floor set to v1.2.0** (content-hash CDC invalidation, #376) and **all `version_fallback` bumped off `v1.0.0`** to `>= floor`.
-5. **New log keys are a stable contract.** `sidecar.version.{checked,below_floor,stale,unreadable}` follow `<domain>.<event>`, are transition-only for the repeating spawn paths, and the daemon emits `stale` from cache only (never fetches).
+5. **New log keys are a stable contract.** `sidecar.version.{checked,below_floor,stale,unreadable,probe_timeout}` follow `<domain>.<event>`. All four repeating events are transition-only: `below_floor`/`stale` key on the version(s); the two version-less events (`unreadable`, `probe_timeout`) key on the install name alone. The daemon emits `stale` from cache only (never fetches). `checked` is DEBUG and also carries the permitted `unreadable_no_floor` disposition (no separate WARN for a state nothing refuses).
 6. **Home crate is `travsr-plugin-host`.** One trait, one reader, two enforcement points - both families and every future sidecar inherit them; no crate-boundary change.
 7. **`parse_sidecar_version` scans for the first `X.Y.Z` token, never `.last()`.** Proven necessary against real `scip-clang`/`scip-ruby` output (§5.2, §11.1); the existing embed-only `sidecar_supports_cancel` is refactored onto it.
 
 ---
 
-## 13. Out of scope
+## 13. Security (trust-boundary exec on a new path)
+
+`travsr-plugin-host` is the trust boundary (CLAUDE.md; ADR-017). This RFC adds a
+new external-binary exec inside it: the offline version reader resolves a sidecar
+via `travsr_core::exec::resolve_executable(install_name)` - which may return a
+`PATH` match - and runs it with a fixed `--version` argument. That is worth
+naming explicitly so a later reader finds it already reasoned about.
+
+**Why `--version` is not the ADR-017 threat.** The threat ADR-017 governs, and
+the reason its trust grant is *per-corpus*, is running a language's build tooling
+**against a repository's contents**. The version probe takes **no repo input**:
+the argument is the fixed literal `--version`, the binary is one the user
+installed on purpose (`travsr embed init` / `travsr lang install`), and the probe
+reads only the tool's own self-reported version. There is no attacker-controlled
+input on this path, so it is deliberately **outside** the Phase B sandbox - a
+sandbox here would guard nothing. The exec is also bounded: the probe runs under
+a hard `VERSION_PROBE_TIMEOUT` (§9) and is SIGKILLed on expiry, so a wedged or
+malicious binary cannot hang the trust-boundary crate.
+
+**The probe does not run when it cannot matter.** A version probe whose result no
+floor can consume is pure cost - an exec and a process spawn to compute a value
+nothing reads. Every Phase B entry declares `Semver::ZERO` (decision 3: no floor
+until a behavior relies on one), so the Phase B floor check is **gated on
+`min_version() != Semver::ZERO`** and does not exec at all today. This keeps the
+no-floor family paying nothing (no exec, no probe timeout, no log line), and
+activates the exact moment a real Phase B floor is declared. The embed floor
+(v1.2.0, the actual #701 defect) is the only live floor, so embed is the only
+family that probes. When a Phase B floor lands, its probe inherits the same
+bound and the same "fixed-argument, no-repo-input" property analysed above.
+
+---
+
+## 14. Out of scope
 
 - **No auto-update / self-download.** A below-floor sidecar is *refused with a remedy*, never silently re-fetched and replaced - that would violate local-first and introduce surprise network. The user runs `--reinstall`.
 - **No handshake protocol changes.** This RFC enforces `protocol_version` / `plugin_version` that the handshake already carries (`embed.rs:82-83`, `types.rs:82-83`); it does not add or alter wire fields.

@@ -26,11 +26,12 @@
 //! is enforced from the handshake the process already negotiates or a cheap
 //! local `--version` probe.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ── Semver ──────────────────────────────────────────────────────────────────
 
@@ -146,33 +147,150 @@ pub trait SidecarSpec {
     fn pinned(&self) -> bool;
 }
 
-// ── Installed-version reader (offline) ──────────────────────────────────────
+// ── Installed-version reader (offline, bounded) ─────────────────────────────
 
-/// Read the installed version of a sidecar binary. Strictly local, no network.
+/// How long a `<bin> --version` probe may run before the watchdog kills it.
 ///
-/// Resolution order (RFC-025 §5.2):
-/// 1. Prefer an already-negotiated handshake `plugin_version` (`live`) — for the
-///    embed sidecar this is live at zero cost once spawned.
-/// 2. Else a cheap `<bin> --version` probe.
+/// The probe sits on `resolve_backend`, which the daemon runs every ~5s, so it
+/// cannot be allowed to block forever: a sidecar that hangs on `--version`
+/// (macOS Gatekeeper verifying a freshly-downloaded binary is the realistic
+/// case, a wedged process the pathological one) would otherwise stall the
+/// daemon scheduler and the foreground `travsr status` / `embed status` /
+/// `lang list`. Three seconds is generous for a first-exec verification yet well
+/// under the scheduler cadence; a healthy `--version` returns in milliseconds
+/// and is never penalised (the watchdog is notified the instant the child
+/// exits). This mirrors the crate's existing subprocess-watchdog discipline
+/// (`watchdog::with_io_watchdog`, `probe_top1_cosines`).
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Outcome of a bounded `<bin> --version` probe.
+enum ProbeOutcome {
+    /// The probe exited cleanly and its output carried a parseable `X.Y.Z`.
+    Parsed(Semver),
+    /// The probe ran to completion but produced no parseable version (an ancient
+    /// binary that predates `--version`, a non-zero exit, or a spawn failure).
+    Unreadable,
+    /// The probe did not finish within [`VERSION_PROBE_TIMEOUT`] and was killed.
+    /// Distinct from `Unreadable` on purpose: a timeout is a transient/infra
+    /// condition (slow first exec), not evidence that the binary is old, so the
+    /// caller degrades rather than hard-refusing (see [`FloorStatus`]).
+    TimedOut,
+}
+
+/// Run `<bin> --version` with a hard deadline. Spawns the child, waits up to
+/// `timeout` on a `Condvar`, and kills it on expiry (via the shared
+/// [`crate::watchdog::kill_pid`]). A healthy probe returns the instant the child
+/// exits — the watchdog is notified immediately, so a fast `--version` is never
+/// slowed to the full `timeout` (a bare `sleep(timeout)` would penalise every
+/// call). 100% local, no network.
 ///
-/// Returns `None` when neither yields a parseable `X.Y.Z` (an ancient binary
-/// that predates `--version`, or one whose probe exits non-zero).
-pub fn installed_version(bin: &Path, live: Option<&str>) -> Option<Semver> {
-    if let Some(v) = live {
-        if let Some(s) = parse_sidecar_version(v) {
-            return Some(s);
-        }
-    }
-    let out = Command::new(bin)
+/// The critical section is bounded on the child's **exit**, not on stdout EOF:
+/// stdout is drained on a detached thread, and the main path guards
+/// [`std::process::Child::wait`], which returns as soon as the direct child
+/// dies (killed → bounded) regardless of any grandchild still holding the pipe
+/// open. Using `wait_with_output` here would reintroduce the very unbounded
+/// block this exists to prevent, since a lingering grandchild keeps the pipe's
+/// write end open past the deadline.
+fn probe_version_bounded(bin: &Path, timeout: Duration) -> ProbeOutcome {
+    let mut child = match Command::new(bin)
         .arg("--version")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return ProbeOutcome::Unreadable, // missing / not executable
+    };
+    let pid = child.id();
+
+    // Drain stdout off the critical path so nothing holding the pipe open can
+    // block us; we bound the child's exit, not the pipe's EOF.
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let state = Arc::new((Mutex::new(false), Condvar::new()));
+    let killed = Arc::new(AtomicBool::new(false));
+    let state_wg = Arc::clone(&state);
+    let killed_wg = Arc::clone(&killed);
+    let watchdog = std::thread::spawn(move || {
+        let (lock, cv) = &*state_wg;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, res) = cv
+            .wait_timeout_while(guard, timeout, |d| !*d)
+            .unwrap_or_else(|e| e.into_inner());
+        if res.timed_out() && !*done {
+            killed_wg.store(true, Ordering::SeqCst);
+            crate::watchdog::kill_pid(pid);
+        }
+    });
+
+    let status = child.wait();
+
+    let (lock, cv) = &*state;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cv.notify_all();
+    drop(watchdog.join());
+
+    if killed.load(Ordering::SeqCst) {
+        return ProbeOutcome::TimedOut;
     }
-    parse_sidecar_version(&String::from_utf8_lossy(&out.stdout))
+    match status {
+        Ok(s) if s.success() => {
+            // The child exited on its own, so its stdout is closed and the
+            // reader has finished; a short bounded recv keeps this defensive
+            // against a self-exited child that left a grandchild on the pipe.
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(buf) => match parse_sidecar_version(&String::from_utf8_lossy(&buf)) {
+                    Some(v) => ProbeOutcome::Parsed(v),
+                    None => ProbeOutcome::Unreadable,
+                },
+                Err(_) => ProbeOutcome::Unreadable,
+            }
+        }
+        _ => ProbeOutcome::Unreadable,
+    }
+}
+
+/// Read a sidecar's version, preferring the negotiated handshake and falling
+/// back to a bounded `--version` probe. Strictly local, no network.
+///
+/// Resolution order (RFC-025 §5.2):
+/// 1. An already-negotiated handshake `plugin_version` (`live`) — for the embed
+///    sidecar this is live at zero cost once spawned, and skips the probe (and
+///    its timeout) entirely.
+/// 2. Else a bounded `<bin> --version` probe ([`probe_version_bounded`]).
+fn read_version(bin: &Path, live: Option<&str>) -> ProbeOutcome {
+    if let Some(v) = live {
+        if let Some(s) = parse_sidecar_version(v) {
+            return ProbeOutcome::Parsed(s);
+        }
+    }
+    probe_version_bounded(bin, VERSION_PROBE_TIMEOUT)
+}
+
+/// Read the installed version of a sidecar binary. Strictly local, no network,
+/// and bounded (see [`VERSION_PROBE_TIMEOUT`]).
+///
+/// Returns `None` when neither the handshake nor the probe yields a parseable
+/// `X.Y.Z` — an ancient binary that predates `--version`, one whose probe exits
+/// non-zero, or one whose probe timed out. Callers that need to distinguish a
+/// timeout from an unreadable version use [`floor_status`] instead; this reader
+/// serves the advisory / feature-detection sites, where all three collapse to
+/// "no usable version".
+pub fn installed_version(bin: &Path, live: Option<&str>) -> Option<Semver> {
+    match read_version(bin, live) {
+        ProbeOutcome::Parsed(s) => Some(s),
+        ProbeOutcome::Unreadable | ProbeOutcome::TimedOut => None,
+    }
 }
 
 // ── Point A: the compatibility floor ────────────────────────────────────────
@@ -184,33 +302,50 @@ pub enum FloorStatus {
     Ok(Semver),
     /// Installed version is below the required floor — hard refuse with remedy.
     BelowFloor { installed: Semver, required: Semver },
-    /// Version could not be read AND a floor is declared: compliance cannot be
-    /// proven, so this is treated conservatively as a refusal (§9).
+    /// Version could not be read (probe exited non-zero / unparseable) AND a
+    /// floor is declared: compliance cannot be proven, so this is treated
+    /// conservatively as a refusal (§9).
     Unreadable { required: Semver },
     /// Version could not be read but no floor is declared (`min_version` ==
-    /// `ZERO`): the floor is trivially met, so this is allowed (§9).
+    /// `ZERO`): the floor is trivially met, so this is allowed (§9). Also covers
+    /// a probe timeout with no floor, which likewise cannot violate anything.
     UnreadableNoFloor,
+    /// The `--version` probe did not finish within [`VERSION_PROBE_TIMEOUT`] and
+    /// a floor is declared. A timeout is transient/infra (a slow first exec, e.g.
+    /// macOS Gatekeeper verifying a freshly-downloaded binary), not proof the
+    /// binary is below the floor — so this **degrades to usable** rather than
+    /// hard-refusing, and the real work downstream is already bounded by its own
+    /// per-call watchdog (`watchdog::with_io_watchdog`). Distinct from
+    /// `Unreadable` so the timeout case is explicit rather than inherited (§9).
+    ProbeTimeout { required: Semver },
 }
 
 impl FloorStatus {
-    /// True when the sidecar may be used (floor satisfied, or no floor declared).
+    /// True when the sidecar may be used: floor satisfied, no floor declared, or
+    /// a probe timeout (a transient condition that is not evidence of an old
+    /// binary — see [`FloorStatus::ProbeTimeout`]).
     pub fn is_usable(&self) -> bool {
-        matches!(self, FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor)
+        matches!(
+            self,
+            FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor | FloorStatus::ProbeTimeout { .. }
+        )
     }
 }
 
 /// Compare a binary's installed version against its spec's declared floor.
-/// 100% offline: reads the handshake `live` value or a local `--version` probe.
+/// 100% offline and bounded: reads the handshake `live` value or a local,
+/// timeout-guarded `--version` probe.
 pub fn floor_status(spec: &dyn SidecarSpec, bin: &Path, live: Option<&str>) -> FloorStatus {
     let required = spec.min_version();
-    match installed_version(bin, live) {
-        Some(v) if v >= required => FloorStatus::Ok(v),
-        Some(v) => FloorStatus::BelowFloor {
+    match read_version(bin, live) {
+        ProbeOutcome::Parsed(v) if v >= required => FloorStatus::Ok(v),
+        ProbeOutcome::Parsed(v) => FloorStatus::BelowFloor {
             installed: v,
             required,
         },
-        None if required == Semver::ZERO => FloorStatus::UnreadableNoFloor,
-        None => FloorStatus::Unreadable { required },
+        _ if required == Semver::ZERO => FloorStatus::UnreadableNoFloor,
+        ProbeOutcome::TimedOut => FloorStatus::ProbeTimeout { required },
+        ProbeOutcome::Unreadable => FloorStatus::Unreadable { required },
     }
 }
 
@@ -279,15 +414,39 @@ fn note_stale_transition(install_name: &str, installed: Semver, latest: Semver) 
     true
 }
 
+/// Names already WARN-logged for a version-less event (`unreadable`,
+/// `probe_timeout`), keyed on `(kind, install_name)`. These states carry no
+/// version to key on, so they de-dup on the name alone.
+fn name_only_dedup() -> &'static Mutex<HashSet<(&'static str, String)>> {
+    static M: OnceLock<Mutex<HashSet<(&'static str, String)>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Transition gate for the version-less WARN events. Returns `true` at most once
+/// per `(kind, install_name)`, so an unparseable-or-timed-out sidecar refused on
+/// every ~5s scheduler tick logs exactly one WARN line — the same
+/// transition-only contract the `below_floor`/`stale` events already honour
+/// (RFC-025 §7.2). Without this, `sidecar.version.unreadable` was the one
+/// repeating event with no de-dup.
+fn note_name_transition(kind: &'static str, install_name: &str) -> bool {
+    let mut set = name_only_dedup().lock().unwrap_or_else(|e| e.into_inner());
+    set.insert((kind, install_name.to_string()))
+}
+
 /// Run the Point A floor check for a spawn/resolve, emit the stable structured
 /// log events (RFC-025 §7.1), and return the [`FloorStatus`] so the caller can
 /// refuse (CLI) or skip (daemon).
 ///
 /// - `sidecar.version.checked` (DEBUG) fires every call so healthy spawns do not
 ///   flood at info.
-/// - `sidecar.version.below_floor` (WARN) and `sidecar.version.stale` (INFO) are
-///   **transition-only**: at most one line per distinct value.
-/// - `sidecar.version.unreadable` (WARN) fires when the version cannot be parsed.
+/// - `sidecar.version.below_floor` (WARN), `sidecar.version.stale` (INFO),
+///   `sidecar.version.unreadable` (WARN) and `sidecar.version.probe_timeout`
+///   (WARN) are all **transition-only**: at most one line per distinct value.
+///   The two version-less events de-dup on the name alone.
+/// - An unreadable version with *no floor declared* is a permitted state
+///   (`is_usable()` is true), so it is logged at DEBUG next to `checked`, not
+///   WARN — a warning that fires forever on an allowed state trains readers to
+///   ignore warnings.
 ///
 /// `family` is a coarse label (`"embed"` / `"phase_b"`). `remedy` is the exact
 /// command string surfaced to the user. The `stale` advisory is emitted from the
@@ -306,9 +465,13 @@ pub fn check_and_log(
     let (installed_str, disposition) = match &status {
         FloorStatus::Ok(v) => (v.to_string(), "ok"),
         FloorStatus::BelowFloor { installed, .. } => (installed.to_string(), "below_floor"),
-        FloorStatus::Unreadable { .. } | FloorStatus::UnreadableNoFloor => {
-            ("unreadable".to_string(), "unreadable")
-        }
+        FloorStatus::Unreadable { .. } => ("unreadable".to_string(), "unreadable"),
+        // A permitted state (no floor to violate). It rides the single DEBUG
+        // `checked` line below with its own disposition — no separate WARN, since
+        // a warning that fires forever on an allowed state trains readers to
+        // ignore warnings.
+        FloorStatus::UnreadableNoFloor => ("unreadable".to_string(), "unreadable_no_floor"),
+        FloorStatus::ProbeTimeout { .. } => ("timeout".to_string(), "probe_timeout"),
     };
     tracing::debug!(
         event = "sidecar.version.checked",
@@ -337,22 +500,31 @@ pub fn check_and_log(
             }
         }
         FloorStatus::Unreadable { required } => {
-            tracing::warn!(
-                event = "sidecar.version.unreadable",
-                install_name,
-                reason = "version output could not be parsed and a floor is declared",
-                required = %required,
-                "sidecar version could not be read"
-            );
+            if note_name_transition("unreadable", install_name) {
+                tracing::warn!(
+                    event = "sidecar.version.unreadable",
+                    install_name,
+                    reason = "version output could not be parsed and a floor is declared",
+                    required = %required,
+                    "sidecar version could not be read"
+                );
+            }
         }
-        FloorStatus::UnreadableNoFloor => {
-            tracing::warn!(
-                event = "sidecar.version.unreadable",
-                install_name,
-                reason = "version output could not be parsed",
-                "sidecar version could not be read (no floor declared, allowed)"
-            );
+        FloorStatus::ProbeTimeout { required } => {
+            if note_name_transition("probe_timeout", install_name) {
+                tracing::warn!(
+                    event = "sidecar.version.probe_timeout",
+                    install_name,
+                    required = %required,
+                    timeout_secs = VERSION_PROBE_TIMEOUT.as_secs(),
+                    "sidecar --version probe timed out; degrading to usable (transient)"
+                );
+            }
         }
+        // Permitted state: nothing to refuse and no action for the reader, so it
+        // carries no WARN — it is already recorded by the DEBUG `checked` line
+        // above (disposition `unreadable_no_floor`).
+        FloorStatus::UnreadableNoFloor => {}
         FloorStatus::Ok(installed) => {
             // Point B / §7.1: re-surface a stale advisory from the local cache
             // only. A cold/expired cache means this simply does not fire.
@@ -569,6 +741,111 @@ mod tests {
             FloorStatus::UnreadableNoFloor
         );
         assert!(floor_status(&spec, missing, None).is_usable());
+    }
+
+    /// The handshake `live` value short-circuits the probe entirely, so a
+    /// wedged binary never even gets exec'd when a version is already known.
+    #[test]
+    fn live_handshake_skips_the_probe() {
+        let spec = FakeSpec {
+            min: Semver::new(1, 2, 0),
+        };
+        // Path does not exist, but `live` is present -> no probe, no I/O.
+        let missing = Path::new("/nonexistent/travsr-embed-xyz");
+        assert_eq!(
+            floor_status(&spec, missing, Some("travsr-embed 1.3.0")),
+            FloorStatus::Ok(Semver::new(1, 3, 0))
+        );
+    }
+
+    /// A probe timeout is a transient/infra condition, not evidence of an old
+    /// binary, so it degrades to usable rather than hard-refusing.
+    #[test]
+    fn probe_timeout_status_is_usable() {
+        let s = FloorStatus::ProbeTimeout {
+            required: Semver::new(1, 2, 0),
+        };
+        assert!(s.is_usable());
+    }
+
+    /// The version-less WARN events (`unreadable`, `probe_timeout`) de-dup on the
+    /// install name alone, and the two kinds are independent keys.
+    #[test]
+    fn name_only_events_log_once_per_kind_and_name() {
+        let name = "dedup-name-only-tool"; // unique key: the global set is shared
+        assert!(note_name_transition("unreadable", name));
+        assert!(!note_name_transition("unreadable", name));
+        // A different kind for the same name is a distinct key.
+        assert!(note_name_transition("probe_timeout", name));
+        assert!(!note_name_transition("probe_timeout", name));
+        // A different name under the same kind is distinct too.
+        assert!(note_name_transition("unreadable", "other-tool"));
+    }
+
+    /// The `--version` probe is bounded: a binary that hangs on `--version` is
+    /// killed at the deadline and reported as `TimedOut`, in well under the time
+    /// it would take to run to completion. Regression for the review finding that
+    /// `floor_status` sat unbounded on the daemon's ~5s path.
+    ///
+    /// Unix-only: relies on a shell script and `kill`-style termination, exactly
+    /// like `watchdog::watchdog_kills_hung_child_and_unblocks_read`.
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_is_bounded_and_reports_timeout() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("hang-on-version");
+        {
+            let mut f = std::fs::File::create(&bin).unwrap();
+            // Ignores its args and blocks far longer than the probe deadline.
+            writeln!(f, "#!/bin/sh\nsleep 30").unwrap();
+        }
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = Instant::now();
+        let outcome = probe_version_bounded(&bin, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(outcome, ProbeOutcome::TimedOut),
+            "a hung probe must report TimedOut"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "probe must be bounded by its deadline, took {elapsed:?}"
+        );
+    }
+
+    /// A healthy `--version` is read promptly and is not penalised the full
+    /// deadline — the watchdog is notified the instant the child exits.
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_reads_a_fast_healthy_version() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fast-version");
+        {
+            let mut f = std::fs::File::create(&bin).unwrap();
+            writeln!(f, "#!/bin/sh\necho 'fake-sidecar 1.4.2'").unwrap();
+        }
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = Instant::now();
+        let outcome = probe_version_bounded(&bin, Duration::from_secs(30));
+        assert!(
+            matches!(outcome, ProbeOutcome::Parsed(v) if v == Semver::new(1, 4, 2)),
+            "a healthy --version must parse"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a healthy probe must not wait the full deadline"
+        );
     }
 
     /// RFC-025 §5.5 honesty test (a): every catalog entry's offline

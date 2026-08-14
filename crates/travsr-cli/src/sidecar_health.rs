@@ -126,6 +126,11 @@ pub fn render_line(h: &SidecarHealth) -> String {
         FloorStatus::UnreadableNoFloor => {
             format!("  {name:<15} unknown  version not reported")
         }
+        FloorStatus::ProbeTimeout { required } => {
+            format!(
+                "  {name:<15} unknown  version probe timed out (usable, cannot confirm >= {required})"
+            )
+        }
     }
 }
 

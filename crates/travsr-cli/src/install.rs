@@ -123,7 +123,9 @@ pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinsta
                 unreadable_message(install_name, &required, reinstall_remedy)
             );
         }
-        FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor => {}
+        // A transient probe timeout at install time is not actionable (degrades
+        // to usable), so it stays quiet, alongside the healthy / no-floor cases.
+        FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor | FloorStatus::ProbeTimeout { .. } => {}
     }
 
     // Leg 2: best-effort staleness advisory. Skipped entirely when downloads are

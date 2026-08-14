@@ -1386,13 +1386,23 @@ fn tool_available(name: &str) -> bool {
 /// as usable.
 fn phase_b_tool_floor_refusal(entry: &travsr_plugin_host::PhaseBEntry) -> Option<String> {
     use travsr_plugin_host::sidecar_version::{
-        below_floor_message, floor_status, unreadable_message, FloorStatus, SidecarSpec,
+        below_floor_message, floor_status, unreadable_message, FloorStatus, Semver, SidecarSpec,
     };
     let (spec, install_name): (&dyn SidecarSpec, &str) = match &entry.scip_install {
         ScipInstall::GithubBinary(s) => (s as &dyn SidecarSpec, s.install_name),
         ScipInstall::ZipBinary(z) => (z as &dyn SidecarSpec, z.install_name),
         _ => return None,
     };
+    // No Phase B entry declares a floor today (RFC-025 decision 3: a floor is
+    // only set once a behavior relies on it). With no floor, `floor_status` can
+    // only ever return a usable state, so the probe cannot change any decision -
+    // and running it would exec a PATH-resolved binary inside the trust-boundary
+    // crate purely to learn a version nothing consumes. Skip it entirely until a
+    // real floor exists; this activates the instant one is declared, and keeps
+    // the no-floor family paying nothing (no exec, no probe timeout, no log).
+    if spec.min_version() == Semver::ZERO {
+        return None;
+    }
     let path = travsr_core::exec::resolve_executable(install_name)
         .or_else(|| dirs::home_dir().map(|h| h.join(".travsr").join("bin").join(install_name)))
         .filter(|p| p.exists())?;
@@ -1410,7 +1420,11 @@ fn phase_b_tool_floor_refusal(entry: &travsr_plugin_host::PhaseBEntry) -> Option
         FloorStatus::Unreadable { required } => {
             Some(unreadable_message(install_name, &required, &remedy))
         }
-        FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor => None,
+        // Usable states (floor met, no floor, or a transient probe timeout that
+        // degrades to usable) do not refuse.
+        FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor | FloorStatus::ProbeTimeout { .. } => {
+            None
+        }
     }
 }
 

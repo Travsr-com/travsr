@@ -30,15 +30,20 @@
 //! lsif.spawn               lsif.complete         fuzz_target.missing
 //! sidecar.version.checked  sidecar.version.below_floor
 //! sidecar.version.stale    sidecar.version.unreadable
+//! sidecar.version.probe_timeout
 //! ```
 //!
 //! The `sidecar.version.*` keys (RFC-025) report the external-binary version
 //! contract. They are emitted from `travsr-plugin-host` on every resolve/spawn,
 //! so they surface here whenever the daemon spawns a sidecar. `checked` is DEBUG
-//! (healthy spawns do not flood at info); `below_floor` (WARN) and `stale`
-//! (INFO) are transition-only — at most one line per distinct value, never one
-//! per ~5s scheduler tick. The daemon emits `stale` from a local cache only and
-//! never fetches (local-first).
+//! (healthy spawns do not flood at info). `below_floor` (WARN), `stale` (INFO),
+//! `unreadable` (WARN) and `probe_timeout` (WARN) are all transition-only — at
+//! most one line per distinct value, never one per ~5s scheduler tick;
+//! `below_floor`/`stale` key on the version(s), the two version-less events
+//! (`unreadable`, `probe_timeout`) key on the install name. `probe_timeout`
+//! fires when a bounded `--version` probe is killed for exceeding its deadline
+//! and the sidecar degrades to usable rather than being refused. The daemon
+//! emits `stale` from a local cache only and never fetches (local-first).
 //!
 //! The keys keep the codebase's own vocabulary (`phase_b`, `lsif`, `kcore`)
 //! because they are identifiers, matched exactly by whatever reads them, and a

@@ -1500,9 +1500,12 @@ fn resolve_backend(db_path: &Path) -> BackendResolve {
                 EMBED_REINSTALL_REMEDY,
             ));
         }
-        // Floor satisfied, or no floor declared -> proceed.
+        // Floor satisfied, no floor declared, or a transient probe timeout that
+        // degrades to usable (the real work downstream is watchdog-bounded) ->
+        // proceed.
         crate::sidecar_version::FloorStatus::Ok(_)
-        | crate::sidecar_version::FloorStatus::UnreadableNoFloor => {}
+        | crate::sidecar_version::FloorStatus::UnreadableNoFloor
+        | crate::sidecar_version::FloorStatus::ProbeTimeout { .. } => {}
     }
 
     BackendResolve::Ready(bin_path, embed_db_path, backend_id)
