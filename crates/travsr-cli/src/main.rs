@@ -264,6 +264,14 @@ enum DaemonAction {
         /// Run the daemon in the foreground (default: background).
         #[arg(long, default_value_t = false)]
         foreground: bool,
+        /// Log at debug level instead of info.
+        ///
+        /// The log file is written at info, so debug-only events are absent
+        /// from it entirely rather than merely filtered out — `daemon logs
+        /// --level debug` cannot recover what was never written. Start with
+        /// this when you need them. Costs log volume, so it is not the default.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
     },
     /// Stop the running daemon.
     Stop,
@@ -277,6 +285,11 @@ enum DaemonAction {
     StopEmbed,
     /// Resume background embed reindexing paused by `stop-embed`.
     ResumeEmbed,
+    /// Show the last diagnostics overlay the editor extension reported (#688).
+    ///
+    /// Answers "is the VS Code overlay reaching the daemon, and what did it
+    /// last see". Held in memory by the running daemon, so a restart clears it.
+    Lsp,
     /// Print daemon log entries. Reads the file directly, so it works after a
     /// crash and does not need a running daemon.
     Logs {
@@ -563,8 +576,17 @@ async fn run(cli: Cli) -> Result<()> {
             // worktree we are in, never the main worktree (issue #586).
             let repo_root = repo::find_git_root_for_write(&cwd)?;
             match action {
-                DaemonAction::Start { foreground } => {
+                DaemonAction::Start {
+                    foreground,
+                    verbose,
+                } => {
                     if foreground {
+                        // The daemon builds its own filter from the environment
+                        // inside `run`, so setting it here reaches it. Only when
+                        // the caller did not already say what they wanted.
+                        if verbose && std::env::var_os("RUST_LOG").is_none() {
+                            std::env::set_var("RUST_LOG", "debug");
+                        }
                         travsr_daemon::Daemon::run(repo_root, foreground).await?;
                     } else {
                         // Race-free guard: consult the flock the daemon itself
@@ -582,7 +604,7 @@ async fn run(cli: Cli) -> Result<()> {
                         relay.seek_to_end();
                         let started = std::time::Instant::now();
 
-                        match daemon_client::spawn_background_daemon(&repo_root, &exe) {
+                        match daemon_client::spawn_background_daemon(&repo_root, &exe, verbose) {
                             daemon_client::SpawnOutcome::AlreadyRunning => {
                                 eprintln!("travsr daemon is already running");
                                 return Ok(());
@@ -673,6 +695,88 @@ async fn run(cli: Cli) -> Result<()> {
                     #[cfg(windows)]
                     if let Err(e) = autostart::unregister(&repo_root) {
                         eprintln!("travsr: warning: could not remove auto-start task: {e}");
+                    }
+                }
+                DaemonAction::Lsp => {
+                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::LspStatus) {
+                        Ok(resp) => {
+                            let v = resp.result.unwrap_or(serde_json::Value::Null);
+                            let sessions = v.get("sessions").and_then(|s| s.as_array()).cloned();
+                            match sessions.as_deref() {
+                                None | Some([]) => {
+                                    println!("no editor attached");
+                                    println!(
+                                        "The VS Code extension attaches when a graph panel \
+                                         renders, and its view expires once the window closes."
+                                    );
+                                }
+                                Some(list) => {
+                                    println!(
+                                        "{} editor{} attached",
+                                        list.len(),
+                                        if list.len() == 1 { "" } else { "s" }
+                                    );
+                                    for s in list {
+                                        let n = |k: &str| {
+                                            s.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+                                        };
+                                        let id = s
+                                            .get("session")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("?");
+                                        let broken = s
+                                            .get("broken")
+                                            .and_then(|b| b.as_array())
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        println!();
+                                        let plural = |c: u64, word: &str| {
+                                            format!("{c} {word}{}", if c == 1 { "" } else { "s" })
+                                        };
+                                        println!(
+                                            "  {id}  ({} seen, updated {}s ago, expires in {}s)",
+                                            plural(n("seen"), "file"),
+                                            n("age_secs"),
+                                            n("expires_in_secs")
+                                        );
+                                        if broken.is_empty() {
+                                            println!("    nothing currently broken");
+                                        }
+                                        for f in &broken {
+                                            let g = |k: &str| {
+                                                f.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+                                            };
+                                            let path = f
+                                                .get("path")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("");
+                                            let mut parts = Vec::new();
+                                            if g("errors") > 0 {
+                                                parts.push(plural(g("errors"), "error"));
+                                            }
+                                            if g("warnings") > 0 {
+                                                parts.push(plural(g("warnings"), "warning"));
+                                            }
+                                            println!("    {path}  {}", parts.join(", "));
+                                        }
+                                        // The difference between "clean" and
+                                        // "nothing looked at it", which no count
+                                        // of errors can express.
+                                        if n("undiagnosed") > 0 {
+                                            println!(
+                                                "    {} of those files had no diagnostic provider \
+                                                 reporting, so they are unknown rather than clean",
+                                                n("undiagnosed")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            println!("daemon: not running, so no editor can be attached");
+                            println!("Start it with `travsr daemon start`.");
+                        }
                     }
                 }
                 DaemonAction::Status => {
@@ -766,7 +870,7 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                     relay.seek_to_end();
                     let started = std::time::Instant::now();
-                    match daemon_client::spawn_background_daemon(&repo_root, &exe) {
+                    match daemon_client::spawn_background_daemon(&repo_root, &exe, false) {
                         daemon_client::SpawnOutcome::Failed => match daemon_start_error(&repo_root)
                         {
                             Some(r) => anyhow::bail!("travsr daemon failed to restart: {r}"),
@@ -815,6 +919,22 @@ async fn run(cli: Cli) -> Result<()> {
                     };
                     let min_level = level.as_deref().map(parse_level).transpose()?;
                     let since = since.as_deref().map(parse_since).transpose()?;
+                    // Asking for a level the file cannot contain must not look
+                    // like "nothing happened". The file layer writes at info, so
+                    // debug and trace lines are absent unless the daemon was
+                    // started for them — a silent empty result here reads as a
+                    // fact about the system when it is a fact about the filter.
+                    let asked_below_info = matches!(
+                        level.as_deref().map(str::to_ascii_lowercase).as_deref(),
+                        Some("debug") | Some("trace")
+                    );
+                    if asked_below_info && !follow {
+                        eprintln!(
+                            "note: the log file is written at info, so debug and trace lines are \
+                             only present if the daemon was started with `travsr daemon start \
+                             --verbose` (or RUST_LOG). Restart it that way to capture them."
+                        );
+                    }
                     daemon_logs(
                         &dir,
                         follow,

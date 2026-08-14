@@ -248,6 +248,7 @@ suite("GraphPanel: diagnostics overlay (#688)", () => {
     );
   });
 
+  
   test("a file no provider has published for is reported as not diagnosed", () => {
     collection.set(fixtureUri("src/sample.ts"), [
       diag(1, vscode.DiagnosticSeverity.Error),

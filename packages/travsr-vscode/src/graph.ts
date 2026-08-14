@@ -29,6 +29,11 @@
  */
 
 import * as vscode from "vscode";
+import {
+  detachSession,
+  reportLspDiagnostics,
+  type FileDiagnostics,
+} from "./daemonIpc";
 import type { McpClient } from "./mcp";
 
 // ── Public types (consumed by commands.ts) ────────────────────────────────
@@ -82,6 +87,14 @@ export interface DiagnosticsOverlay {
    * "not diagnosed" rather than implying "clean".
    */
   unknownCoverage: string[];
+  /**
+   * Files with something wrong, for the daemon's editor plane. Per file rather
+   * than aggregated, because "which files are broken" composes with the graph
+   * and "how many errors" does not.
+   */
+  broken: FileDiagnostics[];
+  /** Distinct files across the rendered nodes. */
+  filesSeen: number;
 }
 
 /** Debounce window for diagnostics recomputation. */
@@ -127,24 +140,32 @@ function resolveWorkspacePath(path: string): vscode.Uri | null {
 
 // ── Diagnostics helpers (#688) ────────────────────────────────────────────
 
-/**
- * Reduce a file's diagnostics to the one badge worth drawing: errors outrank
- * warnings, and the count is of the winning severity only (a file with 2
- * errors and 9 warnings reads "2 errors", not "11 problems"). Returns null
- * when nothing at error/warning level is present, so callers can omit the
- * node entirely rather than post a zero.
- */
-function worstDiagnostic(
-  diags: readonly vscode.Diagnostic[]
-): NodeDiagnostic | null {
+/** Error and warning tallies for one file. Info and Hint are ignored. */
+function tally(diags: readonly vscode.Diagnostic[]): {
+  errors: number;
+  warnings: number;
+} {
   let errors = 0;
   let warnings = 0;
   for (const d of diags) {
     if (d.severity === vscode.DiagnosticSeverity.Error) errors++;
     else if (d.severity === vscode.DiagnosticSeverity.Warning) warnings++;
   }
-  if (errors > 0) return { severity: "error", count: errors };
-  if (warnings > 0) return { severity: "warning", count: warnings };
+  return { errors, warnings };
+}
+
+/**
+ * Reduce a tally to the one badge worth drawing: errors outrank warnings, and
+ * the count is of the winning severity only (a file with 2 errors and 9
+ * warnings reads "2 errors", not "11 problems"). Null when there is nothing at
+ * either level, so callers omit the node rather than post a zero.
+ */
+function worstDiagnostic(t: {
+  errors: number;
+  warnings: number;
+}): NodeDiagnostic | null {
+  if (t.errors > 0) return { severity: "error", count: t.errors };
+  if (t.warnings > 0) return { severity: "warning", count: t.warnings };
   return null;
 }
 
@@ -172,6 +193,7 @@ export function computeDiagnosticsOverlay(
 
   const byNode: Record<string, NodeDiagnostic> = {};
   const unknownCoverage: string[] = [];
+  const broken: FileDiagnostics[] = [];
   const perFile = new Map<string, NodeDiagnostic | null>();
 
   for (const node of nodes) {
@@ -182,14 +204,24 @@ export function computeDiagnosticsOverlay(
         perFile.set(node.path, null);
       } else {
         if (!published.has(uri.fsPath)) unknownCoverage.push(node.path);
-        perFile.set(node.path, worstDiagnostic(vscode.languages.getDiagnostics(uri)));
+        const t = tally(vscode.languages.getDiagnostics(uri));
+        if (t.errors > 0 || t.warnings > 0) {
+          broken.push({ path: node.path, errors: t.errors, warnings: t.warnings });
+        }
+        perFile.set(node.path, worstDiagnostic(t));
       }
     }
     const worst = perFile.get(node.path);
     if (worst) byNode[node.id] = worst;
   }
 
-  return { byNode, scope: "file", unknownCoverage };
+  return {
+    byNode,
+    scope: "file",
+    unknownCoverage,
+    broken,
+    filesSeen: perFile.size,
+  };
 }
 
 /**
@@ -245,6 +277,8 @@ export class GraphPanel {
   private disposables: vscode.Disposable[] = [];
   /** Nodes in the graph as currently rendered — the overlay's input set. */
   private renderedNodes: GraphNode[] = [];
+  /** Last report sent to the daemon, so an unchanged one is not resent. */
+  private lastReportedDiagnostics = "";
   private readonly diagnosticsDebouncer = makeDebouncer(
     () => this.postDiagnosticsOverlay(),
     DIAGNOSTICS_DEBOUNCE_MS
@@ -349,7 +383,7 @@ export class GraphPanel {
     });
 
     this.renderedNodes = data.nodes ?? [];
-    this.postDiagnosticsOverlay();
+    this.postDiagnosticsOverlay(true);
   }
 
   /**
@@ -361,7 +395,7 @@ export class GraphPanel {
     this.panel.title = `Travsr: ${query}`;
     void this.panel.webview.postMessage({ command: "render", data, query });
     this.renderedNodes = data.nodes ?? [];
-    this.postDiagnosticsOverlay();
+    this.postDiagnosticsOverlay(true);
   }
 
   /**
@@ -370,13 +404,34 @@ export class GraphPanel {
    * overlay is addressed to node ids that may no longer exist); the debounce
    * exists for the keystroke-driven path.
    */
-  private postDiagnosticsOverlay(): void {
+  private postDiagnosticsOverlay(force = false): void {
     if (this.renderedNodes.length === 0) return;
     const overlay = computeDiagnosticsOverlay(this.renderedNodes);
     void this.panel.webview.postMessage({
       command: "diagnosticsOverlay",
       ...overlay,
     });
+
+    // #688: mirror the reduction into the daemon log at DEBUG. Fire and
+    // forget — `reportLspDiagnostics` swallows every failure, so a stopped
+    // daemon or an older one costs nothing here.
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) return;
+
+    const report = {
+      files: overlay.broken,
+      seen: overlay.filesSeen,
+      undiagnosed: overlay.unknownCoverage.length,
+    };
+
+    // Renewing an unchanged view is not free of meaning — the lease depends on
+    // it — but a keystroke that changes nothing does not need to say so twice.
+    // `force` marks the render path, which is user-driven and rare, so the
+    // lease is renewed whenever the user actually looks at the graph.
+    const key = JSON.stringify(report);
+    if (!force && key === this.lastReportedDiagnostics) return;
+    this.lastReportedDiagnostics = key;
+    void reportLspDiagnostics(root, report);
   }
 
   private handleMessage(msg: WebviewMessage): void {
@@ -513,6 +568,10 @@ export class GraphPanel {
   dispose(): void {
     GraphPanel.current = undefined;
     this.diagnosticsDebouncer.dispose();
+    // Withdraw this window's view rather than leave it asserting what it saw
+    // for the rest of the lease.
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root) void detachSession(root);
     this.panel.dispose();
     for (const d of this.disposables) {
       d.dispose();
@@ -632,12 +691,6 @@ export function buildHtmlContent(
   </div>
 </div>
 
-<!-- ── Node search overlay ──────────────────────────────────────────────── -->
-<div id="node-search" style="display:none" role="search" aria-label="Search nodes">
-  <input id="node-search-input" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
-  <ul id="node-search-results" role="listbox"></ul>
-</div>
-
 <!-- ── Breadcrumb nav (P3 repo-map LOD) ─────────────────────────────────── -->
 <nav id="breadcrumb" aria-label="Graph navigation level">
   <!-- Populated by graph.js renderBreadcrumb() -->
@@ -645,6 +698,9 @@ export function buildHtmlContent(
 
 <!-- ── Disambiguation bar (multiple implementations of same symbol) ─────── -->
 <div id="disambig-bar" role="navigation" aria-label="Implementation selector"></div>
+<!-- Hover popup for truncated implementation chips. Outside the bar because
+     the chip row clips on both axes once it scrolls. -->
+<div id="db-tip" role="tooltip" aria-hidden="true"></div>
 
 <!-- ── Blast bar ────────────────────────────────────────────────────────── -->
 <div id="blastbar" style="display:none" role="status" aria-live="polite">
@@ -663,6 +719,14 @@ export function buildHtmlContent(
   </div>
   <canvas id="bgfx" aria-hidden="true"></canvas>
   <div id="cy" role="application" aria-label="Code dependency graph"></div>
+
+  <!-- Node search overlay. Inside #main so it is positioned against the canvas
+       rather than the window: the toolbar above wraps to two rows on a narrow
+       panel, and a window-anchored overlay landed on top of it. -->
+  <div id="node-search" style="display:none" role="search" aria-label="Search nodes">
+    <input id="node-search-input" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
+    <ul id="node-search-results" role="listbox"></ul>
+  </div>
 
   <!-- Tile-map for repo-map LOD overview (P3) — hidden until mode='overview' -->
   <div id="tilemap" role="grid" aria-label="Repository package overview">

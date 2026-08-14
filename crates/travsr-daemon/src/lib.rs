@@ -7023,6 +7023,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
+            &std::sync::Mutex::new(std::collections::HashMap::new()),
         );
         assert!(resp.ok, "control message must succeed: {resp:?}");
 
@@ -7485,6 +7486,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
+            &std::sync::Mutex::new(std::collections::HashMap::new()),
         );
         assert!(
             !resp.ok,
@@ -7544,6 +7546,7 @@ mod tests {
             &cache,
             &phase_b_scheduler,
             &index_tx,
+            &std::sync::Mutex::new(std::collections::HashMap::new()),
         );
         assert!(resp.ok, "control message must succeed: {resp:?}");
 
@@ -7991,6 +7994,12 @@ impl Daemon {
         // store. Keyed on (tool, args, last_commit, phase_b_commit), so commits
         // and background Phase B refreshes invalidate it structurally.
         let query_cache = Arc::new(Mutex::new(query_cache::QueryCache::new(256)));
+        // #688: last diagnostics overlay reported by the editor. Daemon
+        // lifetime only, so `travsr daemon lsp` after a restart correctly
+        // reports that nothing has been received yet.
+        let lsp_sessions = Arc::new(Mutex::new(
+            std::collections::HashMap::<String, EditorSession>::new(),
+        ));
 
         // #318 O3: debounced, single-flight background Phase B refresh. A commit
         // arms it; the event loop's phase_b_tick claims a run once the debounce
@@ -8154,6 +8163,7 @@ impl Daemon {
             let sd_win = Arc::clone(&pipe_shutdown);
             let cache_win = Arc::clone(&query_cache);
             let sched_win = Arc::clone(&phase_b_scheduler);
+            let lsp_sessions_win = Arc::clone(&lsp_sessions);
             let index_tx_win = index_tx.clone();
             let pipe_name_accept = pipe_name.clone();
             tokio::spawn(async move {
@@ -8183,6 +8193,7 @@ impl Daemon {
                     let sd = Arc::clone(&sd_win);
                     let cache = Arc::clone(&cache_win);
                     let sched = Arc::clone(&sched_win);
+                    let lsp_sessions_conn = Arc::clone(&lsp_sessions_win);
                     let index_tx_conn = index_tx_win.clone();
                     tokio::spawn(async move {
                         let (reader, mut writer) = tokio::io::split(server);
@@ -8198,6 +8209,7 @@ impl Daemon {
                                         &cache,
                                         &sched,
                                         &index_tx_conn,
+                                        &lsp_sessions_conn,
                                     )
                                 })
                                 .await
@@ -8258,6 +8270,7 @@ impl Daemon {
                         let sd_notify = Arc::clone(&sock_shutdown);
                         let cache = Arc::clone(&query_cache);
                         let sched = Arc::clone(&phase_b_scheduler);
+                        let lsp_sessions_conn = Arc::clone(&lsp_sessions);
                         let index_tx_conn = index_tx.clone();
                         tokio::spawn(async move {
                             let (reader, mut writer) = conn.into_split();
@@ -8276,6 +8289,7 @@ impl Daemon {
                                             &cache,
                                             &sched,
                                             &index_tx_conn,
+                                            &lsp_sessions_conn,
                                         )
                                     })
                                     .await
@@ -8600,12 +8614,60 @@ fn normalize_nl_query_args(tool: &str, mut args: serde_json::Value) -> serde_jso
     args
 }
 
+/// #688: what one editor window currently sees as broken.
+///
+/// Held only in memory and only while its lease is alive. Nothing here is ever
+/// written to the graph: the graph must stay reproducible from the repository,
+/// and this depends on which extensions a developer installed and on unsaved
+/// buffers. Two planes, each true about its own thing.
+#[derive(Debug, Clone)]
+pub struct EditorSession {
+    /// Repo-relative path → (errors, warnings). Only broken files are present.
+    pub files: std::collections::HashMap<String, (usize, usize)>,
+    /// Files the editor examined for this report.
+    pub seen: usize,
+    /// Of `seen`, how many no provider reported on, so are unknown not clean.
+    pub undiagnosed: usize,
+    /// When this report stops being believable.
+    pub expires_at: std::time::SystemTime,
+    pub updated_at: std::time::SystemTime,
+}
+
+/// Editors tracked at once. An editor is a person's open window, so the real
+/// number is one or two; the cap exists because this plane is fed from outside
+/// the daemon and unbounded external input is how a daemon dies.
+const MAX_EDITOR_SESSIONS: usize = 8;
+/// Broken files retained per session. Past this the answer is "the build is
+/// broken", which no longer needs a file list.
+const MAX_FILES_PER_SESSION: usize = 500;
+/// Ceiling on a caller-supplied lease, so a bad or hostile client cannot pin a
+/// stale view in memory for a week.
+const MAX_LEASE_SECS: u64 = 3600;
+
+/// Live sessions, expired ones dropped.
+///
+/// Expiry is evaluated on read rather than on a timer: there is no work to do
+/// when a lease ends, only a fact to stop asserting, and a reader is the only
+/// one who can be misled by it.
+fn live_editor_sessions(
+    sessions: &std::collections::HashMap<String, EditorSession>,
+) -> Vec<(&String, &EditorSession)> {
+    let now = std::time::SystemTime::now();
+    let mut live: Vec<_> = sessions
+        .iter()
+        .filter(|(_, s)| s.expires_at > now)
+        .collect();
+    live.sort_by_key(|(_, s)| std::cmp::Reverse(s.updated_at));
+    live
+}
+
 /// Returns `(response, should_shutdown)`.
 ///
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
 /// accept loop. Gated to the two supported control-plane platforms so the
 /// compiler does not emit dead_code on exotic targets.
 #[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
 fn handle_control_message(
     line: &str,
     repo_root: &std::path::Path,
@@ -8614,6 +8676,7 @@ fn handle_control_message(
     cache: &std::sync::Mutex<query_cache::QueryCache>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
     index_tx: &std::sync::mpsc::Sender<watcher::WatchEvent>,
+    lsp_sessions: &std::sync::Mutex<std::collections::HashMap<String, EditorSession>>,
 ) -> (travsr_ipc::ControlResponse, bool) {
     use travsr_ipc::{ControlMessage, ControlResponse};
 
@@ -8690,6 +8753,120 @@ fn handle_control_message(
             drop(s);
             enqueue_dirty_callers(dirty, repo_root, index_tx);
             (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::ReportLspDiagnostics {
+            session,
+            ttl_secs,
+            files,
+            seen,
+            undiagnosed,
+        }) => {
+            let mut sessions = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::SystemTime::now();
+
+            // ttl 0 is an explicit detach: the window is closing and says so,
+            // rather than leaving its view to rot until the lease runs out.
+            if ttl_secs == 0 {
+                if sessions.remove(&session).is_some() {
+                    tracing::info!(
+                        event = "editor.detached",
+                        session = %session,
+                        "editor detached"
+                    );
+                }
+                return (ControlResponse::ok(None), false);
+            }
+
+            // Attach and detach are lifecycle facts and belong in the log. The
+            // reports in between are a value that changes, which is what the
+            // plane is for; logging each one would bury the daemon's own story
+            // under an editor's typing.
+            let known = sessions.contains_key(&session);
+            if !known {
+                if sessions.len() >= MAX_EDITOR_SESSIONS {
+                    // Drop the least recently updated rather than reject the
+                    // newcomer: the stalest view is the least likely to be true.
+                    if let Some(oldest) = sessions
+                        .iter()
+                        .min_by_key(|(_, s)| s.updated_at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        sessions.remove(&oldest);
+                        tracing::info!(
+                            event = "editor.detached",
+                            session = %oldest,
+                            reason = "evicted",
+                            "editor evicted, session cap reached"
+                        );
+                    }
+                }
+                tracing::info!(
+                    event = "editor.attached",
+                    session = %session,
+                    "editor attached"
+                );
+            }
+
+            let mut map = std::collections::HashMap::new();
+            for f in files.into_iter().take(MAX_FILES_PER_SESSION) {
+                map.insert(f.path, (f.errors, f.warnings));
+            }
+            let lease = std::time::Duration::from_secs(ttl_secs.min(MAX_LEASE_SECS));
+            sessions.insert(
+                session,
+                EditorSession {
+                    files: map,
+                    seen,
+                    undiagnosed,
+                    expires_at: now + lease,
+                    updated_at: now,
+                },
+            );
+            (ControlResponse::ok(None), false)
+        }
+        Ok(ControlMessage::LspStatus) => {
+            let mut sessions = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            // Reading is the only moment an expired lease can mislead anyone,
+            // so it is also where they are cleared.
+            let now = std::time::SystemTime::now();
+            sessions.retain(|_, s| s.expires_at > now);
+
+            let live = live_editor_sessions(&sessions);
+            let payload = serde_json::json!({
+                "editors": live.len(),
+                "sessions": live
+                    .iter()
+                    .map(|(id, s)| {
+                        let mut broken: Vec<_> = s
+                            .files
+                            .iter()
+                            .map(|(path, (errors, warnings))| {
+                                serde_json::json!({
+                                    "path": path,
+                                    "errors": errors,
+                                    "warnings": warnings,
+                                })
+                            })
+                            .collect();
+                        // Stable order so repeated calls do not shuffle, since
+                        // a HashMap iterates differently every time.
+                        broken.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+                        serde_json::json!({
+                            "session": id,
+                            "seen": s.seen,
+                            "undiagnosed": s.undiagnosed,
+                            "age_secs": s.updated_at.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+                            "expires_in_secs": s
+                                .expires_at
+                                .duration_since(now)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                            "broken": broken,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            (ControlResponse::query_result(payload), false)
         }
         Ok(ControlMessage::Status) => {
             let s = read_store.lock().unwrap_or_else(|e| e.into_inner());

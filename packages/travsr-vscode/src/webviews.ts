@@ -131,6 +131,9 @@ export function webviewShell(title: string, body: string, script: string): strin
   .activity tr[data-fam="index"]  .fam-dot { background: var(--orange); }
   .activity tr[data-fam="search"] .fam-dot { background: var(--gold); }
   .activity tr[data-fam="query"]  .fam-dot { background: #7dd3fc; }
+  /* Not a subsystem: this one came from the editor, not from the daemon
+     doing work, so it gets a hue that belongs to none of them. */
+  .activity tr[data-fam="editor"] .fam-dot { background: #f0abfc; }
   /* How many times in a row, as a pill rather than loose text. */
   .run { font-size: 10px; font-variant-numeric: tabular-nums; color: var(--fg-muted);
     border: 1px solid var(--border); border-radius: 8px; padding: 0 5px; margin-left: 5px; }
@@ -583,7 +586,7 @@ const EVENT_LABELS: Record<string, string> = {
   "daemon.session.stop": "Daemon stopped",
   "head.drift.detected": "HEAD moved, reconciling",
   "head.reconcile.complete": "Reindexed after HEAD moved",
-  "head.reconcile.pruned": "Pruned deleted files",
+  "tree.reconcile.pruned": "Pruned deleted files",
   "phase_b.start": "Semantic indexing started",
   "phase_b.indexed": "Semantic indexing complete",
   "phase_b.complete": "Semantic refresh complete",
@@ -594,6 +597,8 @@ const EVENT_LABELS: Record<string, string> = {
   "lsif.spawn": "Analyzer started",
   "lsif.complete": "Analyzer finished",
   "query.failed": "Query failed",
+  "editor.attached": "Editor attached",
+  "editor.detached": "Editor detached",
 };
 
 
@@ -615,7 +620,7 @@ const EVENT_FAMILY: Record<string, string> = {
   "daemon.session.stop": "daemon",
   "head.drift.detected": "git",
   "head.reconcile.complete": "git",
-  "head.reconcile.pruned": "git",
+  "tree.reconcile.pruned": "git",
   "phase_b.start": "index",
   "phase_b.indexed": "index",
   "phase_b.complete": "index",
@@ -626,6 +631,8 @@ const EVENT_FAMILY: Record<string, string> = {
   "embed.text.fts_backfill": "search",
   "store.fts_words.backfill": "search",
   "query.failed": "query",
+  "editor.attached": "editor",
+  "editor.detached": "editor",
 };
 
 /** Stats for the dashboard card. Fields are pre-formatted strings. */
