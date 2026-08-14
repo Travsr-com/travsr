@@ -838,11 +838,110 @@ struct ParsedLine {
     fields: Vec<(String, String)>,
 }
 
-/// Parse `raw` into structured fields, or `None` when it does not match the
+/// Parse `raw` into structured fields, or `None` when it does not match any
 /// expected shape (fallback to a raw entry, see [`build_log_entry`]).
 /// Deliberately all-or-nothing: prefer under-parsing over misclassifying a
 /// line that merely resembles the format (#636 plan risk 5).
+///
+/// Tries JSON first, then the human-readable `tracing` text layout. Both are
+/// supported on purpose (#636 round-4 review). This daemon writes the text
+/// layout today: the file layer is
+/// `tracing_subscriber::fmt::layer().with_writer(non_blocking).with_ansi(false)`
+/// with no `.json()`, verified on `origin/master`, and the text parser reads
+/// 22 of 23 lines of a real `.travsr/daemon.log.*` off this machine. But the
+/// layer is one builder call away from emitting JSON, and if that ever lands
+/// this tool would silently degrade to raw-fallback entries for every line
+/// (no severity filtering, no target, truncated messages) rather than fail
+/// loudly. Accepting both makes the tool robust across that change instead of
+/// coupled to a formatting decision it does not own.
 fn parse_log_line(raw: &str) -> Option<ParsedLine> {
+    if let Some(parsed) = parse_json_log_line(raw) {
+        return Some(parsed);
+    }
+    parse_text_log_line(raw)
+}
+
+/// Parse a `tracing_subscriber::fmt::layer().json()` line.
+///
+/// Shape: `{"timestamp":..,"level":..,"target":..,"fields":{"message":..,..}}`.
+/// Returns `None` for anything that is not a JSON object carrying a `level`,
+/// so a non-JSON line falls through to the text parser untouched.
+///
+/// `message` is lifted out of `fields` (that is where the JSON layer puts it)
+/// and the remaining fields are flattened to strings. String values are
+/// unquoted rather than re-serialized, so a redacted value reads the same as
+/// it does from the text layout; non-string values keep their JSON form.
+fn parse_json_log_line(raw: &str) -> Option<ParsedLine> {
+    let line = raw.trim();
+    // Cheap reject before paying for a parse: every JSON log line is an object.
+    if !line.starts_with('{') {
+        return None;
+    }
+    let serde_json::Value::Object(obj) = serde_json::from_str::<serde_json::Value>(line).ok()?
+    else {
+        return None;
+    };
+
+    // `level` is the one field that makes this a log line rather than any
+    // other JSON object that happens to be in the file.
+    let level = obj.get("level")?.as_str()?.trim().to_ascii_uppercase();
+    if !KNOWN_LEVELS.contains(&level.as_str()) {
+        return None;
+    }
+
+    let ts = obj
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let target = obj
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Render a JSON value as a field string: strings unquoted, everything
+    // else in its compact JSON form.
+    fn flatten(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    let mut message = String::new();
+    let mut fields: Vec<(String, String)> = Vec::new();
+    if let Some(serde_json::Value::Object(inner)) = obj.get("fields") {
+        for (k, v) in inner {
+            if k == "message" {
+                message = flatten(v);
+            } else {
+                fields.push((k.clone(), flatten(v)));
+            }
+        }
+    }
+    // Carry any other top-level keys (`span`, `spans`, ...) as fields too, so
+    // nothing the daemon logged is silently dropped from the payload.
+    for (k, v) in &obj {
+        if matches!(k.as_str(), "timestamp" | "level" | "target" | "fields") {
+            continue;
+        }
+        fields.push((k.clone(), flatten(v)));
+    }
+
+    Some(ParsedLine {
+        ts,
+        level,
+        target,
+        message,
+        fields,
+    })
+}
+
+/// Parse the human-readable `tracing` text layout:
+/// `TS LEVEL target: message key=value ...`. This is what the daemon writes
+/// today; see [`parse_log_line`].
+fn parse_text_log_line(raw: &str) -> Option<ParsedLine> {
     let line = raw.trim_end();
     let mut top = line.splitn(2, char::is_whitespace);
     let ts = top.next()?.trim();
@@ -2051,6 +2150,98 @@ mod tests {
     }
 
     // ── get_daemon_logs parsing / caps ────────────────────────────────────
+
+    /// A real line off this machine's `.travsr/daemon.log.2026-08-12`, which
+    /// the daemon wrote with the text layer it uses today. Pins that the
+    /// format actually on disk keeps parsing, so the JSON support added for
+    /// #636 round-4 cannot regress it.
+    #[test]
+    fn parse_log_line_reads_a_verbatim_real_daemon_log_line() {
+        let line = "2026-08-12T05:25:14.426185Z  WARN travsr_plugin_host::indexer: \
+                    Phase B sidecar spawn go: parse error in plugin:go: \
+                    failed to fill whole buffer";
+        let parsed = parse_log_line(line).expect("the real on-disk format must parse");
+        assert_eq!(parsed.level, "WARN");
+        assert_eq!(parsed.target, "travsr_plugin_host::indexer");
+        assert!(parsed.message.starts_with("Phase B sidecar spawn go"));
+    }
+
+    /// #636 round-4 review: accept `fmt::layer().json()` output too. The
+    /// daemon does not emit this today (its file layer has no `.json()`), but
+    /// it is one builder call away, and degrading to raw-fallback entries
+    /// there would silently disable severity filtering for every line.
+    #[test]
+    fn parse_log_line_reads_the_json_layer_format() {
+        let line = r#"{"timestamp":"2026-08-13T10:25:01.945078Z","level":"INFO","fields":{"message":"daemon starting","event":"daemon.session.start","pid":11262},"target":"travsr_daemon"}"#;
+        let parsed = parse_log_line(line).expect("json layout must parse");
+        assert_eq!(parsed.ts, "2026-08-13T10:25:01.945078Z");
+        assert_eq!(parsed.level, "INFO");
+        assert_eq!(parsed.target, "travsr_daemon");
+        assert_eq!(parsed.message, "daemon starting");
+        let f: HashMap<_, _> = parsed.fields.into_iter().collect();
+        assert_eq!(f.get("event").unwrap(), "daemon.session.start");
+        // Non-string values keep their JSON form rather than being dropped.
+        assert_eq!(f.get("pid").unwrap(), "11262");
+    }
+
+    /// The severity filter must work on JSON lines, which is what the
+    /// raw-fallback path silently defeated: `Some("raw") => true` bypasses
+    /// the filter, so an `error`-only request would have returned INFO too.
+    #[test]
+    fn json_lines_are_severity_filtered_not_treated_as_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let travsr_dir = tmp.path().join(".travsr");
+        std::fs::create_dir_all(&travsr_dir).unwrap();
+        std::fs::write(
+            travsr_dir.join("daemon.log.2026-01-01"),
+            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"level\":\"ERROR\",\"fields\":{\"message\":\"boom\"},\"target\":\"m\"}\n\
+             {\"timestamp\":\"2026-01-01T00:00:01Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"chatter\"},\"target\":\"m\"}\n",
+        )
+        .unwrap();
+
+        let payload = daemon_logs_payload("repo", Some(tmp.path()), 10, "error");
+        let entries = payload["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "INFO must be filtered out: {payload}");
+        assert_eq!(entries[0]["level"], "ERROR", "got: {payload}");
+        assert_eq!(entries[0]["message"], "boom", "got: {payload}");
+    }
+
+    /// #636 round-4 review finding 2: a secret in a JSON field arrives as
+    /// `"token":"..."`, with a colon rather than the `=` the text-shaped
+    /// redactor scans for. Redaction must still fire, via the decoded key.
+    #[test]
+    fn json_field_secret_is_redacted_by_its_decoded_key() {
+        let line = r#"{"timestamp":"2026-01-01T00:00:00Z","level":"ERROR","fields":{"message":"auth failed","token":"ghp_ABCDEFGHIJ0123456789","repo":"/home/alice/proj"},"target":"m"}"#;
+        let entry = build_log_entry(line);
+        assert_eq!(entry["fields"]["token"], "[redacted]", "got: {entry}");
+        assert!(
+            !entry.to_string().contains("ghp_ABCDEFGHIJ0123456789"),
+            "secret leaked: {entry}"
+        );
+        // Home paths in JSON fields are still redacted by the value pass.
+        assert!(
+            !entry.to_string().contains("/home/alice"),
+            "home path leaked: {entry}"
+        );
+    }
+
+    /// Non-log JSON, and JSON without a recognised level, must not be
+    /// mistaken for a log line: they fall through to the raw entry rather
+    /// than being reported with a fabricated level.
+    #[test]
+    fn json_without_a_known_level_falls_through_to_raw() {
+        for line in [
+            r#"{"hello":"world"}"#,
+            r#"{"level":"NOTALEVEL","fields":{"message":"x"}}"#,
+            "[1,2,3]",
+        ] {
+            assert!(
+                parse_log_line(line).is_none(),
+                "must not parse as a log line: {line}"
+            );
+            assert_eq!(build_log_entry(line)["level"], "raw", "line: {line}");
+        }
+    }
 
     #[test]
     fn parse_log_line_extracts_ts_level_target_message_fields_with_quoted_value() {
