@@ -263,8 +263,39 @@ pub fn set_launch_cwd(dir: PathBuf) {
 /// a note naming both, or `None` when they agree or either is unknown — never
 /// fabricate a mismatch for a git-less caller. Pure so both the MCP and CLI
 /// surfaces classify identically and it is trivially unit-testable.
+/// Whether two abbreviated git SHAs denote **different** commits.
+///
+/// `git rev-parse --short` is not a fixed width: it honours `core.abbrev`, and
+/// under the default `auto` the length grows with the repository's object
+/// count. So the same commit can be stamped `a1b2c3d` in `last_commit` by one
+/// process and read back as `a1b2c3d4` by another, whenever the repo has grown
+/// since, a global `core.abbrev` is set, or (in global mode) the MCP server
+/// runs under a different `HOME`, and therefore a different gitconfig, than
+/// the daemon did. A plain `!=` then reports drift on an identical commit
+/// (#636 round-4 review).
+///
+/// Compares on the shorter of the two as a prefix, which is exactly how git
+/// itself treats an abbreviation: two abbreviations denote the same commit
+/// when one is a prefix of the other. Case-insensitive, since git accepts
+/// either case in a rev. Returns `None` when either side is empty (unknown),
+/// so callers can keep "unknown" distinct from "differs" rather than
+/// collapsing it to a verdict.
+pub(crate) fn short_shas_differ(a: &str, b: &str) -> Option<bool> {
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    // `starts_with` on the shared prefix length, ASCII-case-insensitively.
+    let differs = !long
+        .as_bytes()
+        .iter()
+        .zip(short.as_bytes())
+        .all(|(l, s)| l.eq_ignore_ascii_case(s));
+    Some(differs)
+}
+
 pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
-    if head.is_empty() || stored.is_empty() || head == stored {
+    if head.is_empty() || stored.is_empty() || short_shas_differ(head, stored) == Some(false) {
         return None;
     }
     Some(format!(
@@ -10540,6 +10571,36 @@ mod snippet_tests {
         assert!(head_index_mismatch_note("abc123", "abc123").is_none());
         assert!(head_index_mismatch_note("", "abc123").is_none());
         assert!(head_index_mismatch_note("abc123", "").is_none());
+    }
+
+    /// #636 round-4 review: `git rev-parse --short` is variable width
+    /// (`core.abbrev`, and `auto` grows with the object count), so the same
+    /// commit can be stamped at one length and read back at another. Comparing
+    /// those as plain strings reported drift on an identical commit.
+    #[test]
+    fn short_shas_of_differing_width_for_the_same_commit_do_not_differ() {
+        // Verified against a real repo: `git rev-parse --short=7` and
+        // `--short=12` on one commit give `f97492f` and `f97492f91ce4`.
+        assert_eq!(short_shas_differ("f97492f", "f97492f91ce4"), Some(false));
+        assert_eq!(short_shas_differ("f97492f91ce4", "f97492f"), Some(false));
+        // Case-insensitive, since git accepts either case in a rev.
+        assert_eq!(short_shas_differ("F97492F", "f97492f91ce4"), Some(false));
+        // And the note built on it stays silent for that pair.
+        assert!(head_index_mismatch_note("f97492f91ce4", "f97492f").is_none());
+    }
+
+    #[test]
+    fn short_shas_that_genuinely_differ_are_still_reported() {
+        assert_eq!(short_shas_differ("aaa1111", "bbb2222"), Some(true));
+        // Divergence beyond the shared prefix length still counts.
+        assert_eq!(short_shas_differ("f97492f", "f97492e91ce4"), Some(true));
+        assert!(head_index_mismatch_note("bbb2222", "aaa1111").is_some());
+    }
+
+    #[test]
+    fn short_shas_differ_is_none_when_either_side_is_unknown() {
+        assert_eq!(short_shas_differ("", "abc123"), None);
+        assert_eq!(short_shas_differ("abc123", ""), None);
     }
 
     #[test]

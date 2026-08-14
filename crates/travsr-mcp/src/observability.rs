@@ -548,8 +548,17 @@ fn index_status_payload(
     // checkout moved backwards past it so `indexed..HEAD` counts zero even
     // though the two commits differ), fall back to a direct commit-identity
     // comparison instead of fabricating a verdict.
+    //
+    // Compared with `short_shas_differ`, not `!=`: `git rev-parse --short` is
+    // variable width (`core.abbrev`, and `auto` grows with the object count),
+    // so the same commit can be stamped 7 chars in `last_commit` and read
+    // back as 8+ by `git_short_head`. A byte comparison then reported drift on
+    // an identical commit, and because this feeds the `Some(0)` arm below it
+    // produced the self-contradictory `behind_by: 0, is_stale: true` on a
+    // perfectly fresh index, a permanent false alarm rather than a transient
+    // one (#636 round-4 review).
     let commits_known_and_differ = match (last_commit.as_deref(), head_commit.as_deref()) {
-        (Some(a), Some(b)) => Some(a != b),
+        (Some(a), Some(b)) => crate::tools::short_shas_differ(a, b),
         _ => None,
     };
     let is_stale: Option<bool> = match behind_by {
@@ -1975,6 +1984,40 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let payload = index_status_payload(&store, "repo", None);
         assert_eq!(payload["staleness"]["is_stale"], serde_json::Value::Null);
+    }
+
+    /// #636 round-4 review: the payload must never contradict itself by
+    /// reporting `behind_by: 0` alongside `is_stale: true`. That happened
+    /// whenever `last_commit` was stamped at a different `git rev-parse
+    /// --short` width than `git_short_head` returns for the very same commit,
+    /// which `core.abbrev` (or `auto` as the repo grows, or a different
+    /// `HOME`/gitconfig in global mode) makes routine. It was a permanent
+    /// false alarm, not a transient one, since nothing reconciles the widths.
+    #[test]
+    fn index_status_not_stale_when_indexed_sha_is_a_shorter_abbrev_of_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+
+        // Same commit, deliberately stamped shorter than `git_short_head`
+        // will return, which is exactly the real-world drift.
+        let full = {
+            let out = std::process::Command::new("git")
+                .args(["-C", &tmp.path().to_string_lossy(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let short6 = &full[..6];
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", short6).unwrap();
+
+        let payload = index_status_payload(&store, "repo", Some(tmp.path()));
+        assert_eq!(payload["staleness"]["behind_by"], 0, "got: {payload}");
+        assert_eq!(
+            payload["staleness"]["is_stale"], false,
+            "behind_by 0 on the same commit must not report stale: {payload}"
+        );
     }
 
     /// #636 review: `calibrated` must reflect this repo's embedding
