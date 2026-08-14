@@ -72,3 +72,8 @@ otlp = [
 assert_cmd = { workspace = true }
 tempfile = { workspace = true }
 rusqlite = { workspace = true }
+
+# tests/daemon_pipe.rs builds the #572 grandparent-handle repro (CreatePipe +
+# SetHandleInformation) to prove the daemon spawn's inherit allowlist holds.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true }

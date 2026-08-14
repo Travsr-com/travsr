@@ -22,6 +22,11 @@ pub struct PhaseBOutcome {
     /// `travsr lang add <lang>`.
     pub skipped_no_analyzer: Vec<String>,
     pub skipped_unregistered: Vec<String>,
+    /// Non-builtin languages that are registered but whose corpus has no
+    /// per-corpus trust grant in lang.toml (ADR-017 Rule 3 — #414). Their
+    /// external tooling is never spawned. User-actionable:
+    /// `travsr lang add <lang> --corpus <corpus>`.
+    pub skipped_untrusted_corpus: Vec<String>,
     /// Languages that require a `compile_commands.json` at the repo root
     /// (scip-clang, for `c`/`cpp`) but don't have one. Without this gate the
     /// scip-clang invoke hangs with no compilation database until the 300s
@@ -241,11 +246,22 @@ impl PluginIndexer {
     ) {
         let repo_root = inputs.repo_root;
 
+        // One lang.toml read serves both gates below (#685 review): the
+        // registration gate and the trust gate used to read and parse the same
+        // file back-to-back.
+        let lang_toml = crate::trust::LangToml::from_disk();
+
         // Gate Phase B per language against lang.toml registration.
         // `travsr lang remove <lang>` writes registered=[] which must be respected here.
-        let registered: HashSet<String> = crate::trust::registered_languages_from_disk()
-            .into_iter()
-            .collect();
+        let registered: HashSet<String> = lang_toml.registered.iter().cloned().collect();
+
+        // ADR-017 Rule 3 (#414): external Phase B tooling executes repo-related
+        // code (go, scip sidecars, …), so it is spawned only for corpora with an
+        // explicit trust grant in lang.toml. Loaded once per invocation, checked
+        // per non-builtin language below. Builtins are exempt: they ship inside
+        // the travsr binary and are governed by Rule 4's first-party rules.
+        let trust = lang_toml.trust_config();
+        let corpus_trusted = trust.is_trusted(&self.corpus);
 
         let current_exe = std::env::current_exe()
             .unwrap_or_default()
@@ -261,6 +277,21 @@ impl PluginIndexer {
         // H5: collect needs_approval before boxing so we can surface it in outcome.
         let catalog = crate::resolver::CatalogResolver::new();
         let needs_approval_langs: Vec<String> = catalog.needs_approval().to_vec();
+        // #573: providers installed only as npm shims are dropped inside the
+        // resolver (the AppContainer spawn runs PE images only), which used to
+        // leave the language in NO outcome bucket — invisible in `travsr init`
+        // and `status`. Surface repo-present ones as skipped_no_analyzer: the
+        // native binary IS missing, and the bucket's `travsr lang install
+        // <lang>` hint is the fix.
+        let shim_only_langs: Vec<String> = catalog
+            .unresolvable_shims()
+            .iter()
+            .filter(|lang| {
+                inputs.present_languages.is_empty()
+                    || inputs.present_languages.contains(lang.as_str())
+            })
+            .cloned()
+            .collect();
 
         let resolver = crate::resolver::CompositeResolver::new(vec![
             Box::new(crate::resolver::BuiltinResolver::new(
@@ -272,6 +303,7 @@ impl PluginIndexer {
 
         let mut outcome = PhaseBOutcome {
             skipped_needs_approval: needs_approval_langs,
+            skipped_no_analyzer: shim_only_langs,
             ..Default::default()
         };
 
@@ -353,6 +385,22 @@ impl PluginIndexer {
             if !is_builtin && !registered.contains(lang.as_str()) {
                 tracing::debug!(lang = %lang, "semantic analysis skipped, no tool registered for this language");
                 outcome.skipped_unregistered.push(lang.clone());
+                continue;
+            }
+
+            // ADR-017 Rule 3 (#414): a registered external language still needs
+            // a per-corpus trust grant before its tooling runs against this
+            // repo. Without this gate, registering a language once would execute
+            // its build tooling (network-capable under Standard policy) on every
+            // repo the user ever opens, including hostile ones.
+            if !is_builtin && !corpus_trusted {
+                tracing::warn!(
+                    lang = %lang,
+                    corpus = %self.corpus,
+                    "Phase B skipped — corpus not trusted (run `travsr lang add {lang} --corpus {}`)",
+                    self.corpus
+                );
+                outcome.skipped_untrusted_corpus.push(lang.clone());
                 continue;
             }
 

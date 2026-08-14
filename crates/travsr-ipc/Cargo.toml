@@ -16,3 +16,8 @@ blake3    = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# #407 T2: the Windows loopback test needs a named-pipe *server*, which std
+# cannot create; tokio's ServerOptions is what the real daemon uses.
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { workspace = true }

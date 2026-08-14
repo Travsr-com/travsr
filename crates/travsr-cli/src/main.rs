@@ -624,7 +624,7 @@ async fn run(cli: Cli) -> Result<()> {
 
                     // M2/L1: if the daemon is not running, tell the user clearly
                     // and exit 0 — it's not an error to stop something already stopped.
-                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown) {
+                    match send_shutdown_waiting_for_startup(&repo_root) {
                         Ok(_) => match pid_before {
                             Some(pid) if !wait_for_exit(pid, STOP_EXIT_TIMEOUT) => {
                                 anyhow::bail!(
@@ -649,13 +649,7 @@ async fn run(cli: Cli) -> Result<()> {
                             Some(_) => eprintln!("travsr daemon stopped"),
                         },
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("No such file")
-                                || msg.contains("Connection refused")
-                                || msg.contains("os error 2")
-                                || msg.contains("os error 111")
-                                || msg.contains("os error 61")
-                            {
+                            if transport_absent(&e) {
                                 eprintln!("travsr daemon is not running");
                             } else if let Some(pid) = pid_before.filter(|p| pid_is_alive(*p)) {
                                 // #541: the original report. The transport now
@@ -690,21 +684,29 @@ async fn run(cli: Cli) -> Result<()> {
                                 println!("{msg}");
                             }
                         }
+                        // #685 review: a busy pipe or a timed-out exchange means
+                        // something IS listening on the control transport, so the
+                        // daemon is up, not starting and not absent. Only
+                        // transport-absent errors fall through to the repo-lock
+                        // starting/not-running classification below.
+                        Err(e) if transport_busy(&e) => {
+                            println!("daemon: running (control pipe busy, retry shortly)");
+                        }
+                        Err(e) if !transport_absent(&e) => {
+                            println!("daemon: running (not responding: {e:#})");
+                        }
                         Err(_) => {
-                            // Socket not ready yet — check lock file PID.
-                            // On a large repo the watcher initial scan can take
-                            // 10-30 s; the daemon is alive but hasn't bound its
-                            // socket yet.
-                            let lock_path = repo_root.join(".travsr/daemon.lock");
-                            let starting = std::fs::read_to_string(&lock_path)
-                                .ok()
-                                .and_then(|s| s.trim().parse::<u32>().ok())
-                                .map(pid_is_alive)
-                                .unwrap_or(false);
-                            if starting {
-                                println!(
-                                    "daemon: starting (scanning file tree — socket not ready yet)"
-                                );
+                            // Socket not ready yet — the daemon may be alive but
+                            // still starting (store open, embed sidecar model
+                            // load, initial watcher scan; tens of seconds). The
+                            // liveness authority for that window is the repo-lock
+                            // flock, NOT the lock-file PID: on Windows the
+                            // daemon's exclusive flock makes the PID read fail
+                            // with a lock violation for its entire lifetime, so
+                            // the old PID fallback reported "not running" against
+                            // a live, still-starting daemon.
+                            if daemon_client::daemon_lock_held(&repo_root) {
+                                println!("daemon: starting (control socket not ready yet)");
                             } else {
                                 match daemon_start_error(&repo_root) {
                                     Some(r) => {
@@ -717,15 +719,34 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DaemonAction::Restart => {
-                    // Best-effort stop — ignore errors if daemon not running.
-                    let _ = send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown);
-                    // Wait for the old daemon to actually release its lock (≤2 s)
-                    // instead of a fixed sleep, so the new one never races the old
-                    // one's shutdown and fails to acquire the lock.
-                    for _ in 0..40 {
-                        if !daemon_client::daemon_lock_held(&repo_root) {
-                            break;
+                    // Deliver the stop through the daemon's startup window,
+                    // exactly as `daemon stop` does. The old fire-and-forget
+                    // Shutdown was silently lost while the daemon was between
+                    // taking daemon.lock and binding its control transport;
+                    // the lock wait below then expired, the spawn reported
+                    // AlreadyRunning, and the generic success arm still
+                    // printed "restarted" with exit 0 while the old daemon
+                    // kept running and no new daemon existed.
+                    match send_shutdown_waiting_for_startup(&repo_root) {
+                        Ok(_) => {}
+                        // Not running: restart degrades to a plain start.
+                        Err(e) if transport_absent(&e) => {}
+                        Err(e) => {
+                            return Err(e.context(
+                                "the running daemon could not be stopped, so it was NOT \
+                                 restarted; check `travsr daemon status` and retry",
+                            ));
                         }
+                    }
+                    // Wait for the old daemon to actually release its lock
+                    // instead of a fixed sleep, so the new one never races the
+                    // old one's shutdown and fails to acquire the lock.
+                    // Budgeted like `daemon stop`'s exit wait: a clean
+                    // shutdown can spend seconds flushing the store.
+                    let lock_cutoff = std::time::Instant::now() + STOP_EXIT_TIMEOUT;
+                    while daemon_client::daemon_lock_held(&repo_root)
+                        && std::time::Instant::now() < lock_cutoff
+                    {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     let exe = std::env::current_exe().context("finding current exe")?;
@@ -747,11 +768,22 @@ async fn run(cli: Cli) -> Result<()> {
                     match daemon_client::spawn_background_daemon(&repo_root, &exe) {
                         daemon_client::SpawnOutcome::Failed => match daemon_start_error(&repo_root)
                         {
-                            Some(r) => eprintln!("travsr daemon failed to restart: {r}"),
-                            None => eprintln!(
-                                "travsr daemon failed to restart — see `travsr daemon logs`"
+                            Some(r) => anyhow::bail!("travsr daemon failed to restart: {r}"),
+                            None => anyhow::bail!(
+                                "travsr daemon failed to restart (see `travsr daemon logs`)"
                             ),
                         },
+                        // The stop was accepted, but the old process still
+                        // holds the repo lock past the wait above, so nothing
+                        // was spawned. Surface that instead of claiming
+                        // success (the exact false positive `daemon stop`
+                        // refuses to report).
+                        daemon_client::SpawnOutcome::AlreadyRunning => anyhow::bail!(
+                            "travsr daemon was NOT restarted: the old daemon still holds \
+                             the repo lock {}s after accepting the stop.\n  \
+                             Check `travsr daemon status`, then retry `travsr daemon restart`.",
+                            STOP_EXIT_TIMEOUT.as_secs()
+                        ),
                         _ => relay_daemon_startup(&repo_root, relay, started),
                     }
                 }
@@ -800,13 +832,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 .unwrap_or_else(|| "embed auto-reindex paused".into())
                         ),
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("No such file")
-                                || msg.contains("Connection refused")
-                                || msg.contains("os error 2")
-                                || msg.contains("os error 111")
-                                || msg.contains("os error 61")
-                            {
+                            if transport_absent(&e) {
                                 eprintln!("travsr daemon is not running");
                             } else {
                                 return Err(e);
@@ -823,13 +849,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 .unwrap_or_else(|| "embed auto-reindex resumed".into())
                         ),
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("No such file")
-                                || msg.contains("Connection refused")
-                                || msg.contains("os error 2")
-                                || msg.contains("os error 111")
-                                || msg.contains("os error 61")
-                            {
+                            if transport_absent(&e) {
                                 eprintln!("travsr daemon is not running");
                             } else {
                                 return Err(e);
@@ -1699,6 +1719,101 @@ fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
 /// that has to flush a store, short enough to stay scriptable.
 const STOP_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long `daemon stop` waits for a still-starting daemon (repo lock held,
+/// control transport not bound yet) to become reachable before giving up on
+/// delivering the stop. The pre-bind stretch covers the store open, the embed
+/// sidecar loading its model, and the initial watcher scan — tens of seconds
+/// on big repos or with large embedding models.
+const STOP_DELIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// True when a control-transport error means nothing is listening on the
+/// repo's socket/pipe: the endpoint does not exist ("No such file" /
+/// "os error 2"), or a stale Unix socket has no daemon accepting behind it
+/// ("Connection refused" — os error 111 on Linux, 61 on macOS).
+fn transport_absent(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("No such file")
+        || msg.contains("Connection refused")
+        || msg.contains("os error 2")
+        || msg.contains("os error 111")
+        || msg.contains("os error 61")
+}
+
+/// True when the error means a daemon IS listening but every pipe instance was
+/// serving another client when we tried to connect (Windows `ERROR_PIPE_BUSY`,
+/// surfaced by `NamedPipeTransport::connect` as "daemon is busy (...)").
+///
+/// #685 review: this is the one transport error that is both "the daemon is
+/// definitely up" and "transient by construction" (the daemon re-creates a
+/// pipe instance on every accept-loop iteration), so `status` must not report
+/// it as still-starting and `stop` should retry it rather than give up.
+fn transport_busy(e: &anyhow::Error) -> bool {
+    e.to_string().contains("daemon is busy")
+}
+
+/// Send `Shutdown`, waiting out the daemon's startup window if needed.
+///
+/// Between taking `daemon.lock` and binding its control transport the daemon
+/// spends its longest startup stretch (store open, embed sidecar model load,
+/// initial watcher scan), and a connect in that window fails exactly like "no
+/// daemon at all". Treating it that way silently loses the stop: the CLI
+/// reports "not running", the daemon finishes starting, and it keeps running
+/// (and serving) a repo its owner believes is stopped. While the repo lock is
+/// held by a live daemon, keep retrying until the transport binds, the daemon
+/// exits on its own (lock released — the caller then sees the usual "not
+/// running" transport error), or [`STOP_DELIVER_TIMEOUT`] fires.
+///
+/// A busy control pipe (Windows: every instance serving another client) is
+/// retried under the same deadline (#685 review): the daemon is provably up
+/// and the contention clears as soon as its accept loop creates the next
+/// instance, so it sits in the same "worth another attempt" bucket as the
+/// startup window.
+fn send_shutdown_waiting_for_startup(
+    repo_root: &std::path::Path,
+) -> anyhow::Result<travsr_ipc::ControlResponse> {
+    let cutoff = std::time::Instant::now() + STOP_DELIVER_TIMEOUT;
+    let mut announced = false;
+    loop {
+        let err = match send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Shutdown) {
+            Ok(resp) => return Ok(resp),
+            Err(e) => e,
+        };
+        // #685 review: a busy pipe (Windows, all instances mid-request) is as
+        // transient as the startup window this loop already absorbs, and the
+        // daemon is provably up. Retry it too, instead of failing `daemon
+        // stop` on the first contended connect.
+        let busy = transport_busy(&err);
+        let starting = transport_absent(&err) && daemon_client::daemon_lock_held(repo_root);
+        if !busy && !starting {
+            return Err(err);
+        }
+        if std::time::Instant::now() >= cutoff {
+            if busy {
+                return Err(err.context(format!(
+                    "the daemon's control pipe stayed busy for {}s and the stop \
+                     request was NOT delivered; retry `travsr daemon stop`",
+                    STOP_DELIVER_TIMEOUT.as_secs()
+                )));
+            }
+            anyhow::bail!(
+                "travsr daemon is still starting (repo lock held, control transport not \
+                 bound within {}s) and the stop request was NOT delivered.\n  \
+                 Wait for `travsr daemon status` to report it running, then retry \
+                 `travsr daemon stop`.",
+                STOP_DELIVER_TIMEOUT.as_secs()
+            );
+        }
+        if starting && !announced {
+            eprintln!(
+                "travsr daemon is starting (control transport not bound yet); \
+                 waiting to deliver the stop..."
+            );
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 /// Check whether a process with the given PID is currently alive.
 /// Uses `kill -0` on Unix and `tasklist` on Windows (no signal sent).
 fn pid_is_alive(pid: u32) -> bool {
@@ -1747,10 +1862,10 @@ fn send_daemon_command(
 
 /// Retry pinging the daemon transport up to `attempts` times with `delay_ms` between tries.
 ///
-/// Also checks the lock file PID so that a daemon that is alive but still
-/// doing its initial file-tree scan (socket not bound yet) is not mistaken
-/// for "not running" — which would cause a second daemon to be spawned and
-/// crash immediately with "another daemon already running".
+/// Also checks the repo-lock flock so that a daemon that is alive but still
+/// starting (socket not bound yet) is not mistaken for "not running" — which
+/// would cause a second daemon to be spawned and crash immediately with
+/// "another daemon already running".
 pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, delay_ms: u64) -> bool {
     for i in 0..attempts {
         if i > 0 {
@@ -1760,13 +1875,12 @@ pub(crate) fn daemon_is_running(repo_root: &std::path::Path, attempts: u32, dela
             return true;
         }
     }
-    // Socket not ready — fall back to lock-file PID check.
-    let lock_path = repo_root.join(".travsr/daemon.lock");
-    std::fs::read_to_string(&lock_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .map(pid_is_alive)
-        .unwrap_or(false)
+    // Socket not ready — fall back to the repo-lock flock, the race-free
+    // liveness authority. Not the lock-file PID: on Windows the daemon's
+    // exclusive flock makes that read fail with a lock violation for as long
+    // as the daemon lives, which reported a live-but-still-starting daemon
+    // as absent (the exact case this fallback exists for).
+    daemon_client::daemon_lock_held(repo_root)
 }
 
 #[cfg(test)]
@@ -1838,6 +1952,48 @@ mod tests {
             !wait_for_exit(std::process::id(), std::time::Duration::from_millis(150)),
             "a process that is still running must not be reported as exited"
         );
+    }
+
+    /// `daemon stop`/`status` must treat only "nothing is listening" errors as
+    /// "not running"; anything else (busy pipe, wedged daemon, timeout) has to
+    /// surface, or a live daemon gets reported as absent.
+    #[test]
+    fn transport_absent_classifies_no_listener_errors() {
+        for msg in [
+            // Windows: pipe path does not exist.
+            r"daemon not running (\\.\pipe\travsr-abc): The system cannot \
+              find the file specified. (os error 2)",
+            // Unix: socket file missing / stale socket with no acceptor.
+            "No such file or directory (os error 2)",
+            "Connection refused (os error 111)",
+            "Connection refused (os error 61)",
+        ] {
+            assert!(transport_absent(&anyhow::anyhow!(msg)), "{msg}");
+        }
+        for msg in [
+            "daemon is busy (\\\\.\\pipe\\travsr-abc had no free pipe instance for 2s)",
+            "control response exceeded deadline",
+        ] {
+            assert!(!transport_absent(&anyhow::anyhow!(msg)), "{msg}");
+        }
+    }
+
+    /// #685 review: `status` and `stop` special-case a contended-but-alive
+    /// daemon, so the busy classifier must match exactly the connect error the
+    /// named-pipe transport produces and nothing else.
+    #[test]
+    fn transport_busy_matches_only_the_busy_pipe_error() {
+        assert!(transport_busy(&anyhow::anyhow!(
+            "daemon is busy (\\\\.\\pipe\\travsr-abc had no free pipe instance for 2s); \
+             retry shortly"
+        )));
+        for msg in [
+            "daemon not running (\\\\.\\pipe\\travsr-abc): os error 2",
+            "Connection refused (os error 111)",
+            "timed out after 20s talking to the daemon over the named pipe",
+        ] {
+            assert!(!transport_busy(&anyhow::anyhow!(msg)), "{msg}");
+        }
     }
 
     /// The PID has to be read before the stop request, since a clean shutdown

@@ -624,6 +624,27 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
     Ok(())
 }
 
+/// Fail a model download only when the connection STALLS (no bytes for this
+/// long), never for merely being slow. The old total-request timeout (300 s)
+/// silently imposed a minimum line rate: a 1.3 GB model.onnx needed a
+/// sustained ~4.3 MB/s or the client killed a perfectly healthy transfer at
+/// the 300 s mark, every retry, on every connection slower than that.
+const MODEL_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Size-scaled ceiling on the WHOLE download (#685 review). The stall detector
+/// alone lets a server that trickles one byte every <120 s keep `embed init`
+/// alive forever; this cap bounds that. Scaled from the expected size at a
+/// worst-case sustained 64 KiB/s (a 1.3 GB model gets ~5.7 h) plus a flat
+/// grace, so it only fires on transfers no stall-free connection could
+/// plausibly still be making progress on.
+const MODEL_TOTAL_CAP_FLOOR: std::time::Duration = std::time::Duration::from_secs(600);
+const MODEL_TOTAL_CAP_MIN_RATE: u64 = 64 * 1024; // bytes/s
+
+fn model_total_cap(expected_bytes: u64) -> std::time::Duration {
+    MODEL_TOTAL_CAP_FLOOR
+        + std::time::Duration::from_secs(expected_bytes / MODEL_TOTAL_CAP_MIN_RATE)
+}
+
 async fn download_model_file_with_progress(
     hf_repo: &str,
     url_path: &str,
@@ -632,26 +653,39 @@ async fn download_model_file_with_progress(
     size_hint_mb: u32,
 ) -> Result<()> {
     let url = format!("{HF_BASE}/{hf_repo}/resolve/main/{url_path}");
+    // connect_timeout + per-chunk stall detection below — deliberately NO
+    // total-request timeout, so transfer duration scales with file size and
+    // line speed instead of being capped by a constant.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .user_agent(format!("travsr-cli/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building HTTP client")?;
 
-    let resp = client.get(&url).send().await.context("GET model file")?;
+    let mut resp = client.get(&url).send().await.context("GET model file")?;
     if !resp.status().is_success() {
         bail!("model file download failed ({}): {url}", resp.status());
     }
-    let total_mb = resp
-        .content_length()
+    let content_length = resp.content_length();
+    let total_mb = content_length
         .map(|n| n / 1_048_576)
         .unwrap_or(size_hint_mb as u64);
+    // #685 review: the total cap scales with the expected size, so it never
+    // reintroduces the old constant ceiling that killed slow-but-healthy
+    // transfers; it exists to end transfers that can no longer finish.
+    let total_cap = model_total_cap(content_length.unwrap_or(size_hint_mb as u64 * 1_048_576));
+    let total_cutoff = std::time::Instant::now() + total_cap;
 
     let is_tty = std::io::stderr().is_terminal();
     let name = file_name.to_string();
 
-    // Spinner task — aborted once bytes() resolves.
+    // Shared progress counter: the chunk loop writes, the spinner reads, so
+    // the user sees MB downloaded instead of a bare elapsed-seconds count.
+    let downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Spinner task — aborted once the body is fully streamed.
     let spinner = if is_tty {
+        let progress = std::sync::Arc::clone(&downloaded);
         Some(tokio::spawn(async move {
             use std::io::Write as _;
             const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
@@ -661,7 +695,10 @@ async fn download_model_file_with_progress(
             loop {
                 let spin = pal.orange(&FRAMES[i % 4].to_string());
                 let elapsed = start.elapsed().as_secs();
-                eprint!("\r  {spin} downloading {name} ({total_mb} MB) ...  {elapsed}s    ");
+                let done_mb = progress.load(std::sync::atomic::Ordering::Relaxed) / 1_048_576;
+                eprint!(
+                    "\r  {spin} downloading {name} ({done_mb}/{total_mb} MB) ...  {elapsed}s    "
+                );
                 let _ = std::io::stderr().flush();
                 i += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -672,7 +709,63 @@ async fn download_model_file_with_progress(
         None
     };
 
-    let bytes = resp.bytes().await.context("reading model file body")?;
+    // Stream the body straight to the tmp file: a 1.3 GB model never sits in
+    // RAM (the old `bytes()` buffered the whole body), and each chunk resets
+    // the stall clock so only a dead connection fails the download.
+    // L4 (as in download_embed_binary): UUID suffix so concurrent installs
+    // don't clobber each other's partial file.
+    let tmp = dest.with_file_name(format!(
+        "{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let stream_result = async {
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        loop {
+            // #685 review: even a never-stalling trickle must end eventually.
+            anyhow::ensure!(
+                std::time::Instant::now() < total_cutoff,
+                "model download exceeded the {}-minute total cap (got {} of {} MB); \
+                 the connection is too slow to finish; check it and re-run \
+                 `travsr embed init`",
+                total_cap.as_secs() / 60,
+                downloaded.load(std::sync::atomic::Ordering::Relaxed) / 1_048_576,
+                total_mb
+            );
+            let chunk = match tokio::time::timeout(MODEL_STALL_TIMEOUT, resp.chunk()).await {
+                Err(_) => bail!(
+                    "model download stalled: no data received for {}s (got {} of {} MB); \
+                     check the connection and re-run `travsr embed init`",
+                    MODEL_STALL_TIMEOUT.as_secs(),
+                    downloaded.load(std::sync::atomic::Ordering::Relaxed) / 1_048_576,
+                    total_mb
+                ),
+                Ok(next) => next.context("reading model file body")?,
+            };
+            let Some(chunk) = chunk else { break };
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                .await
+                .with_context(|| format!("writing model file {file_name}"))?;
+            let written = downloaded
+                .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                + chunk.len() as u64;
+            // #685 review: a server streaming past its own Content-Length would
+            // otherwise grow the .tmp file without bound (disk-fill guard).
+            if let Some(expected) = content_length {
+                anyhow::ensure!(
+                    written <= expected,
+                    "server sent more than the advertised {expected} bytes for \
+                     {file_name}; aborting instead of filling the disk"
+                );
+            }
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .with_context(|| format!("flushing model file {file_name}"))?;
+        Ok(())
+    }
+    .await;
 
     if let Some(h) = spinner {
         h.abort();
@@ -680,14 +773,17 @@ async fn download_model_file_with_progress(
         eprint!("\r{}\r", " ".repeat(72));
         let _ = std::io::stderr().flush();
     }
+    if let Err(e) = stream_result {
+        // Best-effort: don't leave a partial .tmp behind on failure.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
 
-    let tmp = dest.with_extension("tmp");
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing model file {file_name}"))?;
     // #506: a running sidecar holds the model file open; displace, not delete.
     crate::install::replace_file(&tmp, dest)
         .with_context(|| format!("installing model file {file_name}"))?;
 
-    let actual_mb = bytes.len() / 1_048_576;
+    let actual_mb = downloaded.load(std::sync::atomic::Ordering::Relaxed) / 1_048_576;
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     println!(
         "  {} {file_name} ready · {actual_mb} MB",

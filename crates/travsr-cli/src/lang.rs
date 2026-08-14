@@ -1029,6 +1029,8 @@ fn cmd_approve(
     println!(
         "\u{2713} Security approval recorded for '{language}'.\n\
          Permitted hosts: {}\n\
+         note: the sandbox does not filter traffic per host — this allowlist is\n\
+         only enforced if a host-level firewall or egress proxy backs it.\n\
          Run `travsr lang install {language}` to complete installation.",
         permitted_hosts.join(", ")
     );
@@ -1087,7 +1089,9 @@ fn inline_approval_prompt(
     save_config(&config)?;
 
     println!(
-        "\u{2713} Approval recorded. Permitted hosts: {}\n",
+        "\u{2713} Approval recorded. Permitted hosts: {}\n\
+         note: the sandbox does not filter traffic per host — this allowlist is\n\
+         only enforced if a host-level firewall or egress proxy backs it.\n",
         permitted_hosts.join(", ")
     );
     Ok(())

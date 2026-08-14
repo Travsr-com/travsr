@@ -325,8 +325,13 @@ impl EmbedSupervisor {
         std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
         self.respawn_count += 1;
 
-        let binary = self.binary.as_deref().unwrap();
-        let db_path = self.db_path.as_deref().unwrap();
+        // Guarded by the presence check at the top of this method, but a
+        // let-else keeps a future refactor from desyncing the two (#414 L2):
+        // a missing field is a failed respawn, never a panic.
+        let (Some(binary), Some(db_path)) = (self.binary.as_deref(), self.db_path.as_deref())
+        else {
+            return false;
+        };
         let model_id = self.model_id.as_deref().unwrap_or("");
 
         match EmbedSidecar::spawn(binary, db_path, model_id) {

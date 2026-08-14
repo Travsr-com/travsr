@@ -81,6 +81,10 @@ pub struct InitStats {
 /// tell the user which analyzers ran and which were absent.
 #[derive(Debug, Default, Clone)]
 pub struct PhaseBReport {
+    /// The corpus these outcomes were evaluated against, so the trust hint can
+    /// name the exact `travsr lang add <lang> --corpus <corpus>` invocation
+    /// instead of a placeholder (#414 follow-up). Empty when unknown.
+    pub corpus: String,
     /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
     /// Languages P1-gated because no source files of that type exist in the
@@ -91,6 +95,10 @@ pub struct PhaseBReport {
     pub skipped_no_analyzer: Vec<String>,
     /// Languages registered in the resolver but not in lang.toml.
     pub skipped_unregistered: Vec<String>,
+    /// Registered non-builtin languages whose corpus lacks a trust grant
+    /// (ADR-017 Rule 3 — #414). Shown to the user with a
+    /// `travsr lang add <lang> --corpus <corpus>` call-to-action.
+    pub skipped_untrusted_corpus: Vec<String>,
     /// Languages that need a `compile_commands.json` at the repo root
     /// (scip-clang, for `c`/`cpp`) but don't have one (L5a).
     pub skipped_no_compdb: Vec<String>,
@@ -2578,6 +2586,12 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_unregistered {
         warnings.push(format!("skipped_unregistered:{lang}"));
     }
+    // #414 (ADR-017 Rule 3): a registered language whose corpus has no trust
+    // grant is skipped before spawn — surface the exact `travsr lang add
+    // <lang> --corpus <corpus>` fix.
+    for lang in &pb_outcome.skipped_untrusted_corpus {
+        warnings.push(format!("untrusted_corpus:{lang}"));
+    }
     for lang in &pb_outcome.skipped_no_analyzer {
         warnings.push(format!("skipped_no_analyzer:{lang}"));
     }
@@ -2612,10 +2626,12 @@ fn write_phase_b_results(
     }
 
     let report = PhaseBReport {
+        corpus: corpus.to_string(),
         ran: pb_outcome.ran,
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,
         skipped_unregistered: pb_outcome.skipped_unregistered,
+        skipped_untrusted_corpus: pb_outcome.skipped_untrusted_corpus,
         skipped_no_compdb: pb_outcome.skipped_no_compdb,
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         crashed: pb_outcome.crashed,

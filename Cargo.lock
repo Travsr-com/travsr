@@ -3927,6 +3927,7 @@ dependencies = [
  "travsr-store",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
@@ -4021,6 +4022,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
