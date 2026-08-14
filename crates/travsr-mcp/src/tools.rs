@@ -258,11 +258,6 @@ pub fn set_launch_cwd(dir: PathBuf) {
     let _ = LAUNCH_CWD.set(dir);
 }
 
-/// #645 WS-B: build the index/HEAD mismatch note. `head` is the caller's live
-/// `git rev-parse --short HEAD`; `stored` is the index's `last_commit`. Returns
-/// a note naming both, or `None` when they agree or either is unknown — never
-/// fabricate a mismatch for a git-less caller. Pure so both the MCP and CLI
-/// surfaces classify identically and it is trivially unit-testable.
 /// Whether two abbreviated git SHAs denote **different** commits.
 ///
 /// `git rev-parse --short` is not a fixed width: it honours `core.abbrev`, and
@@ -294,6 +289,15 @@ pub(crate) fn short_shas_differ(a: &str, b: &str) -> Option<bool> {
     Some(differs)
 }
 
+/// #645 WS-B: build the index/HEAD mismatch note. `head` is the caller's live
+/// `git rev-parse --short HEAD`; `stored` is the index's `last_commit`. Returns
+/// a note naming both, or `None` when they agree or either is unknown, never
+/// fabricate a mismatch for a git-less caller. Pure so both the MCP and CLI
+/// surfaces classify identically and it is trivially unit-testable.
+///
+/// Agreement is decided by [`short_shas_differ`], not `==`, so the note does
+/// not fire when the two sides merely abbreviate the same commit to different
+/// widths (#636 round-4 review).
 pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
     if head.is_empty() || stored.is_empty() || short_shas_differ(head, stored) == Some(false) {
         return None;
