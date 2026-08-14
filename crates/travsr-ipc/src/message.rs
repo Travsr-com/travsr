@@ -7,7 +7,7 @@ use std::path::PathBuf;
 /// version does not match the daemon's falls back to opening the store
 /// directly, so version skew degrades to the slow path instead of
 /// mis-rendering (#318 O1).
-pub const QUERY_PROTOCOL_VERSION: u32 = 1;
+pub const QUERY_PROTOCOL_VERSION: u32 = 2;
 
 /// Messages sent to the daemon's control plane.
 ///
