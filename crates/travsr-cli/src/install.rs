@@ -10,8 +10,8 @@ use anyhow::{bail, Context as _, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use travsr_plugin_host::sidecar_version::{
-    below_floor_message, floor_status, installed_version, unreadable_message, write_cached_latest,
-    FloorStatus, SidecarSpec,
+    below_floor_message, floor_status, unreadable_message, write_cached_latest, FloorStatus,
+    SidecarSpec,
 };
 
 const RELEASES_BASE_ENV: &str = "TRAVSR_LANG_RELEASES_BASE";
@@ -105,22 +105,26 @@ pub async fn fetch_latest_version_for_repo(repo: &str) -> Result<String> {
 pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinstall_remedy: &str) {
     let install_name = spec.install_name();
 
+    // One bounded `<bin> --version` probe, read once and reused by both legs
+    // below — the staleness comparison does not re-exec the binary.
+    let status = floor_status(spec, bin_path, None);
+
     // Leg 1: offline floor check. Only the "below floor" states warn; a spec
     // with no declared floor whose version is simply unreadable stays quiet.
-    match floor_status(spec, bin_path, None) {
+    match &status {
         FloorStatus::BelowFloor {
             installed,
             required,
         } => {
             eprintln!(
                 "  warning: {}",
-                below_floor_message(install_name, &installed, &required, reinstall_remedy)
+                below_floor_message(install_name, installed, required, reinstall_remedy)
             );
         }
         FloorStatus::Unreadable { required } => {
             eprintln!(
                 "  warning: {}",
-                unreadable_message(install_name, &required, reinstall_remedy)
+                unreadable_message(install_name, required, reinstall_remedy)
             );
         }
         // A transient probe timeout at install time is not actionable (degrades
@@ -141,10 +145,16 @@ pub fn advise_installed_sidecar(spec: &dyn SidecarSpec, bin_path: &Path, reinsta
     };
     write_cached_latest(install_name, &latest_tag);
 
-    let (Some(latest), Some(installed)) = (
-        travsr_plugin_host::Semver::parse(&latest_tag),
-        installed_version(bin_path, None),
-    ) else {
+    // Reuse the version already read by the floor probe above; only the states
+    // that carry a readable version can be compared against `latest`.
+    let installed = match &status {
+        FloorStatus::Ok(v) => *v,
+        FloorStatus::BelowFloor { installed, .. } => *installed,
+        FloorStatus::Unreadable { .. }
+        | FloorStatus::UnreadableNoFloor
+        | FloorStatus::ProbeTimeout { .. } => return,
+    };
+    let Some(latest) = travsr_plugin_host::Semver::parse(&latest_tag) else {
         return;
     };
     if latest > installed {

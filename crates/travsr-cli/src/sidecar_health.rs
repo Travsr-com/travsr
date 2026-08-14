@@ -45,15 +45,34 @@ fn resolve_tool_path(bin_dir: &Path, name: &str) -> Option<PathBuf> {
     travsr_core::exec::resolve_executable(name)
 }
 
+/// One installed sidecar the caller intends to probe: everything the bounded
+/// `--version` probe needs, so the probes can run without borrowing shared
+/// state. The spec is `'static` catalog data and `Sync`, so it crosses into a
+/// scoped probe thread freely.
+struct Pending {
+    spec: &'static (dyn SidecarSpec + Sync),
+    path: PathBuf,
+    remedy: String,
+}
+
 /// Gather health for every installed sidecar (the embed binary plus the Phase B
 /// underlying `scip-*` / zip tools), de-duplicated by `install_name`. Only
 /// binaries actually present on disk are returned.
+///
+/// Each `--version` probe carries its own bounded deadline (`floor_status`), so
+/// they are run concurrently rather than back to back: a status command must not
+/// stall for the *sum* of every probe's timeout when several tools hang on
+/// `--version`, only for the single slowest one. `floor_status` is pure (it
+/// holds no shared logging/de-dup state), so the probes are independent.
 pub fn gather() -> Vec<SidecarHealth> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
     let Some(bin_dir) = home_bin_dir() else {
-        return out;
+        return Vec::new();
     };
+
+    // Pass 1 (sequential, no I/O beyond `exists()`): resolve which sidecars to
+    // probe, de-duplicated by install name.
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut seen = HashSet::new();
 
     // Embed: every catalog entry shares the one `travsr-embed` binary.
     for b in travsr_plugin_host::embed_backends() {
@@ -62,18 +81,19 @@ pub fn gather() -> Vec<SidecarHealth> {
         }
         let path = bin_dir.join(b.binary_filename());
         if path.exists() {
-            out.push(health_for(
-                b,
-                &path,
-                "travsr embed init --reinstall".to_string(),
-            ));
+            pending.push(Pending {
+                spec: b,
+                path,
+                remedy: "travsr embed init --reinstall".to_string(),
+            });
         }
     }
 
     // Phase B: the underlying scip-* / zip tools, one per distinct install_name.
     for e in travsr_plugin_host::phase_b::catalog::CATALOG {
         use travsr_plugin_host::phase_b::catalog::ScipInstall;
-        let (spec, install_name): (&dyn SidecarSpec, &str) = match &e.scip_install {
+        let (spec, install_name): (&'static (dyn SidecarSpec + Sync), &str) = match &e.scip_install
+        {
             ScipInstall::GithubBinary(s) => (s, s.install_name),
             ScipInstall::ZipBinary(z) => (z, z.install_name),
             _ => continue,
@@ -82,15 +102,26 @@ pub fn gather() -> Vec<SidecarHealth> {
             continue;
         }
         if let Some(path) = resolve_tool_path(&bin_dir, install_name) {
-            out.push(health_for(
+            pending.push(Pending {
                 spec,
-                &path,
-                format!("travsr lang install {} --reinstall", e.language),
-            ));
+                path,
+                remedy: format!("travsr lang install {} --reinstall", e.language),
+            });
         }
     }
 
-    out
+    // Pass 2 (concurrent): each sidecar's bounded `--version` probe, run in its
+    // own scoped thread. Order is preserved so the rendered block is stable.
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = pending
+            .iter()
+            .map(|p| scope.spawn(|| health_for(p.spec, &p.path, p.remedy.clone())))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("sidecar health probe thread panicked"))
+            .collect()
+    })
 }
 
 /// Render one health line. Examples:
