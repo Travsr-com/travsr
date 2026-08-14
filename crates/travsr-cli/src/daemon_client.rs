@@ -197,6 +197,32 @@ pub fn open_read_store(db_path: &Path) -> anyhow::Result<SqliteStore> {
     }
 }
 
+/// Warn on stderr when the call-graph index cannot answer authoritatively.
+///
+/// The MCP tools have carried this note since #617; the CLI never did. So a
+/// terminal user running `travsr references X` while Phase B was still building
+/// got an empty result and no indication that empty meant "not indexed yet"
+/// rather than "no callers". The agent was told; the human was not.
+///
+/// Deliberately a warning rather than terminal progress output. Once `daemon
+/// start` returns, the daemon is detached and owns no terminal, so nothing can
+/// be pushed while indexing runs. What a user actually needs is not "work is
+/// happening" but "the answer you are reading may be incomplete" — which is
+/// only worth saying at the moment they ask.
+///
+/// Opens its own read-only handle because `travsr ask` answers from the daemon
+/// on the warm path and never opens a store locally at all. Three metadata
+/// reads, so the cost does not justify threading a store through every caller.
+///
+/// Silent on any error: a freshness note is not worth failing a query over.
+pub fn warn_if_call_graph_degraded(db_path: &Path) {
+    if let Ok(store) = open_read_store(db_path) {
+        if let Some(note) = travsr_mcp::phase_b_degraded_note(&store) {
+            eprintln!("warning: {note}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod lock_tests {
     use super::*;
@@ -235,5 +261,53 @@ mod lock_tests {
             !daemon_lock_held(tmp.path()),
             "must report free once released"
         );
+    }
+
+    /// The note is shared with the MCP tools rather than reimplemented, so what
+    /// is worth pinning here is that the CLI classifies the same three states
+    /// the same way — and, just as importantly, stays silent on the fourth.
+    #[test]
+    fn the_cli_and_the_mcp_tools_agree_on_call_graph_completeness() {
+        use travsr_store::SqliteStore;
+
+        let set = |s: &mut SqliteStore, pairs: &[(&str, &str)]| {
+            for (k, v) in pairs {
+                s.set_meta(k, v).unwrap();
+            }
+        };
+
+        // Phase B never ran: init happened, no phase_b marker.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(&mut store, &[("last_commit", "abc1234")]);
+        assert!(travsr_mcp::phase_b_degraded_note(&store).is_some());
+
+        // Phase B ran, but HEAD has moved past it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(
+            &mut store,
+            &[("last_commit", "def5678"), ("phase_b_commit", "abc1234")],
+        );
+        assert!(travsr_mcp::phase_b_degraded_note(&store).is_some());
+
+        // Markers agree, but a watcher reindex dropped call edges (#583).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(
+            &mut store,
+            &[
+                ("last_commit", "abc1234"),
+                ("phase_b_commit", "abc1234"),
+                ("phase_b_dirty", "1"),
+            ],
+        );
+        assert!(travsr_mcp::phase_b_degraded_note(&store).is_some());
+
+        // Complete and clean: silent. A note that always fires is noise, and
+        // noise is how the ADR-017 warning made the daemon log unreadable.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        set(
+            &mut store,
+            &[("last_commit", "abc1234"), ("phase_b_commit", "abc1234")],
+        );
+        assert_eq!(travsr_mcp::phase_b_degraded_note(&store), None);
     }
 }

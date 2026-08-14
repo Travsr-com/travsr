@@ -29,25 +29,46 @@ const FUZZ_TARGETS: &[(&str, &str)] = &[
     ("objectivec", "fuzz_objc_parser.rs"), // TODO(#345): create this fuzz target
 ];
 
+/// Emitted at most once per process, like [`SANDBOX_PROBED`] below.
+static FUZZ_CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// ADR-017 Rule 4 eligibility check: warn if a language registered as in-process
 /// does not yet have a cargo-fuzz target. The language is still registered —
 /// refusing to index would be worse than the missing fuzz coverage. Track the gap.
-fn check_fuzz_target(language: &str) {
-    let expected = FUZZ_TARGETS
-        .iter()
-        .find(|(lang, _)| *lang == language)
-        .map(|(_, f)| *f);
-    let Some(filename) = expected else { return };
-    let path = std::path::Path::new("fuzz/fuzz_targets").join(filename);
-    if !path.exists() {
-        tracing::warn!(
-            lang = language,
-            missing = %path.display(),
-            "ADR-017 Rule 4: in-process grammar '{}' has no fuzz target at {} \
-             — add a cargo-fuzz target to satisfy the eligibility requirement",
-            language, path.display()
-        );
-    }
+///
+/// One aggregated line rather than one per language. This used to warn per
+/// language per `PluginIndexer` creation, and since the indexer is recreated
+/// per file, a single daemon start produced dozens of near-identical lines —
+/// on a fresh repo the last 20 lines of the log were nothing else, which made
+/// `travsr daemon logs` useless for the case it exists to serve. The
+/// information is identical; only the repetition is gone.
+fn check_fuzz_targets_once() {
+    FUZZ_CHECKED.get_or_init(|| {
+        let missing: Vec<&str> = FUZZ_TARGETS
+            .iter()
+            .filter(|(_, filename)| {
+                !std::path::Path::new("fuzz/fuzz_targets")
+                    .join(filename)
+                    .exists()
+            })
+            .map(|(lang, _)| *lang)
+            .collect();
+        if !missing.is_empty() {
+            // The eligibility rule this enforces is ADR-017 Rule 4. The rule
+            // reference belongs here rather than in the message: the log is read
+            // by people running travsr, and "ADR-017 Rule 4" tells them nothing
+            // they can act on. DEBUG for the same reason. Nothing about a
+            // missing fuzz target affects the indexing they are waiting on, and
+            // at WARN this was the single most repeated line in the file.
+            tracing::debug!(
+                event = "fuzz_target.missing",
+                count = missing.len(),
+                langs = %missing.join(","),
+                "{} language grammar(s) are parsed in-process without a fuzz target",
+                missing.len()
+            );
+        }
+    });
 }
 
 /// Cached probe: log sandbox availability once per process lifetime.
@@ -69,12 +90,13 @@ pub fn probe_sandbox() {
                 .status()
                 .is_ok();
             if available {
-                tracing::info!("sandbox: bubblewrap available — Phase B sidecar spawn enabled");
+                tracing::info!(
+                    "sandbox available (bubblewrap), semantic analysis can run isolated"
+                );
             } else {
                 tracing::warn!(
-                    "sandbox: bubblewrap (bwrap) not found on PATH — \
-                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed). \
-                     Install with: sudo apt-get install bubblewrap"
+                    "no sandbox found (bubblewrap), so semantic analysis that needs isolation \
+                     is disabled. Install it with: sudo apt-get install bubblewrap"
                 );
             }
         }
@@ -82,18 +104,20 @@ pub fn probe_sandbox() {
         {
             let available = std::path::Path::new("/usr/bin/sandbox-exec").exists();
             if available {
-                tracing::info!("sandbox: sandbox-exec available — Phase B sidecar spawn enabled");
+                tracing::info!(
+                    "sandbox available (sandbox-exec), semantic analysis can run isolated"
+                );
             } else {
                 tracing::warn!(
-                    "sandbox: sandbox-exec not found — \
-                     Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+                    "no sandbox found (sandbox-exec), so semantic analysis that needs isolation \
+                     is disabled"
                 );
             }
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         tracing::warn!(
-            "sandbox: no sandbox implementation for this platform — \
-             Phase B sidecar plugins disabled (ADR-017 Rule 2 fail-closed)"
+            "no sandbox implementation for this platform, so semantic analysis that needs \
+             isolation is disabled"
         );
     });
 }
@@ -109,7 +133,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
     macro_rules! register {
         ($plugin:expr, $lang:expr, $exts:expr, $phase_b:expr) => {{
             // ADR-017 Rule 4: warn if no fuzz target for this in-process grammar.
-            check_fuzz_target($lang);
+            check_fuzz_targets_once();
             let hs = HandshakeResponse {
                 protocol_version: PROTOCOL_VERSION,
                 plugin_version: version.clone(),
@@ -150,7 +174,7 @@ pub fn register_builtins(dispatcher: &mut Dispatcher) {
         &crate::plugins::dart::CONFIG,
         &crate::plugins::objc::CONFIG,
     ] {
-        check_fuzz_target(config.language.as_str());
+        check_fuzz_targets_once();
         register_generic(dispatcher, &version, config);
     }
 }

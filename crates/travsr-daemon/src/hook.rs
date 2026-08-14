@@ -6,18 +6,32 @@ const TRAVSR_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this 
 #[cfg(windows)]
 const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
 
+/// Hooks Travsr installs, and the git event each one covers.
+///
+/// #655 M2: `post-commit` alone leaves the graph describing the pre-pull tree
+/// after a fast-forward `git pull`, because a fast-forward creates no commit
+/// and therefore fires no `post-commit`. `git checkout` between branches has
+/// the same shape. Both are ordinary daily operations, so "always fresh" was
+/// only true for the subset of tree changes that happen to be commits.
+const HOOKS: &[&str] = &["post-commit", "post-merge", "post-checkout"];
+
 /// Absolute path of the binary currently running `travsr`, for embedding in the
-/// installed git hook so every commit is reindexed by the SAME binary that ran
+/// installed git hooks so every event is reindexed by the SAME binary that ran
 /// `travsr init` — not whatever bare `travsr` happens to be first on `PATH`.
 ///
-/// On a dogfooding machine the PATH `travsr` is the npm-global Node wrapper
-/// (often a stale version), while the daemon runs from a freshly built binary;
-/// a bare-`travsr` hook let the stale wrapper reindex the fresh daemon's graph,
-/// violating "always fresh". `.git/hooks/*` is machine-local and untracked, so
-/// an absolute path there is legitimate and never leaks into version control.
-/// Re-running `travsr init` re-pins this to the current binary (self-heal after
-/// a move/reinstall). Falls back to bare `travsr` when the path cannot be
-/// resolved or is not valid UTF-8, preserving the previous behavior.
+/// #655 M1: git runs hooks with a minimal environment, and hooks fired from GUI
+/// clients and IDEs routinely see a `PATH` without the user's shell additions,
+/// so a bare-`travsr` hook failed with `exec: travsr: not found` and the graph
+/// silently stopped tracking the repo. On a dogfooding machine the PATH
+/// `travsr` is the npm-global Node wrapper (often a stale version) while the
+/// daemon runs from a freshly built binary, so a bare name reindexed the fresh
+/// graph with the wrong binary either way. `.git/hooks/*` is machine-local and
+/// untracked, so an absolute path there is legitimate and never leaks into
+/// version control. Re-running `travsr init` re-pins this to the current binary
+/// (self-heal after a move/reinstall), and the generated script also falls back
+/// to a `PATH` lookup at run time if the recorded path stops being executable.
+/// Falls back to the bare name when the path cannot be resolved or is not valid
+/// UTF-8, preserving the previous behaviour rather than failing the install.
 fn installing_binary() -> String {
     std::env::current_exe()
         .ok()
@@ -31,50 +45,82 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn hook_body(bin: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-         # installed by travsr \u{2014} do not edit this line\n\
-         exec {} hook-run --from-hook\n",
-        sh_quote(bin)
-    )
-}
-
-fn chain_hook_body(bin: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-         # installed by travsr \u{2014} do not edit this line\n\
-         # chains the pre-existing hook that was renamed to post-commit.travsr-pre.bak\n\
-         _dir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n\
-         if [ -x \"$_dir/post-commit.travsr-pre.bak\" ]; then\n  \
-         \"$_dir/post-commit.travsr-pre.bak\"\n\
-         fi\n\
-         exec {} hook-run --from-hook\n",
-        sh_quote(bin)
-    )
-}
-
 /// Double-quote a string for safe embedding in a Windows `.cmd` command line.
 #[cfg(windows)]
 fn cmd_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// `post-checkout` receives `<prev-head> <new-head> <branch-flag>`, where the
+/// flag is 1 for a branch checkout and 0 for a file checkout. Reindexing on a
+/// file checkout would fire on every `git checkout -- <path>`, so the generated
+/// hook returns early unless the flag is 1.
+fn branch_checkout_guard_sh(hook: &str) -> &'static str {
+    if hook == "post-checkout" {
+        "[ \"$3\" = \"1\" ] || exit 0\n"
+    } else {
+        ""
+    }
+}
+
+fn hook_body(hook: &str, bin: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+# installed by travsr — do not edit this line
+{guard}_travsr={exe}
+[ -x "$_travsr" ] || _travsr="travsr"
+exec "$_travsr" hook-run --from-hook --event {hook}
+"#,
+        guard = branch_checkout_guard_sh(hook),
+        exe = sh_quote(bin),
+    )
+}
+
+fn chain_hook_body(hook: &str, bin: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+# installed by travsr — do not edit this line
+# chains the pre-existing hook that was renamed to {hook}.travsr-pre.bak
+_dir="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$_dir/{hook}.travsr-pre.bak" ]; then
+  "$_dir/{hook}.travsr-pre.bak" "$@"
+fi
+{guard}_travsr={exe}
+[ -x "$_travsr" ] || _travsr="travsr"
+exec "$_travsr" hook-run --from-hook --event {hook}
+"#,
+        guard = branch_checkout_guard_sh(hook),
+        exe = sh_quote(bin),
+    )
+}
+
+/// `post-checkout` guard for cmd.exe, mirroring [`branch_checkout_guard_sh`].
+#[cfg(windows)]
+fn branch_checkout_guard_cmd(hook: &str) -> &'static str {
+    if hook == "post-checkout" {
+        "@if not \"%3\"==\"1\" exit /b 0\r\n"
+    } else {
+        ""
+    }
+}
+
 /// Windows `.cmd` hook — CRLF line endings required for cmd.exe.
 #[cfg(windows)]
-fn cmd_hook_body(bin: &str) -> String {
+fn cmd_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n{} hook-run --from-hook\r\n",
-        cmd_quote(bin)
+        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        guard = branch_checkout_guard_cmd(hook),
+        exe = cmd_quote(bin),
     )
 }
 
 /// Windows chain `.cmd` hook — calls any pre-existing hook before running travsr.
 #[cfg(windows)]
-fn cmd_chain_hook_body(bin: &str) -> String {
+fn cmd_chain_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0post-commit.travsr-pre.bak.cmd\" call \"%~dp0post-commit.travsr-pre.bak.cmd\"\r\n{} hook-run --from-hook\r\n",
-        cmd_quote(bin)
+        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0{hook}.travsr-pre.bak.cmd\" call \"%~dp0{hook}.travsr-pre.bak.cmd\" %*\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        guard = branch_checkout_guard_cmd(hook),
+        exe = cmd_quote(bin),
     )
 }
 
@@ -107,101 +153,114 @@ fn resolve_hooks_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".git/hooks")
 }
 
-/// Install the Travsr `post-commit` hook in the repo's git hooks directory.
+/// Install the Travsr git hooks in the repo's hooks directory.
 ///
-/// For a standard repo this is `repo_root/.git/hooks`. For a **linked worktree**
-/// `.git` is a gitlink *file*, so hooks live in the shared common dir; the
-/// directory is resolved via git in both cases (see [`resolve_hooks_dir`]).
+/// Installs every hook in [`HOOKS`], not `post-commit` alone: a fast-forward
+/// `git pull` creates no commit and a branch checkout creates none either, so
+/// commit-only coverage left the graph describing the previous tree (#655 M2).
 ///
-/// On all platforms, writes a POSIX shell `post-commit` (works with Git Bash
-/// on Windows). On Windows, additionally writes `post-commit.cmd` so that git
-/// invoked from plain cmd.exe or PowerShell also triggers the hook.
+/// For a standard repo the directory is `repo_root/.git/hooks`. For a **linked
+/// worktree** `.git` is a gitlink *file*, so hooks live in the shared common
+/// dir; the directory is resolved via git in both cases (see
+/// [`resolve_hooks_dir`]).
+///
+/// On all platforms, writes POSIX shell hooks (which work with Git Bash on
+/// Windows). On Windows, additionally writes `<hook>.cmd` so that git invoked
+/// from plain cmd.exe or PowerShell also triggers them.
 ///
 /// If a hook already exists that was NOT installed by Travsr, it is renamed to
-/// `post-commit.travsr-pre.bak` (or `.bak.cmd`) and a chain script is written
-/// instead so the existing hook continues to run.
+/// `<hook>.travsr-pre.bak` (or `.bak.cmd`) and a chain script is written
+/// instead so the existing hook continues to run. The backup name is per hook,
+/// so installing three of them cannot make one clobber another's backup.
 pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
     let hooks_dir = resolve_hooks_dir(repo_root);
     std::fs::create_dir_all(&hooks_dir)
         .with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
-    // Pin the hook to the binary that ran `travsr init` (self-heal: every init
+    // Pin the hooks to the binary that ran `travsr init` (self-heal: every init
     // re-pins to the current binary). See [`installing_binary`].
     let bin = installing_binary();
 
+    for hook in HOOKS {
+        install_one(&hooks_dir, hook, &bin)?;
+    }
+
+    Ok(())
+}
+
+/// Install a single hook, preserving any pre-existing script by backing it up
+/// and chaining to it.
+fn install_one(hooks_dir: &Path, hook: &str, bin: &str) -> anyhow::Result<()> {
     // ── POSIX shell hook (all platforms) ─────────────────────────────────────
-    let hook_path = hooks_dir.join("post-commit");
-    let bak_path = hooks_dir.join("post-commit.travsr-pre.bak");
+    let hook_path = hooks_dir.join(hook);
+    let bak_path = hooks_dir.join(format!("{hook}.travsr-pre.bak"));
 
     let script = if hook_path.exists() {
-        let existing = std::fs::read_to_string(&hook_path).context("reading existing hook")?;
+        let existing = std::fs::read_to_string(&hook_path)
+            .with_context(|| format!("reading existing {hook} hook"))?;
         if existing.contains(TRAVSR_MARKER_SH) {
-            hook_body(&bin)
+            hook_body(hook, bin)
         } else if bak_path.exists() {
             // L6: a backup already exists — the user may have manually restored their
             // original hook over ours. Don't silently overwrite the backup.
             tracing::info!(
-                "post-commit hook modified since last install and {} already exists — \
+                "{hook} hook modified since last install and {} already exists — \
                  overwriting hook only (not re-backing up)",
                 bak_path.display()
             );
-            chain_hook_body(&bin)
+            chain_hook_body(hook, bin)
         } else {
-            std::fs::rename(&hook_path, &bak_path).context("backing up existing hook")?;
-            tracing::info!(
-                "existing post-commit hook backed up to {}",
-                bak_path.display()
-            );
-            chain_hook_body(&bin)
+            std::fs::rename(&hook_path, &bak_path)
+                .with_context(|| format!("backing up existing {hook} hook"))?;
+            tracing::info!("existing {hook} hook backed up to {}", bak_path.display());
+            chain_hook_body(hook, bin)
         }
     } else {
-        hook_body(&bin)
+        hook_body(hook, bin)
     };
 
-    std::fs::write(&hook_path, script).context("writing post-commit hook")?;
+    std::fs::write(&hook_path, script).with_context(|| format!("writing {hook} hook"))?;
     set_executable(&hook_path)?;
-    tracing::info!("installed post-commit hook at {}", hook_path.display());
+    tracing::info!("installed {hook} hook at {}", hook_path.display());
 
     // ── Windows .cmd hook (Windows only) ─────────────────────────────────────
     #[cfg(windows)]
     {
-        let cmd_hook_path = hooks_dir.join("post-commit.cmd");
-        let cmd_bak_path = hooks_dir.join("post-commit.travsr-pre.bak.cmd");
+        let cmd_hook_path = hooks_dir.join(format!("{hook}.cmd"));
+        let cmd_bak_path = hooks_dir.join(format!("{hook}.travsr-pre.bak.cmd"));
 
         let cmd_script = if cmd_hook_path.exists() {
-            let existing =
-                std::fs::read_to_string(&cmd_hook_path).context("reading existing cmd hook")?;
+            let existing = std::fs::read_to_string(&cmd_hook_path)
+                .with_context(|| format!("reading existing {hook}.cmd hook"))?;
             if existing.contains(TRAVSR_MARKER_CMD) {
-                cmd_hook_body(&bin)
+                cmd_hook_body(hook, bin)
             } else if cmd_bak_path.exists() {
                 // L6 (#507): same guard as the POSIX branch above. The user may
                 // have restored their own hook over ours; fs::rename on Windows
                 // REPLACES the destination, so re-backing up here would destroy
                 // the original backup.
                 tracing::info!(
-                    "post-commit.cmd hook modified since last install and {} already exists — \
+                    "{hook}.cmd hook modified since last install and {} already exists — \
                      overwriting hook only (not re-backing up)",
                     cmd_bak_path.display()
                 );
-                cmd_chain_hook_body(&bin)
+                cmd_chain_hook_body(hook, bin)
             } else {
                 std::fs::rename(&cmd_hook_path, &cmd_bak_path)
-                    .context("backing up existing cmd hook")?;
+                    .with_context(|| format!("backing up existing {hook}.cmd hook"))?;
                 tracing::info!(
-                    "existing post-commit.cmd hook backed up to {}",
+                    "existing {hook}.cmd hook backed up to {}",
                     cmd_bak_path.display()
                 );
-                cmd_chain_hook_body(&bin)
+                cmd_chain_hook_body(hook, bin)
             }
         } else {
-            cmd_hook_body(&bin)
+            cmd_hook_body(hook, bin)
         };
 
-        std::fs::write(&cmd_hook_path, cmd_script).context("writing post-commit.cmd hook")?;
-        tracing::info!(
-            "installed post-commit.cmd hook at {}",
-            cmd_hook_path.display()
-        );
+        std::fs::write(&cmd_hook_path, cmd_script)
+            .with_context(|| format!("writing {hook}.cmd hook"))?;
+        tracing::info!("installed {hook}.cmd hook at {}", cmd_hook_path.display());
     }
 
     Ok(())
@@ -459,60 +518,6 @@ mod tests {
         assert!(!hooks.join("post-commit.cmd").exists());
     }
 
-    /// Item C (dogfooding): the hook must `exec` the SAME binary that installed
-    /// it (an absolute path), never bare `travsr`. A stale PATH `travsr` (the
-    /// npm-global wrapper on a dogfooding box) must not be able to reindex a
-    /// fresh daemon's graph.
-    #[cfg(unix)]
-    #[test]
-    fn install_hook_pins_installing_binary_not_bare_travsr() {
-        let tmp = make_fake_repo();
-        install_hook(tmp.path()).unwrap();
-        let body = std::fs::read_to_string(tmp.path().join(".git/hooks/post-commit")).unwrap();
-
-        let exe = std::env::current_exe().unwrap();
-        let exe = exe.to_str().unwrap();
-        assert!(
-            body.contains(exe),
-            "hook must embed the installing binary's absolute path, got:\n{body}"
-        );
-        assert!(body.contains("hook-run --from-hook"));
-        assert!(
-            !body.contains("exec travsr hook-run"),
-            "hook must not invoke bare `travsr`, got:\n{body}"
-        );
-    }
-
-    /// Re-running `install_hook` (what `travsr init` does) re-pins the hook to
-    /// the current binary — the self-heal path. A hook left over as bare
-    /// `travsr` (an old install, before item C) is migrated to the absolute
-    /// path on the next init.
-    #[cfg(unix)]
-    #[test]
-    fn reinstall_repins_stale_bare_travsr_hook() {
-        let tmp = make_fake_repo();
-        let hook_path = tmp.path().join(".git/hooks/post-commit");
-        // Simulate a pre-item-C hook: marker present, but bare `travsr`.
-        std::fs::write(
-            &hook_path,
-            "#!/bin/sh\n# installed by travsr \u{2014} do not edit this line\nexec travsr hook-run --from-hook\n",
-        )
-        .unwrap();
-
-        install_hook(tmp.path()).unwrap();
-
-        let body = std::fs::read_to_string(&hook_path).unwrap();
-        let exe = std::env::current_exe().unwrap();
-        assert!(
-            body.contains(exe.to_str().unwrap()),
-            "reinstall must re-pin to the current binary, got:\n{body}"
-        );
-        assert!(
-            !body.contains("exec travsr hook-run"),
-            "stale bare-`travsr` hook must be migrated, got:\n{body}"
-        );
-    }
-
     #[cfg(windows)]
     #[test]
     fn foreign_cmd_hook_is_backed_up() {
@@ -571,6 +576,134 @@ mod tests {
         assert!(
             sentinel.exists(),
             "backed-up cmd hook should have created sentinel.txt"
+        );
+    }
+
+    // ── #655 M1/M2: what the hook invokes, and which events it covers ────────
+
+    #[test]
+    fn every_git_event_that_moves_the_tree_gets_a_hook() {
+        // post-commit alone misses a fast-forward pull, which creates no
+        // commit, and a branch checkout. Both change the tree.
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        let hooks = tmp.path().join(".git/hooks");
+
+        for hook in HOOKS {
+            assert!(hooks.join(hook).exists(), "{hook} was not installed");
+        }
+        assert!(
+            HOOKS.contains(&"post-merge") && HOOKS.contains(&"post-checkout"),
+            "the merge and checkout events are the ones #655 M2 is about"
+        );
+    }
+
+    /// Each hook has to say which event fired, because the right file set
+    /// differs by event and the hook is the only place that knows.
+    ///
+    /// A commit is described exactly by `git diff-tree HEAD`. A branch checkout
+    /// and a multi-commit fast-forward are not: the new tip's own diff says
+    /// nothing about the other files that differ between the two trees.
+    /// Measured on a fast-forward carrying two commits, reindexing the tip delta
+    /// alone reached 4 nodes where the tree holds 6, and the file from the
+    /// non-tip commit was absent from the graph.
+    #[test]
+    fn each_hook_tells_the_cli_which_event_fired() {
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+
+        for hook in HOOKS {
+            let body = std::fs::read_to_string(tmp.path().join(".git/hooks").join(hook)).unwrap();
+            assert!(
+                body.contains(&format!("--event {hook}")),
+                "{hook} must pass its own name through, got:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hook_names_an_absolute_binary_rather_than_resolving_from_path() {
+        // A bare `travsr` is resolved from PATH, and git runs hooks with a
+        // minimal PATH, so the old body failed with `exec: travsr: not found`
+        // and the graph silently stopped tracking the repo.
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join(".git/hooks/post-commit")).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            body.contains(&exe.display().to_string()),
+            "hook should invoke the resolved binary, got:\n{body}"
+        );
+        assert!(
+            !body.contains("exec travsr hook-run"),
+            "hook should not invoke a bare `travsr`, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn the_hook_still_works_if_the_recorded_binary_moves() {
+        // Pinning an absolute path trades one failure mode for another: the
+        // binary can be moved, upgraded, or uninstalled. The script degrades
+        // to PATH lookup rather than breaking outright.
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join(".git/hooks/post-commit")).unwrap();
+
+        assert!(
+            body.contains(r#"[ -x "$_travsr" ] || _travsr="travsr""#),
+            "expected a PATH fallback, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn post_checkout_ignores_file_checkouts() {
+        // post-checkout also fires for `git checkout -- <path>`, where $3 is 0.
+        // Reindexing there would fire on an operation that restores a single
+        // file, so the hook exits before doing any work.
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        let hooks = tmp.path().join(".git/hooks");
+
+        let checkout = std::fs::read_to_string(hooks.join("post-checkout")).unwrap();
+        assert!(
+            checkout.contains(r#"[ "$3" = "1" ] || exit 0"#),
+            "post-checkout must skip file checkouts, got:\n{checkout}"
+        );
+
+        // The guard belongs only to post-checkout; the others take no such args.
+        for hook in ["post-commit", "post-merge"] {
+            let body = std::fs::read_to_string(hooks.join(hook)).unwrap();
+            assert!(
+                !body.contains(r#""$3""#),
+                "{hook} must not carry the post-checkout guard, got:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_hook_is_backed_up_and_chained_under_its_own_name() {
+        // The backup name used to be hardcoded to post-commit. With three
+        // hooks installed, a shared name would have one hook overwrite
+        // another's backup and lose the user's script.
+        let tmp = make_fake_repo();
+        let hooks = tmp.path().join(".git/hooks");
+        std::fs::write(hooks.join("post-merge"), "#!/bin/sh\necho mine\n").unwrap();
+
+        install_hook(tmp.path()).unwrap();
+
+        let bak = hooks.join("post-merge.travsr-pre.bak");
+        assert!(bak.exists(), "the pre-existing hook must be preserved");
+        assert!(std::fs::read_to_string(&bak).unwrap().contains("echo mine"));
+
+        let body = std::fs::read_to_string(hooks.join("post-merge")).unwrap();
+        assert!(
+            body.contains("post-merge.travsr-pre.bak"),
+            "the chain must call this hook's own backup, got:\n{body}"
+        );
+        assert!(
+            !body.contains("post-commit.travsr-pre.bak"),
+            "the chain must not reference another hook's backup, got:\n{body}"
         );
     }
 }

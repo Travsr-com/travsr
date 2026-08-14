@@ -1648,9 +1648,9 @@ fn cmd_status() -> Result<()> {
         } else if phase_b == last {
             "complete"
         } else {
-            "stale (new commits since last Phase B)"
+            "stale (new commits since the last semantic index)"
         };
-        println!("Phase B state  : {state}");
+        println!("Semantic index : {state}");
     }
 
     // If this repo hasn't been configured, skip the per-repo progress section.
@@ -1700,7 +1700,7 @@ fn cmd_status() -> Result<()> {
     let p1_bar = crate::progress::bar_of_width(pal, stats.phase1_done, stats.phase1_total, 24);
     let p1_eta = fmt_eta(stats.phase1_total.saturating_sub(stats.phase1_done), 400.0);
     println!(
-        "Phase 1 (shell \u{2265}{threshold}) {} {}/{}  ({:.0}%)  {}",
+        "core symbols (centrality \u{2265}{threshold}) {} {}/{}  ({:.0}%)  {}",
         p1_bar,
         fmt_count(stats.phase1_done),
         fmt_count(stats.phase1_total),
@@ -1720,7 +1720,7 @@ fn cmd_status() -> Result<()> {
     let p2_bar = crate::progress::bar_of_width(pal, stats.phase2_done, stats.phase2_total, 24);
     let p2_eta = fmt_eta(stats.phase2_total.saturating_sub(stats.phase2_done), 40.0);
     println!(
-        "Phase 2 (shell <{threshold}) {} {}/{}  ({:.0}%)  {}",
+        "other symbols (centrality <{threshold}) {} {}/{}  ({:.0}%)  {}",
         p2_bar,
         fmt_count(stats.phase2_done),
         fmt_count(stats.phase2_total),
@@ -1746,13 +1746,15 @@ fn cmd_status() -> Result<()> {
             fmt_count(stats.embedded),
         );
     } else {
-        println!("HNSW index     : not built yet (completes after Phase 1 finishes)");
+        println!("Vector index   : not built yet (completes after the core pass finishes)");
     }
 
     // ── actionable hints ──────────────────────────────────────────────────────
     if stats.embedded == 0 && stats.total_symbols > 0 {
         println!();
-        println!("hint: no nodes embedded yet — the daemon triggers embedding after Phase B.");
+        println!(
+            "hint: no symbols embedded yet, the daemon starts embedding after semantic indexing."
+        );
         println!("      If the daemon is not running: travsr daemon start");
     } else if remaining > 0 {
         println!();
