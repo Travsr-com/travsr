@@ -64,42 +64,39 @@ pub(crate) fn spawn_background_daemon(repo_root: &Path, exe: &Path) -> SpawnOutc
     if daemon_lock_held(repo_root) {
         return SpawnOutcome::AlreadyRunning;
     }
-    // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
-    // lock — the last-line-of-defense guard for the tight spawn race).
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(["daemon", "start", "--foreground"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // #503: fully detach from the launching console. Without these flags the
-    // daemon stays attached to the parent's console, so Ctrl+C in that
-    // terminal reaches its ctrl_c handler and shuts it down, closing the
-    // terminal kills it via CTRL_CLOSE_EVENT, and the Task Scheduler
-    // autostart path pops a visible console window. DETACHED_PROCESS gives
-    // the child no console at all; CREATE_NEW_PROCESS_GROUP takes it out of
-    // the parent's Ctrl+C signal group.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-        // #572: with stdio configured the spawn passes bInheritHandles=TRUE,
-        // so every inheritable handle in this process — notably the write end
-        // of a pipe the shell attached to our stdout — leaks into the
-        // long-lived daemon even though ITS stdio is null. A pipeline like
-        // `travsr daemon start | tail` then never sees EOF until the daemon
-        // exits. Un-inherit our std handles first; later children that want
-        // inherited stdio still work because std duplicates the handle
-        // inheritably per spawn.
-        travsr_plugin_host::sandbox::windows::clear_stdio_handle_inheritance();
-    }
     // #592: clear any breadcrumb from a previous failed start so we only observe
     // THIS start's outcome.
     let err_path = repo_root.join(".travsr").join("daemon-start.err");
     let _ = std::fs::remove_file(&err_path);
 
-    let spawned = cmd.spawn();
+    // Re-exec ourselves as the long-lived foreground worker (which re-acquires the
+    // lock — the last-line-of-defense guard for the tight spawn race).
+    #[cfg(unix)]
+    let spawned: std::io::Result<()> = std::process::Command::new(exe)
+        .args(["daemon", "start", "--foreground"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ());
+    // #503/#572: on Windows the daemon must be fully detached from the
+    // launching console (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, or
+    // Ctrl+C / closing the terminal kills it and the Task Scheduler autostart
+    // pops a console window) AND spawned with an explicit handle-inheritance
+    // allowlist. `std::process::Command` forces bInheritHandles=TRUE whenever
+    // stdio is configured, so EVERY inheritable handle in this process leaked
+    // into the long-lived daemon even though its own stdio is null — the
+    // write end of a pipe the shell attached to our stdout, or one a
+    // grandparent (cargo → test harness → travsr) created inheritably and
+    // passed down. Either pins the pipe open so its reader never sees EOF
+    // until the daemon exits. The raw spawn below lists exactly the daemon's
+    // three NUL stdio handles as inheritable and nothing else.
+    #[cfg(windows)]
+    let spawned = travsr_plugin_host::sandbox::windows::spawn_detached_with_inherit_allowlist(
+        exe,
+        &["daemon", "start", "--foreground"],
+    );
+
     if spawned.is_err() {
         return SpawnOutcome::Failed;
     }

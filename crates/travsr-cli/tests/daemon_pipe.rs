@@ -12,7 +12,14 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Serialize the tests in this file. Each deliberately makes a handle
+/// inheritable in THIS process (or relies on none being so); a concurrent
+/// sibling test spawning a CLI child with piped stdio would inherit it too
+/// and hold the other test's pipe open past its EOF assertion.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Generous per-stage ceiling: a tiny-repo init plus daemon spawn completes in
 /// seconds; only the #572 leak makes EOF wait for the daemon's exit.
@@ -248,6 +255,7 @@ impl Drop for DaemonGuard {
 
 #[test]
 fn piped_daemon_start_reaches_eof_while_daemon_keeps_running() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let repo = make_repo();
     let _guard = DaemonGuard(repo.path().to_path_buf());
 
@@ -272,5 +280,110 @@ fn piped_daemon_start_reaches_eof_while_daemon_keeps_running() {
     // single snapshot: on a slow startup the CLI's spawn-confirmation window
     // expires with the control pipe still unbound, and status only reports
     // "running [" once the pipe binds.
+    wait_for_daemon_running(repo.path(), STAGE_DEADLINE);
+}
+
+/// Anonymous pipe whose WRITE end carries `HANDLE_FLAG_INHERIT`, standing in
+/// for a handle a grandparent (cargo, a test harness, CI) created inheritably
+/// and passed down the spawn chain without installing it as anyone's stdout.
+fn inheritable_pipe() -> (std::fs::File, std::fs::File) {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    let mut read_h: HANDLE = std::ptr::null_mut();
+    let mut write_h: HANDLE = std::ptr::null_mut();
+    // SAFETY: out-pointers to two local HANDLEs; null security attributes and
+    // default buffer size are the documented defaults.
+    let ok = unsafe { CreatePipe(&mut read_h, &mut write_h, std::ptr::null(), 0) };
+    assert_ne!(
+        ok,
+        0,
+        "CreatePipe failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: write_h is a live handle we just created; setting the inherit
+    // flag only changes inheritance metadata.
+    let ok = unsafe { SetHandleInformation(write_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    assert_ne!(
+        ok,
+        0,
+        "SetHandleInformation failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: both handles are freshly created, owned, and unaliased; File
+    // takes ownership and closes them on drop.
+    let read = unsafe { std::fs::File::from_raw_handle(read_h as _) };
+    let write = unsafe { std::fs::File::from_raw_handle(write_h as _) };
+    (read, write)
+}
+
+/// #572 residual: an inheritable handle that is NOT one of the CLI's std
+/// handles must not leak into the daemon either. Clearing the inherit flag on
+/// the CLI's own stdio (the first fix) cannot see such a handle; only the
+/// spawn-side `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` allowlist closes it.
+#[test]
+fn daemon_does_not_inherit_grandparent_pipe_handle() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = make_repo();
+    let _guard = DaemonGuard(repo.path().to_path_buf());
+
+    // Set up the repo with no extra handle in play, then stop init's daemon so
+    // the spawn under test below is the explicit `daemon start` path.
+    let (status, output) = run_piped_expecting_prompt_eof(repo.path(), &["init"]);
+    assert!(status.success(), "travsr init failed:\n{output}");
+    stop_daemon_and_wait(repo.path());
+
+    // The grandparent-chain shape: our spawn below configures stdio, so std
+    // passes bInheritHandles=TRUE and the CLI inherits this write end even
+    // though it is not the CLI's stdout. On the buggy build the CLI's own
+    // daemon spawn forwarded every inheritable handle again, so the detached
+    // daemon ended up holding it too.
+    let (mut read_end, write_end) = inheritable_pipe();
+
+    let mut child = Command::new(travsr_exe())
+        .args(["daemon", "start"])
+        .current_dir(repo.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn travsr daemon start");
+    // Our copy is now surplus; the CLI (and, on a buggy build, the daemon it
+    // spawns) holds the only other copies.
+    drop(write_end);
+
+    // Drain the CLI's own stdio so it cannot block on a full pipe buffer.
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+    });
+    let status = child.wait().expect("wait for travsr");
+    assert!(status.success(), "travsr daemon start failed");
+
+    // The CLI has exited, closing its inherited copy. EOF on the side pipe
+    // must now arrive promptly — it can only still be open if the detached
+    // daemon inherited it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = read_end.read_to_end(&mut buf);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            panic!(
+                "side pipe never reached EOF after the CLI exited — the detached \
+             daemon inherited a non-stdio handle (#572 residual)"
+            )
+        });
+
+    // ...while the daemon itself keeps running.
     wait_for_daemon_running(repo.path(), STAGE_DEADLINE);
 }
