@@ -4071,6 +4071,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "fs2",
+ "nix",
  "rusqlite",
  "serde",
  "serde_json",

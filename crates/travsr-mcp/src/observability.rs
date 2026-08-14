@@ -152,38 +152,32 @@ fn working_tree_dirty(root: &Path) -> Option<bool> {
 
 /// Whether a process with the given PID is currently alive.
 ///
-/// On Unix, this is `kill -0`, mirroring `travsr_cli::pid_is_alive`
-/// (travsr-cli/src/main.rs), duplicated rather than imported because
-/// travsr-mcp cannot depend on travsr-cli (cli -> daemon -> mcp, so the
-/// reverse edge is a cycle). No signal sent.
+/// A syscall on both platforms, never a subprocess:
+/// `travsr_plugin_host::unix_pid_is_alive` (`kill(pid, 0)`) on Unix and
+/// `travsr_plugin_host::windows_pid_is_alive` (`OpenProcess` +
+/// `GetExitCodeProcess`) on Windows. travsr-mcp already depends on
+/// travsr-plugin-host (`repo_backend_id`,
+/// `derive_phase1_threshold_for_status`, `PHASE_B_CATALOG`) and is itself
+/// `#![forbid(unsafe_code)]`, so the platform primitives live over there;
+/// see those two functions for why each is written the way it is.
 ///
-/// On Windows, this calls `travsr_plugin_host::windows_pid_is_alive`, a
-/// native `OpenProcess` + `GetExitCodeProcess` syscall, not a subprocess
-/// spawn. travsr-mcp already depends on travsr-plugin-host
-/// (`repo_backend_id`, `derive_phase1_threshold_for_status`,
-/// `PHASE_B_CATALOG`) and is itself `#![forbid(unsafe_code)]`, so it cannot
-/// hold the `unsafe` this needs directly; that crate's own ADR-017 confines
-/// it to `sandbox/windows/ffi.rs` and exposes a safe wrapper. This used to
-/// shell out to `tasklist` here too, which measurably failed under the
-/// process-spawn contention a full `cargo test --workspace` run puts on
-/// Windows CI (#636 round-2 review): `CreateProcess` is comparatively
-/// expensive under load there, and a plain syscall has no equivalent
-/// failure mode.
+/// Both halves used to shell out (`kill -0`, `tasklist`) and both were
+/// wrong for their own reason (#636 rounds 2 and 3). Windows: subprocess
+/// spawns measurably failed under the contention of a full `cargo test
+/// --workspace` run. Unix: `kill -0` as a command collapses `EPERM` and
+/// `ESRCH` into one non-zero exit, so a live daemon owned by another uid
+/// read as dead, which fails in the unsafe direction. `get_index_status`'s
+/// own doc invites an agent to poll in a loop, so removing a fork+exec per
+/// poll is worth having on its own besides.
 ///
-/// Trade-off, same as the CLI helper's: a recycled PID reads as alive. The
-/// window is the same one `daemon_is_running`'s own lock-file fallback
-/// accepts, and it fails in the safe direction for a read-only status probe
-/// (reports "daemon up" one poll too long, never disturbs the singleton).
+/// Remaining trade-off, unchanged and the same as the CLI helper's: a
+/// recycled PID reads as alive. That one fails in the safe direction for a
+/// read-only status probe (reports "daemon up" one poll too long, never
+/// disturbs the singleton).
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        travsr_plugin_host::unix_pid_is_alive(pid)
     }
     #[cfg(windows)]
     {
