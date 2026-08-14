@@ -685,38 +685,122 @@ pub(super) fn make_inheritable(h: HANDLE) -> io::Result<()> {
     }
 }
 
-/// Clear `HANDLE_FLAG_INHERIT` on the calling process's std handles (#572).
+/// Spawn a fully detached child with handle inheritance restricted to an
+/// explicit allowlist of its own three NUL stdio handles (#572 residual).
 ///
-/// A shell attaching a pipe to this process's stdout hands it an *inheritable*
-/// handle, and `std::process::Command` spawns with `bInheritHandles=TRUE`
-/// whenever stdio is configured — so every inheritable handle leaks into the
-/// child, even one whose stdio is explicitly null. For a long-lived detached
-/// child (the daemon), the leaked pipe write end means the shell-side reader
-/// never sees EOF and the pipeline hangs until the daemon exits.
+/// `std::process::Command` forces `bInheritHandles=TRUE` whenever stdio is
+/// configured, which hands the child *every* inheritable handle in this
+/// process — not just the three std handles. The previous fix cleared
+/// `HANDLE_FLAG_INHERIT` on our own std handles, which covered the direct
+/// case (`travsr daemon start | tail`, where the leaked pipe handle IS our
+/// stdout), but an inheritable handle a grandparent created (cargo → test
+/// harness → travsr) and passed down without installing it as our stdout
+/// still leaked into the long-lived daemon and pinned its pipe open: the
+/// reader never saw EOF. `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` inverts the
+/// model — only listed handles are inherited, whatever any other handle's
+/// inherit flag says — so nothing else can leak, and per-handle flag
+/// clearing is superseded.
 ///
-/// Clearing the flag on our own std handles is safe for every later spawn:
-/// `Stdio::inherit` duplicates the current std handle into a fresh inheritable
-/// copy for the child (std `use_stdio_id`), and Rust-created handles are
-/// non-inheritable to begin with.
-///
-/// Best-effort by design: a missing std handle (detached process) or an exotic
-/// handle that rejects `SetHandleInformation` leaves things exactly as they
-/// were today, which must not fail the daemon spawn it protects.
-pub fn clear_stdio_handle_inheritance() {
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
-    for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        // SAFETY: GetStdHandle has no preconditions; it returns null or
-        // INVALID_HANDLE_VALUE when no handle is available.
-        let h = unsafe { GetStdHandle(std_id) };
-        if h.is_null() || h == INVALID_HANDLE_VALUE {
-            continue;
-        }
-        // SAFETY: `h` is a live std handle owned by this process; clearing the
-        // inherit flag only changes inheritance metadata, never the handle.
-        let _ = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+/// The child is started with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+/// (#503: no console at all, out of the parent's Ctrl+C signal group) and
+/// NUL stdio, and inherits this process's environment and current directory,
+/// matching the `std::process::Command` spawn it replaces. Public because
+/// the CLI's daemonizing re-exec (`travsr-cli`, `forbid(unsafe_code)`) is
+/// the caller; the unsafe stays confined to ffi.rs per ADR-017 A2.
+pub fn spawn_detached_with_inherit_allowlist(exe: &Path, args: &[&str]) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    // NUL stdio, one open per stream (mirrors spawn_in_appcontainer's Null
+    // arms). The Files must outlive CreateProcessW; they drop on return.
+    let stdin_nul = std::fs::File::open("NUL")
+        .map_err(|e| io::Error::new(e.kind(), format!("NUL open failed: {e}")))?;
+    let stdout_nul = std::fs::OpenOptions::new()
+        .write(true)
+        .open("NUL")
+        .map_err(|e| io::Error::new(e.kind(), format!("NUL open failed: {e}")))?;
+    let stderr_nul = std::fs::OpenOptions::new()
+        .write(true)
+        .open("NUL")
+        .map_err(|e| io::Error::new(e.kind(), format!("NUL open failed: {e}")))?;
+    let handle_list: [HANDLE; 3] = [
+        stdin_nul.as_raw_handle() as HANDLE,
+        stdout_nul.as_raw_handle() as HANDLE,
+        stderr_nul.as_raw_handle() as HANDLE,
+    ];
+    for h in handle_list {
+        make_inheritable(h)?;
     }
+
+    // Single attribute: the inherit allowlist — exactly the child's stdio.
+    let mut attr_list = init_attr_list(1)?;
+    let ok = unsafe {
+        UpdateProcThreadAttribute(
+            attr_list.as_mut_ptr(),
+            0,
+            PROC_THREAD_ATTR_HANDLE_LIST,
+            handle_list.as_ptr() as *const _,
+            std::mem::size_of_val(&handle_list),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "UpdateProcThreadAttribute(HANDLE_LIST) failed: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+
+    let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si_ex.StartupInfo.hStdInput = handle_list[0];
+    si_ex.StartupInfo.hStdOutput = handle_list[1];
+    si_ex.StartupInfo.hStdError = handle_list[2];
+    si_ex.lpAttributeList = attr_list.as_mut_ptr();
+
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let cmdline = build_command_line(&exe.to_string_lossy(), &args);
+    let mut cmdline_wide = to_wide(&cmdline);
+
+    let creation_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // lpEnvironment / lpCurrentDirectory NULL → child inherits ours, matching
+    // std::process::Command. bInheritHandles=TRUE is required for
+    // STARTF_USESTDHANDLES; the HANDLE_LIST attribute above restricts it.
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),          // lpApplicationName (resolve from cmdline)
+            cmdline_wide.as_mut_ptr(), // lpCommandLine (must be mutable)
+            std::ptr::null(),          // lpProcessAttributes
+            std::ptr::null(),          // lpThreadAttributes
+            1,                         // bInheritHandles = TRUE
+            creation_flags,
+            std::ptr::null(), // lpEnvironment = NULL (inherit)
+            std::ptr::null(), // lpCurrentDirectory = NULL (inherit)
+            &si_ex.StartupInfo as *const STARTUPINFOW,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "CreateProcessW({exe:?}) failed: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    // The daemon owns its own lifetime — the caller confirms liveness via the
+    // repo flock, never via these handles — so close both immediately.
+    drop(OwnedHandle(pi.hThread));
+    drop(OwnedHandle(pi.hProcess));
+    Ok(())
 }
 
 /// Allocate and initialize an attribute list for `count` attributes.

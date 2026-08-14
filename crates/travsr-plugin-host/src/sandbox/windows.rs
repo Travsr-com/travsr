@@ -8,12 +8,14 @@ mod ffi;
 /// block in this crate stays confined to ffi.rs.
 pub(crate) use ffi::{available_physical_memory_mb, pid_alive, windows_p_core_count};
 
-/// #572: make this process's std handles non-inheritable before spawning a
-/// long-lived detached child, so a shell pipe attached to our stdout/stderr
-/// cannot leak into it and hold the pipeline open. Public because the CLI's
-/// daemonizing re-exec (`travsr-cli`, `forbid(unsafe_code)`) is the caller;
-/// the unsafe stays confined to ffi.rs per ADR-017 A2.
-pub use ffi::clear_stdio_handle_inheritance;
+/// #572: spawn a long-lived detached child (the daemon) with handle
+/// inheritance restricted to an explicit allowlist of its own NUL stdio, so
+/// no inheritable handle in this process — a shell pipe on our stdout, or a
+/// pipe a grandparent passed down — can leak into it and hold a pipeline
+/// open. Public because the CLI's daemonizing re-exec (`travsr-cli`,
+/// `forbid(unsafe_code)`) is the caller; the unsafe stays confined to ffi.rs
+/// per ADR-017 A2.
+pub use ffi::spawn_detached_with_inherit_allowlist;
 
 use crate::sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 use crate::sandbox::StdioCfg;
