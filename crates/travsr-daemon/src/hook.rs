@@ -247,11 +247,13 @@ pub fn tracked_files_from_git(repo_root: &Path) -> anyhow::Result<Vec<PathBuf>> 
 /// # Panics
 /// Never — hook must never panic.
 pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
-    // #407 L2: both platforms go through the transports' `send_fire_and_forget`
+    // #407 L2: both platforms go through travsr-ipc's fire-and-forget helpers
     // so the line framing lives in travsr-ipc alone, instead of a hand-rolled
-    // raw-socket copy here that could drift when the protocol changes. The
-    // helper bounds the write by its fire-and-forget deadline, so a wedged
-    // daemon can never stall the user's commit.
+    // raw-socket copy here that could drift when the protocol changes. On
+    // Windows the ENTIRE dispatch (busy-pipe retry, connect, write) runs under
+    // one fire-and-forget deadline (#685 review), since a plain `connect` could
+    // retry a busy pipe for up to 2 s before the bounded write even began, so a
+    // wedged or contended daemon can never stall the user's commit.
     let sha = std::process::Command::new("git")
         .args([
             "-C",
@@ -285,15 +287,14 @@ pub fn try_dispatch_to_daemon(repo_root: &Path) -> bool {
     #[cfg(windows)]
     {
         use travsr_ipc::windows::NamedPipeTransport;
-        use travsr_ipc::{ControlAddr, ControlMessage, ControlTransport as _};
+        use travsr_ipc::{ControlAddr, ControlMessage};
 
         let addr = ControlAddr::for_repo(repo_root);
-        let Ok(mut transport) = NamedPipeTransport::connect(&addr) else {
-            return false;
-        };
-        transport
-            .send_fire_and_forget(&ControlMessage::ReindexCommit { sha })
-            .is_ok()
+        NamedPipeTransport::send_fire_and_forget_bounded(
+            &addr,
+            &ControlMessage::ReindexCommit { sha },
+        )
+        .is_ok()
     }
 
     #[cfg(all(not(unix), not(windows)))]

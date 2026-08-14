@@ -44,9 +44,16 @@ pub const FIRE_AND_FORGET_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Ceiling on one response line (#407 L1). A buggy daemon streaming bytes with
 /// no terminating newline used to grow the client's buffer without limit; now
-/// the read fails at this cap instead of OOMing the CLI. 64 MiB sits
-/// comfortably above the largest real payload (`graph --all --format json`).
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// the read fails at this cap instead of OOMing the CLI.
+///
+/// Sized for the largest LEGITIMATE payload, not just typical traffic (#685
+/// review): a deep `graph <hub-symbol> --format json --budget 0` query applies
+/// its budget truncation client-side, after the full payload crosses this
+/// transport, so a densely-connected seed on a big repo can produce a
+/// well-formed response far above everyday sizes. 256 MiB clears that with
+/// room while still bounding a runaway stream; `graph --all` bypasses the
+/// daemon entirely and is never subject to this cap.
+pub const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 
 /// `msg` as its newline-terminated JSON wire line.
 fn encode_line(msg: &ControlMessage) -> anyhow::Result<String> {
@@ -259,8 +266,10 @@ fn read_line_before<S: Read>(stream: &mut S, deadline: Duration) -> anyhow::Resu
                 // the read, not OOM the client accumulating them forever.
                 anyhow::ensure!(
                     out.len() <= MAX_RESPONSE_BYTES,
-                    "daemon response exceeded the {} MiB cap without a \
-                     terminating newline — the daemon is misbehaving",
+                    "daemon response exceeded the {} MiB cap; either the daemon \
+                     is misbehaving or the query result is enormous (for very \
+                     large graph queries, `travsr graph --all` bypasses the \
+                     daemon and this cap)",
                     MAX_RESPONSE_BYTES / (1024 * 1024)
                 );
             }

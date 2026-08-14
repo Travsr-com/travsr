@@ -231,18 +231,21 @@ impl PluginIndexer {
     ) {
         let repo_root = inputs.repo_root;
 
+        // One lang.toml read serves both gates below (#685 review): the
+        // registration gate and the trust gate used to read and parse the same
+        // file back-to-back.
+        let lang_toml = crate::trust::LangToml::from_disk();
+
         // Gate Phase B per language against lang.toml registration.
         // `travsr lang remove <lang>` writes registered=[] which must be respected here.
-        let registered: HashSet<String> = crate::trust::registered_languages_from_disk()
-            .into_iter()
-            .collect();
+        let registered: HashSet<String> = lang_toml.registered.iter().cloned().collect();
 
         // ADR-017 Rule 3 (#414): external Phase B tooling executes repo-related
         // code (go, scip sidecars, …), so it is spawned only for corpora with an
         // explicit trust grant in lang.toml. Loaded once per invocation, checked
         // per non-builtin language below. Builtins are exempt: they ship inside
         // the travsr binary and are governed by Rule 4's first-party rules.
-        let trust = crate::trust::TrustConfig::from_disk();
+        let trust = lang_toml.trust_config();
         let corpus_trusted = trust.is_trusted(&self.corpus);
 
         let current_exe = std::env::current_exe()

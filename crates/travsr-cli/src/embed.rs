@@ -631,6 +631,20 @@ fn install_backend_with_progress(backend: &'static EmbedBackend, reinstall: bool
 /// the 300 s mark, every retry, on every connection slower than that.
 const MODEL_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Size-scaled ceiling on the WHOLE download (#685 review). The stall detector
+/// alone lets a server that trickles one byte every <120 s keep `embed init`
+/// alive forever; this cap bounds that. Scaled from the expected size at a
+/// worst-case sustained 64 KiB/s (a 1.3 GB model gets ~5.7 h) plus a flat
+/// grace, so it only fires on transfers no stall-free connection could
+/// plausibly still be making progress on.
+const MODEL_TOTAL_CAP_FLOOR: std::time::Duration = std::time::Duration::from_secs(600);
+const MODEL_TOTAL_CAP_MIN_RATE: u64 = 64 * 1024; // bytes/s
+
+fn model_total_cap(expected_bytes: u64) -> std::time::Duration {
+    MODEL_TOTAL_CAP_FLOOR
+        + std::time::Duration::from_secs(expected_bytes / MODEL_TOTAL_CAP_MIN_RATE)
+}
+
 async fn download_model_file_with_progress(
     hf_repo: &str,
     url_path: &str,
@@ -652,10 +666,15 @@ async fn download_model_file_with_progress(
     if !resp.status().is_success() {
         bail!("model file download failed ({}): {url}", resp.status());
     }
-    let total_mb = resp
-        .content_length()
+    let content_length = resp.content_length();
+    let total_mb = content_length
         .map(|n| n / 1_048_576)
         .unwrap_or(size_hint_mb as u64);
+    // #685 review: the total cap scales with the expected size, so it never
+    // reintroduces the old constant ceiling that killed slow-but-healthy
+    // transfers; it exists to end transfers that can no longer finish.
+    let total_cap = model_total_cap(content_length.unwrap_or(size_hint_mb as u64 * 1_048_576));
+    let total_cutoff = std::time::Instant::now() + total_cap;
 
     let is_tty = std::io::stderr().is_terminal();
     let name = file_name.to_string();
@@ -704,9 +723,19 @@ async fn download_model_file_with_progress(
             .await
             .with_context(|| format!("creating {}", tmp.display()))?;
         loop {
+            // #685 review: even a never-stalling trickle must end eventually.
+            anyhow::ensure!(
+                std::time::Instant::now() < total_cutoff,
+                "model download exceeded the {}-minute total cap (got {} of {} MB); \
+                 the connection is too slow to finish; check it and re-run \
+                 `travsr embed init`",
+                total_cap.as_secs() / 60,
+                downloaded.load(std::sync::atomic::Ordering::Relaxed) / 1_048_576,
+                total_mb
+            );
             let chunk = match tokio::time::timeout(MODEL_STALL_TIMEOUT, resp.chunk()).await {
                 Err(_) => bail!(
-                    "model download stalled: no data received for {}s (got {} of {} MB) — \
+                    "model download stalled: no data received for {}s (got {} of {} MB); \
                      check the connection and re-run `travsr embed init`",
                     MODEL_STALL_TIMEOUT.as_secs(),
                     downloaded.load(std::sync::atomic::Ordering::Relaxed) / 1_048_576,
@@ -718,7 +747,18 @@ async fn download_model_file_with_progress(
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
                 .await
                 .with_context(|| format!("writing model file {file_name}"))?;
-            downloaded.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let written = downloaded
+                .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                + chunk.len() as u64;
+            // #685 review: a server streaming past its own Content-Length would
+            // otherwise grow the .tmp file without bound (disk-fill guard).
+            if let Some(expected) = content_length {
+                anyhow::ensure!(
+                    written <= expected,
+                    "server sent more than the advertised {expected} bytes for \
+                     {file_name}; aborting instead of filling the disk"
+                );
+            }
         }
         tokio::io::AsyncWriteExt::flush(&mut file)
             .await

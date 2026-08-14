@@ -39,26 +39,59 @@ impl TrustConfig {
     /// Load trusted corpora from ~/.travsr/lang.toml (written by `travsr lang add --corpus`).
     /// Override path via `TRAVSR_LANG_TOML` env var (for tests), mirroring
     /// [`registered_languages_from_disk`] so both halves of the lang.toml gate
-    /// read the same file.
+    /// read the same file. Callers that also need the registered list should
+    /// use [`LangToml::from_disk`] to read the file once.
     pub fn from_disk() -> Self {
-        let mut cfg = Self::new();
+        LangToml::from_disk().trust_config()
+    }
+}
+
+/// Both lang.toml gates in one read (#685 review): the `registered` language
+/// list and the `trusted_corpora` grants. `registered_languages_from_disk` and
+/// `TrustConfig::from_disk` each used to read and TOML-parse the same file
+/// independently (with duplicated silently-default-on-failure handling);
+/// callers that need both, like `invoke_phase_b_all`, load this once instead.
+///
+/// Read/parse failures deliberately yield the empty (deny-everything) default:
+/// a missing or corrupt lang.toml must fail closed for the trust gate.
+#[derive(Default)]
+pub struct LangToml {
+    pub registered: Vec<String>,
+    pub trusted_corpora: HashSet<String>,
+}
+
+impl LangToml {
+    /// One read + one parse of `~/.travsr/lang.toml` (or the
+    /// `TRAVSR_LANG_TOML` test override).
+    pub fn from_disk() -> Self {
         let Some(path) = lang_toml_path() else {
-            return cfg;
+            return Self::default();
         };
         let Ok(content) = std::fs::read_to_string(&path) else {
-            return cfg;
+            return Self::default();
         };
         let Ok(table) = toml::from_str::<toml::Value>(&content) else {
-            return cfg;
+            return Self::default();
         };
-        if let Some(corpora) = table.get("trusted_corpora").and_then(|v| v.as_array()) {
-            for c in corpora {
-                if let Some(s) = c.as_str() {
-                    cfg.trust(s);
-                }
-            }
+        let str_list = |key: &str| {
+            table
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)))
+                .into_iter()
+                .flatten()
+        };
+        Self {
+            registered: str_list("registered").collect(),
+            trusted_corpora: str_list("trusted_corpora").collect(),
         }
-        cfg
+    }
+
+    /// The trust half as a [`TrustConfig`], for callers holding a `LangToml`.
+    pub fn trust_config(self) -> TrustConfig {
+        TrustConfig {
+            trusted_corpora: self.trusted_corpora,
+        }
     }
 }
 
@@ -72,26 +105,10 @@ fn lang_toml_path() -> Option<std::path::PathBuf> {
 }
 
 /// Read the `registered` language list from ~/.travsr/lang.toml.
-/// Override path via `TRAVSR_LANG_TOML` env var (for tests).
+/// Override path via `TRAVSR_LANG_TOML` env var (for tests). Callers that also
+/// need the trust grants should use [`LangToml::from_disk`] instead.
 pub fn registered_languages_from_disk() -> Vec<String> {
-    let Some(path) = lang_toml_path() else {
-        return vec![];
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return vec![];
-    };
-    let Ok(table) = toml::from_str::<toml::Value>(&content) else {
-        return vec![];
-    };
-    table
-        .get("registered")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    LangToml::from_disk().registered
 }
 
 #[cfg(test)]
