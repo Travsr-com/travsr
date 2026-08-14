@@ -611,6 +611,7 @@ type PanelMessage =
   | { command: "reloadAvailable" }
   | { command: "initRepo" }
   | { command: "openFile"; path: string }
+  | { command: "refreshLog" }
   | { command: "refresh" };
 
 const managedPanels = new Map<string, { panel: vscode.WebviewPanel; refresh: () => Promise<void> }>();
@@ -751,29 +752,61 @@ export function registerShowRepos(client: McpClient): vscode.Disposable {
  * travsr.showGraphStats — read-only metrics dashboard webview.
  */
 export function registerShowGraphStats(client: McpClient): vscode.Disposable {
+  // Kept so a follow tick can redraw the log without re-running the two
+  // expensive halves of a render. Undefined until the first full pass, so a
+  // log-only refresh before then falls back to doing the work.
+  let lastStats: StatsView | undefined;
+  let lastDiags: Diagnostic[] = [];
+  let logOnly = false;
+
   const render = async (): Promise<string> => {
-    const stats = buildStatsView(await client.callTool("get_graph_stats"));
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const reuse = logOnly && lastStats !== undefined;
+    const stats = reuse ? (lastStats as StatsView) : buildStatsView(await client.callTool("get_graph_stats"));
     // Read straight from the log file rather than asking the daemon: it works
-    // after a crash, which is when the panel is worth opening.
+    // after a crash, which is when the panel is worth opening. This is the
+    // cheap half, and the only half a follow tick needs.
     const log = root ? readDaemonLogTail(root) : [];
     const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
-    const diags = root ? await readDiagnostics(bin, root) : [];
+    // readDiagnostics spawns `travsr status`.
+    const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
+    lastStats = stats;
+    lastDiags = diags;
     return buildStatsHtml(stats, log, diags);
   };
 
   const handle = async (msg: PanelMessage, refresh: RefreshFn, _postStatus: PostStatus): Promise<void> => {
     if (msg.command === "openFile") {
       // The log writes absolute paths in some places and repo-relative in
-      // others, so resolve against the repo root and let an absolute path win.
+      // others, so both resolve against the repo root. The result must stay
+      // inside it: the panel renders whatever the log file says, and a log file
+      // is not a trusted input just because it is local. Without this a `path=`
+      // field naming anything on disk becomes a click that opens it.
       const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      const target = root ? path.resolve(root, msg.path) : msg.path;
+      if (root === undefined) return;
+      const target = path.resolve(root, msg.path);
+      const rel = path.relative(root, target);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        void vscode.window.showWarningMessage(
+          `Travsr: ${msg.path} is outside the workspace, not opening it`
+        );
+        return;
+      }
       try {
         const doc = await vscode.workspace.openTextDocument(target);
         await vscode.window.showTextDocument(doc, { preview: true });
       } catch {
         // The file the log complained about may be the file that is gone.
         void vscode.window.showWarningMessage(`Travsr: cannot open ${msg.path}`);
+      }
+      return;
+    }
+    if (msg.command === "refreshLog") {
+      logOnly = true;
+      try {
+        await refresh();
+      } finally {
+        logOnly = false;
       }
       return;
     }

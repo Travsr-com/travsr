@@ -698,9 +698,13 @@ export function buildStatsHtml(
     `<button class="chip-btn" data-level="${id}" onclick="setLevel('${id}',this)">` +
     `${esc(label)} <span class="chip-n">${n}</span></button>`;
 
+  // Every line the reader returned is rendered. It used to cap at 200 while the
+  // header and the chips counted the full array, so on a log over 200 lines the
+  // panel claimed 342 with 200 rows in the DOM, and the 500 option could never
+  // show more than 200. The reader's own cap is the only cap now.
   const logRows = log.length
-    ? log
-        .slice(-200)
+    ? // Copy first: reverse() is in place, and this array belongs to the caller.
+      [...log]
         .reverse()
         .map(
           (e) =>
@@ -846,12 +850,22 @@ function mark(el, q) {
 }
 
 var followTimer = null;
+var followTick = 0;
 function toggleFollow(cb) {
   if (followTimer) { clearInterval(followTimer); followTimer = null; }
+  followTick = 0;
   // Re-reads the file on a timer, which is what --follow does. 3s is slower
   // than a tail and fast enough for a panel you glance at.
+  //
+  // Most ticks ask for the log alone. A full refresh costs a get_graph_stats
+  // round trip and a travsr status process, and paying that every three
+  // seconds to redraw a log is not what --follow does. Every tenth tick is
+  // full, so the health banner cannot claim the daemon is up for more than
+  // thirty seconds after it stops, which is the one thing that must not go
+  // stale while you are watching the log.
   if (cb.checked) followTimer = setInterval(function () {
-    vscode.postMessage({ command: 'refresh' });
+    followTick += 1;
+    vscode.postMessage({ command: followTick % 10 === 0 ? 'refresh' : 'refreshLog' });
   }, 3000);
 }
 

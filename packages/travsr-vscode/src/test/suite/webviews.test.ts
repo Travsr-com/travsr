@@ -444,3 +444,59 @@ suite("activity feed colouring", () => {
     assert.ok(html.includes('data-path="src/legacy.py"'), "the file is offered");
   });
 });
+
+suite("log panel counts what it renders", () => {
+  const line = (i: number, level = "INFO"): LogEntry => ({
+    time: "10:00:00",
+    level,
+    target: "travsr_daemon",
+    message: `line ${i}`,
+    detail: "",
+    iso: "2026-08-14T10:00:00Z",
+    raw: "{}",
+  });
+  const STATS = {
+    nodes: "1",
+    edges: "1",
+    schemaVersion: "22",
+    dbSize: "1 MB",
+    lastIndexed: "now",
+  };
+
+  test("a log past the old 200 cap renders every line it counts", () => {
+    // The reader returns up to 500. The panel used to render 200 while the
+    // header counted the whole array, so it claimed 342 lines with 200 in the
+    // DOM, and the 500 option could never show more than 200.
+    const log = Array.from({ length: 342 }, (_, i) => line(i));
+    const html = buildStatsHtml(STATS, log);
+    const rows = (html.match(/class="log-line /g) ?? []).length;
+    assert.strictEqual(rows, 342, `header says 342, DOM has ${rows}`);
+    assert.ok(html.includes("342 lines"), "and the header agrees");
+  });
+
+  test("severity chips count the same lines that are rendered", () => {
+    const log = [
+      ...Array.from({ length: 250 }, (_, i) => line(i)),
+      line(998, "WARN"),
+      line(999, "ERROR"),
+    ];
+    const html = buildStatsHtml(STATS, log);
+    const rows = (html.match(/class="log-line /g) ?? []).length;
+    assert.strictEqual(rows, 252);
+    // Both the warn and the error line are past the old cap, so under the old
+    // behaviour the chips promised rows the DOM did not have.
+    assert.ok(html.includes('data-rank="3"'), "the warning row is present");
+    assert.ok(html.includes('data-rank="4"'), "the error row is present");
+  });
+
+  test("rendering does not reorder the caller's array", () => {
+    const log = [line(1), line(2), line(3)];
+    const before = log.map((e) => e.message);
+    buildStatsHtml(STATS, log);
+    assert.deepStrictEqual(
+      log.map((e) => e.message),
+      before,
+      "reverse() must run on a copy"
+    );
+  });
+});
