@@ -271,6 +271,21 @@ fn is_username_material_base(c: char) -> bool {
 /// shape is a readability nit. The fallback is bounded to a single token, up
 /// to the next `/` or whitespace, never the old unbounded scan to the next
 /// separator anywhere later in the string.
+///
+/// Refined in #636 round-3 review: the fallback no longer fires when the
+/// candidate token is made up *entirely* of ASCII punctuation. The two
+/// ambiguous cases are separable on exactly that property, so this keeps
+/// fail-closed where it matters while dropping the readability cost where it
+/// does not. An exotic username (all-emoji, or any non-ASCII script) always
+/// contains at least one non-ASCII-punctuation character, so it still takes
+/// the fallback and is still consumed. A run that is nothing but ASCII
+/// punctuation cannot be a username at all, so consuming it only ever
+/// destroyed real message text:
+///
+/// ```text
+/// "see /home/, retrying"        keeps its comma  ->  "see ~, retrying"
+/// "path /home/(unknown) failed" still consumed   ->  "path ~ failed"
+/// ```
 fn username_run_end(after: &str) -> usize {
     let mut end = 0usize;
     for (idx, grapheme) in after.grapheme_indices(true) {
@@ -288,9 +303,17 @@ fn username_run_end(after: &str) -> usize {
     if end == 0 {
         if let Some(next_char) = after.chars().next() {
             if next_char != '/' && !next_char.is_whitespace() {
-                end = after
+                let candidate_end = after
                     .find(|c: char| c == '/' || c.is_whitespace())
                     .unwrap_or(after.len());
+                // An all-ASCII-punctuation run is not a username under any
+                // encoding, so leaving it alone cannot leak one.
+                let all_punctuation = after[..candidate_end]
+                    .chars()
+                    .all(|c| c.is_ascii_punctuation());
+                if !all_punctuation {
+                    end = candidate_end;
+                }
             }
         }
     }
@@ -1121,28 +1144,29 @@ mod tests {
         );
     }
 
-    /// Pins the residual fallback behaviour in [`username_run_end`] (#636
-    /// round-2 review follow-up): plain punctuation directly abutting a bare `/home/`
-    /// (no username at all, so the grapheme-aware run is zero-length) takes
-    /// the same fail-closed path built for an all-emoji username, and
-    /// consumes that one adjacent token along with the redaction.
+    /// Pins the fallback behaviour in [`username_run_end`] after the #636
+    /// round-3 refinement, which split the two previously-conflated
+    /// zero-length cases apart on one property: whether the candidate token
+    /// is made up entirely of ASCII punctuation.
     ///
-    /// This is INTENTIONAL and reviewed, not a latent bug: fixing these two
-    /// cases to stop leaves the fallback unable to tell "zero-length because
-    /// there is no username" apart from "zero-length because the username is
-    /// all-emoji", and the all-emoji case must still be redacted or a real
-    /// username leaks verbatim, which is a privacy defect. A dropped adjacent
-    /// token in this unusual bare-`/home/` shape is a readability nit by
-    /// comparison, and the fallback only ever consumes a single token (up to
-    /// the next `/` or whitespace), never the old unbounded scan. Do not
-    /// change this behaviour to make these two inputs "pass" without also
-    /// reintroducing the all-emoji leak; see the doc comment on
-    /// [`username_run_end`] for the full tradeoff. `assert_eq!` on the whole
-    /// string, never `contains`, since the point being pinned is exactly
-    /// which bytes are dropped.
+    /// The distinction is load-bearing in both directions, so both are
+    /// asserted here:
+    ///   - all ASCII punctuation cannot be a username under any encoding, so
+    ///     leaving it alone cannot leak one, and the comma survives.
+    ///   - anything containing a non-ASCII-punctuation character still takes
+    ///     the fail-closed path and is consumed, which is what keeps an
+    ///     exotic (all-emoji, or any non-ASCII script) username from leaking
+    ///     verbatim. `(unknown)` contains letters, so it is still consumed.
+    ///
+    /// Do not "fix" the second case to stop consuming without re-deriving the
+    /// all-emoji leak it exists to prevent; see the doc comment on
+    /// [`username_run_end`]. `assert_eq!` on the whole string, never
+    /// `contains`, since the point being pinned is exactly which bytes are
+    /// dropped.
     #[test]
-    fn redact_home_path_fallback_consumes_an_adjacent_non_username_token() {
-        assert_eq!(redact_sensitive("see /home/, retrying"), "see ~ retrying");
+    fn redact_home_path_fallback_keeps_punctuation_but_still_consumes_a_possible_username() {
+        // Refined: the comma is message text, not a username, and survives.
+        assert_eq!(redact_sensitive("see /home/, retrying"), "see ~, retrying");
         assert_eq!(
             redact_sensitive("path /home/(unknown) failed"),
             "path ~ failed"
