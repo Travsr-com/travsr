@@ -304,7 +304,22 @@ fn error_payload(reason: &str) -> serde_json::Value {
 /// `"unavailable"` per the #636 plan's classification table. Unknown warning
 /// classes (e.g. `scip_unification_misses`, which is not per-language) are
 /// ignored, they're not a language state.
-fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'static str, String)> {
+///
+/// The set of per-language classes handled here must stay equal to the set
+/// `travsr status` matches on, which is what the shared invariant above
+/// actually requires: a class present there and absent here does not merely
+/// lose its wording, it silently falls through to the availability ladder and
+/// can be reported as a terminal `done` (#636 round-5 review, which is how
+/// `untrusted_corpus` was missed). `phase_b_warning_classes_match_the_cli`
+/// pins the set, not just one string.
+///
+/// `corpus` is the store's `corpus` meta, needed only by the
+/// `untrusted_corpus` arm, whose remediation names the corpus to trust.
+/// Empty when unknown, matching what the CLI prints in that case.
+fn decode_phase_b_warnings(
+    warnings: &str,
+    corpus: &str,
+) -> HashMap<String, (&'static str, String)> {
     let mut out = HashMap::new();
     for warn in warnings.split(',') {
         let warn = warn.trim();
@@ -400,6 +415,24 @@ fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'static str, Str
                     ),
                 );
             }
+            // ADR-017 Rule 3 trust gate (#414): the daemon records this when
+            // it declines to spawn a sidecar for a language because the
+            // repository's corpus is not trusted. Wording tracks
+            // `travsr status` (status.rs), which reads the same `corpus` meta
+            // to name what to trust.
+            "untrusted_corpus" => {
+                out.insert(
+                    rest.to_string(),
+                    (
+                        "unavailable",
+                        format!(
+                            "'{rest}' is registered but this repository's corpus is not \
+                             trusted for semantic indexing. Run `travsr lang add {rest} \
+                             --corpus {corpus}` to trust it"
+                        ),
+                    ),
+                );
+            }
             _ => {}
         }
     }
@@ -431,10 +464,18 @@ fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'static str, Str
 /// `lang.toml` (honouring `TRAVSR_LANG_TOML`) and `CatalogResolver::new`
 /// reads it plus probes `PATH`. Nothing is written, nothing is downloaded.
 /// The resolver is built once per payload, not once per language.
-fn phase_b_availability(root: Option<&Path>) -> HashMap<&'static str, Option<String>> {
+fn phase_b_availability(
+    root: Option<&Path>,
+    corpus: &str,
+) -> HashMap<&'static str, Option<String>> {
     use travsr_plugin_host::resolver::PluginResolver as _;
 
-    let registered = travsr_plugin_host::trust::registered_languages_from_disk();
+    // `LangToml::from_disk` rather than `registered_languages_from_disk`: the
+    // trust rung below needs the `trusted_corpora` half of the same file, and
+    // reading it once keeps the two halves consistent with each other.
+    let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
+    let registered = lang_toml.registered.clone();
+    let trust = lang_toml.trust_config();
     let resolver = travsr_plugin_host::resolver::CatalogResolver::new();
     let has_compdb = root.map(|r| r.join("compile_commands.json").exists());
 
@@ -447,6 +488,20 @@ fn phase_b_availability(root: Option<&Path>) -> HashMap<&'static str, Option<Str
             Some(format!(
                 "'{lang}' sources found but semantic indexing is not set up. \
                  Run `travsr lang install {lang}`"
+            ))
+        } else if !trust.is_trusted(corpus) {
+            // ADR-017 Rule 3 trust gate (#414). Sits exactly here because the
+            // indexer's own ladder does (`travsr-plugin-host/src/indexer.rs`:
+            // between the registration check and the compdb check), and
+            // builtins are exempt there for the same reason as above. Without
+            // this rung a language whose sidecar the gate declined to spawn,
+            // and which therefore has no recorded warning yet, falls through
+            // to "available" and is then reported as a terminal `done`
+            // (#636 round-5 review).
+            Some(format!(
+                "'{lang}' is registered but this repository's corpus is not trusted \
+                 for semantic indexing. Run `travsr lang add {lang} --corpus {corpus}` \
+                 to trust it"
             ))
         } else if entry.command == "scip-clang" && has_compdb == Some(false) {
             Some(format!(
@@ -602,7 +657,8 @@ fn index_status_payload(
         .ok()
         .flatten()
         .unwrap_or_default();
-    let decoded_warnings = decode_phase_b_warnings(&warnings_raw);
+    let corpus_meta = store.get_meta("corpus").ok().flatten().unwrap_or_default();
+    let decoded_warnings = decode_phase_b_warnings(&warnings_raw, &corpus_meta);
     // #636 A4: no persisted "job in flight" signal exists; derive it from the
     // live daemon-lock probe plus a commit mismatch. Best-effort, documented
     // on the field, not tested by any acceptance criterion.
@@ -620,7 +676,7 @@ fn index_status_payload(
     // hand-maintained copy: that copy is missing `objectivec`, which is a
     // real Phase B language, so it was excluded from `phase_b.languages`
     // entirely. It is now reported like any other catalog language.
-    let availability = phase_b_availability(root);
+    let availability = phase_b_availability(root, &corpus_meta);
     let languages = store.language_distribution().unwrap_or_default();
     let languages: Vec<(String, u64)> = languages
         .into_iter()
@@ -1937,14 +1993,24 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let lang_toml = tempfile::tempdir().unwrap();
         let lang_toml_path = lang_toml.path().join("lang.toml");
-        // Registered, so the ladder gets past the registration rung and
-        // reaches the compdb one.
-        std::fs::write(&lang_toml_path, "registered = [\"c\"]\n").unwrap();
+        // Registered AND trusted, so the ladder gets past both the
+        // registration rung and the ADR-017 trust rung (which sits between
+        // registration and compdb, mirroring
+        // `travsr-plugin-host/src/indexer.rs`) and actually reaches the
+        // compdb rung this test is about. Trust was added in #636 round-5;
+        // without the grant the ladder now stops one rung earlier, which is
+        // correct behaviour, just not what is under test here.
+        std::fs::write(
+            &lang_toml_path,
+            "registered = [\"c\"]\ntrusted_corpora = [\"github.com/acme/repo\"]\n",
+        )
+        .unwrap();
         std::env::set_var("TRAVSR_LANG_TOML", &lang_toml_path);
 
         let mut store = SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc123").unwrap();
         store.set_meta("phase_b_commit", "abc123").unwrap();
+        store.set_meta("corpus", "github.com/acme/repo").unwrap();
         store
             .put_node(&Node::new(
                 VName::new("corpus", "main", "src/a.c", "c", "fn:a"),
@@ -2193,7 +2259,7 @@ mod tests {
     /// across crates at compile time, which is exactly why it is pinned here.
     #[test]
     fn phase_b_warning_wording_tracks_the_cli() {
-        let decoded = decode_phase_b_warnings("crashed:go");
+        let decoded = decode_phase_b_warnings("crashed:go", "");
         let (state, detail) = decoded.get("go").expect("go must decode");
         assert_eq!(*state, "failed");
         assert!(
