@@ -735,12 +735,100 @@ function updateHint() {
 // client-side re-render can repaint without asking the host again.
 let _diagByNode = {};
 let _diagUnknown = [];
+// Per-file diagnostic lists, for the detail panel's Problems section. Keyed by
+// graph path because attribution is file-scoped, so every node from one file
+// shares one list.
+let _diagItemsByFile = {};
+let _diagTruncated = {};
 
-function applyDiagnosticsOverlay(byNode, unknownCoverage) {
+function applyDiagnosticsOverlay(byNode, unknownCoverage, itemsByFile, itemsTruncated) {
   _diagByNode = byNode || {};
   _diagUnknown = unknownCoverage || [];
+  _diagItemsByFile = itemsByFile || {};
+  _diagTruncated = itemsTruncated || {};
   paintDiagnostics();
   updateDiagBadge();
+  refreshOpenDetailProblems();
+  refreshOpenPeekDiagnostics();
+}
+
+// ── Problems section of the detail panel ──────────────────────────────────────
+// The ring says a node's file is broken; this says how, and clicking a row
+// opens that file at that diagnostic's own line rather than the node's.
+
+/** Build the Problems section for `path`, or '' when there is nothing to say. */
+function diagProblemsHtml(path) {
+  if (!path) return '';
+  const items = _diagItemsByFile[path] || [];
+  // A file no provider has published for is unknown, not clean. Saying nothing
+  // here would let the absence read as a pass.
+  if (items.length === 0) {
+    if (_diagUnknown.indexOf(path) === -1) return '';
+    return '<div class="d-section"><div class="d-title">Problems</div>' +
+      '<div class="diag-none-note">No diagnostic provider has reported on this file, ' +
+      'so it is not diagnosed rather than clean.</div></div>';
+  }
+
+  const dropped = _diagTruncated[path] || 0;
+  const errors = items.filter(i => i.severity === 'error').length;
+  const warnings = items.length - errors;
+  const counts = [];
+  if (errors > 0) counts.push(errors + (errors === 1 ? ' error' : ' errors'));
+  if (warnings > 0) counts.push(warnings + (warnings === 1 ? ' warning' : ' warnings'));
+
+  const rows = items.map(i =>
+    '<button class="diag-item ' + (i.severity === 'error' ? 'is-err' : 'is-warn') + '"' +
+      ' data-diag-line="' + i.line + '"' +
+      ' title="' + escHtml(i.message) + '\nGo to line ' + i.line + '">' +
+      '<span class="diag-item-icon">' + (i.severity === 'error' ? '⊗' : '⚠') + '</span>' +
+      '<span class="diag-item-line">' + i.line + '</span>' +
+      '<span class="diag-item-msg">' + escHtml(i.message) + '</span>' +
+      (i.source ? '<span class="diag-item-src">' + escHtml(i.source) + '</span>' : '') +
+    '</button>'
+  ).join('');
+
+  return '<div class="d-section"><div class="d-title">Problems (' + counts.join(', ') + ')</div>' +
+    '<div class="diag-list">' + rows + '</div>' +
+    (dropped > 0
+      ? '<div class="diag-none-note">and ' + dropped + ' more, not listed</div>'
+      : '') +
+    '<div class="diag-none-note">Counts are per file, not per symbol.</div>' +
+  '</div>';
+}
+
+/** Wire the Problems rows of an already-rendered detail panel. */
+function wireDiagProblems(detailEl, path) {
+  detailEl.querySelectorAll('[data-diag-line]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      vscode.postMessage({
+        command: 'goToDefinition',
+        path: path,
+        line: Number(btn.getAttribute('data-diag-line')) || 1,
+      });
+    });
+  });
+}
+
+/**
+ * Repaint the Problems section of the open detail panel when a new overlay
+ * lands, so the list tracks the editor while the panel stays open. Only this
+ * section is replaced: rebuilding the whole panel would drop scroll position
+ * and the peek state on every keystroke.
+ */
+function refreshOpenDetailProblems() {
+  const detailEl = document.getElementById('detail');
+  if (!detailEl || !detailEl.classList.contains('open')) return;
+  const host = detailEl.querySelector('[data-diag-host]');
+  if (!host) return;
+  const path = host.getAttribute('data-diag-host');
+  // The list has its own scrollbar, and overlays land on every keystroke, so
+  // rebuilding it would scroll the reader back to the top as they type.
+  const prev = host.querySelector('.diag-list');
+  const scroll = prev ? prev.scrollTop : 0;
+  host.innerHTML = diagProblemsHtml(path);
+  const next = host.querySelector('.diag-list');
+  if (next) next.scrollTop = scroll;
+  wireDiagProblems(host, path);
 }
 
 function paintDiagnostics() {
@@ -866,7 +954,7 @@ window.addEventListener('message', event => {
   }
 
   if (msg.command === 'diagnosticsOverlay') {
-    applyDiagnosticsOverlay(msg.byNode, msg.unknownCoverage);
+    applyDiagnosticsOverlay(msg.byNode, msg.unknownCoverage, msg.itemsByFile, msg.itemsTruncated);
   }
 });
 
@@ -1141,6 +1229,9 @@ function showDetail(n) {
       '<div class="d-row"><span class="d-key">token cost</span><span class="d-val gold">' + tok + '</span></div>' +
     '</div>' +
     (edgeItems ? '<div class="d-section"><div class="d-title">Edges (' + n.connectedEdges().length + ')</div><ul>' + edgeItems + '</ul></div>' : '') +
+    // Problems sits above Actions and inside its own host element, so a new
+    // overlay can replace just this part without rebuilding the panel.
+    '<div data-diag-host="' + escHtml(d.path || '') + '">' + diagProblemsHtml(d.path) + '</div>' +
     '<div class="d-section"><div class="d-title">Actions</div>' +
       (d.path && d.line ? '<button class="btn-action" data-act="peek">↗ Definition peek</button>' : '') +
       (d.path ? '<button class="btn-action" data-act="goto">↗ Go to definition</button>' : '') +
@@ -1150,6 +1241,7 @@ function showDetail(n) {
     '</div>';
 
   // Wire actions — CSP blocks onclick= in innerHTML; must use addEventListener.
+  wireDiagProblems(detailEl, d.path);
   const _peek = detailEl.querySelector('[data-act="peek"]');
   if (_peek) _peek.addEventListener('click', () => peekNode(d.path, d.line || 0));
   const _goto = detailEl.querySelector('[data-act="goto"]');
@@ -1423,15 +1515,129 @@ function peekNode(path, line) {
   };
 }
 
+// Last peek, kept so a new diagnostics overlay can re-mark the open panel
+// without asking the host to read the file again.
+let _lastPeek = null;
+
+/**
+ * Worst severity and messages per line, for the file being peeked.
+ * Errors outrank warnings on a line that has both.
+ */
+function diagByLineFor(path) {
+  const out = {};
+  (_diagItemsByFile[path] || []).forEach(i => {
+    const cur = out[i.line];
+    if (!cur) {
+      out[i.line] = { severity: i.severity, messages: [i.message] };
+      return;
+    }
+    cur.messages.push(i.message);
+    if (i.severity === 'error') cur.severity = 'error';
+  });
+  return out;
+}
+
+/**
+ * How many of a file's problems fall outside the peeked window.
+ *
+ * Counted against the *uncapped* total: `_diagItemsByFile` is clamped to
+ * MAX_DIAGNOSTIC_ITEMS_PER_FILE by the host, with the remainder in
+ * `_diagTruncated`, and leaving that remainder out here would under-report
+ * exactly on the files that have the most wrong with them.
+ */
+function peekOutsideCount(path, byLine, shownLines) {
+  const total = (_diagItemsByFile[path] || []).length + (_diagTruncated[path] || 0);
+  let inside = 0;
+  shownLines.forEach(no => {
+    if (byLine[no]) inside += byLine[no].messages.length;
+  });
+  return Math.max(0, total - inside);
+}
+
+/**
+ * Apply diagnostics to the rows already in the peek body.
+ *
+ * Marks in place rather than re-rendering: overlays land on every keystroke
+ * (debounced), and rebuilding `peekBody.innerHTML` would throw away the
+ * reader's scroll position each time. Every row carries a `.pk-mark` slot and
+ * a `data-line` from the start, so marking one never reflows the code either.
+ */
+function markPeekDiagnostics(path, defLine) {
+  const body = document.getElementById('peekBody');
+  if (!body) return;
+  const byLine = diagByLineFor(path);
+  const shown = [];
+
+  body.querySelectorAll('.pk-ln').forEach(row => {
+    const no = Number(row.getAttribute('data-line'));
+    shown.push(no);
+    const dg = byLine[no];
+    row.classList.remove('pk-err', 'pk-warn');
+    const mark = row.querySelector('.pk-mark');
+    if (!dg) {
+      if (mark) { mark.textContent = ''; mark.removeAttribute('title'); }
+      return;
+    }
+    row.classList.add(dg.severity === 'error' ? 'pk-err' : 'pk-warn');
+    if (mark) {
+      mark.textContent = dg.severity === 'error' ? '⊗' : '⚠';
+      mark.title = dg.messages.join('\n');
+    }
+  });
+
+  // A problem outside the peeked window would otherwise be invisible here, and
+  // the panel would read as though the rest of the file were fine.
+  const outside = peekOutsideCount(path, byLine, shown);
+  const note = document.getElementById('peekOutside');
+  if (note) {
+    note.textContent = outside > 0
+      ? outside + (outside === 1 ? ' more problem' : ' more problems') +
+        ' in this file, outside the lines shown'
+      : '';
+  }
+}
+
 function renderPeekPanel(path, defLine, lines) {
+  _lastPeek = { path: path, defLine: defLine };
   document.getElementById('peekPath').textContent = path + ':' + defLine;
-  const pre = lines.map(({ no, text }) => {
-    const hl = no === defLine;
-    const escaped = escHtml(text);
-    return '<div class="pk-ln' + (hl ? ' hl' : '') + '"><span class="no">' + no + '</span><span class="code">' + escaped + '</span></div>';
-  }).join('');
-  document.getElementById('peekBody').innerHTML = '<pre>' + pre + '</pre>';
+
+  const pre = lines.map(({ no, text }) =>
+    '<div class="pk-ln' + (no === defLine ? ' hl' : '') + '" data-line="' + no + '">' +
+      '<span class="pk-mark"></span>' +
+      '<span class="no">' + no + '</span>' +
+      '<span class="code">' + escHtml(text) + '</span>' +
+    '</div>'
+  ).join('');
+
+  const body = document.getElementById('peekBody');
+  body.innerHTML = '<pre>' + pre + '</pre><div class="pk-outside" id="peekOutside"></div>';
   document.getElementById('peek').classList.add('open');
+
+  // #688: the same diagnostics the rings and the Problems list use, on the
+  // source itself. A ring says the file is broken; this says which line.
+  markPeekDiagnostics(path, defLine);
+
+  // Delegated, and bound once per render rather than per row: marking happens
+  // again on every overlay, so a per-row listener would have to be rebound
+  // each time and would not survive a row that becomes marked later.
+  body.onclick = e => {
+    const row = e.target.closest ? e.target.closest('.pk-ln') : null;
+    if (!row) return;
+    if (!row.classList.contains('pk-err') && !row.classList.contains('pk-warn')) return;
+    vscode.postMessage({
+      command: 'goToDefinition',
+      path: path,
+      line: Number(row.getAttribute('data-line')) || defLine,
+    });
+  };
+}
+
+/** Re-mark an open peek when a new overlay lands, so it tracks the editor. */
+function refreshOpenPeekDiagnostics() {
+  if (!_lastPeek) return;
+  const peek = document.getElementById('peek');
+  if (!peek || !peek.classList.contains('open')) return;
+  markPeekDiagnostics(_lastPeek.path, _lastPeek.defLine);
 }
 
 function closePeek() {

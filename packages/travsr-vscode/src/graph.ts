@@ -70,9 +70,54 @@ export interface NodeDiagnostic {
   count: number;
 }
 
+/**
+ * One diagnostic, as the detail panel lists it. The badge answers "is this
+ * broken"; this answers "broken how, and where", which is the thing a reader
+ * can act on.
+ *
+ * `line` is 1-based, matching the graph's own `line` and what
+ * `goToDefinition` expects, rather than the 0-based `Range` it comes from.
+ */
+export interface NodeDiagnosticItem {
+  severity: NodeDiagnosticSeverity;
+  line: number;
+  message: string;
+  /** Producer (`ts`, `eslint`, …) when the provider set one. */
+  source?: string;
+}
+
+/**
+ * Cap on listed diagnostics per file. A generated or badly broken file can
+ * hold thousands, and the panel is a place to start reading, not a second
+ * Problems view. The overflow is counted, never silently dropped.
+ */
+export const MAX_DIAGNOSTIC_ITEMS_PER_FILE = 50;
+
+/** Cap on a single diagnostic message. Long type errors run to kilobytes. */
+export const MAX_DIAGNOSTIC_MESSAGE_CHARS = 300;
+
 export interface DiagnosticsOverlay {
   /** Node id → worst severity + count. Clean nodes are absent, not zeroed. */
   byNode: Record<string, NodeDiagnostic>;
+  /**
+   * Graph file path → the individual diagnostics in it, worst first.
+   *
+   * Keyed by file rather than by node id because attribution is file-scoped
+   * (see `scope`): a graph routinely holds dozens of symbols from one file,
+   * and keying by node would copy the same list under each of them. The
+   * webview maps a node to its list through the node's own `path`.
+   *
+   * Message text lives here and only here. It never reaches the daemon's
+   * editor plane (`broken`), which stays counts-only: that plane is queried
+   * over a socket and persisted in another process, while this one is posted
+   * to a webview in the same extension host that already holds the text.
+   */
+  itemsByFile: Record<string, NodeDiagnosticItem[]>;
+  /**
+   * Graph file path → how many diagnostics were dropped by
+   * `MAX_DIAGNOSTIC_ITEMS_PER_FILE`. Absent when nothing was dropped.
+   */
+  itemsTruncated: Record<string, number>;
   /**
    * Attribution granularity. `"file"` means a diagnostic anywhere in a file
    * badges every node from that file, because `get_graph_json` emits `line`
@@ -168,6 +213,46 @@ function worstDiagnostic(t: {
   if (t.warnings > 0) return { severity: "warning", count: t.warnings };
   return null;
 }
+/**
+ * The listable diagnostics of one file, errors first and then by line.
+ *
+ * Same severity policy as the badge: Info and Hint are dropped, so the list
+ * and the ring can never disagree about whether a file is a problem. Sorting
+ * puts errors first because a reader scanning the panel wants the thing that
+ * breaks the build before the thing that lints.
+ */
+function listItems(diags: readonly vscode.Diagnostic[]): NodeDiagnosticItem[] {
+  const items: NodeDiagnosticItem[] = [];
+  for (const d of diags) {
+    const severity: NodeDiagnosticSeverity | null =
+      d.severity === vscode.DiagnosticSeverity.Error
+        ? "error"
+        : d.severity === vscode.DiagnosticSeverity.Warning
+          ? "warning"
+          : null;
+    if (!severity) continue;
+    const message = d.message.replace(/\s+/g, " ").trim();
+    items.push({
+      severity,
+      // `Range` is 0-based; every consumer here (the graph's `line`,
+      // `goToDefinition`) is 1-based.
+      line: d.range.start.line + 1,
+      message:
+        message.length > MAX_DIAGNOSTIC_MESSAGE_CHARS
+          ? message.slice(0, MAX_DIAGNOSTIC_MESSAGE_CHARS - 1) + "…"
+          : message,
+      ...(d.source ? { source: d.source } : {}),
+    });
+  }
+  items.sort((a, b) =>
+    a.severity === b.severity
+      ? a.line - b.line
+      : a.severity === "error"
+        ? -1
+        : 1
+  );
+  return items;
+}
 
 /**
  * Map the diagnostics VS Code already holds onto the nodes currently rendered.
@@ -194,6 +279,8 @@ export function computeDiagnosticsOverlay(
   const byNode: Record<string, NodeDiagnostic> = {};
   const unknownCoverage: string[] = [];
   const broken: FileDiagnostics[] = [];
+  const itemsByFile: Record<string, NodeDiagnosticItem[]> = {};
+  const itemsTruncated: Record<string, number> = {};
   const perFile = new Map<string, NodeDiagnostic | null>();
 
   for (const node of nodes) {
@@ -204,9 +291,19 @@ export function computeDiagnosticsOverlay(
         perFile.set(node.path, null);
       } else {
         if (!published.has(uri.fsPath)) unknownCoverage.push(node.path);
-        const t = tally(vscode.languages.getDiagnostics(uri));
+        const diags = vscode.languages.getDiagnostics(uri);
+        const t = tally(diags);
         if (t.errors > 0 || t.warnings > 0) {
           broken.push({ path: node.path, errors: t.errors, warnings: t.warnings });
+          const items = listItems(diags);
+          if (items.length > MAX_DIAGNOSTIC_ITEMS_PER_FILE) {
+            itemsTruncated[node.path] =
+              items.length - MAX_DIAGNOSTIC_ITEMS_PER_FILE;
+          }
+          itemsByFile[node.path] = items.slice(
+            0,
+            MAX_DIAGNOSTIC_ITEMS_PER_FILE
+          );
         }
         perFile.set(node.path, worstDiagnostic(t));
       }
@@ -217,6 +314,8 @@ export function computeDiagnosticsOverlay(
 
   return {
     byNode,
+    itemsByFile,
+    itemsTruncated,
     scope: "file",
     unknownCoverage,
     broken,

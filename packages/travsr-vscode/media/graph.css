@@ -445,6 +445,25 @@ kbd {
 .pk-ln .code { flex: 1; }
 .pk-ln.hl { background: rgba(134,223,134,.06); box-shadow: inset 3px 0 0 var(--green-300); }
 .pk-ln.hl .no { color: var(--green-300); }
+/* #688: diagnostics on the peeked source. The gutter marker is always present
+   but empty on clean lines, so marking one never shifts the code sideways. */
+.pk-ln .pk-mark { width: 16px; text-align: center; flex: none; user-select: none; font-size: 10px; color: transparent; }
+.pk-ln.pk-err, .pk-ln.pk-warn { cursor: pointer; }
+.pk-ln.pk-err  { background: rgba(244,100,90,.07); box-shadow: inset 3px 0 0 var(--danger); }
+.pk-ln.pk-warn { background: rgba(252,208,83,.06); box-shadow: inset 3px 0 0 var(--caution); }
+.pk-ln.pk-err  .pk-mark { color: var(--danger); }
+.pk-ln.pk-warn .pk-mark { color: var(--caution); }
+.pk-ln.pk-err  .no { color: var(--danger); }
+.pk-ln.pk-warn .no { color: var(--caution); }
+.pk-ln.pk-err:hover, .pk-ln.pk-warn:hover { background: rgba(255,255,255,.06); }
+/* The definition line keeps its own green rule when it is also broken: the
+   severity colour wins, since that is the more urgent fact. */
+.pk-ln.hl.pk-err  { box-shadow: inset 3px 0 0 var(--danger); }
+.pk-ln.hl.pk-warn { box-shadow: inset 3px 0 0 var(--caution); }
+/* Always in the DOM so marking can fill it without a reflow, but it must take
+   no space when there is nothing outside the window to report. */
+.pk-outside { padding: 8px 14px 4px; font-size: 9.5px; color: var(--fg-subtle); }
+.pk-outside:empty { display: none; }
 #peekActions { display: flex; gap: 6px; padding: 6px 14px; border-top: 1px solid var(--border); flex-shrink: 0; }
 
 /* ── Detail panel ────────────────────────────────────────────────────────── */
@@ -499,6 +518,40 @@ kbd {
 .btn-action:first-child { margin-top: 0; }
 .btn-action:hover { border-color: var(--line-green); background: rgba(134,223,134,.05); transform: translateX(3px); }
 .btn-action.hot:hover { border-color: var(--line-orange); background: rgba(251,146,60,.05); }
+
+/* #688: the detail panel's Problems list. Rows are buttons, not links: they
+   run a command in the host rather than navigating, and a button is what a
+   screen reader should announce. Severity is carried by the icon and the left
+   border, never by colour alone. */
+.diag-list { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
+.diag-item {
+  display: grid; grid-template-columns: 12px 34px 1fr auto; gap: 7px; align-items: baseline;
+  width: 100%; padding: 6px 9px; text-align: left; cursor: pointer;
+  background: rgba(255,255,255,.028); border: 1px solid #2a2a2a; border-left-width: 2px;
+  color: var(--ch-200); border-radius: 6px;
+  font: 500 11px var(--font-ui); transition: all var(--dur-fast) var(--ease);
+}
+.diag-item.is-err  { border-left-color: var(--danger); }
+.diag-item.is-warn { border-left-color: var(--caution); }
+.diag-item:hover { background: rgba(255,255,255,.06); transform: translateX(3px); }
+.diag-item.is-err:hover  { border-color: var(--danger); }
+.diag-item.is-warn:hover { border-color: var(--caution); }
+.diag-item-icon { font-size: 10px; }
+.diag-item.is-err  .diag-item-icon { color: var(--danger); }
+.diag-item.is-warn .diag-item-icon { color: var(--caution); }
+.diag-item-line { font-family: var(--font-mono); font-size: 10px; color: var(--fg-subtle); }
+/* Two lines then clamp: enough to identify the error, not enough for one
+   stack-shaped type error to push the rest of the list off screen. */
+.diag-item-msg {
+  overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  line-height: 1.35;
+}
+.diag-item-src { font-family: var(--font-mono); font-size: 9px; color: #686868; }
+.diag-none-note { margin-top: 6px; font-size: 9.5px; line-height: 1.4; color: var(--fg-subtle); }
+
+@media (prefers-reduced-motion: reduce) {
+  .diag-item:hover { transform: none; }
+}
 
 /* Tooltip */
 #tip {
