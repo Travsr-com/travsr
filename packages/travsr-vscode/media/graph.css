@@ -210,14 +210,65 @@ input[type=range] { width: 72px; accent-color: var(--green-300); cursor: pointer
   font-size: 10px; font-weight: 600; text-transform: uppercase;
   letter-spacing: .06em; color: var(--fg-muted); flex-shrink: 0;
 }
-#disambig-bar .db-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+/* Always one row. Wrapping grew the bar with the result count and pushed the
+   graph itself off screen; 25 implementations cost six rows. Overflow is the
+   scrollbar's job, and the scrollbar is styled to be seen rather than hidden —
+   an invisible one leaves the row looking truncated with no way out. */
+#disambig-bar .db-chips {
+  display: flex; gap: 6px; flex-wrap: nowrap;
+  overflow-x: auto; overflow-y: visible; flex: 1; min-width: 0;
+  padding: 3px 0 5px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-mid) transparent;
+}
+#disambig-bar .db-chips::-webkit-scrollbar { height: 7px; }
+#disambig-bar .db-chips::-webkit-scrollbar-track {
+  background: rgba(255,255,255,.04); border-radius: var(--r-full);
+}
+#disambig-bar .db-chips::-webkit-scrollbar-thumb {
+  background: var(--border-mid); border-radius: var(--r-full);
+}
+#disambig-bar .db-chips::-webkit-scrollbar-thumb:hover { background: var(--ch-400); }
 .db-chip {
   padding: 3px 10px; border-radius: var(--r-full); border: 1px solid var(--border-mid);
   cursor: pointer; font-size: 10px; font-weight: 600; color: var(--fg-muted);
   user-select: none; transition: all var(--dur-fast) var(--ease);
   white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+  /* Load-bearing. A flex item shrinks by default, so in a nowrap row 28 chips
+     collapsed to unreadable stubs instead of overflowing into the scroll they
+     were given. Chips keep their natural width; the row scrolls. */
+  flex: 0 0 auto;
 }
-.db-chip:hover { border-color: var(--ch-400); color: var(--ch-200); }
+/* Hover lifts the chip out of the row and drops the width cap, so a truncated
+   label reads in place instead of forcing the reader into the title tooltip.
+   The scale is what makes it read as lifted rather than as a layout jump; the
+   global reduced-motion rule already flattens the transition to instant. */
+/* Hover marks the chip; the full text is the popup's job. Widening the chip
+   itself would reflow every chip to its right, out from under the cursor. */
+.db-chip:hover {
+  border-color: var(--ch-400); color: var(--ch-100); background: var(--bg-elev);
+}
+
+/* The popup lives outside the chip row on purpose. `overflow-x: auto` makes
+   that row a clipping context on both axes, so anything absolutely positioned
+   inside it gets cut off; `position: fixed` escapes the clip entirely. One
+   shared element, moved on hover, rather than one per chip. */
+#db-tip {
+  position: fixed; z-index: 60; display: none; pointer-events: none;
+  max-width: min(560px, 90vw);
+  padding: 7px 10px; border-radius: var(--r-sm);
+  background: var(--bg-elev); border: 1px solid var(--border-mid);
+  box-shadow: 0 6px 22px rgba(0,0,0,.55);
+  font-size: 11px; line-height: 1.45; color: var(--fg);
+}
+#db-tip .tip-sym {
+  font-family: var(--font-mono); font-weight: 600; color: var(--green-300);
+  word-break: break-all;
+}
+#db-tip .tip-path {
+  font-family: var(--font-mono); color: var(--fg-subtle); font-size: 10px;
+  word-break: break-all; margin-top: 2px;
+}
 .db-chip.active { border-color: var(--line-green); color: var(--green-300); background: var(--tint-green); }
 .db-chip.db-all { border-style: dashed; }
 
@@ -558,8 +609,10 @@ kbd {
 }
 
 /* ── Node search overlay ────────────────────────────────────────────────── */
+/* Anchored to #main, so it always sits inside the canvas and never over the
+   toolbar, whatever height the toolbar happens to be. */
 #node-search {
-  position: absolute; top: 48px; left: 50%; transform: translateX(-50%);
+  position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
   z-index: 120; width: 320px;
   background: var(--ch-800); border: 1px solid var(--border);
   border-radius: 10px; box-shadow: 0 8px 32px rgba(0,0,0,.6);

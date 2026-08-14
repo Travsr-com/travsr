@@ -354,32 +354,96 @@ function renderDisambigBar() {
   }
   bar.style.display = 'flex';
 
+  // When every implementation lives in the same file, the path is repeated on
+  // every chip and distinguishes nothing — it is pure width. Drop it and let
+  // the file be stated once, in the label.
+  const paths = new Set(roots.map(r => r.path || ''));
+  const sharedPath = paths.size === 1 ? [...paths][0] : null;
+
   function chipLabel(r) {
     const base = shortLabel(r.label, r.id);
+    if (sharedPath !== null) return base;
     const parts = (r.path || '').split('/');
     const sub   = parts.length >= 2 ? parts.slice(-2).join('/') : (parts[0] || '');
     return sub ? base + ' · ' + sub : base;
   }
 
   const allActive = _disambigRoot === null;
+  // No `title`: the native tooltip is slow, truncates long paths, and would
+  // fight the popup. The full text travels in data attributes instead, and
+  // aria-label keeps the accessible name.
   const chipsHtml = [
-    `<span class="db-chip db-all${allActive ? ' active' : ''}" data-root="" title="Show all implementations">all</span>`,
+    `<span class="db-chip db-all${allActive ? ' active' : ''}" data-root="" aria-label="Show all implementations">all</span>`,
     ...roots.map(r => {
       const lbl = escHtml(chipLabel(r));
       const active = _disambigRoot === r.id ? ' active' : '';
-      return `<span class="db-chip${active}" data-root="${escHtml(r.id)}" title="${escHtml(r.id)}">${lbl}</span>`;
+      const sym = shortLabel(r.label, r.id);
+      return `<span class="db-chip${active}" data-root="${escHtml(r.id)}"` +
+        ` data-sym="${escHtml(sym)}" data-path="${escHtml(r.path || '')}"` +
+        ` aria-label="${escHtml(sym)}">${lbl}</span>`;
     }),
   ].join('');
 
-  bar.innerHTML = `<span class="db-label">implementations</span><div class="db-chips">${chipsHtml}</div>`;
+  // The label carries the shared file so the chips do not have to, and the
+  // count so the row reads as complete even when it is scrolled.
+  const shortShared = sharedPath ? sharedPath.split('/').slice(-2).join('/') : '';
+  const label = shortShared
+    ? `${roots.length} in ${escHtml(shortShared)}`
+    : `${roots.length} implementations`;
+
+  // One scrolling row, always. The overflow is the scrollbar's to carry.
+  bar.innerHTML =
+    `<span class="db-label">${label}</span>` +
+    `<div class="db-chips">${chipsHtml}</div>`;
 
   bar.querySelectorAll('.db-chip').forEach(chip => {
     chip.addEventListener('click', () => {
       _disambigRoot = chip.dataset.root || null;
+      hideChipTip();
       renderDisambigBar();
       renderGraph(_disambigRoot || undefined);
     });
+    chip.addEventListener('mouseenter', () => showChipTip(chip));
+    chip.addEventListener('mouseleave', hideChipTip);
   });
+  // Scrolling moves the chip out from under a popup anchored to where it was.
+  const chipsBox = bar.querySelector('.db-chips');
+  if (chipsBox) chipsBox.addEventListener('scroll', hideChipTip);
+}
+
+// ── Implementation chip popup ─────────────────────────────────────────────────
+// Chips truncate, and the whole point of the bar is telling near-identical
+// symbols apart, which is impossible from `G..`. The popup carries the full
+// symbol and its path.
+function showChipTip(chip) {
+  const tip = document.getElementById('db-tip');
+  if (!tip || !chip.dataset.sym) return;
+
+  tip.innerHTML =
+    `<div class="tip-sym">${escHtml(chip.dataset.sym)}</div>` +
+    (chip.dataset.path ? `<div class="tip-path">${escHtml(chip.dataset.path)}</div>` : '');
+  tip.style.display = 'block';
+  tip.setAttribute('aria-hidden', 'false');
+
+  // Measure after it is displayed, then clamp into the viewport so a chip at
+  // the far right of a scrolled row does not push the popup off screen.
+  const c = chip.getBoundingClientRect();
+  const t = tip.getBoundingClientRect();
+  const left = Math.max(8, Math.min(c.left, window.innerWidth - t.width - 8));
+  // Below the chip normally; above it when there is no room underneath.
+  const below = c.bottom + 6;
+  const top = below + t.height > window.innerHeight - 8
+    ? Math.max(8, c.top - t.height - 6)
+    : below;
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+}
+
+function hideChipTip() {
+  const tip = document.getElementById('db-tip');
+  if (!tip) return;
+  tip.style.display = 'none';
+  tip.setAttribute('aria-hidden', 'true');
 }
 
 // ── Build Cytoscape elements from filtered data ────────────────────────────────
@@ -1778,10 +1842,22 @@ requestAnimationFrame(fxLoop);
     else if (e.key === 'Escape') closeSearch();
   });
 
-  // Cmd+F / Ctrl+F to open search
+  // Cmd+F / Ctrl+F toggles, because that is what the same key does in every
+  // other find UI. Opening only meant a stray Cmd+F left an overlay the user
+  // had to know Escape to dismiss.
   document.addEventListener('keydown', e => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'f') { e.preventDefault(); openSearch(); }
+    if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+      e.preventDefault();
+      overlay.style.display === 'none' ? openSearch() : closeSearch();
+    }
   });
+
+  // Start closed, explicitly. The markup ships `display:none`, but the panel
+  // is created with retainContextWhenHidden, so this DOM can outlive the view
+  // that opened the overlay and come back with it still up. Asserting the
+  // closed state here means the overlay is only ever open because someone
+  // asked for it in this session.
+  closeSearch();
 
   // Click outside to close
   document.addEventListener('mousedown', e => {
