@@ -23,7 +23,7 @@
 //!
 //! ```text
 //! daemon.session.start     daemon.ready          daemon.socket.bound
-//! daemon.session.stop      head.drift.detected   head.reconcile.pruned
+//! daemon.session.stop      head.drift.detected   tree.reconcile.pruned
 //! head.reconcile.complete  phase_b.start         phase_b.indexed
 //! phase_b.complete         kcore.updated         embed.text.updated
 //! embed.text.fts_backfill  store.fts_words.backfill

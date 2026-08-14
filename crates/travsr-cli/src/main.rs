@@ -194,6 +194,11 @@ enum Command {
         /// Never passes filenames through the shell; prevents shell injection.
         #[arg(long)]
         from_hook: bool,
+        /// Which git event fired, e.g. `post-commit`, `post-checkout`,
+        /// `post-merge`. A commit is described exactly by its own diff; a
+        /// checkout or a merge is not, so the two need different file sets.
+        #[arg(long)]
+        event: Option<String>,
         /// Paths to re-index (used when calling hook-run directly, without --from-hook).
         paths: Vec<String>,
     },
@@ -913,7 +918,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
             (false, None) => anyhow::bail!("provide a symbol/file query or pass --all"),
         },
-        Command::HookRun { from_hook, paths } => {
+        Command::HookRun {
+            from_hook,
+            event,
+            paths,
+        } => {
             let cwd = std::env::current_dir()?;
             // A commit reindexes the worktree it happened in, never the main
             // worktree (issue #586).
@@ -939,12 +948,56 @@ async fn run(cli: Cli) -> Result<()> {
                 let db_path = repo_root.join(".travsr/graph.db");
                 travsr_store::SqliteStore::open(&db_path)?
             };
-            let abs_paths: Vec<std::path::PathBuf> = if from_hook {
-                travsr_daemon::changed_files_from_git(&repo_root)?
+            // A branch checkout or a fast-forward merge changes the tree
+            // without producing a commit that describes the change, so
+            // `git diff-tree HEAD` reports the new tip's own diff and says
+            // nothing about the files that differ between the two trees.
+            // Reindexing that delta leaves every other changed file describing
+            // a tree that is no longer checked out, and leaves files the
+            // checkout deleted in the graph as ghosts: `travsr ask` then
+            // answers with paths that are not on disk.
+            //
+            // The daemon does not need this. Its watcher sees the same
+            // deletions and reconciles them, which is why the gap only shows up
+            // without one. Verified both ways before choosing where to fix it.
+            let whole_tree = matches!(event.as_deref(), Some("post-checkout") | Some("post-merge"));
+            let dirty = if from_hook && whole_tree {
+                let (dirty, files) = travsr_daemon::reconcile_tracked_tree(&repo_root, &mut store)?;
+                tracing::debug!(
+                    event = event.as_deref().unwrap_or(""),
+                    files,
+                    "hook-run: reconciled the whole tracked tree"
+                );
+                // Phase A now describes the checked-out tree, so say so. Left
+                // unstamped, `travsr status` would print an index/HEAD mismatch
+                // note after every branch switch even though the graph is
+                // correct, and a warning that fires when nothing is wrong is
+                // one users learn to skip past.
+                //
+                // Guarded the way `reconcile_head_drift` guards it: never claim
+                // freshness for a reindex that `reindex_files` skipped wholesale
+                // because the stored signature format is from an older travsr.
+                // Phase B is a separate marker and stays stale, which is honest:
+                // this path rebuilds Phase A only, and `travsr status` reports
+                // the two separately.
+                if store.get_signature_format_version().ok()
+                    == Some(travsr_core::SIGNATURE_FORMAT_VERSION)
+                {
+                    if let Ok(head) = travsr_daemon::read_head_commit_sha(&repo_root) {
+                        if !head.is_empty() {
+                            let _ = store.set_meta("last_commit", &head);
+                        }
+                    }
+                }
+                dirty
             } else {
-                paths.iter().map(|p| repo_root.join(p)).collect()
+                let abs_paths: Vec<std::path::PathBuf> = if from_hook {
+                    travsr_daemon::changed_files_from_git(&repo_root)?
+                } else {
+                    paths.iter().map(|p| repo_root.join(p)).collect()
+                };
+                travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?
             };
-            let dirty = travsr_daemon::reindex_files(&abs_paths, &repo_root, &mut store)?;
             if !dirty.is_empty() {
                 // No daemon running: Tier-0 callers cannot be re-enqueued.
                 // Phase B on the next commit will re-resolve cross-file edges.

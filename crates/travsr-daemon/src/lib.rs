@@ -3283,6 +3283,73 @@ fn run_background_phase_b_inner(
     outcome
 }
 
+/// Bring the graph in line with the whole tracked tree: reindex every tracked
+/// file, then delete what git no longer tracks.
+///
+/// This is the shape a *tree* change needs, as opposed to a commit's delta. A
+/// commit is described exactly by `git diff-tree HEAD`, so the hook reindexes
+/// that and nothing else. A branch checkout and a multi-commit fast-forward are
+/// not described by any single commit's delta: the tip's own diff says nothing
+/// about the files that differ between the two trees, so reindexing it leaves
+/// the rest of the graph describing a tree that is no longer checked out.
+///
+/// Two halves, and both are needed. The reindex updates and adds; it cannot
+/// remove, because `reindex_files` only visits the paths it is given and a file
+/// that vanished is absent from that list by definition. So the prune runs
+/// afterwards, over `db_file_paths − tracked`, which is the same reconcile
+/// `fsck --fix` uses and carries the same mass-delete circuit breaker.
+///
+/// Returns the Tier-0 callers the reindex left dirty, and how many files were
+/// visited.
+pub fn reconcile_tracked_tree(
+    repo_root: &Path,
+    store: &mut SqliteStore,
+) -> anyhow::Result<(travsr_core::DirtySet, usize)> {
+    let mut paths = tracked_files_from_git(repo_root)
+        .context("enumerating tracked files for a whole-tree reconcile")?;
+    // Same ignore rules as init / the watcher / the hook path (#403).
+    let ignore = watcher::build_ignore_matcher(repo_root);
+    paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
+
+    let dirty = reindex_files(&paths, repo_root, store)?;
+
+    // `walked` must match the stored VName key format exactly — relative to
+    // repo_root, forward slashes — or every tracked file reads as a ghost and
+    // the prune tries to delete the entire graph. Windows load-bearing;
+    // `paths` are absolute PathBufs, rebuilt here the way reindex_files does.
+    let walked: std::collections::HashSet<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(repo_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    let corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
+    match store.reconcile(
+        &walked,
+        &travsr_core::SafetyPolicy::default(),
+        repo_root,
+        &corpus,
+    ) {
+        Ok(report) if report.aborted => tracing::warn!(
+            reason = report.abort_reason.as_deref().unwrap_or(""),
+            "tree reconcile: ghost prune tripped the mass-delete circuit breaker — \
+             deleted nothing; run `travsr fsck --fix --force` to override"
+        ),
+        Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
+            event = "tree.reconcile.pruned",
+            pruned = report.ghost_paths.len(),
+            "tree reconcile: pruned files git no longer tracks"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(err = %e, "tree reconcile: ghost prune failed"),
+    }
+
+    Ok((dirty, paths.len()))
+}
+
 /// Re-index a set of changed files into `store`.
 ///
 /// For each file:
@@ -3655,7 +3722,7 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
     })
 }
 
-fn read_head_commit_sha(repo_root: &Path) -> anyhow::Result<String> {
+pub fn read_head_commit_sha(repo_root: &Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .args([
             "-C",
@@ -3710,63 +3777,14 @@ fn reconcile_head_drift(
         head = %head,
         "last_commit does not match live HEAD (history moved during daemon downtime) — reconciling"
     );
-    let mut paths = match tracked_files_from_git(repo_root) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(err = %e, "head reconcile: could not enumerate tracked files — skipped");
-            return false;
-        }
-    };
-    // Same ignore rules as init / the watcher / the hook path (#403).
-    let ignore = watcher::build_ignore_matcher(repo_root);
-    paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-    let dirty = match reindex_files(&paths, repo_root, &mut s) {
-        Ok(d) => d,
+    let (dirty, files) = match reconcile_tracked_tree(repo_root, &mut s) {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!(err = %e, "head reconcile: reindex failed");
             return false;
         }
     };
-
-    // #645 WS-A: reindex_files only visits paths in `paths`; a file the drift
-    // DELETED is absent from tracked_files_from_git, so nothing prunes its
-    // nodes and they survive as ghosts from the discarded commit. Reuse the
-    // §6.5 reconcile (the same prune `fsck --fix` uses) to remove
-    // db_file_paths − tracked. Run it regardless of `dirty`: deletions are
-    // orthogonal to the reindex delta. `walked` must match the stored VName
-    // key format exactly — relative to repo_root, forward slashes — or every
-    // tracked file reads as a ghost (Windows load-bearing; `paths` are
-    // absolute PathBufs, rebuilt here the same way reindex_files does).
-    let walked: std::collections::HashSet<String> = paths
-        .iter()
-        .map(|p| {
-            p.strip_prefix(repo_root)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
-    let corpus = s.get_meta("corpus").ok().flatten().unwrap_or_default();
-    match s.reconcile(
-        &walked,
-        &travsr_core::SafetyPolicy::default(),
-        repo_root,
-        &corpus,
-    ) {
-        Ok(report) if report.aborted => tracing::warn!(
-            reason = report.abort_reason.as_deref().unwrap_or(""),
-            "head reconcile: ghost prune tripped the mass-delete circuit breaker — \
-             deleted nothing; run `travsr fsck --fix --force` to override"
-        ),
-        Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
-            event = "head.reconcile.pruned",
-            pruned = report.ghost_paths.len(),
-            "head reconcile: pruned drift-deleted ghost files"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(err = %e, "head reconcile: ghost prune failed"),
-    }
 
     // Same guard as the ReindexCommit path: never claim freshness for a HEAD
     // whose reindex was skipped due to a signature-format mismatch.
@@ -3781,7 +3799,7 @@ fn reconcile_head_drift(
     tracing::info!(
         event = "head.reconcile.complete",
         head = %head,
-        files = paths.len(),
+        files,
         "head reconcile complete — Phase B rebuild armed"
     );
     true
@@ -7201,6 +7219,62 @@ mod tests {
             s.get_meta("last_commit").unwrap().as_deref(),
             Some("f0f0f0f"),
             "marker must not claim freshness for a skipped reindex"
+        );
+    }
+
+    /// The shape a whole-tree change needs, in one call: everything git tracks
+    /// gets indexed, and everything it no longer tracks gets removed.
+    ///
+    /// The second half is the one that is easy to leave out. `reindex_files`
+    /// only visits the paths handed to it, so a file that vanished from the tree
+    /// is absent from that list by definition and nothing would ever delete its
+    /// nodes. A branch checkout produces exactly that: `travsr ask` keeps
+    /// answering with a path that is not on disk.
+    #[test]
+    fn reconcile_tracked_tree_indexes_what_git_tracks_and_prunes_what_it_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("kept.ts"), "export class Kept { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("gone.ts"), "export class Gone { go() {} }").unwrap();
+        git_commit_all(tmp.path(), "both files");
+
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        // First pass: both tracked, both indexed.
+        reconcile_tracked_tree(tmp.path(), &mut store).unwrap();
+        let hashes = store.get_all_file_hashes().unwrap();
+        assert!(hashes.contains_key("kept.ts"), "kept.ts should be indexed");
+        assert!(hashes.contains_key("gone.ts"), "gone.ts should be indexed");
+
+        // Now the tree loses a file, the way a branch checkout loses one: it is
+        // gone from disk and gone from `git ls-files`.
+        std::fs::remove_file(tmp.path().join("gone.ts")).unwrap();
+        StdCommand::new("git")
+            .args(["rm", "-q", "--cached", "gone.ts"])
+            .current_dir(tmp.path())
+            .status()
+            .expect("git rm --cached");
+
+        let (_dirty, files) = reconcile_tracked_tree(tmp.path(), &mut store).unwrap();
+
+        let hashes = store.get_all_file_hashes().unwrap();
+        assert!(
+            hashes.contains_key("kept.ts"),
+            "the surviving file must stay indexed"
+        );
+        assert!(
+            !hashes.contains_key("gone.ts"),
+            "a file git no longer tracks must not survive as a ghost: {:?}",
+            hashes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            files >= 1,
+            "the reindex should have visited the tracked set"
         );
     }
 
