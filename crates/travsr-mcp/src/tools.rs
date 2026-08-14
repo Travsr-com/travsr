@@ -39,7 +39,10 @@ pub fn get_dependencies(store: &SqliteStore, file: &str, transitive: bool, depth
         }
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
-    sanitize_for_mcp(&raw)
+    // #661 WS-D: carry the HEAD-mismatch note on the real dependency answer. The
+    // invalid-arg reject (above) and the arg-hint diagnostic are not path:line
+    // answers and return early without a note.
+    with_head_note(store, sanitize_for_mcp(&raw))
 }
 
 /// Diagnose an empty `get_dependencies` answer (#619).
@@ -236,15 +239,160 @@ fn phase_b_degraded_note(store: &SqliteStore) -> Option<&'static str> {
     }
 }
 
-/// Append the Phase-B degraded note (when any) to a structural tool response.
-/// An empty body becomes the note alone: the note IS the answer then — it is
-/// exactly the empty-but-unreliable case #617 exists to flag.
+/// #645 WS-B: the stdio server's launch directory — the caller's checkout.
+///
+/// Captured once when the stdio server starts (the IDE launches it in the
+/// workspace dir). The freshness markers only ever compare `phase_b_commit`
+/// vs `last_commit` — two store values, never the repository — so a read from
+/// a checkout at a *different* commit than the index (a linked worktree, or a
+/// HEAD move the daemon has not yet reconciled) answers with confident
+/// `path:line` for the wrong revision. Comparing this cwd's live HEAD to the
+/// index's `last_commit` is the only signal that surfaces it. Unset in the SSE
+/// server (a remote client has no local checkout) and in unit tests, where the
+/// head note correctly never fires.
+static LAUNCH_CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the stdio server's launch directory (§ `LAUNCH_CWD`). Idempotent:
+/// only the first call wins, matching the single server lifetime.
+pub fn set_launch_cwd(dir: PathBuf) {
+    let _ = LAUNCH_CWD.set(dir);
+}
+
+/// #645 WS-B: build the index/HEAD mismatch note. `head` is the caller's live
+/// `git rev-parse --short HEAD`; `stored` is the index's `last_commit`. Returns
+/// a note naming both, or `None` when they agree or either is unknown — never
+/// fabricate a mismatch for a git-less caller. Pure so both the MCP and CLI
+/// surfaces classify identically and it is trivially unit-testable.
+pub fn head_index_mismatch_note(head: &str, stored: &str) -> Option<String> {
+    if head.is_empty() || stored.is_empty() || head == stored {
+        return None;
+    }
+    Some(format!(
+        "[note: index describes commit {stored} but your checkout is at {head}; \
+         results (including path:line) may not match your working tree. This is \
+         expected in a linked worktree; otherwise run `travsr init` or wait for \
+         the daemon to reconcile.]"
+    ))
+}
+
+/// The caller's short HEAD at `cwd`, or `None` when git is unavailable or `cwd`
+/// is not a repo. Uses `--short` to match the `--short`-stamped `last_commit`.
+fn git_short_head(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
+/// #645/#661: the live short HEAD of a *registered* repo, resolved from its db
+/// path (`<root>/.travsr/graph.db` → `<root>`). The global MCP server captures a
+/// single `LAUNCH_CWD` — the caller's one workspace — which is NOT each
+/// registered repo's checkout. The per-repo drift note must therefore read that
+/// repo's own HEAD: using `LAUNCH_CWD` in a multi-repo aggregate would compare
+/// one workspace's commit against every *other* repo's index and fire a spurious
+/// mismatch on repos that are perfectly fresh. `None` when git is unavailable or
+/// the db path has an unexpected shape — the note then correctly never fires.
+fn repo_head_from_registry_path(db_path: &std::path::Path) -> Option<String> {
+    let root = db_path.parent()?.parent()?;
+    git_short_head(root)
+}
+
+/// Append the read-path advisory notes (when any) to a structural tool
+/// response: the Phase-B degraded note (#617) and the index/HEAD mismatch note
+/// (#645 WS-B). Both are independent and may both appear. An empty body becomes
+/// the note(s) alone: the note IS the answer then — exactly the empty-but-
+/// unreliable case these notes exist to flag.
+///
+/// `head` is the caller's live short HEAD (or `None` when git-less); split out
+/// as a parameter so the composition is deterministically testable without the
+/// process-global `LAUNCH_CWD`.
+fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut out = body;
+    for note in [
+        phase_b_degraded_note(store).map(str::to_string),
+        head.and_then(|h| head_index_mismatch_note(h, &stored)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if out.is_empty() {
+            out = note;
+        } else {
+            out.push('\n');
+            out.push_str(&note);
+        }
+    }
+    out
+}
+
+/// Production entry: resolves the caller's HEAD from the captured launch cwd
+/// (§ `LAUNCH_CWD`) and appends the advisory notes. Fail-safe — no cwd or no git
+/// means no head note.
 fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
-    match phase_b_degraded_note(store) {
-        Some(note) if body.is_empty() => note.to_string(),
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    append_read_notes(store, body, head.as_deref())
+}
+
+/// #661 WS-D: append the index/HEAD mismatch note (#645) **only** — no Phase-B
+/// note — to a deterministic `path:line` tool's response. `find_references`,
+/// `get_dependencies` and `get_graph_json` assert `path:line` but do not depend
+/// on Phase B, so they carry the head-drift signal without the Phase-B one.
+///
+/// `head` is split out as a parameter (the same injectable seam as
+/// [`append_read_notes`]) so the composition is deterministically testable
+/// without the process-global `LAUNCH_CWD`. Empty body ⇒ the note is the whole
+/// answer (the empty-but-unreliable case these notes exist to flag).
+fn append_head_note(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    match head.and_then(|h| head_index_mismatch_note(h, &stored)) {
+        Some(note) if body.is_empty() => note,
         Some(note) => format!("{body}\n{note}"),
         None => body,
     }
+}
+
+/// Production entry for the head-only note: resolves the caller's HEAD from the
+/// captured launch cwd (§ `LAUNCH_CWD`) and appends the mismatch note. Fail-safe
+/// — no cwd or no git means no note.
+fn with_head_note(store: &SqliteStore, body: String) -> String {
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    append_head_note(store, body, head.as_deref())
+}
+
+/// #661 WS-D: the read-path advisory notes as JSON `signals` array items, for
+/// tools whose body is JSON for renderers (`get_graph_json`) — appending a
+/// `[note: …]` prose string would break `JSON.parse`. Returns the Phase-B note
+/// (#617) and the index/HEAD mismatch note (#645), each already carried in the
+/// `signals` array the global aggregator merges. `head` is injectable for the
+/// same testability reason as [`append_head_note`].
+fn read_note_signals(store: &SqliteStore, head: Option<&str>) -> Vec<serde_json::Value> {
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    [
+        phase_b_degraded_note(store).map(str::to_string),
+        head.and_then(|h| head_index_mismatch_note(h, &stored)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(serde_json::Value::String)
+    .collect()
 }
 
 /// Return all nodes that have an incoming edge to the given symbol, tagged
@@ -440,11 +588,12 @@ pub fn get_dependencies_global(
         let result = get_dependencies_raw(store, file);
         // #619: in single-repo mode, diagnose an empty answer exactly like the
         // stdio path. In multi-repo mode leave per-repo empties silent — a
-        // hint per non-matching repo would spam the aggregate.
+        // hint per non-matching repo would spam the aggregate. The arg-hint is
+        // a diagnostic, not a path:line answer, so it carries no HEAD note.
         if result.is_empty() && single {
             return dependency_arg_hint(store, file).unwrap_or(result);
         }
-        if result.is_empty() || single {
+        let result = if result.is_empty() || single {
             result
         } else {
             result
@@ -452,7 +601,14 @@ pub fn get_dependencies_global(
                 .map(|l| format!("[{repo_name}] {l}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        }
+        };
+        // #661 WS-D: per-repo HEAD note — read *this* repo's own checkout, not
+        // the global LAUNCH_CWD (the caller's one workspace), so a fresh repo in
+        // the aggregate is never flagged against an unrelated commit.
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        append_head_note(store, result, head.as_deref())
     });
     // SEC-001: sanitize the fully-aggregated string once.
     sanitize_for_mcp(&raw)
@@ -470,8 +626,13 @@ pub fn get_callers_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
-        let result = with_phase_b_note(store, get_callers_raw(store, symbol));
+        // #617 + #645: per-repo notes — each store carries its own Phase B
+        // freshness, and the HEAD note reads *this* repo's own checkout (not the
+        // global LAUNCH_CWD, which is only the caller's one workspace).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(store, get_callers_raw(store, symbol), head.as_deref());
         if result.is_empty() || single {
             result
         } else {
@@ -517,10 +678,10 @@ enum RefTarget {
 /// first (handles full headers like `fn:charge` from `get_context`), then an
 /// exact simple-name match over the FTS candidates. An optional `path` suffix
 /// pins overloaded names to one file.
-fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&str>) -> RefTarget {
+fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
     // Tier 1: exact signature (+ optional path pin).
     let mut candidates = store.lookup_nodes_exact(symbol, path).unwrap_or_else(|e| {
-        tracing::warn!("find_references lookup_nodes_exact '{symbol}': {e}");
+        tracing::warn!("resolve_symbol_nodes lookup_nodes_exact '{symbol}': {e}");
         Vec::new()
     });
 
@@ -543,7 +704,7 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
                 })
                 .collect(),
             Err(e) => {
-                tracing::warn!("find_references search '{symbol}': {e}");
+                tracing::warn!("resolve_symbol_nodes search '{symbol}': {e}");
                 Vec::new()
             }
         };
@@ -561,7 +722,7 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
         if let Some((container, member)) = symbol.rsplit_once('.') {
             if !container.is_empty() && !member.is_empty() {
                 let found = store.search_nodes_by_name(member).unwrap_or_else(|e| {
-                    tracing::warn!("find_references dotted search '{member}': {e}");
+                    tracing::warn!("resolve_symbol_nodes dotted search '{member}': {e}");
                     Vec::new()
                 });
                 let matches: Vec<CoreNode> = found
@@ -594,9 +755,7 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
         }
     }
 
-    // Apply the path suffix pin if the caller supplied one (Tier 2 didn't use it).
-    // Match on a `/`-boundary so a hint like `tools.rs` pins `src/tools.rs` but
-    // never `src/mytools.rs` — mirroring the store's `LIKE '%/' || hint` pin.
+    // Apply the path suffix pin if the caller supplied one.
     if let Some(p) = path {
         let boundary = format!("/{p}");
         candidates.retain(|n| n.vname.path == p || n.vname.path.ends_with(&boundary));
@@ -605,6 +764,13 @@ fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&st
     // Distinct definitions by node id.
     candidates.sort_by_key(|n| n.id.0);
     candidates.dedup_by_key(|n| n.id);
+
+    candidates
+}
+
+/// Helper to map `resolve_symbol_nodes` candidates to a `RefTarget` for find_references.
+fn resolve_reference_targets(store: &SqliteStore, symbol: &str, path: Option<&str>) -> RefTarget {
+    let mut candidates = resolve_symbol_nodes(store, symbol, path);
 
     // C/C++ split a symbol into a header declaration and a source definition
     // (`utils.h` decl + `utils.c` def). They share the simple name, so both
@@ -657,10 +823,13 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     // SEC-001: sanitize before returning. Use the larger find-output limit (not
     // the 4 KiB scalar cap) so a capped 500-site list and its truncation notice
     // survive intact instead of being cut mid-line.
-    wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_references_raw(store, symbol, path),
-        FIND_OUTPUT_LIMIT,
-    ))
+    // #661 WS-D: append the HEAD-mismatch note *after* sanitize (so it is never
+    // truncated) but *before* wrap_envelope (so it stays inside <travsr-data>).
+    // The early returns above (validation reject, pending JSON) are not
+    // path:line answers and intentionally carry no note.
+    let body =
+        sanitize_mcp_body_with_limit(&find_references_raw(store, symbol, path), FIND_OUTPUT_LIMIT);
+    wrap_envelope(&with_head_note(store, body))
 }
 
 /// Raw (unsanitized) variant, shared by the global aggregator.
@@ -790,6 +959,25 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                 target.vname.path
             );
         }
+        // WS-3 (C3): a Dart index built without resolved dependencies drops
+        // every cross-package reference, so "no recorded uses" would be a
+        // confident zero the index cannot support even when the file itself was
+        // analysed. Soften it, mirroring the partial-coverage case above.
+        if target.vname.language == "dart"
+            && store
+                .get_meta("dart_deps_unresolved")
+                .ok()
+                .flatten()
+                .is_some_and(|v| !v.is_empty())
+        {
+            return format!(
+                "{header}\n0 recorded reference(s) — not a definitive zero. This \
+                 repo's Dart dependencies are not resolved (no \
+                 `.dart_tool/package_config.json`), so cross-package references \
+                 are not indexed. Run `dart pub get` and re-run `travsr init`, or \
+                 use `find_pattern` for a textual search."
+            );
+        }
         // Coverage is effectively complete for this language and this symbol has
         // neither occurrence rows nor ref/call edges: a genuine zero. (If the
         // same name is also defined elsewhere, bare calls to it are left
@@ -839,7 +1027,7 @@ pub fn find_references_global(
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         let result = find_references_raw(store, symbol, path);
-        if result.is_empty() || single {
+        let result = if result.is_empty() || single {
             result
         } else {
             result
@@ -847,7 +1035,13 @@ pub fn find_references_global(
                 .map(|l| format!("[{repo_name}] {l}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        }
+        };
+        // #661 WS-D: per-repo HEAD note — read *this* repo's own checkout, not
+        // the global LAUNCH_CWD (mirrors get_callers_global).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        append_head_note(store, result, head.as_deref())
     });
     wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
@@ -2078,8 +2272,16 @@ pub fn get_blast_radius_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
-        let result = with_phase_b_note(store, get_blast_radius_raw(store, file, mode));
+        // #617 + #645: per-repo notes — each store's own Phase B freshness, and
+        // the HEAD note against *this* repo's own checkout (not global LAUNCH_CWD).
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(
+            store,
+            get_blast_radius_raw(store, file, mode),
+            head.as_deref(),
+        );
         if result.is_empty() || single {
             result
         } else {
@@ -3213,12 +3415,17 @@ pub fn get_execution_path_global(
         return String::new();
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        // #617: per-repo note — each store carries its own Phase B freshness.
+        // #617 + #645: per-repo notes — each store's own Phase B freshness, and
+        // the HEAD note against *this* repo's own checkout (not global LAUNCH_CWD).
         // #620: diagnose empty outcomes only in single-repo mode; a repo that
         // simply doesn't contain the symbols must stay silent in an aggregate.
-        let result = with_phase_b_note(
+        let head = repos
+            .get(repo_name)
+            .and_then(|db| repo_head_from_registry_path(db));
+        let result = append_read_notes(
             store,
             get_execution_path_body(store, source, sink, filter, single),
+            head.as_deref(),
         );
         if result.is_empty() || single {
             result
@@ -3559,8 +3766,17 @@ pub(crate) fn is_test_symbol(node: &CoreNode) -> bool {
 /// build/cache/test-dir paths) plus in-src test symbols ([`is_test_symbol`]). A
 /// rejected candidate can still enter retrieval via the lexical/KNN seed paths
 /// (kept by [`is_noise_seed`]); it just cannot be an anchor.
+///
+/// #479: the AST-derived `test_role` is the precise test gate here. The anchor
+/// candidates flow from [`SqliteStore::search_nodes_by_name`], which carries the
+/// `test_role` column, so `node.test_role.is_test()` fires on this path and keeps
+/// a descriptively-named inline test (one whose name `is_test_symbol` does not
+/// recognise) out of the anchor pool, not just at display time. [`is_test_symbol`]
+/// stays as the name-based fallback for rows that predate the v22 reindex (their
+/// `test_role` reads back `None` until re-parsed). Keep both until v22 is
+/// guaranteed to have reparsed every corpus.
 pub(crate) fn is_anchor_noise(node: &CoreNode) -> bool {
-    is_context_result_noise(node) || is_test_symbol(node)
+    is_context_result_noise(node) || node.test_role.is_test() || is_test_symbol(node)
 }
 
 /// Derive PPR seeds from symbol-level KNN results with score-based selection.
@@ -3851,8 +4067,8 @@ fn format_node_line(
 /// (vs a per-row badge) and disambiguates the Exact section's non-rerank score.
 fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
     match ms {
-        crate::seed::MatchSource::Exact => "## exact — literal symbol / FTS match (not reranked)",
-        crate::seed::MatchSource::Semantic => "## semantic — cross-encoder ranked",
+        crate::seed::MatchSource::Exact => "## exact matches — literal symbol / text (not relevance-ranked)",
+        crate::seed::MatchSource::Semantic => "## related — ranked by relevance",
         // #376 Phase 2 (§4.1): no raw cosine printed in this section — see
         // build_docs_section's doc comment for why (doc cosines and code
         // cosines are not commensurable; a printed number invites exactly the
@@ -3860,6 +4076,9 @@ fn match_source_header(ms: crate::seed::MatchSource) -> &'static str {
         crate::seed::MatchSource::Docs => {
             "## docs (documentation prose: claims about the code, verify behaviour against the code itself)"
         }
+        // #479: test entry points & fixtures, capped and placed below the
+        // implementation/design sections so a `#[test]` fn never leads.
+        crate::seed::MatchSource::Tests => "## tests — test entry points & fixtures",
         crate::seed::MatchSource::Relevant => "## relevant — graph-adjacent context",
     }
 }
@@ -3903,7 +4122,19 @@ fn assemble_context_body(
     });
     let mut out: Vec<String> = Vec::with_capacity(entries.len() + 3);
     let mut cur: Option<crate::seed::MatchSource> = None;
+    // #479: cap the tests section small and omit it when empty. Entries are
+    // already sorted by trust_rank then descending score, so the retained tests
+    // are the highest-scoring ones; the section header is only emitted if at
+    // least one test survives the cap.
+    const TESTS_CAP: usize = 3;
+    let mut tests_shown = 0usize;
     for (ms, _score, line) in entries {
+        if ms == crate::seed::MatchSource::Tests {
+            if tests_shown >= TESTS_CAP {
+                continue;
+            }
+            tests_shown += 1;
+        }
         if cur != Some(ms) {
             out.push(match_source_header(ms).to_string());
             cur = Some(ms);
@@ -4822,6 +5053,18 @@ fn get_context_body(
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
+    // #479: index-time test classification for the selected set. A node with
+    // `test_role != None` buckets as `MatchSource::Tests` regardless of its seed
+    // provenance, so a `#[test]` fn that is also an exact/semantic seed renders
+    // in the capped `tests` section, not at the top of `exact`/`semantic`. Read
+    // by id (the store column) rather than `Node.test_role`, which the read
+    // paths default to `None`.
+    let test_node_ids: std::collections::HashSet<NodeId> = selected
+        .iter()
+        .filter(|n| matches!(store.test_role(n.id), Ok(Some(r)) if r.is_test()))
+        .map(|n| n.id)
+        .collect();
+
     // RFC-022 §14: match-source grouping of the (already-selected) node set.
     // Display-only — `selected`/knapsack are untouched; this only decides how the
     // rendered lines are ordered/headed. Gated behind the flag; and collapsed to a
@@ -4832,7 +5075,12 @@ fn get_context_body(
             seed_source_map.get(&id),
             Some(crate::seed::SeedSource::Exact)
         );
-        let ms = crate::seed::match_source(primary_seed_ids.contains(&id), is_exact);
+        // #479: test classification overrides seed-provenance bucketing.
+        let ms = if test_node_ids.contains(&id) {
+            crate::seed::MatchSource::Tests
+        } else {
+            crate::seed::match_source(primary_seed_ids.contains(&id), is_exact)
+        };
         (ms, display_score_map.get(&id).copied().unwrap_or(0.0))
     };
 
@@ -5490,7 +5738,18 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
         }
     }
     let depth = (*depth).clamp(1, 4);
-    get_graph_json_raw(store, query, direction, depth, kind_filter, *token_budget)
+    // #645 WS-D: single-repo stdio server — the caller's checkout IS this repo,
+    // so the launch cwd's HEAD is the correct drift comparand.
+    let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
+    get_graph_json_raw(
+        store,
+        query,
+        direction,
+        depth,
+        kind_filter,
+        *token_budget,
+        head.as_deref(),
+    )
 }
 
 // ── Repo-map LOD overview (P3 #319) ──────────────────────────────────────────
@@ -5831,6 +6090,11 @@ fn get_graph_json_raw(
     depth: u8,
     kind_filter: &str,
     token_budget: usize,
+    // #645/#661: the caller's live short HEAD for the index/HEAD drift signal.
+    // Injected (not read from LAUNCH_CWD here) so the global aggregator can pass
+    // *each* repo's own HEAD rather than the one workspace's — see
+    // `repo_head_from_registry_path`.
+    head: Option<&str>,
 ) -> String {
     use std::collections::{HashSet, VecDeque};
 
@@ -5911,7 +6175,7 @@ fn get_graph_json_raw(
 
     // (NodeId, hop_distance)
     let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
+    let mut queue: VecDeque<(NodeId, u8, bool)> = VecDeque::new();
     let mut nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut edges_out: Vec<serde_json::Value> = Vec::new();
     let mut edge_seen: HashSet<(NodeId, NodeId, &'static str)> = HashSet::new();
@@ -5926,11 +6190,11 @@ fn get_graph_json_raw(
 
     for node in &seed_nodes {
         if visited.insert(node.id) {
-            queue.push_back((node.id, 0));
+            queue.push_back((node.id, 0, true));
         }
     }
 
-    while let Some((current_id, hop)) = queue.pop_front() {
+    while let Some((current_id, hop, expand)) = queue.pop_front() {
         let node = match store.get_node(current_id) {
             Ok(Some(n)) => n,
             _ => continue,
@@ -5990,7 +6254,7 @@ fn get_graph_json_raw(
             continue;
         }
 
-        if hop >= depth {
+        if hop >= depth || !expand {
             continue;
         }
 
@@ -6035,7 +6299,7 @@ fn get_graph_json_raw(
                                 }));
                             }
                             if visited.insert(target.id) {
-                                queue.push_back((target.id, hop + 1));
+                                queue.push_back((target.id, hop + 1, true));
                             }
                         }
                     }
@@ -6079,7 +6343,7 @@ fn get_graph_json_raw(
                                 }));
                             }
                             if visited.insert(source.id) {
-                                queue.push_back((source.id, hop + 1));
+                                queue.push_back((source.id, hop + 1, true));
                             }
                         }
                     }
@@ -6090,17 +6354,23 @@ fn get_graph_json_raw(
 
         // Normal traversal (symbol mode)
         if direction == "deps" || direction == "both" {
-            if let Ok(edges) = store.iter_edges_from(current_id) {
+            if let Ok(nexts) = crate::query::next_edges(
+                store,
+                current_id,
+                crate::query::QueryDirection::Deps,
+                crate::query::QueryEdgeMode::All,
+                hop == 0,
+            ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
                 // Collect (dst_id, kind_s) only for edges that produce JSON output.
                 let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for edge in &edges {
-                    let kind_s = edge_kind_str(&edge.kind);
-                    if edge_seen.insert((edge.src, edge.dst, kind_s)) {
-                        new_edges.push((edge.dst, kind_s));
+                for (kind, next_id, child_expand, _incoming) in &nexts {
+                    let kind_s = edge_kind_str(kind);
+                    if edge_seen.insert((current_id, *next_id, kind_s)) {
+                        new_edges.push((*next_id, kind_s));
                     }
-                    if visited.insert(edge.dst) {
-                        queue.push_back((edge.dst, hop + 1));
+                    if visited.insert(*next_id) {
+                        queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch dst nodes, then emit JSON edges in original order.
@@ -6124,16 +6394,22 @@ fn get_graph_json_raw(
         }
 
         if direction == "callers" || direction == "both" {
-            if let Ok(edges) = store.iter_edges_to(current_id) {
+            if let Ok(nexts) = crate::query::next_edges(
+                store,
+                current_id,
+                crate::query::QueryDirection::Callers,
+                crate::query::QueryEdgeMode::All,
+                hop == 0,
+            ) {
                 // First pass: dedup via edge_seen, enqueue new visits.
                 let mut new_edges: Vec<(NodeId, &str)> = Vec::new();
-                for edge in &edges {
-                    let kind_s = edge_kind_str(&edge.kind);
-                    if edge_seen.insert((edge.src, edge.dst, kind_s)) {
-                        new_edges.push((edge.src, kind_s));
+                for (kind, next_id, child_expand, _incoming) in &nexts {
+                    let kind_s = edge_kind_str(kind);
+                    if edge_seen.insert((*next_id, current_id, kind_s)) {
+                        new_edges.push((*next_id, kind_s));
                     }
-                    if visited.insert(edge.src) {
-                        queue.push_back((edge.src, hop + 1));
+                    if visited.insert(*next_id) {
+                        queue.push_back((*next_id, hop + 1, *child_expand));
                     }
                 }
                 // Batch-fetch src nodes, then emit JSON edges in original order.
@@ -6176,10 +6452,14 @@ fn get_graph_json_raw(
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
     }
-    // #617: degraded-state signal — additive envelope field; first-party
-    // consumers read only `nodes`/`edges` and ignore extra keys.
-    if let Some(note) = phase_b_degraded_note(store) {
-        out["signals"] = serde_json::json!([note]);
+    // #617 + #661 WS-D: degraded-state signals — additive envelope field; first-
+    // party consumers read only `nodes`/`edges` and ignore extra keys. Phase-B
+    // incomplete (#617) and index/HEAD drift (#645) are independent and may both
+    // apply. Carried as JSON `signals` array items (never appended as prose) so
+    // the JSON body still parses; the global aggregator already merges `signals`.
+    let signals = read_note_signals(store, head);
+    if !signals.is_empty() {
+        out["signals"] = serde_json::Value::Array(signals);
     }
     match serde_json::to_string(&out) {
         Ok(s) => s,
@@ -6255,7 +6535,18 @@ pub fn get_graph_json_global(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = get_graph_json_raw(&store, query, direction, depth, kind_filter, 0);
+                // #645 WS-D: per-repo drift signal reads *this* repo's own HEAD,
+                // not the global LAUNCH_CWD (the caller's one workspace).
+                let head = repo_head_from_registry_path(db_path);
+                let raw = get_graph_json_raw(
+                    &store,
+                    query,
+                    direction,
+                    depth,
+                    kind_filter,
+                    0,
+                    head.as_deref(),
+                );
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -7047,6 +7338,50 @@ mod tests {
         assert!(
             result.contains("ruby/src/dog.rb"),
             "dog.rb requires animal (Phase-2 RubyResolver) and must appear, got: {result}"
+        );
+    }
+
+    /// #614 regression: `require 'json'` (load-path, tagged `import:gem:json`
+    /// by the analyzer) must NOT resolve to a same-stem `json.rb` sibling,
+    /// unlike `require_relative 'json'` (`import:json`) which still does.
+    /// Before the fix both keywords emitted the same `import:json` signature
+    /// and RubyResolver could not tell them apart.
+    #[test]
+    fn blast_radius_phase2_ignores_ruby_gem_require() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let ruby = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("", "", path, "ruby", sig), kind)
+        };
+        let json_file = ruby("ruby/src/json.rb", "fn:json", "function");
+        let cat = ruby("ruby/src/cat.rb", "fn:cat", "function");
+        // `require 'json'` in cat.rb: load-path, must not resolve to json.rb.
+        let cat_gem_import = ruby("ruby/src/cat.rb", "import:gem:json", "import");
+        let dog = ruby("ruby/src/dog.rb", "fn:dog", "function");
+        // `require_relative 'json'` in dog.rb: importer-relative, must resolve.
+        let dog_relative_import = ruby("ruby/src/dog.rb", "import:json", "import");
+        let store = make_store(
+            &[
+                json_file.clone(),
+                cat.clone(),
+                cat_gem_import.clone(),
+                dog.clone(),
+                dog_relative_import.clone(),
+            ],
+            &[
+                (cat.id, cat_gem_import.id, EdgeKind::Depends),
+                (dog.id, dog_relative_import.id, EdgeKind::Depends),
+            ],
+        );
+        let result = get_blast_radius(&store, "ruby/src/json.rb", AnalysisMode::TreeSitter);
+        assert!(
+            !result.contains("ruby/src/cat.rb"),
+            "cat.rb's `require 'json'` is load-path (import:gem:json) and must NOT \
+             appear, got: {result}"
+        );
+        assert!(
+            result.contains("ruby/src/dog.rb"),
+            "dog.rb's `require_relative 'json'` (import:json) must still appear, \
+             got: {result}"
         );
     }
 
@@ -8102,6 +8437,189 @@ mod tests {
             "header must survive the reserve:\n{raw}"
         );
     }
+
+    #[test]
+    fn get_graph_json_stops_at_containment_edges() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let file = Node::new(
+            VName::new("", "", "src/service.ts", "typescript", "file"),
+            "file",
+        );
+        let class = Node::new(
+            VName::new(
+                "test",
+                "",
+                "src/service.ts",
+                "typescript",
+                "class:PaymentService",
+            ),
+            "class",
+        );
+        let sibling = Node::new(
+            VName::new(
+                "test",
+                "",
+                "src/service.ts",
+                "typescript",
+                "class:UnrelatedHelper",
+            ),
+            "class",
+        );
+        let caller = Node::new(
+            VName::new(
+                "test",
+                "",
+                "src/controller.ts",
+                "typescript",
+                "fn:processPayment",
+            ),
+            "function",
+        );
+        let store = make_store(
+            &[file.clone(), class.clone(), sibling.clone(), caller.clone()],
+            &[
+                (file.id, class.id, EdgeKind::DefinesBinding),
+                (file.id, sibling.id, EdgeKind::DefinesBinding),
+                (caller.id, class.id, EdgeKind::RefCall),
+            ],
+        );
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "class:PaymentService",
+                direction: "callers",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nodes = v["nodes"].as_array().unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+
+        // Must show class, caller, and defining file
+        assert!(ids.contains(&"src/service.ts:class:PaymentService"));
+        assert!(ids.contains(&"src/controller.ts:fn:processPayment"));
+        assert!(ids.contains(&"src/service.ts")); // the defining file is returned for orientation
+
+        // Must NOT show the sibling (since traversal stops at the defining file containment edge)
+        assert!(!ids.contains(&"src/service.ts:class:UnrelatedHelper"));
+    }
+
+    #[test]
+    fn get_graph_json_and_graph_query_smoke_test() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let seed = Node::new(
+            VName::new("test", "", "src/seed.ts", "typescript", "fn:seed"),
+            "function",
+        );
+        let dep = Node::new(
+            VName::new("test", "", "src/dep.ts", "typescript", "fn:dep"),
+            "function",
+        );
+        let store = make_store(
+            &[seed.clone(), dep.clone()],
+            &[(seed.id, dep.id, EdgeKind::RefCall)],
+        );
+
+        // Run graph_query
+        let query_res = crate::query::graph_query(
+            &store,
+            &crate::query::GraphQueryArgs {
+                query: "fn:seed".to_string(),
+                depth: 2,
+                direction: crate::query::QueryDirection::Deps,
+                edge_mode: crate::query::QueryEdgeMode::All,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+
+        // Run get_graph_json
+        let json_raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "fn:seed",
+                direction: "deps",
+                depth: 2,
+                kind_filter: "",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
+
+        // Extract nodes and verify matching IDs
+        let json_val: serde_json::Value = serde_json::from_str(&json_raw).unwrap();
+        let mcp_nodes: std::collections::HashSet<String> = json_val["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap().to_string())
+            .collect();
+
+        let expected_mcp_node_ids: std::collections::HashSet<String> = query_res
+            .nodes
+            .iter()
+            .map(|n| {
+                if n.kind == "file" {
+                    n.path.clone()
+                } else {
+                    format!("{}:{}", n.path, n.signature)
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            mcp_nodes, expected_mcp_node_ids,
+            "Nodes must match conformantly"
+        );
+
+        // Edge comparison (orientation-independent set of undirected pairs of Node IDs):
+        let id_to_sig: std::collections::HashMap<u64, String> = query_res
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.signature.clone()))
+            .collect();
+        let mut cli_edge_sig_pairs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for e in &query_res.edges {
+            if let (Some(s_sig), Some(d_sig)) = (id_to_sig.get(&e.src), id_to_sig.get(&e.dst)) {
+                let mut pair = (s_sig.clone(), d_sig.clone());
+                if pair.0 > pair.1 {
+                    std::mem::swap(&mut pair.0, &mut pair.1);
+                }
+                cli_edge_sig_pairs.insert(pair);
+            }
+        }
+
+        let mcp_id_to_sig = |id: &str| -> String {
+            if let Some(pos) = id.find(':') {
+                id[pos + 1..].to_string()
+            } else {
+                "file".to_string()
+            }
+        };
+
+        let mut mcp_edge_sig_pairs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for e in json_val["edges"].as_array().unwrap() {
+            let src_id = e["source"].as_str().unwrap();
+            let dst_id = e["target"].as_str().unwrap();
+            let mut pair = (mcp_id_to_sig(src_id), mcp_id_to_sig(dst_id));
+            if pair.0 > pair.1 {
+                std::mem::swap(&mut pair.0, &mut pair.1);
+            }
+            mcp_edge_sig_pairs.insert(pair);
+        }
+
+        assert_eq!(
+            mcp_edge_sig_pairs, cli_edge_sig_pairs,
+            "Edges must match conformantly"
+        );
+    }
 }
 
 // ── get_snippets ──────────────────────────────────────────────────────────────
@@ -8328,9 +8846,11 @@ fn get_snippets_body(
 
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
-    // search_nodes_by_name (O(N) LIKE) is never called — every tier uses the
-    // V19NodesSignatureIdx exact-match index (O(log N)) or direct primary-key
-    // lookup (O(1)).
+    // search_nodes_by_name (O(N) LIKE) is generally avoided for exact-match
+    // tiers (Tiers 0-2), which use the V19NodesSignatureIdx exact-match index
+    // (O(log N)) or direct primary-key lookup (O(1)). However, the bare-signature
+    // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
+    // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
     for tok in &tokens {
         match tok {
@@ -8368,14 +8888,13 @@ fn get_snippets_body(
                 resolved.push(syn);
             }
 
-            // Tier 3: bare signature — exact index, returns up to
+            // Tier 3: bare signature — uses the shared resolution ladder
+            // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
-            SymbolToken::BareSig(sig) => match store.lookup_nodes_exact(sig, None) {
-                Ok(nodes) => {
-                    resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
-                }
-                Err(e) => tracing::warn!("get_snippets BareSig lookup '{sig}': {e}"),
-            },
+            SymbolToken::BareSig(sig) => {
+                let nodes = resolve_symbol_nodes(store, sig, None);
+                resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
+            }
         }
     }
 
@@ -8550,19 +9069,30 @@ mod snippet_tests {
         let db_path = root.join(".travsr").join("graph.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let mut store = SqliteStore::open(&db_path).unwrap();
+
+        let mut by_path: std::collections::HashMap<String, Vec<CoreNode>> =
+            std::collections::HashMap::new();
         for n in nodes {
+            by_path
+                .entry(n.vname.path.clone())
+                .or_default()
+                .push(n.clone());
+        }
+
+        for (path, file_nodes) in by_path {
             store
                 .write_file_graphs_batch(
                     &[travsr_store::FileGraph {
-                        nodes: vec![n.clone()],
+                        nodes: file_nodes,
                         edges: vec![],
-                        vname_path: n.vname.path.clone(),
+                        vname_path: path,
                         new_hash: "deadbeef".to_string(),
                     }],
                     false,
                 )
                 .unwrap();
         }
+
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
         store
     }
@@ -8582,6 +9112,63 @@ mod snippet_tests {
         assert!(
             result.contains("1 symbols, 1 with snippets"),
             "footer missing"
+        );
+    }
+
+    #[test]
+    fn get_snippets_body_resolves_plain_and_dotted_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.ts");
+        std::fs::write(
+            &src,
+            "class ClassA {\n  enableSupportForFeatureX() {\n    return true;\n  }\n}\n",
+        )
+        .unwrap();
+
+        let class_node = make_fn_node("lib.ts", "class:ClassA", 1, 5);
+        let fn_node = make_fn_node("lib.ts", "method:ClassA.enableSupportForFeatureX", 2, 4);
+        let store = make_store_with_meta(&[class_node, fn_node], dir.path());
+
+        // 1. Exact signature still works
+        let exact = get_snippets_body(
+            &store,
+            "method:ClassA.enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+        );
+        assert!(
+            exact.contains("enableSupportForFeatureX() {"),
+            "exact sig failed"
+        );
+
+        // 2. Plain function name works
+        let plain = get_snippets_body(&store, "enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        assert!(
+            plain.contains("enableSupportForFeatureX() {"),
+            "plain function name failed"
+        );
+
+        // 3. Bare class name works
+        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto);
+        assert!(class.contains("class ClassA"), "bare class name failed");
+
+        // 4. Dotted symbol name works
+        let dotted = get_snippets_body(
+            &store,
+            "ClassA.enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+        );
+        assert!(
+            dotted.contains("enableSupportForFeatureX() {"),
+            "dotted symbol name failed"
+        );
+
+        // 5. Unknown symbol
+        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto);
+        assert!(
+            unknown.contains("No symbols matching the provided names found in the graph."),
+            "unknown symbol failed"
         );
     }
 
@@ -9755,16 +10342,32 @@ mod snippet_tests {
 
         let (seeds, n_eligible, _, oracle) =
             embed_path_seeds(&store, "get_context", knn, &OpenFilter);
+        // pkg (kind=package/`pkg:`), crate (kind=crate), and the tests/ node are
+        // all noise and filtered from both the seed list and the oracle.
+        let seed_ids: Vec<_> = seeds.iter().map(|(n, _)| n.id).collect();
+        assert!(!seed_ids.contains(&pkg_id), "pkg node must not be a seed");
         assert!(
-            seeds.iter().all(|(node, _)| node.id == impl_id),
-            "only the src impl node should be a seed; got: {seeds:?}"
+            !seed_ids.contains(&crate_id),
+            "crate node must not be a seed"
         );
-        assert_eq!(seeds.len(), 1, "exactly one seed expected");
+        assert!(
+            !seed_ids.contains(&test_id),
+            "test-dir node must not be a seed"
+        );
+        assert!(
+            seed_ids.contains(&impl_id),
+            "only the real src impl is a seed; got: {seeds:?}"
+        );
+        assert_eq!(seeds.len(), 1, "only the impl seed expected");
         assert_eq!(n_eligible, 1, "n_eligible should match non-noise seeds");
-        // The package node must not be in the confidence-grounding oracle.
+        // The package/crate nodes must not be in the confidence-grounding oracle.
         assert!(
             !oracle.contains_key(&pkg_id),
             "pkg node must be excluded from the cosine oracle"
+        );
+        assert!(
+            !oracle.contains_key(&crate_id),
+            "crate node must be excluded from the cosine oracle"
         );
         assert!(
             oracle.contains_key(&impl_id),
@@ -9925,6 +10528,231 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "0").unwrap();
         assert!(phase_b_degraded_note(&store).is_none());
+    }
+
+    // ── #645 WS-B: index/HEAD mismatch note ──────────────────────────────────
+
+    #[test]
+    fn head_index_mismatch_note_none_when_equal_or_unknown() {
+        assert!(head_index_mismatch_note("abc123", "abc123").is_none());
+        assert!(head_index_mismatch_note("", "abc123").is_none());
+        assert!(head_index_mismatch_note("abc123", "").is_none());
+    }
+
+    #[test]
+    fn head_index_mismatch_note_names_both_shas_on_drift() {
+        let note = head_index_mismatch_note("aaa111", "bbb222").expect("must flag mismatch");
+        assert!(
+            note.contains("aaa111"),
+            "must name the checkout HEAD: {note}"
+        );
+        assert!(
+            note.contains("bbb222"),
+            "must name the index commit: {note}"
+        );
+    }
+
+    #[test]
+    fn git_short_head_reads_repo_and_is_none_off_repo() {
+        // Off a repo (bare tempdir) there is no HEAD to read.
+        let empty = tempfile::tempdir().unwrap();
+        // Prevent git from walking up and finding parent repos (e.g. in CI or user home).
+        let mut ceiling_paths = Vec::new();
+        let mut current = Some(empty.path());
+        while let Some(p) = current {
+            let p_str = p.to_string_lossy().to_string();
+            ceiling_paths.push(p_str.clone());
+            ceiling_paths.push(p_str.replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("C:", "c:"));
+            ceiling_paths.push(p_str.replace("c:", "C:"));
+            ceiling_paths.push(p_str.replace("C:", "c:").replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("c:", "C:").replace("\\", "/"));
+            current = p.parent();
+        }
+        #[cfg(windows)]
+        let delim = ";";
+        #[cfg(not(windows))]
+        let delim = ":";
+        std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
+        let res = git_short_head(empty.path());
+        std::env::remove_var("GIT_CEILING_DIRECTORIES");
+        assert!(res.is_none());
+    }
+
+    /// #645/#661: in global mode the per-repo HEAD must come from that repo's own
+    /// root (`<root>/.travsr/graph.db` → `<root>`), NOT the process-global
+    /// LAUNCH_CWD — otherwise one workspace's commit is compared against every
+    /// other registered repo's index and fires a spurious mismatch. Pin that the
+    /// resolver reads the repo the db belongs to, and matches `git_short_head` of
+    /// that root exactly.
+    #[test]
+    fn repo_head_from_registry_path_reads_the_owning_repo_head() {
+        fn git(dir: &std::path::Path, args: &[&str]) -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !git(std::path::Path::new("."), &["--version"]) {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(git(root, &["init", "-q"]));
+        assert!(git(root, &["config", "user.email", "t@t.t"]));
+        assert!(git(root, &["config", "user.name", "t"]));
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "-qm", "init"]));
+
+        let db_path = root.join(".travsr").join("graph.db");
+        // Resolves from the db path's grandparent (the repo root) and equals a
+        // direct short-HEAD read of that root — the value LAUNCH_CWD would only
+        // coincidentally give when the caller happened to stand in this repo.
+        assert_eq!(
+            repo_head_from_registry_path(&db_path),
+            git_short_head(root),
+            "must read the repo the db belongs to, not the process cwd"
+        );
+        assert!(repo_head_from_registry_path(&db_path).is_some());
+    }
+
+    #[test]
+    fn append_read_notes_emits_head_note_only_on_drift() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Markers agree ⇒ no Phase-B note; isolate the head note.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+
+        // Caller's HEAD differs from the index ⇒ note appended to the body.
+        let out = append_read_notes(&store, "real result".to_string(), Some("chk1111"));
+        assert!(out.starts_with("real result"), "body preserved: {out}");
+        assert!(
+            out.contains("idx0000") && out.contains("chk1111"),
+            "got: {out}"
+        );
+
+        // Same commit ⇒ no head note.
+        assert_eq!(
+            append_read_notes(&store, "real result".to_string(), Some("idx0000")),
+            "real result"
+        );
+        // git-less caller ⇒ no head note.
+        assert_eq!(
+            append_read_notes(&store, "real result".to_string(), None),
+            "real result"
+        );
+    }
+
+    #[test]
+    fn append_read_notes_empty_body_becomes_head_note() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        // Empty body + mismatch: the note is the whole answer (no leading newline).
+        let out = append_read_notes(&store, String::new(), Some("chk1111"));
+        assert!(out.starts_with("[note:"), "note is the body: {out}");
+        assert!(
+            !out.contains("\n[note:"),
+            "no empty line before the note: {out}"
+        );
+    }
+
+    #[test]
+    fn append_read_notes_phase_b_and_head_notes_coexist() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD ⇒ Phase-B pending note fires...
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+        // ...and the caller is at yet another commit ⇒ head note also fires.
+        let out = append_read_notes(&store, "body".to_string(), Some("chk1111"));
+        assert!(
+            out.contains("call-graph index incomplete"),
+            "phase-b note: {out}"
+        );
+        assert!(out.contains("chk1111"), "head note: {out}");
+    }
+
+    // ── #661 WS-D: head-only note on the deterministic path:line tools ────────
+
+    #[test]
+    fn append_head_note_emits_head_note_only_on_drift() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD would fire the Phase-B note — append_head_note must
+        // NOT include it (these tools do not depend on Phase B).
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+
+        let out = append_head_note(&store, "real result".to_string(), Some("chk1111"));
+        assert!(out.starts_with("real result"), "body preserved: {out}");
+        assert!(
+            out.contains("idx0000") && out.contains("chk1111"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("call-graph index incomplete"),
+            "head-only wrapper must not carry the Phase-B note: {out}"
+        );
+
+        // Same commit ⇒ no note. git-less caller ⇒ no note.
+        assert_eq!(
+            append_head_note(&store, "real result".to_string(), Some("idx0000")),
+            "real result"
+        );
+        assert_eq!(
+            append_head_note(&store, "real result".to_string(), None),
+            "real result"
+        );
+    }
+
+    #[test]
+    fn append_head_note_empty_body_becomes_note() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        let out = append_head_note(&store, String::new(), Some("chk1111"));
+        assert!(out.starts_with("[note:"), "note is the body: {out}");
+        assert!(
+            !out.contains('\n'),
+            "no leading newline before the note: {out}"
+        );
+    }
+
+    #[test]
+    fn read_note_signals_carry_head_and_phase_b_as_json_array() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        // Marker behind HEAD ⇒ Phase-B signal; caller at another commit ⇒ head signal.
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+
+        let signals = read_note_signals(&store, Some("chk1111"));
+        assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
+
+        // Embedding them in a graph-json envelope must still parse as JSON.
+        let out = serde_json::json!({ "nodes": [], "edges": [], "signals": signals });
+        let s = serde_json::to_string(&out).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("body must stay valid JSON");
+        let arr = parsed["signals"].as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|v| v.as_str().map(|t| t.contains("chk1111")).unwrap_or(false)),
+            "head signal present: {arr:?}"
+        );
+    }
+
+    #[test]
+    fn read_note_signals_empty_when_fresh_and_git_less() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
+        assert!(read_note_signals(&store, None).is_empty());
+        // Caller at the same commit ⇒ still no head signal.
+        assert!(read_note_signals(&store, Some("idx0000")).is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker
@@ -11883,7 +12711,26 @@ mod snippet_tests {
         ]
         .into();
 
+        // Prevent git from walking up and finding parent repos from bad_root
+        let mut ceiling_paths = Vec::new();
+        let mut current = Some(bad_root.as_path());
+        while let Some(p) = current {
+            let p_str = p.to_string_lossy().to_string();
+            ceiling_paths.push(p_str.clone());
+            ceiling_paths.push(p_str.replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("C:", "c:"));
+            ceiling_paths.push(p_str.replace("c:", "C:"));
+            ceiling_paths.push(p_str.replace("C:", "c:").replace("\\", "/"));
+            ceiling_paths.push(p_str.replace("c:", "C:").replace("\\", "/"));
+            current = p.parent();
+        }
+        #[cfg(windows)]
+        let delim = ";";
+        #[cfg(not(windows))]
+        let delim = ":";
+        std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
         let out = find_pattern_global(&repos, "alpha", None, None, false);
+        std::env::remove_var("GIT_CEILING_DIRECTORIES");
         assert!(
             out.contains("[repo_bad] pattern error"),
             "the failing repo's error must be attributed to it, not silently dropped: {out}"

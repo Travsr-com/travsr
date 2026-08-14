@@ -1,12 +1,29 @@
-//! Phase-A indexing for data/config formats (JSON, YAML, TOML, XML).
+//! Phase-A indexing for data/config formats (JSON, YAML, TOML, XML) and the
+//! dependency manifests expressed in them.
 //!
-//! Level 1: emit a single file node per file (no content parsing).
+//! Level 1: emit a single file node per file (no content parsing). This is all a
+//!   generic `.json`/`.yaml`/`.toml`/`.xml` gets — config *values* are
+//!   intentionally never embedded (local-first resource limits).
 //! Level 2: filename-dispatched schema parsers emit typed edges
-//!   (`ExternalDependency`, `Configures`) for well-known files.
+//!   (`ExternalDependency`, `Configures`) for recognized manifests:
+//!     - npm `package.json`, `tsconfig.json`
+//!     - Cargo `Cargo.toml` (incl. `[workspace.dependencies]`; member
+//!       `{ workspace = true }` versions are resolved cross-file by the indexer)
+//!     - Python `pyproject.toml` (PEP 621 + Poetry)
+//!     - PHP `composer.json`, Dart `pubspec.yaml`, Go `go.mod`, .NET `*.csproj`
+//!     - Maven `pom.xml`, GitHub Actions workflows, docker-compose
+//!
+//! Dispatch is filename-first, so a manifest is recognized by its canonical name
+//! even when its extension is unmapped (`go.mod`) or not a data format
+//! (`*.csproj` is XML). The enumeration gates admit those names via
+//! [`travsr_core::is_manifest_file`]; keep the two lists in agreement.
+//!
+//! Prose (`.md`) is *not* handled here — it has its own chunking parser
+//! (`crate::markdown`) that produces embeddable `doc-chunk` nodes.
 //!
 //! Malformed-input policy: parse errors degrade to Level 1 (file node only)
 //! with a debug-level warning — never panic on user config files.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -16,17 +33,6 @@ use yaml_rust2::{Yaml, YamlLoader};
 use crate::ParseOutput;
 
 pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<ParseOutput> {
-    let lang_str = abs_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(Language::from_extension)
-        .map(Language::as_str)
-        .unwrap_or("json");
-
-    let file_vname = VName::new(corpus, "", vname_path, lang_str, "file");
-    let file_node = Node::new(file_vname, "file");
-    let file_id = file_node.id;
-
     // Use vname_path (repo-relative) for dispatch — abs_path may be a temp file
     // in tests or a canonical path that doesn't reflect the repo structure.
     let file_name = Path::new(vname_path)
@@ -34,28 +40,91 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
+    // Language label for the file node. Extension-mapped formats use their
+    // canonical label; name-recognized manifests whose extension is unmapped
+    // (`go.mod`) or non-data-format (`*.csproj`) fall back to an honest label.
+    let lang_str = abs_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(Language::from_extension)
+        .map(Language::as_str)
+        .unwrap_or_else(|| manifest_lang_label(file_name));
+
+    let file_vname = VName::new(corpus, "", vname_path, lang_str, "file");
+    let file_node = Node::new(file_vname, "file");
+    let file_id = file_node.id;
+
     let mut out = ParseOutput {
         nodes: vec![file_node],
         ..Default::default()
     };
 
-    match (lang_str, file_name) {
-        ("json", "package.json") => parse_package_json(corpus, abs_path, file_id, &mut out),
-        ("json", "tsconfig.json") => {
-            parse_tsconfig_json(corpus, abs_path, vname_path, file_id, &mut out)
-        }
-        ("toml", "Cargo.toml") => parse_cargo_toml(corpus, abs_path, file_id, &mut out),
-        ("yaml", n) if n.ends_with(".yml") || n.ends_with(".yaml") => {
+    // Filename-first dispatch: a manifest is recognized by its canonical name
+    // regardless of extension, so extensionless/odd-extension manifests
+    // (`go.mod`, `*.csproj`) are handled the same as extension-mapped ones.
+    match file_name {
+        "package.json" => parse_package_json(corpus, abs_path, file_id, &mut out),
+        "tsconfig.json" => parse_tsconfig_json(corpus, abs_path, vname_path, file_id, &mut out),
+        "Cargo.toml" => parse_cargo_toml(corpus, abs_path, file_id, &mut out),
+        "pyproject.toml" => parse_pyproject_toml(corpus, abs_path, file_id, &mut out),
+        "composer.json" => parse_composer_json(corpus, abs_path, file_id, &mut out),
+        "pubspec.yaml" | "pubspec.yml" => parse_pubspec_yaml(corpus, abs_path, file_id, &mut out),
+        "go.mod" => parse_go_mod(abs_path, file_id, &mut out),
+        "pom.xml" => parse_pom_xml(abs_path, file_id, &mut out),
+        n if n.ends_with(".csproj") => parse_csproj(abs_path, file_id, &mut out),
+        n if n.ends_with(".yml") || n.ends_with(".yaml") => {
             parse_yaml(corpus, abs_path, vname_path, file_id, &mut out);
         }
-        ("xml", "pom.xml") => parse_pom_xml(abs_path, file_id, &mut out),
         _ => {}
     }
 
     Ok(out)
 }
 
+/// File-node language label for a name-recognized manifest whose extension is
+/// unmapped (`go.mod`) or not itself a data format (`*.csproj` is XML). Falls
+/// back to `"json"` for anything else that reaches `data_format::parse` without
+/// a mapped extension (defensive; such files are otherwise inert).
+fn manifest_lang_label(file_name: &str) -> &'static str {
+    if file_name == "go.mod" {
+        "go"
+    } else if file_name.ends_with(".csproj") {
+        "xml"
+    } else {
+        "json"
+    }
+}
+
 // ── JSON ──────────────────────────────────────────────────────────────────────
+
+/// Normalise a joined path to a repo-relative, forward-slash string so the
+/// resulting `NodeId` matches the real file node. Drops every `.` component
+/// (leading *and* interior, e.g. `sub/./pkg`) and collapses interior `..`
+/// against the preceding segment (`packages/x/../base` → `packages/base`). A
+/// leading `..` that escapes the repo root is preserved. Used for tsconfig
+/// `extends`/`references` target resolution.
+fn normalise_repo_path(raw: &Path) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in raw.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(parts.last(), Some(&p) if p != "..") {
+                    parts.pop();
+                } else {
+                    parts.push("..");
+                }
+            }
+            std::path::Component::Normal(s) => {
+                if let Some(s) = s.to_str() {
+                    parts.push(s);
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join("/")
+}
 
 fn parse_package_json(_corpus: &str, path: &Path, file_id: NodeId, out: &mut ParseOutput) {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -95,28 +164,37 @@ fn parse_tsconfig_json(
         return;
     };
 
+    // Use the vname_path (repo-relative) parent dir so the resolved
+    // target path stays repo-relative, not absolute.
+    let vname_dir = Path::new(vname_path).parent().unwrap_or(Path::new(""));
+
+    // A3: `"extends"` inherits from a base config. Emit a Configures edge to the
+    // base when it is a relative path (the common case). TypeScript appends
+    // `.json` when the reference omits an extension, so mirror that. Bare
+    // package-name extends (`@tsconfig/node18/tsconfig.json`) resolve through
+    // node_modules and are left alone — they are not repo-local file nodes.
+    if let Some(extends) = v.get("extends").and_then(|e| e.as_str()) {
+        if extends.starts_with('.') {
+            let with_ext = if Path::new(extends).extension().is_some() {
+                extends.to_string()
+            } else {
+                format!("{extends}.json")
+            };
+            let target_path = normalise_repo_path(&vname_dir.join(&with_ext));
+            let target_node =
+                Node::new(VName::new(corpus, "", &target_path, "json", "file"), "file");
+            out.edges
+                .push(Edge::new(file_id, target_node.id, EdgeKind::Configures));
+            out.nodes.push(target_node);
+        }
+    }
+
     if let Some(refs) = v.get("references").and_then(|r| r.as_array()) {
-        // Use the vname_path (repo-relative) parent dir so the resolved
-        // target path stays repo-relative, not absolute.
-        let vname_dir = Path::new(vname_path).parent().unwrap_or(Path::new(""));
         for r in refs {
             let Some(ref_path) = r.get("path").and_then(|p| p.as_str()) else {
                 continue;
             };
-            let raw = vname_dir.join(ref_path);
-            // Normalise to a repo-relative, forward-slash path: drop every "."
-            // component (leading *and* interior, e.g. "sub/./pkg") so the target
-            // NodeId matches the real file node. Keep ".." for out-of-dir refs.
-            let target_path = raw
-                .components()
-                .filter_map(|c| match c {
-                    std::path::Component::CurDir => None,
-                    std::path::Component::ParentDir => Some(".."),
-                    std::path::Component::Normal(s) => s.to_str(),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("/");
+            let target_path = normalise_repo_path(&vname_dir.join(ref_path));
             let target_node =
                 Node::new(VName::new(corpus, "", &target_path, "json", "file"), "file");
             let edge = Edge::new(file_id, target_node.id, EdgeKind::Configures);
@@ -128,6 +206,134 @@ fn parse_tsconfig_json(
 
 // ── TOML ─────────────────────────────────────────────────────────────────────
 
+/// Cross-file marker for Cargo workspace dependency resolution (A2).
+///
+/// A workspace **root** `Cargo.toml` declares versions under
+/// `[workspace.dependencies]`; **member** crates inherit them with
+/// `name = { workspace = true }` and carry no version of their own. A single
+/// file cannot resolve a member's version — it lives in a different file — so
+/// `parse_cargo_toml` emits these markers and the indexer resolves them once
+/// every file in the batch is parsed (mirrors the FFI-marker second pass).
+#[derive(Debug, Clone)]
+pub enum WorkspaceDepMarker {
+    /// The workspace root declares `[workspace.dependencies] name = version`.
+    Provider { name: String, version: String },
+    /// A member declares `name = { workspace = true }`; the edge from
+    /// `member_file` to the versioned package node is emitted at resolution time.
+    Consumer { member_file: NodeId, name: String },
+}
+
+/// Build the canonical `crates.io` package node for a Cargo dependency.
+///
+/// Shared by `parse_cargo_toml` and the indexer's workspace-dep resolver so a
+/// member's resolved node has the **same** `NodeId` as the versioned node the
+/// workspace root emits — otherwise the two would be distinct graph nodes.
+pub fn cargo_package_node(name: &str, version: &str) -> Node {
+    let sig = format!("pkg:{name}@{version}");
+    Node::new(VName::new("crates.io", "", "", "toml", &sig), "package")
+}
+
+/// Version string for a Cargo dependency spec (`"1.0"` or `{ version = "1.0" }`).
+fn cargo_dep_version(spec: &toml::Value) -> &str {
+    match spec {
+        toml::Value::String(s) => s.as_str(),
+        toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()).unwrap_or("*"),
+        _ => "*",
+    }
+}
+
+/// Extract `[workspace.dependencies]` from an already-parsed `Cargo.toml` as
+/// `(name, version)` pairs. Shared by [`parse_cargo_toml`] (the root's own
+/// Provider markers) and [`workspace_provider_markers_for_member`] (the daemon's
+/// incremental enrichment) so both derive versions through one code path.
+fn workspace_dep_providers(doc: &toml::Value) -> Vec<(String, String)> {
+    let Some(ws_deps) = doc
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.as_table())
+    else {
+        return Vec::new();
+    };
+    ws_deps
+        .iter()
+        .map(|(name, spec)| (name.clone(), cargo_dep_version(spec).to_string()))
+        .collect()
+}
+
+/// Load the `[workspace.dependencies]` a member `Cargo.toml` inherits, as
+/// `Provider` markers, by walking up to its workspace root.
+///
+/// A member reindexed *alone* (an incremental commit that does not touch the
+/// root) has `Consumer` markers for its `{ workspace = true }` entries but no
+/// matching `Provider` in the batch, so the indexer's `resolve_workspace_deps`
+/// would degrade the edge to the `@workspace` sentinel. This walks from
+/// `member_cargo` up to the nearest ancestor `Cargo.toml` that declares a
+/// `[workspace]` table (bounded by `repo_root`), reads its
+/// `[workspace.dependencies]`, and returns them as `Provider` markers so the
+/// resolver can supply the real versions.
+///
+/// Returns empty when no ancestor workspace root exists on disk (a detached
+/// member) or on read/parse failure — the caller then keeps the `@workspace`
+/// sentinel as the last resort.
+pub fn workspace_provider_markers_for_member(
+    member_cargo: &Path,
+    repo_root: &Path,
+) -> Vec<WorkspaceDepMarker> {
+    let Some(root) = find_workspace_root(member_cargo, repo_root) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&root) else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        tracing::debug!("data_format: malformed workspace root Cargo.toml at {root:?}");
+        return Vec::new();
+    };
+    workspace_dep_providers(&doc)
+        .into_iter()
+        .map(|(name, version)| WorkspaceDepMarker::Provider { name, version })
+        .collect()
+}
+
+/// Walk up from `member_cargo` to the nearest *ancestor* `Cargo.toml` that
+/// declares a `[workspace]` table, bounded by `repo_root` so the search never
+/// escapes the repository. The member file itself is skipped: a self-contained
+/// root (`[workspace]` + `{ workspace = true }` in one file) already resolves
+/// in-batch and never reaches this path.
+fn find_workspace_root(member_cargo: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let repo_root = repo_root.canonicalize().ok();
+    let mut dir = member_cargo.parent()?.to_path_buf();
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate != member_cargo && candidate.is_file() {
+            if let Ok(text) = std::fs::read_to_string(&candidate) {
+                if let Ok(doc) = text.parse::<toml::Value>() {
+                    if doc.get("workspace").is_some() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        // Stop once we have inspected the repo root directory.
+        if let Some(ref rr) = repo_root {
+            if dir.canonicalize().ok().as_deref() == Some(rr.as_path()) {
+                break;
+            }
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    None
+}
+
+/// A member spec that inherits from the workspace: `{ workspace = true }`.
+fn is_workspace_inherited(spec: &toml::Value) -> bool {
+    matches!(spec, toml::Value::Table(t)
+        if t.get("workspace").and_then(|v| v.as_bool()) == Some(true))
+}
+
 fn parse_cargo_toml(_corpus: &str, path: &Path, file_id: NodeId, out: &mut ParseOutput) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
@@ -137,21 +343,44 @@ fn parse_cargo_toml(_corpus: &str, path: &Path, file_id: NodeId, out: &mut Parse
         return;
     };
 
+    // A1: a workspace root declares its dependency versions under
+    // `[workspace.dependencies]`. Emit versioned edges for the root itself and
+    // record Provider markers so member `{ workspace = true }` entries resolve.
+    for (name, ver) in workspace_dep_providers(&doc) {
+        let pkg_node = cargo_package_node(&name, &ver);
+        out.edges.push(Edge::new(
+            file_id,
+            pkg_node.id,
+            EdgeKind::ExternalDependency,
+        ));
+        out.nodes.push(pkg_node);
+        out.workspace_dep_markers
+            .push(WorkspaceDepMarker::Provider { name, version: ver });
+    }
+
     for section in &["dependencies", "dev-dependencies", "build-dependencies"] {
         let Some(deps) = doc.get(section).and_then(|d| d.as_table()) else {
             continue;
         };
         for (name, spec) in deps {
-            let ver = match spec {
-                toml::Value::String(s) => s.as_str(),
-                toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()).unwrap_or("*"),
-                _ => "*",
-            };
-            let sig = format!("pkg:{name}@{ver}");
-            let pkg_node = Node::new(VName::new("crates.io", "", "", "toml", &sig), "package");
-            let edge = Edge::new(file_id, pkg_node.id, EdgeKind::ExternalDependency);
+            // A2: a member's `{ workspace = true }` entry carries no version here;
+            // defer to the cross-file resolver, which looks it up on the root.
+            if is_workspace_inherited(spec) {
+                out.workspace_dep_markers
+                    .push(WorkspaceDepMarker::Consumer {
+                        member_file: file_id,
+                        name: name.clone(),
+                    });
+                continue;
+            }
+            let ver = cargo_dep_version(spec);
+            let pkg_node = cargo_package_node(name, ver);
+            out.edges.push(Edge::new(
+                file_id,
+                pkg_node.id,
+                EdgeKind::ExternalDependency,
+            ));
             out.nodes.push(pkg_node);
-            out.edges.push(edge);
         }
     }
 }
@@ -344,6 +573,402 @@ fn parse_pom_xml(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
     }
 }
 
+// ── Additional dependency manifests (pyproject / composer / pubspec / go.mod / csproj) ──
+
+/// Emit one `ExternalDependency` edge from `file_id` to a synthetic package
+/// node `pkg:<name>@<version>` on the given registry `corpus`.
+fn emit_package(
+    file_id: NodeId,
+    corpus: &str,
+    lang: &str,
+    name: &str,
+    version: &str,
+    out: &mut ParseOutput,
+) {
+    let sig = format!("pkg:{name}@{version}");
+    let node = Node::new(VName::new(corpus, "", "", lang, &sig), "package");
+    out.edges
+        .push(Edge::new(file_id, node.id, EdgeKind::ExternalDependency));
+    out.nodes.push(node);
+}
+
+/// Split a PEP 508 requirement string (`"requests[security]>=2.0 ; python_version<'3.9'"`)
+/// into `(name, version_constraint)`. Extras and environment markers are
+/// stripped; a bare name yields version `"*"`.
+fn pep508_split(spec: &str) -> Option<(String, String)> {
+    let spec = spec.split(';').next().unwrap_or(spec).trim();
+    let name: String = spec
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let mut rest = spec[name.len()..].trim_start();
+    // Drop an optional extras group: `[security,socks]`.
+    if let Some(after_open) = rest.strip_prefix('[') {
+        if let Some(close) = after_open.find(']') {
+            rest = after_open[close + 1..].trim_start();
+        }
+    }
+    let ver = if rest.is_empty() {
+        "*".to_string()
+    } else {
+        rest.trim().to_string()
+    };
+    Some((name, ver))
+}
+
+/// Version for a Poetry dependency spec (`"^2.28"` or `{ version = "^2.28" }`).
+fn poetry_dep_version(spec: &toml::Value) -> String {
+    match spec {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Table(t) => t
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .to_string(),
+        _ => "*".to_string(),
+    }
+}
+
+/// Parse `pyproject.toml` dependency declarations from both PEP 621
+/// (`[project.dependencies]`, `[project.optional-dependencies]`) and Poetry
+/// (`[tool.poetry.dependencies]` + `[tool.poetry.group.*.dependencies]`).
+fn parse_pyproject_toml(_corpus: &str, path: &Path, file_id: NodeId, out: &mut ParseOutput) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        tracing::debug!("data_format: malformed pyproject.toml at {:?}", path);
+        return;
+    };
+
+    // PEP 621: `[project].dependencies` is an array of requirement strings.
+    if let Some(project) = doc.get("project") {
+        if let Some(deps) = project.get("dependencies").and_then(|d| d.as_array()) {
+            for d in deps.iter().filter_map(|d| d.as_str()) {
+                if let Some((name, ver)) = pep508_split(d) {
+                    emit_package(file_id, "pypi.org", "toml", &name, &ver, out);
+                }
+            }
+        }
+        // `[project.optional-dependencies]` is a table of requirement arrays.
+        if let Some(opt) = project
+            .get("optional-dependencies")
+            .and_then(|t| t.as_table())
+        {
+            for arr in opt.values().filter_map(|v| v.as_array()) {
+                for d in arr.iter().filter_map(|d| d.as_str()) {
+                    if let Some((name, ver)) = pep508_split(d) {
+                        emit_package(file_id, "pypi.org", "toml", &name, &ver, out);
+                    }
+                }
+            }
+        }
+    }
+
+    // Poetry: `[tool.poetry.dependencies]` + per-group dependency tables. The
+    // implicit `python` constraint is a language requirement, not a package.
+    if let Some(poetry) = doc.get("tool").and_then(|t| t.get("poetry")) {
+        let mut poetry_tables = Vec::new();
+        if let Some(t) = poetry.get("dependencies").and_then(|d| d.as_table()) {
+            poetry_tables.push(t);
+        }
+        if let Some(groups) = poetry.get("group").and_then(|g| g.as_table()) {
+            for gv in groups.values() {
+                if let Some(t) = gv.get("dependencies").and_then(|d| d.as_table()) {
+                    poetry_tables.push(t);
+                }
+            }
+        }
+        for table in poetry_tables {
+            for (name, spec) in table {
+                if name == "python" {
+                    continue;
+                }
+                let ver = poetry_dep_version(spec);
+                emit_package(file_id, "pypi.org", "toml", name, &ver, out);
+            }
+        }
+    }
+}
+
+/// Parse `composer.json` (`require` + `require-dev`). Platform requirements
+/// (`php`, `ext-*`, `lib-*`) are not Packagist packages and are skipped.
+fn parse_composer_json(_corpus: &str, path: &Path, file_id: NodeId, out: &mut ParseOutput) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        tracing::debug!("data_format: malformed composer.json at {:?}", path);
+        return;
+    };
+
+    for section in &["require", "require-dev"] {
+        if let Some(deps) = v.get(section).and_then(|d| d.as_object()) {
+            for (name, version) in deps {
+                if name == "php" || name.starts_with("ext-") || name.starts_with("lib-") {
+                    continue;
+                }
+                let ver = version.as_str().unwrap_or("*");
+                emit_package(file_id, "packagist.org", "json", name, ver, out);
+            }
+        }
+    }
+}
+
+/// Parse `pubspec.yaml` (`dependencies` + `dev_dependencies`). A dependency
+/// value may be a version string or a map (`sdk:`, `git:`, `path:`, `version:`).
+fn parse_pubspec_yaml(_corpus: &str, path: &Path, file_id: NodeId, out: &mut ParseOutput) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(docs) = YamlLoader::load_from_str(&text) else {
+        tracing::debug!("data_format: malformed pubspec.yaml at {:?}", path);
+        return;
+    };
+    let Some(doc) = docs.into_iter().next() else {
+        return;
+    };
+
+    for section in &["dependencies", "dev_dependencies"] {
+        let Some(map) = doc[*section].as_hash() else {
+            continue;
+        };
+        for (k, val) in map {
+            let Some(name) = k.as_str() else {
+                continue;
+            };
+            let ver = match val {
+                Yaml::String(s) => s.clone(),
+                Yaml::Real(s) => s.clone(),
+                Yaml::Integer(i) => i.to_string(),
+                Yaml::Hash(_) => {
+                    if let Some(v) = val["version"].as_str() {
+                        v.to_string()
+                    } else if let Some(sdk) = val["sdk"].as_str() {
+                        format!("sdk:{sdk}")
+                    } else {
+                        "*".to_string()
+                    }
+                }
+                _ => "*".to_string(),
+            };
+            emit_package(file_id, "pub.dev", "yaml", name, &ver, out);
+        }
+    }
+}
+
+/// Parse `go.mod` `require` directives (both the grouped `require ( … )` block
+/// and single-line `require <module> <version>`). `// indirect` and other
+/// trailing comments are stripped; `replace`/`exclude`/`module`/`go` lines are
+/// ignored.
+fn parse_go_mod(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut in_require = false;
+    for raw in text.lines() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if in_require {
+            if line == ")" {
+                in_require = false;
+            } else {
+                emit_go_require(line, file_id, out);
+            }
+        } else if line == "require (" || line == "require(" {
+            in_require = true;
+        } else if let Some(rest) = line.strip_prefix("require ") {
+            emit_go_require(rest.trim(), file_id, out);
+        }
+    }
+}
+
+/// Emit a Go module requirement (`<module-path> <version>`).
+fn emit_go_require(spec: &str, file_id: NodeId, out: &mut ParseOutput) {
+    let mut it = spec.split_whitespace();
+    if let (Some(name), Some(ver)) = (it.next(), it.next()) {
+        emit_package(file_id, "go.dev", "go", name, ver, out);
+    }
+}
+
+/// Local element name (namespace-stripped) for a quick-xml start/end tag.
+fn xml_local_name(name: quick_xml::name::QName) -> String {
+    std::str::from_utf8(name.local_name().as_ref())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Read the `Include` and `Version` attributes of a `<PackageReference>` tag.
+fn packageref_attrs(e: &quick_xml::events::BytesStart) -> (Option<String>, Option<String>) {
+    let mut include = None;
+    let mut version = None;
+    for attr in e.attributes().flatten() {
+        let key = attr.key.local_name();
+        let key = std::str::from_utf8(key.as_ref()).unwrap_or("");
+        let val = std::str::from_utf8(attr.value.as_ref())
+            .unwrap_or("")
+            .to_string();
+        match key {
+            "Include" => include = Some(val),
+            // `VersionOverride` is how a project pins a version under Central
+            // Package Management; either form makes the reference self-versioned.
+            "Version" | "VersionOverride" => version = Some(val),
+            _ => {}
+        }
+    }
+    (include, version)
+}
+
+/// Collect every `<PackageReference>` in a `.csproj` (MSBuild XML) as
+/// `(name, explicit_version)`, covering both the self-closing
+/// `<PackageReference Include="X" Version="Y" />` and the child-element
+/// `<PackageReference Include="X"><Version>Y</Version></PackageReference>` forms.
+/// `explicit_version` is `None` for a Central Package Management reference whose
+/// version lives in `Directory.Packages.props` (resolved by the caller).
+fn collect_csproj_package_refs(text: &str) -> Vec<(String, Option<String>)> {
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(true);
+
+    let mut refs: Vec<(String, Option<String>)> = Vec::new();
+    let mut include: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut in_pkgref = false;
+    let mut current_tag = String::new();
+
+    loop {
+        match reader.read_event() {
+            // Self-closing: `<PackageReference Include="X" Version="Y" />`.
+            Ok(Event::Empty(e)) => {
+                if xml_local_name(e.name()) == "PackageReference" {
+                    let (inc, ver) = packageref_attrs(&e);
+                    if let Some(name) = inc {
+                        refs.push((name, ver));
+                    }
+                }
+            }
+            Ok(Event::Start(e)) => {
+                let name = xml_local_name(e.name());
+                if name == "PackageReference" {
+                    let (inc, ver) = packageref_attrs(&e);
+                    include = inc;
+                    version = ver;
+                    in_pkgref = true;
+                    current_tag.clear();
+                } else if in_pkgref {
+                    current_tag = name;
+                }
+            }
+            Ok(Event::Text(e)) if in_pkgref && current_tag == "Version" => {
+                version = Some(
+                    std::str::from_utf8(e.as_ref())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                );
+            }
+            Ok(Event::End(e)) => {
+                if xml_local_name(e.name()) == "PackageReference" && in_pkgref {
+                    if let Some(name) = include.take() {
+                        refs.push((name, version.take()));
+                    }
+                    in_pkgref = false;
+                    current_tag.clear();
+                } else {
+                    current_tag.clear();
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    refs
+}
+
+/// Nearest `Directory.Packages.props` at or above `start_dir`, MSBuild's
+/// Central Package Management (CPM) lookup: walk up until the file is found,
+/// stopping at the repo root (a directory containing `.git`) or the filesystem
+/// root. Returns `None` when the project is not under CPM.
+fn find_directory_packages_props(start_dir: &Path) -> Option<PathBuf> {
+    let mut dir = start_dir;
+    loop {
+        let candidate = dir.join("Directory.Packages.props");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.join(".git").exists() {
+            return None; // repo boundary: do not escape into ancestors
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Central package versions from a `Directory.Packages.props`: the
+/// `<PackageVersion Include="X" Version="Y" />` entries that a CPM project's
+/// versionless `<PackageReference>`s inherit. Conditions are ignored
+/// (best-effort — the last definition of a name wins).
+fn parse_central_package_versions(props_path: &Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(props_path) else {
+        return map;
+    };
+    let mut reader = Reader::from_str(&text);
+    reader.config_mut().trim_text(true);
+    loop {
+        let (name, attrs) = match reader.read_event() {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
+                (xml_local_name(e.name()), packageref_attrs(&e))
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => continue,
+        };
+        // `packageref_attrs` reads `Include` + `Version`, the same shape a
+        // `<PackageVersion>` uses.
+        if name == "PackageVersion" {
+            if let (Some(pkg), Some(ver)) = attrs {
+                map.insert(pkg, ver);
+            }
+        }
+    }
+    map
+}
+
+/// Parse a `.csproj` (MSBuild XML) for `<PackageReference>` dependencies.
+/// A reference that carries its own `Version`/`VersionOverride` is emitted as
+/// written; a versionless reference (Central Package Management) has its version
+/// resolved from the nearest `Directory.Packages.props`, falling back to `*`
+/// when the project is not under CPM or the name is absent there.
+///
+/// CAVEAT: the central version is read at parse time. Editing only
+/// `Directory.Packages.props` (a bare version bump) will not re-resolve the
+/// `.csproj` edges until that project is itself reindexed — the same
+/// manifest-only-edit limitation the C1 cross-link documents.
+fn parse_csproj(path: &Path, file_id: NodeId, out: &mut ParseOutput) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let refs = collect_csproj_package_refs(&text);
+    // Only pay the CPM lookup when a reference actually needs it.
+    let central = if refs.iter().any(|(_, v)| v.is_none()) {
+        path.parent()
+            .and_then(find_directory_packages_props)
+            .map(|p| parse_central_package_versions(&p))
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    for (name, ver) in refs {
+        let ver = ver
+            .or_else(|| central.get(&name).cloned())
+            .unwrap_or_else(|| "*".to_string());
+        emit_package(file_id, "nuget.org", "xml", &name, &ver, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +1129,53 @@ tempfile = "3"
         let out = parse("github.com/a/b", f.path(), "Cargo.toml").unwrap();
         assert_eq!(out.nodes.len(), 1);
         assert_eq!(out.edges.len(), 0);
+    }
+
+    /// A2 follow-up: the member-only enrichment helper walks up to the workspace
+    /// root and returns its `[workspace.dependencies]` as `Provider` markers.
+    #[test]
+    fn workspace_provider_markers_walk_up_to_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n\n\
+             [workspace.dependencies]\nserde = \"1.0.200\"\n",
+        )
+        .unwrap();
+        let member_dir = tmp.path().join("crates/member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member = member_dir.join("Cargo.toml");
+        std::fs::write(
+            &member,
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { workspace = true }\n",
+        )
+        .unwrap();
+
+        let markers = workspace_provider_markers_for_member(&member, tmp.path());
+        assert!(
+            markers.iter().any(|m| matches!(
+                m,
+                WorkspaceDepMarker::Provider { name, version }
+                    if name == "serde" && version == "1.0.200"
+            )),
+            "must find serde=1.0.200 from the workspace root"
+        );
+    }
+
+    /// A detached member with no ancestor workspace root yields nothing, so the
+    /// caller keeps the `@workspace` sentinel as the last resort.
+    #[test]
+    fn workspace_provider_markers_detached_member_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &member,
+            "[package]\nname = \"o\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { workspace = true }\n",
+        )
+        .unwrap();
+        assert!(workspace_provider_markers_for_member(&member, tmp.path()).is_empty());
     }
 
     #[test]
@@ -667,5 +1339,329 @@ services:
         let out = parse("github.com/a/b", f.path(), "config/app.xml").unwrap();
         assert_eq!(out.nodes.len(), 1);
         assert_eq!(out.edges.len(), 0);
+    }
+
+    // ── Cargo workspace (A1 + A2) ───────────────────────────────────────────
+
+    fn sigs(out: &ParseOutput) -> Vec<&str> {
+        out.nodes[1..]
+            .iter()
+            .map(|n| n.vname.signature.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn cargo_workspace_root_emits_versioned_deps_and_provider_markers() {
+        let content = r#"
+[workspace]
+members = ["a", "b"]
+
+[workspace.dependencies]
+serde = "1.0"
+anyhow = { version = "1.0.75", features = ["backtrace"] }
+"#;
+        let f = write_tmp(content, "Cargo.toml");
+        let out = parse("github.com/a/b", f.path(), "Cargo.toml").unwrap();
+
+        let s = sigs(&out);
+        assert!(s.contains(&"pkg:serde@1.0"));
+        assert!(
+            s.contains(&"pkg:anyhow@1.0.75"),
+            "table dep keeps its version"
+        );
+        assert_eq!(out.edges.len(), 2);
+        assert!(out
+            .edges
+            .iter()
+            .all(|e| e.kind == EdgeKind::ExternalDependency));
+
+        let providers: Vec<_> = out
+            .workspace_dep_markers
+            .iter()
+            .filter_map(|m| match m {
+                WorkspaceDepMarker::Provider { name, version } => {
+                    Some((name.as_str(), version.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(providers.contains(&("serde", "1.0")));
+        assert!(providers.contains(&("anyhow", "1.0.75")));
+    }
+
+    #[test]
+    fn cargo_member_workspace_inherited_defers_via_consumer_marker_not_star() {
+        let content = r#"
+[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+serde = { workspace = true }
+local_dep = "2.0"
+"#;
+        let f = write_tmp(content, "Cargo.toml");
+        let out = parse("github.com/a/b", f.path(), "crates/member/Cargo.toml").unwrap();
+
+        let s = sigs(&out);
+        assert!(s.contains(&"pkg:local_dep@2.0"));
+        assert!(
+            !s.iter().any(|sig| sig.starts_with("pkg:serde@")),
+            "an inherited dep must NOT emit a versionless @* node (A2 bug)"
+        );
+
+        let consumers: Vec<_> = out
+            .workspace_dep_markers
+            .iter()
+            .filter_map(|m| match m {
+                WorkspaceDepMarker::Consumer { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(consumers, vec!["serde"]);
+    }
+
+    // ── tsconfig extends (A3) ────────────────────────────────────────────────
+
+    #[test]
+    fn tsconfig_extends_emits_configures_edge() {
+        let content = r#"{ "extends": "./tsconfig.base.json", "compilerOptions": {} }"#;
+        let f = write_tmp(content, "tsconfig.json");
+        let out = parse("github.com/a/b", f.path(), "packages/x/tsconfig.json").unwrap();
+        assert_eq!(out.edges.len(), 1);
+        assert_eq!(out.edges[0].kind, EdgeKind::Configures);
+        assert_eq!(out.nodes[1].vname.path, "packages/x/tsconfig.base.json");
+    }
+
+    #[test]
+    fn tsconfig_extends_appends_json_when_extension_omitted() {
+        let content = r#"{ "extends": "../base" }"#;
+        let f = write_tmp(content, "tsconfig.json");
+        let out = parse("github.com/a/b", f.path(), "packages/x/tsconfig.json").unwrap();
+        assert_eq!(out.nodes[1].vname.path, "packages/base.json");
+    }
+
+    #[test]
+    fn tsconfig_extends_bare_package_name_is_ignored() {
+        let content = r#"{ "extends": "@tsconfig/node18/tsconfig.json" }"#;
+        let f = write_tmp(content, "tsconfig.json");
+        let out = parse("github.com/a/b", f.path(), "tsconfig.json").unwrap();
+        assert_eq!(out.nodes.len(), 1);
+        assert_eq!(out.edges.len(), 0);
+    }
+
+    // ── Cross-language manifests (B1/B2) ─────────────────────────────────────
+
+    #[test]
+    fn pyproject_pep621_and_poetry_emit_deps() {
+        let content = r#"
+[project]
+name = "app"
+dependencies = ["requests>=2.0", "flask", "httpx[http2]>=0.27; python_version >= '3.8'"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+rich = "^13.0"
+
+[tool.poetry.group.test.dependencies]
+mypy = "^1.0"
+"#;
+        let f = write_tmp(content, "pyproject.toml");
+        let out = parse("github.com/a/b", f.path(), "pyproject.toml").unwrap();
+        let s = sigs(&out);
+        assert!(s.contains(&"pkg:requests@>=2.0"));
+        assert!(s.contains(&"pkg:flask@*"));
+        assert!(s.contains(&"pkg:httpx@>=0.27"), "extras + marker stripped");
+        assert!(s.contains(&"pkg:pytest@>=7"));
+        assert!(s.contains(&"pkg:rich@^13.0"));
+        assert!(s.contains(&"pkg:mypy@^1.0"));
+        assert!(!s.iter().any(|sig| sig.starts_with("pkg:python@")));
+        assert!(out.nodes[1..].iter().all(|n| n.vname.corpus == "pypi.org"));
+    }
+
+    #[test]
+    fn composer_require_and_dev_skip_platform_packages() {
+        let content = r#"{
+            "require": { "php": ">=8.1", "monolog/monolog": "^3.0", "ext-json": "*" },
+            "require-dev": { "phpunit/phpunit": "^10.0" }
+        }"#;
+        let f = write_tmp(content, "composer.json");
+        let out = parse("github.com/a/b", f.path(), "composer.json").unwrap();
+        let s = sigs(&out);
+        assert!(s.contains(&"pkg:monolog/monolog@^3.0"));
+        assert!(s.contains(&"pkg:phpunit/phpunit@^10.0"));
+        assert!(!s
+            .iter()
+            .any(|sig| sig.contains("php@") || sig.contains("ext-json")));
+        assert!(out.nodes[1..]
+            .iter()
+            .all(|n| n.vname.corpus == "packagist.org"));
+    }
+
+    #[test]
+    fn pubspec_dependencies_and_dev_emit_deps() {
+        let content = r#"
+name: myapp
+dependencies:
+  http: ^1.0.0
+  path: any
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  test: ^1.24.0
+"#;
+        let f = write_tmp(content, "pubspec.yaml");
+        let out = parse("github.com/a/b", f.path(), "pubspec.yaml").unwrap();
+        let s = sigs(&out);
+        assert!(s.contains(&"pkg:http@^1.0.0"));
+        assert!(s.contains(&"pkg:path@any"));
+        assert!(s.contains(&"pkg:flutter@sdk:flutter"));
+        assert!(s.contains(&"pkg:test@^1.24.0"));
+        assert!(out.nodes[1..].iter().all(|n| n.vname.corpus == "pub.dev"));
+    }
+
+    #[test]
+    fn go_mod_require_block_and_single_line() {
+        let content = r#"
+module example.com/foo
+
+go 1.21
+
+require (
+    github.com/pkg/errors v0.9.1
+    golang.org/x/net v0.17.0 // indirect
+)
+
+require github.com/single/dep v1.2.3
+"#;
+        let f = write_tmp(content, ".mod");
+        let out = parse("github.com/a/b", f.path(), "go.mod").unwrap();
+        let s = sigs(&out);
+        assert!(s.contains(&"pkg:github.com/pkg/errors@v0.9.1"));
+        assert!(
+            s.contains(&"pkg:golang.org/x/net@v0.17.0"),
+            "// indirect stripped"
+        );
+        assert!(
+            s.contains(&"pkg:github.com/single/dep@v1.2.3"),
+            "single-line require"
+        );
+        assert!(out.nodes[1..].iter().all(|n| n.vname.corpus == "go.dev"));
+        // Name-recognized manifest with an unmapped extension: honest label.
+        assert_eq!(out.nodes[0].vname.language, "go");
+    }
+
+    #[test]
+    fn csproj_packagereference_attr_and_child_forms() {
+        let content = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Serilog">
+      <Version>3.1.1</Version>
+    </PackageReference>
+  </ItemGroup>
+</Project>"#;
+        let f = write_tmp(content, ".csproj");
+        let out = parse("github.com/a/b", f.path(), "src/App.csproj").unwrap();
+        let s = sigs(&out);
+        assert!(
+            s.contains(&"pkg:Newtonsoft.Json@13.0.3"),
+            "self-closing attr form"
+        );
+        assert!(s.contains(&"pkg:Serilog@3.1.1"), "child <Version> form");
+        assert!(out.nodes[1..].iter().all(|n| n.vname.corpus == "nuget.org"));
+        assert_eq!(out.nodes[0].vname.language, "xml");
+    }
+
+    #[test]
+    fn csproj_central_package_management_resolves_from_props() {
+        // Central Package Management: the project references packages without a
+        // version; the versions live in a `Directory.Packages.props` at the repo
+        // root. A `VersionOverride` on a reference still wins locally.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "").unwrap(); // repo boundary marker
+        std::fs::write(
+            dir.path().join("Directory.Packages.props"),
+            r#"<Project>
+  <ItemGroup>
+    <PackageVersion Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageVersion Include="Serilog" Version="3.1.1" />
+  </ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+        let proj_dir = dir.path().join("src");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let csproj = proj_dir.join("App.csproj");
+        std::fs::write(
+            &csproj,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" />
+    <PackageReference Include="Serilog" VersionOverride="4.0.0" />
+    <PackageReference Include="Unlisted.Pkg" />
+  </ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+
+        let out = parse("github.com/a/b", &csproj, "src/App.csproj").unwrap();
+        let s = sigs(&out);
+        assert!(
+            s.contains(&"pkg:Newtonsoft.Json@13.0.3"),
+            "versionless ref resolves from Directory.Packages.props"
+        );
+        assert!(
+            s.contains(&"pkg:Serilog@4.0.0"),
+            "VersionOverride wins over the central version"
+        );
+        assert!(
+            s.contains(&"pkg:Unlisted.Pkg@*"),
+            "a name absent from the props file falls back to *"
+        );
+    }
+
+    #[test]
+    fn csproj_versionless_without_cpm_falls_back_to_star() {
+        // No Directory.Packages.props anywhere: a versionless reference keeps the
+        // pre-CPM behavior and degrades to `*`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "").unwrap();
+        let csproj = dir.path().join("App.csproj");
+        std::fs::write(
+            &csproj,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" />
+  </ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+        let out = parse("github.com/a/b", &csproj, "App.csproj").unwrap();
+        assert!(sigs(&out).contains(&"pkg:Newtonsoft.Json@*"));
+    }
+
+    #[test]
+    fn new_manifests_malformed_degrade_to_file_node_only() {
+        for (content, vname) in [
+            ("{ not json", "composer.json"),
+            ("[not valid\ntoml = {", "pyproject.toml"),
+            (": : bad: yaml: {{{{", "pubspec.yaml"),
+        ] {
+            let f = write_tmp(content, "x");
+            let out = parse("c", f.path(), vname).unwrap();
+            assert_eq!(out.nodes.len(), 1, "{vname} degrades to file node only");
+            assert_eq!(out.edges.len(), 0, "{vname} emits no edges when malformed");
+        }
+        // go.mod / csproj are best-effort text/XML: junk yields no edges, no panic.
+        let f = write_tmp("garbage not a require line", "x");
+        let out = parse("c", f.path(), "go.mod").unwrap();
+        assert_eq!(out.edges.len(), 0);
+        let f = write_tmp("<not valid xml ><<", "x");
+        let out = parse("c", f.path(), "App.csproj").unwrap();
+        assert_eq!(out.nodes[0].kind, "file");
     }
 }

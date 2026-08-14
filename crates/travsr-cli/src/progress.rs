@@ -251,8 +251,12 @@ impl ProgressReporter {
                 )
             }
             InitProgress::PhaseBDeferred => {
+                // Transient line — do not assert *when* semantic edges build (that
+                // depends on whether a daemon is running, which init decides after
+                // this pass). print_summary states it accurately; here just report
+                // that the structural pass is done.
                 format!(
-                    "  {} structural index ready — semantic edges indexing in background   {}",
+                    "  {} structural index ready   {}",
                     pal.green("●"),
                     pal.dim(&elapsed)
                 )
@@ -309,7 +313,7 @@ impl ProgressReporter {
 /// Print the final, on-brand summary for the human modes (TTY/plain) to stdout.
 /// `--json` is handled by the caller; this is a no-op for it via the caller's
 /// branch. The summary node is fresh green; the "try" hint is shown unless quiet.
-pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
+pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_running: bool) {
     let pal = Palette::for_stream(std::io::stdout().is_terminal());
     let node = pal.green("●");
     let dur = fmt_dur(elapsed);
@@ -339,11 +343,24 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool) {
 
     match &stats.phase_b_report {
         None => {
-            // Phase B deferred — daemon auto-started by init, indexing in background.
-            println!(
-                "  {} semantic call-edge indexing in background — run `travsr daemon status` to check progress",
-                pal.dim("ℹ"),
-            );
+            if daemon_running {
+                // A daemon is up (interactive init spawned one, or one was already
+                // running). It auto-arms Phase B on startup and indexes semantic
+                // call edges in the background for the current commit — so this is
+                // genuinely "in progress", not commit-gated.
+                println!(
+                    "  {} semantic call edges are indexing in the background — run `travsr status` to check progress",
+                    pal.dim("ℹ"),
+                );
+            } else {
+                // No daemon running (non-interactive / CI, or spawn failed): Phase
+                // B waits for one. The git-commit hook starts a daemon, or the user
+                // can build the edges now, synchronously.
+                println!(
+                    "  {} semantic call edges will build once a daemon is running — your next `git commit` starts one, or run `travsr init --semantic` to build them now",
+                    pal.dim("ℹ"),
+                );
+            }
         }
         Some(report) => {
             if !report.ran.is_empty() {

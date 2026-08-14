@@ -57,6 +57,13 @@ pub struct PhaseBScheduler {
     debounce: Duration,
     /// Force a run once the pending window has been open this long, regardless
     /// of ongoing debounce re-arming (FT-M6).
+    ///
+    /// #511: this ceiling governs the healthy-commit-stream regime only. After a
+    /// partial-crash run the partial back-off gate in `try_claim_at` sits ahead
+    /// of this check and deliberately outranks it: re-running a partially broken
+    /// toolchain only reproduces the crash and re-thrashes graph.db + the warm
+    /// query cache, so the ceiling must not force a run there. Staleness in that
+    /// regime is bounded by `PARTIAL_BACKOFF_CAP` (900 s), not by `max_defer`.
     max_defer: Duration,
     /// Consecutive all-crash failures. After MAX_FAILURES the scheduler backs off
     /// until the daemon is restarted, preventing an infinite crash-retry loop when
@@ -66,7 +73,7 @@ pub struct PhaseBScheduler {
     /// the exponential re-run back-off; reset by the first clean run.
     consecutive_partials: AtomicU32,
     /// Claim gate set after a partial-crash run: `try_claim` refuses to start a
-    /// run before this instant. Cleared on a clean run or `reset_failures`.
+    /// run before this instant. Cleared on a clean run.
     backoff_until: Mutex<Option<Instant>>,
 }
 
@@ -99,16 +106,6 @@ impl PhaseBScheduler {
             consecutive_partials: AtomicU32::new(0),
             backoff_until: Mutex::new(None),
         }
-    }
-
-    /// Reset the consecutive-failure counter and the partial-crash back-off.
-    /// Called by `travsr daemon restart` so a user can recover without
-    /// restarting the whole machine.
-    #[allow(dead_code)]
-    pub fn reset_failures(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.consecutive_partials.store(0, Ordering::Relaxed);
-        *self.backoff_until.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Arm (or re-arm) a re-run for `debounce` from now. Called after a
@@ -162,6 +159,11 @@ impl PhaseBScheduler {
         // `phase_b_commit` lags HEAD, so the daemon tick re-arms every 5 s —
         // without this gate Phase B would re-run continuously, each run
         // writing graph.db and invalidating the warm query cache.
+        //
+        // #511: this gate is intentionally ahead of the `max_defer` ceiling
+        // below and outranks it. Re-running a partially broken toolchain only
+        // reproduces the crash, so the ceiling must not force a run here;
+        // back-off staleness is bounded by `PARTIAL_BACKOFF_CAP` instead.
         if let Some(until) = *self.backoff_until.lock().unwrap_or_else(|e| e.into_inner()) {
             if now < until {
                 return false;
@@ -437,30 +439,35 @@ mod tests {
     }
 
     #[test]
-    fn reset_failures_clears_partial_backoff() {
-        let s = PhaseBScheduler::new(Duration::from_secs(0));
+    fn partial_backoff_outranks_max_defer_ceiling() {
+        // #511: after a partial crash the back-off gate deliberately outranks the
+        // max_defer staleness ceiling — forcing a re-run of a broken toolchain
+        // only reproduces the crash and re-thrashes graph.db + the warm cache.
+        // max_defer=50s is below PARTIAL_BACKOFF_BASE=60s, so the very first
+        // back-off already lasts longer than the ceiling would allow.
+        let s = PhaseBScheduler::with_max_defer(Duration::from_secs(30), Duration::from_secs(50));
         let t0 = Instant::now() + Duration::from_secs(1000);
-        s.mark_dirty();
+
+        // A first run partial-crashes at t0, arming a 60 s back-off.
+        *s.dirty.lock().unwrap() = Some(DirtyState {
+            deadline: t0,
+            first_arm: t0,
+        });
         assert!(s.try_claim_at(t0));
         s.finish_with_outcome_at(RunOutcome::Partial, t0);
-        s.mark_dirty();
-        assert!(!s.try_claim_at(t0 + Duration::from_secs(1)), "gated");
-        // `travsr daemon restart` recovery path.
-        s.reset_failures();
-        assert!(s.try_claim_at(t0 + Duration::from_secs(1)), "gate cleared");
-    }
 
-    #[test]
-    fn reset_failures_unblocks_scheduler() {
-        let s = PhaseBScheduler::new(Duration::from_secs(0));
-        for _ in 0..PhaseBScheduler::MAX_FAILURES {
-            s.mark_dirty();
-            assert!(s.try_claim());
-            s.finish_with_result(false);
-        }
-        s.reset_failures();
-        s.mark_dirty();
-        assert!(s.try_claim(), "must be claimable after reset_failures");
+        // Re-arm with first_arm anchored at t0 so the 50 s ceiling is already
+        // past at t0+55s — yet the 60 s back-off must still refuse the claim.
+        *s.dirty.lock().unwrap() = Some(DirtyState {
+            deadline: t0 + Duration::from_secs(1000),
+            first_arm: t0,
+        });
+        assert!(
+            !s.try_claim_at(t0 + Duration::from_secs(55)),
+            "partial back-off outranks the ceiling even after max_defer has elapsed"
+        );
+        // Once the back-off lifts (60 s) the claim — long past the ceiling — succeeds.
+        assert!(s.try_claim_at(t0 + Duration::from_secs(60)));
     }
 
     // ── TC-FT-M6: max-staleness ceiling ──────────────────────────────────────

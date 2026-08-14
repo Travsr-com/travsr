@@ -56,15 +56,26 @@ pub fn run(
     // without a manual `travsr daemon start`.
     // Guard with is_terminal so we never spawn a background process in CI,
     // piped contexts, or integration tests (where it would race the DB lock).
+    use crate::daemon_client::SpawnOutcome;
     use std::io::IsTerminal as _;
-    if std::io::stdout().is_terminal() {
+    // Whether a daemon is (or is coming) up after init. This decides the Phase B
+    // summary wording: a running daemon auto-arms Phase B on startup and indexes
+    // semantic call edges in the background, so "commit-gated" would be wrong.
+    let daemon_running = if std::io::stdout().is_terminal() {
         // Race-free: spawns only if no daemon holds the lock, so a re-`init` over
         // an already-running daemon never forks a doomed child.
         let exe = std::env::current_exe().context("finding current exe path")?;
-        let _ = crate::daemon_client::spawn_background_daemon(&repo_root, &exe);
-    }
+        matches!(
+            crate::daemon_client::spawn_background_daemon(&repo_root, &exe),
+            SpawnOutcome::Started | SpawnOutcome::Starting | SpawnOutcome::AlreadyRunning
+        )
+    } else {
+        // Non-interactive (CI / piped): we never spawn, but a daemon started
+        // earlier may already be running and will pick up the pending Phase B.
+        crate::daemon_client::daemon_lock_held(&repo_root)
+    };
 
-    crate::progress::print_summary(&stats, elapsed, quiet);
+    crate::progress::print_summary(&stats, elapsed, quiet, daemon_running);
 
     // Tips are advisory chatter — suppress under --quiet.
     if !quiet {

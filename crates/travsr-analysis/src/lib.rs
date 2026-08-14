@@ -18,6 +18,7 @@ pub mod ffi;
 pub mod generic;
 pub mod skeleton;
 pub mod snippet;
+pub mod test_role;
 
 // ── Phase A parsers — high-complexity (hand-crafted, FFI/LSIF aware) ─────────
 pub mod go;
@@ -62,6 +63,10 @@ pub struct ParseOutput {
     /// FFI boundary markers collected during parse.
     /// Consumed by `ffi_resolver` in travsr-indexer's second pass.
     pub ffi_markers: Vec<ffi::FfiMarker>,
+    /// Cargo workspace dependency markers (A2). Consumed by the indexer's
+    /// workspace-dep resolver after all files in the batch are parsed, so a
+    /// member's `{ workspace = true }` entry gets the root's version.
+    pub workspace_dep_markers: Vec<data_format::WorkspaceDepMarker>,
 }
 
 impl ParseOutput {
@@ -83,5 +88,7 @@ impl ParseOutput {
             }
         }
         self.ffi_markers.extend(other.ffi_markers);
+        self.workspace_dep_markers
+            .extend(other.workspace_dep_markers);
     }
 }

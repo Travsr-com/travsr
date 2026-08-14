@@ -80,6 +80,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         nodes: vec![file_node],
         edges: vec![],
         ffi_markers: vec![],
+        workspace_dep_markers: vec![],
     };
 
     let mut parser = Parser::new();
@@ -109,6 +110,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
 
     let mut cursor = QueryCursor::new();
     let mut iter = cursor.matches(&query, tree.root_node(), source.as_slice());
+
+    // #479: a `def test_*` is a test entry point when it is corroborated by
+    // either an enclosing `unittest.TestCase` subclass (the class body is a
+    // `@test.scope`) or a pytest-style path (`test_*.py` / `*_test.py` /
+    // `conftest.py`). The name alone (`test_connection_pool` in a production
+    // module) is never enough (asymmetric-cost rule).
+    let mut test_signals = crate::test_role::TestSignals::default();
+    let is_test_path = py_is_test_path(vname_path);
 
     // G2: capture.node is the name identifier; its parent is the definition node
     // (function_definition or class_definition), which has the full declaration span.
@@ -152,6 +161,18 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     };
                     output.edges.push(emit::defines_edge(src_id, node.id));
                     output.nodes.push(node);
+                    // #479: entry point when `test_*` is corroborated by a
+                    // TestCase scope or a pytest path.
+                    let is_test_name = text == "test" || text.starts_with("test_");
+                    if is_test_name {
+                        let in_testcase = capture.node.parent().is_some_and(|fd| {
+                            py_enclosing_class_is_testcase(fd, source.as_slice())
+                        });
+                        if is_test_path || in_testcase {
+                            let r = capture.node.start_position().row;
+                            test_signals.push_entry_span(r, r);
+                        }
+                    }
                 }
                 "class.name" => {
                     let text = match capture.node.utf8_text(source.as_slice()) {
@@ -164,6 +185,16 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .with_end_line(decl_end_line(capture.node));
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
+                    // #479: a `unittest.TestCase` subclass body is a test scope —
+                    // its methods (including non-`test_` helpers) are `Support`.
+                    if let Some(class_def) = capture.node.parent() {
+                        if py_class_is_testcase(class_def, source.as_slice()) {
+                            test_signals.push_scope_span(
+                                class_def.start_position().row,
+                                class_def.end_position().row,
+                            );
+                        }
+                    }
                 }
                 "type.name" => {
                     // PEP 695 `type X = Y` — the left field is a `type` node whose
@@ -214,7 +245,48 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .edges
         .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
+    // #479: language-agnostic post-pass sets test_role from the collected signals.
+    crate::test_role::apply_test_roles(&test_signals, &mut output.nodes);
+
     Ok(output)
+}
+
+/// #479: true when a file's basename is a pytest/unittest test-module name —
+/// `test_*.py`, `*_test.py`, or `conftest.py` (also `.pyi` stubs of the same).
+fn py_is_test_path(vname_path: &str) -> bool {
+    let base = std::path::Path::new(vname_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let stem = base.trim_end_matches(".pyi").trim_end_matches(".py");
+    base == "conftest.py" || stem.starts_with("test_") || stem.ends_with("_test")
+}
+
+/// #479: true when `class_def` (a `class_definition`) subclasses a `*TestCase`
+/// (`unittest.TestCase`, `TestCase`, `IsolatedAsyncioTestCase`, …). Checked by
+/// substring on the superclass argument list — decisive, so a plain class named
+/// `TestRunner` (no `TestCase` base) is not a scope.
+fn py_class_is_testcase(class_def: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    class_def
+        .child_by_field_name("superclasses")
+        .and_then(|s| s.utf8_text(source).ok())
+        .is_some_and(|t| t.contains("TestCase"))
+}
+
+/// #479: walk up from a `function_definition` to the nearest enclosing class and
+/// report whether it is a `TestCase` subclass. Stops at a `function_definition`
+/// boundary (a nested `def` is a closure, not a method).
+fn py_enclosing_class_is_testcase(fn_def: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut current = fn_def.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "class_definition" => return py_class_is_testcase(n, source),
+            "function_definition" => return false,
+            _ => {}
+        }
+        current = n.parent();
+    }
+    false
 }
 
 /// Walk up the AST from a `function_definition` node to find the nearest

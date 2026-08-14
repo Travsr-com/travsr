@@ -142,6 +142,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         nodes: vec![file_node],
         edges: vec![],
         ffi_markers: vec![],
+        workspace_dep_markers: vec![],
     };
 
     let mut parser = Parser::new();
@@ -168,6 +169,17 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .iter()
         .map(|s| s.to_string())
         .collect();
+
+    // #479: Go test detection is path-gated. `go test` only runs functions in
+    // `_test.go` files, so a `TestX`/`BenchmarkX` name in a production file is
+    // never a test (the adversarial case). In a `_test.go` file the whole file
+    // is a test scope — helpers/fixtures classify as `Support`; a `TestX` with a
+    // `*testing.[TBFM]` parameter is the `EntryPoint` (span wins over scope).
+    let mut test_signals = crate::test_role::TestSignals::default();
+    let is_test_file = vname_path.ends_with("_test.go");
+    if is_test_file {
+        test_signals.push_scope_span(0, tree.root_node().end_position().row);
+    }
 
     // Use matches() (not captures()) — the captures() iterator reports captures
     // lazily, so m.captures is incomplete when processing early captures of a
@@ -240,6 +252,16 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     .with_end_line(decl_end_line(anchor.node));
                 output.edges.push(emit::defines_edge(file_id, node.id));
                 output.nodes.push(node);
+                // #479: a top-level `func TestX(t *testing.T)` in a `_test.go`
+                // file is a test entry point. Name-pattern + testing-param is
+                // required together (asymmetric-cost rule); the `_test.go` gate
+                // means a same-named production function is never misclassified.
+                if is_test_file
+                    && go_fn_is_test_entry(anchor.node.parent(), &name, source.as_slice())
+                {
+                    let r = anchor.node.start_position().row;
+                    test_signals.push_entry_span(r, r);
+                }
             }
             "recv.type" => {
                 // Method: all captures (recv.type + method.name) are in m.captures.
@@ -385,6 +407,9 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         .edges
         .dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
+    // #479: language-agnostic post-pass sets test_role from the collected signals.
+    crate::test_role::apply_test_roles(&test_signals, &mut output.nodes);
+
     // Collect cgo FFI markers and synthetic C destination nodes (RFC-005).
     let (cgo_markers, c_nodes) = collect_cgo_markers(corpus, vname_path, &source);
     output.nodes.extend(c_nodes);
@@ -422,6 +447,28 @@ fn extract_import_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Str
 /// Strip surrounding double-quotes from a Go string literal token.
 fn unquote(s: &str) -> String {
     s.trim_matches('"').to_owned()
+}
+
+/// #479: true when a top-level function is a Go test entry point — a name in
+/// the `Test`/`Benchmark`/`Fuzz`/`Example` family (bare, or followed by `_` or
+/// an uppercase letter, per `go test`'s discovery rule) **and** a `testing.`
+/// parameter (`*testing.T`/`.B`/`.F`/`.M`). Both signals are required: the
+/// name alone (a production `TestData` helper) never matches (asymmetric-cost).
+/// Callers additionally gate on the `_test.go` path.
+fn go_fn_is_test_entry(fn_decl: Option<tree_sitter::Node<'_>>, name: &str, source: &[u8]) -> bool {
+    let has_test_name = ["Test", "Benchmark", "Fuzz", "Example"].iter().any(|p| {
+        name.strip_prefix(p).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with(|c: char| c == '_' || c.is_uppercase())
+        })
+    });
+    if !has_test_name {
+        return false;
+    }
+    fn_decl
+        .filter(|n| n.kind() == "function_declaration")
+        .and_then(|n| n.child_by_field_name("parameters"))
+        .and_then(|p| p.utf8_text(source).ok())
+        .is_some_and(|t| t.contains("testing."))
 }
 
 /// Strip generic type parameters from a Go identifier.

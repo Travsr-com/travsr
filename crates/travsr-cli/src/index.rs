@@ -175,28 +175,13 @@ fn collect_source_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let ext = entry
-            .path()
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        if matches!(
-            ext,
-            "ts" | "tsx" | "js" | "jsx" | "mjs"   // TypeScript / JavaScript
-            | "rs"                                   // Rust
-            | "py" | "pyi"                           // Python
-            | "go"                                   // Go
-            | "java"                                 // Java
-            | "kt" | "kts"                           // Kotlin
-            | "scala"                                // Scala
-            | "rb"                                   // Ruby
-            | "php"                                  // PHP
-            | "cs"                                   // C#
-            | "cpp" | "cc" | "cxx" | "hpp" | "hh"  // C++
-            | "c" | "h"                              // C
-            | "swift"                                // Swift
-            | "dart" // Dart
-        ) {
+        // Single source of truth for "is this indexable": recognized source /
+        // data-format extension OR a name-recognized manifest (go.mod, *.csproj).
+        // Previously this walk carried its own hardcoded extension list that had
+        // drifted from `Language::from_extension` (it omitted json/yaml/toml/xml
+        // and markdown entirely); routing through the shared classifier keeps
+        // every enumeration gate consistent.
+        if travsr_core::is_indexable_path(entry.path()) {
             files.push(entry.path().to_path_buf());
         }
     }

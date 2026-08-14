@@ -104,7 +104,37 @@ pub fn run(
         return Ok(());
     }
 
-    render(payload, format, budget)
+    // C3: a manifest/config file has no inbound edges — no source file depends on
+    // a manifest, so `--direction callers` is legitimately empty. Explain that
+    // instead of leaving the user to wonder, and point at what does work.
+    let manifest_dead_end = matches!(direction, Direction::Callers)
+        && matches!(format, Format::Tree)
+        && payload.tree.is_empty()
+        && payload
+            .seed
+            .as_ref()
+            .is_some_and(|s| s.kind == "file" && is_config_manifest_path(&s.path));
+
+    render(payload, format, budget)?;
+    if manifest_dead_end {
+        eprintln!(
+            "note: manifests are configuration inputs — no source file depends on one, so \
+             callers are empty. Use `--direction deps` to see what this manifest declares."
+        );
+    }
+    Ok(())
+}
+
+/// True when `path` is a dependency/config manifest (data-format extension or a
+/// name-recognized manifest). Used to explain an empty `--direction callers`.
+fn is_config_manifest_path(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if matches!(ext, "json" | "jsonc" | "yaml" | "yml" | "toml" | "xml") {
+        return true;
+    }
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    travsr_core::is_manifest_file(name)
 }
 
 pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {

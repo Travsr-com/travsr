@@ -21,6 +21,7 @@ export const DOWNLOAD_VERSION = "0.11.0";
 // (packages/travsr-npm/scripts/install.js). Releases ship no
 // aarch64-pc-windows-msvc artifact, so claiming win32/arm64 here sent
 // Windows-on-ARM users into a guaranteed-404 download.
+// #576: this drift is checked in CI by .github/scripts/check-target-maps.mjs.
 const TARGET_MAP: Partial<Record<string, Partial<Record<string, string>>>> = {
   linux:  { x64: "x86_64-unknown-linux-gnu",  arm64: "aarch64-unknown-linux-gnu" },
   darwin: { x64: "x86_64-apple-darwin",        arm64: "aarch64-apple-darwin" },

@@ -258,6 +258,67 @@ impl Language {
     }
 }
 
+/// True when `file_name` is a dependency manifest that `data_format::parse`
+/// handles but whose extension is unmapped or absent, so the extension-based
+/// [`Language::from_extension`] gates would otherwise skip the file entirely.
+///
+/// Recognized by canonical basename (manifests have fixed names). This is the
+/// single source of truth for "is this an extensionless/odd-extension manifest";
+/// every file-enumeration gate (daemon walk, watcher, CLI walk) and the indexer
+/// dispatch route through it via [`is_indexable_path`], so the recognizer set
+/// can never drift between call sites.
+///
+/// Manifests whose extension IS mapped (`package.json`, `Cargo.toml`,
+/// `pyproject.toml`, `composer.json`, `pubspec.yaml`) are already admitted by
+/// `from_extension`; they are dispatched by name inside `data_format::parse` and
+/// do NOT need to be listed here.
+pub fn is_manifest_file(file_name: &str) -> bool {
+    file_name == "go.mod" || file_name.ends_with(".csproj")
+}
+
+/// True when `path` should be indexed at all — either it has a recognized
+/// source/data-format extension ([`Language::from_extension`]) or it is a
+/// name-recognized manifest ([`is_manifest_file`]). Every enumeration gate calls
+/// this so the "what is indexable" decision lives in exactly one place.
+pub fn is_indexable_path(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if Language::from_extension(ext).is_some() {
+        return true;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    is_manifest_file(name)
+}
+
+/// Canonical list of every [`Language`] variant.
+///
+/// `Language` is `#[non_exhaustive]`, so the compiler cannot enforce that a
+/// downstream `for lang in ALL_LANGUAGES` sees every variant. Keep this slice in
+/// sync with the enum — the test-role coverage gate (issue #479 §7.2) and any
+/// future per-language matrix iterate it, so adding a variant here is the
+/// forcing function that makes those gates flag the new language.
+pub const ALL_LANGUAGES: &[Language] = &[
+    Language::TypeScript,
+    Language::Rust,
+    Language::Python,
+    Language::Go,
+    Language::Java,
+    Language::Kotlin,
+    Language::Ruby,
+    Language::CSharp,
+    Language::Php,
+    Language::Scala,
+    Language::Cpp,
+    Language::C,
+    Language::Swift,
+    Language::Dart,
+    Language::ObjectiveC,
+    Language::Json,
+    Language::Yaml,
+    Language::Toml,
+    Language::Xml,
+    Language::Markdown,
+];
+
 /// Kythe-style globally unique identifier for a code entity.
 ///
 /// VNames are stable across repos, languages, and time — they form the
@@ -464,6 +525,65 @@ impl EdgeKind {
     }
 }
 
+/// Index-time classification of a node as test code (issue #479).
+///
+/// Derived from tree-sitter captures (`@test.entry` / `@test.scope`) during
+/// Phase A parsing. It is **metadata, not identity**: two nodes are the same symbol
+/// regardless of `test_role`, so it is **not** part of the BLAKE3 VName id — it
+/// sits alongside `package`/`line`, exactly like `is_noise`.
+///
+/// Retrieval uses it to bucket test declarations into a capped `tests` section
+/// below the implementation sections, instead of letting a `#[test]` fn take the
+/// top slot of the `exact`/`semantic` groups (the #479 defect).
+///
+/// The asymmetric-cost rule (a false positive removes a real answer from the
+/// section the host reads first) is enforced upstream in the tree-sitter query
+/// predicates, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRole {
+    /// Not test code (production code, or a test-ish name with no corroboration).
+    #[default]
+    None,
+    /// A test entry point — a `#[test]` fn, a `@Test`-annotated method, a
+    /// `func TestX` with a `*testing.T` param, etc. The thing a runner invokes.
+    EntryPoint,
+    /// Support code that lives inside a test unit — a helper fn or fixture inside
+    /// a `#[cfg(test)] mod`, a method of a `TestCase` subclass, etc. Detected from
+    /// AST `@test.scope` captures only (the path-based fallback was Phase 2, which
+    /// regressed the k8s bench and was reverted).
+    Support,
+}
+
+impl TestRole {
+    /// Stable integer representation for the `nodes.test_role` column (v22).
+    ///
+    /// `None = 0` so the `INTEGER NOT NULL DEFAULT 0` column and the serde
+    /// default agree — un-reindexed rows read back as [`TestRole::None`].
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::None => 0,
+            Self::EntryPoint => 1,
+            Self::Support => 2,
+        }
+    }
+
+    /// Parse from the stored integer. Unknown values fail closed to `None`
+    /// (a forward-compatible store row never mislabels code as a test).
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            1 => Self::EntryPoint,
+            2 => Self::Support,
+            _ => Self::None,
+        }
+    }
+
+    /// True for any node classified as test code (entry point or support).
+    pub fn is_test(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// A node in the code graph.
 ///
 /// `PartialEq` compares all fields including `package`. Use `node.id == other.id`
@@ -492,6 +612,16 @@ pub struct Node {
     /// Used by G2 span attribution to find the enclosing function for a SCIP
     /// reference occurrence. `None` until migration v13 backfills the column.
     pub end_line: Option<u32>,
+    /// Index-time test classification (issue #479). Defaults to
+    /// [`TestRole::None`]; set by the `travsr-analysis` post-pass from
+    /// tree-sitter `@test.entry` / `@test.scope` captures. Stored in
+    /// `nodes.test_role` (v22); **not** part of the BLAKE3 id.
+    ///
+    /// `#[serde(default)]` keeps old plugin-protocol payloads (out-of-process
+    /// sidecars, RFC-013 plugins) valid — a missing field deserializes to
+    /// `None`, the default-safe value.
+    #[serde(default)]
+    pub test_role: TestRole,
 }
 
 impl Node {
@@ -509,6 +639,7 @@ impl Node {
             package: String::new(),
             line: None,
             end_line: None,
+            test_role: TestRole::None,
         }
     }
 
@@ -534,6 +665,15 @@ impl Node {
     /// Set the `end_line` field (1-based, inclusive) and return `self` (builder pattern).
     pub fn with_end_line(mut self, end_line: u32) -> Self {
         self.end_line = Some(end_line);
+        self
+    }
+
+    /// Set the `test_role` field and return `self` (builder pattern).
+    ///
+    /// Used by the `travsr-analysis` post-pass so the ~10 `emit.rs` constructors
+    /// stay one-liners and only test declarations pay the extra call (issue #479).
+    pub fn with_test_role(mut self, test_role: TestRole) -> Self {
+        self.test_role = test_role;
         self
     }
 }
@@ -1082,22 +1222,25 @@ impl ImportResolver for DartResolver {
 }
 
 // ── Ruby ───────────────────────────────────────────────────────────────────
-// Signature: `import:animal` (require_relative 'animal') or `import:foo/bar`.
+// Two signature forms, tagged by the keyword that produced them (#614):
+//   `import:animal` / `import:foo/bar`, from `require_relative`, importer-relative.
+//   `import:gem:json`, from `require`, load-path (gem/stdlib/in-repo lib).
 // Ruby's `require`/`require_relative` usually take a path without the `.rb`
 // extension; the indexer emits the import node but no ResolvesTo chain, so
 // resolve the bare require path against the file here.
 //
-// The require path is anchored to the importer's directory and matched
-// exactly, so `require_relative '../lib/foo'` in `app/src/main.rb` resolves
-// deterministically to `app/lib/foo.rb` and can never over-match a same-named
-// file under an unrelated root.
+// A `require_relative` path is anchored to the importer's directory and
+// matched exactly, so `require_relative '../lib/foo'` in `app/src/main.rb`
+// resolves deterministically to `app/lib/foo.rb` and can never over-match a
+// same-named file under an unrelated root. A `gem:`-tagged `require` always
+// resolves to nothing, since a load-path lookup is not available in the
+// graph.
 //
-// Limitation: `require 'json'` (a gem, load-path relative) and
-// `require_relative 'json'` both emit `import:json`; the analyzer does not
-// record which keyword produced the import, so a load-path `require` is
-// resolved as if importer-relative. This may miss a gem-style require whose
-// target lives outside the importer's subtree — an acceptable, deterministic
-// trade over silently matching every same-named file in the repo.
+// Known limitation (was previously the opposite bug, see #611/#613 history):
+// a load-path `require 'my_gem/parser'` that happens to point at an in-repo
+// `lib/my_gem/parser.rb` is now unresolved, since `gem:` requires never
+// resolve. This is deliberate, over-inclusion (resolving every same-stem
+// gem require) is traded for determinism (resolving none of them).
 
 struct RubyResolver;
 impl ImportResolver for RubyResolver {
@@ -1106,6 +1249,12 @@ impl ImportResolver for RubyResolver {
             Some(s) => s,
             None => return false,
         };
+        // #614: `require` (load-path: gem/stdlib/in-repo lib) is tagged
+        // `gem:` by the analyzer and resolves to no project file, only
+        // `require_relative`'s importer-relative form is resolved here.
+        if spec.starts_with("gem:") {
+            return false;
+        }
         // A require may already carry the extension (`require_relative 'foo.rb'`);
         // strip it so we don't build `foo.rb.rb`.
         let spec = spec.strip_suffix(".rb").unwrap_or(spec);
@@ -1193,6 +1342,34 @@ impl Default for SafetyPolicy {
 mod tests {
     use super::*;
 
+    #[test]
+    fn is_manifest_file_recognizes_extensionless_and_odd_ext_manifests() {
+        assert!(is_manifest_file("go.mod"));
+        assert!(is_manifest_file("App.csproj"));
+        assert!(is_manifest_file("Directory.Build.csproj"));
+        // Not manifests handled by the name recognizer:
+        assert!(!is_manifest_file("go.sum"));
+        assert!(!is_manifest_file("Cargo.toml")); // ext-mapped, dispatched by name
+        assert!(!is_manifest_file("main.go"));
+        assert!(!is_manifest_file(""));
+    }
+
+    #[test]
+    fn is_indexable_path_admits_manifests_extension_and_name_based() {
+        // Extension-mapped source / data-format files.
+        assert!(is_indexable_path(Path::new("src/main.rs")));
+        assert!(is_indexable_path(Path::new("package.json")));
+        assert!(is_indexable_path(Path::new("Cargo.toml")));
+        assert!(is_indexable_path(Path::new("README.md")));
+        // Name-recognized manifests with unmapped/absent extensions.
+        assert!(is_indexable_path(Path::new("go.mod")));
+        assert!(is_indexable_path(Path::new("src/App.csproj")));
+        // Not indexable.
+        assert!(!is_indexable_path(Path::new("go.sum")));
+        assert!(!is_indexable_path(Path::new("notes.txt")));
+        assert!(!is_indexable_path(Path::new("Gemfile")));
+    }
+
     fn sample_vname() -> VName {
         VName::new(
             "github.com/raj-rkv/travsr",
@@ -1229,6 +1406,32 @@ mod tests {
         // match, even though the bare stem is identical. This is the transitive
         // false-positive class the fixpoint would otherwise compound.
         assert!(!r.resolves_to("import:animal", "ruby/src/cat.rb", "pkg/other/animal.rb"));
+    }
+
+    #[test]
+    fn ruby_resolver_refuses_load_path_require() {
+        // #614: `require 'json'` (a gem/stdlib load-path require) is tagged
+        // `import:gem:json` by the analyzer and must never resolve, even when
+        // a same-stem `json.rb` sits right next to the importer. This is the
+        // exact false-positive from the issue.
+        let r = resolver_for_language("ruby");
+        assert!(!r.resolves_to("import:gem:json", "ruby/src/cat.rb", "ruby/src/json.rb"));
+        assert!(!r.resolves_to("import:gem:animal", "ruby/src/cat.rb", "ruby/src/animal.rb"));
+    }
+
+    #[test]
+    fn ruby_resolver_gem_early_return_is_load_bearing() {
+        // Mutation-test guard: `ruby_resolver_refuses_load_path_require`
+        // above passes even if the `gem:` early-return in `RubyResolver` is
+        // deleted, because the literal "gem:" text gets folded into the path
+        // segment by `resolve_relative_to_importer`, so it can never equal a
+        // realistic `target_path` and the assertion passes for the wrong
+        // reason. This test uses a `target_path` that contains the literal
+        // "gem:" text the join would produce, so it fails loudly (mismatched
+        // path) if the early-return is ever removed, proving the guard is
+        // exercised rather than vacuously true.
+        let r = resolver_for_language("ruby");
+        assert!(!r.resolves_to("import:gem:json", "ruby/src/cat.rb", "ruby/src/gem:json.rb"));
     }
 
     #[test]

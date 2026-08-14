@@ -43,8 +43,25 @@ fn phase_b_state(payload: &StatusPayload) -> &'static str {
     }
 }
 
+/// #645 WS-B: the caller's live short HEAD, read at `cwd` (before the worktree
+/// redirect in `find_git_root`, so a linked worktree reports its own commit,
+/// not the main worktree's). `None` when git is unavailable or the dir is not a
+/// repo — the mismatch note then correctly never fires.
+fn head_at(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
 pub fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
+    let head = head_at(&cwd);
     let repo_root = find_git_root(&cwd)?;
 
     let db_path = repo_root.join(".travsr").join("graph.db");
@@ -82,6 +99,19 @@ pub fn run() -> anyhow::Result<()> {
         phase_b_state,
         rerank_segment
     );
+
+    // #645 WS-B: the freshness markers only ever compare against each other,
+    // never against the repository. Compare the caller's live HEAD (read at cwd,
+    // above) to the index's last_commit so a checkout at a different revision —
+    // a linked worktree, or a HEAD move the daemon has not yet reconciled — is
+    // never answered for silently. cwd-local, so it holds for both the
+    // daemon-answered and cold-store payloads.
+    if let Some(head) = head.as_deref() {
+        let stored = payload.last_commit.as_deref().unwrap_or("");
+        if let Some(note) = travsr_mcp::head_index_mismatch_note(head, stored) {
+            eprintln!("{note}");
+        }
+    }
 
     // RFC-014 #317 re-index policy: surface signature-format skew so the user
     // knows the graph was built with an older format and a re-index is due.
@@ -167,6 +197,19 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // WS-2: warn when Dart Phase B ran without resolved dependencies, so a
+    // partial cross-package index is never mistaken for a complete one.
+    if let Some(pkgs) = payload.dart_deps_unresolved.as_deref() {
+        if !pkgs.is_empty() {
+            eprintln!(
+                "warning: Dart cross-package references are incomplete — these \
+                 package(s) were indexed without resolved dependencies: {pkgs}. \
+                 Run `dart pub get` in each to enable cross-package references \
+                 (intra-package references are unaffected)."
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -188,6 +231,7 @@ mod tests {
             rust_lsif_degraded: None,
             rerank: String::new(),
             phase_b_dirty: dirty,
+            dart_deps_unresolved: None,
         }
     }
 

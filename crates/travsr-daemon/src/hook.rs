@@ -6,30 +6,77 @@ const TRAVSR_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this 
 #[cfg(windows)]
 const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
 
-const HOOK_BODY: &str = r#"#!/bin/sh
-# installed by travsr — do not edit this line
-exec travsr hook-run --from-hook
-"#;
+/// Absolute path of the binary currently running `travsr`, for embedding in the
+/// installed git hook so every commit is reindexed by the SAME binary that ran
+/// `travsr init` — not whatever bare `travsr` happens to be first on `PATH`.
+///
+/// On a dogfooding machine the PATH `travsr` is the npm-global Node wrapper
+/// (often a stale version), while the daemon runs from a freshly built binary;
+/// a bare-`travsr` hook let the stale wrapper reindex the fresh daemon's graph,
+/// violating "always fresh". `.git/hooks/*` is machine-local and untracked, so
+/// an absolute path there is legitimate and never leaks into version control.
+/// Re-running `travsr init` re-pins this to the current binary (self-heal after
+/// a move/reinstall). Falls back to bare `travsr` when the path cannot be
+/// resolved or is not valid UTF-8, preserving the previous behavior.
+fn installing_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "travsr".to_string())
+}
 
-const CHAIN_HOOK_BODY: &str = r#"#!/bin/sh
-# installed by travsr — do not edit this line
-# chains the pre-existing hook that was renamed to post-commit.travsr-pre.bak
-_dir="$(cd "$(dirname "$0")" && pwd)"
-if [ -x "$_dir/post-commit.travsr-pre.bak" ]; then
-  "$_dir/post-commit.travsr-pre.bak"
-fi
-exec travsr hook-run --from-hook
-"#;
+/// Single-quote a string for safe embedding in a POSIX `sh` command line, so a
+/// binary path containing spaces or shell metacharacters is passed verbatim.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn hook_body(bin: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # installed by travsr \u{2014} do not edit this line\n\
+         exec {} hook-run --from-hook\n",
+        sh_quote(bin)
+    )
+}
+
+fn chain_hook_body(bin: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # installed by travsr \u{2014} do not edit this line\n\
+         # chains the pre-existing hook that was renamed to post-commit.travsr-pre.bak\n\
+         _dir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n\
+         if [ -x \"$_dir/post-commit.travsr-pre.bak\" ]; then\n  \
+         \"$_dir/post-commit.travsr-pre.bak\"\n\
+         fi\n\
+         exec {} hook-run --from-hook\n",
+        sh_quote(bin)
+    )
+}
+
+/// Double-quote a string for safe embedding in a Windows `.cmd` command line.
+#[cfg(windows)]
+fn cmd_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
 
 /// Windows `.cmd` hook — CRLF line endings required for cmd.exe.
 #[cfg(windows)]
-const CMD_HOOK_BODY: &str =
-    "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\ntravsr hook-run --from-hook\r\n";
+fn cmd_hook_body(bin: &str) -> String {
+    format!(
+        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n{} hook-run --from-hook\r\n",
+        cmd_quote(bin)
+    )
+}
 
 /// Windows chain `.cmd` hook — calls any pre-existing hook before running travsr.
 #[cfg(windows)]
-const CMD_CHAIN_HOOK_BODY: &str =
-    "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0post-commit.travsr-pre.bak.cmd\" call \"%~dp0post-commit.travsr-pre.bak.cmd\"\r\ntravsr hook-run --from-hook\r\n";
+fn cmd_chain_hook_body(bin: &str) -> String {
+    format!(
+        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0post-commit.travsr-pre.bak.cmd\" call \"%~dp0post-commit.travsr-pre.bak.cmd\"\r\n{} hook-run --from-hook\r\n",
+        cmd_quote(bin)
+    )
+}
 
 /// Resolve the git hooks directory for `repo_root`.
 ///
@@ -78,6 +125,10 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(&hooks_dir)
         .with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
+    // Pin the hook to the binary that ran `travsr init` (self-heal: every init
+    // re-pins to the current binary). See [`installing_binary`].
+    let bin = installing_binary();
+
     // ── POSIX shell hook (all platforms) ─────────────────────────────────────
     let hook_path = hooks_dir.join("post-commit");
     let bak_path = hooks_dir.join("post-commit.travsr-pre.bak");
@@ -85,7 +136,7 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
     let script = if hook_path.exists() {
         let existing = std::fs::read_to_string(&hook_path).context("reading existing hook")?;
         if existing.contains(TRAVSR_MARKER_SH) {
-            HOOK_BODY
+            hook_body(&bin)
         } else if bak_path.exists() {
             // L6: a backup already exists — the user may have manually restored their
             // original hook over ours. Don't silently overwrite the backup.
@@ -94,17 +145,17 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
                  overwriting hook only (not re-backing up)",
                 bak_path.display()
             );
-            CHAIN_HOOK_BODY
+            chain_hook_body(&bin)
         } else {
             std::fs::rename(&hook_path, &bak_path).context("backing up existing hook")?;
             tracing::info!(
                 "existing post-commit hook backed up to {}",
                 bak_path.display()
             );
-            CHAIN_HOOK_BODY
+            chain_hook_body(&bin)
         }
     } else {
-        HOOK_BODY
+        hook_body(&bin)
     };
 
     std::fs::write(&hook_path, script).context("writing post-commit hook")?;
@@ -121,7 +172,7 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
             let existing =
                 std::fs::read_to_string(&cmd_hook_path).context("reading existing cmd hook")?;
             if existing.contains(TRAVSR_MARKER_CMD) {
-                CMD_HOOK_BODY
+                cmd_hook_body(&bin)
             } else if cmd_bak_path.exists() {
                 // L6 (#507): same guard as the POSIX branch above. The user may
                 // have restored their own hook over ours; fs::rename on Windows
@@ -132,7 +183,7 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
                      overwriting hook only (not re-backing up)",
                     cmd_bak_path.display()
                 );
-                CMD_CHAIN_HOOK_BODY
+                cmd_chain_hook_body(&bin)
             } else {
                 std::fs::rename(&cmd_hook_path, &cmd_bak_path)
                     .context("backing up existing cmd hook")?;
@@ -140,10 +191,10 @@ pub fn install_hook(repo_root: &Path) -> anyhow::Result<()> {
                     "existing post-commit.cmd hook backed up to {}",
                     cmd_bak_path.display()
                 );
-                CMD_CHAIN_HOOK_BODY
+                cmd_chain_hook_body(&bin)
             }
         } else {
-            CMD_HOOK_BODY
+            cmd_hook_body(&bin)
         };
 
         std::fs::write(&cmd_hook_path, cmd_script).context("writing post-commit.cmd hook")?;
@@ -406,6 +457,60 @@ mod tests {
 
         assert!(hooks.join("post-commit").exists());
         assert!(!hooks.join("post-commit.cmd").exists());
+    }
+
+    /// Item C (dogfooding): the hook must `exec` the SAME binary that installed
+    /// it (an absolute path), never bare `travsr`. A stale PATH `travsr` (the
+    /// npm-global wrapper on a dogfooding box) must not be able to reindex a
+    /// fresh daemon's graph.
+    #[cfg(unix)]
+    #[test]
+    fn install_hook_pins_installing_binary_not_bare_travsr() {
+        let tmp = make_fake_repo();
+        install_hook(tmp.path()).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join(".git/hooks/post-commit")).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let exe = exe.to_str().unwrap();
+        assert!(
+            body.contains(exe),
+            "hook must embed the installing binary's absolute path, got:\n{body}"
+        );
+        assert!(body.contains("hook-run --from-hook"));
+        assert!(
+            !body.contains("exec travsr hook-run"),
+            "hook must not invoke bare `travsr`, got:\n{body}"
+        );
+    }
+
+    /// Re-running `install_hook` (what `travsr init` does) re-pins the hook to
+    /// the current binary — the self-heal path. A hook left over as bare
+    /// `travsr` (an old install, before item C) is migrated to the absolute
+    /// path on the next init.
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_repins_stale_bare_travsr_hook() {
+        let tmp = make_fake_repo();
+        let hook_path = tmp.path().join(".git/hooks/post-commit");
+        // Simulate a pre-item-C hook: marker present, but bare `travsr`.
+        std::fs::write(
+            &hook_path,
+            "#!/bin/sh\n# installed by travsr \u{2014} do not edit this line\nexec travsr hook-run --from-hook\n",
+        )
+        .unwrap();
+
+        install_hook(tmp.path()).unwrap();
+
+        let body = std::fs::read_to_string(&hook_path).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            body.contains(exe.to_str().unwrap()),
+            "reinstall must re-pin to the current binary, got:\n{body}"
+        );
+        assert!(
+            !body.contains("exec travsr hook-run"),
+            "stale bare-`travsr` hook must be migrated, got:\n{body}"
+        );
     }
 
     #[cfg(windows)]
