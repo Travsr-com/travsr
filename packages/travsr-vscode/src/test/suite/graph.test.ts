@@ -1,7 +1,14 @@
 import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
-import { GraphPanel, buildHtmlContent } from "../../graph";
+import * as vscode from "vscode";
+import {
+  GraphPanel,
+  buildHtmlContent,
+  computeDiagnosticsOverlay,
+  makeDebouncer,
+  type GraphNode,
+} from "../../graph";
 
 // Combines HTML template + graph.js so tests can check both DOM and JS content.
 function getFullHtml(): string {
@@ -118,5 +125,235 @@ suite("GraphPanel", () => {
     assert.ok(html.includes("command: 'exportDot'"), "exportDot posts a message");
     assert.ok(html.includes("command: 'exportJson'"), "exportJson posts a message");
     assert.ok(html.includes("digraph travsr"), "DOT output is a Graphviz digraph");
+  });
+});
+
+// ── #688: live LSP diagnostics overlay ───────────────────────────────────────
+//
+// Uses a real DiagnosticCollection rather than a stub: the thing under test is
+// the reduction over what `vscode.languages.getDiagnostics` actually returns,
+// and a hand-rolled fake of that API would only prove the fake works.
+
+const node = (id: string, filePath: string): GraphNode => ({
+  id,
+  label: id,
+  kind: "function",
+  path: filePath,
+  package: "",
+  score: 1,
+});
+
+function diag(line: number, severity: vscode.DiagnosticSeverity): vscode.Diagnostic {
+  return new vscode.Diagnostic(
+    new vscode.Range(line, 0, line, 1),
+    `synthetic ${vscode.DiagnosticSeverity[severity]}`,
+    severity
+  );
+}
+
+/** Absolute URI inside the fixture workspace, so resolveWorkspacePath accepts it. */
+function fixtureUri(rel: string): vscode.Uri {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+  assert.ok(root, "fixture workspace must be open");
+  return vscode.Uri.joinPath(root, rel);
+}
+
+suite("GraphPanel: diagnostics overlay (#688)", () => {
+  let collection: vscode.DiagnosticCollection;
+
+  setup(() => {
+    collection = vscode.languages.createDiagnosticCollection("travsr-test-688");
+  });
+
+  teardown(() => {
+    collection.dispose();
+  });
+
+  test("errors outrank warnings in the same file, count is of the winner", () => {
+    const uri = fixtureUri("src/sample.ts");
+    collection.set(uri, [
+      diag(1, vscode.DiagnosticSeverity.Warning),
+      diag(2, vscode.DiagnosticSeverity.Error),
+      diag(3, vscode.DiagnosticSeverity.Warning),
+      diag(4, vscode.DiagnosticSeverity.Error),
+    ]);
+
+    const overlay = computeDiagnosticsOverlay([node("n1", "src/sample.ts")]);
+
+    assert.deepStrictEqual(overlay.byNode["n1"], { severity: "error", count: 2 });
+  });
+
+  test("warning-only file reduces to warning", () => {
+    collection.set(fixtureUri("src/sample.ts"), [
+      diag(1, vscode.DiagnosticSeverity.Warning),
+    ]);
+
+    const overlay = computeDiagnosticsOverlay([node("n1", "src/sample.ts")]);
+
+    assert.deepStrictEqual(overlay.byNode["n1"], { severity: "warning", count: 1 });
+  });
+
+  test("Info and Hint severities do not badge a node", () => {
+    collection.set(fixtureUri("src/sample.ts"), [
+      diag(1, vscode.DiagnosticSeverity.Information),
+      diag(2, vscode.DiagnosticSeverity.Hint),
+    ]);
+
+    const overlay = computeDiagnosticsOverlay([node("n1", "src/sample.ts")]);
+
+    assert.ok(!("n1" in overlay.byNode), "info/hint must not paint a node");
+  });
+
+  test("clean nodes are omitted rather than zeroed", () => {
+    collection.set(fixtureUri("src/sample.ts"), [
+      diag(1, vscode.DiagnosticSeverity.Error),
+    ]);
+
+    const overlay = computeDiagnosticsOverlay([
+      node("dirty", "src/sample.ts"),
+      node("clean", "src/mcp.ts"),
+    ]);
+
+    assert.ok("dirty" in overlay.byNode);
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(overlay.byNode, "clean"),
+      false,
+      "a clean node must be absent from byNode, not present with count 0"
+    );
+  });
+
+  test("file-scoped attribution badges every node from the same file", () => {
+    collection.set(fixtureUri("src/sample.ts"), [
+      diag(40, vscode.DiagnosticSeverity.Error),
+    ]);
+
+    const overlay = computeDiagnosticsOverlay([
+      node("a", "src/sample.ts"),
+      node("b", "src/sample.ts"),
+    ]);
+
+    assert.strictEqual(overlay.scope, "file");
+    assert.deepStrictEqual(overlay.byNode["a"], overlay.byNode["b"]);
+  });
+
+  test("nodes outside the workspace are dropped, not badged", () => {
+    const overlay = computeDiagnosticsOverlay([
+      node("escape", "/etc/passwd"),
+    ]);
+
+    assert.ok(!("escape" in overlay.byNode));
+    assert.ok(
+      !overlay.unknownCoverage.includes("/etc/passwd"),
+      "a rejected path is not reported as undiagnosed either"
+    );
+  });
+
+  test("a file no provider has published for is reported as not diagnosed", () => {
+    collection.set(fixtureUri("src/sample.ts"), [
+      diag(1, vscode.DiagnosticSeverity.Error),
+    ]);
+
+    const overlay = computeDiagnosticsOverlay([
+      node("seen", "src/sample.ts"),
+      node("unseen", "src/mcp.ts"),
+    ]);
+
+    assert.ok(
+      !overlay.unknownCoverage.includes("src/sample.ts"),
+      "a file with published diagnostics has known coverage"
+    );
+    assert.ok(
+      overlay.unknownCoverage.includes("src/mcp.ts"),
+      "a file nothing has diagnosed must not be implied clean"
+    );
+  });
+
+  test("each file is looked up once regardless of node count", () => {
+    collection.set(fixtureUri("src/sample.ts"), [
+      diag(1, vscode.DiagnosticSeverity.Warning),
+    ]);
+
+    const nodes = Array.from({ length: 50 }, (_, i) => node(`n${i}`, "src/sample.ts"));
+    const overlay = computeDiagnosticsOverlay(nodes);
+
+    assert.strictEqual(Object.keys(overlay.byNode).length, 50);
+    assert.strictEqual(
+      overlay.unknownCoverage.length,
+      0,
+      "one file must contribute at most one coverage entry"
+    );
+  });
+
+  test("a burst of diagnostics changes coalesces into exactly one post", async () => {
+    let calls = 0;
+    const d = makeDebouncer(() => calls++, 20);
+
+    d.schedule();
+    d.schedule();
+    d.schedule();
+    assert.strictEqual(calls, 0, "must not fire synchronously");
+
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(calls, 1, "three changes in one window must post once");
+    d.dispose();
+  });
+
+  test("disposing cancels a pending post", async () => {
+    let calls = 0;
+    const d = makeDebouncer(() => calls++, 20);
+
+    d.schedule();
+    d.dispose();
+
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(calls, 0, "a disposed panel must not post after teardown");
+  });
+});
+
+suite("GraphPanel: diagnostics overlay renderer (#688)", () => {
+  test("webview handles the diagnosticsOverlay message", () => {
+    const html = getFullHtml();
+    assert.ok(
+      html.includes("msg.command === 'diagnosticsOverlay'"),
+      "renderer must handle the diagnosticsOverlay message"
+    );
+    assert.ok(
+      html.includes("function applyDiagnosticsOverlay"),
+      "renderer must define applyDiagnosticsOverlay()"
+    );
+  });
+
+  test("diagnostic styling uses design tokens and outranks warning with error", () => {
+    const html = getFullHtml();
+    assert.ok(html.includes("node.diag-error"), "must style error nodes");
+    assert.ok(html.includes("node.diag-warn"), "must style warning nodes");
+    assert.ok(
+      html.indexOf("node.diag-warn") < html.indexOf("node.diag-error"),
+      "error style must come last so it wins on equal specificity"
+    );
+    assert.ok(
+      html.includes("'outline-color': C.err") && html.includes("'outline-color': C.warn"),
+      "colors must come from the C token map, not inline hex"
+    );
+  });
+
+  test("overlay repaints after a client-side re-render", () => {
+    const html = getFullHtml();
+    const render = html.indexOf("function renderGraph");
+    const paintInRender = html.indexOf("paintDiagnostics();", render);
+    assert.ok(
+      render > 0 && paintInRender > render,
+      "renderGraph must repaint diagnostics after rebuilding elements"
+    );
+  });
+
+  test("panel carries a coverage note rather than implying clean", () => {
+    const html = getFullHtml();
+    assert.ok(html.includes('id="diagBadge"'), "status bar must have a diagnostics badge");
+    assert.ok(html.includes("not diagnosed"), "must distinguish undiagnosed from clean");
+    assert.ok(
+      html.includes("Counts are per file, not per symbol."),
+      "must state the file-scoped attribution caveat"
+    );
   });
 });

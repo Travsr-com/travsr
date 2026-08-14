@@ -19,6 +19,11 @@
   --orange-300: #ffb970; --orange-400: #fb923c; --orange-500: #cf6a0a;
   --orange-800: #703000; --orange-900: #4f2000;
 
+  /* Red is the one hue the palette lacked. Added for diagnostics only (#688),
+     kept at the same saturation/lightness steps as the orange ramp beside it
+     so an error badge reads as part of this system rather than pasted in. */
+  --red-300: #ff8f80; --red-400: #f4645a; --red-500: #cf3a2e;
+
   /* Semantic */
   --bg:         var(--ch-800);   /* #141414 */
   --bg-elev:    var(--ch-700);   /* #1a1a1a */
@@ -32,6 +37,8 @@
   --node:       var(--green-300);/* #86df86 — fn / fresh */
   --buried:     var(--gold-300); /* #fcd053 — class / var */
   --hot:        var(--orange-400);/* #fb923c — blast / hot */
+  --danger:     var(--red-400);  /* #f4645a — diagnostics: error */
+  --caution:    var(--gold-300); /* #fcd053 — diagnostics: warning */
 
   --tint-green:  rgba(134,223,134,.10);
   --line-green:  rgba(134,223,134,.38);
@@ -56,6 +63,7 @@
     --bg-input: var(--linen-200); --border: var(--linen-300); --border-mid: var(--linen-400);
     --fg: var(--ch-700); --fg-muted: var(--ch-500); --fg-subtle: var(--ch-400);
     --node: var(--green-500); --hot: var(--orange-500);
+    --danger: var(--red-500);
   }
 }
 
@@ -473,6 +481,12 @@ kbd {
   100% { box-shadow: 0 0 0 0 rgba(134,223,134,0); }
 }
 #noiseBadge { color: var(--gold-300); }
+/* #688: live LSP diagnostics summary. Cursor is help because the title carries
+   the per-file caveat and the not-diagnosed list. */
+#diagBadge { cursor: help; }
+#diagBadge.diag-err  { color: var(--danger); }
+#diagBadge.diag-warn { color: var(--caution); }
+#diagBadge.diag-none { color: var(--fg-subtle); }
 .legend { display: flex; gap: 11px; margin-left: auto; }
 .lg { display: flex; gap: 4px; align-items: center; color: #787878; }
 .dot { width: 7px; height: 7px; border-radius: 50%; }

@@ -16,6 +16,8 @@ const C = {
   vr:    '#fcd053',   // gold-300
   noise: '#4d4d4d',   // ch-500
   pkg:   '#ffb970',   // orange-300  — directory / package tiles
+  err:   '#f4645a',   // red-400     — diagnostics: error
+  warn:  '#fcd053',   // gold-300    — diagnostics: warning
 };
 function nodeColor(kind) {
   return ({ function: C.fn, class: C.cls, file: C.file, interface: C.iface, var: C.vr, pkg: C.pkg, ghost: '#5a5a5a' })[kind] || '#8f7a6c';
@@ -94,6 +96,17 @@ const cy = cytoscape({
     { selector: 'node.softdim', style: { opacity: 0.22 }},
     { selector: 'node:selected', style: {
         'background-opacity': 0.42, 'border-width': 3, 'border-color': '#ffffff',
+    }},
+    // ── Live LSP diagnostics (#688) ──────────────────────────────────────────
+    // Drawn as an outline rather than a border override so the kind-coloured
+    // border survives: a broken function must still read as a function. Static
+    // by design — this is information, not decoration, so it does not pulse and
+    // is not gated on the fx toggle.
+    { selector: 'node.diag-warn', style: {
+        'outline-width': 2.5, 'outline-color': C.warn, 'outline-opacity': 0.85, 'outline-offset': 2,
+    }},
+    { selector: 'node.diag-error', style: {
+        'outline-width': 3, 'outline-color': C.err, 'outline-opacity': 0.95, 'outline-offset': 2,
     }},
     { selector: 'node.hub', style: { 'border-width': 3.5, 'border-style': 'double' }},
     { selector: 'node.wave-1', style: { 'background-opacity': 0.44 }},
@@ -628,6 +641,11 @@ function renderGraph(bloomOriginId) {
     noiseBadge.style.display = 'none';
   }
 
+  // #688: renderGraph rebuilds the element set, so any diagnostic classes from
+  // the previous pass are gone. Repaint from the last overlay the host sent —
+  // client-side re-filters (depth, noise, vars) re-render without a round trip.
+  paintDiagnostics();
+
   updateHint();
   updateStatusBar();
 }
@@ -645,6 +663,65 @@ function updateHint() {
     hintEl.innerHTML = '<b>Rings layout:</b> concentric by hop distance, callers in left hemisphere. ' +
       '<b>Click</b> a node for details · <b>⊗ blast</b> shows impact rings.';
   }
+}
+
+// ── Live LSP diagnostics overlay (#688) ───────────────────────────────────────
+// The host reads vscode.languages.getDiagnostics and posts the reduction; this
+// side only paints. `_diagByNode` is the last overlay received, kept so a
+// client-side re-render can repaint without asking the host again.
+let _diagByNode = {};
+let _diagUnknown = [];
+
+function applyDiagnosticsOverlay(byNode, unknownCoverage) {
+  _diagByNode = byNode || {};
+  _diagUnknown = unknownCoverage || [];
+  paintDiagnostics();
+  updateDiagBadge();
+}
+
+function paintDiagnostics() {
+  cy.batch(() => {
+    cy.nodes('.diag-error, .diag-warn').removeClass('diag-error diag-warn');
+    for (const id in _diagByNode) {
+      const el = cy.getElementById(id);
+      if (!el || el.empty()) continue;
+      el.addClass(_diagByNode[id].severity === 'error' ? 'diag-error' : 'diag-warn');
+    }
+  });
+}
+
+function updateDiagBadge() {
+  const badge = document.getElementById('diagBadge');
+  if (!badge) return;
+
+  let errors = 0, warnings = 0;
+  for (const id in _diagByNode) {
+    const d = _diagByNode[id];
+    if (d.severity === 'error') errors += d.count; else warnings += d.count;
+  }
+
+  const parts = [];
+  if (errors > 0) parts.push('⊗ ' + errors + (errors === 1 ? ' error' : ' errors'));
+  if (warnings > 0) parts.push('⚠ ' + warnings + (warnings === 1 ? ' warning' : ' warnings'));
+  // Absence of diagnostics is not a clean bill of health: a file whose language
+  // has no extension installed reports nothing at all. Say which it is.
+  if (_diagUnknown.length > 0) {
+    parts.push(_diagUnknown.length + ' not diagnosed');
+  }
+
+  if (parts.length === 0) {
+    badge.style.display = 'none';
+    badge.removeAttribute('title');
+    return;
+  }
+  badge.textContent = parts.join(' · ');
+  badge.className = errors > 0 ? 'diag-err' : warnings > 0 ? 'diag-warn' : 'diag-none';
+  badge.style.display = 'inline';
+  badge.title = _diagUnknown.length > 0
+    ? 'Counts are per file, not per symbol.\nNo diagnostic provider has reported on:\n' +
+      _diagUnknown.slice(0, 10).join('\n') +
+      (_diagUnknown.length > 10 ? '\n…and ' + (_diagUnknown.length - 10) + ' more' : '')
+    : 'Counts are per file, not per symbol.';
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -722,6 +799,10 @@ window.addEventListener('message', event => {
 
   if (msg.command === 'renderPeek') {
     renderPeekPanel(msg.path, msg.line, msg.lines || []);
+  }
+
+  if (msg.command === 'diagnosticsOverlay') {
+    applyDiagnosticsOverlay(msg.byNode, msg.unknownCoverage);
   }
 });
 

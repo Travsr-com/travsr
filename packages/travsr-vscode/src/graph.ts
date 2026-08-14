@@ -25,6 +25,7 @@
  *   render         — new graph data
  *   renderPeek     — source lines for the peek panel
  *   freshness      — graph stats (nodeCount, state) for the status bar
+ *   diagnosticsOverlay — live LSP diagnostics per node (#688)
  */
 
 import * as vscode from "vscode";
@@ -53,6 +54,38 @@ export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
+
+// ── Diagnostics overlay (#688) ────────────────────────────────────────────
+
+/** Worst severity found for a node. Info and Hint are deliberately ignored. */
+export type NodeDiagnosticSeverity = "error" | "warning";
+
+export interface NodeDiagnostic {
+  severity: NodeDiagnosticSeverity;
+  count: number;
+}
+
+export interface DiagnosticsOverlay {
+  /** Node id → worst severity + count. Clean nodes are absent, not zeroed. */
+  byNode: Record<string, NodeDiagnostic>;
+  /**
+   * Attribution granularity. `"file"` means a diagnostic anywhere in a file
+   * badges every node from that file, because `get_graph_json` emits `line`
+   * but no `end_line`, so there is no symbol span to test a range against.
+   * Symbol-level attribution is the follow-up (#688 Option A).
+   */
+  scope: "file";
+  /**
+   * Graph file paths no provider has published diagnostics for. Absence of
+   * diagnostics is not evidence of correctness — a file whose language has no
+   * extension installed looks identical to a clean one — so the panel says
+   * "not diagnosed" rather than implying "clean".
+   */
+  unknownCoverage: string[];
+}
+
+/** Debounce window for diagnostics recomputation. */
+export const DIAGNOSTICS_DEBOUNCE_MS = 200;
 
 // ── Message protocol ──────────────────────────────────────────────────────
 
@@ -92,6 +125,98 @@ function resolveWorkspacePath(path: string): vscode.Uri | null {
   return uri;
 }
 
+// ── Diagnostics helpers (#688) ────────────────────────────────────────────
+
+/**
+ * Reduce a file's diagnostics to the one badge worth drawing: errors outrank
+ * warnings, and the count is of the winning severity only (a file with 2
+ * errors and 9 warnings reads "2 errors", not "11 problems"). Returns null
+ * when nothing at error/warning level is present, so callers can omit the
+ * node entirely rather than post a zero.
+ */
+function worstDiagnostic(
+  diags: readonly vscode.Diagnostic[]
+): NodeDiagnostic | null {
+  let errors = 0;
+  let warnings = 0;
+  for (const d of diags) {
+    if (d.severity === vscode.DiagnosticSeverity.Error) errors++;
+    else if (d.severity === vscode.DiagnosticSeverity.Warning) warnings++;
+  }
+  if (errors > 0) return { severity: "error", count: errors };
+  if (warnings > 0) return { severity: "warning", count: warnings };
+  return null;
+}
+
+/**
+ * Map the diagnostics VS Code already holds onto the nodes currently rendered.
+ *
+ * Reads `vscode.languages.getDiagnostics` only — Travsr spawns no language
+ * server and hosts none. Diagnostics are looked up once per distinct file, not
+ * once per node, because a graph routinely holds dozens of symbols from the
+ * same file.
+ *
+ * Nodes whose path escapes the workspace are dropped by `resolveWorkspacePath`
+ * and never appear in the result.
+ */
+export function computeDiagnosticsOverlay(
+  nodes: GraphNode[]
+): DiagnosticsOverlay {
+  // A URI appears in the global list once some provider has published for it,
+  // even if it published an empty array. That is the only signal available for
+  // "was this file looked at at all" — getDiagnostics(uri) returns [] both for
+  // a clean file and for one nothing has ever diagnosed.
+  const published = new Set(
+    vscode.languages.getDiagnostics().map(([uri]) => uri.fsPath)
+  );
+
+  const byNode: Record<string, NodeDiagnostic> = {};
+  const unknownCoverage: string[] = [];
+  const perFile = new Map<string, NodeDiagnostic | null>();
+
+  for (const node of nodes) {
+    if (!node.path) continue;
+    if (!perFile.has(node.path)) {
+      const uri = resolveWorkspacePath(node.path);
+      if (!uri) {
+        perFile.set(node.path, null);
+      } else {
+        if (!published.has(uri.fsPath)) unknownCoverage.push(node.path);
+        perFile.set(node.path, worstDiagnostic(vscode.languages.getDiagnostics(uri)));
+      }
+    }
+    const worst = perFile.get(node.path);
+    if (worst) byNode[node.id] = worst;
+  }
+
+  return { byNode, scope: "file", unknownCoverage };
+}
+
+/**
+ * Collapse a burst of calls into one deferred call. Diagnostics fire per
+ * keystroke once several servers are running; recomputing the whole overlay
+ * on each would burn the extension host for frames nobody sees.
+ */
+export function makeDebouncer(
+  fn: () => void,
+  ms: number
+): { schedule(): void; dispose(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return {
+    schedule(): void {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        fn();
+      }, ms);
+    },
+    dispose(): void {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
+
 // ── Nonce helper ──────────────────────────────────────────────────────────
 
 function getNonce(): string {
@@ -118,6 +243,12 @@ export class GraphPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
+  /** Nodes in the graph as currently rendered — the overlay's input set. */
+  private renderedNodes: GraphNode[] = [];
+  private readonly diagnosticsDebouncer = makeDebouncer(
+    () => this.postDiagnosticsOverlay(),
+    DIAGNOSTICS_DEBOUNCE_MS
+  );
 
   private constructor(
     private readonly client: McpClient,
@@ -140,6 +271,14 @@ export class GraphPanel {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
       (msg: WebviewMessage) => this.handleMessage(msg),
+      null,
+      this.disposables
+    );
+
+    // #688: the language servers the user already runs are the only source of
+    // live correctness data. Tied to the panel so it dies with it.
+    vscode.languages.onDidChangeDiagnostics(
+      () => this.diagnosticsDebouncer.schedule(),
       null,
       this.disposables
     );
@@ -208,6 +347,9 @@ export class GraphPanel {
       pathPrefix,
       ...(reqId !== undefined ? { reqId } : {}),
     });
+
+    this.renderedNodes = data.nodes ?? [];
+    this.postDiagnosticsOverlay();
   }
 
   /**
@@ -218,6 +360,23 @@ export class GraphPanel {
     this.panel.reveal(vscode.ViewColumn.One);
     this.panel.title = `Travsr: ${query}`;
     void this.panel.webview.postMessage({ command: "render", data, query });
+    this.renderedNodes = data.nodes ?? [];
+    this.postDiagnosticsOverlay();
+  }
+
+  /**
+   * Recompute the overlay for the rendered node set and push it. Cheap enough
+   * to run un-debounced on re-render (the node set just changed and the old
+   * overlay is addressed to node ids that may no longer exist); the debounce
+   * exists for the keystroke-driven path.
+   */
+  private postDiagnosticsOverlay(): void {
+    if (this.renderedNodes.length === 0) return;
+    const overlay = computeDiagnosticsOverlay(this.renderedNodes);
+    void this.panel.webview.postMessage({
+      command: "diagnosticsOverlay",
+      ...overlay,
+    });
   }
 
   private handleMessage(msg: WebviewMessage): void {
@@ -353,6 +512,7 @@ export class GraphPanel {
 
   dispose(): void {
     GraphPanel.current = undefined;
+    this.diagnosticsDebouncer.dispose();
     this.panel.dispose();
     for (const d of this.disposables) {
       d.dispose();
@@ -551,6 +711,7 @@ export function buildHtmlContent(
   <span id="fresh"><span class="dot-pulse" aria-hidden="true"></span><span id="freshText">connecting…</span></span>
   <span id="statusGraph">—</span>
   <span id="noiseBadge" style="display:none" aria-live="polite"></span>
+  <span id="diagBadge" style="display:none" aria-live="polite"></span>
   <div class="legend" aria-label="Node type legend">
     <span class="lg"><span class="dot ring" style="border-color:#86df86" aria-hidden="true"></span>function</span>
     <span class="lg"><span class="dot ring" style="border-color:#fcd053" aria-hidden="true"></span>class · var</span>
