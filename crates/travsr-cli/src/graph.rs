@@ -89,6 +89,17 @@ pub fn run(
         include_noise,
     };
 
+    // Callers and blast radius ride ref/call edges, so an incomplete Phase B
+    // turns "nothing found" into a wrong answer rather than a small one.
+    //
+    // `deps` does not: it rides Phase A import and `defines` edges, which are
+    // complete whether or not Phase B has run. Warning there told the user their
+    // complete answer might be missing something, which is both wrong and the
+    // fastest way to teach someone to ignore the warning that matters.
+    if !matches!(direction, Direction::Deps) {
+        daemon_client::warn_if_call_graph_degraded(&db_path);
+    }
+
     // Daemon route first (#318 O1), direct read-only open as fallback.
     let payload: GraphPayload =
         match daemon_client::try_query(&repo_root, "graph", serde_json::to_value(&args)?) {
@@ -146,6 +157,7 @@ pub fn run_all(format: Format, budget: usize) -> anyhow::Result<()> {
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
+    daemon_client::warn_if_call_graph_degraded(&db_path);
     // --all dumps are large by construction — always computed locally rather
     // than shipped through the daemon socket.
     let store = daemon_client::open_read_store(&db_path)?;

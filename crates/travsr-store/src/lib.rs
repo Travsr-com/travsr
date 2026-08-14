@@ -704,6 +704,31 @@ pub struct ExplainLegs {
     pub embed: Vec<(Node, f32)>,
 }
 
+/// Split a node-count vs map-count difference into two non-negative figures.
+///
+/// `saturating_sub` on a signed type saturates at `i64::MIN`, not at zero — a
+/// detail easy to read past, because on an unsigned type it does clamp at zero,
+/// which is plainly what was intended here. Both backfill gates used it that
+/// way, so whenever the map held more rows than `nodes` (stale entries left by
+/// a delete that ran outside this store instance) the log reported a negative
+/// count of missing rows:
+///
+/// ```text
+/// #478: backfilling nodes_fts_words + is_noise  missing=-299 stale=299
+/// ```
+///
+/// Harmless to the backfill itself, which is driven by a `NOT IN` query rather
+/// than by these numbers, but it points a reader diagnosing an index problem in
+/// exactly the wrong direction.
+fn backfill_counts(node_count: i64, map_count: i64) -> (i64, i64) {
+    // `saturating_sub` still earns its place — it handles overflow — but the
+    // zero clamp has to be explicit on a signed type.
+    (
+        node_count.saturating_sub(map_count).max(0),
+        map_count.saturating_sub(node_count).max(0),
+    )
+}
+
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
 pub struct SqliteStore {
     conn: Connection,
@@ -4702,9 +4727,9 @@ impl SqliteStore {
         // In that case the JOIN in search_nodes_fuzzy silently skips them;
         // the count-inequality still triggers a no-op backfill pass.
         tracing::info!(
-            missing = node_count.saturating_sub(map_count),
-            stale = map_count.saturating_sub(node_count),
-            "RFC-012 L1: backfilling FTS index for unindexed nodes"
+            missing = backfill_counts(node_count, map_count).0,
+            stale = backfill_counts(node_count, map_count).1,
+            "building the text search index for new symbols"
         );
 
         // Fetch unindexed nodes into a Vec first so the statement is dropped
@@ -4758,7 +4783,7 @@ impl SqliteStore {
         }
         tx.commit().context("committing FTS backfill transaction")?;
 
-        tracing::info!(indexed = nodes.len(), "RFC-012 L1: FTS backfill complete");
+        tracing::info!(indexed = nodes.len(), "text search index updated");
         Ok(())
     }
 
@@ -4787,11 +4812,15 @@ impl SqliteStore {
             return Ok(());
         }
 
-        tracing::info!(
-            missing = node_count.saturating_sub(words_map_count),
-            stale = words_map_count.saturating_sub(node_count),
-            "#478: backfilling nodes_fts_words + is_noise for unindexed nodes"
-        );
+        // DEBUG, not INFO. The gate above is a count comparison, which is
+        // deliberately conservative: stale map rows left by a delete make the
+        // counts differ forever, so this pass runs on every startup and indexes
+        // nothing. It cannot be gated on `missing == 0` instead — with stale
+        // rows present that figure can read zero while nodes really are
+        // unindexed, and the `NOT IN` query below is the only reliable answer.
+        // So the pass stays, and only its *outcome* is announced.
+        let (missing, stale) = backfill_counts(node_count, words_map_count);
+        tracing::debug!(missing, stale, "checking the word index for new symbols");
 
         let nodes: Vec<Node> = {
             let mut stmt = self
@@ -4849,10 +4878,16 @@ impl SqliteStore {
         tx.commit()
             .context("committing FTS word backfill transaction")?;
 
-        tracing::info!(
-            indexed = nodes.len(),
-            "#478: nodes_fts_words + is_noise backfill complete"
-        );
+        // Only a pass that did something is worth a line in the log.
+        if nodes.is_empty() {
+            tracing::debug!("word index already current");
+        } else {
+            tracing::info!(
+                event = "store.fts_words.backfill",
+                indexed = nodes.len(),
+                "word index updated"
+            );
+        }
         Ok(())
     }
 
@@ -6061,10 +6096,7 @@ LIMIT 100",
         tx.commit()
             .context("committing vocab backfill transaction")?;
 
-        tracing::info!(
-            nodes = token_strings.len(),
-            "RFC-012 L2-A: fts_vocab backfill complete"
-        );
+        tracing::info!(nodes = token_strings.len(), "search vocabulary updated");
         Ok(())
     }
 
@@ -6208,7 +6240,7 @@ LIMIT 100",
             }
         }
         tx.commit()?;
-        tracing::info!("RFC-012 A2 F1: seeded fts_synonyms from static defaults");
+        tracing::info!("loaded default search synonyms");
         Ok(())
     }
 
@@ -10180,5 +10212,20 @@ mod tests {
             "one tombstone, one node, two models \u{2014} at_risk counts nodes, and must never \
              exceed the {total} tombstone(s) pruned"
         );
+    }
+
+    /// The exact shape observed on this repo's own index: 10,857 nodes against
+    /// 11,156 map rows, which reported `missing=-299`.
+    #[test]
+    fn backfill_counts_never_report_a_negative() {
+        // Stale map rows outnumber nodes.
+        assert_eq!(super::backfill_counts(10_857, 11_156), (0, 299));
+        // The ordinary direction: rows still to index.
+        assert_eq!(super::backfill_counts(11_156, 10_857), (299, 0));
+        // In sync.
+        assert_eq!(super::backfill_counts(500, 500), (0, 0));
+        // Signed saturating_sub saturates at i64::MIN rather than zero, which
+        // is what produced the negative in the first place.
+        assert_eq!(super::backfill_counts(0, i64::MAX).0, 0);
     }
 }

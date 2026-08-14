@@ -56,6 +56,7 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
         anyhow::bail!("not initialized — run `travsr init`");
     }
 
+    daemon_client::warn_if_call_graph_degraded(&db_path);
     let store = daemon_client::open_read_store(&db_path)?;
     let output = travsr_mcp::find_references(&store, symbol, path.as_deref());
     // U4: `find_references` returns the model-facing `<travsr-data>` envelope.

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hook;
+pub mod logfile;
 mod phase_b_sched;
 mod query_cache;
 mod scip_unifier;
@@ -219,7 +220,7 @@ fn index_paths_parallel(
                     let new_hash = match hash_file(abs_path) {
                         Ok(h) => h,
                         Err(e) => {
-                            tracing::warn!(path=%abs_path.display(), err=%e, "hash failed, skipping");
+                            tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %e, "hash failed, skipping");
                             continue;
                         }
                     };
@@ -254,7 +255,7 @@ fn index_paths_parallel(
                     let out = match parsed {
                         Ok(o) => o,
                         Err(e) => {
-                            tracing::warn!(path=%abs_path.display(), err=%e, "parse error, skipping");
+                            tracing::warn!(event = "file.parse_failed", path = %abs_path.display(), err = %e, "parse error, skipping");
                             continue;
                         }
                     };
@@ -539,6 +540,15 @@ fn maybe_prompt_large_dep(repo_root: &Path, dir: &str, count: u64, total: u64) -
     exclude
 }
 
+/// File count above which an embed pass announces itself before starting.
+///
+/// An incremental pass touches the handful of files a commit changed and lands
+/// in tens of milliseconds, so announcing it only doubles the most frequent
+/// line in the log. A first pass on a large repo runs for minutes, where a
+/// silent log is indistinguishable from a hung daemon. The threshold sits well
+/// above any incremental pass and well below a whole-repo one.
+const ANNOUNCE_PASS_ABOVE_FILES: usize = 200;
+
 /// Compute and persist `embed_text` for all nodes where it is currently NULL.
 ///
 /// `richness` controls how much context is packed per node — derived from the
@@ -555,11 +565,6 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     if nodes.is_empty() {
         return;
     }
-    tracing::info!(
-        count = nodes.len(),
-        ?richness,
-        "regenerating embed_text (parse-once-per-file, parallel)"
-    );
 
     // Canonicalize the repo root once (skeleton_for_node did it per node).
     let canon_root = repo_root
@@ -574,19 +579,58 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     // Package/external nodes have path="" — collect separately for direct text gen.
     let mut pathless: Vec<&travsr_core::Node> = Vec::new();
     for node in &nodes {
-        if !node.vname.path.is_empty() {
-            by_file
-                .entry(node.vname.path.as_str())
-                .or_default()
-                .push(node);
-        } else {
-            pathless.push(node);
+        if node.vname.path.is_empty() {
+            // Only `package` nodes have a signature to derive text from; `crate`
+            // and `go-pkg` do not, and admitting them here left them queried on
+            // every pass with nothing to write.
+            if node.kind == "package" {
+                pathless.push(node);
+            }
+            continue;
         }
+        // Drop the structurally unfillable before grouping, not inside the
+        // parse: a `file` node cannot produce text, but keeping it here is what
+        // pulled its whole file into the read-and-parse set to yield nothing.
+        if !travsr_analysis::skeleton::can_have_embed_text(node) {
+            continue;
+        }
+        by_file
+            .entry(node.vname.path.as_str())
+            .or_default()
+            .push(node);
     }
     let files: Vec<(&str, Vec<&travsr_core::Node>)> = by_file.into_iter().collect();
-    // NB: do NOT early-return when `files` is empty — pathless package nodes
-    // (path="") are handled below and would otherwise be stranded without
-    // embed_text whenever they are the only nodes missing it.
+    // Gate on `fillable`, never on `files.is_empty()`: pathless package nodes
+    // (path="") are handled below, and keying the return off `files` alone would
+    // strand them without embed_text whenever they are the only nodes missing it.
+    let fillable = files.iter().map(|(_, ns)| ns.len()).sum::<usize>() + pathless.len();
+    if fillable == 0 {
+        // Every node the query returned is unfillable. Running the pass anyway
+        // is what made the log read `count=1009` five times in 90 seconds while
+        // writing nothing, re-reading 5.9 MB across 476 files each time.
+        tracing::debug!(
+            unfillable = nodes.len(),
+            "embed_text: nothing fillable this pass, skipping parse"
+        );
+        return;
+    }
+    // Announce the pass only when it is big enough that silence would read as a
+    // hang. A start line for the common case doubles the volume of the most
+    // frequent line in the log, which is the failure this PR exists to fix; but
+    // the first pass on a large repo runs for minutes, and a log that says
+    // nothing for minutes is its own bug. `unfillable` rides along here rather
+    // than on the routine line: it is a property of the index that barely moves
+    // between passes, so repeating it every tick is noise.
+    if files.len() > ANNOUNCE_PASS_ABOVE_FILES {
+        tracing::info!(
+            count = fillable,
+            unfillable = nodes.len().saturating_sub(fillable),
+            files = files.len(),
+            ?richness,
+            "regenerating embed_text (parse-once-per-file, parallel)"
+        );
+    }
+    let started = std::time::Instant::now();
 
     // Parse + build text in parallel across files (tree-sitter parsing is CPU-bound,
     // so this scales with cores — the reason a single-threaded regen only used 1 CPU).
@@ -624,23 +668,55 @@ fn update_embed_texts(store: &mut SqliteStore, repo_root: &Path, richness: Embed
     };
 
     // Generate embed text for pathless package nodes (pkg:foo@v1 → "foo v1").
+    // `pathless` holds only `package` nodes — gated where it is built, so the
+    // `fillable` count above cannot claim a node this loop then skips.
     let mut pairs = pairs;
     for node in &pathless {
-        if node.kind == "package" {
-            let text = node
-                .vname
-                .signature
-                .trim_start_matches("pkg:")
-                .replace(['@', '/', ':'], " ");
-            pairs.push((node.id, text));
-        }
+        let text = node
+            .vname
+            .signature
+            .trim_start_matches("pkg:")
+            .replace(['@', '/', ':'], " ");
+        pairs.push((node.id, text));
     }
 
     // Write path is single-threaded SQLite; batch to keep transactions small.
+    let mut written = 0usize;
     for chunk in pairs.chunks(500) {
-        if let Err(e) = store.write_embed_texts_batch(chunk) {
-            tracing::warn!("update_embed_texts: batch write failed: {e}");
+        match store.write_embed_texts_batch(chunk) {
+            Ok(()) => written += chunk.len(),
+            Err(e) => tracing::warn!("update_embed_texts: batch write failed: {e}"),
         }
+    }
+
+    // `written` is the field that makes a stalled pass legible. A pass that
+    // reports the same `count` on every tick and `written=0` is doing the work
+    // twice for nothing; without this the repetition looked like progress.
+    // One line for the pass, carrying only what changed between passes.
+    // `missed` is the field that makes a stall legible: a pass that writes
+    // nothing while reporting work to do is doing it twice for nothing, and
+    // without this the repetition read as progress. It is omitted when zero so
+    // the healthy line stays short. `saturating_sub` because `written` cannot
+    // exceed `fillable`, but a subtraction that can render as nonsense has no
+    // place in the one output we are asking a reader to trust (cf.
+    // `missing=-299`).
+    let missed = fillable.saturating_sub(written);
+    let elapsed_ms = started.elapsed().as_millis();
+    if missed > 0 {
+        tracing::info!(
+            event = "embed.text.updated",
+            written,
+            missed,
+            elapsed_ms,
+            "embed_text updated"
+        );
+    } else {
+        tracing::info!(
+            event = "embed.text.updated",
+            written,
+            elapsed_ms,
+            "embed_text updated"
+        );
     }
 }
 
@@ -746,15 +822,8 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
         .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("cannot derive repo_root from db_path"))?;
     // Use the PER-REPO configured model, not the global active.
-    // If this repo has not been configured via `travsr embed init`, skip silently.
-    let active_id = match travsr_plugin_host::repo_backend_id(repo_root) {
-        Some(id) => id,
-        None => return Ok(false),
-    };
-    let backend = match travsr_plugin_host::lookup_embed_backend(&active_id) {
-        Some(b) => b,
-        None => return Ok(false),
-    };
+    let configured = travsr_plugin_host::repo_backend_id(repo_root)
+        .and_then(|id| travsr_plugin_host::lookup_embed_backend(&id).map(|b| (id, b)));
 
     let mut store = travsr_store::SqliteStore::open(db_path)
         .context("opening store for embed_text regeneration")?;
@@ -763,10 +832,30 @@ pub fn regenerate_embed_texts_if_stale(db_path: &Path) -> anyhow::Result<bool> {
     // before the `embed_text`-in-FTS change landed. Idempotent (meta-gated), so it
     // is a cheap no-op after the first run and preserves the always-fresh invariant.
     match store.backfill_fts_embed_text() {
-        Ok(n) if n > 0 => tracing::info!(nodes = n, "backfilled embed_text into FTS content"),
+        Ok(n) if n > 0 => tracing::info!(
+            event = "embed.text.fts_backfill",
+            nodes = n,
+            "backfilled embed_text into FTS content"
+        ),
         Ok(_) => {}
         Err(e) => tracing::warn!("embed-text FTS backfill failed: {e}"),
     }
+
+    // No model configured for this repo. Only the *tier* decision below needs
+    // one; generating the text does not, and returning here made this a silent
+    // no-op on every path that goes through it. `travsr embed reindex` printed
+    // "Preparing embed text for ..." and prepared nothing, and `travsr init`
+    // left the same gap. The daemon's own reindex path never had it: it calls
+    // `update_embed_texts` unconditionally with the same `Compact` fallback, so
+    // the two disagreed about whether this work needs a model at all.
+    //
+    // Text with no model still earns its keep: RFC-022 D1 widens FTS content
+    // with `embed_text`, so it feeds lexical retrieval whether or not a vector
+    // ever gets built from it.
+    let Some((active_id, backend)) = configured else {
+        update_embed_texts(&mut store, repo_root, EmbedRichness::Compact);
+        return Ok(false);
+    };
 
     let stored_id = store.get_meta("embed_text_model_id").ok().flatten();
     if stored_id.as_deref() == Some(active_id.as_str()) {
@@ -2453,9 +2542,10 @@ fn write_phase_b_results(
     }
     if pb_node_count > 0 || pb_edge_count > 0 {
         tracing::info!(
+            event = "phase_b.indexed",
             nodes = pb_node_count,
             structural_edges = pb_edge_count,
-            "phase B indexing complete"
+            "semantic indexing complete"
         );
     }
 
@@ -3017,7 +3107,11 @@ fn run_background_phase_b_inner(
         (corpus, last)
     };
 
-    tracing::info!(commit=%target_sha, "background phase B refresh starting");
+    tracing::info!(
+        event = "phase_b.start",
+        commit = %target_sha,
+        "semantic call and reference indexing starting"
+    );
 
     // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
     // Collect edges into a Vec first; write them under the store lock below.
@@ -3123,11 +3217,12 @@ fn run_background_phase_b_inner(
 
     tracing::info!(
         commit = %target_sha,
+        event = "phase_b.complete",
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
         crashed = report.crashed.len(),
         outcome = ?outcome,
-        "background phase B refresh complete"
+        "semantic call and reference indexing complete"
     );
 
     // Re-run k-core while the lock is still held: Phase B edges change the
@@ -3142,7 +3237,7 @@ fn run_background_phase_b_inner(
                 if let Err(e) = s.write_shell_numbers(&pairs) {
                     tracing::warn!("kcore: failed to update shell numbers after phase B: {e}");
                 } else {
-                    tracing::info!("kcore: shell numbers updated after phase B");
+                    tracing::info!(event = "kcore.updated", "graph centrality updated");
                 }
             }
             Err(e) => tracing::warn!("kcore: computation failed after phase B: {e}"),
@@ -3244,6 +3339,7 @@ pub fn reconcile_tracked_tree(
              deleted nothing; run `travsr fsck --fix --force` to override"
         ),
         Ok(report) if !report.ghost_paths.is_empty() => tracing::info!(
+            event = "tree.reconcile.pruned",
             pruned = report.ghost_paths.len(),
             "tree reconcile: pruned files git no longer tracks"
         ),
@@ -3366,7 +3462,7 @@ pub fn reindex_files(
                 continue;
             }
             Err(err) => {
-                tracing::warn!("skipping {}: {err}", abs_path.display());
+                tracing::warn!(event = "file.skipped", path = %abs_path.display(), err = %err, "hash failed, skipping");
                 continue;
             }
         };
@@ -3393,7 +3489,7 @@ pub fn reindex_files(
         let out = match parsed {
             Ok(o) => o,
             Err(err) => {
-                tracing::warn!("parse error for {}: {err}", abs_path.display());
+                tracing::warn!(event = "file.parse_failed", path = %abs_path.display(), err = %err, "parse error, skipping");
                 continue; // keep old graph intact
             }
         };
@@ -3523,7 +3619,9 @@ pub fn reindex_files(
         }
 
         // Populate embed_text for newly-indexed nodes (commit-hook path).
-        // Only runs when a model is configured for this repo.
+        // Runs whether or not a model is configured: `richness_from_meta` falls
+        // back to `Compact`, and the text feeds FTS content as well as any
+        // vector built from it later.
         let richness = richness_from_meta(repo_root);
         update_embed_texts(store, repo_root, richness);
     }
@@ -3674,6 +3772,7 @@ fn reconcile_head_drift(
         return false;
     }
     tracing::info!(
+        event = "head.drift.detected",
         stored = %stored,
         head = %head,
         "last_commit does not match live HEAD (history moved during daemon downtime) — reconciling"
@@ -3697,7 +3796,12 @@ fn reconcile_head_drift(
     // Phase A is now aligned with HEAD; the RefCall edge set is not. Arm the
     // debounced whole-project Phase B rebuild, same as the hook path.
     phase_b_scheduler.mark_dirty();
-    tracing::info!(head = %head, files, "head reconcile complete — Phase B rebuild armed");
+    tracing::info!(
+        event = "head.reconcile.complete",
+        head = %head,
+        files,
+        "head reconcile complete — Phase B rebuild armed"
+    );
     true
 }
 
@@ -6661,6 +6765,64 @@ mod tests {
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
+    /// The silent no-op. With no `.travsr/embed.toml`, this returned before
+    /// touching the store, so `travsr embed reindex` printed "Preparing embed
+    /// text for ..." and prepared nothing, and `travsr init` had the same gap.
+    /// Only the model-*tier* decision needs a configured model; generating the
+    /// text does not, which is why the daemon's own reindex path had always run
+    /// it unconditionally. The two paths disagreed.
+    #[test]
+    fn embed_text_is_generated_with_no_model_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn handler(a: u32) -> u32 { a }\n",
+        )
+        .unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let node = {
+            let mut store = setup_embed_store(tmp.path());
+            let node = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.rs", "rust", "fn:handler"),
+                "function",
+            )
+            .with_line(1)
+            .with_end_line(1);
+            store.put_node(&node).unwrap();
+            assert!(
+                !store.nodes_missing_embed_text().unwrap().is_empty(),
+                "precondition: the node starts with no embed_text"
+            );
+            node
+        };
+
+        assert!(
+            travsr_plugin_host::repo_backend_id(tmp.path()).is_none(),
+            "precondition: this repo has no embed model configured"
+        );
+
+        let regenerated = regenerate_embed_texts_if_stale(&db_path).unwrap();
+        assert!(
+            !regenerated,
+            "no model means no tier change, so nothing was *re*generated"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let text = store
+            .get_nodes_embed_text(&[node.id])
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|(_, t)| t);
+        assert_eq!(
+            text.as_deref(),
+            Some("function: fn:handler | module: src/lib.rs | params: a: u32 | returns: u32"),
+            "the text is generated at the Compact fallback, not skipped"
+        );
+    }
+
     /// #526: hook injection must prefer a repo's own `.travsr/embed.toml`
     /// override over the machine-wide `~/.travsr/embed.toml` default, the
     /// same resolution order `resolve_backend` (travsr-plugin-host) uses.
@@ -7665,14 +7827,52 @@ impl Daemon {
         let travsr_dir = repo_root.join(".travsr");
         std::fs::create_dir_all(&travsr_dir).context("creating .travsr")?;
 
-        let file_appender = tracing_appender::rolling::daily(&travsr_dir, "daemon.log");
-        // Must be held for the daemon's lifetime — dropping flushes and closes daemon.log.
-        let (non_blocking, _appender_guard) = tracing_appender::non_blocking(file_appender);
+        // #347/#348: drop old rotations before opening today's, so a long-lived
+        // install cannot grow `.travsr/` without bound. `rolling::daily` never
+        // deletes anything on its own.
+        let pruned = logfile::prune(
+            &travsr_dir,
+            logfile::LOG_BUDGET_BYTES,
+            logfile::MAX_LOG_FILES,
+        );
+
+        let file_appender = tracing_appender::rolling::daily(&travsr_dir, logfile::LOG_PREFIX);
+        // Must be held for the daemon's lifetime — dropping flushes and closes
+        // the log.
+        //
+        // The default buffer is 128,000 lines, which at INFO during a large
+        // Phase A is tens of megabytes of resident memory sitting in a channel.
+        // Bounded and lossy instead: under pressure the right thing to drop is
+        // log lines, never indexing throughput. `non_blocking` reports what it
+        // discarded, so the loss is visible rather than silent.
+        let (non_blocking, _appender_guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(logfile::BUFFERED_LINES)
+                .lossy(true)
+                .finish(file_appender);
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
+        // INFO, not WARN. At WARN the file held nothing a user would want: on
+        // this repo, four days of logs were 136 lines, every one of them the
+        // same repeated warning and not one lifecycle event. `travsr daemon
+        // logs` on top of that would have been a working feature showing
+        // nothing. `RUST_LOG` still overrides in both directions.
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // JSON lines on disk. One line is one object, so every field is named
+        // and typed rather than recovered by guessing at column positions, and
+        // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
+        // `travsr daemon logs` renders it back into columns for people, and
+        // `--json` hands over the raw line for anything that would rather parse.
+        //
+        // `with_current_span` is on because the repo tag `--repo` filters by is
+        // a span field, not an event field, and would be absent otherwise.
+        // `with_span_list` is off: the full ancestry repeats the same few frames
+        // on every line for no added information.
         let file_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
             .with_writer(non_blocking)
             .with_ansi(false);
         let init_result = if foreground {
@@ -7690,6 +7890,21 @@ impl Daemon {
         if let Err(e) = init_result {
             eprintln!("travsr daemon: could not init file logger: {e}");
         }
+
+        // First event in every session, so a rotated file is interpretable on
+        // its own: which build wrote it, which repo, which process.
+        tracing::info!(
+            event = "daemon.session.start",
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            repo = %repo_root.display(),
+            // No `foreground` field on purpose. A backgrounded daemon is a
+            // re-exec of `daemon start --foreground`, so the flag is true in the
+            // child either way: accurate for the process, and misleading to the
+            // person who ran the background command and is told they did not.
+            pruned_logs = pruned,
+            "daemon starting"
+        );
 
         // Acquire exclusive lockfile — OS releases the lock on process death.
         let lock_path = travsr_dir.join("daemon.lock");
@@ -7846,15 +8061,29 @@ impl Daemon {
         let embed_phase2_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
-        tracing::info!(repo = %repo_root.display(), "travsr daemon started");
+        tracing::info!(
+            event = "daemon.ready",
+            repo = %repo_root.display(),
+            "travsr daemon started"
+        );
         #[cfg(unix)]
-        tracing::info!(transport = "unix", sock = %sock_path.display(), "control socket bound");
+        tracing::info!(
+            event = "daemon.socket.bound",
+            transport = "unix",
+            sock = %sock_path.display(),
+            "control socket bound"
+        );
 
         // Windows Named Pipe setup — resolved address for use in the accept task.
         #[cfg(windows)]
         let pipe_name = travsr_ipc::ControlAddr::for_repo(&repo_root).pipe_name();
         #[cfg(windows)]
-        tracing::info!(transport = "named_pipe", pipe = %pipe_name, "control pipe bound");
+        tracing::info!(
+            event = "daemon.socket.bound",
+            transport = "named_pipe",
+            pipe = %pipe_name,
+            "control pipe bound"
+        );
 
         let repo_root_arc = Arc::new(repo_root.clone());
         // Notify used for socket-initiated shutdown signal.
@@ -8279,7 +8508,7 @@ impl Daemon {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
         drop(lock_file);
-        tracing::info!("travsr daemon stopped");
+        tracing::info!(event = "daemon.session.stop", "travsr daemon stopped");
         Ok(())
     }
 }
@@ -8573,6 +8802,7 @@ fn handle_control_message(
             // "work?" and "work ?" share the same cache entry and produce
             // identical embedding vectors. Only applied to NL tools ("ask");
             // symbol-name tools ("graph") are left as-is.
+            let started = std::time::Instant::now();
             let args = normalize_nl_query_args(&tool, args);
             // R5 (#342): use the dedicated read-only connection so this lock
             // does not block the indexer worker from acquiring the write store.
@@ -8621,6 +8851,13 @@ fn handle_control_message(
             if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
+                    tracing::info!(
+                        event = "query.served",
+                        tool = %tool,
+                        cached = true,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "query served"
+                    );
                     return (ControlResponse::query_result(cached), false);
                 }
             }
@@ -8637,9 +8874,31 @@ fn handle_control_message(
                             value.clone(),
                         );
                     }
+                    // The line that makes "which query was slow" answerable.
+                    // Without it a successful query logged nothing at all, so
+                    // the `req` correlation id had nothing on the happy path to
+                    // bind to and per-request timing did not exist. `cached`
+                    // distinguishes the two costs, which is usually the first
+                    // thing worth knowing about a slow one.
+                    tracing::info!(
+                        event = "query.served",
+                        tool = %tool,
+                        cached = false,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "query served"
+                    );
                     (ControlResponse::query_result(value), false)
                 }
-                Err(e) => (ControlResponse::err(format!("query failed: {e:#}")), false),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "query.failed",
+                        tool = %tool,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %e,
+                        "query failed"
+                    );
+                    (ControlResponse::err(format!("query failed: {e:#}")), false)
+                }
             }
         }
         Err(e) => (ControlResponse::err(format!("parse error: {e}")), false),

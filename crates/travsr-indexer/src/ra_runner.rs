@@ -130,6 +130,7 @@ fn spawn_or_skip_ra(
     match &status {
         SandboxStatus::Active { mechanism } => {
             tracing::info!(
+                event = "lsif.spawn",
                 repo = %repo_root.display(),
                 sandbox = mechanism,
                 "spawning rust-analyzer lsif"
@@ -186,6 +187,7 @@ fn spawn_or_skip_ra(
 
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     tracing::info!(
+        event = "lsif.complete",
         repo = %repo_root.display(),
         lines = stdout.lines().count(),
         "rust-analyzer lsif complete"

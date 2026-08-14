@@ -1197,7 +1197,7 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
     let Some(threshold) = derive_phase1_threshold(db_path, PHASE1_COVERAGE_FRACTION) else {
         tracing::warn!(
             db = %db_path.display(),
-            "embed Phase 1: k-core data not ready — skipping (will retry after next Phase B)"
+            "graph centrality not computed yet, deferring the first embedding pass"
         );
         return false; // guard drops here → flag reset
     };
