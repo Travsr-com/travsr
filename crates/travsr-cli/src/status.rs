@@ -136,6 +136,19 @@ pub fn run() -> anyhow::Result<()> {
     // analyzers without having to re-read the init output.
     if let Some(warnings) = &payload.phase_b_warnings {
         if !warnings.is_empty() {
+            // #414 follow-up: the trust hint should name the repo's actual
+            // corpus (derived from the git remote, not guessable). Read it
+            // from the store meta stamped by init; best-effort — a failed
+            // read falls back to the placeholder.
+            let corpus = if warnings.contains("untrusted_corpus") {
+                daemon_client::open_read_store(&db_path)
+                    .ok()
+                    .and_then(|s| s.get_meta("corpus").ok().flatten())
+                    .filter(|c| !c.is_empty())
+            } else {
+                None
+            };
+            let corpus = corpus.as_deref().unwrap_or("<your-corpus>");
             for warn in warnings.split(',') {
                 let parts: Vec<&str> = warn.splitn(2, ':').collect();
                 match parts.as_slice() {
@@ -163,7 +176,7 @@ pub fn run() -> anyhow::Result<()> {
                     // repo's corpus has no per-corpus trust grant, so its
                     // external tooling was not spawned.
                     ["untrusted_corpus", lang] => eprintln!(
-                        "warning: '{lang}' is registered but this repository's corpus is not trusted for semantic indexing. Run `travsr lang add {lang} --corpus <your-corpus>` to trust it"
+                        "warning: '{lang}' is registered but this repository's corpus is not trusted for semantic indexing. Run `travsr lang add {lang} --corpus {corpus}` to trust it"
                     ),
                     ["skipped_no_analyzer", lang] => eprintln!(
                         "warning: '{lang}' is registered but its analyzer binary is missing. Run `travsr lang install {lang}`"

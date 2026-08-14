@@ -376,8 +376,16 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             }
             if !report.skipped_untrusted_corpus.is_empty() {
                 let langs = report.skipped_untrusted_corpus.join(", ");
+                // The corpus string is derived from the git remote and is not
+                // something a user can guess — name the real value whenever
+                // the report carries it (#414 follow-up).
+                let corpus = if report.corpus.is_empty() {
+                    "<your-corpus>"
+                } else {
+                    report.corpus.as_str()
+                };
                 println!(
-                    "  {} corpus not trusted for: {langs} — run `travsr lang add <lang> --corpus <your-corpus>` to enable",
+                    "  {} corpus not trusted for: {langs} — run `travsr lang add <lang> --corpus {corpus}` to enable",
                     pal.dim("ℹ"),
                 );
             }

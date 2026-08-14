@@ -277,6 +277,21 @@ impl PluginIndexer {
         // H5: collect needs_approval before boxing so we can surface it in outcome.
         let catalog = crate::resolver::CatalogResolver::new();
         let needs_approval_langs: Vec<String> = catalog.needs_approval().to_vec();
+        // #573: providers installed only as npm shims are dropped inside the
+        // resolver (the AppContainer spawn runs PE images only), which used to
+        // leave the language in NO outcome bucket — invisible in `travsr init`
+        // and `status`. Surface repo-present ones as skipped_no_analyzer: the
+        // native binary IS missing, and the bucket's `travsr lang install
+        // <lang>` hint is the fix.
+        let shim_only_langs: Vec<String> = catalog
+            .unresolvable_shims()
+            .iter()
+            .filter(|lang| {
+                inputs.present_languages.is_empty()
+                    || inputs.present_languages.contains(lang.as_str())
+            })
+            .cloned()
+            .collect();
 
         let resolver = crate::resolver::CompositeResolver::new(vec![
             Box::new(crate::resolver::BuiltinResolver::new(
@@ -288,6 +303,7 @@ impl PluginIndexer {
 
         let mut outcome = PhaseBOutcome {
             skipped_needs_approval: needs_approval_langs,
+            skipped_no_analyzer: shim_only_langs,
             ..Default::default()
         };
 
