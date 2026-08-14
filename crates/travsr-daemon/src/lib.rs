@@ -139,6 +139,8 @@ pub enum InitProgress {
 struct ParseResult {
     file_graph: FileGraph,
     ffi_markers: Vec<FfiMarker>,
+    /// Cargo workspace dependency markers (A2), resolved in the repo-level pass.
+    workspace_dep_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker>,
     /// `true` when the file was skipped (unchanged hash) — graph is empty.
     unchanged: bool,
 }
@@ -232,6 +234,7 @@ fn index_paths_parallel(
                                 edges: vec![],
                             },
                             ffi_markers: vec![],
+                            workspace_dep_markers: vec![],
                             unchanged: true,
                         }));
                         continue;
@@ -285,6 +288,7 @@ fn index_paths_parallel(
                             edges,
                         },
                         ffi_markers: out.ffi_markers,
+                        workspace_dep_markers: out.workspace_dep_markers,
                         unchanged: false,
                     }));
                 }
@@ -298,6 +302,7 @@ fn index_paths_parallel(
         let mut files_skipped_unchanged: u64 = 0;
         let mut batch: Vec<FileGraph> = Vec::with_capacity(BATCH_SIZE);
         let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+        let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
 
         for (done, result) in (1_u64..).zip(rx) {
             let pr = result?;
@@ -314,6 +319,7 @@ fn index_paths_parallel(
             }
 
             all_ffi_markers.extend(pr.ffi_markers);
+            all_ws_markers.extend(pr.workspace_dep_markers);
             batch.push(pr.file_graph);
 
             if batch.len() >= BATCH_SIZE {
@@ -348,6 +354,27 @@ fn index_paths_parallel(
                     tracing::warn!(err=%e, "ffi edge write error");
                 }
                 counts.edges_upserted += 1;
+            }
+        }
+
+        // Repo-level Cargo workspace dependency resolution (A2): resolve member
+        // `{ workspace = true }` entries against the root's
+        // `[workspace.dependencies]` versions. Runs once the whole batch is
+        // parsed so the root and all members are visible together.
+        if !all_ws_markers.is_empty() {
+            let indexer = PluginIndexer::new(corpus);
+            let (nodes, edges) = indexer.resolve_workspace_deps(&all_ws_markers);
+            for node in &nodes {
+                match store.put_node(node) {
+                    Ok(_) => counts.nodes_upserted += 1,
+                    Err(e) => tracing::warn!(err=%e, "workspace dep node write error"),
+                }
+            }
+            for edge in &edges {
+                match store.put_edge(edge) {
+                    Ok(_) => counts.edges_upserted += 1,
+                    Err(e) => tracing::warn!(err=%e, "workspace dep edge write error"),
+                }
             }
         }
 
@@ -1263,6 +1290,12 @@ pub fn init_repo_with_progress(
         if let Some(lang) = Language::from_extension(ext) {
             present_languages.insert(lang.as_str().to_string());
             indexable_paths.push(p);
+        } else if travsr_core::is_manifest_file(
+            p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        ) {
+            // Name-recognized manifest (go.mod, *.csproj): index it even though
+            // its extension is unmapped. No Phase B language to record.
+            indexable_paths.push(p);
         }
     }
     reclassify_objc_headers(&mut present_languages, &indexable_paths);
@@ -1307,6 +1340,11 @@ pub fn init_repo_with_progress(
                 if let Some(lang) = Language::from_extension(ext) {
                     present_languages.insert(lang.as_str().to_string());
                     indexable_paths.push(p);
+                } else if travsr_core::is_manifest_file(
+                    p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                ) {
+                    // Name-recognized manifest (go.mod, *.csproj): unmapped ext.
+                    indexable_paths.push(p);
                 }
             }
             reclassify_objc_headers(&mut present_languages, &indexable_paths);
@@ -1342,10 +1380,7 @@ pub fn init_repo_with_progress(
                     .any(|skip| c.as_os_str() == *skip)
             })
         })
-        .filter(|e| {
-            Language::from_extension(e.path().extension().and_then(|x| x.to_str()).unwrap_or(""))
-                .is_some()
-        })
+        .filter(|e| travsr_core::is_indexable_path(e.path()))
         .count() as u64;
     let files_skipped_ignored =
         source_files_without_ignore.saturating_sub(indexable_paths.len() as u64);
@@ -1549,6 +1584,8 @@ pub fn init_repo_with_progress(
             );
             let (report, alias_map) =
                 write_phase_b_results(&mut store, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+            // WS-2: flag Dart packages indexed without resolved dependencies.
+            record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
             // E1: edges resolved by native leaf-name heuristics are tree-sitter,
             // not compiler-derived — write them separately with truthful
             // provenance instead of folding them into the SCIP batch as 'lsif'.
@@ -2270,6 +2307,151 @@ fn resolve_unresolved_calls(
 /// (#318 O3, [`run_background_phase_b`]) writes results through the exact same
 /// unification + attribution path as a full init — there is one and only one
 /// place that decides how Phase B nodes/edges/refs land in the store.
+/// WS-2 (Dart production readiness): record whether Dart Phase B ran with
+/// resolved dependencies, so `travsr status` and `find_references` never report
+/// the resulting partial index as a confident zero. Mirrors `rust_lsif_degraded`.
+///
+/// Empty meta = resolved (or no Dart in the repo). A comma-separated package
+/// list = Dart packages missing `.dart_tool/package_config.json` — the user can
+/// restore cross-package references by running `dart pub get` there. We never
+/// run it ourselves (local-first: it mutates the tree and needs the network).
+fn record_dart_resolution_state(store: &mut SqliteStore, repo_root: &Path, dart_present: bool) {
+    let unresolved = if dart_present {
+        travsr_analysis::phase_b_dart::unresolved_dep_packages(repo_root)
+    } else {
+        Vec::new()
+    };
+    let _ = store.set_meta("dart_deps_unresolved", &unresolved.join(","));
+}
+
+/// A2 follow-up: enrich `markers` with the `Provider` markers a member manifest
+/// inherits from its workspace root, so a member-only incremental reindex keeps
+/// inherited deps at the root version instead of the `@workspace` sentinel.
+///
+/// For each member `Cargo.toml` that declared an inherited dependency, walks up
+/// to its workspace root and reads `[workspace.dependencies]`. Only providers
+/// for a name not already present are added, so this never overrides an in-batch
+/// root (root + member reindexed together) and de-duplicates a root shared by
+/// several members. All filesystem work is skipped when every `Consumer` already
+/// has a matching `Provider`.
+fn enrich_workspace_providers(
+    markers: &mut Vec<travsr_analysis::data_format::WorkspaceDepMarker>,
+    member_manifests: &[PathBuf],
+    repo_root: &Path,
+) {
+    use travsr_analysis::data_format::WorkspaceDepMarker;
+
+    if member_manifests.is_empty() {
+        return;
+    }
+    let mut have: std::collections::HashSet<String> = markers
+        .iter()
+        .filter_map(|m| match m {
+            WorkspaceDepMarker::Provider { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let unresolved = markers
+        .iter()
+        .any(|m| matches!(m, WorkspaceDepMarker::Consumer { name, .. } if !have.contains(name)));
+    if !unresolved {
+        return;
+    }
+    let mut added = Vec::new();
+    for member in member_manifests {
+        for pm in
+            travsr_analysis::data_format::workspace_provider_markers_for_member(member, repo_root)
+        {
+            if let WorkspaceDepMarker::Provider { ref name, .. } = pm {
+                if have.insert(name.clone()) {
+                    added.push(pm);
+                }
+            }
+        }
+    }
+    if !added.is_empty() {
+        tracing::debug!(
+            count = added.len(),
+            "A2: enriched workspace providers from root for member-only reindex"
+        );
+        markers.extend(added);
+    }
+}
+
+/// C1: cross-link a language's own dependency node (`crate:serde`, kind
+/// `crate`) to the manifest-derived package node (`pkg:serde@ver`, kind
+/// `package`) when their bare names match, using the existing `ResolvesTo` edge
+/// so bare-name graph queries and traversal see the manifest data alongside the
+/// module graph. Package lookup is scoped to the `crates.io` registry so a
+/// same-named npm/pypi package can never link to a Rust crate. The
+/// `(kind, prefix, corpus)` shape generalises to other ecosystems as their
+/// symbol nodes gain stable dependency names.
+///
+/// Idempotent: `put_edge` dedupes on `(src, dst, kind)`, so re-running on every
+/// Phase B write never accumulates duplicates. Returns the edge count.
+fn cross_link_manifest_deps(store: &mut SqliteStore) -> usize {
+    use std::collections::HashMap;
+
+    let pkg_nodes = match store.nodes_by_kind("package") {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("C1 cross-link: package node scan failed: {e}");
+            return 0;
+        }
+    };
+    let mut pkg_by_name: HashMap<String, Vec<travsr_core::NodeId>> = HashMap::new();
+    for n in &pkg_nodes {
+        if n.vname.corpus != "crates.io" {
+            continue;
+        }
+        if let Some(rest) = n.vname.signature.strip_prefix("pkg:") {
+            let name = rest.rsplit_once('@').map(|(nm, _)| nm).unwrap_or(rest);
+            if !name.is_empty() {
+                pkg_by_name.entry(name.to_string()).or_default().push(n.id);
+            }
+        }
+    }
+    if pkg_by_name.is_empty() {
+        return 0;
+    }
+
+    let crate_nodes = match store.nodes_by_kind("crate") {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("C1 cross-link: crate node scan failed: {e}");
+            return 0;
+        }
+    };
+    let mut linked = 0usize;
+    for n in &crate_nodes {
+        let Some(name) = n.vname.signature.strip_prefix("crate:") else {
+            continue;
+        };
+        if let Some(pkg_ids) = pkg_by_name.get(name) {
+            for &pkg_id in pkg_ids {
+                if n.id == pkg_id {
+                    continue;
+                }
+                match store.put_edge(&travsr_core::Edge::new(
+                    n.id,
+                    pkg_id,
+                    travsr_core::EdgeKind::ResolvesTo,
+                )) {
+                    Ok(_) => linked += 1,
+                    Err(e) => tracing::warn!("C1 cross-link edge write error: {e}"),
+                }
+            }
+        }
+    }
+    if linked > 0 {
+        tracing::info!(
+            count = linked,
+            "C1: cross-linked crate <-> manifest package nodes"
+        );
+    }
+    linked
+}
+
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2283,6 +2465,16 @@ fn write_phase_b_results(
 ) {
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
+    // B: gate the C1 manifest cross-link (two unindexed full `nodes` scans) on
+    // whether this cycle actually wrote any `crate` node. Computed before
+    // `pb_nodes` is consumed below. C1 only creates value when `crate:*` nodes
+    // exist to link: on init every crate node is written this cycle, and on an
+    // incremental Rust change the touched crate's nodes are re-written. CAVEAT: a
+    // manifest-only edit (a new `pkg:` node from Phase A, no crate node this
+    // cycle) will not re-link to a pre-existing crate until the next Rust change
+    // — acceptable for a best-effort surfacing feature, and it avoids paying the
+    // scan on every non-Rust commit (e.g. a Go/k8s repo with zero crate nodes).
+    let cycle_wrote_crate = pb_nodes.iter().any(|n| n.kind == "crate");
     // #299 F2: the alias map (SCIP id → unified TS id) produced by `unify_all`
     // must be returned so the caller can remap `resolved_sites.dst` — those sites
     // were resolved against the pre-unify store and may point at a SCIP node that
@@ -2356,6 +2548,17 @@ fn write_phase_b_results(
             "semantic indexing complete"
         );
     }
+
+    // C1: now that the module graph's `crate:*` nodes are written, cross-link
+    // them to the manifest-derived `pkg:*` package nodes by name so a bare-name
+    // query (`graph serde`) surfaces the manifest dependency alongside the
+    // language's own crate node. Skipped when this cycle wrote no crate node —
+    // see `cycle_wrote_crate` above (avoids two full `nodes` scans per commit
+    // for non-Rust repos and manifest-untouched cycles).
+    if cycle_wrote_crate {
+        cross_link_manifest_deps(store);
+    }
+
     // H3: stamp phase_b_warnings in the meta table so `travsr status` can surface
     // actionable issues without the user having to re-read init output.
     let mut warnings: Vec<String> = Vec::new();
@@ -2483,6 +2686,11 @@ fn collect_present_languages_and_paths(
             if !lang.is_phase_a_only() {
                 langs.insert(lang.as_str().to_string());
             }
+            paths.push(p);
+        } else if travsr_core::is_manifest_file(
+            p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        ) {
+            // Name-recognized manifest (go.mod, *.csproj): Phase A only.
             paths.push(p);
         }
     }
@@ -2914,6 +3122,8 @@ fn run_background_phase_b_inner(
     // P6 (#329): single walk yields both present_languages and indexable_paths
     // so Phase B runners skip their own directory walks.
     let (present_languages, indexable_paths) = collect_present_languages_and_paths(repo_root);
+    // WS-2: captured before `present_languages` is moved into PhaseBInputs below.
+    let dart_present = present_languages.contains("dart");
     // R1: reset per-Phase-B skip latch before the run (same as init_repo_with_progress).
     travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
@@ -2964,6 +3174,8 @@ fn run_background_phase_b_inner(
 
     let (report, alias_map) =
         write_phase_b_results(&mut s, &corpus, pb_nodes, pb_edges, pb_refs, pb_outcome);
+    // WS-2: flag Dart packages indexed without resolved dependencies.
+    record_dart_resolution_state(&mut s, repo_root, dart_present);
     // E1: native leaf-name resolved edges are tree-sitter-heuristic — truthful
     // provenance, not the SCIP batch's 'lsif'.
     if let Err(e) = s.write_phase_b_batch(&[], &resolved, "tree-sitter") {
@@ -3128,6 +3340,13 @@ pub fn reindex_files(
     // resolution (RFC-005). Resolution runs once after the per-file loop so
     // markers from both sides of each FFI boundary are available.
     let mut all_ffi_markers: Vec<FfiMarker> = Vec::new();
+    let mut all_ws_markers: Vec<travsr_analysis::data_format::WorkspaceDepMarker> = Vec::new();
+    // A2 follow-up: `Cargo.toml` files in this batch that declare an inherited
+    // (`{ workspace = true }`) dependency. Used after the loop to walk up to the
+    // workspace root and supply the versions the root would provide, so a
+    // member-only incremental reindex keeps inherited deps at the root version
+    // instead of degrading them to the `@workspace` sentinel.
+    let mut member_manifests: Vec<PathBuf> = Vec::new();
     let mut any_changed = false;
     // Accumulate Tier-0 dirty callers across all files in this batch.
     let mut callers_all = travsr_core::DirtySet::default();
@@ -3238,6 +3457,18 @@ pub fn reindex_files(
                 any_changed = true;
                 // Collect FFI markers for the repo-level pass (RFC-005).
                 all_ffi_markers.extend(out.ffi_markers);
+                // Collect Cargo workspace dep markers for the A2 repo-level pass.
+                // Record any member manifest with an inherited dep so the A2
+                // block can walk up to its root for the missing versions.
+                if out.workspace_dep_markers.iter().any(|m| {
+                    matches!(
+                        m,
+                        travsr_analysis::data_format::WorkspaceDepMarker::Consumer { .. }
+                    )
+                }) {
+                    member_manifests.push(abs_path.clone());
+                }
+                all_ws_markers.extend(out.workspace_dep_markers);
             }
             Err(e) => tracing::warn!(path = %vname_path, err = %e, "reindex_replace failed"),
         }
@@ -3254,6 +3485,33 @@ pub fn reindex_files(
         for edge in &ffi_edges {
             if let Err(err) = store.put_edge(edge) {
                 tracing::warn!("ffi edge write error: {err}");
+            }
+        }
+    }
+
+    // Cargo workspace dependency resolution (A2) — same single-pass rationale as
+    // FFI above. A member `{ workspace = true }` entry re-indexed alongside its
+    // workspace root gets the root's version.
+    //
+    // A2 follow-up: when a member is re-indexed *alone* (the common incremental
+    // case — edit a member, commit; the root is not in this batch) the root's
+    // `Provider` markers are absent, so the resolver would degrade the edge to
+    // the `@workspace` sentinel. Before resolving, walk up from each member
+    // manifest to its workspace root and synthesize the missing `Provider`
+    // markers from the root's `[workspace.dependencies]`. Only Consumers still
+    // unresolved after this fall back to the sentinel (a genuinely detached
+    // member whose root is not on disk).
+    if !all_ws_markers.is_empty() {
+        enrich_workspace_providers(&mut all_ws_markers, &member_manifests, repo_root);
+        let (nodes, edges) = indexer.resolve_workspace_deps(&all_ws_markers);
+        for node in &nodes {
+            if let Err(err) = store.put_node(node) {
+                tracing::warn!("workspace dep node write error: {err}");
+            }
+        }
+        for edge in &edges {
+            if let Err(err) = store.put_edge(edge) {
+                tracing::warn!("workspace dep edge write error: {err}");
             }
         }
     }
@@ -5435,6 +5693,120 @@ mod tests {
             Some("1"),
             "a revert back to committed content still degrades Phase B, so the \
              flag must be set even though the working tree is now clean"
+        );
+    }
+
+    /// A2 follow-up: reindexing ONLY a workspace member (the common incremental
+    /// case — edit a member, commit; the root is not in the batch) must keep the
+    /// member's inherited `serde = { workspace = true }` edge pointed at the root
+    /// version, not degrade it to the `@workspace` sentinel.
+    #[test]
+    fn member_only_reindex_keeps_inherited_dep_at_root_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+
+        // Workspace root declares the version under [workspace.dependencies].
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n\n\
+             [workspace.dependencies]\nserde = \"1.0.200\"\n",
+        )
+        .unwrap();
+        // Member inherits it with `{ workspace = true }`.
+        let member_dir = tmp.path().join("crates/member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        std::fs::write(
+            &member_manifest,
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { workspace = true }\n",
+        )
+        .unwrap();
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        store.set_meta("corpus", "test").unwrap();
+
+        // Reindex ONLY the member manifest — the root is not in this batch.
+        reindex_files(
+            std::slice::from_ref(&member_manifest),
+            tmp.path(),
+            &mut store,
+        )
+        .unwrap();
+
+        let versioned = travsr_analysis::data_format::cargo_package_node("serde", "1.0.200").id;
+        let sentinel = travsr_analysis::data_format::cargo_package_node("serde", "workspace").id;
+        let edges = store.all_edges().unwrap();
+        assert!(
+            edges.iter().any(|(_, dst, _, _)| *dst == versioned),
+            "member-only reindex must resolve serde to the root version 1.0.200"
+        );
+        assert!(
+            !edges.iter().any(|(_, dst, _, _)| *dst == sentinel),
+            "member-only reindex must NOT degrade serde to the @workspace sentinel"
+        );
+    }
+
+    /// B: the C1 manifest cross-link pass is gated on the Phase B cycle writing
+    /// a `crate` node. A cycle that writes none (e.g. a Go-only repo) must not
+    /// create the `crate -> package` link even when both nodes already exist;
+    /// a cycle that writes a crate node must.
+    #[test]
+    fn cross_link_gated_on_crate_nodes_in_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        // Pre-seed a manifest package node and a module crate node with matching
+        // bare names, as prior cycles would have written them.
+        let pkg = travsr_analysis::data_format::cargo_package_node("serde", "1.0.200");
+        let crate_node = travsr_core::Node::new(
+            travsr_core::VName::new("test", "", "", "rust", "crate:serde"),
+            "crate",
+        );
+        store.put_node(&pkg).unwrap();
+        store.put_node(&crate_node).unwrap();
+
+        let linked = |store: &travsr_store::SqliteStore| {
+            store
+                .all_edges()
+                .unwrap()
+                .iter()
+                .any(|(src, dst, _, _)| *src == crate_node.id && *dst == pkg.id)
+        };
+
+        // Cycle 1: writes NO crate node -> the gate skips the cross-link scan.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+        );
+        assert!(
+            !linked(&store),
+            "a cycle with no crate node must not run the cross-link pass"
+        );
+
+        // Cycle 2: writes a crate node -> the gate runs the cross-link pass.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![crate_node.clone()],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+        );
+        assert!(
+            linked(&store),
+            "a cycle that writes a crate node links crate -> package"
         );
     }
 

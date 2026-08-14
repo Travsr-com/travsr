@@ -110,10 +110,9 @@ enum Command {
         #[arg(long, value_enum, default_value = "table")]
         format: ask::OutputFormat,
     },
-    /// #478 RFC-023 §6.1: diagnostic seed-building trace for one query/symbol
-    /// pair — per-token IDF, per-leg match, every gate + threshold, and final
-    /// disposition (live vs an FTS-only counterfactual). The instrument for
-    /// tuning retrieval thresholds; not part of the normal retrieval path.
+    /// Show why `travsr ask` ranked (or skipped) results for a query: which
+    /// terms matched, which relevance thresholds passed or failed, and the final
+    /// decision. A diagnostic for tuning search; not part of normal use.
     Explain {
         /// Natural-language question, or a symbol name, exactly as you would
         /// pass it to `travsr ask`.
@@ -223,7 +222,7 @@ enum Command {
         #[command(subcommand)]
         action: synonym::SynonymCommand,
     },
-    /// Manage the RFC-021 cross-encoder reranker model.
+    /// Manage the reranker model that reorders search results by relevance.
     Rerank {
         #[command(subcommand)]
         action: rerank::RerankCommand,

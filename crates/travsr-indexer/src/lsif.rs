@@ -46,6 +46,7 @@ pub fn ingest(dump: &str, corpus: &str) -> anyhow::Result<ParseOutput> {
         nodes: Vec::new(), // LSIF adds edges only; Tree-sitter owns nodes
         edges,
         ffi_markers: Vec::new(),
+        workspace_dep_markers: Vec::new(),
     })
 }
 
@@ -764,6 +765,7 @@ pub fn ingest_rust(dump: &str, corpus: &str) -> anyhow::Result<ParseOutput> {
         nodes: Vec::new(),
         edges,
         ffi_markers: Vec::new(),
+        workspace_dep_markers: Vec::new(),
     })
 }
 
@@ -1364,6 +1366,7 @@ pub fn ingest_scip(bytes: &[u8], corpus: &str) -> anyhow::Result<ParseOutput> {
         nodes,
         edges,
         ffi_markers: vec![],
+        workspace_dep_markers: vec![],
     })
 }
 

@@ -208,6 +208,12 @@ pub struct StatusPayload {
     /// (serde default false), which reads as the pre-#583 behaviour.
     #[serde(default)]
     pub phase_b_dirty: bool,
+    /// WS-2: comma-separated Dart package directories that were indexed without
+    /// resolved dependencies (no `.dart_tool/package_config.json`), so their
+    /// cross-package references are incomplete. Empty = resolved or no Dart.
+    /// Old daemons omit the field (serde default None).
+    #[serde(default)]
+    pub dart_deps_unresolved: Option<String>,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -230,6 +236,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
         rerank: crate::rerank::rerank_status().to_string(),
         phase_b_dirty: store.get_meta("phase_b_dirty")?.as_deref() == Some("1"),
+        dart_deps_unresolved: store.get_meta("dart_deps_unresolved")?,
     })
 }
 

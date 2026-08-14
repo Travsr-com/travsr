@@ -246,6 +246,7 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
         nodes,
         edges,
         ffi_markers,
+        workspace_dep_markers: vec![],
     })
 }
 

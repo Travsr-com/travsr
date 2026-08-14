@@ -154,6 +154,21 @@ impl PluginIndexer {
                         message: e.to_string(),
                     });
                 }
+                // Name-recognized manifest whose extension is unmapped or absent
+                // (`go.mod`, `*.csproj`): route to the data-format parser, which
+                // dispatches by filename. Same fallback as the mapped-extension
+                // data formats above — there is no Phase B sidecar for these.
+                let file_name = Path::new(vname_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if travsr_core::is_manifest_file(file_name) {
+                    return travsr_analysis::data_format::parse(&corpus, abs_path, vname_path)
+                        .map_err(|e| IndexError::Parse {
+                            file: abs_path.display().to_string(),
+                            message: e.to_string(),
+                        });
+                }
                 return Ok(ParseOutput::default());
             }
         };
@@ -987,6 +1002,15 @@ impl PluginIndexer {
         markers: &[travsr_indexer::FfiMarker],
     ) -> Vec<travsr_core::Edge> {
         travsr_indexer::Indexer::with_corpus(&self.corpus).resolve_ffi_edges(markers)
+    }
+
+    /// Resolve Cargo workspace-inherited dependency versions (A2) from
+    /// accumulated markers. Delegates to the travsr_indexer resolver.
+    pub fn resolve_workspace_deps(
+        &self,
+        markers: &[travsr_analysis::data_format::WorkspaceDepMarker],
+    ) -> (Vec<travsr_core::Node>, Vec<travsr_core::Edge>) {
+        travsr_indexer::Indexer::with_corpus(&self.corpus).resolve_workspace_deps(markers)
     }
 }
 
