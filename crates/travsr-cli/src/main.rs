@@ -568,6 +568,17 @@ async fn run(cli: Cli) -> Result<()> {
                                 println!("{msg}");
                             }
                         }
+                        // #685 review: a busy pipe or a timed-out exchange means
+                        // something IS listening on the control transport, so the
+                        // daemon is up, not starting and not absent. Only
+                        // transport-absent errors fall through to the repo-lock
+                        // starting/not-running classification below.
+                        Err(e) if transport_busy(&e) => {
+                            println!("daemon: running (control pipe busy, retry shortly)");
+                        }
+                        Err(e) if !transport_absent(&e) => {
+                            println!("daemon: running (not responding: {e:#})");
+                        }
                         Err(_) => {
                             // Socket not ready yet — the daemon may be alive but
                             // still starting (store open, embed sidecar model
@@ -864,6 +875,18 @@ fn transport_absent(e: &anyhow::Error) -> bool {
         || msg.contains("os error 61")
 }
 
+/// True when the error means a daemon IS listening but every pipe instance was
+/// serving another client when we tried to connect (Windows `ERROR_PIPE_BUSY`,
+/// surfaced by `NamedPipeTransport::connect` as "daemon is busy (...)").
+///
+/// #685 review: this is the one transport error that is both "the daemon is
+/// definitely up" and "transient by construction" (the daemon re-creates a
+/// pipe instance on every accept-loop iteration), so `status` must not report
+/// it as still-starting and `stop` should retry it rather than give up.
+fn transport_busy(e: &anyhow::Error) -> bool {
+    e.to_string().contains("daemon is busy")
+}
+
 /// Send `Shutdown`, waiting out the daemon's startup window if needed.
 ///
 /// Between taking `daemon.lock` and binding its control transport the daemon
@@ -875,6 +898,12 @@ fn transport_absent(e: &anyhow::Error) -> bool {
 /// held by a live daemon, keep retrying until the transport binds, the daemon
 /// exits on its own (lock released — the caller then sees the usual "not
 /// running" transport error), or [`STOP_DELIVER_TIMEOUT`] fires.
+///
+/// A busy control pipe (Windows: every instance serving another client) is
+/// retried under the same deadline (#685 review): the daemon is provably up
+/// and the contention clears as soon as its accept loop creates the next
+/// instance, so it sits in the same "worth another attempt" bucket as the
+/// startup window.
 fn send_shutdown_waiting_for_startup(
     repo_root: &std::path::Path,
 ) -> anyhow::Result<travsr_ipc::ControlResponse> {
@@ -885,18 +914,32 @@ fn send_shutdown_waiting_for_startup(
             Ok(resp) => return Ok(resp),
             Err(e) => e,
         };
-        if !transport_absent(&err) || !daemon_client::daemon_lock_held(repo_root) {
+        // #685 review: a busy pipe (Windows, all instances mid-request) is as
+        // transient as the startup window this loop already absorbs, and the
+        // daemon is provably up. Retry it too, instead of failing `daemon
+        // stop` on the first contended connect.
+        let busy = transport_busy(&err);
+        let starting = transport_absent(&err) && daemon_client::daemon_lock_held(repo_root);
+        if !busy && !starting {
             return Err(err);
         }
-        anyhow::ensure!(
-            std::time::Instant::now() < cutoff,
-            "travsr daemon is still starting (repo lock held, control transport not \
-             bound within {}s) and the stop request was NOT delivered.\n  \
-             Wait for `travsr daemon status` to report it running, then retry \
-             `travsr daemon stop`.",
-            STOP_DELIVER_TIMEOUT.as_secs()
-        );
-        if !announced {
+        if std::time::Instant::now() >= cutoff {
+            if busy {
+                return Err(err.context(format!(
+                    "the daemon's control pipe stayed busy for {}s and the stop \
+                     request was NOT delivered; retry `travsr daemon stop`",
+                    STOP_DELIVER_TIMEOUT.as_secs()
+                )));
+            }
+            anyhow::bail!(
+                "travsr daemon is still starting (repo lock held, control transport not \
+                 bound within {}s) and the stop request was NOT delivered.\n  \
+                 Wait for `travsr daemon status` to report it running, then retry \
+                 `travsr daemon stop`.",
+                STOP_DELIVER_TIMEOUT.as_secs()
+            );
+        }
+        if starting && !announced {
             eprintln!(
                 "travsr daemon is starting (control transport not bound yet); \
                  waiting to deliver the stop..."
@@ -1068,6 +1111,24 @@ mod tests {
             "control response exceeded deadline",
         ] {
             assert!(!transport_absent(&anyhow::anyhow!(msg)), "{msg}");
+        }
+    }
+
+    /// #685 review: `status` and `stop` special-case a contended-but-alive
+    /// daemon, so the busy classifier must match exactly the connect error the
+    /// named-pipe transport produces and nothing else.
+    #[test]
+    fn transport_busy_matches_only_the_busy_pipe_error() {
+        assert!(transport_busy(&anyhow::anyhow!(
+            "daemon is busy (\\\\.\\pipe\\travsr-abc had no free pipe instance for 2s); \
+             retry shortly"
+        )));
+        for msg in [
+            "daemon not running (\\\\.\\pipe\\travsr-abc): os error 2",
+            "Connection refused (os error 111)",
+            "timed out after 20s talking to the daemon over the named pipe",
+        ] {
+            assert!(!transport_busy(&anyhow::anyhow!(msg)), "{msg}");
         }
     }
 

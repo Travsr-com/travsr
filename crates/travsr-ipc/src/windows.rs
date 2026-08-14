@@ -46,10 +46,18 @@ impl NamedPipeTransport {
     /// CLI onto its slow direct-open fallback for a daemon that was merely
     /// mid-request (#407 M2).
     pub fn connect(addr: &ControlAddr) -> anyhow::Result<Self> {
+        Self::connect_within(addr, BUSY_RETRY_DEADLINE)
+    }
+
+    /// [`connect`](Self::connect) with a caller-chosen busy-retry budget, so a
+    /// fire-and-forget caller is never held for the full 2 s
+    /// [`BUSY_RETRY_DEADLINE`] (#685 review: the git post-commit hook must not
+    /// stall a commit on a contended pipe).
+    fn connect_within(addr: &ControlAddr, busy_budget: Duration) -> anyhow::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         let pipe_name = addr.pipe_name();
-        let cutoff = Instant::now() + BUSY_RETRY_DEADLINE;
+        let cutoff = Instant::now() + busy_budget;
         loop {
             match std::fs::OpenOptions::new()
                 .read(true)
@@ -61,16 +69,39 @@ impl NamedPipeTransport {
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                     anyhow::ensure!(
                         Instant::now() < cutoff,
-                        "daemon is busy ({} had no free pipe instance for {:?}) — \
+                        "daemon is busy ({} had no free pipe instance for {:?}); \
                          retry shortly",
                         pipe_name,
-                        BUSY_RETRY_DEADLINE
+                        busy_budget
                     );
-                    std::thread::sleep(BUSY_RETRY_INTERVAL);
+                    std::thread::sleep(BUSY_RETRY_INTERVAL.min(busy_budget));
                 }
                 Err(e) => anyhow::bail!("daemon not running ({}): {e}", pipe_name),
             }
         }
+    }
+
+    /// Connect and fire-and-forget `msg` under ONE overall deadline
+    /// ([`crate::transport::FIRE_AND_FORGET_DEADLINE`]) covering the busy-pipe
+    /// retry, the connect, and the write together (#685 review).
+    ///
+    /// [`connect`](Self::connect) alone may retry a busy pipe for up to 2 s
+    /// before the bounded write even starts; a caller that must never stall
+    /// (the git post-commit hook) uses this instead, so the whole dispatch is
+    /// bounded by the fire-and-forget budget the way the Unix path already is.
+    pub fn send_fire_and_forget_bounded(
+        addr: &ControlAddr,
+        msg: &ControlMessage,
+    ) -> anyhow::Result<()> {
+        let deadline = crate::transport::FIRE_AND_FORGET_DEADLINE;
+        let started = Instant::now();
+        let mut transport = Self::connect_within(addr, deadline)?;
+        let file = transport.take_file()?;
+        // Whatever the connect spent comes out of the write's budget, so the
+        // total can never exceed one FIRE_AND_FORGET_DEADLINE (plus one
+        // blocking `open` syscall, which is not retried).
+        let remaining = deadline.saturating_sub(started.elapsed());
+        crate::transport::write_line_bounded(file, msg, remaining)
     }
 
     /// The pipe handle, consumed by the first request (see type-level docs).
