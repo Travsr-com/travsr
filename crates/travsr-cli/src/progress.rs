@@ -385,7 +385,7 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     report.corpus.as_str()
                 };
                 println!(
-                    "  {} corpus not trusted for: {langs} — run `travsr lang add <lang> --corpus {corpus}` to enable",
+                    "  {} corpus not trusted for: {langs} - run `travsr lang add <lang> --corpus {corpus}` to enable",
                     pal.dim("ℹ"),
                 );
             }
