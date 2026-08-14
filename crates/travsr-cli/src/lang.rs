@@ -302,6 +302,13 @@ fn cmd_list(json: bool) -> Result<()> {
             entry.language, package_col, sandbox_label, status
         );
     }
+
+    // RFC-025 §8: sidecar version health for the installed Phase B tools
+    // (installed vs required vs latest), with the exact remedy. Text output only
+    // — the JSON branch returned above.
+    println!();
+    crate::sidecar_health::print_block();
+
     Ok(())
 }
 
@@ -361,6 +368,17 @@ fn cmd_install(
         None => true, // builtin — no external wrapper needed
         Some(bin) if which(bin) && !reinstall => {
             println!("\u{2713} {bin} already installed.");
+            // RFC-025 Point B: presence never re-checks the release the wrapper
+            // was pinned to. Surface a below-floor WARN (offline) and a newer-
+            // release advisory (best-effort) over the installed wrapper. Never
+            // fails install.
+            if let Some(path) = travsr_core::exec::resolve_executable(bin) {
+                crate::install::advise_installed_sidecar(
+                    entry,
+                    &path,
+                    &format!("travsr lang install {language} --reinstall"),
+                );
+            }
             true
         }
         Some(bin) => {
@@ -413,7 +431,7 @@ fn cmd_install(
 
     // Handle the underlying SCIP tool (scip-go, scip-python, etc.).
     // Builtins are bundled in the travsr binary — no external tool needed.
-    let tool_ready = if entry.builtin {
+    let mut tool_ready = if entry.builtin {
         true
     } else if wrapper_installed && !tool_available(entry.command) {
         let interactive = !no_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -421,6 +439,18 @@ fn cmd_install(
     } else {
         tool_available(entry.command)
     };
+
+    // RFC-025 Point A parity: if the underlying tool is present but below its
+    // declared floor, refuse it here with the same actionable message shape as
+    // embed, exactly as `tool_available` gates readiness. Every Phase B entry
+    // declares `Semver::ZERO` today (no known behavioral floor), so this never
+    // fires until a floor is raised in the same commit a tool behavior needs it.
+    if tool_ready {
+        if let Some(refusal) = phase_b_tool_floor_refusal(entry) {
+            eprintln!("\u{26A0} {refusal}");
+            tool_ready = false;
+        }
+    }
 
     // Register in config and optionally trust a corpus.
     let mut config = load_config().unwrap_or_default();
@@ -563,7 +593,14 @@ fn install_scip_tool(
 ///
 /// `fetch_latest` is only invoked on the live path, so callers pay the network
 /// cost only when neither an override nor a pin decides the tag.
-fn resolve_install_tag(
+/// Shared tag-resolution for every downloadable sidecar (Phase B scip-* tools
+/// and, via `install_backend_with_progress`, the embed sidecar). Precedence:
+/// explicit `--version` override -> live `releases/latest` -> offline
+/// `version_fallback`. A hash-pinned entry (`pinned`) ignores the network and
+/// stays on `version_fallback` for supply-chain integrity (#410 M2). Folding
+/// embed onto this closes RFC-025 G3 at the fetch layer — one tag resolver, both
+/// families.
+pub(crate) fn resolve_install_tag(
     pinned: bool,
     version_fallback: &str,
     override_version: Option<&str>,
@@ -1339,6 +1376,42 @@ fn tool_available(name: &str) -> bool {
         extra_dirs.push(home.join(".dotnet").join("tools"));
     }
     travsr_core::exec::resolve_executable_in(extra_dirs, name).is_some()
+}
+
+/// RFC-025 Point A parity for the Phase B family: if the underlying `scip-*` /
+/// zip tool for `entry` is present but below its declared version floor, return
+/// the actionable refuse message (same shape as embed). Returns `None` when the
+/// tool is at/above the floor, when no floor is declared (the state of every
+/// Phase B entry today), or when the tool is absent — the caller then treats it
+/// as usable.
+fn phase_b_tool_floor_refusal(entry: &travsr_plugin_host::PhaseBEntry) -> Option<String> {
+    use travsr_plugin_host::sidecar_version::{
+        below_floor_message, floor_status, unreadable_message, FloorStatus, SidecarSpec,
+    };
+    let (spec, install_name): (&dyn SidecarSpec, &str) = match &entry.scip_install {
+        ScipInstall::GithubBinary(s) => (s as &dyn SidecarSpec, s.install_name),
+        ScipInstall::ZipBinary(z) => (z as &dyn SidecarSpec, z.install_name),
+        _ => return None,
+    };
+    let path = travsr_core::exec::resolve_executable(install_name)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".travsr").join("bin").join(install_name)))
+        .filter(|p| p.exists())?;
+    let remedy = format!("travsr lang install {} --reinstall", entry.language);
+    match floor_status(spec, &path, None) {
+        FloorStatus::BelowFloor {
+            installed,
+            required,
+        } => Some(below_floor_message(
+            install_name,
+            &installed,
+            &required,
+            &remedy,
+        )),
+        FloorStatus::Unreadable { required } => {
+            Some(unreadable_message(install_name, &required, &remedy))
+        }
+        FloorStatus::Ok(_) | FloorStatus::UnreadableNoFloor => None,
+    }
 }
 
 fn sandbox_available() -> bool {

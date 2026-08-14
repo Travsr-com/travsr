@@ -28,7 +28,17 @@
 //! phase_b.complete         kcore.updated         embed.text.updated
 //! embed.text.fts_backfill  store.fts_words.backfill
 //! lsif.spawn               lsif.complete         fuzz_target.missing
+//! sidecar.version.checked  sidecar.version.below_floor
+//! sidecar.version.stale    sidecar.version.unreadable
 //! ```
+//!
+//! The `sidecar.version.*` keys (RFC-025) report the external-binary version
+//! contract. They are emitted from `travsr-plugin-host` on every resolve/spawn,
+//! so they surface here whenever the daemon spawns a sidecar. `checked` is DEBUG
+//! (healthy spawns do not flood at info); `below_floor` (WARN) and `stale`
+//! (INFO) are transition-only — at most one line per distinct value, never one
+//! per ~5s scheduler tick. The daemon emits `stale` from a local cache only and
+//! never fetches (local-first).
 //!
 //! The keys keep the codebase's own vocabulary (`phase_b`, `lsif`, `kcore`)
 //! because they are identifiers, matched exactly by whatever reads them, and a

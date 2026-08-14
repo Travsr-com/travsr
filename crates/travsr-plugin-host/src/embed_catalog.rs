@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::governance::{self, EmbedOverrides};
+use crate::sidecar_version::SidecarSpec;
 use crate::stderr_ring::StderrRing;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -317,34 +318,20 @@ pub fn cancel_sentinel_path(db_path: &Path) -> PathBuf {
 }
 
 /// Feature-probe whether the installed sidecar understands `--cancel-sentinel`.
-/// Runs `<bin> --version` (added in travsr-embed 1.1.0) with a short deadline; an
-/// old sidecar prints nothing parseable → we return false and fall back to a hard
-/// kill on cancel (F5/H4). Best-effort: any probe failure is treated as "no".
+/// Reads the installed version via the shared [`installed_version`] reader (a
+/// cheap `<bin> --version` probe, first-semver-token parse) and compares against
+/// the first release that shipped `--cancel-sentinel` (travsr-embed 1.1.0). An
+/// old sidecar whose version cannot be read falls back to a hard kill on cancel
+/// (F5/H4). Best-effort: any probe failure is treated as "no".
+///
+/// RFC-025 §5.2: this previously carried its own `.last()` parser, which
+/// silently mis-read multi-token `--version` output; it now shares the corrected
+/// first-semver-token parser used by the floor gate.
 fn sidecar_supports_cancel(bin_path: &Path) -> bool {
-    // First release with `--cancel-sentinel`.
-    const MIN_MAJOR: u64 = 1;
-    const MIN_MINOR: u64 = 1;
-    let Ok(out) = Command::new(bin_path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Expected form: "travsr-embed <MAJOR>.<MINOR>.<PATCH>".
-    let Some(ver) = text.split_whitespace().last() else {
-        return false;
-    };
-    let mut parts = ver.split('.').filter_map(|p| p.parse::<u64>().ok());
-    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
-        return false;
-    };
-    (major, minor) >= (MIN_MAJOR, MIN_MINOR)
+    const MIN_CANCEL_VERSION: crate::sidecar_version::Semver =
+        crate::sidecar_version::Semver::new(1, 1, 0);
+    crate::sidecar_version::installed_version(bin_path, None)
+        .is_some_and(|v| v >= MIN_CANCEL_VERSION)
 }
 
 /// True if a process with `pid` is currently alive (no signal sent).
@@ -497,6 +484,37 @@ pub struct EmbedBackend {
     #[serde(default)]
     pub arch: String,
     pub model_files: Vec<EmbedModelFile>,
+}
+
+/// RFC-025: the behavioral floor the host requires of the `travsr-embed`
+/// sidecar. v1.2.0 is the first release whose content-hash CDC invalidation
+/// (travsr-embed #376) replaced the blanket tombstone-delete path; a sidecar
+/// below it runs a code path the current host no longer expects and fails deep
+/// with a cryptic SQLite error (issue #701). Every embed catalog entry uses the
+/// same `travsr-embed` binary, so the floor is a single host constant rather
+/// than per-model catalog data. Bump this in the same commit that first relies
+/// on a newer sidecar behavior (RFC-025 decision 3), and keep every
+/// `version_fallback` in `embed_catalog.toml` at or above it (honesty test).
+pub const EMBED_MIN_VERSION: crate::sidecar_version::Semver =
+    crate::sidecar_version::Semver::new(1, 2, 0);
+
+impl crate::sidecar_version::SidecarSpec for EmbedBackend {
+    fn install_name(&self) -> &str {
+        &self.binary_name
+    }
+    fn github_repo(&self) -> &str {
+        &self.github_repo
+    }
+    fn min_version(&self) -> crate::sidecar_version::Semver {
+        EMBED_MIN_VERSION
+    }
+    fn version_fallback(&self) -> &str {
+        &self.version_fallback
+    }
+    fn pinned(&self) -> bool {
+        // Embed backends resolve `releases/latest`; they are not hash-pinned.
+        false
+    }
 }
 
 impl EmbedBackend {
@@ -1191,7 +1209,7 @@ pub fn spawn_background_reindex_phase1(db_path: &Path) -> bool {
         tracing::debug!("embed Phase 1: reindex already in-flight — skipping");
         return false;
     };
-    let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
+    let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path).ready() else {
         return false; // guard drops here → flag reset
     };
     let Some(threshold) = derive_phase1_threshold(db_path, PHASE1_COVERAGE_FRACTION) else {
@@ -1236,7 +1254,7 @@ pub fn spawn_background_reindex_phase2(db_path: &Path) -> bool {
         tracing::debug!("embed Phase 2: reindex already in-flight — skipping");
         return false;
     };
-    let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
+    let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path).ready() else {
         return false; // guard drops here → flag reset
     };
     // Derive same threshold as Phase 1 for complementary coverage.
@@ -1282,7 +1300,7 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
         tracing::debug!("embed reindex-all: reindex already in-flight — skipping");
         return false;
     };
-    let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path) else {
+    let Some((bin_path, embed_db_path, model_id)) = resolve_backend(db_path).ready() else {
         return false; // guard drops here → flag reset
     };
     let db_path = db_path.to_path_buf();
@@ -1305,22 +1323,35 @@ pub fn spawn_background_reindex_all(db_path: &Path) -> bool {
         .is_ok()
 }
 
+/// Resolve for an *explicit* (blocking) reindex, surfacing the right error.
+///
+/// A below-floor sidecar returns the RFC-025 remedy message verbatim (the #701
+/// fix): `travsr embed reindex` refuses here with the actionable floor message
+/// (`travsr-embed v1.0.0 is below the required v1.2.0 ...`) instead of the
+/// sidecar's later cryptic SQLite error. An unconfigured or missing backend
+/// keeps the original "run `travsr embed init`" hint.
+fn resolve_backend_for_reindex(db_path: &Path) -> anyhow::Result<(PathBuf, PathBuf, String)> {
+    match resolve_backend(db_path) {
+        BackendResolve::Ready(bin, edb, mid) => Ok((bin, edb, mid)),
+        BackendResolve::Refused(msg) => Err(anyhow::anyhow!("{msg}")),
+        BackendResolve::Unavailable => Err(anyhow::anyhow!(
+            "No embedding backend active or binary missing. \
+             Run `travsr embed init` first."
+        )),
+    }
+}
+
 /// Blocking reindex — called from `travsr embed reindex` (CLI path).
 ///
 /// Runs the sidecar in the calling thread. Suitable for interactive use
 /// where the caller wants to wait for completion.
-/// Returns Err if the backend is not installed.
+/// Returns Err if the backend is not installed or is below the version floor.
 pub fn run_parallel_reindex_blocking(
     db_path: &Path,
     phase1_threshold: Option<u32>,
     overrides: &EmbedOverrides,
 ) -> anyhow::Result<()> {
-    let (bin_path, embed_db_path, model_id) = resolve_backend(db_path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No embedding backend active or binary missing. \
-             Run `travsr embed init` first."
-        )
-    })?;
+    let (bin_path, embed_db_path, model_id) = resolve_backend_for_reindex(db_path)?;
 
     let phase = match phase1_threshold {
         Some(t) => PhaseFilter::Phase1 { threshold: t },
@@ -1341,12 +1372,7 @@ pub fn run_parallel_reindex_blocking(
 /// Blocking reindex with sidecar stdout suppressed — called from `travsr embed init`
 /// which renders its own progress UI. All nodes, no phase split.
 pub fn run_parallel_reindex_blocking_quiet(db_path: &Path) -> anyhow::Result<()> {
-    let (bin_path, embed_db_path, model_id) = resolve_backend(db_path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No embedding backend active or binary missing. \
-             Run `travsr embed init` first."
-        )
-    })?;
+    let (bin_path, embed_db_path, model_id) = resolve_backend_for_reindex(db_path)?;
     run_parallel_reindex(
         &bin_path,
         db_path,
@@ -1376,7 +1402,47 @@ pub fn run_parallel_reindex_blocking_quiet(db_path: &Path) -> anyhow::Result<()>
 /// (`maybe_spawn_embed`, travsr-daemon) specifically so a repo the user never
 /// ran `embed init` inside is never auto-embedded. This fallback only widens
 /// what an *explicit* `travsr embed reindex`/`embed init` can resolve.
-fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
+/// The exact command a user runs to replace a stale/below-floor embed sidecar.
+/// Surfaced verbatim in the refusal message and in the `below_floor` log event.
+const EMBED_REINSTALL_REMEDY: &str = "travsr embed init --reinstall";
+
+/// Outcome of resolving the active embed backend and gating it on the RFC-025
+/// compatibility floor (Point A). This replaces the old bare `Option`: a binary
+/// that exists but is below the floor must surface an actionable message, not a
+/// generic "not installed", so the three states are distinguished.
+enum BackendResolve {
+    /// Usable: `(bin_path, embed_db_path, model_id)`.
+    Ready(PathBuf, PathBuf, String),
+    /// No backend configured, or the binary is missing — the pre-existing
+    /// "not installed" state. Callers surface the `travsr embed init` hint.
+    Unavailable,
+    /// Installed but below the behavioral floor (or its version is unreadable
+    /// while a floor is declared). Carries the user-facing remedy message.
+    Refused(String),
+}
+
+impl BackendResolve {
+    /// Collapse to the resolved tuple, discarding the reason for any non-ready
+    /// state. Used by the daemon's background spawn paths and the calibration
+    /// probe, which skip silently (the refusal is logged inside `resolve_backend`
+    /// via `check_and_log`, transition-only).
+    fn ready(self) -> Option<(PathBuf, PathBuf, String)> {
+        match self {
+            BackendResolve::Ready(a, b, c) => Some((a, b, c)),
+            _ => None,
+        }
+    }
+}
+
+/// Pure config + existence resolution (no version I/O): reads the per-repo /
+/// global backend config, checks the binary is present, and self-heals a
+/// pre-descriptor install. Returns the resolved paths plus the catalog spec so
+/// [`resolve_backend`] can apply the floor gate. Split out from `resolve_backend`
+/// so config-resolution tests do not have to spawn a real `--version`-answering
+/// binary.
+fn resolve_backend_paths(
+    db_path: &Path,
+) -> Option<(PathBuf, PathBuf, String, &'static EmbedBackend)> {
     let repo_root = db_path.parent().and_then(|p| p.parent())?;
     let backend_id = repo_backend_id(repo_root).or_else(active_backend_id)?;
     let backend = lookup(&backend_id)?;
@@ -1396,7 +1462,50 @@ fn resolve_backend(db_path: &Path) -> Option<(PathBuf, PathBuf, String)> {
     ensure_model_descriptor(&model_dir, backend);
 
     let embed_db_path = db_path.with_file_name("embed.db");
-    Some((bin_path, embed_db_path, backend_id))
+    Some((bin_path, embed_db_path, backend_id, backend))
+}
+
+fn resolve_backend(db_path: &Path) -> BackendResolve {
+    let Some((bin_path, embed_db_path, backend_id, backend)) = resolve_backend_paths(db_path)
+    else {
+        return BackendResolve::Unavailable;
+    };
+
+    // RFC-025 Point A: the offline compatibility floor. No sidecar has been
+    // spawned yet (no handshake), so this reads the binary's own `--version`.
+    // Below the floor -> refuse *here* with the remedy, turning #701's cryptic
+    // downstream "Error code 517" into an actionable message. Zero network.
+    match crate::sidecar_version::check_and_log(
+        "embed",
+        backend,
+        &bin_path,
+        None,
+        EMBED_REINSTALL_REMEDY,
+    ) {
+        crate::sidecar_version::FloorStatus::BelowFloor {
+            installed,
+            required,
+        } => {
+            return BackendResolve::Refused(crate::sidecar_version::below_floor_message(
+                backend.install_name(),
+                &installed,
+                &required,
+                EMBED_REINSTALL_REMEDY,
+            ));
+        }
+        crate::sidecar_version::FloorStatus::Unreadable { required } => {
+            return BackendResolve::Refused(crate::sidecar_version::unreadable_message(
+                backend.install_name(),
+                &required,
+                EMBED_REINSTALL_REMEDY,
+            ));
+        }
+        // Floor satisfied, or no floor declared -> proceed.
+        crate::sidecar_version::FloorStatus::Ok(_)
+        | crate::sidecar_version::FloorStatus::UnreadableNoFloor => {}
+    }
+
+    BackendResolve::Ready(bin_path, embed_db_path, backend_id)
 }
 
 /// Probe the repo's active embedding model with `queries` against its freshly-built
@@ -1422,7 +1531,7 @@ pub fn probe_top1_cosines(db_path: &Path, queries: &[String]) -> Option<Vec<f32>
         return Some(Vec::new());
     }
     // `db_path` is graph.db; the sidecar derives embed.db from it (see EmbedSidecar).
-    let (bin_path, _embed_db, model_id) = resolve_backend(db_path)?;
+    let (bin_path, _embed_db, model_id) = resolve_backend(db_path).ready()?;
     let sidecar = crate::embed_sidecar::EmbedSidecar::spawn(&bin_path, db_path, &model_id).ok()?;
 
     // Warm the model + HNSW once so the first real probe isn't charged cold-start
@@ -1964,14 +2073,17 @@ mod tests {
         std::fs::create_dir_all(graph_db.parent().unwrap()).unwrap();
         std::fs::write(&graph_db, b"").unwrap();
 
-        let resolved = resolve_backend(&graph_db);
+        // Config-resolution behavior only; the floor gate (which would spawn the
+        // empty test binary's `--version`) is exercised separately in
+        // sidecar_version.rs, so this test calls the pure path resolver.
+        let resolved = resolve_backend_paths(&graph_db);
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
 
-        let (_, _, model_id) = resolved.expect(
+        let (_, _, model_id, _) = resolved.expect(
             "resolve_backend must fall back to the machine-global config \
              when the repo has no config of its own",
         );
@@ -2013,14 +2125,14 @@ mod tests {
         std::fs::write(&graph_db, b"").unwrap();
         write_repo_backend_id(repo.path(), &repo_backend.id).unwrap();
 
-        let resolved = resolve_backend(&graph_db);
+        let resolved = resolve_backend_paths(&graph_db);
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
 
-        let (_, _, model_id) = resolved.expect("resolve_backend must resolve");
+        let (_, _, model_id, _) = resolved.expect("resolve_backend must resolve");
         assert_eq!(
             model_id, repo_backend.id,
             "the repo's own config must win over the machine-global default"

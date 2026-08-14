@@ -82,14 +82,13 @@ impl EmbedCapabilities {
     /// an error. The host must check this before ever setting
     /// `KnnRequest.space = Space::Docs`.
     pub fn supports_doc_space(&self) -> bool {
-        let mut parts = self
-            .plugin_version
-            .split('.')
-            .filter_map(|p| p.parse::<u64>().ok());
-        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
-            return false;
-        };
-        (major, minor) >= (MIN_DOC_SPACE_MAJOR, MIN_DOC_SPACE_MINOR)
+        // RFC-025 §5.2: read the negotiated handshake `plugin_version` through the
+        // shared first-semver-token parser instead of a bespoke split, so this
+        // feature gate and the floor gate agree on how a version string is read.
+        const MIN_DOC_SPACE: crate::sidecar_version::Semver =
+            crate::sidecar_version::Semver::new(MIN_DOC_SPACE_MAJOR, MIN_DOC_SPACE_MINOR, 0);
+        crate::sidecar_version::parse_sidecar_version(&self.plugin_version)
+            .is_some_and(|v| v >= MIN_DOC_SPACE)
     }
 }
 
