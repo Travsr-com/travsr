@@ -921,61 +921,37 @@ pub fn fsck_repo(
 
     let corpus = store.get_meta("corpus")?.unwrap_or_default();
 
-    let node_count = store.node_count()?;
-    let fts_words_count = store.fts_words_node_count()?;
-    let lexical_index_parity_issue = if node_count == fts_words_count {
-        None
-    } else {
-        Some(format!(
-            "nodes ({node_count}) != nodes_fts_words_map ({fts_words_count}) — \
-             run `travsr init` to re-backfill the lexical word index (#478)"
-        ))
-    };
-
-    let mut report = travsr_core::GcReport {
-        node_count,
-        edge_count: store.edge_count()?,
-        lexical_index_parity_issue,
-        ..travsr_core::GcReport::default()
-    };
-
-    // Ghost detection stats each DB path directly rather than re-walking the disk.
-    // The DB side (`files`) tracks every indexed file, including hidden dirs and
-    // non-code files (.github/*, .mcp.json, *.yml) that carry a `file` node. A disk
-    // re-walk diverged from that set on two axes: `ignore::WalkBuilder` skips hidden
-    // entries by default, and it was additionally filtered by language extension.
-    // Either divergence flagged existing files as ghosts. Statting the DB paths is
-    // symmetric by construction — a ghost is any DB path whose file is absent on
-    // disk, with no walk config or filters to drift. `.exists()` matches the TOCTOU
-    // re-check inside `reconcile`, and `on_disk` feeds it so the report and the
-    // `--fix` deletion agree exactly.
-    let db_paths: std::collections::HashSet<String> =
-        store.get_all_file_hashes()?.into_keys().collect();
-    let mut on_disk = std::collections::HashSet::<String>::with_capacity(db_paths.len());
-    let mut ghosts: Vec<String> = Vec::new();
-    for path in &db_paths {
-        if repo_root.join(path).exists() {
-            on_disk.insert(path.clone());
-        } else {
-            ghosts.push(path.clone());
-        }
-    }
-    report.ghost_paths = ghosts;
-
-    // Count orphan edges read-only so the default (no-`--fix`) report is honest
-    // about them; `sweep_orphans` below only runs under `fix` (issue #580).
-    report.orphan_edges_detected = store.count_orphans()?;
-
-    // #650: self-referential `ref/call` edges are a false structural edge (the
-    // one failure mode the project's thesis rules out). Counted read-only here;
-    // swept under `--fix` below. New writes are guarded at the choke point
-    // (`write_scip_attributed_batch`), so a non-zero count here means a
-    // pre-guard DB that a reindex or `--fix` will clean.
-    report.self_ref_call_edges_detected = store.count_self_ref_call_edges()?;
+    // #636: the read-only report half (node/edge counts, ghost detection,
+    // orphan/self-ref-edge counts, lexical parity) is extracted onto
+    // `SqliteStore` so `travsr-mcp`'s `get_graph_health` tool can answer it
+    // without depending on travsr-daemon or opening the store read-write.
+    // See `SqliteStore::integrity_report`'s doc comment for why ghosts are
+    // detected by statting DB paths rather than re-walking disk.
+    let report = store.integrity_report(repo_root)?;
 
     if !fix {
         return Ok(report);
     }
+
+    // `reconcile` takes the on-disk set (walked_paths), not the ghost set.
+    // Derive it as `db_paths \ report.ghost_paths` instead of re-statting
+    // every path a second time (#636 review): the removed code built both
+    // sets in a single `.exists()` pass specifically so the report and the
+    // `--fix` deletion agree exactly ("`.exists()` matches the TOCTOU
+    // re-check inside `reconcile`, and `on_disk` feeds it so the report and
+    // the `--fix` deletion agree exactly"). A second independent stat pass
+    // can disagree with `report.ghost_paths` if a file appears or
+    // disappears in between; deriving from the report's own ghost set can't.
+    // `reconcile`'s own TOCTOU re-check is still the safety net against a
+    // file changing between this point and the actual delete.
+    let db_paths: std::collections::HashSet<String> =
+        store.get_all_file_hashes()?.into_keys().collect();
+    let ghost_set: std::collections::HashSet<&str> =
+        report.ghost_paths.iter().map(String::as_str).collect();
+    let on_disk: std::collections::HashSet<String> = db_paths
+        .into_iter()
+        .filter(|path| !ghost_set.contains(path.as_str()))
+        .collect();
 
     let policy = if force {
         travsr_core::SafetyPolicy {

@@ -15,6 +15,8 @@
 //! registry lookups without sanitization. `validate_mcp_arg` rejects `../`,
 //! absolute paths, oversized inputs, and null bytes before any store query runs.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 /// Maximum byte length of a sanitized MCP output item (per item, not per call).
 const MAX_OUTPUT_BYTES: usize = 4_096;
 
@@ -141,6 +143,463 @@ pub(crate) fn wrap_envelope(content: &str) -> String {
     }
 }
 
+// ── #636: home-path + secret redaction (observability tools) ──────────────────
+//
+// `get_daemon_logs` forwards real `tracing` log lines to the MCP client. Those
+// lines carry absolute filesystem paths (`repo=/home/alice/proj`) and, in
+// error/debug messages from third-party tooling, can carry credential-shaped
+// substrings. Neither `sanitize_for_mcp` nor `sanitize_mcp_body_with_limit`
+// strip either: they only handle prompt-injection framing (SEC-001). This is
+// a best-effort, pattern-based redaction pass: defence-in-depth, not a
+// guarantee that every possible secret shape is caught. Tool descriptions
+// must not claim logs are secret-free.
+
+/// Sensitive-value key names redacted by [`redact_key_value_pairs`] (case-insensitive).
+const SENSITIVE_KEY_NAMES: &[&str] = &[
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "api_key",
+];
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether `key` (case-insensitive) is one of [`SENSITIVE_KEY_NAMES`].
+///
+/// Shared by [`redact_key_value_pairs`] (matches a literal `key=value`
+/// substring still embedded in a message) and `observability::build_log_entry`
+/// (checks a field's key once `split_message_and_fields` has already pulled
+/// it out of the message into a bare value, where the key name is no longer
+/// present in the value string for `redact_key_value_pairs` to match against).
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
+    SENSITIVE_KEY_NAMES
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+}
+
+/// Redact absolute home-directory paths and common credential shapes from `s`.
+/// Applied BEFORE truncation (see [`sanitize_log_value`]) so a token split by
+/// a byte cap can never survive as a recognizable partial.
+pub(crate) fn redact_sensitive(s: &str) -> String {
+    let s = redact_home_paths(s);
+    let s = redact_bearer_tokens(&s);
+    let s = redact_prefixed_tokens(&s);
+    let s = redact_private_key_headers(&s);
+    redact_key_value_pairs(&s)
+}
+
+/// `sanitize_mcp_body_with_limit(&redact_sensitive(raw), limit)`: redact
+/// first, then apply the existing control-char strip / tag-escape / byte-cap
+/// pipeline. Always returns `<= limit` bytes.
+pub(crate) fn sanitize_log_value(raw: &str, limit: usize) -> String {
+    sanitize_mcp_body_with_limit(&redact_sensitive(raw), limit)
+}
+
+/// Replace the caller's real home directory, and any `/home/<user>/`,
+/// `/Users/<user>/`, or `<drive>:\Users\<user>\` shaped run, with `~/`.
+fn redact_home_paths(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if !home_str.is_empty() {
+            out = replace_home_prefix_at_boundary(&out, home_str.as_ref());
+        }
+    }
+    out = redact_unix_home_run(&out, "/home/");
+    out = redact_unix_home_run(&out, "/Users/");
+    out = redact_windows_home_run(&out, ":\\Users\\");
+    redact_windows_home_run(&out, ":/Users/")
+}
+
+/// Replace occurrences of `home` with `~`, but only where the match ends at a
+/// real path boundary: end of string, or a `/` or `\` separator.
+///
+/// A plain `str::replace` here mangled, and partially leaked, any path that
+/// merely shares the home directory as a *string* prefix, because a sibling
+/// account name starts with the same bytes (#636 round-4 review). With
+/// `HOME=/home/bob`:
+///
+/// ```text
+/// "/home/bobby/x"        ->  "~by/x"          (leaks "by", fabricates a path)
+/// "/home/bobs-backup/db" ->  "~s-backup/db"
+/// ```
+///
+/// The tail of the *other* account name survives, and the result reads as a
+/// genuine path while pointing somewhere that does not exist. It also
+/// consumed the `/home/` marker that [`redact_unix_home_run`] looks for, so
+/// the generic pass downstream could no longer repair it. This is the same
+/// boundary discipline [`username_run_end`] already applies to the generic
+/// passes, just on the earlier literal-home branch.
+fn replace_home_prefix_at_boundary(s: &str, home: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(home) {
+        let after = &rest[idx + home.len()..];
+        // Only a separator or end-of-string terminates the home path itself;
+        // anything else means this is a longer, different name that merely
+        // starts with the same bytes, so it must be left for the generic
+        // `/home/<user>/` pass to redact properly.
+        let at_boundary = after.is_empty() || after.starts_with('/') || after.starts_with('\\');
+        if at_boundary {
+            out.push_str(&rest[..idx]);
+            out.push('~');
+            rest = after;
+        } else {
+            // Copy through the non-match and continue past it, so a later
+            // genuine occurrence in the same string is still found.
+            let keep = idx + home.len();
+            out.push_str(&rest[..keep]);
+            rest = &rest[keep..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `c`, the base (leading) character of a grapheme cluster, marks
+/// that cluster as username material: any Unicode alphanumeric, plus `_`,
+/// `-`, `.`.
+fn is_username_material_base(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Byte offset of the end of the username run starting at `after`: the first
+/// grapheme cluster whose base character isn't plausible username material
+/// (see [`is_username_material_base`]), or `after.len()` when the whole
+/// remainder is username-shaped. The returned offset is always a char
+/// boundary (grapheme cluster boundaries are always char boundaries).
+///
+/// This bounds the username in EVERY case, whether or not a path separator
+/// follows it: only the username itself is consumed, everything after it is
+/// unrelated message text and must survive (#636 review: consuming to the
+/// next separator, or to end-of-string, silently dropped the rest of the log
+/// message, e.g. `"cannot stat /home/bob, retrying"` became `"cannot stat ~"`
+/// and `"index /home/bob failed, see /var/log/travsr.log"` became the
+/// actively misleading `"index ~/var/log/travsr.log"`).
+///
+/// Grapheme-cluster aware, not a per-`char` scan (#636 round-2 review,
+/// second half): `char::is_alphanumeric` is false for many combining marks
+/// (e.g. U+0308 COMBINING DIAERESIS) and for ZWJ, so a per-char scan ends the
+/// run in the middle of a base-character-plus-mark pair and leaks the rest
+/// of the username as if it were message text (`"stat /home/bo\u{308}b
+/// failed"` -> `"stat ~\u{308}b failed"`). This matters in practice, not just
+/// in theory: macOS APFS/HFS+ store filenames in NFD (decomposed) form by
+/// default, and CI runs `macos-latest`, so a real `/Users/böb` home
+/// directory on that runner arrives at this redactor already decomposed,
+/// in exactly the leaking spelling. Walking grapheme clusters (via
+/// `unicode-segmentation`, already resolved transitively in this workspace)
+/// keeps a combining mark bound to the base character it modifies, so the
+/// run can never end mid-cluster.
+///
+/// Fails CLOSED, not open, whenever the computed run is zero-length: an
+/// all-emoji username has no alphanumeric base character at all, so the
+/// grapheme-aware scan above alone reports zero, which used to mean "nothing
+/// to redact" and emit the whole username verbatim. This fallback fires on
+/// ANY zero-length run, not only on an exotic (e.g. all-emoji) username. When
+/// the next character after the prefix is neither `/` nor whitespace, it
+/// consumes up to the next `/` or whitespace boundary instead of stopping
+/// immediately, so a zero-length run with plain punctuation directly abutting
+/// the prefix (where there is in fact no username at all, e.g. a bare
+/// `/home/` followed by a comma or a parenthesis) takes this same path and
+/// that one adjacent token is consumed along with the redaction.
+///
+/// This is a deliberate fail-closed-over-fail-open choice (#636 round-2
+/// review): on ambiguous input, the redactor prefers to consume one extra
+/// adjacent token rather than risk emitting a real username verbatim. The
+/// two outcomes are not symmetric. A leaked real username is a privacy and
+/// security defect; a dropped adjacent token in an unusual bare-`/home/` log
+/// shape is a readability nit. The fallback is bounded to a single token, up
+/// to the next `/` or whitespace, never the old unbounded scan to the next
+/// separator anywhere later in the string.
+///
+/// Refined in #636 round-3 review: the fallback no longer fires when the
+/// candidate token is made up *entirely* of ASCII punctuation. The two
+/// ambiguous cases are separable on exactly that property, so this keeps
+/// fail-closed where it matters while dropping the readability cost where it
+/// does not. An exotic username (all-emoji, or any non-ASCII script) always
+/// contains at least one non-ASCII-punctuation character, so it still takes
+/// the fallback and is still consumed. A run that is nothing but ASCII
+/// punctuation cannot be a username at all, so consuming it only ever
+/// destroyed real message text:
+///
+/// ```text
+/// "see /home/, retrying"        keeps its comma  ->  "see ~, retrying"
+/// "path /home/(unknown) failed" still consumed   ->  "path ~ failed"
+/// ```
+fn username_run_end(after: &str) -> usize {
+    let mut end = 0usize;
+    for (idx, grapheme) in after.grapheme_indices(true) {
+        let base_is_username = grapheme
+            .chars()
+            .next()
+            .is_some_and(is_username_material_base);
+        if !base_is_username {
+            end = idx;
+            break;
+        }
+        end = idx + grapheme.len();
+    }
+
+    if end == 0 {
+        if let Some(next_char) = after.chars().next() {
+            if next_char != '/' && !next_char.is_whitespace() {
+                let candidate_end = after
+                    .find(|c: char| c == '/' || c.is_whitespace())
+                    .unwrap_or(after.len());
+                // An all-ASCII-punctuation run is not a username under any
+                // encoding, so leaving it alone cannot leak one.
+                let all_punctuation = after[..candidate_end]
+                    .chars()
+                    .all(|c| c.is_ascii_punctuation());
+                if !all_punctuation {
+                    end = candidate_end;
+                }
+            }
+        }
+    }
+
+    end
+}
+
+/// Replace `<prefix><username>` with `~` (and a trailing `/`, when the
+/// username is directly followed by one) left to right. `<username>` is the
+/// run bounded by [`username_run_end`], never the span up to the next `/`
+/// anywhere in the remainder.
+///
+/// Single code path on purpose: the separator-present and separator-absent
+/// cases differ only in whether the separator itself is consumed, and
+/// splitting them into two branches is exactly how the unbounded scan
+/// survived in the "some other path follows on this line" branch (#636
+/// round-2 review). The non-ASCII/NFD leak that same review found lives in
+/// [`username_run_end`] itself, this helper only consumes whatever it reports.
+fn redact_unix_home_run(s: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + prefix.len()..];
+        let end = username_run_end(after);
+        if after[end..].starts_with('/') {
+            out.push_str("~/");
+            rest = &after[end + '/'.len_utf8()..];
+        } else {
+            out.push('~');
+            rest = &after[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace `<drive-letter><prefix><username><sep>` with `~/`, where `prefix`
+/// is `:\Users\` or `:/Users/` and a single preceding ASCII drive-letter
+/// character (if present) is consumed too.
+///
+/// Same bounding as [`redact_unix_home_run`]: the username run ends at
+/// [`username_run_end`], not at the next `sep` anywhere later in the string,
+/// and shares that function's grapheme-cluster-aware, NFD-safe bounding
+/// (#636 round-2 review). Unlike the Unix helper both cases emit `~/` (the
+/// trailing separator is part of the replacement here, so a bare
+/// `C:\Users\bob` reads `~/`), which is pre-existing behaviour and
+/// deliberately preserved.
+fn redact_windows_home_run(s: &str, prefix: &str) -> String {
+    let sep = prefix.chars().last().unwrap_or('\\');
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        // Consume a single preceding ASCII drive-letter byte, if present.
+        // `idx` and `idx - 1` are both valid boundaries since a drive letter
+        // is always a single ASCII byte.
+        let prefix_start = if idx > 0 && rest.as_bytes()[idx - 1].is_ascii_alphabetic() {
+            idx - 1
+        } else {
+            idx
+        };
+        out.push_str(&rest[..prefix_start]);
+        out.push_str("~/");
+        let after = &rest[idx + prefix.len()..];
+        let end = username_run_end(after);
+        rest = if after[end..].starts_with(sep) {
+            &after[end + sep.len_utf8()..]
+        } else {
+            &after[end..]
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace `Bearer <token>` (case-insensitive) with `Bearer [redacted]`.
+fn redact_bearer_tokens(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut rest_lower: &str = &lower;
+    let mut rest: &str = s;
+    while let Some(idx) = rest_lower.find("bearer ") {
+        out.push_str(&rest[..idx]);
+        out.push_str("Bearer [redacted]");
+        let after = &rest[idx + "bearer ".len()..];
+        // Skip the token run (non-whitespace) that followed "Bearer ".
+        let token_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        rest = &after[token_end..];
+        rest_lower = &rest_lower[idx + "bearer ".len() + token_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Prefixes of common credential shapes: GitHub PATs, AWS access key IDs,
+/// Slack tokens, and OpenAI-style secret keys. Matched case-sensitively (all
+/// real-world prefixes are lowercase/mixed-case-fixed, not user-cased).
+const TOKEN_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "AKIA",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "xoxs-",
+    "xoxr-",
+    "sk-",
+];
+
+/// Find the leftmost occurrence of `prefix` in `s` whose preceding byte (if
+/// any) is not an identifier byte, skipping past any occurrence that fails
+/// that boundary check to look for a later one, rather than giving up on
+/// `prefix` entirely after its first occurrence (#636 review: a real token
+/// later in the string must still be found when an earlier lookalike
+/// substring merely happens to share the prefix mid-identifier, e.g. `sk-`
+/// inside `risk-free` must not shadow a real `sk-...` token that follows).
+fn find_boundary_ok(s: &str, prefix: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find(prefix) {
+        let idx = search_from + rel;
+        let boundary_ok = idx == 0 || !is_ident_byte(s.as_bytes()[idx - 1]);
+        if boundary_ok {
+            return Some(idx);
+        }
+        // `prefix` is pure ASCII, so `idx` is a char boundary and `idx + 1`
+        // always is too (an ASCII byte is exactly one char wide).
+        search_from = idx + 1;
+    }
+    None
+}
+
+/// Replace any run starting with a [`TOKEN_PREFIXES`] entry (prefix included)
+/// up to the next non-token byte with `[redacted]`.
+///
+/// O(n * |TOKEN_PREFIXES|): each outer step re-scans the remaining slice for
+/// every prefix to find the leftmost match. `TOKEN_PREFIXES` is a small fixed
+/// constant and `s` is already bounded by `MAX_FIELD_BYTES`, so this stays cheap.
+fn redact_prefixed_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        // Leftmost match across all prefixes, skipping any that would land
+        // mid-identifier (the preceding byte, if any, is an ident byte).
+        let next = TOKEN_PREFIXES
+            .iter()
+            .filter_map(|prefix| find_boundary_ok(rest, prefix).map(|idx| (idx, *prefix)))
+            .min_by_key(|(idx, _)| *idx);
+
+        let Some((idx, prefix)) = next else {
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + prefix.len()..];
+        let token_body_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(after.len());
+        out.push_str("[redacted]");
+        rest = &after[token_body_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace a `-----BEGIN ... PRIVATE KEY-----` header span with `[redacted]`.
+/// Best-effort: only redacts the header line itself, not a multi-line key
+/// body (log lines are single-line by construction).
+fn redact_private_key_headers(s: &str) -> String {
+    const MARKER: &str = "-----BEGIN";
+    const SUFFIX: &str = "PRIVATE KEY-----";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(MARKER) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + MARKER.len()..];
+        match after.find(SUFFIX) {
+            Some(pos) => {
+                out.push_str("[redacted]");
+                rest = &after[pos + SUFFIX.len()..];
+            }
+            None => {
+                out.push_str(MARKER);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace the value of any `key|token|secret|password|passwd|authorization|
+/// api_key`-named `name=value` pair with `[redacted]`, keeping the name.
+/// Values may be a bare non-whitespace run or a double-quoted string.
+fn redact_key_value_pairs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let Some(rel_eq) = s[i..].find('=') else {
+            out.push_str(&s[i..]);
+            break;
+        };
+        let eq = i + rel_eq;
+        // Walk back over an ASCII identifier run to find the key name.
+        let mut key_start = eq;
+        while key_start > i && is_ident_byte(s.as_bytes()[key_start - 1]) {
+            key_start -= 1;
+        }
+        let key = &s[key_start..eq];
+        out.push_str(&s[i..=eq]);
+        let value_start = eq + 1;
+        let sensitive = is_sensitive_key(key);
+        if !sensitive {
+            i = value_start;
+            continue;
+        }
+        if s[value_start..].starts_with('"') {
+            match s[value_start + 1..].find('"') {
+                Some(end_rel) => {
+                    out.push_str("\"[redacted]\"");
+                    i = value_start + 1 + end_rel + 1;
+                }
+                None => {
+                    out.push_str("\"[redacted]");
+                    i = s.len();
+                }
+            }
+        } else {
+            let value_end = s[value_start..]
+                .find(char::is_whitespace)
+                .map(|p| value_start + p)
+                .unwrap_or(s.len());
+            out.push_str("[redacted]");
+            i = value_end;
+        }
+    }
+    out
+}
+
 // ── SEC-002: input validator ──────────────────────────────────────────────────
 
 /// Validate an incoming MCP argument before it is forwarded to the store.
@@ -186,6 +645,34 @@ pub fn validate_mcp_list_arg(arg: &str) -> Result<(), &'static str> {
 /// Keeps: byte-length cap, null-byte rejection.
 /// Drops: percent-encoding rejection, `../` / absolute-path rejection.
 pub fn validate_mcp_pattern_arg(arg: &str) -> Result<(), &'static str> {
+    if arg.len() > MAX_ARG_BYTES {
+        return Err("argument exceeds maximum length");
+    }
+    if arg.contains('\0') {
+        return Err("null bytes not permitted in arguments");
+    }
+    Ok(())
+}
+
+/// Repo-key variant of [`validate_mcp_arg`] for the observability tools'
+/// global-mode `repo` argument (#636, `observability::resolve_single_repo`).
+///
+/// Every registry key is `repo_root.to_string_lossy()`, an absolute path
+/// (`travsr-daemon/src/lib.rs`, `travsr-store::registry`). `validate_mcp_arg`
+/// unconditionally rejects any argument starting with `/`, so a caller could
+/// never supply a real registry key, making the tools' documented
+/// disambiguation mechanism ("supply `repo` when more than one is
+/// registered") a dead end. This is safe to relax here specifically because
+/// `repo_arg` is used only for an exact `HashMap` key-equality comparison
+/// against locally-registered, trusted values (`resolve_single_repo`). It is
+/// never opened as a path, never concatenated, never interpolated into a
+/// query, unlike file/symbol args elsewhere in this crate. A traversal-shaped
+/// string simply fails to match any real key and falls through to
+/// `UNKNOWN_REPO_ERR`.
+///
+/// Keeps: byte-length cap, null-byte rejection.
+/// Drops: percent-encoding rejection, `../` / absolute-path rejection.
+pub fn validate_mcp_repo_key_arg(arg: &str) -> Result<(), &'static str> {
     if arg.len() > MAX_ARG_BYTES {
         return Err("argument exceeds maximum length");
     }
@@ -375,6 +862,37 @@ mod tests {
         assert!(validate_mcp_pattern_arg(&exact).is_ok());
     }
 
+    // ── #636: is_sensitive_key ─────────────────────────────────────────────
+
+    #[test]
+    fn is_sensitive_key_matches_case_insensitively() {
+        for name in ["token", "TOKEN", "Token", "password", "api_key"] {
+            assert!(is_sensitive_key(name), "{name} must be sensitive");
+        }
+        assert!(!is_sensitive_key("repo"));
+        assert!(!is_sensitive_key("reason"));
+    }
+
+    // ── #636: repo-key validator (observability tools' global `repo` arg) ────
+
+    #[test]
+    fn repo_key_arg_allows_absolute_paths_and_traversal_lookalikes() {
+        // Every registry key is an absolute repo-root path, and a caller must
+        // be able to pass one back verbatim to match it, unlike `validate_mcp_arg`.
+        assert!(validate_mcp_repo_key_arg("/home/alice/proj").is_ok());
+        assert!(validate_mcp_repo_key_arg("../../etc").is_ok());
+        assert!(validate_mcp_repo_key_arg("%2e%2e%2f").is_ok());
+    }
+
+    #[test]
+    fn repo_key_arg_still_rejects_null_byte_and_oversize() {
+        assert!(validate_mcp_repo_key_arg("foo\0bar").is_err());
+        let long = "a".repeat(MAX_ARG_BYTES + 1);
+        assert!(validate_mcp_repo_key_arg(&long).is_err());
+        let exact = "a".repeat(MAX_ARG_BYTES);
+        assert!(validate_mcp_repo_key_arg(&exact).is_ok());
+    }
+
     #[test]
     fn list_arg_permits_batch_beyond_scalar_limit() {
         // A realistic get_snippets batch (~20 symbols) exceeds the scalar 512-byte
@@ -423,5 +941,438 @@ mod tests {
         assert!(validate_mcp_arg("my-repo").is_ok());
         assert!(validate_mcp_arg("github.com/acme/foo").is_ok());
         assert!(validate_mcp_arg("").is_ok()); // empty is valid — "nothing found"
+    }
+
+    // ── #636: redact_sensitive / sanitize_log_value ──────────────────────────
+
+    #[test]
+    fn redact_replaces_unix_home_path_with_tilde() {
+        let input = "repo=/home/rvishwakarma/learning/Travsr-com/travsr reason=\"ok\"";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("/home/"), "home path must be redacted: {out}");
+        assert!(out.contains("~/"), "redacted form must use ~/: {out}");
+    }
+
+    /// #636 round-4 review: the literal-home pass was a plain substring
+    /// `replace`, so a *sibling* account whose name merely starts with the
+    /// same bytes was mangled and partially leaked (`/home/bobby/x` became
+    /// `~by/x` under `HOME=/home/bob`, keeping `by` and fabricating a path
+    /// that reads as real). Tested on the helper directly so the assertion
+    /// does not depend on the machine's actual `HOME`.
+    #[test]
+    fn home_prefix_replacement_requires_a_path_boundary() {
+        // A different account that shares the prefix must be left entirely
+        // alone here, for the generic `/home/<user>/` pass to handle.
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bobby/x", "/home/bob"),
+            "/home/bobby/x"
+        );
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bobs-backup/db", "/home/bob"),
+            "/home/bobs-backup/db"
+        );
+        // The real home still redacts, both mid-path and at end-of-string.
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bob/proj", "/home/bob"),
+            "~/proj"
+        );
+        assert_eq!(
+            replace_home_prefix_at_boundary("cwd=/home/bob", "/home/bob"),
+            "cwd=~"
+        );
+        // A genuine occurrence after a near-miss is still found.
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bobby/x and /home/bob/y", "/home/bob"),
+            "/home/bobby/x and ~/y"
+        );
+    }
+
+    /// End to end through `redact_sensitive`: whatever the literal-home pass
+    /// declines to touch, the generic pass must still redact, so a sibling
+    /// account name never survives in the output.
+    #[test]
+    fn sibling_home_account_is_still_redacted_by_the_generic_pass() {
+        let out = redact_sensitive("stat /home/bobby/x failed");
+        assert!(!out.contains("bobby"), "sibling username leaked: {out}");
+        assert!(out.contains("failed"), "message text dropped: {out}");
+    }
+
+    #[test]
+    fn redact_replaces_macos_home_path() {
+        let input = "cwd=/Users/alice/proj/main.rs";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("/Users/"), "got: {out}");
+        assert!(out.contains("~/"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_replaces_windows_home_path() {
+        let input = r"cwd=C:\Users\alice\proj";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("Users"), "got: {out}");
+        assert!(out.contains("~/"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_replaces_bearer_token() {
+        let input = "Authorization: Bearer abc.def.ghi more text";
+        let out = redact_sensitive(input);
+        assert!(!out.contains("abc.def.ghi"), "got: {out}");
+        assert!(out.contains("Bearer [redacted]"), "got: {out}");
+        assert!(out.contains("more text"), "trailing text preserved: {out}");
+    }
+
+    #[test]
+    fn redact_key_value_pair_replaces_value_keeps_key() {
+        let out = redact_sensitive("token=abc123 next=field");
+        assert!(out.contains("token=[redacted]"), "got: {out}");
+        assert!(!out.contains("abc123"), "got: {out}");
+        assert!(
+            out.contains("next=field"),
+            "non-sensitive key untouched: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_github_pat_token() {
+        let out = redact_sensitive("token ghp_ABCDEFGHIJ0123456789 leaked");
+        assert!(!out.contains("ghp_ABCDEFGHIJ0123456789"), "got: {out}");
+        assert!(out.contains("[redacted]"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_aws_key_id() {
+        let out = redact_sensitive("key AKIAABCDEFGHIJKLMNOP end");
+        assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_private_key_header() {
+        let out = redact_sensitive("-----BEGIN RSA PRIVATE KEY----- rest of line");
+        assert!(!out.contains("PRIVATE KEY-----"), "got: {out}");
+        assert!(out.contains("[redacted]"), "got: {out}");
+    }
+
+    /// #636 review: a lookalike substring earlier in the string (`sk-` inside
+    /// `risk-free`, mid-identifier, boundary-rejected) previously caused the
+    /// whole `sk-` prefix to be dropped for the rest of this pass, so a real
+    /// token later in the same string went out unredacted.
+    #[test]
+    fn redact_prefixed_token_found_after_an_earlier_boundary_rejected_lookalike() {
+        let out = redact_sensitive("risk-free sk-abc123secret");
+        assert!(!out.contains("sk-abc123secret"), "got: {out}");
+        assert!(out.contains("[redacted]"), "got: {out}");
+    }
+
+    /// #636 review: when no path separator follows the redacted username (the
+    /// home path is the last path-ish token in the string), only the username
+    /// must be consumed. The previous code cleared the rest of the string,
+    /// silently dropping any trailing message text.
+    #[test]
+    fn redact_home_path_without_trailing_slash_keeps_rest_of_message() {
+        let out = redact_sensitive("ERROR mod: cannot stat /home/bob, retrying");
+        assert!(out.contains("retrying"), "got: {out}");
+        assert!(!out.contains("/home/bob"), "got: {out}");
+    }
+
+    #[test]
+    fn redact_windows_home_path_without_trailing_sep_keeps_rest_of_message() {
+        let out = redact_sensitive(r"cannot stat C:\Users\bob, retrying");
+        assert!(out.contains("retrying"), "got: {out}");
+        assert!(!out.contains("Users"), "got: {out}");
+    }
+
+    #[test]
+    fn sanitize_log_value_still_escapes_angle_brackets_and_strips_controls() {
+        let out = sanitize_log_value("<script>\x01bad\x01</script>", 4_096);
+        assert!(!out.contains("<script>"), "got: {out}");
+        assert!(out.contains("&lt;script&gt;"), "got: {out}");
+        assert!(!out.contains('\x01'), "got: {out}");
+    }
+
+    #[test]
+    fn sanitize_log_value_honors_limit_even_after_redaction_expansion() {
+        // "key=x" (5 bytes) redacts to "key=[redacted]" (15 bytes), an
+        // expansion. The final output must still respect the caller's limit.
+        let limit = 8;
+        let out = sanitize_log_value("key=x", limit);
+        assert!(out.len() <= limit, "got {} bytes: {out}", out.len());
+    }
+
+    #[test]
+    fn redact_does_not_touch_unrelated_text() {
+        let out = redact_sensitive("fn charge(amount: u64) -> Result<(), Error>");
+        assert_eq!(out, "fn charge(amount: u64) -> Result<(), Error>");
+    }
+
+    /// #636 round-2 review: the branch that fires when another path appears
+    /// later on the line scanned to the next `/` anywhere in the remainder,
+    /// so everything between the home path and that slash was swallowed as if
+    /// it were part of the username. The first case is the worst: it dropped
+    /// "failed, see" and rewrote the line to read as though the path itself
+    /// were `~/var/log/travsr.log`.
+    #[test]
+    fn redact_home_path_bounds_username_when_another_path_follows_on_the_line() {
+        let out = redact_sensitive("index /home/bob failed, see /var/log/travsr.log");
+        assert!(out.contains("failed, see"), "got: {out}");
+        assert!(out.contains("/var/log/travsr.log"), "got: {out}");
+        assert!(!out.contains("/home/bob"), "got: {out}");
+
+        let out = redact_sensitive("reindex /Users/alice aborted; retry with --force /tmp/x");
+        assert!(out.contains("aborted; retry with --force"), "got: {out}");
+        assert!(!out.contains("alice"), "got: {out}");
+    }
+
+    /// The same unbounded scan resumed past the *second* home path, so that
+    /// username went out unredacted (#636 round-2 review).
+    #[test]
+    fn redact_home_path_redacts_a_second_username_later_on_the_line() {
+        let out = redact_sensitive("copy /home/bob to /home/carol/dest");
+        assert!(out.contains(" to "), "got: {out}");
+        assert!(!out.contains("carol"), "got: {out}");
+
+        let out = redact_sensitive(r"copy C:\Users\bob to C:\Users\carol\dest");
+        assert!(out.contains(" to "), "got: {out}");
+        assert!(!out.contains("carol"), "got: {out}");
+    }
+
+    /// #636 round-2 review: `username_run_end` accepted only ASCII, so a
+    /// non-ASCII username ended its run at the first non-ASCII byte and
+    /// leaked the tail (`/home/böb` -> `~öb`).
+    #[test]
+    fn redact_home_path_handles_non_ascii_username() {
+        let out = redact_sensitive("stat /home/b\u{f6}b failed");
+        assert!(!out.contains("\u{f6}b"), "got: {out}");
+        assert!(out.contains(" failed"), "got: {out}");
+    }
+
+    /// #636 round-2 review, second half: `char::is_alphanumeric` is false for
+    /// U+0308 COMBINING DIAERESIS (and for combining marks generally), so a
+    /// per-char scan ended the username run mid-cluster and leaked the tail.
+    /// This is the NFD spelling of "böb" (base `o` + U+0308), exactly what
+    /// macOS APFS/HFS+ hands back for a real `/Users/böb` home directory,
+    /// since CI runs `macos-latest`. Every assertion here is `assert_eq!` on
+    /// the whole string: the failure mode is dropped/leaked text, which a
+    /// `contains` check on the surviving half cannot see. Each case is run
+    /// against both the failing pre-fix predicate's shape (documented in the
+    /// comment) and the fixed one, so this test would have failed before the
+    /// grapheme-aware rewrite.
+    #[test]
+    fn redact_home_path_handles_combining_marks_zwj_and_emoji_without_leaking() {
+        for (input, want) in [
+            // NFD "böb": base `o` + U+0308 COMBINING DIAERESIS. Pre-fix:
+            // "stat ~\u{308}b failed" (leaked "\u{308}b").
+            ("stat /home/bo\u{308}b failed", "stat ~ failed"),
+            // Same NFD username with a real path after it: only the
+            // separator is consumed with the username, the rest of the path
+            // (and the combining mark) must not leak either.
+            (
+                "index /home/bo\u{308}b/pkg/mod.rs failed",
+                "index ~/pkg/mod.rs failed",
+            ),
+            // Windows helper shares `username_run_end`: must be fixed too.
+            (
+                "copy C:\\Users\\bo\u{308}b to C:\\Users\\carol\\dest",
+                "copy ~/ to ~/dest",
+            ),
+            // ZWJ (U+200D): also not `is_alphanumeric`, also must bind to
+            // its neighbours rather than ending the run.
+            ("stat /home/a\u{200D}b failed", "stat ~ failed"),
+            // All-emoji username: the grapheme run is zero-length (no
+            // alphanumeric base at all), so the fail-closed fallback must
+            // consume up to the next whitespace/`/` instead of emitting the
+            // username verbatim (fail OPEN). Pre-fix this leaked the whole
+            // username unredacted.
+            ("stat /home/\u{1F600}\u{1F601} failed", "stat ~ failed"),
+        ] {
+            assert_eq!(redact_sensitive(input), want, "input: {input:?}");
+        }
+
+        // NFC control: the precomposed spelling of the same username ("böb",
+        // single codepoint U+00F6) already passed before this fix, and must
+        // keep passing, so NFC and NFD spellings of the same name behave the
+        // same way.
+        assert_eq!(
+            redact_sensitive("stat /home/b\u{f6}b failed"),
+            "stat ~ failed"
+        );
+        assert_eq!(
+            redact_sensitive("copy C:\\Users\\b\u{f6}b to C:\\Users\\carol\\dest"),
+            "copy ~/ to ~/dest"
+        );
+    }
+
+    /// #636 round-2 review: guard against the *other* failure direction. A
+    /// non-ASCII character that is not part of the username (a standalone
+    /// combining mark starting the trailing message text, or a symbol glued
+    /// directly onto the username with no separator) must not be swallowed
+    /// into the redacted run. A simpler dependency-free predicate ("every
+    /// non-ASCII char is username material") was considered and rejected
+    /// specifically because it fails the glued case below by dropping
+    /// message text, the very defect Ritik's review raised.
+    #[test]
+    fn redact_home_path_does_not_over_consume_non_username_non_ascii_text() {
+        // A combining mark starting the message text, after a space: the
+        // run already ended at the space, so this must survive untouched.
+        assert_eq!(
+            redact_sensitive("stat /home/bob \u{0301}message failed"),
+            "stat ~ \u{0301}message failed"
+        );
+        // A non-ASCII symbol as its own token, after a space.
+        assert_eq!(
+            redact_sensitive("index /home/bob \u{2192} done"),
+            "index ~ \u{2192} done"
+        );
+        // Glued directly onto the username with no separator at all: the
+        // arrow is its own grapheme cluster with a non-alphanumeric base, so
+        // the run stops right before it. Must not become "index ~", which
+        // would silently drop "\u{2192}done".
+        assert_eq!(
+            redact_sensitive("index /home/bob\u{2192}done"),
+            "index ~\u{2192}done"
+        );
+    }
+
+    /// Pins the fallback behaviour in [`username_run_end`] after the #636
+    /// round-3 refinement, which split the two previously-conflated
+    /// zero-length cases apart on one property: whether the candidate token
+    /// is made up entirely of ASCII punctuation.
+    ///
+    /// The distinction is load-bearing in both directions, so both are
+    /// asserted here:
+    ///   - all ASCII punctuation cannot be a username under any encoding, so
+    ///     leaving it alone cannot leak one, and the comma survives.
+    ///   - anything containing a non-ASCII-punctuation character still takes
+    ///     the fail-closed path and is consumed, which is what keeps an
+    ///     exotic (all-emoji, or any non-ASCII script) username from leaking
+    ///     verbatim. `(unknown)` contains letters, so it is still consumed.
+    ///
+    /// Do not "fix" the second case to stop consuming without re-deriving the
+    /// all-emoji leak it exists to prevent; see the doc comment on
+    /// [`username_run_end`]. `assert_eq!` on the whole string, never
+    /// `contains`, since the point being pinned is exactly which bytes are
+    /// dropped.
+    #[test]
+    fn redact_home_path_fallback_keeps_punctuation_but_still_consumes_a_possible_username() {
+        // Refined: the comma is message text, not a username, and survives.
+        assert_eq!(redact_sensitive("see /home/, retrying"), "see ~, retrying");
+        assert_eq!(
+            redact_sensitive("path /home/(unknown) failed"),
+            "path ~ failed"
+        );
+    }
+
+    /// Exact outputs for the shapes a daemon log line actually takes around a
+    /// home path (#636 round-2 review follow-up). `assert_eq` on the whole
+    /// string, not `contains`: both defects the review found were *dropped*
+    /// message text, which a `contains` assertion on the surviving half
+    /// cannot see. Every case here is byte-for-byte what the redactor must
+    /// produce, so an over-consuming username run fails loudly.
+    #[test]
+    fn redact_home_paths_produces_exact_output_for_log_shaped_lines() {
+        for (input, want) in [
+            // Ritik's three round-2 cases, pinned exactly rather than by
+            // substring.
+            (
+                "index /home/bob failed, see /var/log/travsr.log",
+                "index ~ failed, see /var/log/travsr.log",
+            ),
+            ("copy /home/bob to /home/carol/dest", "copy ~ to ~/dest"),
+            (
+                "reindex /Users/alice aborted; retry with --force /tmp/x",
+                "reindex ~ aborted; retry with --force /tmp/x",
+            ),
+            // Three home paths on one line: every one of them is bounded.
+            ("repeat /home/a /home/b /home/c", "repeat ~ ~ ~"),
+            // Punctuation immediately after the username must survive.
+            ("comma /home/bob, retrying", "comma ~, retrying"),
+            ("paren (/home/bob) done", "paren (~) done"),
+            ("quoted \"/home/bob/x\" done", "quoted \"~/x\" done"),
+            // Degenerate separators: no panic, no swallowed remainder.
+            ("lone /home/", "lone ~"),
+            ("double /home//x", "double ~/x"),
+            ("users end /Users/", "users end ~"),
+            // Non-ASCII usernames, precomposed: the whole run is consumed.
+            ("cjk /home/\u{5317}\u{4EAC} failed", "cjk ~ failed"),
+            (
+                "rtl /home/\u{0645}\u{062D}\u{0645}\u{062F} failed",
+                "rtl ~ failed",
+            ),
+            // Windows: both usernames go, the text between them stays.
+            (
+                r"copy C:\Users\bob to C:\Users\carol\dest",
+                "copy ~/ to ~/dest",
+            ),
+            (r"win nosep C:\Users\bob suffix", "win nosep ~/ suffix"),
+        ] {
+            assert_eq!(redact_sensitive(input), want, "input: {input:?}");
+        }
+    }
+
+    /// Property: for a home path followed by arbitrary message text, the
+    /// username never survives and the message text after it always does.
+    ///
+    /// Deterministic LCG rather than `proptest` (no new dependency, and a
+    /// fixed seed keeps CI failures reproducible). The two alphabets are
+    /// disjoint on purpose, so "the username does not appear in the output"
+    /// cannot be satisfied accidentally by the tail, and the tail alphabet
+    /// excludes `=`, `:` and `/` so no other redactor in `redact_sensitive`
+    /// (key=value, bearer, prefixed-token) can rewrite it.
+    #[test]
+    fn prop_redact_home_paths_consumes_the_username_and_keeps_the_tail() {
+        const USER: &[char] = &['a', 'b', 'x', 'y', 'z', '0', '9', '_', '-', '.'];
+        const TAIL: &[char] = &[' ', ',', ';', ')', '!', '?', 'Q', 'W', 'R', 'T'];
+        let mut state: u64 = 0x5DEE_CE66_D1CE_4B9D;
+        let mut next = |n: usize| -> usize {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % n
+        };
+
+        for prefix in ["/home/", "/Users/"] {
+            for _ in 0..500 {
+                // Username: always starts with a letter (a leading '.' or '-'
+                // is not a plausible account name and would make the expected
+                // output ambiguous), 1..=8 chars from USER.
+                let mut user = String::from(USER[next(5)]);
+                for _ in 0..next(8) {
+                    user.push(USER[next(USER.len())]);
+                }
+                // Tail: always starts with a non-username character, so the
+                // username run provably ends where we say it does.
+                let mut tail = String::from(TAIL[next(6)]);
+                for _ in 0..next(12) {
+                    tail.push(TAIL[next(TAIL.len())]);
+                }
+
+                let line = format!("op {prefix}{user}{tail}");
+                let out = redact_sensitive(&line);
+                assert_eq!(out, format!("op ~{tail}"), "input: {line:?}");
+                assert!(!out.contains(&user), "username leaked: {out:?}");
+                assert!(out.ends_with(&tail), "tail dropped: {out:?}");
+
+                // The same line with an unrelated path further along: this is
+                // the branch the round-2 review found, where the username run
+                // was scanned to that later `/` and everything in between was
+                // swallowed.
+                let line = format!("op {prefix}{user}{tail} /var/log/travsr.log");
+                let out = redact_sensitive(&line);
+                assert_eq!(
+                    out,
+                    format!("op ~{tail} /var/log/travsr.log"),
+                    "input: {line:?}"
+                );
+
+                // Same username, now a real path: only the separator is
+                // consumed with it, the rest of the path survives.
+                let line = format!("op {prefix}{user}/pkg/mod.rs");
+                assert_eq!(
+                    redact_sensitive(&line),
+                    "op ~/pkg/mod.rs".to_string(),
+                    "input: {line:?}"
+                );
+            }
+        }
     }
 }

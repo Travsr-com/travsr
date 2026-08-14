@@ -36,7 +36,14 @@ while IFS='=' read -r crate recorded_hash; do
     # Hash file contents only (not paths) so the hash is identical across macOS and Linux.
     # Use a while-read loop instead of xargs to avoid xargs reading from stdin when find
     # produces no output (which causes an indefinite hang on GNU xargs or wrong hash on BSD).
-    actual_hash=$(find "$src_dir" -type f -name "*.rs" | sort | while IFS= read -r f; do cat -- "$f"; done | $SHA256 | awk '{print $1}')
+    # LC_ALL=C pins byte-order collation: without it `sort` is locale-dependent and orders
+    # `plugins/c.rs` vs `plugins/cpp.rs` differently under (for example) en_IN than under
+    # C/POSIX, because most non-C locales ignore punctuation as a primary weight. That
+    # changes the concatenation order and therefore the hash, so a contributor whose shell
+    # locale is not C generated a lock file this gate then rejected, with a misleading
+    # "source changed but plugin_version not bumped" error naming a bump that would not
+    # help. Must stay identical to the `sort` in update-plugin-hashes.sh.
+    actual_hash=$(find "$src_dir" -type f -name "*.rs" | LC_ALL=C sort | while IFS= read -r f; do cat -- "$f"; done | $SHA256 | awk '{print $1}')
 
     if [[ "$actual_hash" != "$recorded_hash" ]]; then
         echo "ERROR: $crate source changed but plugin_version not bumped"

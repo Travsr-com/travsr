@@ -113,6 +113,17 @@ base64           = "0.22"
 tokio-util       = { version = "0.7", features = ["rt"] }
 tokio-stream     = "0.1"
 fs2              = "0.4"
+# Safe kill(2) wrapper for travsr-plugin-host's `unix_pid_is_alive`, the Unix
+# half of the daemon-liveness probe (#636 round-3 review). Already resolved at
+# this version transitively via ctrlc, so no new external code enters the build
+# graph. `signal` is the only feature needed; default features are off so this
+# does not pull in the rest of nix.
+nix              = { version = "0.31", default-features = false, features = ["signal"] }
+# Already resolved transitively (liquid-lib, tokenizers' spm_precompiled) at
+# 1.13.3, so a direct dependency here introduces no new external code into
+# the build graph (#636 round-2 review: grapheme-cluster-aware username
+# bounding in travsr-mcp's home-path redactor).
+unicode-segmentation = "1"
 # SIGINT/Ctrl-C handler for graceful foreground reindex cancel (WS3).
 ctrlc            = "3"
 tracing-appender = "0.2"

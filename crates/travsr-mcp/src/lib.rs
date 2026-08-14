@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod observability;
 mod protocol;
 pub mod query;
 mod rerank;
