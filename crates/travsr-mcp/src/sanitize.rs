@@ -207,13 +207,58 @@ fn redact_home_paths(s: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         let home_str = home.to_string_lossy();
         if !home_str.is_empty() {
-            out = out.replace(home_str.as_ref(), "~");
+            out = replace_home_prefix_at_boundary(&out, home_str.as_ref());
         }
     }
     out = redact_unix_home_run(&out, "/home/");
     out = redact_unix_home_run(&out, "/Users/");
     out = redact_windows_home_run(&out, ":\\Users\\");
     redact_windows_home_run(&out, ":/Users/")
+}
+
+/// Replace occurrences of `home` with `~`, but only where the match ends at a
+/// real path boundary: end of string, or a `/` or `\` separator.
+///
+/// A plain `str::replace` here mangled, and partially leaked, any path that
+/// merely shares the home directory as a *string* prefix, because a sibling
+/// account name starts with the same bytes (#636 round-4 review). With
+/// `HOME=/home/bob`:
+///
+/// ```text
+/// "/home/bobby/x"        ->  "~by/x"          (leaks "by", fabricates a path)
+/// "/home/bobs-backup/db" ->  "~s-backup/db"
+/// ```
+///
+/// The tail of the *other* account name survives, and the result reads as a
+/// genuine path while pointing somewhere that does not exist. It also
+/// consumed the `/home/` marker that [`redact_unix_home_run`] looks for, so
+/// the generic pass downstream could no longer repair it. This is the same
+/// boundary discipline [`username_run_end`] already applies to the generic
+/// passes, just on the earlier literal-home branch.
+fn replace_home_prefix_at_boundary(s: &str, home: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(home) {
+        let after = &rest[idx + home.len()..];
+        // Only a separator or end-of-string terminates the home path itself;
+        // anything else means this is a longer, different name that merely
+        // starts with the same bytes, so it must be left for the generic
+        // `/home/<user>/` pass to redact properly.
+        let at_boundary = after.is_empty() || after.starts_with('/') || after.starts_with('\\');
+        if at_boundary {
+            out.push_str(&rest[..idx]);
+            out.push('~');
+            rest = after;
+        } else {
+            // Copy through the non-match and continue past it, so a later
+            // genuine occurrence in the same string is still found.
+            let keep = idx + home.len();
+            out.push_str(&rest[..keep]);
+            rest = &rest[keep..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether `c`, the base (leading) character of a grapheme cluster, marks
@@ -906,6 +951,50 @@ mod tests {
         let out = redact_sensitive(input);
         assert!(!out.contains("/home/"), "home path must be redacted: {out}");
         assert!(out.contains("~/"), "redacted form must use ~/: {out}");
+    }
+
+    /// #636 round-4 review: the literal-home pass was a plain substring
+    /// `replace`, so a *sibling* account whose name merely starts with the
+    /// same bytes was mangled and partially leaked (`/home/bobby/x` became
+    /// `~by/x` under `HOME=/home/bob`, keeping `by` and fabricating a path
+    /// that reads as real). Tested on the helper directly so the assertion
+    /// does not depend on the machine's actual `HOME`.
+    #[test]
+    fn home_prefix_replacement_requires_a_path_boundary() {
+        // A different account that shares the prefix must be left entirely
+        // alone here, for the generic `/home/<user>/` pass to handle.
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bobby/x", "/home/bob"),
+            "/home/bobby/x"
+        );
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bobs-backup/db", "/home/bob"),
+            "/home/bobs-backup/db"
+        );
+        // The real home still redacts, both mid-path and at end-of-string.
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bob/proj", "/home/bob"),
+            "~/proj"
+        );
+        assert_eq!(
+            replace_home_prefix_at_boundary("cwd=/home/bob", "/home/bob"),
+            "cwd=~"
+        );
+        // A genuine occurrence after a near-miss is still found.
+        assert_eq!(
+            replace_home_prefix_at_boundary("/home/bobby/x and /home/bob/y", "/home/bob"),
+            "/home/bobby/x and ~/y"
+        );
+    }
+
+    /// End to end through `redact_sensitive`: whatever the literal-home pass
+    /// declines to touch, the generic pass must still redact, so a sibling
+    /// account name never survives in the output.
+    #[test]
+    fn sibling_home_account_is_still_redacted_by_the_generic_pass() {
+        let out = redact_sensitive("stat /home/bobby/x failed");
+        assert!(!out.contains("bobby"), "sibling username leaked: {out}");
+        assert!(out.contains("failed"), "message text dropped: {out}");
     }
 
     #[test]
