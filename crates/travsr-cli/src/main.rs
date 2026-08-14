@@ -602,26 +602,56 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 DaemonAction::Restart => {
-                    // Best-effort stop — ignore errors if daemon not running.
-                    let _ = send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Shutdown);
-                    // Wait for the old daemon to actually release its lock (≤2 s)
-                    // instead of a fixed sleep, so the new one never races the old
-                    // one's shutdown and fails to acquire the lock.
-                    for _ in 0..40 {
-                        if !daemon_client::daemon_lock_held(&repo_root) {
-                            break;
+                    // Deliver the stop through the daemon's startup window,
+                    // exactly as `daemon stop` does. The old fire-and-forget
+                    // Shutdown was silently lost while the daemon was between
+                    // taking daemon.lock and binding its control transport;
+                    // the lock wait below then expired, the spawn reported
+                    // AlreadyRunning, and the generic success arm still
+                    // printed "restarted" with exit 0 while the old daemon
+                    // kept running and no new daemon existed.
+                    match send_shutdown_waiting_for_startup(&repo_root) {
+                        Ok(_) => {}
+                        // Not running: restart degrades to a plain start.
+                        Err(e) if transport_absent(&e) => {}
+                        Err(e) => {
+                            return Err(e.context(
+                                "the running daemon could not be stopped, so it was NOT \
+                                 restarted; check `travsr daemon status` and retry",
+                            ));
                         }
+                    }
+                    // Wait for the old daemon to actually release its lock
+                    // instead of a fixed sleep, so the new one never races the
+                    // old one's shutdown and fails to acquire the lock.
+                    // Budgeted like `daemon stop`'s exit wait: a clean
+                    // shutdown can spend seconds flushing the store.
+                    let lock_cutoff = std::time::Instant::now() + STOP_EXIT_TIMEOUT;
+                    while daemon_client::daemon_lock_held(&repo_root)
+                        && std::time::Instant::now() < lock_cutoff
+                    {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     let exe = std::env::current_exe().context("finding current exe")?;
                     match daemon_client::spawn_background_daemon(&repo_root, &exe) {
                         daemon_client::SpawnOutcome::Failed => match daemon_start_error(&repo_root)
                         {
-                            Some(r) => eprintln!("travsr daemon failed to restart: {r}"),
-                            None => eprintln!(
+                            Some(r) => anyhow::bail!("travsr daemon failed to restart: {r}"),
+                            None => anyhow::bail!(
                                 "travsr daemon failed to restart (see .travsr/daemon.log)"
                             ),
                         },
+                        // The stop was accepted, but the old process still
+                        // holds the repo lock past the wait above, so nothing
+                        // was spawned. Surface that instead of claiming
+                        // success (the exact false positive `daemon stop`
+                        // refuses to report).
+                        daemon_client::SpawnOutcome::AlreadyRunning => anyhow::bail!(
+                            "travsr daemon was NOT restarted: the old daemon still holds \
+                             the repo lock {}s after accepting the stop.\n  \
+                             Check `travsr daemon status`, then retry `travsr daemon restart`.",
+                            STOP_EXIT_TIMEOUT.as_secs()
+                        ),
                         _ => eprintln!("travsr daemon restarted in background"),
                     }
                 }

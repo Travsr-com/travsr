@@ -80,6 +80,10 @@ pub struct InitStats {
 /// tell the user which analyzers ran and which were absent.
 #[derive(Debug, Default, Clone)]
 pub struct PhaseBReport {
+    /// The corpus these outcomes were evaluated against, so the trust hint can
+    /// name the exact `travsr lang add <lang> --corpus <corpus>` invocation
+    /// instead of a placeholder (#414 follow-up). Empty when unknown.
+    pub corpus: String,
     /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
     /// Languages P1-gated because no source files of that type exist in the
@@ -2532,6 +2536,7 @@ fn write_phase_b_results(
     }
 
     let report = PhaseBReport {
+        corpus: corpus.to_string(),
         ran: pb_outcome.ran,
         skipped_not_in_repo: pb_outcome.skipped_not_in_repo,
         skipped_no_analyzer: pb_outcome.skipped_no_analyzer,

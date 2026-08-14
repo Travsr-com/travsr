@@ -358,6 +358,15 @@ fn cmd_shim_only_provider_is_skipped_not_crashed() {
         "no handshake can happen: {:?}",
         outcome.version_mismatch
     );
+    // The skip must be user-visible, not silent: the resolver returns None for
+    // the unresolvable shim, so the language lands in skipped_no_analyzer and
+    // `travsr init`/`status` surface the `travsr lang install go` hint (#573's
+    // "actionable message, not a bare CreateProcessW error" criterion).
+    assert!(
+        outcome.skipped_no_analyzer.iter().any(|l| l == "go"),
+        "a .cmd-only provider must surface as skipped_no_analyzer so the user \
+         gets the install hint: {outcome:?}"
+    );
 }
 
 /// When npm's packaged native binary ships next to the shim
