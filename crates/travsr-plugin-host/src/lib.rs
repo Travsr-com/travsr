@@ -45,6 +45,98 @@ pub use registry::probe_sandbox;
 pub use sandbox::policy::{SandboxPolicy, SandboxUnavailable};
 pub use transport::{InProcess, PluginHealth, Sidecar, Transport};
 
+/// Native Windows process-liveness probe (`OpenProcess` +
+/// `GetExitCodeProcess`, no signal sent), for callers outside this crate
+/// that need it and cannot themselves hold `unsafe` (`travsr-mcp` is
+/// `#![forbid(unsafe_code)]`).
+///
+/// Delegates to [`sandbox::windows::pid_alive`], the same probe
+/// `embed_catalog::pid_alive` already uses for the daemon shutdown grace
+/// poll; `unsafe` stays confined to `sandbox/windows/ffi.rs` per ADR-017
+/// Amendment A2 Invariant 1, this is a safe wrapper only.
+///
+/// #636 round-2 review: `travsr-mcp`'s `observability::pid_is_alive`
+/// previously shelled out to `tasklist` on every call, which measurably
+/// failed under the process-spawn contention a full `cargo test --workspace`
+/// run puts on Windows CI (`CreateProcess` is comparatively expensive under
+/// load there). A syscall has no such failure mode. See
+/// [`unix_pid_is_alive`] for the Unix counterpart.
+#[cfg(target_os = "windows")]
+pub fn windows_pid_is_alive(pid: u32) -> bool {
+    sandbox::windows::pid_alive(pid)
+}
+
+/// Native Unix process-liveness probe: `kill(pid, 0)`, which sends no signal
+/// and only performs the permission-and-existence check. Unix counterpart to
+/// [`windows_pid_is_alive`], living here for the same reason, so callers that
+/// are `#![forbid(unsafe_code)]` (`travsr-mcp`) still get a syscall rather
+/// than a subprocess.
+///
+/// **`EPERM` means alive.** This is the correctness point, not an
+/// optimisation (#636 round-3 review). `kill -0` as a shell command collapses
+/// `EPERM` and `ESRCH` into the same non-zero exit status, so the previous
+/// subprocess implementation reported any live process the calling user
+/// cannot signal as *dead*:
+///
+/// ```text
+/// $ ps -p 1 -o pid,user,comm
+///     1 root systemd
+/// $ kill -0 1 ; echo $?
+/// kill: (1) - Operation not permitted
+/// 1
+/// ```
+///
+/// A daemon started under a different uid (sudo, a shared machine, a
+/// container where the MCP server runs as another user) read as down. That
+/// fails in the *unsafe* direction for a status probe, unlike the
+/// recycled-PID case, which merely reports a daemon one poll too long.
+/// Distinguishing the two errno values is the whole fix: `EPERM` proves the
+/// process exists (the kernel had something to refuse permission *on*),
+/// `ESRCH` proves it does not.
+///
+/// Uses `nix`'s safe wrapper rather than `libc::kill` deliberately: a raw
+/// call needs an `unsafe` block, and ADR-017 Amendment A2 Invariant 1 allows
+/// exactly one override site in this crate, noting that "any second override
+/// site re-opens this amendment". `unsafe` stays confined to
+/// `sandbox/windows/ffi.rs`.
+#[cfg(unix)]
+pub fn unix_pid_is_alive(pid: u32) -> bool {
+    // A PID that does not fit in i32 cannot name a real process on any Unix.
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None) {
+        Ok(()) => true,
+        // The process exists; this user just may not signal it.
+        Err(nix::errno::Errno::EPERM) => true,
+        // ESRCH (no such process) and anything else: treat as not alive.
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_pid_tests {
+    /// The regression the round-3 review reported: PID 1 is always alive and
+    /// (outside a root-run container) never signallable by the test user, so
+    /// it is the canonical `EPERM`-means-alive case. Skips itself when the
+    /// suite happens to run as root, where the call returns `Ok` instead and
+    /// the assertion would pass without exercising the `EPERM` arm at all.
+    #[test]
+    fn pid_one_reads_as_alive_even_when_not_signallable() {
+        assert!(
+            super::unix_pid_is_alive(1),
+            "PID 1 is alive; EPERM must not be read as dead"
+        );
+    }
+
+    #[test]
+    fn own_pid_is_alive_and_an_impossible_pid_is_not() {
+        assert!(super::unix_pid_is_alive(std::process::id()));
+        // u32::MAX - 1 is above every platform's pid_max, so it cannot exist.
+        assert!(!super::unix_pid_is_alive(u32::MAX - 1));
+    }
+}
+
 /// Formal plugin state — reported at startup and queryable by the daemon.
 /// ADR-017 Rule 2: `Disabled` means no subprocess runs, not "degraded mode".
 #[derive(Debug, Clone, PartialEq, Eq)]

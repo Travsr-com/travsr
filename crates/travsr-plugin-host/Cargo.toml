@@ -31,5 +31,17 @@ fs2        = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Safe wrapper over kill(2) for `unix_pid_is_alive` (#636 round-3 review).
+# Deliberately `nix` rather than raw `libc`: a `libc::kill` call needs an
+# `unsafe` block, and ADR-017 Amendment A2 Invariant 1 permits exactly one
+# override site in this crate (sandbox/windows/ffi.rs), stating that "any
+# second override site re-opens this amendment"; CLAUDE.md rule 7 also
+# requires an RFC plus Tech Lead sign-off for new unsafe. A safe wrapper
+# needs neither. Already resolved at this exact version transitively
+# (ctrlc -> nix 0.31.3), so this introduces no new external code into the
+# build graph, only a direct edge to it.
+nix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -2370,6 +2370,59 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Read-only graph integrity report: the report-only half of `travsr fsck`.
+    ///
+    /// NEVER mutates: no reconcile, no sweep, no writes of any kind. Safe to
+    /// call against a store opened with [`Self::open_read_only`] (§ `query_only`
+    /// PRAGMA would hard-fail any write attempt).
+    ///
+    /// Computes: `node_count`, `edge_count`, the ghost-path set (DB paths
+    /// absent on disk), orphan-edge count, self-referential `ref/call` edge
+    /// count, and the lexical (FTS words) index parity check. Extracted from
+    /// `travsr_daemon::fsck_repo`'s report path (#636) so travsr-mcp (which
+    /// must never depend on travsr-daemon) can answer `get_graph_health`
+    /// without opening the store read-write.
+    ///
+    /// O(F) where F = tracked file count (one `exists()` stat per DB path).
+    pub fn integrity_report(&self, repo_root: &std::path::Path) -> Result<GcReport, StoreError> {
+        let node_count = self.node_count()?;
+        let fts_words_count = self.fts_words_node_count()?;
+        let lexical_index_parity_issue = if node_count == fts_words_count {
+            None
+        } else {
+            Some(format!(
+                "nodes ({node_count}) != nodes_fts_words_map ({fts_words_count}), \
+                 run `travsr init` to re-backfill the lexical word index (#478)"
+            ))
+        };
+
+        let mut report = GcReport {
+            node_count,
+            edge_count: self.edge_count()?,
+            lexical_index_parity_issue,
+            ..GcReport::default()
+        };
+
+        // Ghost detection stats each DB path directly rather than re-walking the
+        // disk (see `travsr_daemon::fsck_repo`'s doc comment for why, #580):
+        // statting the DB paths is symmetric by construction, with no walk
+        // config or filters to drift from the write path.
+        let db_paths: std::collections::HashSet<String> =
+            self.get_all_file_hashes()?.into_keys().collect();
+        let mut ghosts: Vec<String> = Vec::new();
+        for path in &db_paths {
+            if !repo_root.join(path).exists() {
+                ghosts.push(path.clone());
+            }
+        }
+        report.ghost_paths = ghosts;
+
+        report.orphan_edges_detected = self.count_orphans()?;
+        report.self_ref_call_edges_detected = self.count_self_ref_call_edges()?;
+
+        Ok(report)
+    }
+
     /// Delete all nodes (and their edges) whose VName path starts with `prefix`.
     ///
     /// Used by `init_repo` to purge ghost nodes from directories that were added
@@ -6990,6 +7043,73 @@ mod tests {
             VName::new("test-corpus", "", path, "markdown", anchor),
             "doc-chunk",
         )
+    }
+
+    // ── #636: SqliteStore::integrity_report ──────────────────────────────────
+
+    #[test]
+    fn integrity_report_clean_graph_is_all_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        store.put_node(&a).unwrap();
+        store.put_file_hash("src/foo.ts", "deadbeef").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/foo.ts"), b"export function a() {}").unwrap();
+
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert_eq!(report.node_count, 1);
+        assert_eq!(report.edge_count, 0);
+        assert!(
+            report.ghost_paths.is_empty(),
+            "no file on disk yet: {:?}",
+            report.ghost_paths
+        );
+        assert_eq!(report.orphan_edges_detected, 0);
+        assert_eq!(report.self_ref_call_edges_detected, 0);
+        assert!(report.lexical_index_parity_issue.is_none());
+    }
+
+    #[test]
+    fn integrity_report_detects_ghost_when_tracked_file_missing_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_file_hash("src/deleted.ts", "deadbeef").unwrap();
+        // src/deleted.ts is tracked in the DB but never created on disk.
+
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert_eq!(report.ghost_paths, vec!["src/deleted.ts".to_string()]);
+    }
+
+    #[test]
+    fn integrity_report_does_not_flag_file_present_on_disk_as_ghost() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/present.ts"), b"ok").unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_file_hash("src/present.ts", "deadbeef").unwrap();
+
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert!(report.ghost_paths.is_empty());
+    }
+
+    #[test]
+    fn integrity_report_counts_orphan_edges_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let a = sample_node("fn:a");
+        let a_id = store.put_node(&a).unwrap();
+        // dst NodeId 999999 has no corresponding node row (an orphan edge).
+        store
+            .put_edge(&Edge::new(a_id, NodeId(999_999), EdgeKind::RefCall))
+            .unwrap();
+
+        let before_nodes = store.node_count().unwrap();
+        let report = store.integrity_report(tmp.path()).unwrap();
+        assert_eq!(report.orphan_edges_detected, 1);
+        // Read-only: never mutates.
+        assert_eq!(store.node_count().unwrap(), before_nodes);
+        assert_eq!(store.edge_count().unwrap(), 1);
     }
 
     /// #376 W1: this filter must stay identical to the sidecar's NODE_ELIGIBLE.
