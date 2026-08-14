@@ -321,8 +321,16 @@ fn decode_phase_b_warnings(warnings: &str) -> HashMap<String, (&'static str, Str
                     rest.to_string(),
                     (
                         "failed",
+                        // Wording tracks `travsr status` (travsr-cli/src/
+                        // status.rs), which #673 changed from "phase B
+                        // analyzer" to "semantic analyzer" when it dropped
+                        // internal vocabulary from user-facing output. #673
+                        // merged first, so this side owns the sync, as
+                        // called out in this PR's description. The comma is
+                        // deliberate where the CLI uses an em-dash: em-dashes
+                        // are forbidden in this repo's content.
                         format!(
-                            "phase B analyzer for '{rest}' crashed, re-run \
+                            "semantic analyzer for '{rest}' crashed, re-run \
                              `travsr init --semantic` to retry"
                         ),
                     ),
@@ -844,16 +852,26 @@ struct ParsedLine {
 /// line that merely resembles the format (#636 plan risk 5).
 ///
 /// Tries JSON first, then the human-readable `tracing` text layout. Both are
-/// supported on purpose (#636 round-4 review). This daemon writes the text
-/// layout today: the file layer is
-/// `tracing_subscriber::fmt::layer().with_writer(non_blocking).with_ansi(false)`
-/// with no `.json()`, verified on `origin/master`, and the text parser reads
-/// 22 of 23 lines of a real `.travsr/daemon.log.*` off this machine. But the
-/// layer is one builder call away from emitting JSON, and if that ever lands
-/// this tool would silently degrade to raw-fallback entries for every line
-/// (no severity filtering, no target, truncated messages) rather than fail
-/// loudly. Accepting both makes the tool robust across that change instead of
-/// coupled to a formatting decision it does not own.
+/// supported on purpose (#636 round-4 review).
+///
+/// JSON is what the daemon writes now: #673 landed
+/// `fmt::layer().json().with_current_span(true)` on the file layer, and
+/// `travsr-daemon/src/logfile.rs` documents the resulting contract, including
+/// the stable dotted `event` keys a machine reader is meant to select on
+/// (`fields.message` is explicitly prose that may be reworded). Those keys
+/// arrive here as ordinary fields and are passed through untouched.
+///
+/// The text parser is kept rather than replaced. It costs one fallback call
+/// on a failed JSON parse and it keeps this tool readable against a log
+/// written by an older daemon, a rotated file from before that change, or the
+/// stderr layer, which is still `fmt::layer()` without `.json()`. Reading
+/// somebody's existing `.travsr/daemon.log.*` should not depend on which
+/// version wrote it.
+///
+/// Deliberately not importing `logfile.rs` for any of this, despite it
+/// owning the contract: `travsr-mcp` cannot depend on `travsr-daemon`
+/// (CLAUDE.md's dependency rules run `daemon -> mcp`, so the reverse edge is
+/// a cycle). The shapes are pinned by tests here instead.
 fn parse_log_line(raw: &str) -> Option<ParsedLine> {
     if let Some(parsed) = parse_json_log_line(raw) {
         return Some(parsed);
@@ -2166,10 +2184,63 @@ mod tests {
         assert!(parsed.message.starts_with("Phase B sidecar spawn go"));
     }
 
-    /// #636 round-4 review: accept `fmt::layer().json()` output too. The
-    /// daemon does not emit this today (its file layer has no `.json()`), but
-    /// it is one builder call away, and degrading to raw-fallback entries
-    /// there would silently disable severity filtering for every line.
+    /// The wording here must track `travsr status`
+    /// (`travsr-cli/src/status.rs`), which is the invariant
+    /// [`decode_phase_b_warnings`] documents: the CLI and this tool must
+    /// never disagree about why a language's Phase B is degraded. #673
+    /// reworded the CLI side from "phase B analyzer" to "semantic analyzer"
+    /// and merged first, so this side owns the sync. Nothing enforces this
+    /// across crates at compile time, which is exactly why it is pinned here.
+    #[test]
+    fn phase_b_warning_wording_tracks_the_cli() {
+        let decoded = decode_phase_b_warnings("crashed:go");
+        let (state, detail) = decoded.get("go").expect("go must decode");
+        assert_eq!(*state, "failed");
+        assert!(
+            detail.starts_with("semantic analyzer for 'go' crashed"),
+            "must match travsr status's wording, got: {detail}"
+        );
+        assert!(
+            !detail.contains("phase B analyzer"),
+            "internal vocabulary must not reappear: {detail}"
+        );
+        // The repo forbids em-dashes, so the CLI's dash is a comma here.
+        assert!(!detail.contains('\u{2014}'), "em-dash: {detail}");
+    }
+
+    /// The exact shape master's file layer now writes
+    /// (`fmt::layer().json().with_current_span(true)`), including the stable
+    /// `event` selector key that `travsr-daemon/src/logfile.rs` documents as
+    /// the thing a machine reader should match on. Pins that the key survives
+    /// into `fields` rather than being dropped or renamed.
+    #[test]
+    fn parse_log_line_reads_the_real_daemon_json_shape_with_event_key() {
+        let line = r#"{"timestamp":"2026-08-14T10:25:01.945078Z","level":"INFO","fields":{"message":"semantic call and reference indexing complete","event":"phase_b.complete","repo":"/home/alice/proj"},"target":"travsr_daemon","span":{"name":"reindex"}}"#;
+        let entry = build_log_entry(line);
+        assert_eq!(entry["level"], "INFO", "got: {entry}");
+        assert_eq!(entry["target"], "travsr_daemon", "got: {entry}");
+        assert_eq!(entry["ts"], "2026-08-14T10:25:01.945078Z", "got: {entry}");
+        assert_eq!(
+            entry["message"], "semantic call and reference indexing complete",
+            "got: {entry}"
+        );
+        // The stable selector key must reach the caller intact.
+        assert_eq!(entry["fields"]["event"], "phase_b.complete", "got: {entry}");
+        // Redaction still applies to JSON field values.
+        assert_eq!(entry["fields"]["repo"], "~/proj", "got: {entry}");
+        // Non-`fields` top-level keys are carried, not dropped.
+        assert!(
+            entry["fields"]["span"]
+                .as_str()
+                .is_some_and(|s| s.contains("reindex")),
+            "span must be carried as a field: {entry}"
+        );
+    }
+
+    /// #636 round-4 review: accept `fmt::layer().json()` output too. This is
+    /// now the format the daemon actually writes (#673 landed
+    /// `.json()` on the file layer), so this path is load-bearing rather
+    /// than defensive.
     #[test]
     fn parse_log_line_reads_the_json_layer_format() {
         let line = r#"{"timestamp":"2026-08-13T10:25:01.945078Z","level":"INFO","fields":{"message":"daemon starting","event":"daemon.session.start","pid":11262},"target":"travsr_daemon"}"#;
