@@ -1176,3 +1176,95 @@ fn test_exact_only_filters_pure_substring() {
     assert!(!sigs.contains("struct:ClassDConfigurationManager"));
     assert!(!sigs.contains("fn:unrelated_func"));
 }
+
+#[test]
+fn test_exact_only_respects_language_filter() {
+    let mut store = open();
+
+    // Rust nodes:
+    // - Rust exact match: struct:ClassD
+    let rust_exact = Node::new(
+        VName::new("corpus", "root", "src/ClassD.rs", "rust", "struct:ClassD"),
+        "struct",
+    );
+    // - Rust word-boundary match: fn:ClassD::method
+    let rust_word_boundary = Node::new(
+        VName::new("corpus", "root", "src/ClassD.rs", "rust", "fn:ClassD::method"),
+        "function",
+    );
+    // - Rust pure-substring match: struct:ClassDConfigurationManager
+    let rust_substring = Node::new(
+        VName::new(
+            "corpus",
+            "root",
+            "src/ClassDConfig.rs",
+            "rust",
+            "struct:ClassDConfigurationManager",
+        ),
+        "struct",
+    );
+
+    // TypeScript nodes:
+    // - TypeScript exact match: struct:ClassD
+    let ts_exact = Node::new(
+        VName::new(
+            "corpus",
+            "root",
+            "src/ClassD.ts",
+            "typescript",
+            "struct:ClassD",
+        ),
+        "struct",
+    );
+
+    put(&mut store, &rust_exact);
+    put(&mut store, &rust_word_boundary);
+    put(&mut store, &rust_substring);
+    put(&mut store, &ts_exact);
+
+    // A. Language filter only:
+    //    search_nodes_fuzzy_filtered("ClassD", Some("rust"), false)
+    //    Expected:
+    //    - 3 results
+    //    - all results are Rust
+    //    - substring match is still included
+    let results_lang_only = store
+        .search_nodes_fuzzy_filtered("ClassD", Some("rust"), false)
+        .unwrap();
+    assert_eq!(results_lang_only.len(), 3);
+    for node in &results_lang_only {
+        assert_eq!(node.vname.language, "rust");
+    }
+    let sigs_lang_only: std::collections::HashSet<String> = results_lang_only
+        .iter()
+        .map(|n| n.vname.signature.clone())
+        .collect();
+    assert!(sigs_lang_only.contains("struct:ClassD"));
+    assert!(sigs_lang_only.contains("fn:ClassD::method"));
+    assert!(sigs_lang_only.contains("struct:ClassDConfigurationManager"));
+
+    // B. Language filter + exact_only:
+    //    search_nodes_fuzzy_filtered("ClassD", Some("rust"), true)
+    //    Expected:
+    //    - 2 results
+    //    - exact Rust match is included
+    //    - Rust word-boundary match is included
+    //    - Rust substring match is excluded
+    //    - TypeScript exact match is excluded because of the language filter
+    //    - every returned node has language == "rust"
+    let results_lang_exact = store
+        .search_nodes_fuzzy_filtered("ClassD", Some("rust"), true)
+        .unwrap();
+    assert_eq!(results_lang_exact.len(), 2);
+    for node in &results_lang_exact {
+        assert_eq!(node.vname.language, "rust");
+    }
+    let sigs_lang_exact: std::collections::HashSet<String> = results_lang_exact
+        .iter()
+        .map(|n| n.vname.signature.clone())
+        .collect();
+    assert!(sigs_lang_exact.contains("struct:ClassD"));
+    assert!(sigs_lang_exact.contains("fn:ClassD::method"));
+    assert!(!sigs_lang_exact.contains("struct:ClassDConfigurationManager"));
+}
+
