@@ -1189,7 +1189,13 @@ fn test_exact_only_respects_language_filter() {
     );
     // - Rust word-boundary match: fn:ClassD::method
     let rust_word_boundary = Node::new(
-        VName::new("corpus", "root", "src/ClassD.rs", "rust", "fn:ClassD::method"),
+        VName::new(
+            "corpus",
+            "root",
+            "src/ClassD.rs",
+            "rust",
+            "fn:ClassD::method",
+        ),
         "function",
     );
     // - Rust pure-substring match: struct:ClassDConfigurationManager
@@ -1267,4 +1273,3 @@ fn test_exact_only_respects_language_filter() {
     assert!(sigs_lang_exact.contains("fn:ClassD::method"));
     assert!(!sigs_lang_exact.contains("struct:ClassDConfigurationManager"));
 }
-
