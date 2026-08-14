@@ -1072,16 +1072,28 @@ fn relay_daemon_startup(
     let render = LogRenderer::new(false).for_repo(repo_root.to_path_buf());
     eprintln!("[travsr] starting…");
 
-    loop {
+    let drain = |relay: &mut travsr_daemon::logfile::LogTail| {
         if let Ok(lines) = relay.poll() {
             for line in lines {
                 eprintln!("[travsr] {}", render.one_line(&LogLine::parse(&line)));
             }
         }
+    };
+
+    loop {
+        drain(&mut relay);
 
         // One attempt, no internal sleep: this loop already paces itself, and a
         // nested delay would double the interval and blur the elapsed figure.
         if daemon_is_running(repo_root, 1, 0) {
+            // Readiness is the socket answering, not the log catching up. The
+            // startup lines are flushed on the writer's own cadence, so the
+            // socket can go live between the poll above and this check, leaving
+            // the last few lines on disk but unrelayed. One final drain empties
+            // what landed in that window before the "ready" line closes the
+            // stream. Lines flushed strictly after this belong to the running
+            // daemon, not to startup, so `--follow` is the right place for them.
+            drain(&mut relay);
             eprintln!("[travsr] ready in {:.1}s", started.elapsed().as_secs_f32());
             return;
         }
