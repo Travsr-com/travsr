@@ -12,12 +12,26 @@ import {
   type GraphNode,
 } from "../../graph";
 
+/**
+ * Read `media/graph.js` with line endings normalized to LF.
+ *
+ * The repo has no `.gitattributes`, so a Windows checkout gets CRLF. Tests
+ * that locate a top-level function by its closing `\n}\n` then find nothing
+ * and fail on Windows only, which is exactly how this was discovered. Reading
+ * through one normalizing helper keeps every such scan platform-independent.
+ */
+function readGraphJs(): string {
+  return fs
+    .readFileSync(
+      path.join(__dirname, "..", "..", "..", "media", "graph.js"),
+      "utf8"
+    )
+    .replace(/\r\n/g, "\n");
+}
+
 // Combines HTML template + graph.js so tests can check both DOM and JS content.
 function getFullHtml(): string {
-  const graphJs = fs.readFileSync(
-    path.join(__dirname, "..", "..", "..", "media", "graph.js"),
-    "utf8"
-  );
+  const graphJs = readGraphJs();
   const htmlTemplate = buildHtmlContent(
     "test-nonce", "test-csp",
     "graph.css", "cytoscape.min.js", "graph.js", "icon.png"
@@ -45,10 +59,7 @@ function loadWebviewFns(names: string[]): {
     truncated?: Record<string, number>;
   }): void;
 } {
-  const src = fs.readFileSync(
-    path.join(__dirname, "..", "..", "..", "media", "graph.js"),
-    "utf8"
-  );
+  const src = readGraphJs();
   const sliced = names.map((name) => {
     const start = src.indexOf(`function ${name}(`);
     assert.ok(start >= 0, `graph.js must define ${name}()`);
@@ -542,6 +553,45 @@ suite("GraphPanel: diagnostics overlay (#688)", () => {
 
     await new Promise((r) => setTimeout(r, 60));
     assert.strictEqual(calls, 0, "a disposed panel must not post after teardown");
+  });
+});
+
+suite("webview test harness is platform-independent", () => {
+  // The repo has no `.gitattributes`, so a Windows checkout gets CRLF and
+  // every "find the closing brace" scan in these tests silently matched
+  // nothing. It failed on Windows only, after passing everywhere else.
+  test("graph.js is read with LF endings whatever the checkout did", () => {
+    const src = readGraphJs();
+
+    assert.ok(!src.includes("\r\n"), "CRLF must be normalized away");
+    assert.ok(
+      src.includes("\n}\n"),
+      "a top-level function must be locatable by its closing brace"
+    );
+  });
+
+  test("function slicing works on a CRLF source", () => {
+    // Proves the normalization is what makes the scan work, rather than the
+    // host happening to check out LF.
+    const crlf = readGraphJs().replace(/\n/g, "\r\n");
+    const normalized = crlf.replace(/\r\n/g, "\n");
+
+    assert.strictEqual(crlf.indexOf("\n}\n"), -1, "CRLF defeats the raw scan");
+    assert.ok(normalized.indexOf("\n}\n") > 0, "normalizing restores it");
+  });
+
+  test("every function the vm suites load can actually be sliced out", () => {
+    // A rename in graph.js would otherwise surface as a confusing hook
+    // failure inside an unrelated suite.
+    for (const name of [
+      "escHtml",
+      "diagProblemsHtml",
+      "diagByLineFor",
+      "peekOutsideCount",
+    ]) {
+      const fns = loadWebviewFns([name]);
+      assert.ok(fns, `${name} must be loadable`);
+    }
   });
 });
 
