@@ -48,21 +48,29 @@ fn phase_b_state(payload: &StatusPayload) -> &'static str {
 /// not the main worktree's). `None` when git is unavailable or the dir is not a
 /// repo — the mismatch note then correctly never fires.
 fn head_at(cwd: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!head.is_empty()).then_some(head)
+    // Bounded: an unbounded `output()` here can never return on Windows when a
+    // git child or grandchild inherits the pipe (#717 triage, same mechanism as
+    // #503 / #572). A HEAD that does not arrive is the same as no HEAD, which
+    // this function already handles.
+    // `cwd` goes through as a real path rather than `-C <string>`: a path with
+    // bytes that are not valid UTF-8 is legal, and converting it to a string
+    // first would mangle it into U+FFFD and lose a repo that exists.
+    crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
 }
 
 pub fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let head = head_at(&cwd);
+    // `head_at` and `find_git_root` are independent, bounded git queries on the
+    // same `cwd` (the latter only shells out in the linked-worktree branch, via
+    // `main_worktree_root`). Run concurrently rather than sequentially: with a
+    // wedged git, sequential calls each pay their own `GIT_QUERY_TIMEOUT`, so
+    // this command could stall for up to 2x the bound instead of 1x.
+    let head_handle = {
+        let cwd = cwd.clone();
+        std::thread::spawn(move || head_at(&cwd))
+    };
     let repo_root = find_git_root(&cwd)?;
+    let head = head_handle.join().ok().flatten();
 
     let db_path = repo_root.join(".travsr").join("graph.db");
 
@@ -233,6 +241,42 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #717: `head_at` runs on every `travsr status`, and it used an unbounded
+    /// `Command::output()`. These pin the two answers it must give without
+    /// hanging for either: a real repo reports a short SHA, a directory that is
+    /// not a repo reports nothing.
+    #[test]
+    fn head_at_reports_a_sha_inside_a_repo_and_none_outside() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sha = head_at(here).expect("this crate lives in a git repo");
+        assert!(!sha.is_empty(), "a short SHA, not an empty string");
+        assert!(!sha.contains('\n'), "arrives trimmed: {sha:?}");
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "a short SHA is hex: {sha:?}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            head_at(tmp.path()).is_none(),
+            "outside a repo there is no HEAD, and asking must not hang"
+        );
+    }
+
+    /// The bound is what stops a wedged git holding the CLI forever, so the
+    /// happy path must not be anywhere near it.
+    #[test]
+    fn head_at_is_far_inside_its_deadline() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let started = std::time::Instant::now();
+        let _ = head_at(here);
+        assert!(
+            started.elapsed() * 4 < crate::git_bounded::GIT_QUERY_TIMEOUT,
+            "a warm rev-parse should finish in a small fraction of the deadline, took {:?}",
+            started.elapsed()
+        );
+    }
     use super::*;
 
     fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {

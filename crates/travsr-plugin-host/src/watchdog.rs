@@ -29,7 +29,7 @@ use std::time::Duration;
 /// on Windows we must use `taskkill /PID <native> /F` (force) `/T` (tree) to
 /// actually terminate the sidecar — otherwise the watchdog kill is a silent
 /// no-op and a wedged plugin never gets killed.
-pub(crate) fn kill_pid(pid: u32) {
+pub fn kill_pid(pid: u32) {
     // #507: silence the kill subprocess. taskkill prints "SUCCESS: The
     // process with PID … has been terminated." to stdout, which interleaved
     // into `travsr init --json` / `embed reindex` output and broke JSON
