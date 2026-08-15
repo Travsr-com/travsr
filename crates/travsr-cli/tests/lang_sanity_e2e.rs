@@ -241,54 +241,268 @@ fn assert_cross_file_reference(lang: &str, symbol: &str, expected_site: &str) {
     );
 }
 
-#[test]
-fn c_resolves_a_cross_file_call() {
-    // add_numbers is declared in math_util.h, defined in math_util.c, and
-    // called from main.c and from a sibling in its own file.
-    assert_cross_file_reference("c", "add_numbers", "main.c:5");
+/// One construct under test: the symbol a user would type, and a `path:line`
+/// that must appear among its uses.
+struct Probe {
+    symbol: &'static str,
+    site: &'static str,
+    /// What language feature this pins, for the failure message.
+    construct: &'static str,
+    /// `Some(reason)` when this construct is known **not** to resolve today.
+    ///
+    /// Recorded as an expectation rather than deleted or `#[ignore]`d, so the
+    /// suite stays green on a known gap *and* goes red the moment someone
+    /// fixes it. A gap that silently starts working is how coverage rots: the
+    /// probe would keep passing for the wrong reason and nobody would learn
+    /// the limitation is gone.
+    gap: Option<&'static str>,
 }
 
-#[test]
-fn typescript_resolves_a_cross_file_call() {
-    assert_cross_file_reference("typescript", "makeGreeter", "main.ts:4");
-}
-
-#[test]
-fn javascript_esm_resolves_a_cross_file_call() {
-    // `.mjs` is the flavour worth pinning: it is ESM by extension rather than
-    // by `package.json` type, so it exercises the module path independently of
-    // any manifest.
-    assert_cross_file_reference("javascript", "addNumbers", "main.mjs:5");
-}
-
-#[test]
-fn javascript_commonjs_resolves_a_cross_file_call() {
-    // Same question through `require`/`module.exports` (#610). The ESM and
-    // CommonJS symbols are named differently on purpose: a name defined in two
-    // files is deliberately left unindexed to avoid mis-targeting, so sharing
-    // a name would report an ambiguity and hide whichever flavour is broken.
-    assert_cross_file_reference("javascript", "sumLegacy", "legacy.cjs:5");
-}
-
-/// C++ out-of-line member definitions, the shape that had no working path
-/// through unification until the cross-file rung was added.
+/// Index `lang` once, then run every probe against it.
 ///
-/// This is the regression guard for that fix, so it is worth stating what was
-/// wrong. `app::Widget::draw` is *declared* in `widget.h:9` and *defined* in
-/// `widget.cpp:7`. Phase A anchors its node on the declaration; scip-clang
-/// anchors its definition on the implementation. The same-file matcher cannot
-/// see across that, and the cross-file rescue only fires when the same symbol
-/// already unified somewhere, which it never had. So the store kept both
-/// `fn:draw` and an orphan `scip:...app/Widget#draw(...)`, all 12 ref/call
-/// edges pointed at the orphan, and `travsr references draw` answered zero
-/// while `travsr status` said "semantic: complete" — the answer present in the
-/// graph and unreachable from every query a user can type.
+/// One index per language rather than one per construct: indexing dominates the
+/// runtime (scip-clang alone is tens of seconds), and a per-probe repo would
+/// make broad coverage too slow to run, which is how a suite stops being run.
 ///
-/// C never hit it because its function is defined in the `.c` file Phase A
-/// anchors to, which is why a C-only test would have looked green.
+/// Reports **every** failing probe rather than stopping at the first, so one run
+/// tells you the whole state of a language instead of one construct at a time.
+fn assert_probes(lang: &str, probes: &[Probe]) {
+    if !provider_active(lang) {
+        eprintln!("SKIP {lang}: Phase B provider not active (travsr lang install {lang})");
+        return;
+    }
+    let repo = indexed_repo(lang);
+    let mut failures = Vec::new();
+    for p in probes {
+        let refs = references(repo.path(), p.symbol);
+        let resolved = refs.contains(p.site);
+        match (p.gap, resolved) {
+            // Works, as expected.
+            (None, true) => {}
+            // Regression: something that used to resolve no longer does.
+            (None, false) => failures.push(format!(
+                "  [{}] `{}` should be used at {}\n      got: {}",
+                p.construct,
+                p.symbol,
+                p.site,
+                refs.lines().take(2).collect::<Vec<_>>().join(" / ")
+            )),
+            // Known gap, still a gap.
+            (Some(_), false) => {}
+            // Known gap that now works: the expectation is stale and hiding
+            // real coverage. Fail so it gets removed rather than left to rot.
+            (Some(reason), true) => failures.push(format!(
+                "  [{}] `{}` now resolves at {} but is still marked a known gap ({reason}).\n      \
+                 Drop `gap` from this probe.",
+                p.construct, p.symbol, p.site
+            )),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{lang}: {} of {} constructs did not resolve:\n{}",
+        failures.len(),
+        probes.len(),
+        failures.join("\n")
+    );
+}
+
 #[test]
-fn cpp_resolves_a_cross_file_call() {
-    assert_cross_file_reference("cpp", "draw", "main.cpp:6");
+fn c_constructs_resolve_end_to_end() {
+    assert_probes(
+        "c",
+        &[
+            Probe {
+                symbol: "add_numbers",
+                site: "main.c:5",
+                construct: "header decl + .c definition",
+                gap: None,
+            },
+            Probe {
+                symbol: "scale_value",
+                site: "main.c:6",
+                construct: "cross-file call",
+                gap: None,
+            },
+            Probe {
+                symbol: "clamp_low",
+                site: "math_util.c:9",
+                construct: "static (file-local) function",
+                gap: None,
+            },
+            Probe {
+                symbol: "apply_op",
+                site: "main.c:7",
+                construct: "function-pointer parameter",
+                gap: None,
+            },
+            Probe {
+                symbol: "point_sum",
+                site: "main.c:10",
+                construct: "struct pointer parameter",
+                gap: None,
+            },
+            Probe {
+                symbol: "enum_width",
+                site: "main.c:11",
+                construct: "enum parameter",
+                gap: None,
+            },
+        ],
+    );
+}
+
+#[test]
+fn cpp_constructs_resolve_end_to_end() {
+    assert_probes(
+        "cpp",
+        &[
+            Probe {
+                symbol: "draw",
+                site: "main.cpp:6",
+                construct: "out-of-line member (the #698 shape)",
+                gap: None,
+            },
+            Probe {
+                symbol: "area",
+                site: "main.cpp:7",
+                construct: "virtual override, out-of-line",
+                gap: None,
+            },
+            Probe {
+                symbol: "inlineSize",
+                site: "main.cpp:8",
+                construct: "inline member defined in the header",
+                gap: None,
+            },
+            Probe {
+                symbol: "build_default",
+                site: "main.cpp:12",
+                construct: "free function in a nested namespace",
+                gap: None,
+            },
+            Probe {
+                symbol: "instances",
+                site: "main.cpp:13",
+                construct: "static member function",
+                gap: None,
+            },
+            Probe {
+                symbol: "twice",
+                site: "main.cpp:14",
+                construct: "function template",
+                gap: Some(
+                    "scip-clang attributes the call to an instantiation, not the template definition",
+                ),
+            },
+            Probe {
+                symbol: "unwrap",
+                site: "main.cpp:16",
+                construct: "class template, out-of-class member",
+                gap: Some(
+                    "template member: the instantiation problem plus the out-of-class split",
+                ),
+            },
+            Probe {
+                symbol: "describe",
+                site: "main.cpp:17",
+                construct: "inherited base-class method",
+                gap: None,
+            },
+            Probe {
+                symbol: "label_of",
+                site: "main.cpp:18",
+                construct: "free function taking a base reference",
+                gap: Some(
+                    "the argument needs a derived-to-base conversion at the call site",
+                ),
+            },
+        ],
+    );
+}
+
+#[test]
+fn typescript_constructs_resolve_end_to_end() {
+    assert_probes(
+        "typescript",
+        &[
+            Probe {
+                symbol: "makeGreeter",
+                site: "main.ts:5",
+                construct: "factory function via a barrel re-export",
+                gap: None,
+            },
+            Probe {
+                symbol: "speak",
+                site: "main.ts:6",
+                construct: "class method implementing an abstract base",
+                gap: None,
+            },
+            Probe {
+                symbol: "speakLater",
+                site: "main.ts:7",
+                construct: "async method",
+                gap: None,
+            },
+            Probe {
+                symbol: "describe",
+                site: "main.ts:8",
+                construct: "inherited method on an abstract class",
+                gap: Some("call is on a subclass instance; the method is defined on the base"),
+            },
+            Probe {
+                symbol: "firstOf",
+                site: "main.ts:13",
+                construct: "generic function",
+                gap: None,
+            },
+            Probe {
+                symbol: "formatGreeting",
+                site: "main.ts:15",
+                construct: "arrow function behind a type alias",
+                gap: None,
+            },
+        ],
+    );
+}
+
+#[test]
+fn javascript_constructs_resolve_end_to_end() {
+    assert_probes(
+        "javascript",
+        &[
+            Probe {
+                symbol: "addNumbers",
+                site: "main.mjs:4",
+                construct: "ESM named export via a barrel",
+                gap: None,
+            },
+            Probe {
+                symbol: "scaleValue",
+                site: "main.mjs:7",
+                construct: "ESM default export",
+                gap: None,
+            },
+            Probe {
+                symbol: "addLater",
+                site: "main.mjs:6",
+                construct: "ESM async export",
+                gap: None,
+            },
+            Probe {
+                symbol: "sumLegacy",
+                site: "legacy.cjs:5",
+                construct: "CommonJS require + module.exports",
+                gap: None,
+            },
+            Probe {
+                symbol: "plainHelper",
+                site: "plain.js:7",
+                construct: "plain .js ambient script",
+                gap: None,
+            },
+        ],
+    );
 }
 
 /// Every JavaScript flavour parses, whatever its extension.

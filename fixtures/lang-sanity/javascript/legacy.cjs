@@ -1,8 +1,12 @@
 // CommonJS: require/module.exports, the flavour `.cjs` forces.
-const { sumLegacy } = require("./util.cjs");
+const { sumLegacy, LegacyBag } = require("./util.cjs");
 
 function legacyTotal(a, b) {
   return sumLegacy(a, b);
 }
 
-module.exports = { legacyTotal };
+function legacyBag(v) {
+  return new LegacyBag().push(v);
+}
+
+module.exports = { legacyTotal, legacyBag };
