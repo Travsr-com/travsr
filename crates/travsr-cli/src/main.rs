@@ -11,6 +11,7 @@ mod daemon_client;
 mod embed;
 mod explain;
 mod fsck;
+mod git_bounded;
 mod graph;
 mod index;
 mod init;

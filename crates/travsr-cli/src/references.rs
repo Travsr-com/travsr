@@ -21,15 +21,14 @@ pub enum OutputFormat {
 /// `None` when git is unavailable or the dir is not a repo — the mismatch note
 /// then correctly never fires. Mirrors `status::head_at`.
 fn head_at(cwd: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!head.is_empty()).then_some(head)
+    // Bounded: an unbounded `output()` here can never return on Windows when a
+    // git child or grandchild inherits the pipe (#717 triage, same mechanism as
+    // #503 / #572). A HEAD that does not arrive is the same as no HEAD, which
+    // this function already handles.
+    // `cwd` goes through as a real path rather than `-C <string>`: a path with
+    // bytes that are not valid UTF-8 is legal, and converting it to a string
+    // first would mangle it into U+FFFD and lose a repo that exists.
+    crate::git_bounded::git_stdout_bounded(Some(cwd), ["rev-parse", "--short", "HEAD"])
 }
 
 /// Extract the content between `<travsr-data>` and `</travsr-data>`. Mirrors
@@ -49,8 +48,18 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
     let cwd = std::env::current_dir().context("getting current directory")?;
     // #661 WS-D: read HEAD at cwd before the worktree redirect so a drifted
     // checkout is compared against the served index below.
-    let head = head_at(&cwd);
+    //
+    // Run concurrently with `find_git_root` below: both are independent,
+    // bounded git queries on `cwd` (the latter only shells out in the
+    // linked-worktree branch, via `main_worktree_root`). Sequentially, a wedged
+    // git would let this command stall for up to 2x `GIT_QUERY_TIMEOUT` instead
+    // of 1x. Mirrors `status::run`.
+    let head_handle = {
+        let cwd = cwd.clone();
+        std::thread::spawn(move || head_at(&cwd))
+    };
     let repo_root = find_git_root(&cwd)?;
+    let head = head_handle.join().ok().flatten();
     let db_path = repo_root.join(".travsr/graph.db");
     if !db_path.exists() {
         anyhow::bail!("not initialized — run `travsr init`");

@@ -901,20 +901,23 @@ fn tracked(repo: &Path, rels: &[String]) -> Vec<String> {
     if rels.is_empty() {
         return Vec::new();
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["ls-files", "--error-unmatch", "--"])
-        .args(rels.iter().map(|r| r.trim_start_matches('/')))
-        .output();
+    // Bounded (#717 triage): an unbounded `Command::output()` here can hang the
+    // CLI forever on Windows if git or something it spawns inherits the stdout
+    // pipe and never closes it (#503 / #572). `repo` goes through as the
+    // working directory rather than a `-C <string>` argument for the same
+    // reason `main_worktree_root` does: a path with bytes that are not valid
+    // UTF-8 is legal, and converting it to a string first would mangle it.
+    let mut args: Vec<&str> = vec!["ls-files", "--error-unmatch", "--"];
+    args.extend(rels.iter().map(|r| r.trim_start_matches('/')));
     // `--error-unmatch` makes git exit non-zero when any path is untracked, but
     // it still lists the tracked ones on stdout, which is what we read.
     //
-    // Fails open: no git on PATH, or a repo git cannot read, yields "nothing is
-    // tracked", so the adapters write as usual instead of refusing everything on
-    // a machine that cannot answer the question. The cost is that the refusal
-    // and its warning silently do not fire there.
-    let Ok(out) = out else {
+    // Fails open: no git on PATH, a repo git cannot read, or git that does not
+    // answer within the bound, yields "nothing is tracked", so the adapters
+    // write as usual instead of refusing everything on a machine that cannot
+    // answer the question. The cost is that the refusal and its warning
+    // silently do not fire there.
+    let Some(out) = crate::git_bounded::git_output_bounded(Some(repo), args) else {
         return Vec::new();
     };
     let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
