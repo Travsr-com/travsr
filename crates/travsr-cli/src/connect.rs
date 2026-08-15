@@ -644,7 +644,20 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
 
 /// Upsert one server under `root[top_key]["travsr"]`. Skips (never clobbers) a
 /// file that does not parse as strict JSON or whose shape is unexpected.
-fn merge_json_server(path: &Path, top_key: &str, entry: &Value) -> Result<Outcome> {
+///
+/// `refuse_new` declines to introduce the entry at all: set for a git-tracked
+/// config, where writing the server definition puts it in the next commit and
+/// `.gitignore` cannot take it back. Refusing is what makes `--commit` the
+/// consent gate for a shared server definition rather than an acknowledgement
+/// collected after the modification already sits in the working tree. An entry
+/// that already matches is left alone and reported `Unchanged`, since re-running
+/// over an already-committed config adds no exposure that is not already there.
+fn merge_json_server(
+    path: &Path,
+    top_key: &str,
+    entry: &Value,
+    refuse_new: bool,
+) -> Result<Outcome> {
     let mut root: Value = if path.exists() {
         let text = std::fs::read_to_string(path)?;
         if text.trim().is_empty() {
@@ -675,6 +688,13 @@ fn merge_json_server(path: &Path, top_key: &str, entry: &Value) -> Result<Outcom
 
     if map.get("travsr") == Some(entry) {
         return Ok(Outcome::Unchanged);
+    }
+    if refuse_new {
+        return Ok(Outcome::Skipped(
+            "tracked by git, so .gitignore cannot keep it local (re-run with \
+             --commit to share it)"
+                .into(),
+        ));
     }
     map.insert("travsr".to_string(), entry.clone());
 
@@ -791,13 +811,13 @@ fn remove_block(path: &Path, begin: &str, end: &str) -> Result<Outcome> {
     Ok(Outcome::Removed)
 }
 
-fn execute(p: &Planned, remove: bool) -> Result<Outcome> {
+fn execute(p: &Planned, remove: bool, refuse_new: bool) -> Result<Outcome> {
     match &p.content {
         Content::JsonServer { top_key, entry } => {
             if remove {
                 remove_json_server(&p.path, top_key)
             } else {
-                merge_json_server(&p.path, top_key, entry)
+                merge_json_server(&p.path, top_key, entry, refuse_new)
             }
         }
         Content::ManagedMd { body } => {
@@ -889,6 +909,11 @@ fn tracked(repo: &Path, rels: &[String]) -> Vec<String> {
         .output();
     // `--error-unmatch` makes git exit non-zero when any path is untracked, but
     // it still lists the tracked ones on stdout, which is what we read.
+    //
+    // Fails open: no git on PATH, or a repo git cannot read, yields "nothing is
+    // tracked", so the adapters write as usual instead of refusing everything on
+    // a machine that cannot answer the question. The cost is that the refusal
+    // and its warning silently do not fire there.
     let Ok(out) = out else {
         return Vec::new();
     };
@@ -986,6 +1011,15 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         };
     }
 
+    // Warnings survive `Silent`. `--quiet` silences what the run *did*, not what
+    // it could not guarantee: the only thing routed here says a server
+    // definition is committed and will auto-load for anyone who clones, and
+    // `travsr init --quiet` is the unattended path where that is least likely to
+    // be noticed otherwise. Always stderr, so it never lands in `--json` stdout.
+    macro_rules! warn {
+        ($($arg:tt)*) => { eprintln!($($arg)*) };
+    }
+
     let mut detected = false;
     // Paths to add to the .gitignore block, and paths to drop from it. Kept
     // apart because a remove run must subtract exactly what it unwired and leave
@@ -1001,6 +1035,24 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     // tool it was never asked to touch, and because the file is often nothing but
     // our block, delete that file outright.
     let shared = shared_md_paths(repo_root, home.as_deref(), &cmd);
+
+    // Config files that carry a server definition and that git already tracks.
+    // Computed before anything is written, because for these `.gitignore` is
+    // inert: the definition is in the index and goes out with the next commit.
+    // Without `--commit` the adapters decline to introduce it rather than
+    // modifying the file and warning afterwards.
+    let tracked_server_files: Vec<String> = if opts.remove || opts.commit {
+        Vec::new()
+    } else {
+        let planned: Vec<String> = Tool::ALL
+            .iter()
+            .filter(|t| matches!(t.detect(repo_root, home.as_deref()), Detection::Auto))
+            .flat_map(|t| t.plan(repo_root, &cmd))
+            .filter(|p| p.gitignore)
+            .filter_map(|p| rel(repo_root, &p.path))
+            .collect();
+        tracked(repo_root, &planned)
+    };
 
     for tool in Tool::ALL {
         if let Some(only) = &opts.only {
@@ -1052,7 +1104,10 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
                         }
                         continue;
                     }
-                    match execute(&planned, opts.remove) {
+                    let refuse_new = planned.gitignore
+                        && rel(repo_root, &planned.path)
+                            .is_some_and(|r| tracked_server_files.contains(&r));
+                    match execute(&planned, opts.remove, refuse_new) {
                         Ok(outcome) => {
                             match &outcome {
                                 Outcome::Skipped(reason) => {
@@ -1111,14 +1166,16 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
         return Ok(());
     }
 
-    // Files git already tracks cannot be un-shared by a .gitignore entry, so say
-    // so rather than printing the local-only claim over a server definition that
-    // is heading into the next commit.
-    let already_tracked = if opts.remove || opts.commit {
-        Vec::new()
-    } else {
-        tracked(repo_root, &gitignore)
-    };
+    // What is left after the refusal above: a tracked config that already holds
+    // our exact entry, so there was nothing to write and nothing to decline. The
+    // definition is still committed and will still auto-load for a cloner, and
+    // `.gitignore` cannot take it back, so the local-only claim has to be dropped
+    // and the state named.
+    let already_tracked: Vec<String> = gitignore
+        .iter()
+        .filter(|r| tracked_server_files.contains(r))
+        .cloned()
+        .collect();
 
     if opts.dry_run {
         for r in &gitignore {
@@ -1140,11 +1197,10 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
     }
 
     for r in &already_tracked {
-        say!(
-            "warning: {r} is tracked by git, so .gitignore cannot keep it local. The \
-             travsr server definition in it will be committed and will auto-load for \
-             anyone who clones. `git rm --cached {r}` to untrack it, or re-run with \
-             --commit to accept sharing it.",
+        warn!(
+            "warning: {r} is tracked by git and already holds the travsr server \
+             definition, so .gitignore cannot keep it local. It will auto-load for \
+             anyone who clones. `git rm --cached {r}` to untrack it.",
         );
     }
 
@@ -1186,7 +1242,7 @@ mod tests {
         let p = dir.path().join(".mcp.json");
         std::fs::write(&p, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
         let entry = json!({ "command": "travsr", "args": ["mcp","--stdio"] });
-        merge_json_server(&p, "mcpServers", &entry).unwrap();
+        merge_json_server(&p, "mcpServers", &entry, false).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["mcpServers"]["other"]["command"], "x");
         assert_eq!(v["mcpServers"]["travsr"]["command"], "travsr");
@@ -1198,11 +1254,11 @@ mod tests {
         let p = dir.path().join(".mcp.json");
         let entry = json!({ "command": "travsr", "args": ["mcp","--stdio"] });
         assert!(matches!(
-            merge_json_server(&p, "mcpServers", &entry).unwrap(),
+            merge_json_server(&p, "mcpServers", &entry, false).unwrap(),
             Outcome::Written
         ));
         assert!(matches!(
-            merge_json_server(&p, "mcpServers", &entry).unwrap(),
+            merge_json_server(&p, "mcpServers", &entry, false).unwrap(),
             Outcome::Unchanged
         ));
     }
@@ -1215,7 +1271,7 @@ mod tests {
         std::fs::write(&p, original).unwrap();
         let entry = json!({ "command": "travsr" });
         assert!(matches!(
-            merge_json_server(&p, "context_servers", &entry).unwrap(),
+            merge_json_server(&p, "context_servers", &entry, false).unwrap(),
             Outcome::Skipped(_)
         ));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
@@ -1540,6 +1596,39 @@ mod tests {
         assert_eq!(found, vec![".mcp.json"]);
     }
 
+    /// Writing a server definition into a git-tracked config puts it in the next
+    /// commit, and `.gitignore` cannot take it back. Declining is what makes
+    /// `--commit` the consent gate, rather than warning once the modification is
+    /// already sitting in the working tree.
+    #[test]
+    fn a_tracked_config_is_not_given_a_server_without_consent() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join(".mcp.json");
+        std::fs::write(&p, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        let entry = json!({ "command": "travsr", "args": ["mcp","--stdio"] });
+
+        // Tracked and travsr is not in it: refuse, and leave the file byte-identical.
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert!(matches!(
+            merge_json_server(&p, "mcpServers", &entry, true).unwrap(),
+            Outcome::Skipped(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+
+        // --commit is the consent gate, and it writes.
+        assert!(matches!(
+            merge_json_server(&p, "mcpServers", &entry, false).unwrap(),
+            Outcome::Written
+        ));
+
+        // Already committed with our exact entry: nothing to write and nothing to
+        // decline, so report Unchanged and let the caller warn about the state.
+        assert!(matches!(
+            merge_json_server(&p, "mcpServers", &entry, true).unwrap(),
+            Outcome::Unchanged
+        ));
+    }
+
     /// A user who tuned a generated rule file has content travsr did not write.
     /// Deleting it on `--remove` is the destructive edit every other path in
     /// this module refuses to make.
@@ -1554,18 +1643,21 @@ mod tests {
             },
             gitignore: false,
         };
-        execute(&planned, false).unwrap();
+        execute(&planned, false, false).unwrap();
         assert!(p.exists());
 
         // Untouched: removal owns it and takes it.
-        assert!(matches!(execute(&planned, true).unwrap(), Outcome::Removed));
+        assert!(matches!(
+            execute(&planned, true, false).unwrap(),
+            Outcome::Removed
+        ));
         assert!(!p.exists());
 
         // Edited: removal must decline and say why.
-        execute(&planned, false).unwrap();
+        execute(&planned, false, false).unwrap();
         std::fs::write(&p, format!("{}\n\nmy own note\n", markdown_rules())).unwrap();
         assert!(matches!(
-            execute(&planned, true).unwrap(),
+            execute(&planned, true, false).unwrap(),
             Outcome::Skipped(_)
         ));
         assert!(p.exists(), "an edited rules file must survive --remove");
