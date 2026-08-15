@@ -633,7 +633,12 @@ async fn run(cli: Cli) -> Result<()> {
             commit,
         } => {
             let cwd = std::env::current_dir()?;
-            let repo_root = repo::find_git_root(&cwd)?;
+            // Write command: `connect` creates files in the resolved root, so it
+            // must stay in the worktree we are standing in. The read resolver
+            // redirects a linked worktree to the main worktree (issue #302),
+            // which would drop this checkout's AI config into a different one.
+            // `travsr init` already wires connect through the write resolver.
+            let repo_root = repo::find_git_root_for_write(&cwd)?;
             connect::run(
                 &repo_root,
                 &connect::ConnectOpts {
